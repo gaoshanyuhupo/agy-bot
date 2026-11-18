@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import time
 import uuid
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -508,6 +509,8 @@ def dispatch_assignments(
                 "mode": str(spec.get("mode") or ""),
                 "thread_key": str(spec.get("thread_key") or ""),
                 "resume_cid": str(spec.get("resume_cid") or ""),
+                "worktree": bool(spec.get("worktree", False)),
+                "worktree_info": {},
                 "notify_group": bool(spec.get("notify_group", default_notify_group)),
                 "origin_scope_key": origin_scope_key or "",
                 "origin_chat_id": int(origin_chat_id or 0),
@@ -657,6 +660,7 @@ def finish_job(
     worker_cid: str = "",
     artifacts: Optional[List[str]] = None,
     usage: Optional[Dict[str, Any]] = None,
+    worktree_info: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     if status not in TERMINAL_STATUSES:
         raise ValueError(f"Invalid terminal status: {status}")
@@ -678,6 +682,8 @@ def finish_job(
             job["artifacts"] = list(artifacts)
         if usage is not None:
             job["usage"] = dict(usage)
+        if worktree_info is not None:
+            job["worktree_info"] = dict(worktree_info)
         _atomic_write_json(fp, job)
         _maybe_notify_batch_done_unlocked(job)
         return dict(job)
@@ -722,6 +728,7 @@ def retry_job(job_id: str, requester_bot: str, prompt_override: str = "") -> Dic
         "mode": prev.get("mode") or "",
         "thread_key": prev.get("thread_key") or "",
         "resume_cid": prev.get("worker_cid") or prev.get("resume_cid") or "",
+        "worktree": bool(prev.get("worktree")),
         "notify_group": bool(prev.get("notify_group")),
     }
     res = dispatch_assignments(
@@ -1301,12 +1308,472 @@ def relay_group_mentions(
         return {"relayed": relayed, "blocked_reason": blocked_reason}
 
 
+# ---------------------------------------------------------------- git worktree isolation
+WORKTREE_DIR_NAME = ".worktrees"
+WORKTREE_BRANCH_PREFIX = "agy-team/"
+WORKTREE_CHANGED_FILES_LIMIT = 30
+_GIT_ENV_STRIP = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+)
+
+
+def _run_git(
+    args: List[str],
+    *,
+    cwd: Optional[str] = None,
+    timeout: float = 30.0,
+) -> Tuple[bool, str, str]:
+    """Run a non-interactive hardened Git subprocess without hanging on prompts."""
+    env = dict(os.environ)
+    for k in _GIT_ENV_STRIP:
+        env.pop(k, None)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_ASKPASS"] = "/bin/false"
+    env["SSH_ASKPASS"] = "/bin/false"
+    env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes"
+    try:
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
+        return proc.returncode == 0, proc.stdout or "", proc.stderr or ""
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, "", repr(exc)
+
+
+def _safe_worktree_id(job_id: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9_-]+", "-", str(job_id or "").strip()).strip("-")
+    return cleaned[:80] or "job"
+
+
+def _ensure_git_info_exclude(repo_root: str) -> bool:
+    """Append `.worktrees/` to `<git-common-dir>/info/exclude` without touching `.gitignore`."""
+    ok, out, _ = _run_git(["rev-parse", "--git-common-dir"], cwd=repo_root)
+    if not ok or not out.strip():
+        return False
+    common_dir = out.strip()
+    if not os.path.isabs(common_dir):
+        common_dir = os.path.realpath(os.path.join(repo_root, common_dir))
+    info_dir = os.path.join(common_dir, "info")
+    os.makedirs(info_dir, exist_ok=True)
+    exclude_path = os.path.join(info_dir, "exclude")
+
+    existing = ""
+    if os.path.isfile(exclude_path):
+        with open(exclude_path, "r", encoding="utf-8", errors="replace") as f:
+            existing = f.read()
+        lines = {ln.strip() for ln in existing.splitlines()}
+        if f"{WORKTREE_DIR_NAME}/" in lines or WORKTREE_DIR_NAME in lines:
+            return True
+
+    prefix = "\n" if existing and not existing.endswith("\n") else ""
+    with open(exclude_path, "a", encoding="utf-8") as f:
+        f.write(f"{prefix}{WORKTREE_DIR_NAME}/\n")
+    return True
+
+
+def prepare_job_worktree(workdir: str, job_id: str) -> Dict[str, Any]:
+    """Create an isolated Git worktree `<repo>/.worktrees/<safe_id>` on `agy-team/<safe_id>`.
+
+    Gracefully degrades (`active=False`) on missing dirs, non-Git dirs, unborn HEADs,
+    or existing conflicting branches/directories without blocking job execution.
+    """
+    raw_wdir = os.path.realpath(os.path.expanduser(workdir)) if workdir else ""
+    if not raw_wdir or not os.path.isdir(raw_wdir):
+        return {"enabled": True, "active": False, "pruned": False, "reason": "workdir_missing"}
+
+    ok_root, out_root, err_root = _run_git(["rev-parse", "--show-toplevel"], cwd=raw_wdir)
+    if not ok_root or not out_root.strip():
+        return {
+            "enabled": True,
+            "active": False,
+            "pruned": False,
+            "reason": "not_git_repo",
+            "detail": err_root.strip()[:300],
+        }
+    repo_root = os.path.realpath(out_root.strip())
+
+    ok_head, out_head, err_head = _run_git(["rev-parse", "--verify", "HEAD"], cwd=repo_root)
+    if not ok_head or not out_head.strip():
+        return {
+            "enabled": True,
+            "active": False,
+            "pruned": False,
+            "repo_root": repo_root,
+            "reason": "unborn_or_invalid_head",
+            "detail": err_head.strip()[:300],
+        }
+    base_commit = out_head.strip()
+
+    safe_id = _safe_worktree_id(job_id)
+    branch = f"{WORKTREE_BRANCH_PREFIX}{safe_id}"
+    wt_root = os.path.join(repo_root, WORKTREE_DIR_NAME)
+    wt_path = os.path.join(wt_root, safe_id)
+
+    try:
+        if not _ensure_git_info_exclude(repo_root):
+            return {
+                "enabled": True,
+                "active": False,
+                "pruned": False,
+                "repo_root": repo_root,
+                "base_commit": base_commit,
+                "reason": "git_exclude_failed",
+            }
+        os.makedirs(wt_root, exist_ok=True)
+    except OSError as exc:
+        return {
+            "enabled": True,
+            "active": False,
+            "pruned": False,
+            "repo_root": repo_root,
+            "base_commit": base_commit,
+            "reason": "prepare_dir_failed",
+            "detail": repr(exc)[:300],
+        }
+
+    if os.path.exists(wt_path):
+        return {
+            "enabled": True,
+            "active": False,
+            "pruned": False,
+            "repo_root": repo_root,
+            "base_commit": base_commit,
+            "branch": branch,
+            "reason": "worktree_path_exists",
+        }
+
+    has_branch, _, _ = _run_git(["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"], cwd=repo_root)
+    if has_branch:
+        # Only prune stale leftover branch if it has no unmerged commits
+        del_ok, _, _ = _run_git(["branch", "-d", branch], cwd=repo_root)
+        if not del_ok:
+            return {
+                "enabled": True,
+                "active": False,
+                "pruned": False,
+                "repo_root": repo_root,
+                "base_commit": base_commit,
+                "branch": branch,
+                "reason": "branch_already_exists",
+            }
+
+    ok_add, _, err_add = _run_git(
+        ["worktree", "add", "-b", branch, wt_path, base_commit],
+        cwd=repo_root,
+        timeout=60.0,
+    )
+    if not ok_add:
+        return {
+            "enabled": True,
+            "active": False,
+            "pruned": False,
+            "repo_root": repo_root,
+            "base_commit": base_commit,
+            "branch": branch,
+            "reason": "worktree_add_failed",
+            "detail": err_add.strip()[:300],
+        }
+
+    return {
+        "enabled": True,
+        "active": True,
+        "path": os.path.realpath(wt_path),
+        "branch": branch,
+        "repo_root": repo_root,
+        "base_commit": base_commit,
+        "pruned": False,
+    }
+
+
+def _inspect_worktree_state(wt_path: str, base_commit: str) -> Dict[str, Any]:
+    """Probe commit count and working-tree status inside an active worktree."""
+    ok_rev = False
+    commits: Optional[int] = None
+    if base_commit:
+        rev_success, out_rev, _ = _run_git(["rev-list", "--count", f"{base_commit}..HEAD"], cwd=wt_path)
+        if rev_success:
+            try:
+                commits = int(out_rev.strip())
+                ok_rev = True
+            except ValueError:
+                ok_rev = False
+
+    ok_stat, out_stat, _ = _run_git(["status", "--porcelain", "--untracked-files=normal"], cwd=wt_path)
+    dirty: Optional[bool] = None
+    changed_files: List[str] = []
+    if ok_stat:
+        raw_lines = [ln.rstrip("\r") for ln in out_stat.splitlines() if ln.strip()]
+        dirty = len(raw_lines) > 0
+        for ln in raw_lines:
+            fpath = ln[3:] if len(ln) > 3 else ln.strip()
+            if " -> " in fpath:
+                fpath = fpath.split(" -> ", 1)[1]
+            if fpath and fpath not in changed_files:
+                changed_files.append(fpath)
+
+    if ok_rev and commits and commits > 0 and base_commit:
+        ok_diff, out_diff, _ = _run_git(["diff", "--name-only", f"{base_commit}..HEAD"], cwd=wt_path)
+        if ok_diff:
+            for ln in out_diff.splitlines():
+                fpath = ln.strip()
+                if fpath and fpath not in changed_files:
+                    changed_files.append(fpath)
+
+    return {
+        "ok_rev": ok_rev,
+        "ok_stat": ok_stat,
+        "inspection_failed": not (ok_rev and ok_stat),
+        "commits": commits,
+        "dirty": dirty,
+        "changed_files": changed_files[:WORKTREE_CHANGED_FILES_LIMIT],
+    }
+
+
+def finalize_job_worktree(wt_info: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Auto-prune clean zero-commit worktrees; preserve any dirty, committed, or unreadable worktrees."""
+    if not isinstance(wt_info, dict) or not wt_info:
+        return {"enabled": False, "active": False, "pruned": False}
+    if not wt_info.get("active"):
+        out = dict(wt_info)
+        out["active"] = False
+        out.setdefault("pruned", False)
+        return out
+
+    wt_path = str(wt_info.get("path") or "")
+    repo_root = str(wt_info.get("repo_root") or "")
+    branch = str(wt_info.get("branch") or "")
+    base_commit = str(wt_info.get("base_commit") or "")
+
+    if not wt_path or not os.path.isdir(wt_path):
+        return {
+            "enabled": bool(wt_info.get("enabled", True)),
+            "active": False,
+            "path": wt_path,
+            "branch": branch,
+            "repo_root": repo_root,
+            "base_commit": base_commit,
+            "pruned": bool(wt_info.get("pruned", False)),
+            "note": "worktree_dir_missing",
+        }
+
+    probe = _inspect_worktree_state(wt_path, base_commit)
+    inspection_failed = probe["inspection_failed"]
+    commits = probe["commits"]
+    dirty = probe["dirty"]
+    changed_files = probe["changed_files"]
+
+    if not inspection_failed and commits == 0 and not dirty:
+        rm_cwd = repo_root if (repo_root and os.path.isdir(repo_root)) else os.path.dirname(wt_path)
+        ok_rm, _, err_rm = _run_git(["worktree", "remove", wt_path], cwd=rm_cwd)
+        if ok_rm:
+            if branch and repo_root and os.path.isdir(repo_root):
+                _run_git(["branch", "-d", branch], cwd=repo_root)
+            return {
+                "enabled": True,
+                "active": False,
+                "path": wt_path,
+                "branch": branch,
+                "repo_root": repo_root,
+                "base_commit": base_commit,
+                "commits": 0,
+                "dirty": False,
+                "changed_files": [],
+                "pruned": True,
+                "inspection_failed": False,
+                "note": "pruned_clean_worktree",
+            }
+        return {
+            "enabled": True,
+            "active": True,
+            "path": wt_path,
+            "branch": branch,
+            "repo_root": repo_root,
+            "base_commit": base_commit,
+            "commits": 0,
+            "dirty": False,
+            "changed_files": [],
+            "pruned": False,
+            "inspection_failed": False,
+            "note": f"prune_remove_failed: {err_rm.strip()[:200]}",
+        }
+
+    note = "inspection_failed_preserved" if inspection_failed else "preserved_with_changes"
+    return {
+        "enabled": True,
+        "active": True,
+        "path": wt_path,
+        "branch": branch,
+        "repo_root": repo_root,
+        "base_commit": base_commit,
+        "commits": commits,
+        "dirty": dirty,
+        "changed_files": changed_files,
+        "pruned": False,
+        "inspection_failed": inspection_failed,
+        "note": note,
+    }
+
+
+def cleanup_job_worktree(job_id: str, force: bool = False) -> Dict[str, Any]:
+    """Explicitly clean up a job's preserved worktree and branch after review/merge."""
+    job = get_job(job_id)
+    if not job:
+        return {"ok": False, "job_id": job_id, "error": f"Job not found: {job_id}"}
+
+    wt = (
+        job.get("worktree_info")
+        if isinstance(job.get("worktree_info"), dict) and job.get("worktree_info")
+        else (job.get("worktree") if isinstance(job.get("worktree"), dict) else {})
+    )
+    if not wt or wt.get("pruned") or (not wt.get("active") and not wt.get("path")):
+        return {
+            "ok": True,
+            "job_id": job_id,
+            "pruned": bool(wt.get("pruned")) if wt else False,
+            "already_clean": True,
+            "note": "Worktree not active or already pruned.",
+        }
+
+    if not force and job.get("status") == "running":
+        return {
+            "ok": False,
+            "job_id": job_id,
+            "pruned": False,
+            "error": "Job is still running; cancel it first or pass force=True.",
+        }
+
+    wt_path = str(wt.get("path") or "")
+    repo_root = str(wt.get("repo_root") or "")
+    branch = str(wt.get("branch") or "")
+    base_commit = str(wt.get("base_commit") or "")
+
+    if wt_path and os.path.isdir(wt_path):
+        probe = _inspect_worktree_state(wt_path, base_commit)
+        if not force:
+            if not probe["ok_stat"]:
+                return {
+                    "ok": False,
+                    "job_id": job_id,
+                    "pruned": False,
+                    "error": "Failed to inspect worktree status; pass force=True to force removal.",
+                }
+            if probe["dirty"]:
+                return {
+                    "ok": False,
+                    "job_id": job_id,
+                    "pruned": False,
+                    "dirty": True,
+                    "changed_files": probe["changed_files"],
+                    "error": (
+                        f"Worktree at {wt_path} has uncommitted changes. "
+                        "Commit/merge or discard them first, or pass force=True."
+                    ),
+                }
+            if not probe["ok_rev"]:
+                return {
+                    "ok": False,
+                    "job_id": job_id,
+                    "pruned": False,
+                    "error": "Failed to inspect worktree commit history; pass force=True to force removal.",
+                }
+            if (probe["commits"] or 0) > 0:
+                merged = False
+                if branch and repo_root and os.path.isdir(repo_root):
+                    merged, _, _ = _run_git(["merge-base", "--is-ancestor", branch, "HEAD"], cwd=repo_root)
+                if not merged:
+                    return {
+                        "ok": False,
+                        "job_id": job_id,
+                        "pruned": False,
+                        "commits": probe["commits"],
+                        "branch": branch,
+                        "error": (
+                            f"Worktree branch {branch} has {probe['commits']} unmerged commit(s). "
+                            "Merge into target branch first or pass force=True."
+                        ),
+                    }
+
+        rm_cwd = repo_root if (repo_root and os.path.isdir(repo_root)) else os.path.dirname(wt_path)
+        rm_args = ["worktree", "remove", "--force", wt_path] if force else ["worktree", "remove", wt_path]
+        ok_rm, _, err_rm = _run_git(rm_args, cwd=rm_cwd)
+        if not ok_rm:
+            return {
+                "ok": False,
+                "job_id": job_id,
+                "pruned": False,
+                "error": f"git worktree remove failed: {err_rm.strip()[:300]}",
+            }
+    elif repo_root and os.path.isdir(repo_root):
+        _run_git(["worktree", "prune"], cwd=repo_root)
+        if branch and not force:
+            has_br, _, _ = _run_git(["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"], cwd=repo_root)
+            if has_br:
+                merged, _, _ = _run_git(["merge-base", "--is-ancestor", branch, "HEAD"], cwd=repo_root)
+                if not merged:
+                    return {
+                        "ok": False,
+                        "job_id": job_id,
+                        "pruned": False,
+                        "branch": branch,
+                        "error": (
+                            f"Worktree directory is missing but branch {branch} has unmerged commits. "
+                            "Merge first or pass force=True."
+                        ),
+                    }
+
+    branch_deleted = False
+    if branch and repo_root and os.path.isdir(repo_root):
+        has_br, _, _ = _run_git(["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"], cwd=repo_root)
+        if has_br:
+            del_flag = "-D" if force else "-d"
+            ok_br, _, err_br = _run_git(["branch", del_flag, branch], cwd=repo_root)
+            if not ok_br:
+                return {
+                    "ok": False,
+                    "job_id": job_id,
+                    "pruned": False,
+                    "error": f"Worktree removed but failed to delete branch {branch}: {err_br.strip()[:300]}",
+                }
+            branch_deleted = True
+
+    wt_updated = dict(wt)
+    wt_updated["pruned"] = True
+    wt_updated["active"] = False
+    wt_updated["note"] = "force_cleaned" if force else "cleaned"
+    if isinstance(job.get("worktree"), dict) and not job.get("worktree_info"):
+        update_job(job_id, worktree=wt_updated)
+    else:
+        update_job(job_id, worktree_info=wt_updated)
+
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "pruned": True,
+        "branch": branch,
+        "branch_deleted": branch_deleted,
+        "worktree": wt_updated,
+    }
+
+
 def format_worker_envelope(
     job: Dict[str, Any],
     effective_workdir: str,
     outbox_dir: str,
     worker_specialty: str = "",
     group_history: Optional[str] = None,
+    worktree_info: Optional[Dict[str, Any]] = None,
 ) -> str:
     jid = job.get("job_id") or "?"
     sender = job.get("from_bot") or "coordinator"
@@ -1318,6 +1785,19 @@ def format_worker_envelope(
         header += f' label="{label}"'
     header += "]"
     role_line = f"- 职责分工：{worker_specialty}\n" if worker_specialty else ""
+
+    wt = worktree_info if worktree_info is not None else job.get("worktree_info")
+    wt_line = ""
+    if isinstance(wt, dict) and wt.get("active"):
+        wt_branch = wt.get("branch") or ""
+        wt_path = wt.get("path") or effective_workdir
+        wt_root = wt.get("repo_root") or ""
+        wt_line = (
+            f"- 隔离 Worktree：已启用（分支 `{wt_branch}`，路径 `{wt_path}`）；"
+            f"请仅在当前隔离工作目录内读写、提交与测试，严禁越权修改主检出目录"
+            + (f"（`{wt_root}`）" if wt_root else "")
+            + "。\n"
+        )
 
     ctx_block = group_history if group_history is not None else ""
     origin_chat = int(job.get("origin_chat_id") or 0)
@@ -1337,6 +1817,7 @@ def format_worker_envelope(
         f"你正在作为专职子 Bot（@{target}）执行主控 Bot（@{sender}）分派的任务。当前无人工实时交互，请勿反问用户，直接完成职责范围内工作并用清晰、结构化、可直接验收的总结回复（列出关键发现、改动文件或验证结果）。\n"
         f"{role_line}"
         f"- 工作目录：`{effective_workdir}`\n"
+        f"{wt_line}"
         f"- 若生成截图或图片交付物，可写入 `{outbox_dir}/` 并在回复中注明完整路径。\n\n"
         f"{history_section}"
         f"任务简报：\n{prompt}"
@@ -1368,4 +1849,17 @@ def summarize_job_brief(job: Dict[str, Any]) -> Dict[str, Any]:
         out["artifacts"] = list(job["artifacts"])
     if job.get("usage"):
         out["usage"] = dict(job["usage"])
+    wt_info = job.get("worktree_info")
+    if isinstance(wt_info, dict) and wt_info:
+        wt_summary: Dict[str, Any] = {}
+        for bk in ("enabled", "active", "pruned"):
+            if bk in wt_info:
+                wt_summary[bk] = bool(wt_info[bk])
+        for k in ("path", "branch", "repo_root", "base_commit", "commits", "dirty", "changed_files", "inspection_failed", "reason", "note"):
+            if k in wt_info and wt_info[k] not in (None, "", []):
+                wt_summary[k] = wt_info[k]
+        if wt_summary:
+            out["worktree"] = wt_summary
+    elif job.get("worktree"):
+        out["worktree"] = {"enabled": True, "active": False, "pruned": False}
     return out

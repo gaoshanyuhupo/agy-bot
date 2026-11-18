@@ -41,8 +41,8 @@ COORDINATOR_INSTRUCTIONS = (
     "  * Developer worker: code implementation, refactoring, local deploy/sync, Git commits, tags, and releases.\n"
     "  * Tester worker: unit/security/regression verification, post-release checks, and collecting/summarizing post-release GitHub Issues, PRs, CI status, and external feedback.\n"
     "- `team_dispatch` defaults to `wait=false` (non-blocking async with automatic `batch_done` wake-up). Keep `wait=false` for normal dev, release, test, and collection tasks so you stay immediately idle for new user instructions; on `batch_done`, verify results and asynchronously chain the next stage (e.g., Dev -> Test/Feedback) or report to the user. Pass `wait=true` only for tiny <15s read-only checks.\n"
-    "- Keep workdirs/files partitioned so concurrent workers never edit the exact same file simultaneously.\n"
-    "- Inspect, cancel, or retry background worker jobs via `team_job`; send plain status notices via `team_broadcast`."
+    "- Keep workdirs/files partitioned, or pass `worktree: true` on `team_dispatch` when multiple workers need to edit the same Git repository concurrently in isolated worktrees/branches; after verification/merge, call `team_job(action=\"cleanup_worktree\", job_id=...)` to clean up.\n"
+    "- Inspect, cancel, retry, or clean up worktrees for background worker jobs via `team_job`; send plain status notices via `team_broadcast`."
 )
 
 
@@ -187,7 +187,7 @@ def _tool_schemas() -> List[Dict[str, Any]]:
                     },
                     "assignments": {
                         "type": "array",
-                        "description": "Parallel fan-out list (each item: {bot, prompt, label?, project?, workdir?, model?, effort?, mode?, thread_key?}).",
+                        "description": "Parallel fan-out list (each item: {bot, prompt, label?, project?, workdir?, model?, effort?, mode?, thread_key?, worktree?}).",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -200,6 +200,7 @@ def _tool_schemas() -> List[Dict[str, Any]]:
                                 "effort": {"type": "string"},
                                 "mode": {"type": "string"},
                                 "thread_key": {"type": "string"},
+                                "worktree": {"type": "boolean"},
                             },
                             "required": ["bot", "prompt"],
                         },
@@ -213,6 +214,10 @@ def _tool_schemas() -> List[Dict[str, Any]]:
                     "thread_key": {
                         "type": "string",
                         "description": "Optional persistent worker thread key to resume multi-turn state across dispatches.",
+                    },
+                    "worktree": {
+                        "type": "boolean",
+                        "description": "Create an isolated Git worktree (<repo>/.worktrees/<job_id>, branch agy-team/<job_id>) per worker so concurrent workers can edit the same repository safely without conflicts (default false).",
                     },
                     "wait": {
                         "type": "boolean",
@@ -231,19 +236,23 @@ def _tool_schemas() -> List[Dict[str, Any]]:
         },
         {
             "name": "team_job",
-            "description": "Inspect, list, cancel, or retry delegated Bot Bus jobs.",
+            "description": "Inspect, list, cancel, retry, or clean up worktrees for delegated Bot Bus jobs.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["list", "status", "cancel", "retry"],
+                        "enum": ["list", "status", "cancel", "retry", "cleanup_worktree"],
                         "description": "Operation to perform.",
                     },
-                    "job_id": {"type": "string", "description": "Job ID for status/cancel/retry."},
+                    "job_id": {"type": "string", "description": "Job ID for status/cancel/retry/cleanup_worktree."},
                     "limit": {"type": "integer", "description": "Max jobs for action=list (default 10)."},
                     "reason": {"type": "string", "description": "Cancellation reason."},
                     "prompt_override": {"type": "string", "description": "Optional corrected brief for action=retry."},
+                    "force": {
+                        "type": "boolean",
+                        "description": "For action=cleanup_worktree: force removal even if uncommitted changes or unmerged commits remain (default false).",
+                    },
                 },
                 "required": ["action"],
             },
@@ -297,7 +306,7 @@ def _build_assignment_list(args: Dict[str, Any]) -> List[Dict[str, Any]]:
     raw_items = args.get("assignments")
     shared_defaults = {
         k: args[k]
-        for k in ("label", "project", "workdir", "model", "effort", "mode", "thread_key")
+        for k in ("label", "project", "workdir", "model", "effort", "mode", "thread_key", "worktree")
         if args.get(k) not in (None, "")
     }
     if isinstance(raw_items, list) and raw_items:
@@ -406,6 +415,11 @@ def _handle_team_job(args: Dict[str, Any]) -> Dict[str, Any]:
     if action == "retry":
         job = bot_bus.retry_job(jid, requester_bot=me, prompt_override=str(args.get("prompt_override") or ""))
         return _tool_text({"retried": bot_bus.summarize_job_brief(job)})
+
+    if action == "cleanup_worktree":
+        force = bool(args.get("force", False))
+        res = bot_bus.cleanup_job_worktree(jid, force=force)
+        return _tool_text(res, is_error=not bool(res.get("ok")))
 
     return _tool_text(f"Unknown action: {action}", is_error=True)
 

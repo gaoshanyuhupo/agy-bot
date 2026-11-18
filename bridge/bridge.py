@@ -2486,7 +2486,7 @@ class LiveDraftStreamer:
 
 # ---------------------------------------------------------------- workspace & image detection
 _SKIP_WALK_DIRS = frozenset({
-    ".git", "uploads", "node_modules", ".pnpm", ".pnpm-store", "dist", "build",
+    ".git", ".worktrees", "uploads", "node_modules", ".pnpm", ".pnpm-store", "dist", "build",
     ".next", ".nuxt", ".output", ".svelte-kit", "coverage", "vendor", "venv",
     ".venv", "__pycache__", ".pytest_cache", ".mypy_cache", ".cache", ".agents",
     ".claude", "target",
@@ -2494,7 +2494,7 @@ _SKIP_WALK_DIRS = frozenset({
 
 _NOISE_ASSET_SEGMENTS = (
     "/node_modules/", "/.pnpm/", "/.pnpm-store/", "/vendor/", "/dist/", "/build/",
-    "/.next/", "/.nuxt/", "/.output/", "/coverage/", "/.git/", "/.venv/", "/venv/",
+    "/.next/", "/.nuxt/", "/.output/", "/coverage/", "/.git/", "/.worktrees/", "/.venv/", "/venv/",
     "/__pycache__/", "/.cache/",
 )
 
@@ -4570,69 +4570,7 @@ def _execute_bus_job(job_id):
                 log("Bus job %s card receipt send failed: %s" % (job_id, _format_tg_err(r_m)))
 
     started_ts = time.time()
-    before_files = snapshot_workspace_files(workdir=exec_workdir)
-    before_outbox = snapshot_workspace_files(workdir=BOT_OUTBOX_DIR) if os.path.isdir(BOT_OUTBOX_DIR) else {}
-    full_prompt = bot_bus.format_worker_envelope(
-        job,
-        exec_workdir,
-        BOT_OUTBOX_DIR,
-        worker_specialty=cfg.get("specialty") or "",
-    )
-
-    cmd = [
-        AGY_BIN,
-        "--input-format", "text",
-        "--output-format", "stream-json",
-        "--print-timeout", PRINT_TIMEOUT,
-    ]
-    if exec_mode == "auto":
-        cmd.append("--dangerously-skip-permissions")
-    if exec_model:
-        cmd += ["--model", exec_model]
-    if exec_effort:
-        cmd += ["--effort", exec_effort]
-    if exec_project:
-        cmd += ["--project", exec_project]
-    if resume_cid:
-        cmd += ["--conversation", resume_cid]
-    cmd += ["-p", full_prompt]
-
-    env = dict(os.environ)
-    env["PATH"] = os.path.join(HOME, ".local/bin") + ":" + env.get("PATH", "")
-    env.setdefault("HOME", HOME)
-    env["AGY_OUTBOX_DIR"] = BOT_OUTBOX_DIR
-    if mirror_chat and int(mirror_chat) < 0:
-        worker_skey = scope_key_for(mirror_chat, mirror_thread)
-        bot_bus.set_origin_context(
-            worker_skey,
-            bot_handle=my_handle,
-            chat_id=mirror_chat,
-            thread_id=mirror_thread,
-            msg_id=origin_msg_id,
-            mention_hop=0,
-            chain_id=str(job.get("chain_id") or ""),
-        )
-        env["AGY_BOT_BUS_ENABLE"] = "1"
-        env["AGY_BOT_BUS_ROLE"] = "worker"
-        env["AGY_BOT_CHAT_ID"] = str(mirror_chat)
-        env["AGY_BOT_THREAD_ID"] = str(mirror_thread) if mirror_thread is not None else ""
-        env["AGY_BOT_SCOPE_KEY"] = worker_skey
-        env["AGY_BOT_ORIGIN_MSG_ID"] = str(origin_msg_id or 0)
-        env["AGY_BOT_MENTION_HOP"] = "0"
-    else:
-        env["AGY_BOT_BUS_ENABLE"] = "0"
-        env["AGY_BOT_BUS_ROLE"] = "disabled"
-    env["AGY_BOT_HANDLE"] = my_handle
-    env["AGY_BOT_CHAIN"] = ",".join(job.get("chain") or [])
-
-    with session_lock:
-        turn_running = True
-        turn_running_scope = f"bus:{job_id}"
-        turn_running_chat = mirror_chat or (PRIMARY_CHAT_ID or 0)
-        cancel_requested = False
-        _active_bus_job_id = job_id
-
-    _publish_bot_heartbeat()
+    wt_info = None
     proc = None
     final_status = "error"
     final_text = ""
@@ -4642,6 +4580,81 @@ def _execute_bus_job(job_id):
     usage = {}
 
     try:
+        if job.get("worktree") and exec_workdir and os.path.isdir(exec_workdir):
+            try:
+                wt_info = bot_bus.prepare_job_worktree(exec_workdir, job_id)
+                bot_bus.update_job(job_id, worktree_info=wt_info)
+                if wt_info.get("active") and wt_info.get("path") and os.path.isdir(wt_info["path"]):
+                    exec_workdir = wt_info["path"]
+            except Exception as wte:
+                log("Bus job %s worktree prepare failed: %r" % (job_id, wte))
+                wt_info = {"enabled": True, "active": False, "pruned": False, "reason": repr(wte)}
+                bot_bus.update_job(job_id, worktree_info=wt_info)
+
+        before_files = snapshot_workspace_files(workdir=exec_workdir)
+        before_outbox = snapshot_workspace_files(workdir=BOT_OUTBOX_DIR) if os.path.isdir(BOT_OUTBOX_DIR) else {}
+        full_prompt = bot_bus.format_worker_envelope(
+            job,
+            exec_workdir,
+            BOT_OUTBOX_DIR,
+            worker_specialty=cfg.get("specialty") or "",
+            worktree_info=wt_info,
+        )
+
+        cmd = [
+            AGY_BIN,
+            "--input-format", "text",
+            "--output-format", "stream-json",
+            "--print-timeout", PRINT_TIMEOUT,
+        ]
+        if exec_mode == "auto":
+            cmd.append("--dangerously-skip-permissions")
+        if exec_model:
+            cmd += ["--model", exec_model]
+        if exec_effort:
+            cmd += ["--effort", exec_effort]
+        if exec_project:
+            cmd += ["--project", exec_project]
+        if resume_cid:
+            cmd += ["--conversation", resume_cid]
+        cmd += ["-p", full_prompt]
+
+        env = dict(os.environ)
+        env["PATH"] = os.path.join(HOME, ".local/bin") + ":" + env.get("PATH", "")
+        env.setdefault("HOME", HOME)
+        env["AGY_OUTBOX_DIR"] = BOT_OUTBOX_DIR
+        if mirror_chat and int(mirror_chat) < 0:
+            worker_skey = scope_key_for(mirror_chat, mirror_thread)
+            bot_bus.set_origin_context(
+                worker_skey,
+                bot_handle=my_handle,
+                chat_id=mirror_chat,
+                thread_id=mirror_thread,
+                msg_id=origin_msg_id,
+                mention_hop=0,
+                chain_id=str(job.get("chain_id") or ""),
+            )
+            env["AGY_BOT_BUS_ENABLE"] = "1"
+            env["AGY_BOT_BUS_ROLE"] = "worker"
+            env["AGY_BOT_CHAT_ID"] = str(mirror_chat)
+            env["AGY_BOT_THREAD_ID"] = str(mirror_thread) if mirror_thread is not None else ""
+            env["AGY_BOT_SCOPE_KEY"] = worker_skey
+            env["AGY_BOT_ORIGIN_MSG_ID"] = str(origin_msg_id or 0)
+            env["AGY_BOT_MENTION_HOP"] = "0"
+        else:
+            env["AGY_BOT_BUS_ENABLE"] = "0"
+            env["AGY_BOT_BUS_ROLE"] = "disabled"
+        env["AGY_BOT_HANDLE"] = my_handle
+        env["AGY_BOT_CHAIN"] = ",".join(job.get("chain") or [])
+
+        with session_lock:
+            turn_running = True
+            turn_running_scope = f"bus:{job_id}"
+            turn_running_chat = mirror_chat or (PRIMARY_CHAT_ID or 0)
+            cancel_requested = False
+            _active_bus_job_id = job_id
+
+        _publish_bot_heartbeat()
         log("Starting Bus job %s (from=@%s, model=%s, cwd=%s, conv=%s)" % (
             job_id, from_bot, exec_model or "default", exec_workdir, (resume_cid or "new")[:8]
         ))
@@ -4858,6 +4871,15 @@ def _execute_bus_job(job_id):
 
         if delivered_to_group:
             bot_bus.update_job(job_id, group_delivered=True)
+        if wt_info is not None:
+            try:
+                wt_info = bot_bus.finalize_job_worktree(wt_info)
+            except Exception as wfe:
+                log("Bus job %s worktree finalize failed: %r" % (job_id, wfe))
+                wt_info = dict(wt_info)
+                wt_info["inspection_failed"] = True
+                wt_info["pruned"] = False
+                wt_info["note"] = f"finalize_exception: {wfe!r}"
         bot_bus.finish_job(
             job_id,
             status=final_status,
@@ -4866,6 +4888,7 @@ def _execute_bus_job(job_id):
             worker_cid=new_cid or "",
             artifacts=artifacts,
             usage=usage,
+            worktree_info=wt_info,
         )
         _publish_bot_heartbeat()
 

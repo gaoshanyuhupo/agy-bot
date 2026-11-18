@@ -29,6 +29,7 @@ target-version = "py311"
 line-length = 120
 exclude = [
     ".git",
+    ".worktrees",
     ".ruff_cache",
     "__pycache__",
     "venv",
