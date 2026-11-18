@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Lightweight Antigravity CLI hook pre-filter before invoking `claude-mem` (`bun`).
 
-Filters out wasteful invocations before spawning Bun or triggering background LLM calls:
+Filters out wasteful or untrusted invocations before spawning Bun or triggering background LLM calls:
 - Skips internal background observer calls (`AGY_INTERNAL_OBSERVER=1`, `/observer-sandbox`, or `shim_session.json` CIDs)
+- Enforces anti-poisoning taint checks (`memory_taint.json`, `AGY_UNTRUSTED_SESSION`, `AGY_MEMORY_READONLY`,
+  and full-step payload/transcript inspection) and blocks `session-init` / `summarize` writes on tainted sessions
 - Skips `session-init` when `invocationNum > 0` (avoids per-tool Bun spawns & file-context prompt bloat)
 - Skips slash commands (`/compact`, `/cost`, `/status`, ...) and `<STATELESS_TASK>` prompts
 - Skips `summarize` when the transcript just ended on a `CHECKPOINT` or a trivial 0-tool short ack
@@ -18,7 +20,32 @@ import subprocess
 import sys
 from typing import Any
 
+
+def _load_memory_guard():
+    candidates = [
+        Path(__file__).resolve().parents[1] / "bridge",
+        Path(os.environ.get("AGY_BRIDGE_DIR", str(Path.home() / "agy-tg-bridge"))),
+    ]
+    for cand in candidates:
+        if (cand / "memory_guard.py").is_file() and str(cand) not in sys.path:
+            sys.path.insert(0, str(cand))
+    try:
+        import memory_guard  # type: ignore
+
+        return memory_guard
+    except Exception:
+        return None
+
+
+_MEMORY_GUARD = _load_memory_guard()
+
 SHIM_STATE_FILE = Path(os.environ.get("AGY_SHIM_STATE_FILE", str(Path.home() / "agy-mem-hub/state/shim_session.json")))
+TAINT_FILE = Path(
+    os.environ.get(
+        "AGY_MEMORY_TAINT_FILE",
+        str(Path.home() / ".gemini" / "antigravity-cli" / "cache" / "memory_taint.json"),
+    )
+)
 BUN_BIN = os.environ.get("AGY_BUN_BIN", str(Path.home() / ".bun/bin/bun"))
 WORKER_CJS = os.environ.get(
     "CLAUDE_MEM_WORKER_CJS",
@@ -27,8 +54,25 @@ WORKER_CJS = os.environ.get(
 
 USER_REQ_RE = re.compile(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", re.S)
 SLASH_CMD_RE = re.compile(
-    r"^/(?:compact|cost|usage|bill|status|context|model|effort|new|help|sessions|resume|project|reload|cancel|mode|thinking|files|get)\b",
+    r"^/(?:compact|cost|usage|bill|status|context|model|effort|new|help|sessions|resume|project|reload|cancel|mode|thinking|files|get|dream)\b",
     re.IGNORECASE,
+)
+
+_FALLBACK_MARKERS = (
+    "[ACB_SCHEDULED_TASK",
+    "[ACB_SCHEDULED_HANDOFF",
+    "[REPO_WATCH_DELTA",
+    "[GITHUB_WEBHOOK",
+    "[BENCHMARK_DIGEST",
+    "UNTRUSTED_WARNING",
+    "不可信外部数据",
+    "[EXTERNAL_UNTRUSTED",
+    "[ACB_READONLY_GUEST",
+)
+_FALLBACK_POISON_RE = re.compile(
+    r"(?i)(?:ignore\s+(?:all\s+|any\s+)?previous\s+instructions|"
+    r"save\s+to\s+memory|write\s+to\s+ecc-active-instincts|"
+    r"ecc-homunculus|(?:curl|wget)\s+[^\n|]{3,200}\|\s*(?:ba|z)?sh\b)"
 )
 
 
@@ -77,7 +121,54 @@ def _is_internal_observer(payload: dict[str, Any]) -> bool:
     return False
 
 
-def _read_tail_steps(transcript_path: str, max_bytes: int = 24576) -> list[dict[str, Any]]:
+def _is_cid_tainted(cid: str) -> bool:
+    if not cid:
+        return False
+    if _MEMORY_GUARD is not None:
+        return _MEMORY_GUARD.is_tainted(cid)
+    try:
+        if TAINT_FILE.is_file():
+            data = json.loads(TAINT_FILE.read_text(encoding="utf-8", errors="replace"))
+            entries = data.get("entries") if isinstance(data, dict) and "entries" in data else data
+            return isinstance(entries, dict) and cid in entries
+    except Exception:
+        pass
+    return False
+
+
+def _mark_cid_tainted(cid: str, reason: str, event: str) -> None:
+    if not cid:
+        return
+    if _MEMORY_GUARD is not None:
+        _MEMORY_GUARD.mark_tainted(cid, reason=reason, source=f"hook_gate:{event}")
+
+
+def _record_block() -> None:
+    if _MEMORY_GUARD is not None:
+        _MEMORY_GUARD.record_guard_block(1)
+
+
+def _inspect_payload_and_steps(payload: dict[str, Any], tail_steps: list[dict[str, Any]]) -> tuple[bool, str]:
+    if _MEMORY_GUARD is not None:
+        res = _MEMORY_GUARD.inspect_payload(payload, tail_steps)
+        if res["untrusted"]:
+            return True, ",".join(res["reasons"][:4])
+        return False, ""
+    blob = json.dumps({"payload": payload, "steps": tail_steps}, ensure_ascii=False)
+    for m in _FALLBACK_MARKERS:
+        if m in blob:
+            return True, f"marker:{m}"
+    if _FALLBACK_POISON_RE.search(blob):
+        return True, "poison:fallback"
+    return False, ""
+
+
+def _read_tail_steps(
+    transcript_path: str,
+    max_bytes: int = 65536,
+    *,
+    hard_cap_bytes: int = 4 * 1024 * 1024,
+) -> list[dict[str, Any]]:
     if not transcript_path:
         return []
     tp = Path(transcript_path)
@@ -87,12 +178,20 @@ def _read_tail_steps(transcript_path: str, max_bytes: int = 24576) -> list[dict[
         size = tp.stat().st_size
         if size <= 0:
             return []
-        seek_pos = max(0, size - max_bytes)
+        window = max(1, int(max_bytes))
+        hard_cap = max(window, int(hard_cap_bytes))
         with open(tp, "rb") as fb:
-            fb.seek(seek_pos)
-            raw_lines = fb.read().splitlines()
-        if seek_pos > 0 and raw_lines:
-            raw_lines = raw_lines[1:]
+            while True:
+                seek_pos = max(0, size - window)
+                fb.seek(seek_pos)
+                raw_lines = fb.read().splitlines()
+                if seek_pos == 0:
+                    break
+                non_empty_tail = [rl for rl in raw_lines[1:] if rl.strip()]
+                if non_empty_tail or window >= hard_cap:
+                    raw_lines = raw_lines[1:]
+                    break
+                window = min(hard_cap, window * 2)
         steps: list[dict[str, Any]] = []
         for rl in raw_lines:
             if not rl.strip():
@@ -170,15 +269,37 @@ def main() -> int:
             print("{}")
             return 0
 
+        cid = str(payload.get("conversationId") or payload.get("session_id") or "").strip()
+        env_untrusted = (
+            os.environ.get("AGY_UNTRUSTED_SESSION") == "1"
+            or os.environ.get("AGY_MEMORY_READONLY") == "1"
+        )
+        if env_untrusted and cid:
+            _mark_cid_tainted(cid, "env_untrusted_session", event)
+
+        if event in ("session-init", "summarize") and (env_untrusted or _is_cid_tainted(cid)):
+            _record_block()
+            print("{}")
+            return 0
+
         inv_num = payload.get("invocationNum")
         if event == "session-init" and isinstance(inv_num, int) and inv_num > 0:
             print("{}")
             return 0
 
         tpath = str(payload.get("transcriptPath") or payload.get("transcript_path") or "")
-        tail_steps: list[dict[str, Any]] = []
+        tail_steps: list[dict[str, Any]] = _read_tail_steps(tpath, max_bytes=65536) if tpath else []
+
+        is_untrusted, untrusted_reason = _inspect_payload_and_steps(payload, tail_steps)
+        if is_untrusted:
+            if cid:
+                _mark_cid_tainted(cid, untrusted_reason, event)
+            if event in ("session-init", "summarize"):
+                _record_block()
+                print("{}")
+                return 0
+
         if event in ("session-init", "summarize"):
-            tail_steps = _read_tail_steps(tpath, max_bytes=24576 if event == "summarize" else 16384)
             prompt_text = _extract_prompt_text(payload, tail_steps)
             if prompt_text.startswith("<STATELESS_TASK") or SLASH_CMD_RE.match(prompt_text):
                 print("{}")

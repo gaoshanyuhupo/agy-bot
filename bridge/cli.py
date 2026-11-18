@@ -23,6 +23,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 BRIDGE_PKG_DIR = Path(__file__).resolve().parent
 RUNTIME_BRIDGE_FILES: Tuple[str, ...] = (
     "bridge.py",
+    "memory_guard.py",
     "formatting.py",
     "access_control.py",
     "model_failover.py",
@@ -32,6 +33,26 @@ RUNTIME_BRIDGE_FILES: Tuple[str, ...] = (
     "bot_bus_mcp.py",
     "github_webhook.py",
 )
+
+
+def check_bridge_files_compile(bridge_dir: Optional[Path] = None) -> Tuple[bool, str]:
+    """Compile-check runtime bridge `.py` files without importing or mutating state."""
+    import py_compile
+
+    target = bridge_dir or BRIDGE_PKG_DIR
+    checked = 0
+    for fname in RUNTIME_BRIDGE_FILES:
+        fpath = target / fname
+        if not fpath.is_file():
+            if fname in ("bridge.py", "memory_guard.py"):
+                return False, f"missing required bridge file: {fpath}"
+            continue
+        try:
+            py_compile.compile(str(fpath), doraise=True)
+            checked += 1
+        except py_compile.PyCompileError as exc:
+            return False, f"compile failed ({fname}): {exc}"
+    return True, f"compiled {checked} bridge file(s)"
 
 _PLACEHOLDER_MARKERS: Tuple[str, ...] = (
     "REPLACE_WITH",

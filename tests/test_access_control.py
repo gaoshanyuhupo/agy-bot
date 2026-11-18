@@ -21,6 +21,7 @@ def _load_isolated_bridge(tmp: str, extra_env: dict[str, str] | None = None):
     env_patch = {
         "AGY_BOT_BUS_DIR": os.path.join(tmp, "bus"),
         "AGY_TG_STATE_FILE": os.path.join(tmp, "state.json"),
+        "AGY_MEMORY_TAINT_FILE": os.path.join(tmp, "memory_taint.json"),
         "AGY_TG_WORKDIR": os.path.join(tmp, "workdir"),
         "AGY_TG_LOCK_DIR": os.path.join(tmp, "locks"),
         "AGY_TG_ALLOWED_CHATS": "-1001234567890,111",

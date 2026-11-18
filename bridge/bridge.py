@@ -22,10 +22,12 @@ import html as html_mod
 import itertools
 import json
 import os
+import py_compile
 import queue
 import random
 import re
 import shlex
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -33,6 +35,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 import zlib
 try:
     import zoneinfo
@@ -71,6 +74,11 @@ try:
 except ImportError:
     from bridge import cost_usage
 
+try:
+    import memory_guard
+except ImportError:
+    from bridge import memory_guard
+
 # Load local .env file if present
 _env_file = os.environ.get("AGY_TG_ENV_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 if os.path.isfile(_env_file):
@@ -97,6 +105,16 @@ PROJECTS_DIR = os.path.join(HOME, ".gemini/config/projects")
 AGY_BIN = os.environ.get("AGY_TG_AGY_BIN", os.path.join(HOME, ".local/bin/agy"))
 PRINT_TIMEOUT = os.environ.get("AGY_TG_PRINT_TIMEOUT", "30m")
 STATE_FILE = os.environ.get("AGY_TG_STATE_FILE", os.path.join(HOME, ".agy-tg-bridge-state.json"))
+QUEUE_FILE = os.environ.get("AGY_TG_QUEUE_FILE") or (STATE_FILE + ".queue.json")
+QUEUE_TTL_SEC = int(os.environ.get("AGY_TG_QUEUE_TTL_SEC", "3600") or "3600")
+BRIDGE_RUNTIME_DIR = os.path.dirname(os.path.abspath(__file__))
+ROLLBACK_DIR = os.environ.get("AGY_TG_ROLLBACK_DIR") or os.path.join(BRIDGE_RUNTIME_DIR, ".rollback", "lkg")
+RELOAD_BREADCRUMB_FILE = os.environ.get("AGY_TG_RELOAD_BREADCRUMB") or (STATE_FILE + ".reload_pending.json")
+MAX_ROLLBACK_ATTEMPTS = int(os.environ.get("AGY_TG_MAX_ROLLBACK_ATTEMPTS", "2") or "2")
+MEMORY_TAINT_FILE = os.environ.get(
+    "AGY_MEMORY_TAINT_FILE",
+    os.path.join(HOME, ".gemini/antigravity-cli/cache/memory_taint.json"),
+)
 RELOAD_TRIGGER = os.environ.get("AGY_TG_RELOAD_FILE", "/tmp/agy_bridge_reload")
 BOT_INSTANCE_ID = hashlib.sha1((os.path.realpath(STATE_FILE) + "|" + BOT_TOKEN[:12]).encode("utf-8")).hexdigest()[:10]
 BOT_OUTBOX_DIR = os.path.join("/tmp", f"agy-outbox-{BOT_INSTANCE_ID}")
@@ -266,33 +284,21 @@ shutting_down = False
 
 
 class _JobQueue:
-    """Thread-safe FIFO job queue supporting per-scope inspection and selective cancellation."""
+    """Thread-safe FIFO job queue with atomic disk persistence, scope inspection, and selective cancellation."""
 
-    def __init__(self):
+    def __init__(self, persist_path=None, *, use_global_queue_file=False):
         self._cond = threading.Condition()
-        self._items = collections.deque()
+        self._entries = collections.deque()     # pending items: {"qid": str, "enqueued_at": float, "item": Any}
+        self._dispatched = collections.deque()  # currently executing items until task_done()
+        self._persist_path = persist_path
+        self._use_global_queue_file = bool(use_global_queue_file)
 
-    def put(self, item):
-        with self._cond:
-            self._items.append(item)
-            self._cond.notify()
-
-    def get(self):
-        with self._cond:
-            while not self._items:
-                self._cond.wait()
-            return self._items.popleft()
-
-    def qsize(self):
-        with self._cond:
-            return len(self._items)
-
-    def empty(self):
-        with self._cond:
-            return not self._items
-
-    def task_done(self):
-        pass
+    def _resolve_persist_path(self):
+        if self._persist_path:
+            return str(self._persist_path)
+        if self._use_global_queue_file:
+            return QUEUE_FILE
+        return None
 
     def _item_scope(self, item):
         if isinstance(item, tuple):
@@ -302,31 +308,350 @@ class _JobQueue:
                 return scope_key_for(item[0], None)
         return None
 
+    @staticmethod
+    def _is_control_sentinel(item):
+        if item == "__RELOAD__":
+            return True
+        if isinstance(item, tuple) and len(item) >= 2:
+            payload = item[3] if len(item) >= 4 else item[1]
+            if payload == "__RELOAD__":
+                return True
+        return False
+
+    @classmethod
+    def _serialize_entry(cls, entry, status="pending"):
+        item = entry["item"]
+        if cls._is_control_sentinel(item):
+            return None
+        if isinstance(item, tuple) and len(item) == 4:
+            chat_id, thread_id, skey, payload = item
+        elif isinstance(item, tuple) and len(item) == 2:
+            chat_id, payload = item
+            thread_id = None
+            skey = scope_key_for(chat_id, None)
+        else:
+            return None
+
+        if isinstance(payload, tuple) and len(payload) == 2:
+            tag, val = payload
+            if tag == "__CHAT_TURN__" and isinstance(val, dict):
+                kind = "chat_turn"
+                ser_payload = {
+                    "prompt": str(val.get("prompt") or ""),
+                    "origin_msg_id": int(val.get("origin_msg_id") or 0),
+                    "mention_hop": int(val.get("mention_hop") or 0),
+                    "chain_id": str(val.get("chain_id") or ""),
+                    "user_role": str(val.get("user_role") or "admin"),
+                    "user_id": val.get("user_id"),
+                }
+            elif tag == "__COMPACT__":
+                kind = "compact"
+                ser_payload = val
+            elif tag == "__SCHEDULED__":
+                kind = "scheduled"
+                ser_payload = dict(val) if isinstance(val, dict) else val
+            elif tag == "__BUS_JOB__":
+                kind = "bus_job"
+                ser_payload = str(val)
+            else:
+                return None
+        elif isinstance(payload, str):
+            kind = "text"
+            ser_payload = payload
+        else:
+            return None
+
+        return {
+            "qid": entry["qid"],
+            "enqueued_at": float(entry["enqueued_at"]),
+            "status": status,
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+            "scope_key": skey,
+            "kind": kind,
+            "payload": ser_payload,
+        }
+
+    @staticmethod
+    def _deserialize_record(rec):
+        if not isinstance(rec, dict):
+            return None
+        kind = rec.get("kind")
+        chat_id = rec.get("chat_id")
+        thread_id = rec.get("thread_id")
+        skey = rec.get("scope_key") or scope_key_for(chat_id, thread_id)
+        raw_payload = rec.get("payload")
+
+        if kind == "text" and isinstance(raw_payload, str):
+            if raw_payload == "__RELOAD__":
+                return None
+            payload = raw_payload
+        elif kind == "chat_turn" and isinstance(raw_payload, dict):
+            payload = (
+                "__CHAT_TURN__",
+                {
+                    "prompt": str(raw_payload.get("prompt") or ""),
+                    "origin_msg_id": int(raw_payload.get("origin_msg_id") or 0),
+                    "mention_hop": int(raw_payload.get("mention_hop") or 0),
+                    "chain_id": str(raw_payload.get("chain_id") or ""),
+                    "user_role": str(raw_payload.get("user_role") or "admin"),
+                    "user_id": raw_payload.get("user_id"),
+                },
+            )
+        elif kind == "compact":
+            payload = ("__COMPACT__", raw_payload)
+        elif kind == "scheduled" and isinstance(raw_payload, dict):
+            payload = ("__SCHEDULED__", raw_payload)
+        elif kind == "bus_job" and raw_payload:
+            payload = ("__BUS_JOB__", str(raw_payload))
+        else:
+            return None
+
+        return (chat_id, thread_id, skey, payload)
+
+    @staticmethod
+    def _prompt_signature(rec):
+        kind = rec.get("kind")
+        raw_payload = rec.get("payload")
+        if kind == "chat_turn" and isinstance(raw_payload, dict):
+            return str(raw_payload.get("prompt") or "")
+        if kind == "text" and isinstance(raw_payload, str):
+            return raw_payload
+        return None
+
+    def _write_records_atomic(self, qpath, records):
+        parent = os.path.dirname(os.path.abspath(qpath))
+        os.makedirs(parent, exist_ok=True)
+        lock_path = qpath + ".lock"
+        lf_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        with os.fdopen(lf_fd, "a+", encoding="utf-8") as lf:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+            try:
+                tmp = f"{qpath}.{os.getpid()}.tmp"
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as wf:
+                    json.dump({"version": 1, "items": records}, wf, ensure_ascii=False)
+                    wf.flush()
+                os.chmod(tmp, 0o600)
+                os.replace(tmp, qpath)
+                os.chmod(qpath, 0o600)
+            finally:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+
+    def _persist_locked(self):
+        qpath = self._resolve_persist_path()
+        if not qpath:
+            return
+        records = []
+        for ent in self._dispatched:
+            ser = self._serialize_entry(ent, status="dispatched")
+            if ser is not None:
+                records.append(ser)
+        for ent in self._entries:
+            ser = self._serialize_entry(ent, status="pending")
+            if ser is not None:
+                records.append(ser)
+        try:
+            self._write_records_atomic(qpath, records)
+        except Exception as e:
+            log("queue persist error: %r" % e)
+
+    def put(self, item, *, _persist=True, _enqueued_at=None, _qid=None):
+        entry = {
+            "qid": _qid or uuid.uuid4().hex[:12],
+            "enqueued_at": float(_enqueued_at if _enqueued_at is not None else time.time()),
+            "item": item,
+        }
+        with self._cond:
+            self._entries.append(entry)
+            if _persist and not self._is_control_sentinel(item):
+                self._persist_locked()
+            self._cond.notify()
+
+    def get(self):
+        with self._cond:
+            while not self._entries:
+                self._cond.wait()
+            entry = self._entries.popleft()
+            if not self._is_control_sentinel(entry["item"]):
+                self._dispatched.append(entry)
+                self._persist_locked()
+            return entry["item"]
+
+    def qsize(self):
+        with self._cond:
+            return len(self._entries)
+
+    def empty(self):
+        with self._cond:
+            return not self._entries
+
+    def task_done(self):
+        with self._cond:
+            if self._dispatched:
+                self._dispatched.popleft()
+                self._persist_locked()
+
     def count_scope(self, scope_key):
         with self._cond:
-            return sum(1 for it in self._items if self._item_scope(it) == scope_key)
+            return sum(1 for ent in self._entries if self._item_scope(ent["item"]) == scope_key)
 
     def cancel_scope(self, scope_key):
         removed = 0
         kept = collections.deque()
         with self._cond:
-            while self._items:
-                it = self._items.popleft()
-                if self._item_scope(it) == scope_key:
+            while self._entries:
+                ent = self._entries.popleft()
+                if self._item_scope(ent["item"]) == scope_key:
                     removed += 1
                 else:
-                    kept.append(it)
-            self._items = kept
+                    kept.append(ent)
+            self._entries = kept
+            if removed:
+                self._persist_locked()
         return removed
 
     def clear_all(self):
         with self._cond:
-            removed = len(self._items)
-            self._items.clear()
+            removed = len(self._entries)
+            self._entries.clear()
+            if removed:
+                self._persist_locked()
         return removed
 
+    def restore_from_disk(self, *, ttl_sec=None, recovered_in_flight=None):
+        """Load persisted items from disk in FIFO order, enforcing TTL, in-flight dedup, and bus job checks."""
+        qpath = self._resolve_persist_path()
+        if not qpath or not os.path.isfile(qpath):
+            return {"restored": 0, "dropped_expired": 0, "dropped_dedup": 0, "dropped_invalid": 0, "routes": {}}
 
-job_q = _JobQueue()
+        lock_path = qpath + ".lock"
+        os.makedirs(os.path.dirname(os.path.abspath(qpath)), exist_ok=True)
+        raw_items = []
+        lf_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        with os.fdopen(lf_fd, "a+", encoding="utf-8") as lf:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_SH)
+            try:
+                with open(qpath, "r", encoding="utf-8", errors="replace") as rf:
+                    data = json.load(rf)
+                if isinstance(data, dict) and isinstance(data.get("items"), list):
+                    raw_items = data["items"]
+            except Exception:
+                raw_items = []
+            finally:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+
+        if not raw_items:
+            return {"restored": 0, "dropped_expired": 0, "dropped_dedup": 0, "dropped_invalid": 0, "routes": {}}
+
+        effective_ttl = QUEUE_TTL_SEC if ttl_sec is None else int(ttl_sec)
+        now = time.time()
+        in_flight_sigs = set()
+        for sig in (recovered_in_flight or ()):
+            if isinstance(sig, tuple) and len(sig) >= 2:
+                in_flight_sigs.add((str(sig[0]), str(sig[1])))
+
+        restored = 0
+        dropped_expired = 0
+        dropped_dedup = 0
+        dropped_invalid = 0
+        routes = {}  # (chat_id, thread_id) -> count
+
+        with self._cond:
+            for rec in raw_items:
+                if not isinstance(rec, dict):
+                    dropped_invalid += 1
+                    continue
+                enq_at = float(rec.get("enqueued_at") or 0.0)
+                if effective_ttl > 0 and (now - enq_at) > effective_ttl:
+                    dropped_expired += 1
+                    continue
+
+                item = self._deserialize_record(rec)
+                if item is None or self._is_control_sentinel(item):
+                    dropped_invalid += 1
+                    continue
+
+                if rec.get("status") == "dispatched":
+                    psig = self._prompt_signature(rec)
+                    skey = str(rec.get("scope_key") or "")
+                    cand_skeys = [skey]
+                    if rec.get("kind") == "chat_turn" and isinstance(rec.get("payload"), dict):
+                        pl = rec["payload"]
+                        if pl.get("user_role") == "readonly":
+                            uid = pl.get("user_id")
+                            ro_skey = f"{skey}:ro:{uid if uid is not None else 'guest'}"
+                            if ro_skey not in cand_skeys:
+                                cand_skeys.insert(0, ro_skey)
+                    if psig is not None:
+                        matched_sig = next(((cs, psig) for cs in cand_skeys if (cs, psig) in in_flight_sigs), None)
+                        if matched_sig is not None:
+                            in_flight_sigs.discard(matched_sig)
+                            dropped_dedup += 1
+                            continue
+
+                if rec.get("kind") == "bus_job":
+                    jid = str(rec.get("payload") or "")
+                    job = bot_bus.get_job(jid) if jid else None
+                    if (
+                        not isinstance(job, dict)
+                        or job.get("status") != "queued"
+                        or bool(job.get("cancel_requested"))
+                    ):
+                        dropped_invalid += 1
+                        continue
+
+                self._entries.append(
+                    {
+                        "qid": str(rec.get("qid") or uuid.uuid4().hex[:12]),
+                        "enqueued_at": enq_at or now,
+                        "item": item,
+                    }
+                )
+                restored += 1
+                chat_id = item[0]
+                thread_id = item[1]
+                if chat_id and rec.get("kind") != "bus_job":
+                    rkey = (chat_id, thread_id)
+                    routes[rkey] = routes.get(rkey, 0) + 1
+
+            self._persist_locked()
+
+        return {
+            "restored": restored,
+            "dropped_expired": dropped_expired,
+            "dropped_dedup": dropped_dedup,
+            "dropped_invalid": dropped_invalid,
+            "routes": routes,
+        }
+
+
+job_q = _JobQueue(use_global_queue_file=True)
+
+
+def restore_persisted_queue(ttl_sec=None, recovered_in_flight=None, notify=True):
+    """Restore queued tasks from QUEUE_FILE on startup and emit one summary notice per affected route."""
+    summary = job_q.restore_from_disk(ttl_sec=ttl_sec, recovered_in_flight=recovered_in_flight)
+    restored = summary["restored"]
+    if restored or summary["dropped_expired"] or summary["dropped_dedup"] or summary["dropped_invalid"]:
+        log(
+            "Queue recovery: restored=%d, expired=%d, dedup=%d, invalid=%d"
+            % (restored, summary["dropped_expired"], summary["dropped_dedup"], summary["dropped_invalid"])
+        )
+    if notify and restored > 0:
+        for (chat_id, thread_id), cnt in summary["routes"].items():
+            if not chat_id:
+                continue
+            try:
+                send(
+                    chat_id,
+                    f"🔄 <b>服务重启完成：</b>已按 FIFO 顺序自动恢复 <b>{cnt}</b> 条待处理排队任务，即将继续执行。",
+                    parse_mode="HTML",
+                    thread_id=thread_id,
+                )
+            except Exception as e:
+                log("restore_persisted_queue notify failed (%s): %r" % (chat_id, e))
+    return summary
 
 # Monotonic non-zero draft_id generator (1 .. 2_000_000_000)
 _draft_id_lock = threading.Lock()
@@ -1054,6 +1379,7 @@ _PRIVATE_COMMANDS = [
     {"command": "schedule", "description": "Manage scheduled tasks, cron jobs & timers"},
     {"command": "compact", "description": "Compact context now or set auto-compact"},
     {"command": "context", "description": "View session context tokens & auto-compact"},
+    {"command": "dream", "description": "Memory guard & Dream consolidation status/run"},
     {"command": "status", "description": "Check current state & running tasks"},
     {"command": "project", "description": "Switch Antigravity CLI project / repo workspace"},
     {"command": "model", "description": "View or switch AI model"},
@@ -1148,9 +1474,10 @@ class AgySession:
     with non-blocking stdout event queue for instant cancellation & 60ms result lookahead.
     """
 
-    def __init__(self, conv, mode, model, effort, project=None, workdir=None, scope_key=None, readonly=False):
+    def __init__(self, conv, mode, model, effort, project=None, workdir=None, scope_key=None, readonly=False, untrusted=False):
         self.cid = conv
         self.readonly = bool(readonly)
+        self.untrusted = bool(untrusted) or self.readonly
         self.mode = "safe" if self.readonly else mode
         self.model = model
         self.effort = effort
@@ -1199,9 +1526,13 @@ class AgySession:
         env["AGY_BOT_CHAIN"] = ""
         env["AGY_BOT_MENTION_HOP"] = "0"
         env["AGY_RBAC_ROLE"] = "readonly" if self.readonly else "admin"
+        if self.untrusted:
+            env["AGY_INTERNAL_OBSERVER"] = "1"
+            env["AGY_UNTRUSTED_SESSION"] = "1"
+            env["AGY_MEMORY_READONLY"] = "1"
 
-        log("Spawning persistent AgySession (conv=%s, project=%s, cwd=%s, model=%s, effort=%s, mode=%s, bus=%s, ro=%s)"
-            % ((conv or "new")[:8], self.project or "default", self.workdir, model or "default", effort or "default", self.mode, self.bus_enable, self.readonly))
+        log("Spawning persistent AgySession (conv=%s, project=%s, cwd=%s, model=%s, effort=%s, mode=%s, bus=%s, ro=%s, untrusted=%s)"
+            % ((conv or "new")[:8], self.project or "default", self.workdir, model or "default", effort or "default", self.mode, self.bus_enable, self.readonly, self.untrusted))
         self.proc = subprocess.Popen(
             cmd,
             cwd=self.workdir,
@@ -1280,10 +1611,12 @@ class AgySession:
     def is_alive(self):
         return self.proc is not None and self.proc.poll() is None and not self.eof_reached
 
-    def matches(self, conv, mode, model, effort, project=None, workdir=None, readonly=False):
+    def matches(self, conv, mode, model, effort, project=None, workdir=None, readonly=False, untrusted=False):
         if not self.is_alive():
             return False
         if getattr(self, "readonly", False) != bool(readonly):
+            return False
+        if getattr(self, "untrusted", False) != (bool(untrusted) or bool(readonly)):
             return False
         eff_mode = "safe" if self.readonly else mode
         expected_bus = False if self.readonly else _desired_bus_enable(self.scope_key)
@@ -1410,8 +1743,9 @@ def check_and_recover_in_flight():
             if isinstance(inf, dict):
                 pending.append((sk, dict(inf), sc.get("conversation_id")))
     if not pending:
-        return
+        return []
 
+    recovered_sigs = []
     for sk, inflight, sc_conv in pending:
         chat_id = inflight.get("chat_id")
         thread_id = inflight.get("thread_id")
@@ -1420,6 +1754,7 @@ def check_and_recover_in_flight():
             if thread_id is None:
                 thread_id = parsed_tid
         prompt = inflight.get("prompt", "")
+        recovered_sigs.append((sk, prompt))
         target_conv = inflight.get("conv") or sc_conv
         already_delivered = (inflight.get("last_delivered_text") or "").strip()
         log("Checking in-flight recovery for scope %s (chat %s, thread %s, conv %s)..." % (
@@ -1459,6 +1794,7 @@ def check_and_recover_in_flight():
 
         update_scope_state(sk, in_flight=None)
     save_state()
+    return recovered_sigs
 
 
 # ---------------------------------------------------------------- formatting (delegated to formatting.py)
@@ -2806,13 +3142,13 @@ def _apply_checkpoint_changes(entry, reverse=False, force=False):
 
 
 # ---------------------------------------------------------------- core execution
-def _acquire_session(scope_key, conv, mode, model, effort, project, workdir, force_new=False, readonly=False):
+def _acquire_session(scope_key, conv, mode, model, effort, project, workdir, force_new=False, readonly=False, untrusted=False):
     skey = scope_key or PRIMARY_SCOPE_KEY
     to_close = []
     with session_lock:
         existing = _session_pool.get(skey)
         if not force_new and existing is not None and existing.matches(
-            conv, mode, model, effort, project, workdir, readonly=readonly
+            conv, mode, model, effort, project, workdir, readonly=readonly, untrusted=untrusted
         ):
             return existing, True
         if existing is not None:
@@ -2838,7 +3174,7 @@ def _acquire_session(scope_key, conv, mode, model, effort, project, workdir, for
             log("Warm session pool cap (%d) reached; evicting LRU scope=%s" % (MAX_WARM_SESSIONS, evict_k))
         sess = AgySession(
             conv, mode, model, effort,
-            project=project, workdir=workdir, scope_key=skey, readonly=readonly,
+            project=project, workdir=workdir, scope_key=skey, readonly=readonly, untrusted=untrusted,
         )
         _session_pool[skey] = sess
     for old in to_close:
@@ -2913,10 +3249,18 @@ def _sleep_interruptible(seconds):
     return not (cancel_requested or shutting_down)
 
 
-def _execute_compact_on_session(scope_key, conv, mode, model, effort, project, workdir, instruction="", readonly=False):
+def _execute_compact_on_session(
+    scope_key, conv, mode, model, effort, project, workdir,
+    instruction="", readonly=False, untrusted=None,
+):
     """Run `/compact` on `conv` while `turn_running` is held. Auto-retries once on transient OAuth hiccup."""
     if not conv:
         return False, 0.0, "no active conversation"
+    is_untrusted = bool(
+        untrusted
+        or readonly
+        or (conv and memory_guard.is_tainted(conv, taint_file=MEMORY_TAINT_FILE))
+    )
     slash_cmd = "/compact" if not (instruction and instruction.strip()) else ("/compact " + instruction.strip())
     t0 = time.time()
     last_err = ""
@@ -2926,7 +3270,7 @@ def _execute_compact_on_session(scope_key, conv, mode, model, effort, project, w
             return False, time.time() - t0, "cancelled"
         sess, reused_warm = _acquire_session(
             scope_key, conv, mode, model, effort, project, workdir,
-            force_new=(attempt > 1), readonly=readonly,
+            force_new=(attempt > 1), readonly=readonly, untrusted=is_untrusted,
         )
         try:
             sess.send_user_prompt(slash_cmd, raw_slash=True)
@@ -3329,6 +3673,11 @@ def _run_fast_group_reply(
         env.setdefault("HOME", HOME)
         env["AGY_BOT_BUS_ENABLE"] = "0"
         env["AGY_INTERNAL_OBSERVER"] = "1"
+        fast_inspect = memory_guard.inspect_text(fast_prompt)
+        fast_untrusted = (user_role == "readonly") or fast_inspect["untrusted"]
+        if fast_untrusted:
+            env["AGY_UNTRUSTED_SESSION"] = "1"
+            env["AGY_MEMORY_READONLY"] = "1"
 
         rc, raw_out, raw_err = _run_subprocess_group(
             cmd,
@@ -3350,6 +3699,15 @@ def _run_fast_group_reply(
                     parsed = None
             if isinstance(parsed, dict):
                 reply_text = (parsed.get("response") or "").strip()
+                fast_cid = parsed.get("conversation_id")
+                if fast_untrusted and fast_cid:
+                    reason = "readonly_fast_reply" if user_role == "readonly" else ",".join(fast_inspect["reasons"][:4])
+                    memory_guard.mark_tainted(
+                        str(fast_cid),
+                        reason=reason or "fast_untrusted",
+                        source="bridge:fast_group_reply",
+                        taint_file=MEMORY_TAINT_FILE,
+                    )
             else:
                 reply_text = raw_out
         if not reply_text:
@@ -3463,6 +3821,33 @@ def run_agy(
     prompt_parts.append(prompt)
     effective_prompt = "\n\n".join(prompt_parts)
 
+    prompt_taint = memory_guard.inspect_text(effective_prompt)
+    conv_already_tainted = bool(conv and memory_guard.is_tainted(conv, taint_file=MEMORY_TAINT_FILE))
+    turn_untrusted = session_readonly or conv_already_tainted or prompt_taint["untrusted"]
+    if session_readonly:
+        taint_reason = "readonly_guest"
+        taint_source = "bridge:readonly"
+    elif prompt_taint["untrusted"]:
+        taint_reason = ",".join(prompt_taint["reasons"][:4]) or "untrusted_prompt"
+        taint_source = "bridge:prompt"
+    elif conv_already_tainted:
+        taint_reason = "sticky_tainted_conv"
+        taint_source = "bridge:sticky"
+    else:
+        taint_reason = ""
+        taint_source = ""
+
+    if turn_untrusted:
+        if conv:
+            memory_guard.mark_tainted(
+                conv,
+                reason=taint_reason,
+                source=taint_source,
+                taint_file=MEMORY_TAINT_FILE,
+            )
+        if not session_readonly and "[AGY_MEMORY_READONLY=1]" not in effective_prompt:
+            effective_prompt = memory_guard.build_untrusted_memory_boundary() + "\n\n" + effective_prompt
+
     before_files = snapshot_workspace_files(workdir=workdir)
     undo_manifest = None if session_readonly else snapshot_undo_manifest(workdir)
     segment_start_line = get_transcript_line_count(conv)
@@ -3546,14 +3931,26 @@ def run_agy(
             attempt_tools = 0
             if active_model not in attempted_models:
                 attempted_models.append(active_model)
+            acq_kw = {
+                "force_new": (same_model_retries > 0 or candidate_idx > 0),
+                "readonly": session_readonly,
+            }
+            if turn_untrusted:
+                acq_kw["untrusted"] = True
             sess, reused_warm = _acquire_session(
                 exec_skey, conv, mode, active_model, effort, project, workdir,
-                force_new=(same_model_retries > 0 or candidate_idx > 0),
-                readonly=session_readonly,
+                **acq_kw,
             )
             if sess.cid and sess.cid != conv:
                 conv = sess.cid
                 streamer.set_cid(conv)
+            if turn_untrusted and conv:
+                memory_guard.mark_tainted(
+                    conv,
+                    reason=taint_reason,
+                    source=taint_source,
+                    taint_file=MEMORY_TAINT_FILE,
+                )
             try:
                 sess.send_user_prompt(effective_prompt)
             except Exception as e:
@@ -3586,6 +3983,13 @@ def run_agy(
                     if cid:
                         sess.cid = cid
                         conv = cid
+                        if turn_untrusted:
+                            memory_guard.mark_tainted(
+                                cid,
+                                reason=taint_reason,
+                                source=taint_source,
+                                taint_file=MEMORY_TAINT_FILE,
+                            )
                         with state_lock:
                             sc_w = _ensure_scope_locked(exec_skey)
                             sc_w["conversation_id"] = cid
@@ -3838,6 +4242,13 @@ def run_agy(
             conv = res_cid
             if sess:
                 sess.cid = res_cid
+            if turn_untrusted:
+                memory_guard.mark_tainted(
+                    res_cid,
+                    reason=taint_reason,
+                    source=taint_source,
+                    taint_file=MEMORY_TAINT_FILE,
+                )
             with state_lock:
                 sc_w = _ensure_scope_locked(exec_skey)
                 sc_w["conversation_id"] = res_cid
@@ -3978,13 +4389,278 @@ def run_agy(
         save_state()
 
 
+def _runtime_py_files(src_dir):
+    if not os.path.isdir(src_dir):
+        return []
+    return sorted(
+        fn for fn in os.listdir(src_dir)
+        if fn.endswith(".py") and os.path.isfile(os.path.join(src_dir, fn))
+    )
+
+
+def run_self_check(bridge_dir=None):
+    """Lightweight read-only verification of runtime bridge syntax and core exports."""
+    bdir = bridge_dir or BRIDGE_RUNTIME_DIR
+    py_files = _runtime_py_files(bdir)
+    if "bridge.py" not in py_files:
+        return 1, {"status": "fail", "error": f"missing bridge.py in {bdir}"}
+    for fn in py_files:
+        fpath = os.path.join(bdir, fn)
+        try:
+            py_compile.compile(fpath, doraise=True)
+        except py_compile.PyCompileError as exc:
+            return 1, {"status": "fail", "error": f"py_compile failed ({fn}): {exc}"}
+
+    required_symbols = (
+        "main",
+        "worker",
+        "run_agy",
+        "_JobQueue",
+        "perform_hot_reload",
+        "restore_persisted_queue",
+        "memory_guard",
+    )
+    missing = [sym for sym in required_symbols if sym not in globals()]
+    if missing:
+        return 1, {"status": "fail", "error": f"missing symbols: {', '.join(missing)}"}
+
+    return 0, {
+        "status": "ok",
+        "bridge_dir": bdir,
+        "compiled_files": len(py_files),
+    }
+
+
+def _pre_reload_self_check(bridge_dir=None, python_bin=None):
+    """Run syntax + isolated `--self-check` probe on disk files BEFORE closing sessions or execv."""
+    bdir = bridge_dir or BRIDGE_RUNTIME_DIR
+    py_files = _runtime_py_files(bdir)
+    if "bridge.py" not in py_files:
+        return False, f"bridge.py missing in {bdir}"
+    for fn in py_files:
+        fpath = os.path.join(bdir, fn)
+        try:
+            py_compile.compile(fpath, doraise=True)
+        except py_compile.PyCompileError as exc:
+            return False, f"py_compile failed ({fn}): {exc}"
+
+    bridge_py = os.path.join(bdir, "bridge.py")
+    py_exe = python_bin or sys.executable
+    try:
+        proc = subprocess.run(
+            [py_exe, bridge_py, "--self-check"],
+            cwd=bdir,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except Exception as exc:
+        return False, f"self-check subprocess error: {exc}"
+
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()
+        return False, f"self-check failed (rc={proc.returncode}): {detail[:800]}"
+    return True, (proc.stdout or "ok").strip()
+
+
+def _snapshot_lkg(src_dir=None, lkg_dir=None, *, pre_deploy=False, preserve_pending_pre_deploy=True):
+    """Snapshot runtime `*.py` files into LKG rollback directory."""
+    sdir = src_dir or BRIDGE_RUNTIME_DIR
+    ldir = lkg_dir or ROLLBACK_DIR
+    meta_path = os.path.join(ldir, ".lkg_meta.json")
+    if preserve_pending_pre_deploy and os.path.isfile(meta_path) and os.path.isfile(os.path.join(ldir, "bridge.py")):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as mf:
+                existing_meta = json.load(mf)
+            if isinstance(existing_meta, dict) and existing_meta.get("pre_deploy"):
+                return True, "preserved_pre_deploy_lkg"
+        except Exception:
+            pass
+
+    py_files = _runtime_py_files(sdir)
+    if not py_files:
+        return False, f"no .py files found in {sdir}"
+
+    os.makedirs(ldir, exist_ok=True)
+    for old_fn in _runtime_py_files(ldir):
+        if old_fn not in py_files:
+            try:
+                os.unlink(os.path.join(ldir, old_fn))
+            except OSError:
+                pass
+    for fn in py_files:
+        src_p = os.path.join(sdir, fn)
+        dst_p = os.path.join(ldir, fn)
+        tmp_p = f"{dst_p}.{os.getpid()}.tmp"
+        shutil.copy2(src_p, tmp_p)
+        os.replace(tmp_p, dst_p)
+
+    meta = {"ts": time.time(), "pre_deploy": bool(pre_deploy), "files": py_files}
+    meta_tmp = f"{meta_path}.{os.getpid()}.tmp"
+    with open(meta_tmp, "w", encoding="utf-8") as mf:
+        json.dump(meta, mf, indent=2)
+    os.replace(meta_tmp, meta_path)
+    return True, f"snapshotted {len(py_files)} file(s)"
+
+
+def _restore_lkg_files(lkg_dir=None, dst_dir=None):
+    """Atomically restore verified LKG `*.py` files back into runtime directory."""
+    ldir = lkg_dir or ROLLBACK_DIR
+    ddir = dst_dir or BRIDGE_RUNTIME_DIR
+    py_files = _runtime_py_files(ldir)
+    if "bridge.py" not in py_files:
+        return False, f"LKG missing bridge.py in {ldir}"
+    for fn in py_files:
+        try:
+            py_compile.compile(os.path.join(ldir, fn), doraise=True)
+        except py_compile.PyCompileError as exc:
+            return False, f"LKG file invalid ({fn}): {exc}"
+
+    for fn in py_files:
+        src_p = os.path.join(ldir, fn)
+        dst_p = os.path.join(ddir, fn)
+        tmp_p = f"{dst_p}.rollback.{os.getpid()}.tmp"
+        shutil.copy2(src_p, tmp_p)
+        os.replace(tmp_p, dst_p)
+    return True, f"restored {len(py_files)} file(s) from {ldir}"
+
+
+def _read_reload_breadcrumb():
+    if not RELOAD_BREADCRUMB_FILE or not os.path.isfile(RELOAD_BREADCRUMB_FILE):
+        return None
+    try:
+        with open(RELOAD_BREADCRUMB_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _write_reload_breadcrumb(data):
+    parent = os.path.dirname(os.path.abspath(RELOAD_BREADCRUMB_FILE))
+    os.makedirs(parent, exist_ok=True)
+    tmp = f"{RELOAD_BREADCRUMB_FILE}.{os.getpid()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as wf:
+        json.dump(data, wf, indent=2, ensure_ascii=False)
+        wf.flush()
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, RELOAD_BREADCRUMB_FILE)
+    os.chmod(RELOAD_BREADCRUMB_FILE, 0o600)
+
+
+def _clear_reload_breadcrumb():
+    try:
+        if RELOAD_BREADCRUMB_FILE and os.path.isfile(RELOAD_BREADCRUMB_FILE):
+            os.unlink(RELOAD_BREADCRUMB_FILE)
+    except OSError:
+        pass
+
+
+def _mark_reload_healthy():
+    """Commit hot reload as healthy: clear breadcrumb and refresh LKG snapshot."""
+    crumb = _read_reload_breadcrumb()
+    if crumb and crumb.get("rollback_attempted"):
+        log("Recovered cleanly on rolled-back LKG version.")
+    _clear_reload_breadcrumb()
+    _snapshot_lkg(pre_deploy=False, preserve_pending_pre_deploy=False)
+
+
+def _perform_lkg_rollback(crumb, reason):
+    """Restore LKG runtime files, alert Telegram admin, and re-exec into stable version."""
+    rollback_count = int(crumb.get("rollback_count") or 0)
+    if crumb.get("rollback_attempted") or rollback_count >= MAX_ROLLBACK_ATTEMPTS:
+        log("Hot-reload rollback exhausted (attempts=%d): %s" % (rollback_count, reason))
+        _clear_reload_breadcrumb()
+        raise RuntimeError(f"Hot-reload failed and rollback exhausted: {reason}")
+
+    lkg_dir = crumb.get("lkg_dir") or ROLLBACK_DIR
+    ok, rest_msg = _restore_lkg_files(lkg_dir=lkg_dir, dst_dir=BRIDGE_RUNTIME_DIR)
+    if not ok:
+        log("Hot-reload LKG restore failed: %s" % rest_msg)
+        raise RuntimeError(f"Hot-reload failed ({reason}) and LKG restore failed ({rest_msg})")
+
+    updated_crumb = dict(crumb)
+    updated_crumb["rollback_attempted"] = True
+    updated_crumb["rollback_count"] = rollback_count + 1
+    updated_crumb["seen_in_main"] = False
+    updated_crumb["error"] = str(reason)[:400]
+    updated_crumb["ts"] = time.time()
+    try:
+        _write_reload_breadcrumb(updated_crumb)
+    except Exception:
+        pass
+
+    alert_chat = crumb.get("notify_chat_id") or PRIMARY_CHAT_ID
+    alert_thread = crumb.get("notify_thread_id")
+    if alert_chat:
+        try:
+            send(
+                alert_chat,
+                f"⚠️ <b>热重载启动自检失败，已自动回滚至上一稳定版本</b>\n"
+                f"原因：<code>{html_mod.escape(str(reason)[:300])}</code>",
+                parse_mode="HTML",
+                thread_id=alert_thread,
+            )
+        except Exception as send_err:
+            log("Rollback Telegram alert failed: %r" % send_err)
+
+    log("Auto-rolled back to LKG (%s); re-execing..." % rest_msg)
+    close_all_sessions_sync()
+    argv_clean = [a for a in sys.argv if a != "--self-check"]
+    os.execv(sys.executable, [sys.executable] + argv_clean)
+
+
 def perform_hot_reload(notify_chat_id=None, notify_thread_id=None):
+    ok, detail = _pre_reload_self_check()
+    if not ok:
+        log("Hot reload aborted by pre-exec self-check: %s" % detail)
+        if os.path.exists(RELOAD_TRIGGER):
+            try:
+                os.remove(RELOAD_TRIGGER)
+            except OSError:
+                pass
+        alert_chat = notify_chat_id or PRIMARY_CHAT_ID
+        if alert_chat:
+            try:
+                send(
+                    alert_chat,
+                    f"⚠️ <b>热重载前置自检失败，已中止重启并保持当前稳定进程继续运行：</b>\n"
+                    f"<pre>{html_mod.escape(detail[:1200])}</pre>",
+                    parse_mode="HTML",
+                    thread_id=notify_thread_id,
+                )
+            except Exception as send_err:
+                log("Self-check failure Telegram alert error: %r" % send_err)
+        return False
+
+    _snapshot_lkg(pre_deploy=False, preserve_pending_pre_deploy=True)
+    prev = _read_reload_breadcrumb() or {}
+    crumb = {
+        "attempt": int(prev.get("attempt") or 0) + 1,
+        "ts": time.time(),
+        "lkg_dir": ROLLBACK_DIR,
+        "notify_chat_id": notify_chat_id or PRIMARY_CHAT_ID,
+        "notify_thread_id": notify_thread_id,
+        "rollback_attempted": False,
+        "rollback_count": int(prev.get("rollback_count") or 0),
+        "seen_in_main": False,
+        "pid": os.getpid(),
+    }
+    try:
+        _write_reload_breadcrumb(crumb)
+    except Exception as e:
+        log("Failed to write reload breadcrumb: %r" % e)
+
     log("Executing graceful hot reload via execv...")
     if notify_chat_id:
         send(notify_chat_id, "🔄 正在热重载桥接服务...", thread_id=notify_thread_id)
     close_all_sessions_sync()
     time.sleep(0.3)
-    os.execv(sys.executable, [sys.executable] + sys.argv)
+    argv_clean = [a for a in sys.argv if a != "--self-check"]
+    os.execv(sys.executable, [sys.executable] + argv_clean)
+    return True
 
 
 SCHEDULED_CIDS_LOCK = "/tmp/agy_scheduled_cids.lock"
@@ -4225,6 +4901,8 @@ def execute_scheduled_task(task):
             env["AGY_BOT_BUS_ENABLE"] = "0"
             if not payload.get("use_memory"):
                 env["AGY_INTERNAL_OBSERVER"] = "1"
+                env["AGY_UNTRUSTED_SESSION"] = "1"
+                env["AGY_MEMORY_READONLY"] = "1"
 
             precheck_cmd = (payload.get("precheck_cmd") or "").strip()
             precheck_section = ""
@@ -4277,6 +4955,12 @@ def execute_scheduled_task(task):
                 f"任务内容：\n{prompt}"
                 f"{precheck_section}"
             )
+            sched_taint = memory_guard.inspect_text(full_prompt)
+            sched_untrusted = (not payload.get("use_memory")) or sched_taint["untrusted"]
+            if sched_untrusted:
+                env["AGY_INTERNAL_OBSERVER"] = "1"
+                env["AGY_UNTRUSTED_SESSION"] = "1"
+                env["AGY_MEMORY_READONLY"] = "1"
 
             started_ts = time.time()
             before_files = snapshot_workspace_files(workdir=exec_workdir)
@@ -4325,6 +5009,13 @@ def execute_scheduled_task(task):
 
             if new_cid:
                 _record_scheduled_cid(new_cid)
+                if sched_untrusted:
+                    memory_guard.mark_tainted(
+                        str(new_cid),
+                        reason=",".join(sched_taint["reasons"][:4]) or "scheduled_task",
+                        source=f"bridge:scheduled:{tid}",
+                        taint_file=MEMORY_TAINT_FILE,
+                    )
 
             if rc != 0 and not resp_text:
                 err_msg = f"Agent failed ({rc}): {err}"
@@ -5035,8 +5726,9 @@ def worker():
 
         if prompt == "__RELOAD__":
             job_q.task_done()
-            perform_hot_reload(notify_chat_id=chat_id, notify_thread_id=thread_id)
-            return
+            if perform_hot_reload(notify_chat_id=chat_id, notify_thread_id=thread_id):
+                return
+            continue
         try:
             if isinstance(prompt, tuple) and len(prompt) == 2 and prompt[0] == "__COMPACT__":
                 run_compact(chat_id, instruction=prompt[1], thread_id=thread_id, scope_key=skey)
@@ -6805,6 +7497,164 @@ def cmd_status(chat_id, thread_id=None, scope_key=None):
     send(chat_id, text, parse_mode="HTML", reply_markup=kb, thread_id=norm_tid)
 
 
+def _find_instinct_daemon_script():
+    explicit = os.environ.get("AGY_INSTINCT_DAEMON_PATH", "").strip()
+    candidates = []
+    if explicit:
+        candidates.append(explicit)
+    candidates.extend([
+        os.path.join(AGY_REPO_DIR, "mem-hub", "agy_instinct_daemon.py"),
+        os.path.join(HOME, "agy-mem-hub", "agy_instinct_daemon.py"),
+        os.path.join(os.path.dirname(BRIDGE_RUNTIME_DIR), "mem-hub", "agy_instinct_daemon.py"),
+    ])
+    for cand in candidates:
+        if cand and os.path.isfile(cand):
+            return cand
+    return None
+
+
+def _read_dream_status_snapshot():
+    guard_stats = memory_guard.get_guard_stats(taint_file=MEMORY_TAINT_FILE)
+    daemon_path = _find_instinct_daemon_script()
+    hub_dir = os.environ.get("AGY_MEM_HUB_DIR", os.path.join(HOME, "agy-mem-hub"))
+    state_path = os.path.join(hub_dir, "state", "instinct_daemon_state.json")
+    homunculus_dir = os.path.join(
+        os.environ.get("XDG_DATA_HOME", os.path.join(HOME, ".local", "share")),
+        "ecc-homunculus",
+    )
+    instincts_dir = os.path.join(homunculus_dir, "instincts", "personal")
+    archive_inst_dir = os.path.join(homunculus_dir, "archive", "instincts")
+    obs_path = os.path.join(homunculus_dir, "observations.jsonl")
+
+    daemon_state = {}
+    if os.path.isfile(state_path):
+        try:
+            with open(state_path, "r", encoding="utf-8", errors="replace") as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, dict):
+                daemon_state = loaded
+        except Exception:
+            pass
+
+    personal_cnt = len([f for f in os.listdir(instincts_dir) if f.endswith(".yaml")]) if os.path.isdir(instincts_dir) else 0
+    archived_cnt = len([f for f in os.listdir(archive_inst_dir) if f.endswith(".yaml")]) if os.path.isdir(archive_inst_dir) else 0
+    obs_lines = 0
+    if os.path.isfile(obs_path):
+        try:
+            with open(obs_path, "r", encoding="utf-8", errors="replace") as fh:
+                obs_lines = sum(1 for _ in fh)
+        except OSError:
+            pass
+
+    return {
+        "daemon_installed": bool(daemon_path),
+        "daemon_path": daemon_path,
+        "guard": guard_stats,
+        "personal_instincts": personal_cnt,
+        "archived_instincts": archived_cnt,
+        "observations_lines": obs_lines,
+        "last_dream_ts": float(daemon_state.get("last_dream_ts") or 0.0),
+        "last_dream_summary": daemon_state.get("last_dream_summary") or {},
+        "poison_blocked_count": int(daemon_state.get("poison_blocked_count") or 0),
+    }
+
+
+def cmd_dream(chat_id, raw_rest="", thread_id=None):
+    norm_tid = _normalize_thread_id(thread_id)
+    sub = (raw_rest or "").strip().lower().split()[0] if (raw_rest or "").strip() else "status"
+
+    if sub in ("run", "force", "now"):
+        daemon_path = _find_instinct_daemon_script()
+        if not daemon_path:
+            snap = _read_dream_status_snapshot()
+            g = snap["guard"]
+            send(
+                chat_id,
+                "ℹ️ <b>未检测到本地 <code>agy_instinct_daemon.py</code>（独立部署模式）</b>\n"
+                "已跳过 Dream 记忆合并；Memory Guard 防投毒仍正常运行：\n"
+                f"• Tainted 会话数：<code>{g.get('tainted_count', 0)}</code>\n"
+                f"• 累计拦截投毒：<code>{g.get('guard_blocked_total', 0)}</code>",
+                parse_mode="HTML",
+                thread_id=norm_tid,
+            )
+            return
+
+        send(chat_id, "🌙 正在后台触发 Dream 记忆合并（防投毒校验 + 归并 + 观测归档）...", thread_id=norm_tid)
+
+        def _bg_dream():
+            try:
+                env = dict(os.environ)
+                env["AGY_MEMORY_TAINT_FILE"] = MEMORY_TAINT_FILE
+                proc = subprocess.run(
+                    [sys.executable, daemon_path, "dream", "--force", "--quiet"],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    env=env,
+                    check=False,
+                )
+                out = (proc.stdout or "").strip()
+                if proc.returncode != 0:
+                    err = (proc.stderr or out or f"exit {proc.returncode}").strip()
+                    send(
+                        chat_id,
+                        f"⚠️ <b>Dream 合并执行失败</b>\n<pre>{html_mod.escape(err[:1000])}</pre>",
+                        parse_mode="HTML",
+                        thread_id=norm_tid,
+                    )
+                    return
+                try:
+                    res = json.loads(out)
+                except Exception:
+                    res = {}
+                obs_c = res.get("observations_compaction") or {}
+                send(
+                    chat_id,
+                    "🌙 <b>Dream 记忆合并完成</b>\n"
+                    f"• 归并簇数：<code>{len(res.get('merged_groups') or [])}</code> · "
+                    f"衰减：<code>{len(res.get('decayed_ids') or [])}</code> · "
+                    f"低置信归档：<code>{len(res.get('archived_low_conf_ids') or [])}</code>\n"
+                    f"• 拦截/隔离投毒：<code>{len(res.get('quarantined_ids') or [])}</code>（累计 <code>{res.get('poison_blocked_count', 0)}</code>）\n"
+                    f"• 观测归档压缩：<code>{obs_c.get('archived_lines', 0)}</code> 行 · "
+                    f"活跃规则：<code>{res.get('active_rules_synced', 0)}</code>",
+                    parse_mode="HTML",
+                    thread_id=norm_tid,
+                )
+            except Exception as exc:
+                send(
+                    chat_id,
+                    f"⚠️ <b>Dream 合并异常：</b><code>{html_mod.escape(str(exc)[:300])}</code>",
+                    parse_mode="HTML",
+                    thread_id=norm_tid,
+                )
+
+        threading.Thread(target=_bg_dream, daemon=True).start()
+        return
+
+    snap = _read_dream_status_snapshot()
+    g = snap["guard"]
+    last_ts = snap["last_dream_ts"]
+    last_str = (
+        datetime.datetime.fromtimestamp(last_ts, tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        if last_ts > 0
+        else "(never)"
+    )
+    daemon_note = "已安装" if snap["daemon_installed"] else "未安装（独立模式，Dream 合并已降级）"
+    text = (
+        "🛡 <b>Memory Guard &amp; Dream 记忆治理状态</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"• <b>Memory Guard：</b>Tainted 会话 <code>{g.get('tainted_count', 0)}</code> · "
+        f"拦截计数 <code>{g.get('guard_blocked_total', 0)}</code>\n"
+        f"• <b>Daemon 拦截投毒：</b><code>{snap['poison_blocked_count']}</code>\n"
+        f"• <b>Dream 引擎：</b><code>{daemon_note}</code>\n"
+        f"• <b>上次合并：</b><code>{last_str}</code>\n"
+        f"• <b>个人 Instincts：</b><code>{snap['personal_instincts']}</code>（已归档 <code>{snap['archived_instincts']}</code>）\n"
+        f"• <b>Observations 行数：</b><code>{snap['observations_lines']}</code>\n\n"
+        "<i>输入 <code>/dream run</code> 可立即触发一次轻量 Dream 合并。</i>"
+    )
+    send(chat_id, text, parse_mode="HTML", thread_id=norm_tid)
+
+
 # ---------------------------------------------------------------- live-browser panel (/browser)
 def _live_browser_endpoint():
     base_url = (os.environ.get("AGY_LIVE_BROWSER_URL") or "http://127.0.0.1:18795").strip().rstrip("/")
@@ -7916,6 +8766,8 @@ def handle_message(msg):
             cmd_compact(chat_id, raw_rest, thread_id=thread_id, scope_key=skey)
         elif cmd == "/context":
             cmd_context(chat_id, thread_id=thread_id, scope_key=skey)
+        elif cmd == "/dream":
+            cmd_dream(chat_id, raw_rest, thread_id=thread_id)
         elif cmd in ("/usage", "/quota"):
             cmd_usage(chat_id, raw_rest, thread_id=thread_id)
         elif cmd in ("/cost", "/bill"):
@@ -8014,6 +8866,7 @@ def handle_message(msg):
                  "/schedule — manage scheduled tasks, cron jobs &amp; timers\n"
                  "/compact [note|on|off|auto 160k] — compact context or configure auto-compact\n"
                  "/context — inspect active context tokens &amp; compaction stats\n"
+                 "/dream [status|run] — inspect Memory Guard anti-poisoning &amp; trigger Dream consolidation\n"
                  "/status — check agent state, scope &amp; active jobs\n"
                  "/project [name] — switch Antigravity CLI project &amp; repo\n"
                  "/model [fallback m1,m2|off] — switch AI models &amp; auto-failover\n"
@@ -8293,18 +9146,38 @@ def main():
     signal.signal(signal.SIGTERM, sig_handler)
     signal.signal(signal.SIGINT, sig_handler)
 
-    os.makedirs(WORKDIR, exist_ok=True)
-    os.makedirs(UPLOADDIR, exist_ok=True)
-    _init_bot_identity()
-    ensure_team_mcp_configured()
-    _publish_bot_heartbeat()
-    register_bot_commands()
-    check_and_recover_in_flight()
+    crumb = _read_reload_breadcrumb()
+    if crumb and (time.time() - float(crumb.get("ts") or 0)) < 300:
+        if crumb.get("seen_in_main") and not crumb.get("rollback_attempted"):
+            _perform_lkg_rollback(crumb, "previous_startup_aborted_before_healthy")
+        elif not crumb.get("seen_in_main"):
+            crumb["seen_in_main"] = True
+            try:
+                _write_reload_breadcrumb(crumb)
+            except Exception:
+                pass
 
-    threading.Thread(target=worker, daemon=True).start()
-    threading.Thread(target=idle_session_reaper, daemon=True).start()
-    threading.Thread(target=scheduler_loop, daemon=True).start()
-    threading.Thread(target=_bot_bus_loop, daemon=True).start()
+    try:
+        os.makedirs(WORKDIR, exist_ok=True)
+        os.makedirs(UPLOADDIR, exist_ok=True)
+        _init_bot_identity()
+        ensure_team_mcp_configured()
+        _publish_bot_heartbeat()
+        register_bot_commands()
+        recovered_sigs = check_and_recover_in_flight()
+        restore_persisted_queue(recovered_in_flight=recovered_sigs, notify=True)
+
+        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=idle_session_reaper, daemon=True).start()
+        threading.Thread(target=scheduler_loop, daemon=True).start()
+        threading.Thread(target=_bot_bus_loop, daemon=True).start()
+        _mark_reload_healthy()
+    except Exception as startup_exc:
+        active_crumb = _read_reload_breadcrumb()
+        if active_crumb and (time.time() - float(active_crumb.get("ts") or 0)) < 300:
+            _perform_lkg_rollback(active_crumb, f"{type(startup_exc).__name__}: {startup_exc}")
+        raise
+
     offset = 0
     first_poll = True
     poll_err_streak = 0
@@ -8349,4 +9222,8 @@ def main():
 
 
 if __name__ == "__main__":
+    if "--self-check" in sys.argv[1:]:
+        rc, report = run_self_check()
+        print(json.dumps(report, ensure_ascii=False))
+        sys.exit(rc)
     main()

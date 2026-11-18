@@ -205,6 +205,10 @@ def is_command_allowed_for_role(role: str, cmd: str, raw_rest: str = "") -> Tupl
         if sub in ("status", "info", "panel"):
             return True, ""
         return False, c
+    if c == "/dream":
+        if not rest or sub in ("status", "info"):
+            return True, ""
+        return False, f"{c} {sub}"
 
     return False, c
 

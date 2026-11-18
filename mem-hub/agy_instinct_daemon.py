@@ -1,43 +1,77 @@
 #!/usr/bin/env python3
-"""Native Antigravity (`agy`) Continuous-Learning v2 ("Instinct -> Skill") Daemon & CLI.
+"""Native Antigravity (`agy`) Continuous-Learning v2 ("Instinct -> Skill" + Dream) Daemon & CLI.
 
 - Zero foreground hook latency: tails `~/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl`
-  asynchronously (skipping the internal observer session).
+  asynchronously (skipping internal observer & tainted untrusted sessions).
+- Anti-poisoning defense: checks `memory_guard` sticky taint registry and inspects EVERY harvested
+  step (USER_INPUT + PLANNER_RESPONSE + tool calls/outputs) plus LLM candidate instincts.
 - Scrubs secrets before persisting observations to `~/.local/share/ecc-homunculus/observations.jsonl`.
-- Calls our local `agy-llm-shim` (`http://127.0.0.1:18791/v1/chat/completions`, `gemini-3.8-flash-high`)
+- Calls our local `agy-llm-shim` (`http://127.0.0.1:18791/v1/chat/completions`)
   to extract/update atomic instincts (`0.30`..`0.95` confidence) in ECC v2.1 YAML format.
-- Syncs high-confidence instincts (`>= 0.60`) to `$HOME/agy-workspace/.agents/rules/ecc-active-instincts.md`
-  and syncs evolved skills (`evolve`) to `$HOME/agy-workspace/.agents/skills/evolved-<slug>/SKILL.md`.
+- Periodic Dream consolidation (`dream`): deduplicates/merges fragmented instincts, applies gentle
+  time decay with safe archival, compresses/archives analyzed `observations.jsonl` history with exact
+  offset recalculation, and syncs `>= 0.80` instincts deterministically without breaking prefix cache.
 """
 
 from __future__ import annotations
 
 import argparse
+import fcntl
+import gzip
 import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
+
+
+def _load_memory_guard():
+    candidates = [
+        Path(__file__).resolve().parents[1] / "bridge",
+        Path(os.environ.get("AGY_BRIDGE_DIR", str(Path.home() / "agy-tg-bridge"))),
+    ]
+    for cand in candidates:
+        if (cand / "memory_guard.py").is_file() and str(cand) not in sys.path:
+            sys.path.insert(0, str(cand))
+    try:
+        import memory_guard  # type: ignore
+
+        return memory_guard
+    except Exception:
+        return None
+
+
+_MEMORY_GUARD = _load_memory_guard()
 
 SHIM_URL = os.environ.get("AGY_SHIM_COMPLETIONS_URL", "http://127.0.0.1:18791/v1/chat/completions")
 SHIM_MODEL = os.environ.get("AGY_SHIM_MODEL", "gemini-3.8-flash-low")
 
-BRAIN_ROOT = Path.home() / ".gemini" / "antigravity-cli" / "brain"
+BRAIN_ROOT = Path(os.environ.get("AGY_BRAIN_ROOT", str(Path.home() / ".gemini" / "antigravity-cli" / "brain")))
 HOMUNCULUS_DIR = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share"))) / "ecc-homunculus"
 PERSONAL_INSTINCTS_DIR = HOMUNCULUS_DIR / "instincts" / "personal"
 EVOLVED_SKILLS_DIR = HOMUNCULUS_DIR / "evolved" / "skills"
+ARCHIVE_DIR = HOMUNCULUS_DIR / "archive"
+ARCHIVE_INSTINCTS_DIR = ARCHIVE_DIR / "instincts"
 OBSERVATIONS_FILE = HOMUNCULUS_DIR / "observations.jsonl"
 
 HUB_DIR = Path(os.environ.get("AGY_MEM_HUB_DIR", str(Path.home() / "agy-mem-hub")))
 STATE_DIR = HUB_DIR / "state"
 SHIM_STATE_FILE = STATE_DIR / "shim_session.json"
 DAEMON_STATE_FILE = STATE_DIR / "instinct_daemon_state.json"
+MEMORY_TAINT_FILE = Path(
+    os.environ.get(
+        "AGY_MEMORY_TAINT_FILE",
+        str(Path.home() / ".gemini" / "antigravity-cli" / "cache" / "memory_taint.json"),
+    )
+)
 
 WORKSPACE_AGENTS_DIR = Path(os.environ.get("AGY_WORKSPACE_DIR", str(Path.home() / "agy-workspace"))) / ".agents"
 ACTIVE_RULE_FILE = WORKSPACE_AGENTS_DIR / "rules" / "ecc-active-instincts.md"
@@ -52,6 +86,12 @@ MIN_OBS_FOR_BATCH = 40
 MIN_OBS_ON_CORRECTION = 6
 ANALYSIS_COOLDOWN_SEC = 1800
 MAX_EVOLVED_SKILLS = 8
+
+DREAM_INTERVAL_SEC = int(os.environ.get("AGY_DREAM_INTERVAL_SEC", "86400") or "86400")
+DREAM_MAX_OBS_LINES = int(os.environ.get("AGY_DREAM_MAX_OBS_LINES", "2000") or "2000")
+DREAM_OBS_KEEP_TAIL = int(os.environ.get("AGY_DREAM_OBS_KEEP_TAIL", "500") or "500")
+DREAM_DECAY_GRACE_DAYS = int(os.environ.get("AGY_DREAM_DECAY_GRACE_DAYS", "14") or "14")
+DREAM_ARCHIVE_CONF = float(os.environ.get("AGY_DREAM_ARCHIVE_CONF", "0.35") or "0.35")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -70,6 +110,80 @@ CORRECTION_RE = re.compile(
     r"(不对|不要|别用|改成|以后记住|记住|不要这样|应该用|换成|no,\s*use|instead of|don't use|always use|prefer )",
     re.IGNORECASE,
 )
+
+_FALLBACK_MARKERS = (
+    "[ACB_SCHEDULED_TASK",
+    "[ACB_SCHEDULED_HANDOFF",
+    "[REPO_WATCH_DELTA",
+    "[GITHUB_WEBHOOK",
+    "[BENCHMARK_DIGEST",
+    "UNTRUSTED_WARNING",
+    "不可信外部数据",
+    "[EXTERNAL_UNTRUSTED",
+    "[ACB_READONLY_GUEST",
+)
+_FALLBACK_POISON_RE = re.compile(
+    r"(?i)(?:ignore\s+(?:all\s+|any\s+)?previous\s+instructions|"
+    r"save\s+to\s+memory|write\s+to\s+ecc-active-instincts|"
+    r"ecc-homunculus|(?:curl|wget)\s+[^\n|]{3,200}\|\s*(?:ba|z)?sh\b|"
+    r"\beval\s*\(\s*(?:__import__|base64|urllib|requests))"
+)
+
+
+def _get_tainted_cids() -> set[str]:
+    if _MEMORY_GUARD is not None:
+        return _MEMORY_GUARD.get_tainted_cids(taint_file=MEMORY_TAINT_FILE)
+    tf = MEMORY_TAINT_FILE
+    try:
+        if tf.is_file():
+            raw = json.loads(tf.read_text(encoding="utf-8", errors="replace"))
+            entries = raw.get("entries") if isinstance(raw, dict) and "entries" in raw else raw
+            if isinstance(entries, dict):
+                return {str(k).strip() for k in entries.keys() if str(k).strip()}
+    except Exception:
+        pass
+    return set()
+
+
+def _mark_cid_tainted(cid: str, reason: str, source: str = "instinct_daemon") -> None:
+    if _MEMORY_GUARD is not None:
+        _MEMORY_GUARD.mark_tainted(cid, reason=reason, source=source, taint_file=MEMORY_TAINT_FILE)
+
+
+def _record_guard_block(count: int = 1) -> None:
+    if _MEMORY_GUARD is not None:
+        _MEMORY_GUARD.record_guard_block(count, taint_file=MEMORY_TAINT_FILE)
+
+
+def _inspect_text(text: str) -> tuple[bool, str]:
+    if _MEMORY_GUARD is not None:
+        res = _MEMORY_GUARD.inspect_text(text)
+        return bool(res["untrusted"]), ",".join(res["reasons"][:4])
+    for m in _FALLBACK_MARKERS:
+        if m in text:
+            return True, f"marker:{m}"
+    if _FALLBACK_POISON_RE.search(text):
+        return True, "poison:fallback"
+    return False, ""
+
+
+def _inspect_step(step: dict[str, Any]) -> tuple[bool, str]:
+    if _MEMORY_GUARD is not None:
+        res = _MEMORY_GUARD.inspect_step(step)
+        return bool(res["untrusted"]), ",".join(res["reasons"][:4])
+    return _inspect_text(json.dumps(step, ensure_ascii=False))
+
+
+def _validate_instinct_candidate(inst: dict[str, Any], *, is_existing: bool = False) -> tuple[bool, str]:
+    if _MEMORY_GUARD is not None:
+        return _MEMORY_GUARD.validate_instinct_candidate(inst, is_existing=is_existing)
+    blob = json.dumps(inst, ensure_ascii=False)
+    if is_existing:
+        if _FALLBACK_POISON_RE.search(blob):
+            return False, "poison:fallback"
+        return True, ""
+    bad, reason = _inspect_text(blob)
+    return (not bad), reason
 
 
 def scrub_secrets(text: str) -> str:
@@ -94,7 +208,12 @@ def unwrap_user_request(text: str) -> str:
     return cleaned.strip()
 
 
-SCHEDULED_CIDS_FILE = Path.home() / ".gemini" / "antigravity-cli" / "cache" / "scheduled_cids.json"
+SCHEDULED_CIDS_FILE = Path(
+    os.environ.get(
+        "AGY_SCHEDULED_CIDS_FILE",
+        str(Path.home() / ".gemini" / "antigravity-cli" / "cache" / "scheduled_cids.json"),
+    )
+)
 
 
 def get_observer_cids() -> set[str]:
@@ -124,26 +243,98 @@ def get_observer_cids() -> set[str]:
     return cids
 
 
-def load_daemon_state() -> dict[str, Any]:
+_STATE_THREAD_LOCK = threading.Lock()
+
+
+def _state_lock_path() -> Path:
+    return DAEMON_STATE_FILE.with_name(DAEMON_STATE_FILE.name + ".lock")
+
+
+def _default_daemon_state() -> dict[str, Any]:
+    return {
+        "transcript_offsets": {},
+        "last_analyzed_obs_line": 0,
+        "last_analysis_ts": 0.0,
+        "poison_blocked_count": 0,
+        "last_dream_ts": 0.0,
+        "obs_compaction_gen": 0,
+    }
+
+
+def _read_daemon_state_unlocked() -> dict[str, Any]:
     try:
         if DAEMON_STATE_FILE.exists():
-            return json.loads(DAEMON_STATE_FILE.read_text(encoding="utf-8"))
+            data = json.loads(DAEMON_STATE_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                data.setdefault("transcript_offsets", {})
+                data.setdefault("last_analyzed_obs_line", 0)
+                data.setdefault("last_analysis_ts", 0.0)
+                data.setdefault("poison_blocked_count", 0)
+                data.setdefault("last_dream_ts", 0.0)
+                data.setdefault("obs_compaction_gen", 0)
+                return data
     except Exception:
         pass
-    return {"transcript_offsets": {}, "last_analyzed_obs_line": 0, "last_analysis_ts": 0.0}
+    return _default_daemon_state()
+
+
+def _write_daemon_state_unlocked(st: dict[str, Any]) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = DAEMON_STATE_FILE.with_name(f".{DAEMON_STATE_FILE.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(st, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(DAEMON_STATE_FILE)
+
+
+def load_daemon_state() -> dict[str, Any]:
+    if not DAEMON_STATE_FILE.exists():
+        return _default_daemon_state()
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    lock_p = _state_lock_path()
+    try:
+        with _STATE_THREAD_LOCK:
+            with open(lock_p, "a+", encoding="utf-8") as lf:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_SH)
+                try:
+                    return _read_daemon_state_unlocked()
+                finally:
+                    fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        return _read_daemon_state_unlocked()
 
 
 def save_daemon_state(st: dict[str, Any]) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = DAEMON_STATE_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(st, indent=2, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(DAEMON_STATE_FILE)
+    lock_p = _state_lock_path()
+    with _STATE_THREAD_LOCK:
+        with open(lock_p, "a+", encoding="utf-8") as lf:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+            try:
+                _write_daemon_state_unlocked(st)
+            finally:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+
+
+def _update_daemon_state(mutator) -> dict[str, Any]:
+    """Atomically read-modify-write DAEMON_STATE_FILE under thread lock + flock."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    lock_p = _state_lock_path()
+    with _STATE_THREAD_LOCK:
+        with open(lock_p, "a+", encoding="utf-8") as lf:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+            try:
+                st = _read_daemon_state_unlocked()
+                mutator(st)
+                _write_daemon_state_unlocked(st)
+                return st
+            finally:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
 
 
 def ensure_dirs() -> None:
     for d in (
         PERSONAL_INSTINCTS_DIR,
         EVOLVED_SKILLS_DIR,
+        ARCHIVE_INSTINCTS_DIR,
         STATE_DIR,
         WORKSPACE_AGENTS_DIR / "rules",
         WORKSPACE_SKILLS_DIR,
@@ -151,10 +342,19 @@ def ensure_dirs() -> None:
         d.mkdir(parents=True, exist_ok=True)
 
 
+def _obs_lock_path() -> Path:
+    return OBSERVATIONS_FILE.with_name(OBSERVATIONS_FILE.name + ".lock")
+
+
 def harvest_transcripts(state: dict[str, Any]) -> tuple[int, bool]:
-    """Read new steps from agy brain transcripts and append sanitized observations."""
+    """Read new steps from agy brain transcripts and append sanitized observations.
+
+    Enforces sticky taint filtering (`get_tainted_cids()`) AND per-step inspection across
+    all newly arrived steps (closing the `lines[:12]` bypass).
+    """
     ensure_dirs()
     observer_cids = get_observer_cids()
+    tainted_cids = _get_tainted_cids()
     offsets: dict[str, int] = state.setdefault("transcript_offsets", {})
     appended = 0
     saw_correction = False
@@ -168,6 +368,7 @@ def harvest_transcripts(state: dict[str, Any]) -> tuple[int, bool]:
         cid = brain_dir.name
         if cid in observer_cids:
             continue
+
         tpath = brain_dir / ".system_generated" / "logs" / "transcript.jsonl"
         if not tpath.is_file():
             continue
@@ -178,10 +379,25 @@ def harvest_transcripts(state: dict[str, Any]) -> tuple[int, bool]:
             continue
 
         total = len(lines)
-        head_sample = "\n".join(lines[:12])
-        if "<STATELESS_TASK>" in head_sample or "[ACB_SCHEDULED_TASK" in head_sample:
+        if cid in tainted_cids:
+            prev_off = int(offsets.get(cid) or 0)
+            if prev_off < total:
+                state["poison_blocked_count"] = int(state.get("poison_blocked_count") or 0) + 1
+                _record_guard_block(1)
             offsets[cid] = total
             continue
+
+        head_sample = "\n".join(lines[:12])
+        if "<STATELESS_TASK>" in head_sample or "[ACB_SCHEDULED_TASK" in head_sample:
+            if "[ACB_SCHEDULED_TASK" in head_sample:
+                _mark_cid_tainted(cid, "marker:[ACB_SCHEDULED_TASK", "instinct_daemon:head")
+                tainted_cids.add(cid)
+                if int(offsets.get(cid) or 0) < total:
+                    state["poison_blocked_count"] = int(state.get("poison_blocked_count") or 0) + 1
+                    _record_guard_block(1)
+            offsets[cid] = total
+            continue
+
         if cid not in offsets:
             # First time seeing an existing transcript: start near tail (last 30 lines)
             offsets[cid] = max(0, total - 30)
@@ -194,6 +410,7 @@ def harvest_transcripts(state: dict[str, Any]) -> tuple[int, bool]:
 
         new_obs: list[dict[str, Any]] = []
         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        tainted_now = False
 
         for raw in lines[start_idx:]:
             raw = raw.strip()
@@ -203,12 +420,27 @@ def harvest_transcripts(state: dict[str, Any]) -> tuple[int, bool]:
                 step = json.loads(raw)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(step, dict):
+                continue
+
+            is_bad, bad_reason = _inspect_step(step)
+            if is_bad:
+                _mark_cid_tainted(cid, bad_reason or "untrusted_step", "instinct_daemon:harvest")
+                tainted_cids.add(cid)
+                state["poison_blocked_count"] = int(state.get("poison_blocked_count") or 0) + 1
+                _record_guard_block(1)
+                tainted_now = True
+                log.warning("Blocked tainted/poisoned transcript %s at step (%s)", cid[:12], bad_reason)
+                break
 
             stype = step.get("type")
             ts = step.get("created_at") or now_iso
 
             if stype == "USER_INPUT":
-                user_txt = scrub_secrets(unwrap_user_request(str(step.get("content") or "")))
+                raw_content = str(step.get("content") or "")
+                if "<STATELESS_TASK" in raw_content:
+                    continue
+                user_txt = scrub_secrets(unwrap_user_request(raw_content))
                 if not user_txt or user_txt.startswith("/compact") or "<STATELESS_TASK" in user_txt:
                     continue
                 if CORRECTION_RE.search(user_txt):
@@ -257,12 +489,56 @@ def harvest_transcripts(state: dict[str, Any]) -> tuple[int, bool]:
 
         offsets[cid] = total
         if new_obs:
-            with OBSERVATIONS_FILE.open("a", encoding="utf-8") as f:
-                for row in new_obs:
-                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            lock_p = _obs_lock_path()
+            lock_p.parent.mkdir(parents=True, exist_ok=True)
+            with open(lock_p, "a+", encoding="utf-8") as lf:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+                try:
+                    with OBSERVATIONS_FILE.open("a", encoding="utf-8") as f:
+                        for row in new_obs:
+                            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                finally:
+                    fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
             appended += len(new_obs)
+        if tainted_now:
+            continue
 
     return appended, saw_correction
+
+
+def _extract_action_from_body(body: str) -> str:
+    act_m = re.search(r"## Action\s*\n([\s\S]*?)(?:\n## |\Z)", body or "")
+    if act_m:
+        return act_m.group(1).strip()
+    return (body or "").strip()
+
+
+def _extract_evidence_from_body(body: str) -> list[str]:
+    ev_m = re.search(r"## Evidence\s*\n([\s\S]*?)$", body or "")
+    src = ev_m.group(1) if ev_m else (body or "")
+    return [e.strip() for e in re.findall(r"^- (.+)$", src, re.MULTILINE) if e.strip()]
+
+
+def _extract_title_from_body(body: str, fallback: str) -> str:
+    m = re.search(r"^#\s+(.+)$", body or "", re.MULTILINE)
+    return m.group(1).strip() if m else fallback
+
+
+def _extract_last_observed_date(meta: dict[str, Any]) -> date:
+    body = str(meta.get("body") or "")
+    matches = re.findall(r"Last observed:\s*(\d{4}-\d{2}-\d{2})", body)
+    if matches:
+        try:
+            return datetime.strptime(matches[-1], "%Y-%m-%d").date()
+        except ValueError:
+            pass
+    p = meta.get("path")
+    if p:
+        try:
+            return datetime.fromtimestamp(Path(p).stat().st_mtime, tz=timezone.utc).date()
+        except OSError:
+            pass
+    return datetime.now(timezone.utc).date()
 
 
 def load_existing_instincts() -> dict[str, dict[str, Any]]:
@@ -289,8 +565,12 @@ def load_existing_instincts() -> dict[str, dict[str, Any]]:
                         v = v.strip('"')
                 meta[k] = v
             iid = str(meta.get("id") or p.stem)
+            meta["id"] = iid
             meta["confidence"] = float(meta.get("confidence") or 0.5)
             meta["body"] = body
+            meta["action"] = _extract_action_from_body(body)
+            meta["evidence"] = _extract_evidence_from_body(body)
+            meta["title"] = _extract_title_from_body(body, iid.replace("-", " ").title())
             meta["path"] = str(p)
             result[iid] = meta
         except Exception:
@@ -298,7 +578,7 @@ def load_existing_instincts() -> dict[str, dict[str, Any]]:
     return result
 
 
-def write_instinct_yaml(inst: dict[str, Any]) -> Path:
+def write_instinct_yaml(inst: dict[str, Any], *, preserve_last_observed: bool = False) -> Path:
     ensure_dirs()
     raw_id = str(inst.get("id") or "").strip().lower()
     clean_id = re.sub(r"[^a-z0-9._-]+", "-", raw_id).strip("-")[:80] or "learned-pattern"
@@ -313,7 +593,10 @@ def write_instinct_yaml(inst: dict[str, Any]) -> Path:
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     ev_lines = [f"- {str(e).strip()}" for e in evidence_list if str(e).strip()][:6]
-    if not any("Last observed" in e for e in ev_lines):
+    if not preserve_last_observed:
+        ev_lines = [e for e in ev_lines if not e.startswith("- Last observed:")]
+        ev_lines.append(f"- Last observed: {today}")
+    elif not any("Last observed" in e for e in ev_lines):
         ev_lines.append(f"- Last observed: {today}")
 
     yaml_text = (
@@ -349,13 +632,7 @@ def touch_bridge_reloads() -> None:
 
 
 def sync_claude_mem_recent_rule() -> bool:
-    """Ensure rolling claude-mem timeline is NOT written as an `always_on` rule file.
-
-    Mutating `.agents/rules/claude-mem-recent.md` every 30s invalidates `<user_rules>` at the top
-    of the system prompt and wipes out 100k+ token prompt prefix caches across active sessions.
-    Cross-session memory is already injected once at `SessionStart` and searchable on demand via
-    the `claude-mem` MCP server / `mem-search` skill.
-    """
+    """Ensure rolling claude-mem timeline is NOT written as an `always_on` rule file."""
     if CLAUDE_MEM_RECENT_RULE_FILE.exists():
         try:
             CLAUDE_MEM_RECENT_RULE_FILE.unlink()
@@ -370,7 +647,15 @@ def sync_active_instincts_rule() -> tuple[int, bool]:
     using deterministic ordering and omitting volatile confidence percentages to preserve prompt cache.
     """
     existing = load_existing_instincts()
-    active = [v for v in existing.values() if float(v.get("confidence", 0)) >= 0.80]
+    active = []
+    for v in existing.values():
+        if float(v.get("confidence", 0)) < 0.80:
+            continue
+        ok, _reason = _validate_instinct_candidate(v, is_existing=True)
+        if not ok:
+            continue
+        active.append(v)
+
     active.sort(key=lambda x: (-float(x.get("confidence", 0)), str(x.get("id", ""))))
     active = active[:15]
     # Sort deterministically by (domain, id) so minor confidence updates do not reorder or mutate <user_rules>
@@ -455,7 +740,6 @@ def sync_evolved_skills() -> tuple[list[str], bool]:
             if es.is_dir():
                 candidate_dirs.append(es)
 
-    # Collect candidates keyed by deduplicated clean_slug; prefer LLM-synthesized skills over raw boilerplate stubs
     by_slug: dict[str, tuple[tuple[int, int], str]] = {}
     for sroot in candidate_dirs:
         if not sroot.is_dir():
@@ -480,7 +764,6 @@ def sync_evolved_skills() -> tuple[list[str], bool]:
             if prev is None or rank > prev[0]:
                 by_slug[clean_slug] = (rank, normalized)
 
-    # Cap total active evolved skills by richness/size so <skills> prompt stays lean
     chosen = sorted(by_slug.items(), key=lambda kv: (-kv[1][0][0], -kv[1][0][1], kv[0]))[:MAX_EVOLVED_SKILLS]
 
     for clean_slug, (_rank, normalized) in sorted(chosen, key=lambda kv: kv[0]):
@@ -525,26 +808,78 @@ def call_shim_json(system_prompt: str, user_prompt: str, timeout: int = 120) -> 
 
 def analyze_observations_batch(force: bool = False) -> dict[str, Any]:
     state = load_daemon_state()
+    poison_before_harvest = int(state.get("poison_blocked_count") or 0)
     harvested, saw_corr = harvest_transcripts(state)
-    save_daemon_state(state)
+    harvest_poison_delta = max(0, int(state.get("poison_blocked_count") or 0) - poison_before_harvest)
+    harvested_offsets = dict(state.get("transcript_offsets") or {})
+
+    def _save_harvest(latest: dict[str, Any]) -> None:
+        offsets = latest.setdefault("transcript_offsets", {})
+        for cid, off in harvested_offsets.items():
+            offsets[cid] = max(int(offsets.get(cid) or 0), int(off))
+        if harvest_poison_delta:
+            latest["poison_blocked_count"] = int(latest.get("poison_blocked_count") or 0) + harvest_poison_delta
+
+    state = _update_daemon_state(_save_harvest)
 
     if not OBSERVATIONS_FILE.is_file():
         return {"status": "no_observations", "harvested": harvested}
 
-    all_lines = OBSERVATIONS_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+    lock_p = _obs_lock_path()
+    lock_p.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_p, "a+", encoding="utf-8") as lf:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_SH)
+        try:
+            state = load_daemon_state()
+            all_lines = OBSERVATIONS_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+        finally:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+
+    start_compaction_gen = int(state.get("obs_compaction_gen") or 0)
     last_idx = int(state.get("last_analyzed_obs_line") or 0)
     if last_idx > len(all_lines):
         last_idx = 0
-    pending = all_lines[last_idx:]
+    batch_end_idx = len(all_lines)
+    last_batch_line = all_lines[-1] if all_lines else ""
+
+    pending_raw = all_lines[last_idx:]
+    pending: list[str] = []
+    obs_poison_delta = 0
+    for ln in pending_raw:
+        bad, _reason = _inspect_text(ln)
+        if bad:
+            obs_poison_delta += 1
+            _record_guard_block(1)
+            continue
+        pending.append(ln)
 
     min_needed = MIN_OBS_ON_CORRECTION if saw_corr else MIN_OBS_FOR_BATCH
     if not force:
         if len(pending) < min_needed:
+            if obs_poison_delta:
+                _update_daemon_state(
+                    lambda st: st.__setitem__(
+                        "poison_blocked_count", int(st.get("poison_blocked_count") or 0) + obs_poison_delta
+                    )
+                )
             return {"status": "waiting_for_more", "pending": len(pending), "needed": min_needed}
         if (time.time() - float(state.get("last_analysis_ts") or 0)) < ANALYSIS_COOLDOWN_SEC:
+            if obs_poison_delta:
+                _update_daemon_state(
+                    lambda st: st.__setitem__(
+                        "poison_blocked_count", int(st.get("poison_blocked_count") or 0) + obs_poison_delta
+                    )
+                )
             return {"status": "cooldown", "pending": len(pending)}
 
     if not pending:
+        def _commit_empty(latest: dict[str, Any]) -> None:
+            if int(latest.get("obs_compaction_gen") or 0) == start_compaction_gen:
+                latest["last_analyzed_obs_line"] = max(int(latest.get("last_analyzed_obs_line") or 0), batch_end_idx)
+            if obs_poison_delta:
+                latest["poison_blocked_count"] = int(latest.get("poison_blocked_count") or 0) + obs_poison_delta
+
+        _update_daemon_state(_commit_empty)
         return {"status": "up_to_date", "updated": 0}
 
     batch_slice = pending[-60:]
@@ -581,7 +916,6 @@ def analyze_observations_batch(force: bool = False) -> dict[str, Any]:
     )
 
     raw_reply = call_shim_json(sys_prompt, usr_prompt, timeout=150)
-    # Extract JSON array from reply
     arr_match = re.search(r"\[[\s\S]*\]", raw_reply)
     items: list[dict[str, Any]] = []
     if arr_match:
@@ -593,13 +927,18 @@ def analyze_observations_batch(force: bool = False) -> dict[str, Any]:
             log.warning("Could not parse JSON array from observer reply: %s", raw_reply[:250])
 
     written_ids: list[str] = []
+    blocked_candidates = 0
     for item in items[:8]:
+        ok, block_reason = _validate_instinct_candidate(item, is_existing=False)
+        if not ok:
+            blocked_candidates += 1
+            _record_guard_block(1)
+            log.warning("Rejected unsafe instinct candidate %r (%s)", item.get("id"), block_reason)
+            continue
+
         iid = re.sub(r"[^a-z0-9._-]+", "-", str(item["id"]).lower()).strip("-")
         if iid in existing:
-            # Preserve prior evidence lines and merge
-            old_body = existing[iid].get("body", "")
-            old_ev = re.findall(r"^- (.+)$", old_body, re.MULTILINE)
-            old_ev = [e for e in old_ev if not e.startswith("Last observed:")]
+            old_ev = [e for e in (existing[iid].get("evidence") or []) if not e.startswith("Last observed:")]
             new_ev = item.get("evidence") or []
             if isinstance(new_ev, str):
                 new_ev = [new_ev]
@@ -608,41 +947,590 @@ def analyze_observations_batch(force: bool = False) -> dict[str, Any]:
         out_p = write_instinct_yaml(item)
         written_ids.append(out_p.stem)
 
-    state["last_analyzed_obs_line"] = len(all_lines)
-    state["last_analysis_ts"] = time.time()
-    save_daemon_state(state)
+    now_ts = time.time()
+    total_poison_delta = obs_poison_delta + blocked_candidates
 
-    synced_rules, rules_changed = sync_active_instincts_rule()
+    def _commit_analysis(latest: dict[str, Any]) -> None:
+        if int(latest.get("obs_compaction_gen") or 0) == start_compaction_gen:
+            latest["last_analyzed_obs_line"] = max(int(latest.get("last_analyzed_obs_line") or 0), batch_end_idx)
+        else:
+            cur_lines = (
+                OBSERVATIONS_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+                if OBSERVATIONS_FILE.is_file()
+                else []
+            )
+            cur_idx = int(latest.get("last_analyzed_obs_line") or 0)
+            if last_batch_line:
+                found_pos = None
+                for idx_c in range(max(0, cur_idx), len(cur_lines)):
+                    if cur_lines[idx_c] == last_batch_line:
+                        found_pos = idx_c + 1
+                if found_pos is not None:
+                    latest["last_analyzed_obs_line"] = found_pos
+                else:
+                    latest["last_analyzed_obs_line"] = min(
+                        len(cur_lines), cur_idx + max(0, batch_end_idx - last_idx)
+                    )
+            else:
+                latest["last_analyzed_obs_line"] = min(len(cur_lines), cur_idx)
+        latest["last_analysis_ts"] = now_ts
+        if total_poison_delta:
+            latest["poison_blocked_count"] = int(latest.get("poison_blocked_count") or 0) + total_poison_delta
+
+    state = _update_daemon_state(_commit_analysis)
+
+    synced_rules, _rules_changed = sync_active_instincts_rule()
     sync_claude_mem_recent_rule()
 
-    # Auto-evolve when 3+ high-confidence (>=0.80) instincts exist in a domain not yet evolved,
-    # staying under MAX_EVOLVED_SKILLS to keep <skills> prompt overhead bounded.
     latest_instincts = load_existing_instincts()
     by_domain: dict[str, list[dict[str, Any]]] = {}
     for v in latest_instincts.values():
         if float(v.get("confidence", 0)) >= 0.80:
             dom = str(v.get("domain") or "general")
             by_domain.setdefault(dom, []).append(v)
-    evolved_domains: list[str] = state.setdefault("evolved_domains", [])
+    evolved_domains: list[str] = list(state.get("evolved_domains") or [])
     new_ready_domains = [d for d, items_d in by_domain.items() if len(items_d) >= 3 and d not in evolved_domains]
     current_synced, _ = sync_evolved_skills()
     if new_ready_domains and len(current_synced) < MAX_EVOLVED_SKILLS:
         try:
             evolve_with_llm_and_cli(quiet=True)
             sync_evolved_skills()
-            evolved_domains.extend(new_ready_domains)
-            save_daemon_state(state)
+
+            def _record_evolved(latest: dict[str, Any]) -> None:
+                ev_doms = latest.setdefault("evolved_domains", [])
+                for d in new_ready_domains:
+                    if d not in ev_doms:
+                        ev_doms.append(d)
+
+            _update_daemon_state(_record_evolved)
         except Exception as e:
             log.warning("Auto-evolve check skipped: %s", e)
 
-    # Never auto-touch bridge reload sentinels from the background observer daemon:
-    # killing warm AgySession processes wipes 100k+ token prompt prefix caches mid-conversation.
     return {
         "status": "analyzed",
         "observations_processed": len(pending),
         "instincts_written": written_ids,
+        "candidates_blocked": blocked_candidates,
         "active_rules_synced": synced_rules,
         "reloads_armed": False,
+    }
+
+
+def _archive_instinct_file(src_path: Path, tag: str) -> Path:
+    ARCHIVE_INSTINCTS_DIR.mkdir(parents=True, exist_ok=True)
+    ts_tag = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    dest = ARCHIVE_INSTINCTS_DIR / f"{src_path.stem}-{tag}-{ts_tag}{src_path.suffix}"
+    counter = 1
+    while dest.exists():
+        dest = ARCHIVE_INSTINCTS_DIR / f"{src_path.stem}-{tag}-{ts_tag}-{counter}{src_path.suffix}"
+        counter += 1
+    shutil.move(str(src_path), str(dest))
+    return dest
+
+
+_STOPWORDS = frozenset(
+    {
+        "when",
+        "always",
+        "never",
+        "use",
+        "using",
+        "the",
+        "and",
+        "for",
+        "with",
+        "before",
+        "after",
+        "into",
+        "from",
+        "that",
+        "this",
+        "agy",
+        "workspace",
+    }
+)
+
+
+def _tokenize_for_similarity(text: str) -> set[str]:
+    low = (text or "").lower()
+    words = {w for w in re.findall(r"[a-z0-9_-]{2,}", low) if w not in _STOPWORDS}
+    cjk_runs = re.findall(r"[\u4e00-\u9fff]+", low)
+    for run in cjk_runs:
+        if len(run) == 1:
+            words.add(run)
+        else:
+            for i in range(len(run) - 1):
+                words.add(run[i : i + 2])
+    return words
+
+
+def _norm_trigger(trigger: str) -> str:
+    s = re.sub(r"^when\s+", "", (trigger or "").strip().lower())
+    s = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", " ", s).strip()
+    return s
+
+
+def _instinct_similarity(a: dict[str, Any], b: dict[str, Any]) -> float:
+    if str(a.get("domain") or "workflow").lower() != str(b.get("domain") or "workflow").lower():
+        return 0.0
+    ta = _norm_trigger(str(a.get("trigger") or ""))
+    tb = _norm_trigger(str(b.get("trigger") or ""))
+    if ta and tb and ta == tb:
+        return 1.0
+    toks_a = _tokenize_for_similarity(f"{a.get('trigger', '')} {a.get('action', '')}")
+    toks_b = _tokenize_for_similarity(f"{b.get('trigger', '')} {b.get('action', '')}")
+    if not toks_a or not toks_b:
+        return 0.0
+    inter = len(toks_a & toks_b)
+    union = len(toks_a | toks_b)
+    return inter / union if union else 0.0
+
+
+_MERGE_CLAUSE_SPLIT_RE = re.compile(r"[;\n；]+")
+_BOILERPLATE_PREFIX_RE = re.compile(
+    r"^(?:always|ensure(?:\s+you)?|make\s+sure(?:\s+to)?|be\s+sure\s+to|"
+    r"remember\s+to|you\s+should|explicitly)\s+",
+    re.IGNORECASE,
+)
+
+
+def _normalize_clause(text: str) -> str:
+    s = re.sub(r"\s+", " ", (text or "").strip().lower())
+    return s.rstrip(".。;；,，")
+
+
+def _extract_action_clauses(action: str) -> list[str]:
+    clauses: list[str] = []
+    for part in _MERGE_CLAUSE_SPLIT_RE.split(action or ""):
+        cleaned = re.sub(r"\s+", " ", part).strip(" ;；")
+        if cleaned:
+            clauses.append(cleaned)
+    return clauses
+
+
+def _condense_clause(clause: str) -> str:
+    condensed = _BOILERPLATE_PREFIX_RE.sub("", clause.strip())
+    return condensed.strip() or clause.strip()
+
+
+def _merge_instinct_cluster_local(cluster: list[dict[str, Any]]) -> dict[str, Any]:
+    ordered = sorted(
+        cluster,
+        key=lambda x: (
+            -float(x.get("confidence") or 0.0),
+            -_extract_last_observed_date(x).toordinal(),
+            str(x.get("id") or ""),
+        ),
+    )
+    primary = dict(ordered[0])
+    absorbed = ordered[1:]
+
+    max_conf = max(float(x.get("confidence") or 0.5) for x in ordered)
+    boosted = min(0.95, round(max_conf + 0.04 * min(3, len(absorbed)), 2))
+
+    # Clause-level deduplication & condensation so shared clauses don't crowd out trailing core directives
+    dedup_clauses: list[str] = []
+    kept_norms: list[str] = []
+    kept_tokens: list[set[str]] = []
+    for item in ordered:
+        for clause in _extract_action_clauses(str(item.get("action") or "")):
+            norm = _normalize_clause(clause)
+            if not norm:
+                continue
+            toks = _tokenize_for_similarity(clause)
+            is_dup = False
+            for idx, prev_norm in enumerate(kept_norms):
+                if norm == prev_norm or norm in prev_norm:
+                    is_dup = True
+                    break
+                if prev_norm in norm and len(norm) > len(prev_norm):
+                    dedup_clauses[idx] = clause
+                    kept_norms[idx] = norm
+                    kept_tokens[idx] = toks
+                    is_dup = True
+                    break
+                prev_toks = kept_tokens[idx]
+                if toks and prev_toks and (len(toks & prev_toks) / len(toks | prev_toks)) >= 0.80:
+                    is_dup = True
+                    break
+            if not is_dup:
+                dedup_clauses.append(clause)
+                kept_norms.append(norm)
+                kept_tokens.append(toks)
+
+    if not dedup_clauses:
+        merged_action = str(ordered[0].get("action") or "").strip()
+    else:
+        merged_action = "; ".join(dedup_clauses)
+        if len(merged_action) > 700:
+            condensed = [_condense_clause(c) if i > 0 else c for i, c in enumerate(dedup_clauses)]
+            merged_condensed = "; ".join(condensed)
+            if len(merged_condensed) <= 1500:
+                merged_action = merged_condensed
+            else:
+                max_budget = 1500
+                tail_budget = sum(len(c) + 2 for c in condensed[1:])
+                head_cap = max(500, max_budget - tail_budget)
+                head_text = (
+                    condensed[0]
+                    if len(condensed[0]) <= head_cap
+                    else (condensed[0][: max(40, head_cap - 3)].rstrip() + "...")
+                )
+                tail_clauses: list[str] = []
+                used_len = len(head_text)
+                for c in reversed(condensed[1:]):
+                    add_len = len(c) + 2
+                    if used_len + add_len <= max_budget:
+                        tail_clauses.append(c)
+                        used_len += add_len
+                    elif max_budget - used_len > 40:
+                        avail = max_budget - used_len - 5
+                        tail_clauses.append(c[:avail].rstrip() + "...")
+                        used_len = max_budget
+                        break
+                    else:
+                        break
+                merged_action = "; ".join([head_text] + list(reversed(tail_clauses)))
+
+    # Merge evidence lines, preserving newest Last observed date
+    ev_items: list[str] = []
+    latest_date = max(_extract_last_observed_date(x) for x in ordered)
+    for item in ordered:
+        for ev in item.get("evidence") or []:
+            ev_s = str(ev).strip()
+            if not ev_s or ev_s.startswith("Last observed:"):
+                continue
+            if ev_s not in ev_items:
+                ev_items.append(ev_s)
+    ev_items = ev_items[-5:]
+    ev_items.append(f"Last observed: {latest_date.strftime('%Y-%m-%d')}")
+
+    primary["confidence"] = boosted
+    primary["action"] = merged_action
+    primary["evidence"] = ev_items
+    return primary
+
+
+def _merge_instinct_cluster(cluster: list[dict[str, Any]], *, use_llm: bool = False) -> dict[str, Any]:
+    local_merged = _merge_instinct_cluster_local(cluster)
+    if not use_llm:
+        return local_merged
+    try:
+        sys_p = (
+            "Consolidate duplicate ECC instincts into ONE concise atomic rule. "
+            'Return strict JSON: {"trigger":"when ...","action":"...","title":"..."}'
+        )
+        usr_p = json.dumps(
+            [
+                {
+                    "id": x.get("id"),
+                    "trigger": x.get("trigger"),
+                    "action": x.get("action"),
+                    "confidence": x.get("confidence"),
+                }
+                for x in cluster
+            ],
+            ensure_ascii=False,
+        )
+        raw = call_shim_json(sys_p, usr_p, timeout=60)
+        obj_m = re.search(r"\{[\s\S]*\}", raw)
+        if obj_m:
+            data = json.loads(obj_m.group(0))
+            cand = dict(local_merged)
+            if data.get("trigger"):
+                cand["trigger"] = str(data["trigger"]).strip()
+            if data.get("action"):
+                cand["action"] = str(data["action"]).strip()
+            if data.get("title"):
+                cand["title"] = str(data["title"]).strip()
+            llm_only = {
+                "id": cand.get("id"),
+                "title": cand.get("title"),
+                "trigger": cand.get("trigger"),
+                "action": cand.get("action"),
+                "domain": cand.get("domain"),
+            }
+            ok_llm, _ = _validate_instinct_candidate(llm_only, is_existing=False)
+            ok_full, _ = _validate_instinct_candidate(cand, is_existing=True)
+            if ok_llm and ok_full:
+                return cand
+    except Exception as e:
+        log.warning("Dream LLM merge fallback to local deterministic merge: %s", e)
+    return local_merged
+
+
+def _compact_observations_if_needed(
+    state: dict[str, Any],
+    *,
+    dry_run: bool = False,
+    max_lines: int | None = None,
+    keep_tail: int | None = None,
+) -> dict[str, int]:
+    """Compress & gzip-archive already-analyzed observations.jsonl lines without offset drift."""
+    res = {"total_before": 0, "archived_lines": 0, "dropped_poison": 0, "total_after": 0}
+    if not OBSERVATIONS_FILE.is_file():
+        return res
+
+    max_l = DREAM_MAX_OBS_LINES if max_lines is None else max(20, int(max_lines))
+    tail_n = DREAM_OBS_KEEP_TAIL if keep_tail is None else max(0, int(keep_tail))
+
+    lock_p = _obs_lock_path()
+    lock_p.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_p, "a+", encoding="utf-8") as lf:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        try:
+            lines = OBSERVATIONS_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+            total = len(lines)
+            res["total_before"] = total
+            if total <= max_l:
+                res["total_after"] = total
+                return res
+
+            fresh_state = load_daemon_state() if DAEMON_STATE_FILE.exists() else state
+            last_idx = int(fresh_state.get("last_analyzed_obs_line") or state.get("last_analyzed_obs_line") or 0)
+            last_idx = max(0, min(total, last_idx))
+            effective_tail = min(tail_n, last_idx)
+            archive_end = max(0, last_idx - effective_tail)
+            if archive_end <= 0:
+                res["total_after"] = total
+                return res
+
+            raw_archive = lines[:archive_end]
+            raw_remaining = lines[archive_end:]
+            analyzed_in_remaining = last_idx - archive_end
+
+            clean_archive: list[str] = []
+            for ln in raw_archive:
+                bad, _ = _inspect_text(ln)
+                if bad:
+                    res["dropped_poison"] += 1
+                    continue
+                clean_archive.append(ln)
+
+            clean_remaining: list[str] = []
+            new_last_idx = analyzed_in_remaining
+            for idx, ln in enumerate(raw_remaining):
+                bad, _ = _inspect_text(ln)
+                if bad:
+                    res["dropped_poison"] += 1
+                    if idx < analyzed_in_remaining:
+                        new_last_idx = max(0, new_last_idx - 1)
+                    continue
+                clean_remaining.append(ln)
+
+            res["archived_lines"] = len(clean_archive)
+            res["total_after"] = len(clean_remaining)
+
+            if not dry_run:
+                if clean_archive:
+                    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+                    ym = datetime.now(timezone.utc).strftime("%Y%m")
+                    gz_path = ARCHIVE_DIR / f"observations-{ym}.jsonl.gz"
+                    with gzip.open(gz_path, "at", encoding="utf-8") as gz:
+                        for ln in clean_archive:
+                            gz.write(ln + "\n")
+
+                tmp = OBSERVATIONS_FILE.with_name(f".{OBSERVATIONS_FILE.name}.{os.getpid()}.tmp")
+                tmp.write_text(("\n".join(clean_remaining) + "\n") if clean_remaining else "", encoding="utf-8")
+                tmp.replace(OBSERVATIONS_FILE)
+                if res["dropped_poison"]:
+                    _record_guard_block(res["dropped_poison"])
+
+                def _commit_compact(latest: dict[str, Any]) -> None:
+                    latest["last_analyzed_obs_line"] = new_last_idx
+                    latest["obs_compaction_gen"] = int(latest.get("obs_compaction_gen") or 0) + 1
+                    if res["dropped_poison"]:
+                        latest["poison_blocked_count"] = (
+                            int(latest.get("poison_blocked_count") or 0) + res["dropped_poison"]
+                        )
+
+                updated_st = _update_daemon_state(_commit_compact)
+                state["last_analyzed_obs_line"] = updated_st["last_analyzed_obs_line"]
+                state["obs_compaction_gen"] = updated_st["obs_compaction_gen"]
+                state["poison_blocked_count"] = updated_st["poison_blocked_count"]
+            return res
+        finally:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+
+
+def run_dream(
+    *,
+    dry_run: bool = False,
+    force: bool = False,
+    quiet: bool = False,
+    use_llm: bool = False,
+    today: date | None = None,
+) -> dict[str, Any]:
+    """Periodic Dream memory consolidation:
+    1. Anti-poisoning re-validation on existing instincts
+    2. Gentle time decay & low-confidence archival
+    3. Similarity-based instinct deduplication & merge (deterministic local + optional LLM)
+    4. `observations.jsonl` rolling gzip archival with exact `last_analyzed_obs_line` recalculation
+    5. Deterministic `ecc-active-instincts.md` sync (preserving prompt cache, zero bridge reload)
+    """
+    ensure_dirs()
+    state = load_daemon_state()
+    now_ts = time.time()
+    last_dream_ts = float(state.get("last_dream_ts") or 0.0)
+    if not force and (now_ts - last_dream_ts) < DREAM_INTERVAL_SEC:
+        return {
+            "status": "cooldown",
+            "last_dream_ts": last_dream_ts,
+            "next_due_in_sec": int(DREAM_INTERVAL_SEC - (now_ts - last_dream_ts)),
+        }
+
+    ref_today = today or datetime.now(timezone.utc).date()
+    existing = load_existing_instincts()
+
+    quarantined_ids: list[str] = []
+    decayed_ids: list[str] = []
+    archived_low_conf_ids: list[str] = []
+    merged_groups: list[dict[str, Any]] = []
+    survivors: list[dict[str, Any]] = []
+    dream_quarantine_poison = 0
+
+    # 1 & 2. Anti-poisoning validation + time decay + low-confidence archival
+    for iid, meta in sorted(existing.items()):
+        ok, bad_reason = _validate_instinct_candidate(meta, is_existing=True)
+        if not ok:
+            quarantined_ids.append(iid)
+            if not dry_run:
+                _archive_instinct_file(Path(meta["path"]), "quarantined")
+                dream_quarantine_poison += 1
+                _record_guard_block(1)
+            log.warning("Dream quarantined unsafe instinct %s (%s)", iid, bad_reason)
+            continue
+
+        last_obs = _extract_last_observed_date(meta)
+        days_stale = max(0, (ref_today - last_obs).days)
+        old_conf = float(meta.get("confidence") or 0.5)
+        new_conf = old_conf
+        if days_stale > DREAM_DECAY_GRACE_DAYS:
+            weeks_over = (days_stale - DREAM_DECAY_GRACE_DAYS) / 7.0
+            decay = round(min(0.30, max(0.02, weeks_over * 0.03)), 2)
+            new_conf = round(max(0.10, old_conf - decay), 2)
+
+        if new_conf < DREAM_ARCHIVE_CONF:
+            archived_low_conf_ids.append(iid)
+            if not dry_run:
+                _archive_instinct_file(Path(meta["path"]), "decayed")
+            continue
+
+        updated = dict(meta)
+        if new_conf != old_conf:
+            updated["confidence"] = new_conf
+            decayed_ids.append(iid)
+            if not dry_run:
+                write_instinct_yaml(updated, preserve_last_observed=True)
+        survivors.append(updated)
+
+    # 3. Cluster & merge fragmented/duplicate instincts per domain
+    by_domain: dict[str, list[dict[str, Any]]] = {}
+    for item in survivors:
+        dom = str(item.get("domain") or "workflow").lower()
+        by_domain.setdefault(dom, []).append(item)
+
+    for _dom, dom_items in sorted(by_domain.items()):
+        used: set[str] = set()
+        for i, anchor in enumerate(dom_items):
+            aid = str(anchor["id"])
+            if aid in used:
+                continue
+            cluster = [anchor]
+            used.add(aid)
+            for cand in dom_items[i + 1 :]:
+                cid = str(cand["id"])
+                if cid in used:
+                    continue
+                if _instinct_similarity(anchor, cand) >= 0.50:
+                    cluster.append(cand)
+                    used.add(cid)
+            if len(cluster) >= 2:
+                merged = _merge_instinct_cluster(cluster, use_llm=use_llm)
+                ok, _ = _validate_instinct_candidate(merged, is_existing=True)
+                if not ok:
+                    continue
+                merged_id = str(merged["id"])
+                absorbed = [c for c in cluster if str(c["id"]) != merged_id]
+                merged_groups.append({"kept": merged_id, "absorbed": [str(a["id"]) for a in absorbed]})
+                if not dry_run:
+                    write_instinct_yaml(merged, preserve_last_observed=True)
+                    for abs_item in absorbed:
+                        abs_p = Path(abs_item["path"])
+                        if abs_p.is_file():
+                            _archive_instinct_file(abs_p, "merged")
+
+    # 4. Compact & archive observations.jsonl
+    obs_compaction = _compact_observations_if_needed(state, dry_run=dry_run)
+
+    # 5. Deterministic active rules sync (no bridge reload!)
+    active_rules = 0
+    rules_changed = False
+    if not dry_run:
+        active_rules, rules_changed = sync_active_instincts_rule()
+        sync_claude_mem_recent_rule()
+        summary = {
+            "ts": now_ts,
+            "quarantined": len(quarantined_ids),
+            "decayed": len(decayed_ids),
+            "archived_low_conf": len(archived_low_conf_ids),
+            "merged_groups": len(merged_groups),
+            "obs_archived_lines": obs_compaction["archived_lines"],
+            "active_rules_synced": active_rules,
+        }
+
+        def _commit_dream(latest: dict[str, Any]) -> None:
+            latest["last_dream_ts"] = now_ts
+            latest["last_dream_summary"] = summary
+            if dream_quarantine_poison:
+                latest["poison_blocked_count"] = (
+                    int(latest.get("poison_blocked_count") or 0) + dream_quarantine_poison
+                )
+
+        state = _update_daemon_state(_commit_dream)
+    else:
+        active_rules = sum(1 for s in survivors if float(s.get("confidence") or 0) >= 0.80)
+
+    result = {
+        "status": "dry_run" if dry_run else "dreamed",
+        "dry_run": dry_run,
+        "quarantined_ids": quarantined_ids,
+        "decayed_ids": decayed_ids,
+        "archived_low_conf_ids": archived_low_conf_ids,
+        "merged_groups": merged_groups,
+        "observations_compaction": obs_compaction,
+        "active_rules_synced": active_rules,
+        "rules_changed": rules_changed,
+        "poison_blocked_count": int(state.get("poison_blocked_count") or 0),
+        "reloads_armed": False,
+    }
+    if not quiet:
+        log.info("Dream consolidation finished: %s", json.dumps(result, ensure_ascii=False))
+    return result
+
+
+def get_dream_status() -> dict[str, Any]:
+    """Return read-only Dream & Memory Guard status summary."""
+    state = load_daemon_state()
+    existing = load_existing_instincts()
+    archived_cnt = len(list(ARCHIVE_INSTINCTS_DIR.glob("*.yaml"))) if ARCHIVE_INSTINCTS_DIR.is_dir() else 0
+    obs_lines = 0
+    if OBSERVATIONS_FILE.is_file():
+        try:
+            obs_lines = len(OBSERVATIONS_FILE.read_text(encoding="utf-8", errors="replace").splitlines())
+        except OSError:
+            obs_lines = 0
+    guard_stats = _MEMORY_GUARD.get_guard_stats(taint_file=MEMORY_TAINT_FILE) if _MEMORY_GUARD is not None else {}
+    return {
+        "personal_instincts": len(existing),
+        "active_rules_count": sum(1 for v in existing.values() if float(v.get("confidence") or 0) >= 0.80),
+        "archived_instincts": archived_cnt,
+        "observations_lines": obs_lines,
+        "last_analyzed_obs_line": int(state.get("last_analyzed_obs_line") or 0),
+        "last_dream_ts": float(state.get("last_dream_ts") or 0.0),
+        "last_dream_summary": state.get("last_dream_summary") or {},
+        "poison_blocked_count": int(state.get("poison_blocked_count") or 0),
+        "guard": guard_stats,
     }
 
 
@@ -696,7 +1584,8 @@ def evolve_with_llm_and_cli(quiet: bool = False) -> int:
                 slug = _clean_evolved_slug(str(data.get("slug") or ""))
                 md = str(data.get("markdown") or "").strip()
                 desc = str(data.get("description") or "").strip()
-                if slug and md and desc:
+                bad_md, _ = _inspect_text(f"{slug}\n{desc}\n{md}")
+                if slug and md and desc and not bad_md:
                     skill_file = EVOLVED_SKILLS_DIR / slug / "SKILL.md"
                     skill_file.parent.mkdir(parents=True, exist_ok=True)
                     full_md = (
@@ -726,12 +1615,15 @@ def run_daemon_loop() -> None:
     ensure_dirs()
     sync_claude_mem_recent_rule()
     sync_active_instincts_rule()
-    log.info("Starting agy-instinct-daemon (poll=%ds, shim=%s, model=%s)", POLL_INTERVAL_SEC, SHIM_URL, SHIM_MODEL)
+    log.info("Starting agy-instinct-daemon (poll=%ds, dream=%ds, shim=%s, model=%s)", POLL_INTERVAL_SEC, DREAM_INTERVAL_SEC, SHIM_URL, SHIM_MODEL)
     while True:
         try:
             res = analyze_observations_batch(force=False)
             if res.get("status") == "analyzed":
                 log.info("Instinct batch analyzed: %s", res)
+            dream_res = run_dream(force=False, quiet=True)
+            if dream_res.get("status") == "dreamed":
+                log.info("Periodic Dream consolidation completed: %s", dream_res)
         except Exception as e:
             log.warning("Instinct loop iteration error: %s", e)
         time.sleep(POLL_INTERVAL_SEC)
@@ -746,6 +1638,12 @@ def main() -> int:
     p_sync.add_argument("--reload", action="store_true", help="Explicitly queue zero-downtime bridge reload")
     sub.add_parser("status", help="Show ECC instinct status")
     sub.add_parser("evolve", help="Cluster and evolve high-confidence instincts into .agents/skills/")
+    p_dream = sub.add_parser("dream", help="Consolidate instincts, apply decay, and compact observations")
+    p_dream.add_argument("--dry-run", action="store_true", help="Preview consolidation without writing files")
+    p_dream.add_argument("--force", action="store_true", help="Bypass DREAM_INTERVAL_SEC cooldown")
+    p_dream.add_argument("--quiet", action="store_true", help="Suppress verbose log output")
+    p_dream.add_argument("--use-llm", action="store_true", help="Allow optional LLM merge refinement via agy-llm-shim")
+    sub.add_parser("dream-status", help="Print JSON summary of Memory Guard & Dream status")
 
     args, rest = parser.parse_known_args()
     cmd = args.cmd or "status"
@@ -756,6 +1654,18 @@ def main() -> int:
     if cmd == "analyze-now":
         res = analyze_observations_batch(force=True)
         print(json.dumps(res, indent=2, ensure_ascii=False))
+        return 0
+    if cmd == "dream":
+        res = run_dream(
+            dry_run=bool(getattr(args, "dry_run", False)),
+            force=bool(getattr(args, "force", False)),
+            quiet=bool(getattr(args, "quiet", False)),
+            use_llm=bool(getattr(args, "use_llm", False)),
+        )
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+        return 0
+    if cmd == "dream-status":
+        print(json.dumps(get_dream_status(), indent=2, ensure_ascii=False))
         return 0
     if cmd == "sync":
         n_rules, r_ch = sync_active_instincts_rule()
