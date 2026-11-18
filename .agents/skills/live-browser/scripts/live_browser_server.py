@@ -20,36 +20,27 @@ import fcntl
 import hashlib
 import hmac
 import html
+import importlib.util
 import json
 import logging
 import os
 from pathlib import Path
+import re
 import secrets
 import shutil
+import subprocess
 import sys
+import tempfile
 import time
 from typing import Any
 import urllib.parse
 
-from aiohttp import FormData, WSMsgType, web
-
-# Import canonical profile constants & helpers from google-profile skill
-GOOGLE_SKILL_SCRIPTS = Path(
-    os.environ.get(
-        "AGY_GOOGLE_SKILL_SCRIPTS",
-        str(Path.home() / "agy-workspace/.agents/skills/google-profile/scripts"),
-    )
-)
-if str(GOOGLE_SKILL_SCRIPTS) not in sys.path:
-    sys.path.insert(0, str(GOOGLE_SKILL_SCRIPTS))
-
-from google_browser import (  # noqa: E402
-    LOCK_PATH,
-    PINNED_FINGERPRINT,
-    PROFILE_DIR,
-    _clean_stale_firefox_locks,
-    _direct_env,
-)
+try:
+    from aiohttp import FormData, WSMsgType, web
+except ImportError:
+    FormData = None  # type: ignore[assignment]
+    WSMsgType = None  # type: ignore[assignment]
+    web = None  # type: ignore[assignment]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,18 +50,727 @@ log = logging.getLogger("live-browser")
 
 CONFIG_DIR = Path(os.environ.get("AGY_LIVE_BROWSER_CONFIG_DIR", str(Path.home() / ".config/agy-live-browser")))
 CONFIG_FILE = CONFIG_DIR / "config.json"
+PROFILES_FILE = CONFIG_DIR / "profiles.json"
 LOCAL_TOKEN_FILE = CONFIG_DIR / "local.token"
+PROFILES_DATA_DIR = Path(
+    os.environ.get("AGY_LIVE_BROWSER_PROFILES_DIR", str(Path.home() / ".local/share/camoufox-profiles"))
+)
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 18795
 IDLE_AUTOCLOSE_SECONDS = 900.0  # Auto-release profile lock after 15m idle
 
+PINNED_FINGERPRINT_DEFAULTS: dict[str, Any] = {
+    "headless": "virtual",
+    "os": "windows",
+    "humanize": True,
+    "i_know_what_im_doing": True,
+}
+ALLOWED_OS_VALUES = ("windows", "macos", "linux")
+ALLOWED_PROXY_SCHEMES = ("http", "https", "socks4", "socks5", "socks5h")
+PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+PROXY_ENV_KEYS = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "FTP_PROXY",
+    "SOCKS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "ftp_proxy",
+    "socks_proxy",
+    "no_proxy",
+)
+PINNED_FORBIDDEN_OVERRIDES = frozenset(
+    {
+        "proxy",
+        "proxy_bao_ref",
+        "os",
+        "locale",
+        "window",
+        "webgl_config",
+        "block_webrtc",
+        "geoip",
+        "headless",
+        "user_data_dir",
+        "persistent_context",
+        "persistent",
+        "ephemeral",
+    }
+)
+
 _BRIDGE_DIR = Path(os.environ.get("AGY_TG_BRIDGE_DIR", str(Path.home() / "agy-tg-bridge")))
 BRIDGE_ENV_FILES = {
     "main": _BRIDGE_DIR / ".env",
     "sg": _BRIDGE_DIR / ".env.sg",
 }
+
+
+def _get_google_skill_scripts_dir() -> Path:
+    raw = os.environ.get("AGY_GOOGLE_SKILL_SCRIPTS")
+    if raw is not None:
+        return Path(raw) if raw.strip() else Path("/nonexistent-google-skill-dir")
+    return Path.home() / "agy-workspace/.agents/skills/google-profile/scripts"
+
+
+def _import_google_browser() -> Any | None:
+    """Optionally load host-specific `google_browser` module when present."""
+    scripts_dir = _get_google_skill_scripts_dir()
+    mod_path = scripts_dir / "google_browser.py"
+    if not mod_path.is_file():
+        return None
+    existing = sys.modules.get("google_browser")
+    if existing is not None:
+        existing_file = getattr(existing, "__file__", None)
+        if existing_file and Path(existing_file).resolve() == mod_path.resolve():
+            return existing
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
+    spec = importlib.util.spec_from_file_location("google_browser", mod_path)
+    if spec is None or spec.loader is None:
+        return None
+    mod = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(mod)
+    except Exception:
+        return None
+    return mod
+
+
+def discover_pinned_host_profile() -> dict[str, Any] | None:
+    """Discover a host-pinned persistent profile if `google_browser` is installed."""
+    gb = _import_google_browser()
+    if gb is None:
+        return None
+    profile_dir = getattr(gb, "PROFILE_DIR", None)
+    lock_path = getattr(gb, "LOCK_PATH", None)
+    if not profile_dir or not lock_path:
+        return None
+    p_dir = Path(profile_dir)
+    fp = dict(getattr(gb, "PINNED_FINGERPRINT", PINNED_FINGERPRINT_DEFAULTS))
+    return {
+        "name": p_dir.name,
+        "profile_dir": p_dir,
+        "lock_path": Path(lock_path),
+        "pinned": True,
+        "fingerprint": fp,
+        "direct_env_fn": getattr(gb, "_direct_env", None),
+    }
+
+
+def _clean_proxy_env(base_env: dict[str, str] | None = None, *, direct: bool = True) -> dict[str, str]:
+    """Return an environment dict stripped of proxy variables (enforcing direct egress when direct=True)."""
+    cleaned = dict(os.environ if base_env is None else base_env)
+    for key in PROXY_ENV_KEYS:
+        cleaned.pop(key, None)
+    if direct:
+        cleaned["NO_PROXY"] = "*"
+        cleaned["no_proxy"] = "*"
+    return cleaned
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _clean_stale_firefox_locks(profile_dir: Path) -> None:
+    """Remove stale Firefox lock symlinks inside `profile_dir` after external flock is held."""
+    lock_link = profile_dir / "lock"
+    if lock_link.is_symlink():
+        try:
+            target = os.readlink(lock_link)
+        except OSError:
+            return
+        pid_part = target.rsplit("+", 1)[-1] if "+" in target else ""
+        if pid_part.isdigit() and not _pid_alive(int(pid_part)):
+            lock_link.unlink(missing_ok=True)
+            (profile_dir / ".parentlock").unlink(missing_ok=True)
+
+
+def validate_profile_name(name: str) -> str:
+    """Validate named profile identifier (blocks traversal, slashes, whitespace, '..')."""
+    if not isinstance(name, str):
+        raise ValueError("Profile name must be a string")
+    if not name or ".." in name or not PROFILE_NAME_RE.match(name):
+        raise ValueError(
+            f"Invalid profile name {name!r}: must match ^[A-Za-z0-9][A-Za-z0-9._-]{{0,63}}$ without '..'"
+        )
+    return name
+
+
+def parse_proxy_url(raw_url: str) -> dict[str, str]:
+    """Parse a proxy URL into Playwright proxy dict `{server, username?, password?}`."""
+    text = str(raw_url or "").strip()
+    if "://" not in text:
+        raise ValueError("Proxy URL must include scheme (e.g. socks5://proxy.example.com:1080)")
+    parsed = urllib.parse.urlparse(text)
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in ALLOWED_PROXY_SCHEMES:
+        raise ValueError(f"Unsupported proxy scheme {scheme!r}; allowed: {', '.join(ALLOWED_PROXY_SCHEMES)}")
+    if not parsed.hostname:
+        raise ValueError("Proxy URL missing hostname")
+    host_part = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+    port_part = f":{parsed.port}" if parsed.port else ""
+    out: dict[str, str] = {"server": f"{scheme}://{host_part}{port_part}"}
+    if parsed.username is not None:
+        out["username"] = urllib.parse.unquote(parsed.username)
+    if parsed.password is not None:
+        out["password"] = urllib.parse.unquote(parsed.password)
+    return out
+
+
+def normalize_proxy_config(proxy: dict[str, Any] | str | None) -> dict[str, str] | None:
+    """Normalize proxy string or dict into `{server, username?, password?}`."""
+    if proxy is None or proxy == "" or proxy == {}:
+        return None
+    if isinstance(proxy, str):
+        return parse_proxy_url(proxy)
+    if isinstance(proxy, dict):
+        raw_server = str(proxy.get("server") or "").strip()
+        if not raw_server:
+            raise ValueError("Proxy config dict must contain non-empty 'server'")
+        out = parse_proxy_url(raw_server)
+        if proxy.get("username") is not None and str(proxy["username"]) != "":
+            out["username"] = str(proxy["username"])
+        if proxy.get("password") is not None and str(proxy["password"]) != "":
+            out["password"] = str(proxy["password"])
+        return out
+    raise ValueError("Proxy config must be a URL string or dict")
+
+
+def mask_proxy_display(proxy: dict[str, Any] | str | None, *, bao_ref: str | None = None) -> str:
+    """Return a credential-free display string for proxy egress (e.g. `socks5://***@example.com:1080`)."""
+    if proxy is None or proxy == "" or proxy == {}:
+        return f"bao:{bao_ref}" if bao_ref else "direct"
+    try:
+        norm = normalize_proxy_config(proxy)
+    except Exception:
+        return "proxy:invalid"
+    if not norm:
+        return f"bao:{bao_ref}" if bao_ref else "direct"
+    parsed = urllib.parse.urlparse(norm["server"])
+    host_part = f"[{parsed.hostname}]" if parsed.hostname and ":" in parsed.hostname else (parsed.hostname or "")
+    port_part = f":{parsed.port}" if parsed.port else ""
+    has_auth = bool(norm.get("username") or norm.get("password"))
+    if has_auth:
+        return f"{parsed.scheme}://***@{host_part}{port_part}"
+    return f"{parsed.scheme}://{host_part}{port_part}"
+
+
+def resolve_proxy_bao_ref(bao_ref: str) -> dict[str, str]:
+    """Fetch proxy config in memory from OpenBao (`path` or `path#field`) without persisting secrets."""
+    ref = str(bao_ref or "").strip()
+    if not ref or any(ch.isspace() for ch in ref):
+        raise ValueError(f"Invalid proxy_bao_ref: {bao_ref!r}")
+    if "#" in ref:
+        secret_path, field = ref.split("#", 1)
+        secret_path = secret_path.strip()
+        field = field.strip()
+        if not secret_path or not field:
+            raise ValueError(f"Invalid proxy_bao_ref syntax: {bao_ref!r}")
+    else:
+        secret_path, field = ref, None
+
+    bao_bin = shutil.which("bao")
+    if not bao_bin:
+        candidate = Path.home() / ".local/bin/bao"
+        bao_bin = str(candidate) if candidate.is_file() else "bao"
+
+    cmd = [bao_bin, "get", secret_path]
+    if field:
+        cmd.extend(["--field", field])
+
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15, check=False)
+    if proc.returncode != 0:
+        raise RuntimeError(f"Failed to resolve proxy secret from OpenBao ref '{ref}' (exit {proc.returncode})")
+
+    raw = (proc.stdout or "").strip()
+    if not raw:
+        raise RuntimeError(f"OpenBao ref '{ref}' returned empty proxy value")
+
+    if raw.startswith("{"):
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            raise ValueError(f"OpenBao ref '{ref}' JSON payload must be an object")
+        if "server" in payload:
+            res = normalize_proxy_config(payload)
+        elif "url" in payload:
+            res = normalize_proxy_config(str(payload["url"]))
+        elif "proxy" in payload:
+            res = normalize_proxy_config(payload["proxy"])
+        else:
+            raise ValueError(f"OpenBao ref '{ref}' JSON missing 'server'/'url'/'proxy'")
+        if not res:
+            raise ValueError(f"OpenBao ref '{ref}' resolved to empty proxy")
+        return res
+
+    return parse_proxy_url(raw)
+
+
+def _normalize_window(val: Any) -> list[int]:
+    if isinstance(val, str):
+        parts = re.split(r"[xX,]", val.strip())
+    elif isinstance(val, (list, tuple)):
+        parts = list(val)
+    else:
+        raise ValueError("window must be [width, height] or 'WxH'")
+    if len(parts) != 2:
+        raise ValueError("window must contain exactly width and height")
+    try:
+        w, h = int(parts[0]), int(parts[1])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("window dimensions must be integers") from exc
+    if not (320 <= w <= 7680 and 240 <= h <= 4320):
+        raise ValueError(f"window dimensions out of range: {w}x{h}")
+    return [w, h]
+
+
+def _normalize_webgl(val: Any) -> list[str]:
+    if isinstance(val, str):
+        parts = [p.strip() for p in val.split(",", 1)]
+    elif isinstance(val, (list, tuple)):
+        parts = [str(p).strip() for p in val]
+    else:
+        raise ValueError("webgl_config must be [vendor, renderer] or 'VENDOR,RENDERER'")
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise ValueError("webgl_config must contain non-empty vendor and renderer")
+    return parts
+
+
+def _normalize_geoip(val: Any) -> bool | str:
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        s = val.strip()
+        low = s.lower()
+        if low in ("true", "1", "yes"):
+            return True
+        if low in ("false", "0", "no"):
+            return False
+        if s:
+            return s
+    raise ValueError("geoip must be a boolean or IP string")
+
+
+def validate_profile_payload(data: dict[str, Any]) -> dict[str, Any]:
+    """Validate and normalize a profile configuration dictionary."""
+    if not isinstance(data, dict):
+        raise ValueError("Profile config must be a JSON object")
+
+    pinned = bool(data.get("pinned", False))
+    os_val = data.get("os")
+    if os_val is not None:
+        os_val = str(os_val).strip().lower()
+        if os_val not in ALLOWED_OS_VALUES:
+            raise ValueError(f"Unsupported os {os_val!r}; allowed: {', '.join(ALLOWED_OS_VALUES)}")
+
+    locale_val = data.get("locale")
+    if locale_val is not None:
+        locale_val = str(locale_val).strip()
+        if not locale_val:
+            locale_val = None
+
+    window_val = _normalize_window(data["window"]) if data.get("window") is not None else None
+    webgl_val = _normalize_webgl(data["webgl_config"]) if data.get("webgl_config") is not None else None
+    block_webrtc_val = bool(data["block_webrtc"]) if data.get("block_webrtc") is not None else None
+    geoip_val = _normalize_geoip(data["geoip"]) if data.get("geoip") is not None else None
+
+    persistent_val = True if data.get("persistent") is None else bool(data["persistent"])
+    if data.get("ephemeral"):
+        persistent_val = False
+
+    proxy_val = normalize_proxy_config(data.get("proxy")) if data.get("proxy") is not None else None
+    bao_ref_raw = data.get("proxy_bao_ref")
+    bao_ref_val = str(bao_ref_raw).strip() if bao_ref_raw is not None and str(bao_ref_raw).strip() else None
+    if bao_ref_val and any(ch.isspace() for ch in bao_ref_val):
+        raise ValueError("proxy_bao_ref must not contain whitespace")
+    if proxy_val and bao_ref_val:
+        raise ValueError("Cannot specify both 'proxy' and 'proxy_bao_ref' on the same profile")
+
+    if pinned:
+        if proxy_val or bao_ref_val:
+            raise ValueError("Pinned profile cannot configure proxy or proxy_bao_ref")
+        if not persistent_val:
+            raise ValueError("Pinned profile must have persistent=True")
+        if os_val is not None and os_val != "windows":
+            raise ValueError("Pinned profile must use os='windows'")
+        os_val = "windows"
+
+    out: dict[str, Any] = {
+        "pinned": pinned,
+        "os": os_val or "windows",
+        "persistent": persistent_val,
+    }
+    if locale_val is not None:
+        out["locale"] = locale_val
+    if window_val is not None:
+        out["window"] = window_val
+    if webgl_val is not None:
+        out["webgl_config"] = webgl_val
+    if block_webrtc_val is not None:
+        out["block_webrtc"] = block_webrtc_val
+    if geoip_val is not None:
+        out["geoip"] = geoip_val
+    if proxy_val is not None:
+        out["proxy"] = proxy_val
+    if bao_ref_val is not None:
+        out["proxy_bao_ref"] = bao_ref_val
+    return out
+
+
+def sanitize_profile_for_output(name: str, entry: dict[str, Any], *, active: bool = False, source: str = "configured") -> dict[str, Any]:
+    """Return a safe public representation of a profile with proxy credentials masked."""
+    proxy_raw = entry.get("proxy")
+    bao_ref = entry.get("proxy_bao_ref")
+    egress = mask_proxy_display(proxy_raw, bao_ref=bao_ref)
+    out: dict[str, Any] = {
+        "name": name,
+        "pinned": bool(entry.get("pinned", False)),
+        "os": entry.get("os") or "windows",
+        "persistent": bool(entry.get("persistent", True)),
+        "egress": egress,
+        "active": active,
+        "source": source,
+    }
+    for key in ("locale", "window", "webgl_config", "block_webrtc", "geoip", "proxy_bao_ref"):
+        if key in entry and entry[key] is not None:
+            out[key] = entry[key]
+    if proxy_raw is not None:
+        out["proxy_masked"] = egress
+    return out
+
+
+def load_profiles(profiles_file: Path | None = None) -> dict[str, dict[str, Any]]:
+    """Load named profile definitions from `profiles.json`."""
+    target = profiles_file or PROFILES_FILE
+    if not target.is_file():
+        return {}
+    try:
+        raw = json.loads(target.read_text(encoding="utf-8"))
+    except Exception as exc:
+        log.warning("Failed reading %s: %s", target, exc)
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    if isinstance(raw.get("profiles"), dict):
+        return dict(raw["profiles"])
+    return {k: v for k, v in raw.items() if isinstance(v, dict)}
+
+
+def save_profiles(profiles: dict[str, dict[str, Any]], profiles_file: Path | None = None) -> None:
+    """Persist named profiles to `profiles.json` atomically with 0600 permissions."""
+    target = profiles_file or PROFILES_FILE
+    target.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(target.parent, 0o700)
+    tmp = target.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"profiles": profiles}, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    tmp.replace(target)
+
+
+def list_profiles(
+    *,
+    active_profile: str = "",
+    profiles_file: Path | None = None,
+) -> list[dict[str, Any]]:
+    """List host-pinned (if present) and configured profiles with masked proxy credentials."""
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    host_pinned = discover_pinned_host_profile()
+    if host_pinned is not None:
+        p_name = host_pinned["name"]
+        items.append(
+            sanitize_profile_for_output(
+                p_name,
+                {"pinned": True, "os": "windows", "persistent": True},
+                active=(active_profile == p_name),
+                source="host_pinned",
+            )
+        )
+        seen.add(p_name)
+
+    configured = load_profiles(profiles_file=profiles_file)
+    for name in sorted(configured.keys()):
+        if name in seen or (host_pinned is not None and name == "default"):
+            continue
+        items.append(
+            sanitize_profile_for_output(
+                name,
+                configured[name],
+                active=(active_profile == name),
+                source="configured",
+            )
+        )
+        seen.add(name)
+
+    if host_pinned is None and "default" not in seen:
+        items.insert(
+            0,
+            sanitize_profile_for_output(
+                "default",
+                {"pinned": False, "os": "windows", "persistent": True},
+                active=(active_profile == "default"),
+                source="builtin_default",
+            ),
+        )
+    return items
+
+
+def create_profile(
+    name: str,
+    config: dict[str, Any],
+    *,
+    overwrite: bool = False,
+    profiles_file: Path | None = None,
+) -> dict[str, Any]:
+    """Create (or optionally update) a named browser profile in `profiles.json`."""
+    clean_name = validate_profile_name(name)
+    host_pinned = discover_pinned_host_profile()
+    if host_pinned is not None and clean_name in ("default", host_pinned["name"]):
+        raise ValueError(f"Cannot create or overwrite host-pinned profile '{clean_name}'")
+
+    profiles = load_profiles(profiles_file=profiles_file)
+    if clean_name in profiles and not overwrite:
+        raise ValueError(f"Profile '{clean_name}' already exists")
+
+    validated = validate_profile_payload(config)
+    profiles[clean_name] = validated
+    save_profiles(profiles, profiles_file=profiles_file)
+    return sanitize_profile_for_output(clean_name, validated, active=False, source="configured")
+
+
+def delete_profile(
+    name: str,
+    *,
+    active_profile: str = "",
+    profiles_file: Path | None = None,
+) -> dict[str, Any]:
+    """Delete a non-pinned, non-running named profile from `profiles.json`."""
+    clean_name = validate_profile_name(name)
+    host_pinned = discover_pinned_host_profile()
+    if host_pinned is not None and clean_name in ("default", host_pinned["name"]):
+        raise ValueError(f"Cannot delete host-pinned profile '{clean_name}'")
+
+    profiles = load_profiles(profiles_file=profiles_file)
+    if clean_name not in profiles:
+        raise KeyError(f"Profile '{clean_name}' not found")
+    if profiles[clean_name].get("pinned"):
+        raise ValueError(f"Cannot delete pinned profile '{clean_name}'")
+    if active_profile and active_profile == clean_name:
+        raise RuntimeError(f"Cannot delete running profile '{clean_name}'; stop browser first")
+
+    del profiles[clean_name]
+    save_profiles(profiles, profiles_file=profiles_file)
+    return {"ok": True, "deleted": clean_name}
+
+
+def _check_pinned_overrides(profile_name: str, overrides: dict[str, Any] | None) -> None:
+    if not overrides:
+        return
+    bad: list[str] = []
+    for key in PINNED_FORBIDDEN_OVERRIDES:
+        if key not in overrides:
+            continue
+        val = overrides[key]
+        if key == "ephemeral":
+            if val:
+                bad.append(key)
+        elif key == "persistent":
+            if val is not None:
+                bad.append(key)
+        elif val is not None:
+            bad.append(key)
+    custom_env = overrides.get("env")
+    if isinstance(custom_env, dict):
+        for env_key in PROXY_ENV_KEYS:
+            if env_key in custom_env:
+                if env_key.lower() == "no_proxy" and custom_env[env_key] == "*":
+                    continue
+                if custom_env[env_key]:
+                    bad.append(f"env:{env_key}")
+    custom_prefs = overrides.get("firefox_user_prefs")
+    if isinstance(custom_prefs, dict) and "network.proxy.type" in custom_prefs:
+        if custom_prefs["network.proxy.type"] != 0:
+            bad.append("firefox_user_prefs:network.proxy.type")
+    if bad:
+        raise ValueError(
+            f"Pinned profile '{profile_name}' forbids overrides: {', '.join(sorted(set(bad)))}"
+        )
+
+
+def resolve_launch_spec(
+    profile_name: str | None = None,
+    overrides: dict[str, Any] | None = None,
+    *,
+    profiles_file: Path | None = None,
+    profiles_data_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Resolve a profile name + optional overrides into a validated launch specification."""
+    req_name = (profile_name or "").strip()
+    data_dir = profiles_data_dir or PROFILES_DATA_DIR
+    host_pinned = discover_pinned_host_profile()
+
+    if host_pinned is not None and (not req_name or req_name in ("default", host_pinned["name"])):
+        p_name = host_pinned["name"]
+        _check_pinned_overrides(p_name, overrides)
+        return {
+            "name": p_name,
+            "pinned": True,
+            "persistent": True,
+            "profile_dir": Path(host_pinned["profile_dir"]),
+            "lock_path": Path(host_pinned["lock_path"]),
+            "os": str(host_pinned["fingerprint"].get("os", "windows")),
+            "fingerprint": dict(host_pinned["fingerprint"]),
+            "direct_env_fn": host_pinned.get("direct_env_fn"),
+            "proxy": None,
+            "proxy_bao_ref": None,
+            "locale": None,
+            "window": None,
+            "webgl_config": None,
+            "block_webrtc": None,
+            "geoip": None,
+        }
+
+    target_name = validate_profile_name(req_name or "default")
+    configured = load_profiles(profiles_file=profiles_file)
+    if target_name in configured:
+        entry = dict(configured[target_name])
+    elif target_name == "default":
+        entry = {"pinned": False, "os": "windows", "persistent": True}
+    else:
+        raise KeyError(
+            f"Profile '{target_name}' not found. Create it with `live-browser profile create {target_name}`."
+        )
+
+    is_pinned = bool(entry.get("pinned", False))
+    if is_pinned:
+        _check_pinned_overrides(target_name, overrides)
+        if entry.get("proxy") or entry.get("proxy_bao_ref") or entry.get("persistent") is False:
+            raise ValueError(f"Pinned profile '{target_name}' cannot have proxy or ephemeral config")
+        return {
+            "name": target_name,
+            "pinned": True,
+            "persistent": True,
+            "profile_dir": data_dir / target_name,
+            "lock_path": data_dir / f"{target_name}.lock",
+            "os": "windows",
+            "fingerprint": dict(PINNED_FINGERPRINT_DEFAULTS),
+            "direct_env_fn": None,
+            "proxy": None,
+            "proxy_bao_ref": None,
+            "locale": None,
+            "window": None,
+            "webgl_config": None,
+            "block_webrtc": None,
+            "geoip": None,
+        }
+
+    ov = overrides or {}
+    merged: dict[str, Any] = dict(entry)
+    for field in ("os", "locale", "window", "webgl_config", "block_webrtc", "geoip", "persistent"):
+        if ov.get(field) is not None:
+            merged[field] = ov[field]
+    if ov.get("ephemeral"):
+        merged["persistent"] = False
+
+    if ov.get("proxy") is not None:
+        merged["proxy"] = ov["proxy"]
+        merged.pop("proxy_bao_ref", None)
+    elif ov.get("proxy_bao_ref") is not None and str(ov["proxy_bao_ref"]).strip():
+        merged["proxy_bao_ref"] = str(ov["proxy_bao_ref"]).strip()
+        merged.pop("proxy", None)
+
+    validated = validate_profile_payload(merged)
+    return {
+        "name": target_name,
+        "pinned": False,
+        "persistent": bool(validated["persistent"]),
+        "profile_dir": data_dir / target_name,
+        "lock_path": data_dir / f"{target_name}.lock",
+        "os": validated["os"],
+        "fingerprint": {
+            "headless": "virtual",
+            "os": validated["os"],
+            "humanize": True,
+            "i_know_what_im_doing": True,
+        },
+        "direct_env_fn": None,
+        "proxy": validated.get("proxy"),
+        "proxy_bao_ref": validated.get("proxy_bao_ref"),
+        "locale": validated.get("locale"),
+        "window": validated.get("window"),
+        "webgl_config": validated.get("webgl_config"),
+        "block_webrtc": validated.get("block_webrtc"),
+        "geoip": validated.get("geoip"),
+    }
+
+
+def build_camoufox_kwargs(spec: dict[str, Any], user_data_dir: Path) -> tuple[dict[str, Any], str]:
+    """Build `AsyncCamoufox` launch kwargs and masked egress summary from a launch spec."""
+    if spec.get("pinned"):
+        direct_fn = spec.get("direct_env_fn")
+        env = direct_fn() if callable(direct_fn) else _clean_proxy_env(direct=True)
+        kwargs: dict[str, Any] = {
+            **PINNED_FINGERPRINT_DEFAULTS,
+            **dict(spec.get("fingerprint") or {}),
+            "headless": "virtual",
+            "os": "windows",
+            "humanize": True,
+            "i_know_what_im_doing": True,
+            "persistent_context": True,
+            "user_data_dir": str(user_data_dir),
+            "env": env,
+            "firefox_user_prefs": {"network.proxy.type": 0},
+        }
+        return kwargs, "direct"
+
+    proxy_dict: dict[str, str] | None = None
+    bao_ref = spec.get("proxy_bao_ref")
+    if spec.get("proxy") is not None:
+        proxy_dict = normalize_proxy_config(spec["proxy"])
+    elif bao_ref:
+        proxy_dict = resolve_proxy_bao_ref(str(bao_ref))
+
+    kwargs = {
+        "headless": "virtual",
+        "os": spec.get("os") or "windows",
+        "humanize": True,
+        "i_know_what_im_doing": True,
+        "persistent_context": True,
+        "user_data_dir": str(user_data_dir),
+    }
+    if spec.get("locale"):
+        kwargs["locale"] = spec["locale"]
+    if spec.get("window"):
+        w, h = spec["window"]
+        kwargs["window"] = (int(w), int(h))
+    if spec.get("webgl_config"):
+        vendor, renderer = spec["webgl_config"]
+        kwargs["webgl_config"] = (str(vendor), str(renderer))
+    if spec.get("block_webrtc") is not None:
+        kwargs["block_webrtc"] = bool(spec["block_webrtc"])
+    if spec.get("geoip") is not None:
+        kwargs["geoip"] = spec["geoip"]
+
+    if proxy_dict:
+        kwargs["proxy"] = proxy_dict
+        kwargs["env"] = _clean_proxy_env(direct=False)
+        egress_summary = mask_proxy_display(proxy_dict)
+    else:
+        kwargs["env"] = _clean_proxy_env(direct=True)
+        kwargs["firefox_user_prefs"] = {"network.proxy.type": 0}
+        egress_summary = "direct"
+
+    return kwargs, egress_summary
 
 
 def ensure_local_config() -> tuple[dict[str, Any], str]:
@@ -192,7 +892,7 @@ def verify_telegram_init_data(
 XCLIP_BIN = shutil.which("xclip") or "/usr/bin/xclip"
 
 
-def resolve_camoufox_display(ctx: Any) -> str | None:
+def resolve_camoufox_display(ctx: Any, profile_dir: Path | None = None) -> str | None:
     """Discover the Xvfb DISPLAY string (e.g. ':1') attached to Camoufox without touching browser prefs."""
     if ctx is not None:
         close_fn = getattr(ctx, "close", None)
@@ -206,8 +906,8 @@ def resolve_camoufox_display(ctx: Any) -> str | None:
             if isinstance(disp_num, int):
                 return f":{disp_num}"
 
-    # Fallback: scan /proc for camoufox-bin running against PROFILE_DIR
-    prof_bytes = str(PROFILE_DIR).encode("utf-8")
+    # Fallback: scan /proc for camoufox-bin running against active profile_dir
+    prof_bytes = str(profile_dir).encode("utf-8") if profile_dir is not None else b""
     proc_root = Path("/proc")
     if proc_root.is_dir():
         for entry in proc_root.iterdir():
@@ -215,7 +915,9 @@ def resolve_camoufox_display(ctx: Any) -> str | None:
                 continue
             try:
                 cmd = (entry / "cmdline").read_bytes()
-                if b"camoufox-bin" not in cmd or prof_bytes not in cmd:
+                if b"camoufox-bin" not in cmd:
+                    continue
+                if prof_bytes and prof_bytes not in cmd:
                     continue
                 env_raw = (entry / "environ").read_bytes()
                 for item in env_raw.split(b"\x00"):
@@ -320,6 +1022,14 @@ class TelegramLiveCardPublisher:
             f"🔗 <code>{url}</code>",
             status_line,
         ]
+        if self.hub.active_profile:
+            lock_badge = "🔒 " if self.hub.active_pinned else ""
+            os_part = self.hub.active_os or "windows"
+            egress_part = self.hub.active_egress or "direct"
+            lines.append(
+                f"🎭 <b>环境</b>：{lock_badge}<code>{html.escape(self.hub.active_profile)}</code>"
+                f" · <code>{html.escape(os_part)}</code> · <code>{html.escape(egress_part)}</code>"
+            )
         if not (self.hub.config.get("public_url") or "").startswith("https://"):
             lines.append("💡 <i>绑定 HTTPS 隧道域名后将自动显示【实时画面/人工接管】按钮</i>")
         return "\n".join(lines)
@@ -504,6 +1214,15 @@ class LiveBrowserHub:
         self.ai_busy_count: int = 0
         self.last_activity_ts: float = time.monotonic()
 
+        # Active profile & egress state (never stores plaintext proxy credentials)
+        self.active_profile: str = ""
+        self.active_profile_dir: Path | None = None
+        self._ephemeral_dir: Path | None = None
+        self.active_pinned: bool = False
+        self.active_egress: str = "direct"
+        self.active_os: str = ""
+        self.active_fingerprint: dict[str, Any] = {}
+
         # Shared display state
         self.latest_jpeg: bytes | None = None
         self.url: str = ""
@@ -569,6 +1288,11 @@ class LiveBrowserHub:
             "type": "state",
             "running": self.engine_mode != "idle",
             "engine_mode": self.engine_mode,
+            "profile": self.active_profile or None,
+            "pinned": self.active_pinned,
+            "egress": self.active_egress or "direct",
+            "os": self.active_os or "",
+            "fingerprint": dict(self.active_fingerprint),
             "takeover": self.takeover,
             "takeover_reason": self.takeover_reason,
             "ai_status": self.ai_status,
@@ -643,25 +1367,101 @@ class LiveBrowserHub:
 
     # ---------------- Hosted AsyncCamoufox Lifecycle ----------------
 
+    async def _stop_hosted_locked(self) -> None:
+        if self.engine_mode != "async_hosted":
+            return
+        await self._capture_once()
+        cm = self.camoufox_cm
+        fd = self.lock_fd
+        ephemeral_dir = self._ephemeral_dir
+        self.camoufox_cm = None
+        self.ctx = None
+        self.lock_fd = None
+        self._ephemeral_dir = None
+        self.engine_mode = "idle"
+        self.x11_display = None
+        self._last_x11_clip = ""
+        self.tabs = []
+        self.ai_status = ""
+        self.takeover = False
+        self.takeover_reason = ""
+        self.active_profile = ""
+        self.active_profile_dir = None
+        self.active_pinned = False
+        self.active_egress = "direct"
+        self.active_os = ""
+        self.active_fingerprint = {}
+        self.ai_allowed_event.set()
+
+        if cm is not None:
+            try:
+                await cm.__aexit__(None, None, None)
+            except Exception as exc:
+                log.warning("Error closing AsyncCamoufox: %s", exc)
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+        if ephemeral_dir is not None and ephemeral_dir.exists():
+            shutil.rmtree(ephemeral_dir, ignore_errors=True)
+        log.info("Stopped hosted AsyncCamoufox and released profile lock")
+
     async def start_hosted(
         self,
         initial_url: str | None = None,
         bot_hint: str | None = None,
         notify_tg: bool = True,
         lock_timeout: float = 45.0,
+        profile: str | None = None,
+        overrides: dict[str, Any] | None = None,
+        restart: bool = False,
     ) -> dict[str, Any]:
         async with self._engine_lock:
             self.last_activity_ts = time.monotonic()
             if self.engine_mode == "sync_external":
                 raise RuntimeError("当前已有外部同步脚本持有浏览器会话。")
 
-            if self.engine_mode != "async_hosted":
-                if not PROFILE_DIR.is_dir():
-                    raise FileNotFoundError(f"Pinned Google profile missing: {PROFILE_DIR}")
+            spec = resolve_launch_spec(profile_name=profile, overrides=overrides)
+            has_explicit_overrides = bool(
+                overrides
+                and any(
+                    v is not None and not (k == "ephemeral" and v is False)
+                    for k, v in overrides.items()
+                )
+            )
+            if self.engine_mode == "async_hosted":
+                wants_switch = (spec["name"] != self.active_profile) or has_explicit_overrides
+                if wants_switch:
+                    if not restart:
+                        raise RuntimeError(
+                            f"当前正在运行 Profile '{self.active_profile}'，请先执行 `live-browser stop` 或传入 `--restart` 切换至 '{spec['name']}'。"
+                        )
+                    if self.takeover or self.ai_busy_count > 0:
+                        raise RuntimeError(
+                            "当前浏览器处于人工接管或任务执行中，暂不允许自动重启切换，请先结束接管/等待任务完成后再切换。"
+                        )
+                    await self._stop_hosted_locked()
 
-                PROFILE_DIR.parent.mkdir(parents=True, exist_ok=True)
-                os.chmod(PROFILE_DIR.parent, 0o700)
-                fd = os.open(LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o600)
+            if self.engine_mode != "async_hosted":
+                ephemeral_dir: Path | None = None
+                if spec["persistent"]:
+                    user_data_dir = Path(spec["profile_dir"])
+                    if spec["pinned"]:
+                        if not user_data_dir.is_dir():
+                            raise FileNotFoundError(f"Pinned profile missing: {user_data_dir}")
+                    else:
+                        user_data_dir.mkdir(parents=True, exist_ok=True)
+                        os.chmod(user_data_dir, 0o700)
+                else:
+                    ephemeral_dir = Path(tempfile.mkdtemp(prefix=f"agy-live-{spec['name']}-"))
+                    os.chmod(ephemeral_dir, 0o700)
+                    user_data_dir = ephemeral_dir
+
+                lock_path = Path(spec["lock_path"])
+                lock_path.parent.mkdir(parents=True, exist_ok=True)
+                os.chmod(lock_path.parent, 0o700)
+                fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
                 deadline = time.monotonic() + lock_timeout
                 try:
                     while True:
@@ -670,19 +1470,14 @@ class LiveBrowserHub:
                             break
                         except BlockingIOError:
                             if time.monotonic() >= deadline:
-                                raise TimeoutError(f"等待 {PROFILE_DIR.name} 浏览器锁超时。")
+                                raise TimeoutError(f"等待 {spec['name']} 浏览器锁超时。")
                             await asyncio.sleep(0.25)
-                    _clean_stale_firefox_locks()
+                    _clean_stale_firefox_locks(user_data_dir)
+
+                    kwargs, egress_summary = build_camoufox_kwargs(spec, user_data_dir)
 
                     from camoufox.async_api import AsyncCamoufox
 
-                    kwargs = {
-                        **PINNED_FINGERPRINT,
-                        "persistent_context": True,
-                        "user_data_dir": str(PROFILE_DIR),
-                        "env": _direct_env(),
-                        "firefox_user_prefs": {"network.proxy.type": 0},
-                    }
                     cm = AsyncCamoufox(**kwargs)
                     ctx = await cm.__aenter__()
                 except Exception:
@@ -691,14 +1486,28 @@ class LiveBrowserHub:
                     except Exception:
                         pass
                     os.close(fd)
+                    if ephemeral_dir is not None and ephemeral_dir.exists():
+                        shutil.rmtree(ephemeral_dir, ignore_errors=True)
                     raise
 
                 self.lock_fd = fd
                 self.camoufox_cm = cm
                 self.ctx = ctx
                 self.engine_mode = "async_hosted"
+                self.active_profile = spec["name"]
+                self.active_profile_dir = user_data_dir
+                self._ephemeral_dir = ephemeral_dir
+                self.active_pinned = bool(spec["pinned"])
+                self.active_egress = egress_summary
+                self.active_os = str(spec.get("os") or "windows")
+                fp_summary: dict[str, Any] = {"os": self.active_os, "persistent": bool(spec["persistent"])}
+                for fp_key in ("locale", "window", "webgl_config", "block_webrtc", "geoip"):
+                    if spec.get(fp_key) is not None:
+                        fp_summary[fp_key] = spec[fp_key]
+                self.active_fingerprint = fp_summary
+
                 self.ai_status = "已启动安全浏览器"
-                self.x11_display = resolve_camoufox_display(ctx)
+                self.x11_display = resolve_camoufox_display(ctx, self.active_profile_dir)
                 self._last_x11_clip = await read_x11_clipboard_async(self.x11_display)
                 log.info("Resolved Camoufox X11 display=%s", self.x11_display)
 
@@ -714,7 +1523,13 @@ class LiveBrowserHub:
                 if not ctx.pages:
                     await ctx.new_page()
                 self.active_tab_index = max(0, len(ctx.pages) - 1)
-                log.info("Started hosted AsyncCamoufox on profile %s", PROFILE_DIR)
+                log.info(
+                    "Started hosted AsyncCamoufox profile=%s pinned=%s os=%s egress=%s",
+                    self.active_profile,
+                    self.active_pinned,
+                    self.active_os,
+                    self.active_egress,
+                )
 
             page = self._current_page()
             if initial_url and page:
@@ -736,32 +1551,7 @@ class LiveBrowserHub:
         async with self._engine_lock:
             if self.engine_mode != "async_hosted":
                 return
-            await self._capture_once()
-            cm = self.camoufox_cm
-            fd = self.lock_fd
-            self.camoufox_cm = None
-            self.ctx = None
-            self.lock_fd = None
-            self.engine_mode = "idle"
-            self.x11_display = None
-            self._last_x11_clip = ""
-            self.tabs = []
-            self.ai_status = ""
-            self.takeover = False
-            self.takeover_reason = ""
-            self.ai_allowed_event.set()
-
-            if cm is not None:
-                try:
-                    await cm.__aexit__(None, None, None)
-                except Exception as exc:
-                    log.warning("Error closing AsyncCamoufox: %s", exc)
-            if fd is not None:
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-                finally:
-                    os.close(fd)
-            log.info("Stopped hosted AsyncCamoufox and released profile lock")
+            await self._stop_hosted_locked()
 
         if notify_finished:
             await self.tg.tick_updates(finished=True, force=True)
@@ -830,7 +1620,7 @@ class LiveBrowserHub:
         if self.engine_mode != "async_hosted":
             return
         if not self.x11_display:
-            self.x11_display = resolve_camoufox_display(self.ctx)
+            self.x11_display = resolve_camoufox_display(self.ctx, self.active_profile_dir)
             if self.x11_display:
                 self._last_x11_clip = await read_x11_clipboard_async(self.x11_display)
                 return
@@ -1548,13 +2338,85 @@ async def internal_start(request: web.Request) -> web.Response:
     hub: LiveBrowserHub = request.app["hub"]
     check_local_auth(request, hub)
     body = await request.json()
+    overrides: dict[str, Any] = {}
+    for key in (
+        "os",
+        "locale",
+        "window",
+        "webgl_config",
+        "block_webrtc",
+        "geoip",
+        "proxy",
+        "proxy_bao_ref",
+        "ephemeral",
+        "persistent",
+        "headless",
+        "user_data_dir",
+        "persistent_context",
+    ):
+        if key in body and body[key] is not None:
+            overrides[key] = body[key]
     try:
         st = await hub.start_hosted(
             initial_url=body.get("url"),
             bot_hint=body.get("bot"),
             notify_tg=bool(body.get("notify", True)),
+            profile=body.get("profile"),
+            overrides=overrides or None,
+            restart=bool(body.get("restart", False)),
         )
         return web.json_response({"ok": True, **st})
+    except ValueError as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=400)
+    except (KeyError, FileNotFoundError) as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=404)
+    except RuntimeError as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=409)
+    except Exception as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=500)
+
+
+async def internal_profiles_list(request: web.Request) -> web.Response:
+    hub: LiveBrowserHub = request.app["hub"]
+    check_local_auth(request, hub)
+    return web.json_response(
+        {
+            "ok": True,
+            "active_profile": hub.active_profile or None,
+            "profiles": list_profiles(active_profile=hub.active_profile),
+        }
+    )
+
+
+async def internal_profiles_create(request: web.Request) -> web.Response:
+    hub: LiveBrowserHub = request.app["hub"]
+    check_local_auth(request, hub)
+    body = await request.json()
+    name = body.get("name", "")
+    overwrite = bool(body.get("overwrite", False))
+    cfg = {k: v for k, v in body.items() if k not in ("name", "overwrite")}
+    try:
+        prof = create_profile(name, cfg, overwrite=overwrite)
+        return web.json_response({"ok": True, "profile": prof})
+    except ValueError as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=400)
+    except Exception as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=500)
+
+
+async def internal_profiles_delete(request: web.Request) -> web.Response:
+    hub: LiveBrowserHub = request.app["hub"]
+    check_local_auth(request, hub)
+    name = request.match_info.get("name", "")
+    try:
+        res = delete_profile(name, active_profile=hub.active_profile)
+        return web.json_response(res)
+    except KeyError as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=404)
+    except ValueError as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=400)
+    except RuntimeError as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=409)
     except Exception as exc:
         return web.json_response({"ok": False, "error": str(exc)}, status=500)
 
@@ -1614,6 +2476,14 @@ async def internal_sync_start(request: web.Request) -> web.Response:
     if hub.engine_mode == "async_hosted":
         await hub.stop_hosted(notify_finished=False)
     hub.engine_mode = "sync_external"
+    host_pinned = discover_pinned_host_profile()
+    if host_pinned is not None:
+        hub.active_profile = host_pinned["name"]
+        hub.active_profile_dir = Path(host_pinned["profile_dir"])
+        hub.active_pinned = True
+        hub.active_egress = "direct"
+        hub.active_os = str(host_pinned["fingerprint"].get("os", "windows"))
+        hub.active_fingerprint = {"os": hub.active_os, "persistent": True}
     hub.sync_cmd_queue.clear()
     hub.ai_status = str(body.get("ai_status") or "外部脚本运行中")
     hub.last_activity_ts = time.monotonic()
@@ -1702,6 +2572,12 @@ async def internal_sync_stop(request: web.Request) -> web.Response:
         hub.engine_mode = "idle"
         hub.takeover = False
         hub.takeover_reason = ""
+        hub.active_profile = ""
+        hub.active_profile_dir = None
+        hub.active_pinned = False
+        hub.active_egress = "direct"
+        hub.active_os = ""
+        hub.active_fingerprint = {}
         hub.ai_allowed_event.set()
         hub.sync_cmd_queue.clear()
         await hub.tg.tick_updates(finished=True, force=True)
@@ -1710,6 +2586,8 @@ async def internal_sync_stop(request: web.Request) -> web.Response:
 
 
 def create_app() -> web.Application:
+    if web is None:
+        raise RuntimeError("aiohttp is required to run the Live Browser Hub server")
     cfg, local_token = ensure_local_config()
     hub = LiveBrowserHub(cfg, local_token)
     app = web.Application(client_max_size=12 * 1024 * 1024)
@@ -1734,6 +2612,9 @@ def create_app() -> web.Application:
     app.router.add_post("/internal/action", internal_action)
     app.router.add_post("/internal/config", internal_config)
     app.router.add_post("/internal/yield-lock", internal_yield_lock)
+    app.router.add_get("/internal/profiles", internal_profiles_list)
+    app.router.add_post("/internal/profiles", internal_profiles_create)
+    app.router.add_delete("/internal/profiles/{name}", internal_profiles_delete)
     app.router.add_post("/internal/sync/start", internal_sync_start)
     app.router.add_post("/internal/sync/push", internal_sync_push)
     app.router.add_post("/internal/sync/clipboard", internal_sync_clipboard)

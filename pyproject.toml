@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agy-bot"
 version = "3.2.0"
-description = "Real-time multi-bot Telegram bridge, live browser takeover, and companion stack for Google Antigravity CLI"
+description = "Native Google Antigravity CLI (agy) companion stack: multi-bot Telegram team bridge, multi-fingerprint live browser Mini App takeover, OpenBao secret ops, and self-healing memory"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }

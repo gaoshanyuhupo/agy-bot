@@ -9,11 +9,21 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import time
 from typing import Any
 import urllib.parse
 
 import requests
+
+
+def _import_server_module() -> Any:
+    scripts_dir = str(Path(__file__).resolve().parent)
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    import live_browser_server
+
+    return live_browser_server
 
 CONFIG_DIR = Path(os.environ.get("AGY_LIVE_BROWSER_CONFIG_DIR", str(Path.home() / ".config/agy-live-browser")))
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -87,14 +97,91 @@ class LiveBrowserClient:
         r.raise_for_status()
         return r.json()
 
-    def start(self, url: str | None = None, notify: bool = True) -> dict[str, Any]:
+    def start(
+        self,
+        url: str | None = None,
+        notify: bool = True,
+        *,
+        profile: str | None = None,
+        os_name: str | None = None,
+        locale: str | None = None,
+        window: list[int] | str | None = None,
+        webgl_config: list[str] | str | None = None,
+        block_webrtc: bool | None = None,
+        geoip: bool | str | None = None,
+        proxy: str | dict[str, str] | None = None,
+        proxy_bao_ref: str | None = None,
+        ephemeral: bool = False,
+        restart: bool = False,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"url": url, "bot": self.bot, "notify": notify}
+        if profile is not None:
+            payload["profile"] = profile
+        if os_name is not None:
+            payload["os"] = os_name
+        if locale is not None:
+            payload["locale"] = locale
+        if window is not None:
+            payload["window"] = window
+        if webgl_config is not None:
+            payload["webgl_config"] = webgl_config
+        if block_webrtc is not None:
+            payload["block_webrtc"] = block_webrtc
+        if geoip is not None:
+            payload["geoip"] = geoip
+        if proxy is not None:
+            payload["proxy"] = proxy
+        if proxy_bao_ref is not None:
+            payload["proxy_bao_ref"] = proxy_bao_ref
+        if ephemeral:
+            payload["ephemeral"] = True
+        if restart:
+            payload["restart"] = True
         r = self.session.post(
             f"{self.base_url}/internal/start",
             headers=self._headers(),
-            json={"url": url, "bot": self.bot, "notify": notify},
+            json=payload,
             timeout=65.0,
         )
         return r.json()
+
+    def list_profiles(self) -> dict[str, Any]:
+        if self.is_alive() and self.token:
+            r = self.session.get(
+                f"{self.base_url}/internal/profiles", headers=self._headers(), timeout=5.0
+            )
+            return r.json()
+        srv = _import_server_module()
+
+        return {"ok": True, "active_profile": None, "profiles": srv.list_profiles()}
+
+    def create_profile(self, name: str, overwrite: bool = False, **kwargs: Any) -> dict[str, Any]:
+        payload = {"name": name, "overwrite": overwrite, **{k: v for k, v in kwargs.items() if v is not None}}
+        if self.is_alive() and self.token:
+            r = self.session.post(
+                f"{self.base_url}/internal/profiles",
+                headers=self._headers(),
+                json=payload,
+                timeout=10.0,
+            )
+            return r.json()
+        srv = _import_server_module()
+
+        prof = srv.create_profile(name, kwargs, overwrite=overwrite)
+        return {"ok": True, "profile": prof}
+
+    def delete_profile(self, name: str) -> dict[str, Any]:
+        if self.is_alive() and self.token:
+            safe_name = urllib.parse.quote(name, safe="")
+            r = self.session.delete(
+                f"{self.base_url}/internal/profiles/{safe_name}",
+                headers=self._headers(),
+                timeout=10.0,
+            )
+            return r.json()
+        srv = _import_server_module()
+
+        return srv.delete_profile(name)
 
     def stop(self) -> dict[str, Any]:
         r = self.session.post(
@@ -492,6 +579,20 @@ class WrappedSyncContext:
 # ---------------- CLI Entrypoint ----------------
 
 
+def _parse_geoip_arg(raw: Any) -> bool | str | None:
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        return raw
+    txt = str(raw).strip()
+    low = txt.lower()
+    if low in ("true", "1", "yes"):
+        return True
+    if low in ("false", "0", "no"):
+        return False
+    return txt
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Control AGY Live Browser (Telegram Mini App real-time view + human takeover)."
@@ -501,9 +602,41 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("status", help="Inspect Live Browser Hub status and public Mini App URL.")
 
-    p_start = sub.add_parser("start", help="Start hosted persistent Google Camoufox session.")
+    p_start = sub.add_parser("start", help="Start hosted Camoufox session (pinned default or named profile).")
     p_start.add_argument("--url", help="Optional initial URL to open.")
     p_start.add_argument("--no-notify", action="store_true", help="Skip sending Telegram live card.")
+    p_start.add_argument("--profile", help="Profile name (defaults to host-pinned profile or 'default').")
+    p_start.add_argument("--os", dest="os_name", choices=["windows", "macos", "linux"], help="Override OS fingerprint.")
+    p_start.add_argument("--locale", help="Override browser locale (e.g. en-US, zh-CN, ja-JP).")
+    p_start.add_argument("--window", help="Override window size WxH (e.g. 1440x900).")
+    p_start.add_argument("--webgl", dest="webgl_config", help="Override WebGL VENDOR,RENDERER.")
+    p_start.add_argument("--block-webrtc", action="store_true", default=None, help="Block WebRTC leaks.")
+    p_start.add_argument("--geoip", nargs="?", const="true", default=None, help="Enable Camoufox GeoIP (true or IP).")
+    p_start.add_argument("--proxy", help="Egress proxy URL (e.g. socks5://proxy.example.com:1080).")
+    p_start.add_argument("--proxy-bao", dest="proxy_bao_ref", help="OpenBao secret ref for proxy (e.g. kv/proxies/us-west).")
+    p_start.add_argument("--ephemeral", action="store_true", help="Use temporary profile directory cleaned up on stop.")
+    p_start.add_argument("--restart", action="store_true", help="Safely restart & switch profile if idle.")
+
+    p_prof = sub.add_parser("profile", help="Manage named browser profiles, fingerprints, and proxy egress.")
+    prof_sub = p_prof.add_subparsers(dest="profile_cmd", required=True)
+
+    prof_sub.add_parser("list", help="List configured and host-pinned browser profiles.")
+
+    p_prof_create = prof_sub.add_parser("create", help="Create a named browser profile.")
+    p_prof_create.add_argument("name", help="Profile name (alphanumeric, '.', '_', '-').")
+    p_prof_create.add_argument("--os", dest="os_name", choices=["windows", "macos", "linux"], default="windows")
+    p_prof_create.add_argument("--locale", help="Browser locale (e.g. en-US, ja-JP).")
+    p_prof_create.add_argument("--window", help="Window size WxH (e.g. 1440x900).")
+    p_prof_create.add_argument("--webgl", dest="webgl_config", help="WebGL VENDOR,RENDERER.")
+    p_prof_create.add_argument("--block-webrtc", action="store_true", default=None, help="Block WebRTC leaks.")
+    p_prof_create.add_argument("--geoip", nargs="?", const="true", default=None, help="Enable Camoufox GeoIP (true or IP).")
+    p_prof_create.add_argument("--proxy", help="Proxy URL (e.g. socks5://proxy.example.com:1080).")
+    p_prof_create.add_argument("--proxy-bao", dest="proxy_bao_ref", help="OpenBao secret ref for proxy (e.g. kv/proxies/us-west).")
+    p_prof_create.add_argument("--ephemeral", action="store_true", help="Mark profile ephemeral (non-persistent).")
+    p_prof_create.add_argument("--overwrite", action="store_true", help="Overwrite existing profile config.")
+
+    p_prof_del = prof_sub.add_parser("delete", help="Delete a non-pinned, stopped named profile.")
+    p_prof_del.add_argument("name", help="Profile name to delete.")
 
     sub.add_parser("stop", help="Stop hosted browser session and release profile lock.")
 
@@ -558,43 +691,81 @@ def main() -> int:
     args = build_parser().parse_args()
     cli = LiveBrowserClient(bot=args.bot)
 
-    if args.cmd == "status":
-        out = cli.status()
-    elif args.cmd == "start":
-        out = cli.start(url=args.url, notify=not args.no_notify)
-    elif args.cmd == "stop":
-        out = cli.stop()
-    elif args.cmd == "open":
-        out = cli.action("goto", url=args.url)
-    elif args.cmd == "click":
-        out = cli.action("click", target=args.target)
-    elif args.cmd == "fill":
-        out = cli.action("fill", selector=args.selector, text=args.text, submit=args.submit)
-    elif args.cmd == "type":
-        out = cli.action("type", text=args.text, submit=args.submit)
-    elif args.cmd == "press":
-        out = cli.action("press", key=args.key)
-    elif args.cmd == "wait":
-        out = cli.action("wait", target=args.target)
-    elif args.cmd == "text":
-        out = cli.action("text", selector=args.selector)
-    elif args.cmd == "eval":
-        out = cli.action("eval", expression=args.expression)
-    elif args.cmd == "screenshot":
-        out = cli.action("screenshot", path=args.path, full_page=args.full_page)
-    elif args.cmd == "wait-human":
-        out = cli.action(
-            "wait_human",
-            reason=args.reason,
-            timeout=args.timeout,
-            timeout_http=args.timeout + 15.0,
-        )
-    elif args.cmd == "set-public-url":
-        out = cli.update_config(public_url=args.url)
-    elif args.cmd == "notify":
-        out = cli.update_config(ensure_card=True, force_new=args.new)
-    else:
-        raise SystemExit(f"Unknown command: {args.cmd}")
+    try:
+        if args.cmd == "status":
+            out = cli.status()
+        elif args.cmd == "start":
+            out = cli.start(
+                url=args.url,
+                notify=not args.no_notify,
+                profile=args.profile,
+                os_name=args.os_name,
+                locale=args.locale,
+                window=args.window,
+                webgl_config=args.webgl_config,
+                block_webrtc=args.block_webrtc,
+                geoip=_parse_geoip_arg(args.geoip),
+                proxy=args.proxy,
+                proxy_bao_ref=args.proxy_bao_ref,
+                ephemeral=args.ephemeral,
+                restart=args.restart,
+            )
+        elif args.cmd == "profile":
+            if args.profile_cmd == "list":
+                out = cli.list_profiles()
+            elif args.profile_cmd == "create":
+                out = cli.create_profile(
+                    args.name,
+                    overwrite=args.overwrite,
+                    os=args.os_name,
+                    locale=args.locale,
+                    window=args.window,
+                    webgl_config=args.webgl_config,
+                    block_webrtc=args.block_webrtc,
+                    geoip=_parse_geoip_arg(args.geoip),
+                    proxy=args.proxy,
+                    proxy_bao_ref=args.proxy_bao_ref,
+                    persistent=False if args.ephemeral else True,
+                )
+            elif args.profile_cmd == "delete":
+                out = cli.delete_profile(args.name)
+            else:
+                raise SystemExit(f"Unknown profile command: {args.profile_cmd}")
+        elif args.cmd == "stop":
+            out = cli.stop()
+        elif args.cmd == "open":
+            out = cli.action("goto", url=args.url)
+        elif args.cmd == "click":
+            out = cli.action("click", target=args.target)
+        elif args.cmd == "fill":
+            out = cli.action("fill", selector=args.selector, text=args.text, submit=args.submit)
+        elif args.cmd == "type":
+            out = cli.action("type", text=args.text, submit=args.submit)
+        elif args.cmd == "press":
+            out = cli.action("press", key=args.key)
+        elif args.cmd == "wait":
+            out = cli.action("wait", target=args.target)
+        elif args.cmd == "text":
+            out = cli.action("text", selector=args.selector)
+        elif args.cmd == "eval":
+            out = cli.action("eval", expression=args.expression)
+        elif args.cmd == "screenshot":
+            out = cli.action("screenshot", path=args.path, full_page=args.full_page)
+        elif args.cmd == "wait-human":
+            out = cli.action(
+                "wait_human",
+                reason=args.reason,
+                timeout=args.timeout,
+                timeout_http=args.timeout + 15.0,
+            )
+        elif args.cmd == "set-public-url":
+            out = cli.update_config(public_url=args.url)
+        elif args.cmd == "notify":
+            out = cli.update_config(ensure_card=True, force_new=args.new)
+        else:
+            raise SystemExit(f"Unknown command: {args.cmd}")
+    except (ValueError, KeyError, RuntimeError) as exc:
+        out = {"ok": False, "error": str(exc)}
 
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0 if out.get("ok", True) else 1
