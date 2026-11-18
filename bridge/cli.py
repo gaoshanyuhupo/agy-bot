@@ -23,6 +23,10 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 BRIDGE_PKG_DIR = Path(__file__).resolve().parent
 RUNTIME_BRIDGE_FILES: Tuple[str, ...] = (
     "bridge.py",
+    "formatting.py",
+    "access_control.py",
+    "model_failover.py",
+    "cost_usage.py",
     "scheduler.py",
     "bot_bus.py",
     "bot_bus_mcp.py",

@@ -17,7 +17,6 @@ Key Real-Time Architecture:
 import collections
 import datetime
 import fcntl
-import glob
 import hashlib
 import html as html_mod
 import itertools
@@ -52,6 +51,26 @@ try:
 except ImportError:
     from bridge import bot_bus
 
+try:
+    import formatting
+except ImportError:
+    from bridge import formatting
+
+try:
+    import access_control
+except ImportError:
+    from bridge import access_control
+
+try:
+    import model_failover
+except ImportError:
+    from bridge import model_failover
+
+try:
+    import cost_usage
+except ImportError:
+    from bridge import cost_usage
+
 # Load local .env file if present
 _env_file = os.environ.get("AGY_TG_ENV_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 if os.path.isfile(_env_file):
@@ -65,7 +84,12 @@ if os.path.isfile(_env_file):
 HOME = os.path.expanduser("~")
 BOT_TOKEN = os.environ.get("AGY_TG_BOT_TOKEN", "")
 ALLOWED = {int(x) for x in os.environ.get("AGY_TG_ALLOWED_CHATS", "").split(",") if x.strip()}
-ALLOWED_USERS = {int(x) for x in os.environ.get("AGY_TG_ALLOWED_USERS", "").split(",") if x.strip()}
+ALLOWED_USERS = access_control.parse_uid_set(os.environ.get("AGY_TG_ALLOWED_USERS", ""))
+ADMIN_USERS = access_control.parse_uid_set(os.environ.get("AGY_TG_ADMIN_USERS", ""))
+READONLY_USERS = access_control.parse_uid_set(os.environ.get("AGY_TG_READONLY_USERS", ""))
+ALLOW_GROUP_READONLY = access_control.parse_bool_flag(os.environ.get("AGY_TG_ALLOW_GROUP_READONLY", "0"), default=False)
+FALLBACK_MODELS_RAW = os.environ.get("AGY_TG_FALLBACK_MODELS", "").strip()
+FALLBACK_MODELS = model_failover.parse_fallback_models(FALLBACK_MODELS_RAW)
 WORKDIR = os.path.realpath(os.environ.get("AGY_TG_WORKDIR", os.path.join(HOME, "agy-workspace")))
 UPLOADDIR = os.path.join(WORKDIR, "uploads")
 BRAIN_ROOT = os.path.join(HOME, ".gemini/antigravity-cli/brain")
@@ -352,7 +376,7 @@ def _record_auto_compact_failure(cid):
 PRIMARY_CHAT_ID = next((c for c in sorted(ALLOWED) if c > 0), next(iter(sorted(ALLOWED)), None))
 PRIMARY_SCOPE_KEY = str(PRIMARY_CHAT_ID) if PRIMARY_CHAT_ID is not None else "default"
 
-_SCOPE_PREF_KEYS = ("mode", "model", "effort", "thinking", "auto_compact", "auto_compact_tokens")
+_SCOPE_PREF_KEYS = ("mode", "model", "fallback_models", "effort", "thinking", "auto_compact", "auto_compact_tokens")
 
 
 def _normalize_thread_id(tid):
@@ -406,17 +430,21 @@ def parse_scope_key(scope_key):
         return PRIMARY_CHAT_ID, None
 
 
+def _get_user_role(chat_id, from_user=None, allow_uid_fallback=False):
+    return access_control.resolve_user_role(
+        chat_id,
+        from_user=from_user,
+        allowed_chats=ALLOWED,
+        allowed_users=ALLOWED_USERS,
+        admin_users=ADMIN_USERS,
+        readonly_users=READONLY_USERS,
+        allow_group_readonly=ALLOW_GROUP_READONLY,
+        allow_uid_fallback=allow_uid_fallback,
+    )
+
+
 def _is_authorized(chat_id, from_user=None, allow_uid_fallback=False):
-    if not ALLOWED:
-        return False
-    uid = (from_user or {}).get("id") if isinstance(from_user, dict) else None
-    if ALLOWED_USERS and uid is not None and uid not in ALLOWED_USERS:
-        return False
-    if chat_id in ALLOWED:
-        return True
-    if allow_uid_fallback and uid is not None and uid in ALLOWED:
-        return True
-    return False
+    return _get_user_role(chat_id, from_user=from_user, allow_uid_fallback=allow_uid_fallback) in ("admin", "readonly")
 
 
 def _format_scope_badge(chat_id, thread_id=None):
@@ -436,6 +464,7 @@ def _default_scope_state(prefs_source=None):
         "workdir": None,
         "mode": src.get("mode") or "auto",
         "model": src.get("model"),
+        "fallback_models": src.get("fallback_models"),
         "effort": src.get("effort"),
         "thinking": bool(src.get("thinking", True)),
         "auto_compact": bool(src.get("auto_compact", True)),
@@ -455,6 +484,7 @@ state = {
     "workdir": None,
     "mode": "auto",
     "model": None,
+    "fallback_models": None,
     "effort": None,
     "thinking": True,
     "auto_compact": True,
@@ -472,8 +502,8 @@ def _sync_top_level_mirrors_locked():
     prim_key = state.get("primary_scope") or PRIMARY_SCOPE_KEY
     prim = scopes.get(prim_key)
     if isinstance(prim, dict):
-        for k in ("conversation_id", "project", "workdir", "mode", "model", "effort",
-                  "thinking", "auto_compact", "auto_compact_tokens"):
+        for k in ("conversation_id", "project", "workdir", "mode", "model", "fallback_models",
+                  "effort", "thinking", "auto_compact", "auto_compact_tokens"):
             state[k] = prim.get(k)
     active_inf = None
     for sc in scopes.values():
@@ -1117,16 +1147,17 @@ class AgySession:
     with non-blocking stdout event queue for instant cancellation & 60ms result lookahead.
     """
 
-    def __init__(self, conv, mode, model, effort, project=None, workdir=None, scope_key=None):
+    def __init__(self, conv, mode, model, effort, project=None, workdir=None, scope_key=None, readonly=False):
         self.cid = conv
-        self.mode = mode
+        self.readonly = bool(readonly)
+        self.mode = "safe" if self.readonly else mode
         self.model = model
         self.effort = effort
         self.scope_key = scope_key or PRIMARY_SCOPE_KEY
         self.project = project
         self.workdir = workdir or WORKDIR
         self.bus_role = _current_bot_role()
-        self.bus_enable = _desired_bus_enable(self.scope_key)
+        self.bus_enable = False if self.readonly else _desired_bus_enable(self.scope_key)
         self.spawned_at = time.time()
         self.last_used = self.spawned_at
         self.stderr_tail = collections.deque(maxlen=80)
@@ -1140,7 +1171,7 @@ class AgySession:
             "--output-format", "stream-json",
             "--print-timeout", PRINT_TIMEOUT,
         ]
-        if mode == "auto":
+        if self.mode == "auto" and not self.readonly:
             cmd.append("--dangerously-skip-permissions")
         if self.project:
             cmd += ["--project", self.project]
@@ -1166,9 +1197,10 @@ class AgySession:
         env["AGY_BOT_THREAD_ID"] = str(origin_tid) if origin_tid is not None else ""
         env["AGY_BOT_CHAIN"] = ""
         env["AGY_BOT_MENTION_HOP"] = "0"
+        env["AGY_RBAC_ROLE"] = "readonly" if self.readonly else "admin"
 
-        log("Spawning persistent AgySession (conv=%s, project=%s, cwd=%s, model=%s, effort=%s, mode=%s, bus=%s)"
-            % ((conv or "new")[:8], self.project or "default", self.workdir, model or "default", effort or "default", mode, self.bus_enable))
+        log("Spawning persistent AgySession (conv=%s, project=%s, cwd=%s, model=%s, effort=%s, mode=%s, bus=%s, ro=%s)"
+            % ((conv or "new")[:8], self.project or "default", self.workdir, model or "default", effort or "default", self.mode, self.bus_enable, self.readonly))
         self.proc = subprocess.Popen(
             cmd,
             cwd=self.workdir,
@@ -1247,14 +1279,18 @@ class AgySession:
     def is_alive(self):
         return self.proc is not None and self.proc.poll() is None and not self.eof_reached
 
-    def matches(self, conv, mode, model, effort, project=None, workdir=None):
+    def matches(self, conv, mode, model, effort, project=None, workdir=None, readonly=False):
         if not self.is_alive():
             return False
-        if getattr(self, "bus_enable", False) != _desired_bus_enable(self.scope_key):
+        if getattr(self, "readonly", False) != bool(readonly):
+            return False
+        eff_mode = "safe" if self.readonly else mode
+        expected_bus = False if self.readonly else _desired_bus_enable(self.scope_key)
+        if getattr(self, "bus_enable", False) != expected_bus:
             return False
         if getattr(self, "bus_role", None) != _current_bot_role():
             return False
-        if self.mode != mode or self.model != model or self.effort != effort:
+        if self.mode != eff_mode or self.model != model or self.effort != effort:
             return False
         if self.project != project or self.workdir != (workdir or WORKDIR):
             return False
@@ -1424,136 +1460,10 @@ def check_and_recover_in_flight():
     save_state()
 
 
-# ---------------------------------------------------------------- formatting
-def format_inline_markdown(text):
-    """Format markdown text (outside code blocks) into Telegram HTML."""
-    esc = html_mod.escape(text)
-
-    code_tokens = []
-
-    def save_code(m):
-        code_tokens.append(m.group(1))
-        return f"\x00CODE{len(code_tokens)-1}\x00"
-
-    esc = re.sub(r"`([^`\n]+)`", save_code, esc)
-    esc = re.sub(r"\*\*([^*\n]+)\*\*", r"<b>\1</b>", esc)
-    esc = re.sub(r"__([^_\n]+)__", r"<b>\1</b>", esc)
-    esc = re.sub(r"~~([^~\n]+)~~", r"<s>\1</s>", esc)
-    esc = re.sub(r"(?<!\w)\*([^*\n]+)\*(?!\w)", r"<i>\1</i>", esc)
-    esc = re.sub(r"(?<!\w)_([^_\n]+)_(?!\w)", r"<i>\1</i>", esc)
-    esc = re.sub(
-        r"^(#{1,6})\s+(.+)$",
-        lambda m: f"<b>{re.sub(r'</?b>', '', m.group(2))}</b>",
-        esc,
-        flags=re.MULTILINE,
-    )
-
-    # Markdown images: ![alt](path) -> 🖼 <code>alt</code>
-    esc = re.sub(
-        r"!\[([^\]]*)\]\(([^)\s]+)\)",
-        lambda m: f"🖼 <code>{m.group(1) or os.path.basename(m.group(2))}</code>",
-        esc,
-    )
-    # Local file:// links -> <code>label</code>
-    esc = re.sub(r"\[([^\]]+)\]\(file://[^)\s]+\)", r"<code>\1</code>", esc)
-    # Web/Telegram links
-    esc = re.sub(r"\[([^\]]+)\]\(((?:https?|tg)://[^)\s]+)\)", r'<a href="\2">\1</a>', esc)
-
-    def replace_quote(m):
-        q = m.group(0).replace("&gt; ", "").replace("&gt;", "").strip("\n")
-        return f"<blockquote>{q}</blockquote>"
-
-    esc = re.sub(r"(?:^&gt; .*(?:\n|$))+", replace_quote, esc, flags=re.MULTILINE)
-
-    for idx, code_content in enumerate(code_tokens):
-        esc = esc.replace(f"\x00CODE{idx}\x00", f"<code>{code_content}</code>")
-
-    return esc
-
-
-def md_to_html(text):
-    """Convert full markdown to Telegram HTML, preserving language in code blocks."""
-    if not text:
-        return ""
-
-    code_block_pattern = re.compile(r"```([a-zA-Z0-9_\-\+]*)\n?(.*?)```", re.DOTALL)
-    parts = []
-    last_idx = 0
-    for m in code_block_pattern.finditer(text):
-        if m.start() > last_idx:
-            parts.append(("text", text[last_idx:m.start()]))
-        parts.append(("code", (m.group(1).strip(), m.group(2))))
-        last_idx = m.end()
-
-    if last_idx < len(text):
-        rem = text[last_idx:]
-        if rem.startswith("```"):
-            first_nl = rem.find("\n")
-            if first_nl != -1:
-                lang = rem[3:first_nl].strip()
-                parts.append(("code", (lang, rem[first_nl + 1:])))
-            else:
-                parts.append(("code", ("", rem[3:])))
-        else:
-            parts.append(("text", rem))
-
-    out = []
-    for kind, content in parts:
-        if kind == "code":
-            lang, code = content
-            esc_code = html_mod.escape(code.strip("\r\n"))
-            if lang:
-                out.append(f'<pre><code class="language-{html_mod.escape(lang)}">{esc_code}</code></pre>')
-            else:
-                out.append(f'<pre><code>{esc_code}</code></pre>')
-        else:
-            out.append(format_inline_markdown(content))
-
-    return "".join(out)
-
-
-def split_markdown(text, max_len=3200):
-    """Split long markdown text cleanly at line or code boundaries."""
-    if len(text) <= max_len:
-        return [text]
-
-    lines = text.split("\n")
-    chunks = []
-    current_chunk = []
-    current_len = 0
-    in_code_block = False
-    code_fence = ""
-
-    for line in lines:
-        line_len = len(line) + 1
-        m = re.match(r"^(```+)(\w*)", line)
-
-        if current_len + line_len > max_len and current_chunk:
-            if in_code_block:
-                current_chunk.append("```")
-                chunks.append("\n".join(current_chunk))
-                current_chunk = [f"```{code_fence}", line]
-                current_len = len(current_chunk[0]) + 1 + line_len
-            else:
-                chunks.append("\n".join(current_chunk))
-                current_chunk = [line]
-                current_len = line_len
-        else:
-            current_chunk.append(line)
-            current_len += line_len
-
-        if m:
-            if not in_code_block:
-                in_code_block = True
-                code_fence = m.group(2)
-            else:
-                in_code_block = False
-                code_fence = ""
-
-    if current_chunk:
-        chunks.append("\n".join(current_chunk))
-
-    return chunks
+# ---------------------------------------------------------------- formatting (delegated to formatting.py)
+format_inline_markdown = formatting.format_inline_markdown
+md_to_html = formatting.md_to_html
+split_markdown = formatting.split_markdown
 
 
 def _extract_msg_id(resp):
@@ -1742,105 +1652,10 @@ def send_rich(chat_id, text, header_html=None, footer_str=None, reply_markup=Non
     return last_info
 
 
-def format_tool_label(tool_name, tool_info):
-    """Format tool execution into a clear, informative label for live streaming."""
-    if not tool_name:
-        return ""
-    params = (tool_info or {}).get("parameters") or {}
-    if tool_name == "run_command":
-        summary = params.get("toolSummary")
-        cmd = params.get("CommandLine", "").strip().split("\n")[0]
-        if summary and cmd:
-            return f"sh: {summary[:24]} ({cmd[:28]})"
-        elif summary:
-            return f"sh: {summary[:40]}"
-        return f"sh: {cmd[:42]}" if cmd else "sh"
-    elif tool_name in ("read_file", "view_file"):
-        path = params.get("Path") or params.get("AbsolutePath") or ""
-        return f"read: {os.path.basename(path)[:32]}" if path else "read"
-    elif tool_name in ("edit_file", "replace_file_content", "multi_replace_file_content"):
-        path = params.get("Path") or params.get("TargetFile") or ""
-        return f"edit: {os.path.basename(path)[:32]}" if path else "edit"
-    elif tool_name in ("write_file", "write_to_file"):
-        path = params.get("Path") or params.get("TargetFile") or ""
-        return f"write: {os.path.basename(path)[:32]}" if path else "write"
-    elif tool_name == "search_web":
-        q = params.get("query", "")
-        return f"search: {q[:32]}" if q else "search"
-    elif tool_name == "invoke_subagent":
-        role = params.get("Role") or params.get("TypeName") or "agent"
-        return f"agent: {role[:30]}"
-    elif tool_name == "call_mcp_tool":
-        srv = params.get("ServerName", "")
-        tname = params.get("ToolName", "")
-        return f"mcp: {srv}.{tname}"[:36] if srv else f"mcp: {tname[:30]}"
-    elif tool_name == "context_compaction":
-        return "🧹 自动压缩上下文 (Context Compaction)"
-    return tool_name[:30]
-
-
-def summarize_tool_output(tool_info):
-    """Extract a crisp 1-line outcome snippet from completed tool_info if available."""
-    out = (tool_info or {}).get("output")
-    if not isinstance(out, str) or not out.strip():
-        return ""
-    idx = out.find("Command output:\n")
-    if idx != -1:
-        body = out[idx + len("Command output:\n"):].strip()
-    else:
-        body = out.strip()
-    for line in body.splitlines():
-        s = line.strip()
-        if s and not s.startswith("Created At:") and not s.startswith("Completed At:"):
-            return s[:48] + ("…" if len(s) > 48 else "")
-    return ""
-
-
-def format_usage_suffix(dur, total_tokens, model=None, effort=None):
-    parts = []
-    eff_model = model or "gemini-3.8-flash-high"
-    if effort:
-        eff_effort = effort
-    else:
-        for lvl in ("xhigh", "high", "medium", "low"):
-            if eff_model.endswith("-" + lvl):
-                eff_effort = lvl
-                break
-        else:
-            eff_effort = "default"
-
-    parts.append(f"🤖 {eff_model}")
-    parts.append(f"🧠 {eff_effort}")
-
-    if dur is not None:
-        try:
-            parts.append(f"⏱ {float(dur) / 60.0:.2f} min")
-        except Exception:
-            parts.append(f"⏱ {dur} min")
-
-    if total_tokens is not None:
-        try:
-            m = float(total_tokens) / 1_000_000.0
-            if m < 0.001:
-                tok_str = f"{m:.4f}".rstrip("0").rstrip(".") + " m"
-            elif m < 0.1:
-                tok_str = f"{m:.3f}".rstrip("0").rstrip(".") + " m"
-            else:
-                tok_str = f"{m:.2f}".rstrip("0").rstrip(".") + " m"
-            parts.append(tok_str)
-        except Exception:
-            parts.append(f"{total_tokens} m")
-
-    return " · ".join(parts)
-
-
-def format_tokens_k(tokens):
-    if tokens is None:
-        return "0k"
-    if tokens >= 1000:
-        val = tokens / 1000.0
-        return f"{val:.1f}k" if val < 100 else f"{int(round(val))}k"
-    return str(int(tokens))
+format_tool_label = formatting.format_tool_label
+summarize_tool_output = formatting.summarize_tool_output
+format_usage_suffix = formatting.format_usage_suffix
+format_tokens_k = formatting.format_tokens_k
 
 
 def get_context_stats(cid):
@@ -1922,38 +1737,10 @@ def should_auto_compact(cid, scope_key=None):
     return True, stats
 
 
-_TRANSIENT_ERR_MARKERS = (
-    "oauth2:",
-    "internal_failure",
-    "token refresh",
-    "error getting token source",
-    "not logged into antigravity",
-    "context summarization: request failed",
-    "checkpoint_empty_summary",
-    "502 bad gateway",
-    "503 service unavailable",
-    "504 gateway timeout",
-    "status 502",
-    "status 503",
-    "code = unavailable",
-    "connection reset by peer",
-    "tls handshake timeout",
-    "unexpected eof",
-)
-
-
-def is_transient_agy_error(err_text):
-    if not err_text:
-        return False
-    low = err_text.lower()
-    return any(m in low for m in _TRANSIENT_ERR_MARKERS)
-
-
-def is_summarization_error(err_text):
-    if not err_text:
-        return False
-    low = err_text.lower()
-    return ("context summarization" in low) or ("checkpoint_empty_summary" in low)
+_TRANSIENT_ERR_MARKERS = model_failover.TRANSIENT_ERR_MARKERS
+is_transient_agy_error = model_failover.is_transient_agy_error
+is_summarization_error = model_failover.is_summarization_error
+is_failover_eligible_error = model_failover.is_failover_eligible_error
 
 
 def get_transcript_line_count(cid):
@@ -1998,69 +1785,8 @@ def get_turn_details(cid, start_line=0):
     return thinkings, tool_calls, total_lines
 
 
-def build_thinking_header(thinkings, tool_calls):
-    """Build a collapsible Telegram blockquote (<blockquote expandable>) safely within 3800 chars."""
-    open_tag = "<blockquote expandable>"
-    close_tag = "</blockquote>\n\n"
-    max_inner = 3800 - len(open_tag) - len(close_tag)
-
-    thinking_block = ""
-    if thinkings:
-        joined_thinking = "\n\n".join(t.strip() for t in thinkings if t and t.strip())
-        if len(joined_thinking) > 1600:
-            joined_thinking = joined_thinking[:1600] + "... (truncated)"
-        while joined_thinking and len(html_mod.escape(joined_thinking)) > 2000:
-            joined_thinking = joined_thinking[:max(100, int(len(joined_thinking) * 0.75))] + "... (truncated)"
-        if joined_thinking:
-            thinking_block = "💭 <b>思考过程 (Thinking Process):</b>\n" + html_mod.escape(joined_thinking)
-
-    blocks = [thinking_block] if thinking_block else []
-    used_len = len(thinking_block)
-
-    if tool_calls:
-        tool_hdr = f"🛠 <b>工具调用 (Tool Calls - {len(tool_calls)}):</b>"
-        sep = 2 if blocks else 0
-        if used_len + sep + len(tool_hdr) + 64 <= max_inner:
-            tool_lines = [tool_hdr]
-            used_len += sep + len(tool_hdr)
-            cap = min(len(tool_calls), 25)
-            shown = 0
-            for tc in tool_calls[:cap]:
-                name = tc.get("name", "tool")
-                args = tc.get("args") or {}
-                label = format_tool_label(name, {"parameters": args})
-                line = f"• <code>{html_mod.escape(name)}</code> ({html_mod.escape(label)})"
-                more_note = f"\n• <i>... +{len(tool_calls) - (shown + 1)} more</i>"
-                reserve = len(more_note) if (shown + 1) < len(tool_calls) else 0
-                if used_len + 1 + len(line) + reserve > max_inner:
-                    break
-                tool_lines.append(line)
-                used_len += 1 + len(line)
-                shown += 1
-            if shown < len(tool_calls):
-                tool_lines.append(f"• <i>... +{len(tool_calls) - shown} more</i>")
-            blocks.append("\n".join(tool_lines))
-
-    if not blocks:
-        return ""
-    return open_tag + "\n\n".join(blocks) + close_tag
-
-
-def extract_live_thought_snippet(raw_thought, max_chars=360):
-    """Extract the latest reasoning lines (up to ~4 lines / 360 chars) for live streaming preview."""
-    if not raw_thought:
-        return ""
-    cleaned_lines = []
-    for line in raw_thought.strip().splitlines():
-        s = re.sub(r"^[#>*\s]+", "", line).strip()
-        if s:
-            cleaned_lines.append(s)
-    if not cleaned_lines:
-        return ""
-    tail = "\n".join(cleaned_lines[-4:])
-    if len(tail) > max_chars:
-        tail = "…" + tail[-max_chars:]
-    return tail
+build_thinking_header = formatting.build_thinking_header
+extract_live_thought_snippet = formatting.extract_live_thought_snippet
 
 
 # ---------------------------------------------------------------- Native Real-Time Draft Streamer
@@ -3079,12 +2805,14 @@ def _apply_checkpoint_changes(entry, reverse=False, force=False):
 
 
 # ---------------------------------------------------------------- core execution
-def _acquire_session(scope_key, conv, mode, model, effort, project, workdir, force_new=False):
+def _acquire_session(scope_key, conv, mode, model, effort, project, workdir, force_new=False, readonly=False):
     skey = scope_key or PRIMARY_SCOPE_KEY
     to_close = []
     with session_lock:
         existing = _session_pool.get(skey)
-        if not force_new and existing is not None and existing.matches(conv, mode, model, effort, project, workdir):
+        if not force_new and existing is not None and existing.matches(
+            conv, mode, model, effort, project, workdir, readonly=readonly
+        ):
             return existing, True
         if existing is not None:
             _session_pool.pop(skey, None)
@@ -3107,7 +2835,10 @@ def _acquire_session(scope_key, conv, mode, model, effort, project, workdir, for
             _session_pool.pop(evict_k, None)
             to_close.append(evict_s)
             log("Warm session pool cap (%d) reached; evicting LRU scope=%s" % (MAX_WARM_SESSIONS, evict_k))
-        sess = AgySession(conv, mode, model, effort, project=project, workdir=workdir, scope_key=skey)
+        sess = AgySession(
+            conv, mode, model, effort,
+            project=project, workdir=workdir, scope_key=skey, readonly=readonly,
+        )
         _session_pool[skey] = sess
     for old in to_close:
         close_session_async(old, force=False)
@@ -3125,6 +2856,7 @@ def _compute_workspace_diff_and_footer(
     turn_tool_texts=None,
     step_text="",
     workdir=None,
+    fallback_from=None,
 ):
     dur = time.time() - started
     denied = result.get("denied_actions") or []
@@ -3160,8 +2892,10 @@ def _compute_workspace_diff_and_footer(
         suffix.append("🔒 Denied: " + ", ".join(d.get("action", "?") for d in denied) + " (/mode auto to approve)")
     if finished_reason == "print_timeout":
         suffix.append("⏰ Timeout reached (partial)")
-    usage_str = format_usage_suffix(dur, (result.get("usage") or {}).get("total_tokens"),
-                                    model=model, effort=effort)
+    usage_kw = {"model": model, "effort": effort}
+    if fallback_from:
+        usage_kw["fallback_from"] = fallback_from
+    usage_str = format_usage_suffix(dur, (result.get("usage") or {}).get("total_tokens"), **usage_kw)
     if usage_str:
         suffix.append(usage_str)
     if new_files:
@@ -3178,7 +2912,7 @@ def _sleep_interruptible(seconds):
     return not (cancel_requested or shutting_down)
 
 
-def _execute_compact_on_session(scope_key, conv, mode, model, effort, project, workdir, instruction=""):
+def _execute_compact_on_session(scope_key, conv, mode, model, effort, project, workdir, instruction="", readonly=False):
     """Run `/compact` on `conv` while `turn_running` is held. Auto-retries once on transient OAuth hiccup."""
     if not conv:
         return False, 0.0, "no active conversation"
@@ -3190,7 +2924,8 @@ def _execute_compact_on_session(scope_key, conv, mode, model, effort, project, w
         if cancel_requested or shutting_down:
             return False, time.time() - t0, "cancelled"
         sess, reused_warm = _acquire_session(
-            scope_key, conv, mode, model, effort, project, workdir, force_new=(attempt > 1)
+            scope_key, conv, mode, model, effort, project, workdir,
+            force_new=(attempt > 1), readonly=readonly,
         )
         try:
             sess.send_user_prompt(slash_cmd, raw_slash=True)
@@ -3536,6 +3271,8 @@ def _run_fast_group_reply(
     origin_msg_id=0,
     mention_hop=0,
     busy_desc="",
+    user_role="admin",
+    user_id=None,
 ):
     """Isolated read-only fast-reply lane that never mutates `turn_running`, `state`, or `undo`."""
     norm_tid = _normalize_thread_id(thread_id)
@@ -3563,7 +3300,9 @@ def _run_fast_group_reply(
             advance_cursor=True,
         )
         history_section = f"{history_block}\n\n" if history_block else ""
+        ro_prefix = (access_control.build_readonly_prompt_prefix(user_id) + "\n\n") if user_role == "readonly" else ""
         fast_prompt = (
+            f"{ro_prefix}"
             f"[ACB_FAST_GROUP_CHAT bot=@{my_handle}]\n"
             f"你当前正在后台串行执行耗时任务（{busy_desc or '进行中'}），现在通过【只读快答旁路】响应群内的一条简短提问/点名。\n"
             f"- 严禁修改任何工作区文件或执行写入/提交/部署命令（当前为只读安全模式）。\n"
@@ -3629,7 +3368,7 @@ def _run_fast_group_reply(
                 sent_mid,
                 norm_tid,
                 reply_text,
-                relay_mentions=True,
+                relay_mentions=(user_role != "readonly"),
                 source_hop=mention_hop,
             )
     except Exception as e:
@@ -3644,32 +3383,52 @@ def _run_fast_group_reply(
         _fast_chat_sem.release()
 
 
-def run_agy(chat_id, prompt, thread_id=None, scope_key=None, origin_msg_id=0, mention_hop=0, chain_id=""):
+def run_agy(
+    chat_id,
+    prompt,
+    thread_id=None,
+    scope_key=None,
+    origin_msg_id=0,
+    mention_hop=0,
+    chain_id="",
+    user_role="admin",
+    user_id=None,
+):
     global turn_running, turn_running_scope, turn_running_chat, cancel_requested
 
     norm_tid = _normalize_thread_id(thread_id)
     skey = scope_key or scope_key_for(chat_id, norm_tid)
-    bot_bus.set_origin_context(
-        skey,
-        bot_handle=_current_bot_handle(),
-        chat_id=chat_id,
-        thread_id=norm_tid,
-        msg_id=origin_msg_id,
-        mention_hop=mention_hop,
-        chain_id=chain_id,
-    )
+    session_readonly = (user_role == "readonly")
+    exec_skey = f"{skey}:ro:{user_id if user_id is not None else 'guest'}" if session_readonly else skey
+
+    if not session_readonly:
+        bot_bus.set_origin_context(
+            exec_skey,
+            bot_handle=_current_bot_handle(),
+            chat_id=chat_id,
+            thread_id=norm_tid,
+            msg_id=origin_msg_id,
+            mention_hop=mention_hop,
+            chain_id=chain_id,
+        )
 
     with state_lock:
         sc = _ensure_scope_locked(skey)
-        mode = sc.get("mode", "auto")
+        mode = "safe" if session_readonly else sc.get("mode", "auto")
         model = sc.get("model")
+        scope_fallback = sc.get("fallback_models")
         effort = sc.get("effort")
-        conv = sc.get("conversation_id")
         show_thinking = sc.get("thinking", True)
         project = sc.get("project") or None
         wdir_raw = sc.get("workdir")
-        undo_notice = sc.get("pending_undo_notice")
-        sc["pending_undo_notice"] = None
+        if session_readonly:
+            ro_sc = _ensure_scope_locked(exec_skey)
+            conv = ro_sc.get("conversation_id")
+            undo_notice = None
+        else:
+            conv = sc.get("conversation_id")
+            undo_notice = sc.get("pending_undo_notice")
+            sc["pending_undo_notice"] = None
 
     workdir = WORKDIR
     if wdir_raw:
@@ -3677,8 +3436,16 @@ def run_agy(chat_id, prompt, thread_id=None, scope_key=None, origin_msg_id=0, me
         if os.path.isdir(rw):
             workdir = rw
 
+    candidates = model_failover.resolve_model_chain(
+        model,
+        scope_fallback=scope_fallback,
+        env_fallback=FALLBACK_MODELS_RAW,
+    )
+
     base_prompt = prompt
     prompt_parts = []
+    if session_readonly:
+        prompt_parts.append(access_control.build_readonly_prompt_prefix(user_id))
     if undo_notice:
         prompt_parts.append(undo_notice)
     if chat_id and int(chat_id) < 0 and not (prompt or "").lstrip().startswith("/"):
@@ -3696,22 +3463,22 @@ def run_agy(chat_id, prompt, thread_id=None, scope_key=None, origin_msg_id=0, me
     effective_prompt = "\n\n".join(prompt_parts)
 
     before_files = snapshot_workspace_files(workdir=workdir)
-    undo_manifest = snapshot_undo_manifest(workdir)
+    undo_manifest = None if session_readonly else snapshot_undo_manifest(workdir)
     segment_start_line = get_transcript_line_count(conv)
     started = time.time()
 
     with session_lock:
         turn_running = True
-        turn_running_scope = skey
+        turn_running_scope = exec_skey
         turn_running_chat = chat_id
         cancel_requested = False
 
     update_scope_state(
-        skey,
+        exec_skey,
         in_flight={
             "chat_id": chat_id,
             "thread_id": norm_tid,
-            "scope_key": skey,
+            "scope_key": exec_skey,
             "prompt": base_prompt,
             "started_at": int(started),
             "conv": conv,
@@ -3745,9 +3512,17 @@ def run_agy(chat_id, prompt, thread_id=None, scope_key=None, origin_msg_id=0, me
     coalesced_final_delivered = False
     retry_kb = {"inline_keyboard": [[{"text": "🔁 重试上一轮 (/retry)", "callback_data": "action:retry"}]]}
 
+    pre_turn_conv = conv
+    candidate_idx = 0
+    active_model = candidates[0]
+    primary_model_label = active_model
+    same_model_retries = 0
+    max_same_model_retries = 2
+    attempted_models = []
+
     try:
         # Pre-turn guard: if resuming a heavy session already >= auto_compact_tokens, compact cleanly first!
-        if conv:
+        if conv and not session_readonly:
             pre_need, pre_stats = should_auto_compact(conv, scope_key=skey)
             if pre_need and not cancel_requested and not shutting_down:
                 pre_k = format_tokens_k(pre_stats["raw_ctx_tokens"])
@@ -3755,21 +3530,25 @@ def run_agy(chat_id, prompt, thread_id=None, scope_key=None, origin_msg_id=0, me
                 streamer.set_status_override(
                     f"🧹 <b>当前会话上下文较大 ({pre_k})，正在先自动压缩防超限 ({{elapsed}}s)...</b>"
                 )
-                _execute_compact_on_session(skey, conv, mode, model, effort, project, workdir)
+                _execute_compact_on_session(
+                    exec_skey, conv, mode, active_model, effort, project, workdir,
+                    readonly=session_readonly,
+                )
                 streamer.set_status_override(None)
                 segment_start_line = get_transcript_line_count(conv)
                 turn_start_line = segment_start_line
                 streamer.start_line = segment_start_line
 
-        max_attempts = 3
-        attempt = 0
         result = None
         sess = None
-        while attempt < max_attempts:
-            attempt += 1
+        while True:
             attempt_tools = 0
+            if active_model not in attempted_models:
+                attempted_models.append(active_model)
             sess, reused_warm = _acquire_session(
-                skey, conv, mode, model, effort, project, workdir, force_new=(attempt > 1)
+                exec_skey, conv, mode, active_model, effort, project, workdir,
+                force_new=(same_model_retries > 0 or candidate_idx > 0),
+                readonly=session_readonly,
             )
             if sess.cid and sess.cid != conv:
                 conv = sess.cid
@@ -3777,9 +3556,10 @@ def run_agy(chat_id, prompt, thread_id=None, scope_key=None, origin_msg_id=0, me
             try:
                 sess.send_user_prompt(effective_prompt)
             except Exception as e:
-                log("send_user_prompt failed (reused_warm=%s, attempt=%d): %s" % (reused_warm, attempt, e))
-                if reused_warm and attempt == 1 and not cancel_requested and not shutting_down:
-                    invalidate_session("stdin_broken_pipe", force=True, scope_key=skey)
+                log("send_user_prompt failed (reused_warm=%s, model=%s): %s" % (reused_warm, active_model or "default", e))
+                if reused_warm and same_model_retries == 0 and candidate_idx == 0 and not cancel_requested and not shutting_down:
+                    invalidate_session("stdin_broken_pipe", force=True, scope_key=exec_skey)
+                    same_model_retries += 1
                     continue
                 raise
 
@@ -3806,12 +3586,12 @@ def run_agy(chat_id, prompt, thread_id=None, scope_key=None, origin_msg_id=0, me
                         sess.cid = cid
                         conv = cid
                         with state_lock:
-                            sc = _ensure_scope_locked(skey)
-                            sc["conversation_id"] = cid
-                            if isinstance(sc.get("in_flight"), dict):
-                                sc["in_flight"]["conv"] = cid
-                            if isinstance(sc.get("last_turn"), dict):
-                                sc["last_turn"]["conv"] = cid
+                            sc_w = _ensure_scope_locked(exec_skey)
+                            sc_w["conversation_id"] = cid
+                            if isinstance(sc_w.get("in_flight"), dict):
+                                sc_w["in_flight"]["conv"] = cid
+                            if isinstance(sc_w.get("last_turn"), dict):
+                                sc_w["last_turn"]["conv"] = cid
                         save_state()
                         streamer.set_cid(cid)
                     continue
@@ -3820,6 +3600,8 @@ def run_agy(chat_id, prompt, thread_id=None, scope_key=None, origin_msg_id=0, me
                 sess.last_used = time.time()
 
                 if kind == "step_update":
+                    if streamer.status_override:
+                        streamer.set_status_override(None)
                     su = ev.get("step_update") or {}
                     st = su.get("step_type")
                     state_kind = su.get("state")
@@ -3871,7 +3653,7 @@ def run_agy(chat_id, prompt, thread_id=None, scope_key=None, origin_msg_id=0, me
                             if not final_step_text:
                                 continue
 
-                            cur_cid = conv or get_scope_value(skey, "conversation_id")
+                            cur_cid = conv or get_scope_value(exec_skey, "conversation_id")
                             th_list, tc_list, new_end_line = get_turn_details(cur_cid, segment_start_line)
                             segment_start_line = new_end_line
                             header_html = build_thinking_header(th_list, tc_list) if show_thinking else None
@@ -3880,11 +3662,12 @@ def run_agy(chat_id, prompt, thread_id=None, scope_key=None, origin_msg_id=0, me
                             imm_res, _ = sess.peek_immediate_result(timeout=0.065)
                             if imm_res is not None and imm_res.get("status") == "SUCCESS":
                                 result = imm_res
+                                fb_from = (primary_model_label or "default") if candidate_idx > 0 else None
                                 footer_str, reply_markup = _compute_workspace_diff_and_footer(
-                                    result, before_files, started, model, effort,
+                                    result, before_files, started, active_model, effort,
                                     cid=cur_cid, turn_start_line=turn_start_line,
                                     turn_tool_texts=turn_tool_texts, step_text=final_step_text,
-                                    workdir=workdir,
+                                    workdir=workdir, fallback_from=fb_from,
                                 )
                                 last_msg_info = streamer.finalize_step(
                                     final_step_text, header_html=header_html,
@@ -3896,7 +3679,7 @@ def run_agy(chat_id, prompt, thread_id=None, scope_key=None, origin_msg_id=0, me
                                         last_msg_info[0],
                                         norm_tid,
                                         final_step_text,
-                                        relay_mentions=True,
+                                        relay_mentions=(not session_readonly),
                                         source_hop=mention_hop,
                                     )
                                 delivered_steps += 1
@@ -3916,14 +3699,14 @@ def run_agy(chat_id, prompt, thread_id=None, scope_key=None, origin_msg_id=0, me
                                         last_msg_info[0],
                                         norm_tid,
                                         final_step_text,
-                                        relay_mentions=True,
+                                        relay_mentions=(not session_readonly),
                                         source_hop=mention_hop,
                                     )
                                 delivered_steps += 1
                                 with state_lock:
-                                    sc = _ensure_scope_locked(skey)
-                                    if isinstance(sc.get("in_flight"), dict):
-                                        sc["in_flight"]["last_delivered_text"] = final_step_text
+                                    sc_w = _ensure_scope_locked(exec_skey)
+                                    if isinstance(sc_w.get("in_flight"), dict):
+                                        sc_w["in_flight"]["last_delivered_text"] = final_step_text
                                 save_state()
                                 push_step_images(
                                     chat_id, final_step_text, cur_cid, started, before_files, sent_images,
@@ -3944,38 +3727,72 @@ def run_agy(chat_id, prompt, thread_id=None, scope_key=None, origin_msg_id=0, me
                 break
             if result is not None and result.get("status") != "ERROR":
                 break
-            if result is None and reused_warm and not got_turn_event and attempt == 1:
+            if result is None and reused_warm and not got_turn_event and same_model_retries == 0 and candidate_idx == 0:
                 log("Warm AgySession hit EOF before turn started; respawning fresh session...")
-                invalidate_session("warm_eof", force=True, scope_key=skey)
+                invalidate_session("warm_eof", force=True, scope_key=exec_skey)
+                same_model_retries += 1
                 continue
 
-            # Self-healing retry for transient OAuth2 / pre-invocation context summarization failures!
-            if attempt < max_attempts and delivered_steps == 0 and attempt_tools == 0:
-                err_candidate = ""
-                if result is not None and result.get("status") == "ERROR":
-                    err_candidate = str(result.get("error") or result.get("response") or "")
-                elif result is None and sess is not None:
-                    err_candidate = sess.get_stderr_text()
+            err_candidate = ""
+            if result is not None and result.get("status") == "ERROR":
+                err_candidate = str(result.get("error") or result.get("response") or "")
+            elif result is None and sess is not None:
+                err_candidate = sess.get_stderr_text()
 
-                if is_transient_agy_error(err_candidate):
-                    log("Transient agy error on attempt %d/%d (%s); auto-recovering..."
-                        % (attempt, max_attempts, err_candidate[:200]))
-                    invalidate_session("transient_error_retry", force=True, scope_key=skey)
-                    wait_s = 1.3 * attempt + random.uniform(0.15, 0.75)
+            # Ironclad guard: ONLY recover/failover BEFORE any visible output and BEFORE any tool execution!
+            if model_failover.can_switch_model_safely(delivered_steps, attempt_tools):
+                has_next_fallback = (candidate_idx + 1) < len(candidates)
+                is_quota_model = model_failover.is_quota_or_model_error(err_candidate)
+                is_transient = is_transient_agy_error(err_candidate)
+                is_eligible = model_failover.is_failover_eligible_error(err_candidate)
+
+                same_model_cap = 1 if has_next_fallback else max_same_model_retries
+                if is_transient and not is_quota_model and same_model_retries < same_model_cap:
+                    same_model_retries += 1
+                    log("Transient agy error on model=%s retry %d/%d (%s); auto-recovering..."
+                        % (active_model or "default", same_model_retries, same_model_cap, err_candidate[:200]))
+                    invalidate_session("transient_error_retry", force=True, scope_key=exec_skey)
+                    wait_s = 1.3 * same_model_retries + random.uniform(0.15, 0.75)
                     streamer.set_status_override(
-                        f"🔄 <b>检测到上游凭证/预压缩瞬时波动，正在自动恢复重试 ({attempt}/{max_attempts - 1} · {{elapsed}}s)...</b>"
+                        f"🔄 <b>检测到上游凭证/预压缩瞬时波动，正在自动恢复重试 ({same_model_retries}/{same_model_cap} · {{elapsed}}s)...</b>"
                     )
                     if not _sleep_interruptible(wait_s):
                         break
                     if is_summarization_error(err_candidate) and conv:
                         streamer.set_status_override(
-                            f"🧹 <b>正在用新凭证压缩上下文后重试 ({attempt}/{max_attempts - 1} · {{elapsed}}s)...</b>"
+                            f"🧹 <b>正在用新凭证压缩上下文后重试 ({same_model_retries}/{same_model_cap} · {{elapsed}}s)...</b>"
                         )
-                        _execute_compact_on_session(skey, conv, mode, model, effort, project, workdir)
+                        _execute_compact_on_session(
+                            exec_skey, conv, mode, active_model, effort, project, workdir,
+                            readonly=session_readonly,
+                        )
                     streamer.set_status_override(None)
                     step_buffers.clear()
                     turn_tool_texts.clear()
                     active_step_idx = None
+                    conv = pre_turn_conv
+                    segment_start_line = get_transcript_line_count(conv)
+                    turn_start_line = segment_start_line
+                    streamer.start_line = segment_start_line
+                    result = None
+                    continue
+
+                if is_eligible and has_next_fallback:
+                    prev_model = active_model
+                    candidate_idx += 1
+                    active_model = candidates[candidate_idx]
+                    same_model_retries = 0
+                    log("Pre-output model failover (%s -> %s): %s"
+                        % (prev_model or "default", active_model or "default", err_candidate[:200]))
+                    invalidate_session("model_failover", force=True, scope_key=exec_skey)
+                    fb_label = html_mod.escape(str(active_model or "default"))
+                    streamer.set_status_override(
+                        f"🔁 <b>主模型受限，自动切换备用模型 ({fb_label})... ({{elapsed}}s)</b>"
+                    )
+                    step_buffers.clear()
+                    turn_tool_texts.clear()
+                    active_step_idx = None
+                    conv = pre_turn_conv
                     segment_start_line = get_transcript_line_count(conv)
                     turn_start_line = segment_start_line
                     streamer.start_line = segment_start_line
@@ -3987,27 +3804,32 @@ def run_agy(chat_id, prompt, thread_id=None, scope_key=None, origin_msg_id=0, me
         streamer.stop()
 
         if result is None:
-            invalidate_session("eof_or_cancel", force=True, scope_key=skey)
+            invalidate_session("eof_or_cancel", force=True, scope_key=exec_skey)
             with state_lock:
-                sc = _ensure_scope_locked(skey)
-                if isinstance(sc.get("last_turn"), dict):
-                    sc["last_turn"]["status"] = "CANCELLED" if cancel_requested else "ERROR"
+                sc_w = _ensure_scope_locked(exec_skey)
+                if isinstance(sc_w.get("last_turn"), dict):
+                    sc_w["last_turn"]["status"] = "CANCELLED" if cancel_requested else "ERROR"
+                if delivered_steps == 0 and pre_turn_conv is None:
+                    sc_w["conversation_id"] = None
             partial = (step_buffers.get(active_step_idx, "") if active_step_idx is not None else "").strip()
             if cancel_requested:
                 if partial:
                     send_rich(chat_id, partial + "\n\n*🛑 [已手动停止生成]*",
-                              reply_markup=retry_kb, thread_id=norm_tid)
+                              reply_markup=retry_kb if not session_readonly else None, thread_id=norm_tid)
             elif sess and sess.proc.returncode in (-15, 143, -2, 130):
                 if partial:
                     send_rich(chat_id, partial + "\n\n*🛑 [任务已中断]*",
-                              reply_markup=retry_kb, thread_id=norm_tid)
+                              reply_markup=retry_kb if not session_readonly else None, thread_id=norm_tid)
                 else:
-                    send(chat_id, "🛑 Task cancelled.", reply_markup=retry_kb, thread_id=norm_tid)
+                    send(chat_id, "🛑 Task cancelled.", reply_markup=retry_kb if not session_readonly else None, thread_id=norm_tid)
             else:
                 rc = sess.proc.returncode if sess else "?"
                 err = sess.get_stderr_text() if sess else ""
-                send(chat_id, "⚠️ agy produced no result (exit %s)\n%s" % (rc, err),
-                     reply_markup=retry_kb, thread_id=norm_tid)
+                if len(attempted_models) > 1:
+                    msg_err = model_failover.format_failover_exhausted_error(attempted_models, f"exit {rc}: {err}".strip())
+                else:
+                    msg_err = "⚠️ agy produced no result (exit %s)\n%s" % (rc, err)
+                send(chat_id, msg_err, reply_markup=retry_kb if not session_readonly else None, thread_id=norm_tid)
             return
 
         res_cid = result.get("conversation_id")
@@ -4016,42 +3838,44 @@ def run_agy(chat_id, prompt, thread_id=None, scope_key=None, origin_msg_id=0, me
             if sess:
                 sess.cid = res_cid
             with state_lock:
-                sc = _ensure_scope_locked(skey)
-                sc["conversation_id"] = res_cid
-                if isinstance(sc.get("last_turn"), dict):
-                    sc["last_turn"]["conv"] = res_cid
+                sc_w = _ensure_scope_locked(exec_skey)
+                sc_w["conversation_id"] = res_cid
+                if isinstance(sc_w.get("last_turn"), dict):
+                    sc_w["last_turn"]["conv"] = res_cid
             save_state()
 
         # If final step + footer + images were already delivered atomically via 65ms lookahead, check post-turn auto-compact!
         if coalesced_final_delivered:
             with state_lock:
-                sc = _ensure_scope_locked(skey)
-                if isinstance(sc.get("last_turn"), dict):
-                    sc["last_turn"]["status"] = "SUCCESS"
+                sc_w = _ensure_scope_locked(exec_skey)
+                if isinstance(sc_w.get("last_turn"), dict):
+                    sc_w["last_turn"]["status"] = "SUCCESS"
             push_step_images(
                 chat_id, "", conv, started, before_files, sent_images,
                 turn_tool_texts=turn_tool_texts, turn_start_line=turn_start_line,
                 thread_id=norm_tid, workdir=workdir,
             )
-            _maybe_post_turn_auto_compact(
-                chat_id, conv, mode, model, effort,
-                project=project, workdir=workdir, thread_id=norm_tid, scope_key=skey,
-            )
+            if not session_readonly:
+                _maybe_post_turn_auto_compact(
+                    chat_id, conv, mode, active_model, effort,
+                    project=project, workdir=workdir, thread_id=norm_tid, scope_key=exec_skey,
+                )
             return
 
         status = result.get("status")
         finished_reason = result.get("finished_reason")
         resp = (result.get("response") or "").strip()
         with state_lock:
-            sc = _ensure_scope_locked(skey)
-            if isinstance(sc.get("last_turn"), dict):
-                sc["last_turn"]["status"] = status or "UNKNOWN"
+            sc_w = _ensure_scope_locked(exec_skey)
+            if isinstance(sc_w.get("last_turn"), dict):
+                sc_w["last_turn"]["status"] = status or "UNKNOWN"
 
+        fb_from = (primary_model_label or "default") if candidate_idx > 0 else None
         footer_str, reply_markup = _compute_workspace_diff_and_footer(
-            result, before_files, started, model, effort,
+            result, before_files, started, active_model, effort,
             cid=conv, turn_start_line=turn_start_line,
             turn_tool_texts=turn_tool_texts, step_text=resp,
-            workdir=workdir,
+            workdir=workdir, fallback_from=fb_from,
         )
         push_step_images(
             chat_id, resp, conv, started, before_files, sent_images,
@@ -4101,13 +3925,14 @@ def run_agy(chat_id, prompt, thread_id=None, scope_key=None, origin_msg_id=0, me
                         sent_info[0],
                         norm_tid,
                         out,
-                        relay_mentions=True,
+                        relay_mentions=(not session_readonly),
                         source_hop=mention_hop,
                     )
-            _maybe_post_turn_auto_compact(
-                chat_id, conv, mode, model, effort,
-                project=project, workdir=workdir, thread_id=norm_tid, scope_key=skey,
-            )
+            if not session_readonly:
+                _maybe_post_turn_auto_compact(
+                    chat_id, conv, mode, active_model, effort,
+                    project=project, workdir=workdir, thread_id=norm_tid, scope_key=exec_skey,
+                )
 
         elif status == "WAITING":
             if delivered_steps > 0:
@@ -4118,30 +3943,37 @@ def run_agy(chat_id, prompt, thread_id=None, scope_key=None, origin_msg_id=0, me
         else:
             if finished_reason == "interrupted" or cancel_requested:
                 if not cancel_requested:
-                    send(chat_id, "🛑 Task cancelled.", reply_markup=retry_kb, thread_id=norm_tid)
+                    send(chat_id, "🛑 Task cancelled.", reply_markup=retry_kb if not session_readonly else None, thread_id=norm_tid)
             else:
-                send(chat_id, "⚠️ agy %s: %s" % (status, result.get("error") or resp or "(no details)"),
-                     reply_markup=retry_kb, thread_id=norm_tid)
+                if status == "ERROR" and len(attempted_models) > 1:
+                    err_out = model_failover.format_failover_exhausted_error(
+                        attempted_models, result.get("error") or resp or "(no details)"
+                    )
+                else:
+                    err_out = "⚠️ agy %s: %s" % (status, result.get("error") or resp or "(no details)")
+                send(chat_id, err_out,
+                     reply_markup=retry_kb if not session_readonly else None, thread_id=norm_tid)
 
     finally:
         streamer.stop()
-        try:
-            changed_cnt = finalize_turn_undo(skey, workdir, undo_manifest, base_prompt, conv)
-            if changed_cnt:
-                log("Recorded undo checkpoint (%d changed file(s)) for scope=%s" % (changed_cnt, skey))
-        except Exception as ue:
-            log("finalize_turn_undo error: %r" % ue)
+        if not session_readonly and undo_manifest is not None:
+            try:
+                changed_cnt = finalize_turn_undo(exec_skey, workdir, undo_manifest, base_prompt, conv)
+                if changed_cnt:
+                    log("Recorded undo checkpoint (%d changed file(s)) for scope=%s" % (changed_cnt, exec_skey))
+            except Exception as ue:
+                log("finalize_turn_undo error: %r" % ue)
         recycle = None
         with session_lock:
             turn_running = False
             turn_running_scope = None
             turn_running_chat = None
-            if skey in session_dirty_scopes and skey in _session_pool:
-                recycle = _session_pool.pop(skey, None)
-                session_dirty_scopes.discard(skey)
+            if exec_skey in session_dirty_scopes and exec_skey in _session_pool:
+                recycle = _session_pool.pop(exec_skey, None)
+                session_dirty_scopes.discard(exec_skey)
         if recycle is not None:
             close_session_async(recycle, force=False)
-        update_scope_state(skey, in_flight=None)
+        update_scope_state(exec_skey, in_flight=None)
         save_state()
 
 
@@ -5072,6 +4904,14 @@ def _handle_bot_bus_packet(pkt):
         t_id = _normalize_thread_id(pkt.get("thread_id"))
         skey = scope_key_for(c_id, t_id)
         if c_id < 0 and _is_authorized(c_id):
+            if (
+                str(pkt.get("user_role") or "").strip().lower() == "readonly"
+                or str(pkt.get("sender_role") or "").strip().lower() == "readonly"
+                or bool(pkt.get("readonly"))
+            ):
+                log("RBAC blocked readonly group_mention wake for %s (from=@%s)"
+                    % (skey, pkt.get("from_bot") or "unknown"))
+                return
             if not bot_bus.loop_guard_allow(f"mention:{skey}"):
                 log("BotLoopGuard blocked group_mention wake for %s" % skey)
                 return
@@ -5213,6 +5053,8 @@ def worker():
                     origin_msg_id=int(meta.get("origin_msg_id") or 0),
                     mention_hop=int(meta.get("mention_hop") or 0),
                     chain_id=str(meta.get("chain_id") or ""),
+                    user_role=str(meta.get("user_role") or "admin"),
+                    user_id=meta.get("user_id"),
                 )
             else:
                 run_agy(chat_id, prompt, thread_id=thread_id, scope_key=skey)
@@ -5455,19 +5297,78 @@ def make_status_keyboard(scope_key=None):
 # ---------------------------------------------------------------- commands
 def cmd_model(chat_id, arg, thread_id=None, scope_key=None):
     skey = scope_key or scope_key_for(chat_id, thread_id)
-    if not arg:
+    raw_arg = (arg or "").strip()
+    if not raw_arg:
         models = agy_models()
-        cur = get_scope_value(skey, "model")
+        sc = get_scope_state(skey)
+        cur = sc.get("model")
+        fb_desc = model_failover.describe_fallback_config(sc.get("fallback_models"), FALLBACK_MODELS_RAW)
         lines = ["<b>🤖 Models</b> (tap to switch):"]
         for slug, desc in models:
             mark = "✓" if slug == cur else "·"
             lines.append(f"{mark} <code>{slug}</code> — {desc}")
-        lines.append(f"\nCurrent: <b>{cur or '(agy default)'}</b>")
+        lines.append(f"\nCurrent: <b>{html_mod.escape(cur or '(agy default)')}</b>")
+        lines.append(f"Fallback: <code>{html_mod.escape(fb_desc)}</code>")
+        lines.append("<i>Tip: <code>/model fallback m1,m2</code> · <code>/model fallback off</code></i>")
         kb = make_model_keyboard(cur)
         send(chat_id, "\n".join(lines), parse_mode="HTML", reply_markup=kb, thread_id=thread_id)
         return
 
-    new_val = None if arg in ("default", "reset", "clear", "none") else arg
+    parts = raw_arg.split(None, 1)
+    head = parts[0].lower()
+    if head in ("fallback", "fb"):
+        rest_fb = parts[1].strip() if len(parts) > 1 else ""
+        if not rest_fb:
+            sc = get_scope_state(skey)
+            fb_desc = model_failover.describe_fallback_config(sc.get("fallback_models"), FALLBACK_MODELS_RAW)
+            send(
+                chat_id,
+                f"🔁 <b>当前备用模型降级链：</b><code>{html_mod.escape(fb_desc)}</code>\n"
+                "用法：\n"
+                "• <code>/model fallback m1,m2,...</code> — 设置本会话有序备用模型\n"
+                "• <code>/model fallback off</code> — 禁用本会话自动降级\n"
+                "• <code>/model fallback default</code> — 恢复环境变量配置 (<code>AGY_TG_FALLBACK_MODELS</code>)",
+                parse_mode="HTML",
+                thread_id=thread_id,
+            )
+            return
+        low_fb = rest_fb.lower()
+        if low_fb in ("off", "none", "disable", "disabled"):
+            update_scope_state(skey, fallback_models=[])
+            save_state()
+            send(chat_id, "🔁 本会话备用模型自动降级已关闭 (off)", thread_id=thread_id)
+            return
+        if low_fb in ("default", "reset", "clear", "env"):
+            update_scope_state(skey, fallback_models=None)
+            save_state()
+            fb_desc = model_failover.describe_fallback_config(None, FALLBACK_MODELS_RAW)
+            send(
+                chat_id,
+                f"🔁 本会话备用模型已恢复默认：<code>{html_mod.escape(fb_desc)}</code>",
+                parse_mode="HTML",
+                thread_id=thread_id,
+            )
+            return
+        fb_list = model_failover.parse_fallback_models(rest_fb)
+        if not fb_list:
+            send(
+                chat_id,
+                "⚠️ 未解析到有效模型名，用法：<code>/model fallback m1,m2</code> 或 <code>/model fallback off</code>",
+                parse_mode="HTML",
+                thread_id=thread_id,
+            )
+            return
+        update_scope_state(skey, fallback_models=fb_list)
+        save_state()
+        send(
+            chat_id,
+            f"🔁 本会话备用模型链已设为：<code>{html_mod.escape(' → '.join(fb_list))}</code>",
+            parse_mode="HTML",
+            thread_id=thread_id,
+        )
+        return
+
+    new_val = None if head in ("default", "reset", "clear", "none") else parts[0]
     update_scope_state(skey, model=new_val)
     save_state()
     invalidate_session("model_change", scope_key=skey)
@@ -5827,88 +5728,27 @@ def cmd_context(chat_id, thread_id=None, scope_key=None):
 _cost_cache_lock = threading.Lock()
 _cost_mem_cache = {}  # cid -> (mtime_ns, size, first_epoch, steps_list)
 
-_MODEL_SETTINGS_RE = re.compile(r"Model Selection` from .+? to (.+?)\. No need")
-_WEEKDAY_CN = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
-
-_MODEL_FAMILY_LABELS = {
-    "gemini-3.8-flash": "Gemini 3.8 Flash",
-    "gemini-4-hydrogen": "Gemini 4 Hydrogen",
-    "gemini-4-carbon": "Gemini 4 Carbon",
-    "gemini-4-argon": "Gemini 4 Argon",
-    "gemini-pro-orchestrator": "Orchestrator Pro",
-    "gemini-3.1-pro": "Gemini 3.1 Pro",
-    "claude-opus-5-5": "Claude Opus 5.5",
-    "claude-sonnet-5-5": "Claude Sonnet 5.5",
-    "gpt-oss-120b": "GPT-OSS 120B",
-}
+_MODEL_SETTINGS_RE = cost_usage.MODEL_SETTINGS_RE
+_WEEKDAY_CN = cost_usage.WEEKDAY_CN
+_MODEL_FAMILY_LABELS = cost_usage.MODEL_FAMILY_LABELS
+_canonical_model_family = cost_usage.canonical_model_family
+_google_model_rates_per_m = cost_usage.google_model_rates_per_m
+_new_cost_agg = cost_usage.new_cost_agg
+_add_cost_agg = cost_usage.add_cost_agg
+_fmt_m_tokens = cost_usage.fmt_m_tokens
+_fmt_m_num = cost_usage.fmt_m_num
+_fmt_usd = cost_usage.fmt_usd
+_agg_metrics = cost_usage.agg_metrics
+_render_period_block = cost_usage.render_period_block
+_make_cost_keyboard = cost_usage.make_cost_keyboard
+_DEFAULT_WEEKLY_RESET_UTC = cost_usage.DEFAULT_WEEKLY_RESET_UTC
+_parse_iso_z = cost_usage.parse_iso_z
+_make_usage_keyboard = cost_usage.make_usage_keyboard
+_fmt_quota_countdown = cost_usage.fmt_quota_countdown
 
 
 def _get_cost_tz():
-    now_utc = datetime.datetime.now(datetime.timezone.utc)
-    if zoneinfo is not None and COST_TZ_NAME:
-        try:
-            tz = zoneinfo.ZoneInfo(COST_TZ_NAME)
-            off = tz.utcoffset(now_utc) or datetime.timedelta(0)
-            hrs = off.total_seconds() / 3600.0
-            if hrs == 0:
-                lbl = "UTC"
-            elif hrs == int(hrs):
-                lbl = f"UTC{int(hrs):+d}"
-            else:
-                lbl = f"UTC{hrs:+.1f}"
-            return tz, lbl
-        except Exception:
-            pass
-    return datetime.timezone(datetime.timedelta(hours=8)), "UTC+8"
-
-
-def _canonical_model_family(raw_model):
-    s = (raw_model or "").strip().lower()
-    if not s or s == "none":
-        return "gemini-3.8-flash"
-    if "3.8" in s or "flash" in s:
-        return "gemini-3.8-flash"
-    if "hydrogen" in s:
-        return "gemini-4-hydrogen"
-    if "orchestrator" in s:
-        return "gemini-pro-orchestrator"
-    if "argon" in s:
-        return "gemini-4-argon"
-    if "carbon" in s:
-        return "gemini-4-carbon"
-    if "opus" in s:
-        return "claude-opus-5-5"
-    if "sonnet" in s:
-        return "claude-sonnet-5-5"
-    if "gpt-oss" in s or "120b" in s:
-        return "gpt-oss-120b"
-    if "pro" in s:
-        return "gemini-3.1-pro"
-    return "gemini-3.8-flash"
-
-
-def _google_model_rates_per_m(family, ymd_utc, prompt_tokens=0):
-    """Return (uncached_input_usd, cache_read_usd, output_usd) per 1M tokens
-    based on official Google AI Studio / Vertex AI API pricing schedules.
-    """
-    if family == "gemini-3.8-flash":
-        # Official Google paid tier: $0.75 / $0.075 / $3.75 through 2026-12-31, then $1.50 / $0.15 / $7.50
-        return (0.75, 0.075, 3.75) if ymd_utc <= "2026-12-31" else (1.50, 0.15, 7.50)
-    if family == "gemini-4-hydrogen":
-        # Official Gemini 4 Hydrogen unified 1M context tier (95% implicit cache read discount)
-        return (1.50, 0.075, 7.50)
-    if family in ("gemini-4-carbon", "gemini-4-argon", "gemini-pro-orchestrator"):
-        # Official Gemini 4 Carbon/Argon: $2.00 / $0.10 / $10.00 through 2026-11-30, then $4.00 / $0.20 / $20.00
-        return (2.00, 0.10, 10.00) if ymd_utc <= "2026-11-30" else (4.00, 0.20, 20.00)
-    if family == "gemini-3.1-pro":
-        return (4.00, 0.40, 18.00) if prompt_tokens > 200_000 else (2.00, 0.20, 12.00)
-    if family == "claude-opus-5-5":
-        return (4.00, 0.20, 20.00)
-    if family == "claude-sonnet-5-5":
-        return (2.00, 0.10, 10.00)
-    if family == "gpt-oss-120b":
-        return (0.15, 0.075, 0.60)
-    return (2.00, 0.10, 10.00)
+    return cost_usage.get_cost_tz(COST_TZ_NAME)
 
 
 def _load_conv_meta_map():
@@ -5973,553 +5813,53 @@ def _load_conv_meta_map():
 
 
 def _parse_transcript_cost_steps(tpath):
-    """Parse a conversation's transcript.jsonl into compact billing step tuples."""
-    steps = []
-    cur_family = "gemini-3.8-flash"
-    first_epoch = float("inf")
-    has_sched_marker = False
-    try:
-        with open(tpath, "r", encoding="utf-8") as f:
-            for raw in f:
-                if not raw.strip():
-                    continue
-                if not has_sched_marker and "[ACB_SCHEDULED_TASK" in raw:
-                    has_sched_marker = True
-                try:
-                    o = json.loads(raw)
-                except Exception:
-                    continue
-                if "Model Selection" in raw:
-                    c = str(o.get("content") or "")
-                    m = _MODEL_SETTINGS_RE.search(c)
-                    if m:
-                        cur_family = _canonical_model_family(m.group(1))
-                if o.get("type") not in ("PLANNER_RESPONSE", "CHECKPOINT"):
-                    continue
-                inp = int(o.get("input_tokens") or 0)
-                ca = int(o.get("cache_read_tokens") or 0)
-                out = int(o.get("output_tokens") or 0)
-                if not (inp or ca or out):
-                    continue
-                if o.get("model"):
-                    cur_family = _canonical_model_family(o.get("model"))
-                ts = str(o.get("created_at") or "").strip()
-                if not ts:
-                    continue
-                try:
-                    dt_utc = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(datetime.timezone.utc)
-                except Exception:
-                    continue
-                ep = dt_utc.timestamp()
-                if ep < first_epoch:
-                    first_epoch = ep
-                ymd_utc = dt_utc.strftime("%Y-%m-%d")
-                hour_utc = dt_utc.strftime("%Y-%m-%dT%H")
-                pi, pc, po = _google_model_rates_per_m(cur_family, ymd_utc, prompt_tokens=(inp + ca))
-                cost_usd = (inp * pi + ca * pc + out * po) / 1_000_000.0
-                nocache_usd = ((inp + ca) * pi + out * po) / 1_000_000.0
-                sig = (int(o.get("step_index") or 0), ts, inp, ca, out)
-                steps.append((hour_utc, cur_family, inp, ca, out, cost_usd, nocache_usd, sig))
-    except Exception as e:
-        log("parse transcript cost failed (%s): %r" % (tpath, e))
-    if first_epoch == float("inf"):
-        first_epoch = 0.0
-    return first_epoch, steps, has_sched_marker
+    return cost_usage.parse_transcript_cost_steps(tpath, log_fn=log)
 
 
 def _collect_cost_hourly_buckets():
-    """Return list of (dt_utc_hour, cid, project_id, is_observer, is_scheduled, family, inp, ca, out, calls, cost_usd, nocache_usd).
-    Uses mtime/size memory cache + persistent multi-process ledger so even pruned conversations retain history.
-    """
-    meta_map = _load_conv_meta_map()
-    tpaths = glob.glob(os.path.join(BRAIN_ROOT, "*", ".system_generated", "logs", "transcript.jsonl"))
-
-    dirty = False
-    live_convs = {}
-    with _cost_cache_lock:
-        for tp in tpaths:
-            try:
-                st = os.stat(tp)
-            except OSError:
-                continue
-            parts = tp.split(os.sep)
-            try:
-                b_idx = parts.index("brain")
-                cid = parts[b_idx + 1]
-            except ValueError:
-                continue
-            cached = _cost_mem_cache.get(cid)
-            if cached and len(cached) >= 5 and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
-                first_ep, steps, has_sched = cached[2], cached[3], cached[4]
-            else:
-                first_ep, steps, has_sched = _parse_transcript_cost_steps(tp)
-                _cost_mem_cache[cid] = (st.st_mtime_ns, st.st_size, first_ep, steps, has_sched)
-                dirty = True
-            live_convs[cid] = (st.st_mtime_ns, st.st_size, first_ep, steps, has_sched)
-
-    # Deduplicate any forked parent steps in chronological conversation order & build per-conversation UTC hour buckets
-    seen_sigs = set()
-    conv_hours = {}
-    for cid, (mtime_ns, size, _first_ep, steps, has_sched) in sorted(live_convs.items(), key=lambda kv: (kv[1][2], kv[0])):
-        m_info = meta_map.get(cid) or {"project_id": "default-cli-project", "is_observer": False}
-        hours_map = {}
-        for hour_utc, fam, inp, ca, out, cost_u, nocache_u, sig in steps:
-            if sig in seen_sigs:
-                continue
-            seen_sigs.add(sig)
-            fam_map = hours_map.setdefault(hour_utc, {})
-            acc = fam_map.get(fam)
-            if acc is None:
-                fam_map[fam] = [inp, ca, out, 1, cost_u, nocache_u]
-            else:
-                acc[0] += inp
-                acc[1] += ca
-                acc[2] += out
-                acc[3] += 1
-                acc[4] += cost_u
-                acc[5] += nocache_u
-        conv_hours[cid] = {
-            "mtime_ns": mtime_ns,
-            "size": size,
-            "project_id": m_info["project_id"],
-            "is_observer": m_info["is_observer"],
-            "is_scheduled": bool(m_info.get("is_scheduled", False) or has_sched),
-            "hours": hours_map,
-        }
-
-    # Merge with persistent disk ledger (protects historical data if old brain/<cid> directories are ever pruned)
-    archived_convs = {}
-    try:
-        os.makedirs(os.path.dirname(COST_LEDGER_FILE), exist_ok=True)
-        with open(COST_LEDGER_LOCK, "a+", encoding="utf-8") as lf:
-            fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
-            try:
-                ledger = {}
-                if os.path.isfile(COST_LEDGER_FILE):
-                    try:
-                        with open(COST_LEDGER_FILE, "r", encoding="utf-8") as rf:
-                            ledger = json.load(rf) or {}
-                    except Exception:
-                        ledger = {}
-                saved_convs = ledger.get("conversations") or {}
-                for cid, entry in saved_convs.items():
-                    if cid not in conv_hours:
-                        if meta_map.get(cid, {}).get("is_scheduled") and not entry.get("is_scheduled"):
-                            entry = dict(entry)
-                            entry["is_scheduled"] = True
-                            dirty = True
-                        archived_convs[cid] = entry
-                    elif bool(entry.get("is_scheduled", False)) != bool(conv_hours[cid]["is_scheduled"]):
-                        dirty = True
-                if dirty or not os.path.isfile(COST_LEDGER_FILE):
-                    merged = dict(archived_convs)
-                    merged.update(conv_hours)
-                    tmp_path = f"{COST_LEDGER_FILE}.{os.getpid()}.tmp"
-                    with open(tmp_path, "w", encoding="utf-8") as wf:
-                        json.dump({"version": 1, "conversations": merged}, wf, separators=(",", ":"))
-                    os.replace(tmp_path, COST_LEDGER_FILE)
-            finally:
-                fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
-    except Exception as e:
-        log("cost ledger sync error: %r" % e)
-
-    all_convs = dict(archived_convs)
-    all_convs.update(conv_hours)
-
-    records = []
-    for cid, entry in all_convs.items():
-        pid = entry.get("project_id") or "default-cli-project"
-        is_obs = bool(entry.get("is_observer", False))
-        is_sched = bool(entry.get("is_scheduled", False))
-        for hour_utc, fam_map in (entry.get("hours") or {}).items():
-            try:
-                dt_h = datetime.datetime.strptime(hour_utc, "%Y-%m-%dT%H").replace(tzinfo=datetime.timezone.utc)
-            except Exception:
-                continue
-            for fam, vals in fam_map.items():
-                records.append((
-                    dt_h, cid, pid, is_obs, is_sched, fam,
-                    int(vals[0]), int(vals[1]), int(vals[2]), int(vals[3]),
-                    float(vals[4]), float(vals[5]),
-                ))
-    return records
-
-
-def _new_cost_agg():
-    return {"inp": 0, "ca": 0, "out": 0, "calls": 0, "cost": 0.0, "nocache": 0.0}
-
-
-def _add_cost_agg(agg, inp, ca, out, calls, cost, nocache):
-    agg["inp"] += inp
-    agg["ca"] += ca
-    agg["out"] += out
-    agg["calls"] += calls
-    agg["cost"] += cost
-    agg["nocache"] += nocache
-
-
-def _fmt_m_tokens(tokens):
-    if tokens <= 0:
-        return "0 M"
-    m = tokens / 1_000_000.0
-    if m < 0.01:
-        return f"{m:.4f} M"
-    if m < 0.1:
-        return f"{m:.3f} M"
-    return f"{m:,.2f} M"
-
-
-def _fmt_m_num(tokens):
-    if tokens <= 0:
-        return "0"
-    m = tokens / 1_000_000.0
-    if m < 0.01:
-        return f"{m:.3f}"
-    return f"{m:,.2f}"
-
-
-def _fmt_usd(val):
-    if val <= 0.0:
-        return "$0.00"
-    if val < 0.01:
-        return f"${val:.4f}"
-    if val < 1.0:
-        return f"${val:.3f}"
-    return f"${val:,.2f}"
-
-
-def _agg_metrics(agg):
-    tot_in = agg["inp"] + agg["ca"]
-    tot_tok = tot_in + agg["out"]
-    cache_pct = (agg["ca"] * 100.0 / tot_in) if tot_in > 0 else 0.0
-    saved = max(0.0, agg["nocache"] - agg["cost"])
-    save_pct = (saved * 100.0 / agg["nocache"]) if agg["nocache"] > 0 else 0.0
-    filled = min(10, max(0, int(round(cache_pct / 10.0))))
-    bar = "▓" * filled + "░" * (10 - filled)
-    return tot_tok, cache_pct, bar, saved, save_pct
-
-
-def _render_period_block(icon, title, sub_label, agg):
-    tot_tok, cache_pct, bar, saved, save_pct = _agg_metrics(agg)
-    if tot_tok == 0:
-        return (
-            f"{icon} <b>{title}</b> ({sub_label})\n"
-            f"• 消耗：<code>0 M</code> · 缓存率：<code>0.0%</code> · 美金：<code>$0.00</code>"
-        )
-    save_note = (
-        f"无缓存{_fmt_usd(agg['nocache'])} · 省{_fmt_usd(saved)} / -{save_pct:.0f}%"
-        if saved >= 0.005 else f"共 {agg['calls']} 次调用"
+    return cost_usage.collect_cost_hourly_buckets(
+        brain_root=BRAIN_ROOT,
+        cost_ledger_file=COST_LEDGER_FILE,
+        cost_ledger_lock=COST_LEDGER_LOCK,
+        meta_map=_load_conv_meta_map(),
+        mem_cache=_cost_mem_cache,
+        cache_lock=_cost_cache_lock,
+        log_fn=log,
     )
-    return (
-        f"{icon} <b>{title}</b> ({sub_label})\n"
-        f"• 消耗：<b><code>{_fmt_m_tokens(tot_tok)}</code></b> "
-        f"<code>(新{_fmt_m_num(agg['inp'])} + 缓{_fmt_m_num(agg['ca'])} + 出{_fmt_m_num(agg['out'])})</code>\n"
-        f"• 缓存率：<b><code>{cache_pct:.1f}%</code></b> <code>[{bar}]</code>\n"
-        f"• 折算美金：<b><code>{_fmt_usd(agg['cost'])}</code></b> <code>({save_note})</code>"
-    )
-
-
-def _make_cost_keyboard(view="overview", scope="all"):
-    views = [
-        ("overview", "📊 日周月"),
-        ("daily", "📅 每日明细"),
-        ("models", "🤖 模型单价"),
-    ]
-    scopes = [
-        ("all", "🌐 全部"),
-        ("agent", "👤 仅主对话"),
-        ("sched", "⏰ 定时"),
-        ("project", "📂 当前项目"),
-    ]
-    row_views = [
-        {
-            "text": f"{'✓ ' if v == view else ''}{lbl}",
-            "callback_data": f"cost:{v}:{scope}",
-        }
-        for v, lbl in views
-    ]
-    row_scopes = [
-        {
-            "text": f"{'✓ ' if s == scope else ''}{lbl}",
-            "callback_data": f"cost:{view}:{s}",
-        }
-        for s, lbl in scopes
-    ]
-    row_refresh = [
-        {"text": "🔄 刷新我的用量", "callback_data": f"cost:{view}:{scope}"},
-        {"text": "📊 总套餐配额 (/usage)", "callback_data": "action:usage"},
-    ]
-    return {"inline_keyboard": [row_views, row_scopes, row_refresh]}
-
-
-# Default weekly quota reset anchor: Friday 23:00 UTC (override via `/cost calibrate` or COST_CONFIG_FILE)
-_DEFAULT_WEEKLY_RESET_UTC = (4, 23, 0)  # (weekday: 0=Mon..4=Fri..6=Sun, hour, minute)
 
 
 def _load_weekly_reset_utc():
-    if os.path.isfile(COST_CONFIG_FILE):
-        try:
-            with open(COST_CONFIG_FILE, "r", encoding="utf-8") as f:
-                cfg = json.load(f) or {}
-            wd = int(cfg.get("weekly_reset_utc_weekday", _DEFAULT_WEEKLY_RESET_UTC[0])) % 7
-            hr = int(cfg.get("weekly_reset_utc_hour", _DEFAULT_WEEKLY_RESET_UTC[1])) % 24
-            mn = int(cfg.get("weekly_reset_utc_minute", _DEFAULT_WEEKLY_RESET_UTC[2])) % 60
-            return wd, hr, mn
-        except Exception:
-            pass
-    return _DEFAULT_WEEKLY_RESET_UTC
+    return cost_usage.load_weekly_reset_utc(COST_CONFIG_FILE)
 
 
 def _save_weekly_reset_utc(wd, hr, mn):
-    os.makedirs(os.path.dirname(COST_CONFIG_FILE), exist_ok=True)
-    tmp = f"{COST_CONFIG_FILE}.{os.getpid()}.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({
-            "weekly_reset_utc_weekday": int(wd) % 7,
-            "weekly_reset_utc_hour": int(hr) % 24,
-            "weekly_reset_utc_minute": int(mn) % 60,
-            "updated_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        }, f, indent=2)
-    os.replace(tmp, COST_CONFIG_FILE)
+    return cost_usage.save_weekly_reset_utc(COST_CONFIG_FILE, wd, hr, mn)
 
 
 def _get_weekly_quota_bounds(now_utc, local_tz):
-    """Return (cycle_start_utc, cycle_end_utc, cycle_start_local, cycle_end_local, rem_str)."""
-    wd, hr, mn = _load_weekly_reset_utc()
-    days_ahead = (wd - now_utc.weekday()) % 7
-    cand_end = now_utc.replace(hour=hr, minute=mn, second=0, microsecond=0) + datetime.timedelta(days=days_ahead)
-    if cand_end <= now_utc:
-        cand_end += datetime.timedelta(days=7)
-    cycle_end_utc = cand_end
-    cycle_start_utc = cycle_end_utc - datetime.timedelta(days=7)
-    rem = max(datetime.timedelta(0), cycle_end_utc - now_utc)
-    rem_d = rem.days
-    rem_h = rem.seconds // 3600
-    rem_m = (rem.seconds % 3600) // 60
-    if rem_d > 0:
-        rem_str = f"剩{rem_d}天{rem_h}h重置"
-    elif rem_h > 0:
-        rem_str = f"剩{rem_h}h{rem_m}m重置"
-    else:
-        rem_str = f"剩{rem_m}m重置"
-    return (
-        cycle_start_utc,
-        cycle_end_utc,
-        cycle_start_utc.astimezone(local_tz),
-        cycle_end_utc.astimezone(local_tz),
-        rem_str,
-    )
+    return cost_usage.get_weekly_quota_bounds(now_utc, local_tz, COST_CONFIG_FILE)
 
 
 def _calibrate_weekly_reset_from_text(raw_arg):
-    """Parse e.g. '5 days, 11 hours' or '5d 11h' or 'default' and persist new UTC weekly anchor."""
-    s = (raw_arg or "").strip().lower()
-    if s in ("default", "reset"):
-        _save_weekly_reset_utc(*_DEFAULT_WEEKLY_RESET_UTC)
-        return True
-    m_d = re.search(r"(\d+)\s*(?:days?|d|天)", s)
-    m_h = re.search(r"(\d+)\s*(?:hours?|hrs?|h|小时)", s)
-    m_m = re.search(r"(\d+)\s*(?:minutes?|mins?|m|分)", s)
-    if not (m_d or m_h or m_m):
-        return False
-    days = int(m_d.group(1)) if m_d else 0
-    hours = int(m_h.group(1)) if m_h else 0
-    mins = int(m_m.group(1)) if m_m else None
-    now_utc = datetime.datetime.now(datetime.timezone.utc)
-    target = now_utc + datetime.timedelta(days=days, hours=hours, minutes=(mins or 0))
-    if mins is None:
-        # Google UI truncates remaining minutes (e.g. 5d 11h 09m -> '5 days, 11 hours'); snap to nearest whole hour
-        if target.minute >= 30:
-            target = (target + datetime.timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-        else:
-            target = target.replace(minute=0, second=0, microsecond=0)
-    else:
-        target = target.replace(second=0, microsecond=0)
-    _save_weekly_reset_utc(target.weekday(), target.hour, target.minute)
-    return True
+    return cost_usage.calibrate_weekly_reset_from_text(raw_arg, COST_CONFIG_FILE)
 
 
 def build_cost_panel(view="overview", scope="all", scope_key=None):
-    if view not in ("overview", "daily", "models"):
-        view = "overview"
-    if scope not in ("all", "agent", "sched", "project"):
-        scope = "all"
-
-    tz, tz_lbl = _get_cost_tz()
-    now_local = datetime.datetime.now(tz)
-    now_utc = now_local.astimezone(datetime.timezone.utc)
     cur_proj = current_project(scope_key=scope_key) or "default-cli-project"
     proj_name = cur_proj
     for p_item in list_agy_projects():
         if p_item["id"] == cur_proj:
             proj_name = p_item["name"]
             break
-
-    if scope == "agent":
-        scope_desc = "👤 仅主对话 (不含后台观测/定时)"
-    elif scope == "sched":
-        scope_desc = "⏰ 定时任务消耗"
-    elif scope == "project":
-        scope_desc = f"📂 当前项目 ({html_mod.escape(proj_name)})"
-    else:
-        scope_desc = "🌐 全部消耗 (主对话 + 后台记忆 + 定时)"
-
-    today_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-    week_start_utc, _week_end_utc, week_start_loc, week_end_loc, week_rem_str = _get_weekly_quota_bounds(now_utc, tz)
-    d7_start = today_start - datetime.timedelta(days=6)
-    d14_start = today_start - datetime.timedelta(days=13)
-    d30_start = today_start - datetime.timedelta(days=29)
-    month_prefix = now_local.strftime("%Y-%m")
-    today_ymd = now_local.strftime("%Y-%m-%d")
-
-    agg_today = _new_cost_agg()
-    agg_week = _new_cost_agg()
-    agg_d7 = _new_cost_agg()
-    agg_d30 = _new_cost_agg()
-    agg_month = _new_cost_agg()
-    by_day = {}
-    by_model_today = {}
-    by_model_week = {}
-    by_model_month = {}
-
-    records = _collect_cost_hourly_buckets()
-    for dt_utc_h, _cid, pid, is_obs, is_sched, fam, inp, ca, out, calls, cost_u, nocache_u in records:
-        if scope == "agent" and (is_obs or is_sched):
-            continue
-        if scope == "sched" and not is_sched:
-            continue
-        if scope == "project" and (is_obs or is_sched or pid != cur_proj):
-            continue
-        dt_loc = dt_utc_h.astimezone(tz)
-        ymd = dt_loc.strftime("%Y-%m-%d")
-
-        if ymd == today_ymd:
-            _add_cost_agg(agg_today, inp, ca, out, calls, cost_u, nocache_u)
-            _add_cost_agg(by_model_today.setdefault(fam, _new_cost_agg()), inp, ca, out, calls, cost_u, nocache_u)
-        if dt_utc_h >= week_start_utc:
-            _add_cost_agg(agg_week, inp, ca, out, calls, cost_u, nocache_u)
-            _add_cost_agg(by_model_week.setdefault(fam, _new_cost_agg()), inp, ca, out, calls, cost_u, nocache_u)
-        if dt_loc >= d7_start:
-            _add_cost_agg(agg_d7, inp, ca, out, calls, cost_u, nocache_u)
-        if dt_loc >= d14_start:
-            _add_cost_agg(by_day.setdefault(ymd, _new_cost_agg()), inp, ca, out, calls, cost_u, nocache_u)
-        if dt_loc >= d30_start:
-            _add_cost_agg(agg_d30, inp, ca, out, calls, cost_u, nocache_u)
-        if ymd.startswith(month_prefix):
-            _add_cost_agg(agg_month, inp, ca, out, calls, cost_u, nocache_u)
-            _add_cost_agg(by_model_month.setdefault(fam, _new_cost_agg()), inp, ca, out, calls, cost_u, nocache_u)
-
-    header = (
-        f"<b>💰 我的用量与缓存账单 (/cost)</b>\n"
-        f"<code>口径: {scope_desc} · 本机统计 · {tz_lbl}</code>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
+    return cost_usage.render_cost_panel(
+        view=view,
+        scope=scope,
+        cur_proj=cur_proj,
+        proj_name=proj_name,
+        records=_collect_cost_hourly_buckets(),
+        cost_tz_name=COST_TZ_NAME,
+        cost_config_file=COST_CONFIG_FILE,
     )
-    wk_reset_note = f"{_WEEKDAY_CN[week_end_loc.weekday()]} {week_end_loc.strftime('%H:%M')} 重置"
-    footer = (
-        f"\n\n<i>🕒 刷新于 {now_local.strftime('%H:%M:%S')} · 周周期每{wk_reset_note} · "
-        f"按 Google 官方阶梯及缓存计费</i>"
-    )
-
-    if view == "overview":
-        b_today = _render_period_block("📅", "今日", now_local.strftime("%m-%d"), agg_today)
-        week_lbl = f"{week_start_loc.strftime('%m-%d %H:%M')}起 · {week_rem_str}"
-        b_week = _render_period_block("📆", "本周累计", week_lbl, agg_week)
-        b_month = _render_period_block("🗓", "本月", month_prefix, agg_month)
-
-        def _fmt_overview_models(mdict, title):
-            lines = []
-            for fam, magg in sorted(mdict.items(), key=lambda kv: -kv[1]["cost"]):
-                mtok, mcr, _, _, _ = _agg_metrics(magg)
-                mlbl = _MODEL_FAMILY_LABELS.get(fam, fam)
-                lines.append(
-                    f"• <code>{html_mod.escape(mlbl)}</code> · "
-                    f"<code>{_fmt_m_tokens(mtok)}</code> · 缓<code>{mcr:.1f}%</code> · "
-                    f"<b><code>{_fmt_usd(magg['cost'])}</code></b>"
-                )
-            if not lines:
-                return ""
-            return f"\n\n{title}\n" + "\n".join(lines)
-
-        sec_week_models = _fmt_overview_models(by_model_week, f"🤖 <b>本周模型构成</b> ({week_rem_str})")
-        sec_month_models = _fmt_overview_models(by_model_month, "🤖 <b>本月模型构成</b>")
-
-        body = f"{b_today}\n\n{b_week}\n\n{b_month}{sec_week_models}{sec_month_models}"
-
-    elif view == "daily":
-        day_lines = []
-        for offset in range(14):
-            d_dt = today_start - datetime.timedelta(days=offset)
-            ymd = d_dt.strftime("%Y-%m-%d")
-            dagg = by_day.get(ymd)
-            if not dagg:
-                continue
-            dtok, dcr, _, dsaved, _ = _agg_metrics(dagg)
-            wk = _WEEKDAY_CN[d_dt.weekday()]
-            day_lines.append(
-                f"• <code>{d_dt.strftime('%m-%d')} {wk}</code> · "
-                f"<b><code>{_fmt_m_tokens(dtok)}</code></b> · "
-                f"缓<code>{dcr:.1f}%</code> · "
-                f"<b><code>{_fmt_usd(dagg['cost'])}</code></b> "
-                f"<code>(省{_fmt_usd(dsaved)})</code>"
-            )
-        if not day_lines:
-            day_lines.append("• <code>近 14 天暂无 Token 消耗记录</code>")
-
-        wk_tok, wk_cr, _, wk_saved, _ = _agg_metrics(agg_week)
-        d7_tok, d7_cr, _, d7_saved, _ = _agg_metrics(agg_d7)
-        d30_tok, d30_cr, _, d30_saved, _ = _agg_metrics(agg_d30)
-        body = (
-            "📅 <b>近 14 天每日明细</b>\n"
-            + "\n".join(day_lines)
-            + "\n\n📊 <b>配额周期与滚动合计</b>\n"
-            + f"• <b>本周配额 ({week_rem_str})：</b><code>{_fmt_m_tokens(wk_tok)}</code> · 缓<code>{wk_cr:.1f}%</code> · "
-              f"<b><code>{_fmt_usd(agg_week['cost'])}</code></b> <code>(省{_fmt_usd(wk_saved)})</code>\n"
-            + f"• <b>近7天滚动：</b><code>{_fmt_m_tokens(d7_tok)}</code> · 缓<code>{d7_cr:.1f}%</code> · "
-              f"<b><code>{_fmt_usd(agg_d7['cost'])}</code></b> <code>(省{_fmt_usd(d7_saved)})</code>\n"
-            + f"• <b>近30天滚动：</b><code>{_fmt_m_tokens(d30_tok)}</code> · 缓<code>{d30_cr:.1f}%</code> · "
-              f"<b><code>{_fmt_usd(agg_d30['cost'])}</code></b> <code>(省{_fmt_usd(d30_saved)})</code>"
-        )
-
-    else:  # view == "models"
-        def _fmt_model_group(title, mdict):
-            if not mdict:
-                return f"<b>{title}</b>\n• <code>暂无消耗</code>"
-            rows = [f"<b>{title}</b>"]
-            for fam, magg in sorted(mdict.items(), key=lambda kv: -kv[1]["cost"]):
-                mtok, mcr, _, msaved, _ = _agg_metrics(magg)
-                mlbl = _MODEL_FAMILY_LABELS.get(fam, fam)
-                tot_in = magg["inp"] + magg["ca"]
-                pi, pc, _ = _google_model_rates_per_m(fam, now_utc.strftime("%Y-%m-%d"))
-                eff_in = ((magg["inp"] * pi + magg["ca"] * pc) / tot_in) if tot_in > 0 else pi
-                rows.append(
-                    f"• <b>{html_mod.escape(mlbl)}</b>\n"
-                    f"  <code>{_fmt_m_tokens(mtok)}</code> · 缓<code>{mcr:.1f}%</code> "
-                    f"(等效输入<code>${eff_in:.2f}/M</code>) · "
-                    f"<b><code>{_fmt_usd(magg['cost'])}</code></b> <code>(省{_fmt_usd(msaved)})</code>"
-                )
-            return "\n".join(rows)
-
-        ymd_now = now_utc.strftime("%Y-%m-%d")
-        f_pi, f_pc, f_po = _google_model_rates_per_m("gemini-3.8-flash", ymd_now)
-        h_pi, h_pc, h_po = _google_model_rates_per_m("gemini-4-hydrogen", ymd_now)
-        c_pi, c_pc, c_po = _google_model_rates_per_m("gemini-4-carbon", ymd_now)
-        price_ref = (
-            "📌 <b>当前 Google 官方计费单价 (/ 1M tok)</b>\n"
-            f"• <code>Flash 3.8 </code>: 入<code>${f_pi:g}</code> · 缓存读<code>${f_pc:g}</code> · 出<code>${f_po:g}</code>\n"
-            f"• <code>Hydrogen 4</code>: 入<code>${h_pi:g}</code> · 缓存读<code>${h_pc:g}</code> · 出<code>${h_po:g}</code>\n"
-            f"• <code>Carbon/Arg</code>: 入<code>${c_pi:g}</code> · 缓存读<code>${c_pc:g}</code> · 出<code>${c_po:g}</code>"
-        )
-        body = (
-            _fmt_model_group("📅 今日模型分项", by_model_today)
-            + "\n\n"
-            + _fmt_model_group(f"📆 本周配额模型分项 ({week_rem_str})", by_model_week)
-            + "\n\n"
-            + _fmt_model_group("🗓 本月模型分项", by_model_month)
-            + "\n\n"
-            + price_ref
-        )
-
-    return header + body + footer, _make_cost_keyboard(view=view, scope=scope)
 
 
 def cmd_cost(chat_id, raw_rest="", thread_id=None, scope_key=None):
@@ -6565,31 +5905,7 @@ QUOTA_LOCK_FILE = "/tmp/agy_quota_usage.lock"
 
 
 def _load_cached_plan_quota():
-    if not os.path.isfile(QUOTA_CACHE_FILE):
-        return None
-    try:
-        with open(QUOTA_CACHE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict) and isinstance(data.get("groups"), list) and data["groups"]:
-            return data
-    except Exception:
-        pass
-    return None
-
-
-def _parse_iso_z(ts_str):
-    if not ts_str or not isinstance(ts_str, str):
-        return None
-    try:
-        s = ts_str.strip()
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        dt = datetime.datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=datetime.timezone.utc)
-        return dt.astimezone(datetime.timezone.utc)
-    except Exception:
-        return None
+    return cost_usage.load_cached_plan_quota(QUOTA_CACHE_FILE)
 
 
 def fetch_plan_quota_data(force_live=True):
@@ -6673,165 +5989,9 @@ def fetch_plan_quota_data(force_live=True):
             return None, False, err_msg
 
 
-def _make_usage_keyboard():
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "🔄 刷新总套餐配额", "callback_data": "usage:refresh"},
-                {"text": "💰 我的本机用量 (/cost)", "callback_data": "action:cost"},
-            ],
-            [
-                {"text": "🤖 切换模型 (/model)", "callback_data": "action:model"},
-            ],
-        ]
-    }
-
-
-def _fmt_quota_countdown(rst_utc, now_utc):
-    if rst_utc is None:
-        return "未知"
-    rem = max(datetime.timedelta(0), rst_utc - now_utc)
-    d = rem.days
-    h = rem.seconds // 3600
-    m = (rem.seconds % 3600) // 60
-    if d > 0:
-        return f"剩{d}天{h}h"
-    if h > 0:
-        return f"剩{h}h{m}m"
-    return f"剩{m}m"
-
-
 def build_usage_panel(force_live=True):
-    tz, tz_lbl = _get_cost_tz()
-    now_local = datetime.datetime.now(tz)
-    now_utc = now_local.astimezone(datetime.timezone.utc)
     snap, is_fallback, err_str = fetch_plan_quota_data(force_live=force_live)
-
-    header = (
-        "<b>📊 反重力总套餐配额卡片 (/usage)</b>\n"
-        f"<code>口径: ☁️ 官方云端总套餐实时配额 (全端共享) · {tz_lbl}</code>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-    )
-    kb = _make_usage_keyboard()
-
-    if not snap:
-        body = (
-            "⚠️ <b>暂无法获取云端总套餐实时配额</b>\n"
-            f"<code>{html_mod.escape(err_str[:220] or '未知错误')}</code>\n\n"
-            "<i>可点击下方按钮重试，或查看本机统计 <code>/cost</code>。</i>"
-        )
-        return header + body, kb
-
-    group_blocks = []
-    gemini_wk_pct = None
-    gemini_5h_pct = None
-    claude_wk_pct = None
-
-    for grp in (snap.get("groups") or []):
-        raw_gname = (grp.get("name") or "").strip()
-        gl = raw_gname.lower()
-        if "gemini" in gl:
-            g_icon = "💎"
-            g_title = "Gemini 模型组"
-            g_models = "Carbon 4 · Hydrogen 4 · Argon 4 · Orchestrator · Flash 3.8"
-        elif "claude" in gl or "gpt" in gl:
-            g_icon = "🧩"
-            g_title = "Claude & GPT 模型组"
-            g_models = "Claude Opus 5.5 · Claude Sonnet 5.5 · GPT-OSS 120B"
-        else:
-            g_icon = "🤖"
-            g_title = raw_gname or "其他模型组"
-            raw_desc = (grp.get("description") or "").replace("Models within this group:", "").strip()
-            g_models = raw_desc[:72]
-
-        b_lines = [f"{g_icon} <b>{html_mod.escape(g_title)}</b>"]
-        if g_models:
-            b_lines.append(f"<code>含 {html_mod.escape(g_models)}</code>")
-
-        for b in (grp.get("buckets") or []):
-            win = (b.get("window") or "").lower()
-            bname = (b.get("name") or "").strip()
-            if win == "weekly" or "weekly" in bname.lower():
-                win_lbl = "每周限额"
-                is_weekly = True
-            elif win == "5h" or "hour" in bname.lower():
-                win_lbl = "5小时窗口"
-                is_weekly = False
-            else:
-                win_lbl = bname or "配额"
-                is_weekly = False
-
-            rem_frac = max(0.0, min(1.0, float(b.get("remaining_fraction", 0.0))))
-            rem_pct = rem_frac * 100.0
-            used_pct = max(0.0, 100.0 - rem_pct)
-
-            if "gemini" in gl and is_weekly:
-                gemini_wk_pct = rem_pct
-            elif "gemini" in gl and not is_weekly:
-                gemini_5h_pct = rem_pct
-            elif ("claude" in gl or "gpt" in gl) and is_weekly:
-                claude_wk_pct = rem_pct
-
-            filled = int(round(rem_frac * 10))
-            bar = "▓" * filled + "░" * (10 - filled)
-
-            if rem_pct <= 5.0:
-                badge = " 🚨"
-            elif rem_pct < 20.0:
-                badge = " ⚠️"
-            elif rem_pct < 50.0:
-                badge = " ⚡"
-            else:
-                badge = " ✅"
-
-            rst_utc = _parse_iso_z(b.get("reset_time"))
-            if rst_utc is not None:
-                rst_loc = rst_utc.astimezone(tz)
-                if rst_loc.date() == now_local.date():
-                    rst_str = f"今日 {rst_loc.strftime('%H:%M')}"
-                else:
-                    rst_str = f"{rst_loc.strftime('%m-%d')} {_WEEKDAY_CN[rst_loc.weekday()]} {rst_loc.strftime('%H:%M')}"
-                cd_str = _fmt_quota_countdown(rst_utc, now_utc)
-                rst_info = f"<code>{rst_str}</code> 重置 (<b>{cd_str}</b>)"
-            else:
-                rst_info = "<code>重置时间未知</code>"
-
-            b_lines.append(
-                f"• <b>{html_mod.escape(win_lbl)}：</b>剩余 <b><code>{rem_pct:.1f}%</code></b> "
-                f"<code>(已用 {used_pct:.1f}%)</code>{badge}\n"
-                f"  <code>[{bar}]</code> · {rst_info}"
-            )
-
-        group_blocks.append("\n".join(b_lines))
-
-    if gemini_wk_pct is not None and gemini_wk_pct < 20.0 and (claude_wk_pct or 0.0) >= 50.0:
-        tip = (
-            f"\n\n💡 <b>配额建议：</b>Gemini 周限额仅剩 <code>{gemini_wk_pct:.1f}%</code>，"
-            f"而 Claude/GPT 池尚余 <code>{claude_wk_pct:.1f}%</code>；重度编码/推理可点下方切至 Claude 5.5 分担额度。"
-        )
-    elif gemini_5h_pct is not None and gemini_5h_pct < 20.0:
-        tip = (
-            f"\n\n💡 <b>配额建议：</b>Gemini 5小时窗口剩余 <code>{gemini_5h_pct:.1f}%</code>，"
-            f"短期密集请求建议稍候窗口刷新或切换 Flash / Claude 模型。"
-        )
-    else:
-        tip = "\n\n<i>💡 同组模型共享周限额与 5h 窗口，按模型 Token 成本权重扣减套餐进度。</i>"
-
-    ft_epoch = float(snap.get("fetched_at_epoch") or time.time())
-    ft_loc = datetime.datetime.fromtimestamp(ft_epoch, tz)
-    if is_fallback:
-        footer = (
-            f"\n\n<i>🕒 缓存快照于 {ft_loc.strftime('%m-%d %H:%M:%S')}（后续自动刷新） · "
-            f"本机明细请看 /cost</i>"
-        )
-    else:
-        footer = (
-            f"\n\n<i>🕒 实时同步于 {ft_loc.strftime('%H:%M:%S')} · "
-            f"0 Token 直连官方配额接口 · 本机明细请看 /cost</i>"
-        )
-
-    body = "\n\n".join(group_blocks) + tip
-    return header + body + footer, kb
+    return cost_usage.render_usage_panel(snap, is_fallback, err_str, cost_tz_name=COST_TZ_NAME)
 
 
 def cmd_usage(chat_id, raw_rest="", edit_msg_id=None, thread_id=None):
@@ -7622,6 +6782,7 @@ def cmd_status(chat_id, thread_id=None, scope_key=None):
     q_str = f"{q_here} here" + (f" / {q_all} total" if q_all != q_here else "")
     team_role = _current_bot_role()
     roster_online = sum(1 for b in bot_bus.list_roster(include_offline=False))
+    fb_desc = model_failover.describe_fallback_config(sc.get("fallback_models"), FALLBACK_MODELS_RAW)
 
     text = (f"<b>🤖 Antigravity Bridge v3.2 (Scoped Topics &amp; Bot Bus)</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -7630,6 +6791,7 @@ def cmd_status(chat_id, thread_id=None, scope_key=None):
             f"• <b>Project:</b> <code>{html_mod.escape(proj_label)}</code> (<code>{html_mod.escape(wdir_short)}</code>)\n"
             f"• <b>Mode:</b> <code>{mode}</code>\n"
             f"• <b>Model:</b> <code>{model or '(default)'}</code>\n"
+            f"• <b>Fallback:</b> <code>{html_mod.escape(fb_desc)}</code>\n"
             f"• <b>Effort:</b> <code>{effort or '(default)'}</code>\n"
             f"• <b>Thinking:</b> <code>{'enabled' if th_on else 'disabled'}</code>\n"
             f"• <b>Session:</b> <code>{(conv or '(none)')[:8]}</code>\n"
@@ -7651,11 +6813,17 @@ def handle_callback(cb):
     skey = scope_key_for(chat_id, thread_id)
     msg_id = msg.get("message_id")
 
-    if not _is_authorized(chat_id, from_user=from_user, allow_uid_fallback=True):
+    role = _get_user_role(chat_id, from_user=from_user, allow_uid_fallback=True)
+    if role == "denied":
         tg("answerCallbackQuery", callback_query_id=cb_id, text="Unauthorized", show_alert=True)
         return
 
     data = cb.get("data", "")
+    allowed_cb, _ = access_control.is_callback_allowed_for_role(role, data)
+    if not allowed_cb:
+        tg("answerCallbackQuery", callback_query_id=cb_id,
+           text=access_control.format_rbac_denied_message(data, is_callback=True), show_alert=True)
+        return
 
     if data.startswith("model:"):
         target = data[6:]
@@ -8216,7 +7384,7 @@ def _note_poll_album_batch(updates):
         if not mg_id or not _has_msg_media(m):
             continue
         chat_id = (m.get("chat") or {}).get("id")
-        if not _is_authorized(chat_id, from_user=m.get("from")):
+        if _get_user_role(chat_id, from_user=m.get("from")) != "admin":
             continue
         thread_id = _extract_thread_id(m)
         skey = scope_key_for(chat_id, thread_id)
@@ -8422,7 +7590,9 @@ def _handle_album_item(msg, chat_id, thread_id, skey, mg_id):
 # ---------------------------------------------------------------- message dispatch
 def handle_message(msg):
     chat_id = msg.get("chat", {}).get("id")
-    if not _is_authorized(chat_id, from_user=msg.get("from")):
+    from_user = msg.get("from")
+    role = _get_user_role(chat_id, from_user=from_user)
+    if role == "denied":
         log("rejected chat %s" % chat_id)
         return
     chain_id = _record_human_group_msg(msg) or ""
@@ -8440,6 +7610,15 @@ def handle_message(msg):
         cmd = parts[0].split("@")[0]
         arg = parts[1] if len(parts) > 1 else ""
         raw_rest = text[len(parts[0]):].strip()
+        allowed_cmd, denied_label = access_control.is_command_allowed_for_role(role, cmd, raw_rest)
+        if not allowed_cmd:
+            send(
+                chat_id,
+                access_control.format_rbac_denied_message(denied_label),
+                parse_mode="HTML",
+                thread_id=thread_id,
+            )
+            return
         if cmd in ("/new", "/reset"):
             update_scope_state(skey, conversation_id=None, pending_undo_notice=None)
             save_state()
@@ -8468,7 +7647,7 @@ def handle_message(msg):
         elif cmd in ("/project", "/projects"):
             cmd_project(chat_id, raw_rest, thread_id=thread_id, scope_key=skey)
         elif cmd == "/model":
-            cmd_model(chat_id, arg, thread_id=thread_id, scope_key=skey)
+            cmd_model(chat_id, raw_rest, thread_id=thread_id, scope_key=skey)
         elif cmd == "/effort":
             cmd_effort(chat_id, arg, thread_id=thread_id, scope_key=skey)
         elif cmd == "/thinking":
@@ -8581,6 +7760,8 @@ def handle_message(msg):
         origin_msg_id=msg_id,
         chain_id=chain_id,
         raw_text=text,
+        user_role=role,
+        user_id=access_control.extract_user_id(from_user),
     )
 
 
@@ -8596,6 +7777,8 @@ def enqueue(
     is_mention=False,
     has_media=False,
     raw_text=None,
+    user_role="admin",
+    user_id=None,
 ):
     norm_tid = _normalize_thread_id(thread_id)
     skey = scope_key or scope_key_for(chat_id, norm_tid)
@@ -8619,6 +7802,8 @@ def enqueue(
                     "origin_msg_id": int(origin_msg_id or 0),
                     "mention_hop": int(mention_hop or 0),
                     "busy_desc": busy_desc,
+                    "user_role": user_role,
+                    "user_id": user_id,
                 },
                 daemon=True,
             ).start()
@@ -8642,7 +7827,7 @@ def enqueue(
                 thread_id=norm_tid,
             )
 
-    if origin_msg_id or mention_hop or chain_id:
+    if origin_msg_id or mention_hop or chain_id or user_role != "admin" or user_id is not None:
         item_payload = (
             "__CHAT_TURN__",
             {
@@ -8650,6 +7835,8 @@ def enqueue(
                 "origin_msg_id": int(origin_msg_id or 0),
                 "mention_hop": int(mention_hop or 0),
                 "chain_id": str(chain_id or ""),
+                "user_role": str(user_role or "admin"),
+                "user_id": user_id,
             },
         )
     else:
@@ -8659,11 +7846,15 @@ def enqueue(
 
 def handle_voice(msg):
     chat_id = msg.get("chat", {}).get("id")
-    if not _is_authorized(chat_id, from_user=msg.get("from")):
+    role = _get_user_role(chat_id, from_user=msg.get("from"))
+    if role == "denied":
         return
     if _should_ignore_group_message(msg):
         return
     thread_id = _extract_thread_id(msg)
+    if role == "readonly":
+        send(chat_id, "🔒 当前为只读访客权限（readonly），暂不支持发送语音写入工作区，请直接发送文字提问。", thread_id=thread_id)
+        return
     skey = scope_key_for(chat_id, thread_id)
     v = msg.get("voice") or msg.get("audio")
     ext = ".oga" if msg.get("voice") else (os.path.splitext(v.get("file_name") or "audio.mp3")[1] or ".mp3")
@@ -8701,11 +7892,15 @@ def handle_voice(msg):
 
 def handle_media(msg):
     chat_id = msg.get("chat", {}).get("id")
-    if not _is_authorized(chat_id, from_user=msg.get("from")):
+    role = _get_user_role(chat_id, from_user=msg.get("from"))
+    if role == "denied":
         return
     if _should_ignore_group_message(msg):
         return
     thread_id = _extract_thread_id(msg)
+    if role == "readonly":
+        send(chat_id, "🔒 当前为只读访客权限（readonly），暂不支持上传文件写入工作区，请直接发送文字提问。", thread_id=thread_id)
+        return
     skey = scope_key_for(chat_id, thread_id)
     mg_id = msg.get("media_group_id")
     if mg_id:
@@ -8779,7 +7974,7 @@ def _run_poll_iteration(offset, first_poll, poll_err_streak):
                 if smg:
                     smg_chat = (smg.get("chat") or {}).get("id")
                     smg_tid = _normalize_thread_id(smg.get("message_thread_id"))
-                    if _is_authorized(smg_chat, from_user=smg.get("from")):
+                    if _get_user_role(smg_chat, from_user=smg.get("from")) == "admin":
                         log("Native Stop button pressed in chat %s (thread %s, draft %s)"
                             % (smg_chat, smg_tid, smg.get("draft_id")))
                         cancel_current_task(smg_chat, from_native_stop=True, thread_id=smg_tid)
