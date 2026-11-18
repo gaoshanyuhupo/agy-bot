@@ -929,9 +929,26 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _normalize_cli_argv(argv: Sequence[str]) -> list[str]:
+    """Bind negative Telegram chat IDs (e.g. ``-100...``) to ``--allowed-chats=`` for Python <3.14 argparse."""
+    items = list(argv)
+    out: list[str] = []
+    i = 0
+    while i < len(items):
+        tok = items[i]
+        if tok == "--allowed-chats" and i + 1 < len(items) and items[i + 1].startswith("-"):
+            out.append(f"{tok}={items[i + 1]}")
+            i += 2
+            continue
+        out.append(tok)
+        i += 1
+    return out
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    raw_argv = sys.argv[1:] if argv is None else argv
+    args = parser.parse_args(_normalize_cli_argv(raw_argv))
     if args.command == "doctor":
         rc, report = run_doctor(env_file=args.env_file, online=args.online, fix=args.fix)
         if args.json:
