@@ -32,6 +32,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import zlib
@@ -134,10 +135,109 @@ if os.environ.get("AGY_TG_FORCE_IPV4", "1").strip().lower() not in ("0", "false"
         pass
 
 # Persistent HTTP session (thread-safe connection pool)
-http_session = requests.Session()
-_adapter = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=16)
-http_session.mount("https://", _adapter)
-http_session.mount("http://", _adapter)
+_http_session_lock = threading.Lock()
+
+
+def _build_http_session():
+    """Create a fresh requests.Session with bounded connection pooling."""
+    sess = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=16)
+    sess.mount("https://", adapter)
+    sess.mount("http://", adapter)
+    return sess
+
+
+def _reset_http_session(reason=None):
+    """Atomically swap `http_session` without closing in-flight worker connections."""
+    global http_session
+    new_sess = _build_http_session()
+    with _http_session_lock:
+        http_session = new_sess
+    if reason:
+        log("Rebuilt http_session connection pool (%s)" % reason)
+    return new_sess
+
+
+http_session = _build_http_session()
+
+_instance_lock_fh = None
+_instance_lock_path_held = None
+
+
+def _instance_lock_path():
+    """Return a per-bot isolated lock path so distinct bots never block each other."""
+    lock_dir = os.environ.get("AGY_TG_LOCK_DIR") or tempfile.gettempdir()
+    key = f"token:{BOT_TOKEN}" if BOT_TOKEN else f"state:{os.path.realpath(STATE_FILE)}"
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+    return os.path.join(lock_dir, f"agy-tg-bridge-{digest}.lock")
+
+
+def _acquire_instance_lock(lock_path=None):
+    """Acquire an exclusive non-blocking flock for this bot instance.
+
+    Sets FD_CLOEXEC so `os.execv` hot reload atomically closes the fd at exec time
+    and lets the re-exec'd process seamlessly re-acquire the lock.
+    """
+    global _instance_lock_fh, _instance_lock_path_held
+    target = lock_path or _instance_lock_path()
+    os.makedirs(os.path.dirname(os.path.abspath(target)), exist_ok=True)
+    if _instance_lock_fh is not None:
+        if _instance_lock_path_held == target:
+            return _instance_lock_fh
+        _release_instance_lock()
+
+    fh = open(target, "a+", encoding="utf-8")
+    try:
+        os.set_inheritable(fh.fileno(), False)
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:
+        owner_pid = ""
+        try:
+            fh.seek(0)
+            lines = fh.read().strip().splitlines()
+            if lines:
+                owner_pid = lines[0].strip()
+        except Exception:
+            pass
+        try:
+            fh.close()
+        except Exception:
+            pass
+        pid_note = f", pid={owner_pid}" if owner_pid else ""
+        msg = (
+            f"ERROR: Another bridge instance is already running for this bot "
+            f"(lock={target}{pid_note}): {e}"
+        )
+        print(msg, file=sys.stderr, flush=True)
+        raise SystemExit(1)
+
+    try:
+        fh.seek(0)
+        fh.truncate(0)
+        fh.write(f"{os.getpid()}\n{BOT_INSTANCE_ID}\n")
+        fh.flush()
+    except Exception:
+        pass
+    _instance_lock_fh = fh
+    _instance_lock_path_held = target
+    return fh
+
+
+def _release_instance_lock():
+    """Release the held instance flock (used in tests and clean process exit)."""
+    global _instance_lock_fh, _instance_lock_path_held
+    fh = _instance_lock_fh
+    _instance_lock_fh = None
+    _instance_lock_path_held = None
+    if fh is not None:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            fh.close()
+        except Exception:
+            pass
 
 shutting_down = False
 
@@ -288,6 +388,8 @@ def parse_scope_key(scope_key):
 
 
 def _is_authorized(chat_id, from_user=None, allow_uid_fallback=False):
+    if not ALLOWED:
+        return False
     uid = (from_user or {}).get("id") if isinstance(from_user, dict) else None
     if ALLOWED_USERS and uid is not None and uid not in ALLOWED_USERS:
         return False
@@ -562,7 +664,11 @@ def _tg_retry_after(resp):
         return 2
 
 
-def _sleep_wait_429(seconds):
+POLL_BACKOFF_BASE = 2.0
+POLL_BACKOFF_MAX = 30.0
+
+
+def _sleep_interruptible(seconds):
     deadline = time.time() + max(0.0, float(seconds))
     while not shutting_down:
         rem = deadline - time.time()
@@ -570,6 +676,17 @@ def _sleep_wait_429(seconds):
             return True
         time.sleep(min(0.5, rem))
     return False
+
+
+def _sleep_wait_429(seconds):
+    return _sleep_interruptible(seconds)
+
+
+def _poll_backoff_seconds(streak):
+    """Compute capped exponential backoff (2s -> 4s -> 8s -> 16s -> max 30s)."""
+    if streak <= 0:
+        return 0.0
+    return min(POLL_BACKOFF_MAX, POLL_BACKOFF_BASE * (2 ** min(int(streak) - 1, 10)))
 
 
 def tg(method, _timeout=None, _retry_429=True, _max_429_wait=12, **params):
@@ -4348,17 +4465,17 @@ def _execute_bus_job(job_id):
     if silent_group:
         mirror_chat = 0
         mirror_thread = None
-    elif BUS_CHAT_MODE == "conversational" and origin_chat < 0 and (not ALLOWED or origin_chat in ALLOWED):
+    elif BUS_CHAT_MODE == "conversational" and origin_chat < 0 and _is_authorized(origin_chat):
         mirror_chat = origin_chat
         mirror_thread = origin_thread
     else:
         mirror_chat = int(cfg.get("mirror_chat_id") or 0)
         mirror_thread = _normalize_thread_id(cfg.get("mirror_thread_id"))
         if not mirror_chat and job.get("notify_group") and origin_chat:
-            if not ALLOWED or origin_chat in ALLOWED:
+            if _is_authorized(origin_chat):
                 mirror_chat = origin_chat
                 mirror_thread = origin_thread
-    if mirror_chat and ALLOWED and mirror_chat not in ALLOWED:
+    if mirror_chat and not _is_authorized(mirror_chat):
         mirror_chat = 0
 
     mirror_msg_id = None
@@ -4751,7 +4868,7 @@ def _bot_bus_loop():
                     c_id = int(pkt.get("chat_id") or 0)
                     t_id = _normalize_thread_id(pkt.get("thread_id"))
                     msg_txt = pkt.get("message") or ""
-                    if c_id and msg_txt and (not ALLOWED or c_id in ALLOWED):
+                    if c_id and msg_txt and _is_authorized(c_id):
                         sent_mid, _ = send_rich(
                             c_id,
                             msg_txt,
@@ -4771,7 +4888,7 @@ def _bot_bus_loop():
                     c_id = int(pkt.get("chat_id") or 0)
                     t_id = _normalize_thread_id(pkt.get("thread_id"))
                     skey = scope_key_for(c_id, t_id)
-                    if c_id < 0 and (not ALLOWED or c_id in ALLOWED):
+                    if c_id < 0 and _is_authorized(c_id):
                         if not bot_bus.loop_guard_allow(f"mention:{skey}"):
                             log("BotLoopGuard blocked group_mention wake for %s" % skey)
                             continue
@@ -7745,6 +7862,115 @@ def _apply_reply_context(user_text, msg):
 _album_lock = threading.Lock()
 _album_buffers = {}  # album_key -> dict
 
+MAX_TG_FILE_BYTES = 20 * 1024 * 1024
+_MEDIA_MIME_EXTS = {
+    "video/mp4": ".mp4",
+    "video/webm": ".webm",
+    "video/quicktime": ".mov",
+    "video/x-matroska": ".mkv",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+}
+# Check `animation` BEFORE `document` because Telegram populates both on GIF messages.
+_MEDIA_KEY_ORDER = ("animation", "video", "video_note", "sticker", "document", "photo")
+
+
+def _has_msg_media(msg):
+    return isinstance(msg, dict) and any(msg.get(k) for k in _MEDIA_KEY_ORDER)
+
+
+def _extract_media_spec(msg):
+    """Return `(kind, media_obj)` for supported Telegram media fields, or `(None, None)`."""
+    if not isinstance(msg, dict):
+        return None, None
+    for kind in _MEDIA_KEY_ORDER:
+        val = msg.get(kind)
+        if not val:
+            continue
+        if kind == "photo":
+            if isinstance(val, list) and val:
+                return "photo", val[-1]
+            continue
+        if isinstance(val, dict):
+            return kind, val
+    return None, None
+
+
+def _safe_media_filename(kind, media_obj, msg_id, ts=None, unique_album_names=False):
+    stamp = int(ts if ts is not None else time.time())
+    if kind == "sticker":
+        ext = ".webm" if media_obj.get("is_video") else (".tgs" if media_obj.get("is_animated") else ".webp")
+        fname = f"sticker_{stamp}_{msg_id}{ext}"
+    elif kind == "video_note":
+        fname = f"video_note_{stamp}_{msg_id}.mp4"
+    elif kind == "photo":
+        fname = f"photo_{stamp}_{msg_id}.jpg"
+    else:
+        mime = str(media_obj.get("mime_type") or "").split(";", 1)[0].strip().lower()
+        default_ext = _MEDIA_MIME_EXTS.get(mime) or (".mp4" if kind in ("video", "animation") else "")
+        raw_fn = media_obj.get("file_name") or ""
+        raw_base = os.path.basename(str(raw_fn).replace("\x00", "").strip())
+        if raw_base in ("", ".", ".."):
+            prefix = "file" if kind == "document" else kind
+            fname = f"{prefix}_{stamp}_{msg_id}{default_ext}"
+        else:
+            _stem, ext = os.path.splitext(raw_base)
+            fname = f"{raw_base}{default_ext}" if (not ext and default_ext) else raw_base
+    if unique_album_names and os.path.exists(os.path.join(UPLOADDIR, fname)):
+        stem, ext = os.path.splitext(fname)
+        fname = f"{stem}_{msg_id}{ext}"
+    return fname
+
+
+def _describe_msg_media(msg):
+    """Return `(kind, ledger_label, meta_text)` describing semantic Telegram media attributes."""
+    kind, obj = _extract_media_spec(msg)
+    if not kind or not obj:
+        return None, "文件", ""
+    if kind == "sticker":
+        fmt = "video .webm" if obj.get("is_video") else ("animated .tgs" if obj.get("is_animated") else "static .webp")
+        parts = [fmt]
+        if obj.get("emoji"):
+            parts.append(f"emoji={obj['emoji']}")
+        if obj.get("set_name"):
+            parts.append(f"set={obj['set_name']}")
+        if obj.get("width") and obj.get("height"):
+            parts.append(f"{obj['width']}x{obj['height']}")
+        return kind, "贴纸", f"Sticker ({', '.join(parts)})"
+    if kind == "video":
+        parts = []
+        if obj.get("duration") is not None:
+            parts.append(f"{obj['duration']}s")
+        if obj.get("width") and obj.get("height"):
+            parts.append(f"{obj['width']}x{obj['height']}")
+        if obj.get("file_name"):
+            parts.append(f"name={os.path.basename(str(obj['file_name']))}")
+        meta = f"Video ({', '.join(parts)})" if parts else "Video"
+        return kind, "视频", meta
+    if kind == "video_note":
+        parts = []
+        if obj.get("duration") is not None:
+            parts.append(f"{obj['duration']}s")
+        if obj.get("length"):
+            parts.append(f"{obj['length']}x{obj['length']}")
+        meta = f"Video Note ({', '.join(parts)})" if parts else "Video Note"
+        return kind, "圆视频", meta
+    if kind == "animation":
+        parts = []
+        if obj.get("duration") is not None:
+            parts.append(f"{obj['duration']}s")
+        if obj.get("width") and obj.get("height"):
+            parts.append(f"{obj['width']}x{obj['height']}")
+        if obj.get("file_name"):
+            parts.append(f"name={os.path.basename(str(obj['file_name']))}")
+        meta = f"Animation/GIF ({', '.join(parts)})" if parts else "Animation/GIF"
+        return kind, "动图", meta
+    if kind == "photo":
+        return kind, "图片", ""
+    return kind, "文件", ""
+
 
 def _note_poll_album_batch(updates):
     """Pre-register every album item in the current getUpdates poll batch so slow downloads never split an album."""
@@ -7754,7 +7980,7 @@ def _note_poll_album_batch(updates):
         if not isinstance(m, dict):
             continue
         mg_id = m.get("media_group_id")
-        if not mg_id or not (m.get("document") or m.get("photo")):
+        if not mg_id or not _has_msg_media(m):
             continue
         chat_id = (m.get("chat") or {}).get("id")
         if not _is_authorized(chat_id, from_user=m.get("from")):
@@ -7838,7 +8064,10 @@ def _flush_album(akey):
     captions = list(dict.fromkeys(c for c in entry["captions"] if c))
     reply_ctxs = list(dict.fromkeys(r for r in entry["reply_ctxs"] if r))
     caption_block = "\n".join(captions) if captions else "Please review these uploaded files"
-    file_lines = "\n".join(f"- {it['dest']}" for it in items)
+    file_lines = "\n".join(
+        f"- {it['dest']}" + (f" ({it['meta']})" if it.get("meta") else "")
+        for it in items
+    )
     err_note = ("\n(Failed items: " + "; ".join(errors[:5]) + ")") if errors else ""
 
     parts = []
@@ -7852,6 +8081,8 @@ def _flush_album(akey):
     sender_handle = entry.get("sender_handle") or "user"
     chain_id = ""
     if chat_id and int(chat_id) < 0:
+        meta_tags = [it.get("meta") for it in items if it.get("meta")]
+        ledger_suffix = f" ({'; '.join(meta_tags[:4])})" if (not captions and meta_tags) else ""
         bot_bus.record_group_message(
             int(chat_id),
             msg_id=first_mid,
@@ -7859,7 +8090,7 @@ def _flush_album(akey):
             sender_handle=sender_handle,
             sender_role="human",
             is_bot=False,
-            text=f"[相册 {len(items)} 个文件] {caption_block}",
+            text=f"[相册 {len(items)} 个文件] {caption_block}{ledger_suffix}",
         )
         chain_id = bot_bus.mark_human_group_activity(int(chat_id), thread_id=thread_id, msg_id=first_mid) or ""
     enqueue(
@@ -7875,23 +8106,17 @@ def _flush_album(akey):
 
 
 def _download_msg_media(msg, unique_album_names=False):
-    """Download photo or document from `msg` into UPLOADDIR. Returns `(dest, rel, err_str)`."""
+    """Download supported Telegram media from `msg` into UPLOADDIR. Returns `(dest, rel, err_str)`."""
+    kind, media_obj = _extract_media_spec(msg)
+    if not kind or not media_obj or not media_obj.get("file_id"):
+        return None, None, "Unsupported or empty media payload"
+    if (media_obj.get("file_size") or 0) > MAX_TG_FILE_BYTES:
+        return None, None, "File over 20MB — Telegram Bot API limit"
     msg_id = msg.get("message_id") or int(time.time() * 1000) % 100000
-    if msg.get("document"):
-        d = msg["document"]
-        if d.get("file_size", 0) > 20 * 1024 * 1024:
-            return None, None, "File over 20MB — Telegram Bot API limit"
-        raw_name = os.path.basename(d.get("file_name") or f"file_{int(time.time())}_{msg_id}")
-        if unique_album_names and os.path.exists(os.path.join(UPLOADDIR, raw_name)):
-            stem, ext = os.path.splitext(raw_name)
-            raw_name = f"{stem}_{msg_id}{ext}"
-        dest = os.path.join(UPLOADDIR, raw_name)
-        file_id = d["file_id"]
-    else:
-        file_id = msg["photo"][-1]["file_id"]
-        dest = os.path.join(UPLOADDIR, f"photo_{int(time.time())}_{msg_id}.jpg")
+    fname = _safe_media_filename(kind, media_obj, msg_id, unique_album_names=unique_album_names)
+    dest = os.path.join(UPLOADDIR, fname)
     try:
-        tg_download(file_id, dest)
+        tg_download(media_obj["file_id"], dest)
     except Exception as e:
         return None, None, f"Download failed: {e!r}"
     rel = os.path.relpath(dest, WORKDIR)
@@ -7936,10 +8161,11 @@ def _handle_album_item(msg, chat_id, thread_id, skey, mg_id):
 
     try:
         dest, rel, err = _download_msg_media(msg, unique_album_names=True)
+        _, _, media_meta = _describe_msg_media(msg)
         caption = (msg.get("caption") or "").strip()
         reply_ctx = _extract_reply_context(msg)
     except Exception as exc:
-        dest, rel, err, caption, reply_ctx = None, None, f"Download error: {exc!r}", "", ""
+        dest, rel, err, media_meta, caption, reply_ctx = None, None, f"Download error: {exc!r}", "", "", ""
     finally:
         with _album_lock:
             entry = _album_buffers.get(akey)
@@ -7948,7 +8174,7 @@ def _handle_album_item(msg, chat_id, thread_id, skey, mg_id):
                 if err:
                     entry["errors"].append(err)
                 elif dest:
-                    entry["items"].append({"dest": dest, "rel": rel})
+                    entry["items"].append({"dest": dest, "rel": rel, "meta": media_meta})
                 if caption:
                     entry["captions"].append(caption)
                 if reply_ctx:
@@ -8253,14 +8479,25 @@ def handle_media(msg):
         _handle_album_item(msg, chat_id, thread_id, skey, str(mg_id))
         return
 
-    caption = (msg.get("caption") or "").strip() or "Please review this file"
+    _kind, ledger_label, media_meta = _describe_msg_media(msg)
+    user_caption = (msg.get("caption") or "").strip()
     dest, rel, err = _download_msg_media(msg, unique_album_names=False)
     if err:
         send(chat_id, err, thread_id=thread_id)
         return
     send(chat_id, "📥 Saved as %s — tasking agent" % rel, thread_id=thread_id)
-    chain_id = _record_human_group_msg(msg, text_override=f"[文件 {rel}] {caption}") or ""
-    full_prompt = _apply_reply_context("%s\n(The file is saved at: %s)" % (caption, dest), msg)
+    if media_meta:
+        lead = user_caption or f"User sent {media_meta}"
+        prompt_body = f"{lead}\n({media_meta}; the file is saved at: {dest})"
+        ledger_text = f"[{ledger_label} {rel}] {media_meta}" + (f" {user_caption}" if user_caption else "")
+        raw_text = f"{media_meta} {user_caption}".strip()
+    else:
+        lead = user_caption or "Please review this file"
+        prompt_body = f"{lead}\n(The file is saved at: {dest})"
+        ledger_text = f"[文件 {rel}] {lead}"
+        raw_text = lead
+    chain_id = _record_human_group_msg(msg, text_override=ledger_text) or ""
+    full_prompt = _apply_reply_context(prompt_body, msg)
     enqueue(
         chat_id,
         full_prompt,
@@ -8269,11 +8506,80 @@ def handle_media(msg):
         origin_msg_id=int(msg.get("message_id") or 0),
         chain_id=chain_id,
         has_media=True,
-        raw_text=caption,
+        raw_text=raw_text,
     )
 
 
+def _run_poll_iteration(offset, first_poll, poll_err_streak):
+    """Execute one getUpdates cycle with self-healing session rebuild & exponential backoff."""
+    try:
+        poll_params = {"offset": offset, "timeout": 15}
+        if first_poll:
+            # Reset allowed_updates to default [] so stopped_message_generation is delivered
+            poll_params["allowed_updates"] = json.dumps([])
+        r = http_session.get(API + "/getUpdates", params=poll_params, timeout=(8, 20))
+        first_poll = False
+        data = r.json()
+        if not data.get("ok"):
+            poll_err_streak += 1
+            err_code = data.get("error_code") or getattr(r, "status_code", None)
+            desc = str(data.get("description", ""))
+            if err_code == 409 or "conflict" in desc.lower():
+                log(
+                    "getUpdates 409 Conflict (streak=%d): %s — another process or webhook is polling this bot token!"
+                    % (poll_err_streak, data)
+                )
+            else:
+                log("getUpdates error (streak=%d): %s" % (poll_err_streak, data))
+            if poll_err_streak >= 3 or (isinstance(err_code, int) and err_code >= 500):
+                _reset_http_session(reason=f"getUpdates_api_error_{err_code or 'unknown'}")
+            _sleep_interruptible(_poll_backoff_seconds(poll_err_streak))
+            return offset, first_poll, poll_err_streak
+
+        poll_err_streak = 0
+        updates = data.get("result", [])
+        _note_poll_album_batch(updates)
+        for u in updates:
+            offset = u["update_id"] + 1
+            try:
+                smg = u.get("stopped_message_generation")
+                if smg:
+                    smg_chat = (smg.get("chat") or {}).get("id")
+                    smg_tid = _normalize_thread_id(smg.get("message_thread_id"))
+                    if _is_authorized(smg_chat, from_user=smg.get("from")):
+                        log("Native Stop button pressed in chat %s (thread %s, draft %s)"
+                            % (smg_chat, smg_tid, smg.get("draft_id")))
+                        cancel_current_task(smg_chat, from_native_stop=True, thread_id=smg_tid)
+                    continue
+                cb = u.get("callback_query")
+                if cb:
+                    handle_callback(cb)
+                    continue
+                msg = u.get("message") or u.get("edited_message")
+                if not msg:
+                    continue
+                if _has_msg_media(msg):
+                    handle_media(msg)
+                elif msg.get("voice") or msg.get("audio"):
+                    handle_voice(msg)
+                else:
+                    handle_message(msg)
+            except Exception as e:
+                log("dispatch error: %r" % e)
+        return offset, first_poll, poll_err_streak
+    except requests.exceptions.ReadTimeout:
+        return offset, False, poll_err_streak
+    except Exception as e:
+        if not shutting_down:
+            poll_err_streak += 1
+            log("poll error (streak=%d): %r" % (poll_err_streak, e))
+            _reset_http_session(reason=f"poll_error:{type(e).__name__}")
+            _sleep_interruptible(_poll_backoff_seconds(poll_err_streak))
+        return offset, first_poll, poll_err_streak
+
+
 def main():
+    _acquire_instance_lock()
     signal.signal(signal.SIGTERM, sig_handler)
     signal.signal(signal.SIGINT, sig_handler)
 
@@ -8291,6 +8597,7 @@ def main():
     threading.Thread(target=_bot_bus_loop, daemon=True).start()
     offset = 0
     first_poll = True
+    poll_err_streak = 0
     prim = get_scope_state(PRIMARY_SCOPE_KEY)
     log("bridge v3.2 (Coordinator Bot Bus + scoped topics/albums/undo) started, role: %s, allowed chats: %s, mode: %s, model: %s"
         % (_current_bot_role(), ALLOWED, prim.get("mode"), prim.get("model")))
@@ -8307,53 +8614,7 @@ def main():
                 log("Detected %s while idle, reloading via execv..." % RELOAD_TRIGGER)
                 perform_hot_reload()
 
-        try:
-            poll_params = {"offset": offset, "timeout": 15}
-            if first_poll:
-                # Reset allowed_updates to default [] so stopped_message_generation is delivered
-                poll_params["allowed_updates"] = json.dumps([])
-                first_poll = False
-            r = http_session.get(API + "/getUpdates", params=poll_params, timeout=(8, 20))
-            data = r.json()
-            if not data.get("ok"):
-                log("getUpdates error: %s" % data)
-                time.sleep(2)
-                continue
-            updates = data.get("result", [])
-            _note_poll_album_batch(updates)
-            for u in updates:
-                offset = u["update_id"] + 1
-                try:
-                    smg = u.get("stopped_message_generation")
-                    if smg:
-                        smg_chat = (smg.get("chat") or {}).get("id")
-                        smg_tid = _normalize_thread_id(smg.get("message_thread_id"))
-                        if smg_chat in ALLOWED:
-                            log("Native Stop button pressed in chat %s (thread %s, draft %s)"
-                                % (smg_chat, smg_tid, smg.get("draft_id")))
-                            cancel_current_task(smg_chat, from_native_stop=True, thread_id=smg_tid)
-                        continue
-                    cb = u.get("callback_query")
-                    if cb:
-                        handle_callback(cb)
-                        continue
-                    msg = u.get("message") or u.get("edited_message")
-                    if not msg:
-                        continue
-                    if msg.get("document") or msg.get("photo"):
-                        handle_media(msg)
-                    elif msg.get("voice") or msg.get("audio"):
-                        handle_voice(msg)
-                    else:
-                        handle_message(msg)
-                except Exception as e:
-                    log("dispatch error: %r" % e)
-        except requests.exceptions.ReadTimeout:
-            continue
-        except Exception as e:
-            if not shutting_down:
-                log("poll error: %r" % e)
-                time.sleep(2)
+        offset, first_poll, poll_err_streak = _run_poll_iteration(offset, first_poll, poll_err_streak)
 
     _cancel_all_album_timers()
     log("Polling loop exited. Waiting for in-flight tasks to complete before shutdown...")
@@ -8374,6 +8635,7 @@ def main():
         close_all_sessions_sync()
 
     log("Graceful shutdown complete. Exiting.")
+    _release_instance_lock()
 
 
 if __name__ == "__main__":
