@@ -31,6 +31,7 @@ Open-source companion stack built natively on the **official Google Antigravity 
 - **Model Failover & Group RBAC (`model_failover.py`, `access_control.py`)**: Automatic pre-output model fallback across `AGY_TG_FALLBACK_MODELS` (or `/model fallback`) on `429`/`5xx` errors before any tool or user-visible output occurs, paired with `admin`/`readonly` group RBAC isolation (`AGY_TG_ADMIN_USERS`, `AGY_TG_READONLY_USERS`) and separate warm pools.
 - **Telegram `/browser` Inline Control Panel**: Inspect live browser status, switch fingerprints (`browser:switch:*`) or start/stop safely from Telegram, with private-chat-only Mini App `web_app` button enforcement and `readonly` write protection.
 - **Setup, Diagnostics & Docker (`agy-bot setup` / `agy-bot doctor`, `Dockerfile`)**: PEP 621 packaged CLI (`pyproject.toml`) supporting single-bot and multi-bot team bootstrapping (`agy-bot setup --bots ... --systemd-out ...`), offline/online `doctor` checks, and non-root container templates ([`Dockerfile`](./Dockerfile), [`docker-compose.example.yml`](./docker-compose.example.yml), [docs/AI-INSTALL.md](./docs/AI-INSTALL.md)).
+- **Fail-Closed GitHub Webhook Receiver (`bridge/github_webhook.py`)**: Zero-dependency HMAC-SHA256 (`X-Hub-Signature-256`) webhook listener (`127.0.0.1:18798`) with OpenBao/file/env secret resolution, bounded `Content-Length` & `X-GitHub-Delivery` replay dedup, prompt-injection sanitization, and sanitized unit template ([`systemd/examples/agy-github-webhook.service.example`](./systemd/examples/agy-github-webhook.service.example)).
 - **Zero-Downtime Hot Reload**: Sentinel-file triggered (`AGY_TG_RELOAD_FILE`, e.g. `/tmp/agy_bridge_reload`) graceful `os.execv` reload between turns.
 
 ### 2. `.agents/skills/live-browser/` — Multi-Fingerprint Live Browser & Telegram Takeover
@@ -57,7 +58,8 @@ Open-source companion stack built natively on the **official Google Antigravity 
 ### 5. `scripts/`, `tests/` & `docs/OPENBAO_SECRETOPS_GUIDE.md` — Zero-Trace Secret Ops, Desensitization Gate & Cost Accounting
 - **Self-Hosted OpenBao Zero-Trace Secret Guide**: Fully sanitized patterns for `0600` local Vault credentials, ephemeral CLI env injection, in-memory Python helpers, and disk-free `live-browser --proxy-bao` egress in [docs/OPENBAO_SECRETOPS_GUIDE.md](./docs/OPENBAO_SECRETOPS_GUIDE.md).
 - **`scripts/security_audit.py`**: Zero-leak structural scanner covering raw API keys/tokens, half-masked prefixes, credentialed URLs, unallowlisted external endpoints/domains, numeric/hex/UUID IDs, emails/`@handles`, hardcoded `/home/<user>` or `User=` paths, non-doc IPs, forbidden runtime files, and Git commit history (`--check-history`). Supports optional external blocklists (`--blocklist-file` / `~/.config/agy-audit-blocklist.txt`).
-- **`tests/`**: Automated `unittest` suite covering desensitization boundaries (`test_desensitization.py`), P0 hardening (`test_bridge_p0.py`), core bridge subsystems (`test_bridge_core.py`), group RBAC (`test_access_control.py`), model failover (`test_model_failover.py`), cron scheduler (`test_scheduler.py`), CLI diagnostics (`test_cli_doctor.py`), Mini App & `/browser` panel (`test_browser_panel.py`), live-browser multi-fingerprint/pinned-profile isolation (`test_live_browser_profiles.py`), and multi-bot team bus & worktree isolation (`test_bot_bus.py`, `test_bot_bus_worktree.py`, `test_group_chat_bus.py`).
+- **`tests/`**: Automated `unittest` suite covering desensitization boundaries (`test_desensitization.py`), P0 hardening (`test_bridge_p0.py`), core bridge subsystems (`test_bridge_core.py`), group RBAC (`test_access_control.py`), model failover (`test_model_failover.py`), cron scheduler (`test_scheduler.py`), CLI diagnostics (`test_cli_doctor.py`), Mini App & `/browser` panel (`test_browser_panel.py`), live-browser multi-fingerprint/pinned-profile isolation (`test_live_browser_profiles.py`), GitHub webhook security (`test_github_webhook.py`), weekly benchmark digest (`test_benchmark_digest.py`), and multi-bot team bus & worktree isolation (`test_bot_bus.py`, `test_bot_bus_worktree.py`, `test_group_chat_bus.py`).
+- **`scripts/benchmark_digest.py`**: Pure-stdlib weekly upstream benchmark radar tracking configurable GitHub repositories (`--repos-file`) for non-draft releases, merged PRs, and default-branch commits with `0600` state dedup, `[SILENT]` no-op output, and prompt-injection neutralization.
 - **`scripts/calc_cycle_cost.py`**: Standalone CLI calculator reading `~/.gemini/antigravity-cli/brain/*/logs/transcript.jsonl` to report token totals, cache hit rate, and estimated API USD savings.
 
 ---
@@ -68,14 +70,14 @@ Open-source companion stack built natively on the **official Google Antigravity 
 agy-bot/
 ├── .agents/                  # Shared skills (live-browser, continuous-learning-v2, altare, mem-search) & workflows
 ├── .github/                  # CI workflows, Issue forms, and PR desensitization checklist
-├── bridge/                   # Telegram Bridge v3 (bridge.py, access_control.py, model_failover.py, scheduler.py, bot_bus*.py, cli.py, .env.example)
+├── bridge/                   # Telegram Bridge v3 (bridge.py, github_webhook.py, access_control.py, model_failover.py, scheduler.py, bot_bus*.py, cli.py, .env.example)
 ├── config/                   # Sanitized MCP configuration template (mcp_config.example.json)
 ├── docs/                     # AI-INSTALL guide, architecture diagram, Live Browser guide & OpenBao zero-trace secret guide
 ├── hooks/                    # hooks.json + lossless rehydrate_after_compact.py + hook gate
 ├── legacy/sdk-bridge/        # Historical SDK bridge v1 reference
 ├── mem-hub/                  # agy_llm_shim.py, agy_instinct_daemon.py, and isolated observer-sandbox/
-├── scripts/                  # security_audit.py and standalone calc_cycle_cost.py
-├── systemd/examples/         # Generic systemd unit templates (KillMode=mixed, YOUR_USER placeholders)
+├── scripts/                  # security_audit.py, benchmark_digest.py, and standalone calc_cycle_cost.py
+├── systemd/examples/         # Generic systemd unit templates (including agy-github-webhook.service.example, YOUR_USER placeholders)
 ├── tests/                    # Automated desensitization, RBAC, failover, bridge, scheduler, CLI, browser panel & team-bus tests
 ├── workspace/                # Shared workspace agent delivery guidelines (AGENTS.md)
 ├── Dockerfile                # Non-root container image built from pyproject.toml

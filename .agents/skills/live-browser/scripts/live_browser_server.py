@@ -2551,9 +2551,52 @@ async def internal_profiles_switch(request: web.Request) -> web.Response:
         return web.json_response({"ok": False, "error": str(exc)}, status=500)
 
 
+def _parse_bool_flag(raw: Any) -> bool:
+    if isinstance(raw, bool):
+        return raw
+    return str(raw or "").strip().lower() in ("1", "true", "yes")
+
+
 async def internal_stop(request: web.Request) -> web.Response:
     hub: LiveBrowserHub = request.app["hub"]
     check_local_auth(request, hub)
+
+    body: dict[str, Any] = {}
+    if hasattr(request, "read"):
+        try:
+            raw = await request.read()
+        except Exception:
+            raw = b""
+        if raw:
+            try:
+                parsed = json.loads(raw.decode("utf-8"))
+            except Exception:
+                return web.json_response({"ok": False, "error": "Invalid JSON body"}, status=400)
+            if not isinstance(parsed, dict):
+                return web.json_response({"ok": False, "error": "Request body must be a JSON object"}, status=400)
+            body = parsed
+    elif hasattr(request, "json"):
+        try:
+            parsed = await request.json()
+            if isinstance(parsed, dict):
+                body = parsed
+        except Exception:
+            body = {}
+
+    query = getattr(request, "query", {}) or {}
+    force = _parse_bool_flag(body.get("force")) or _parse_bool_flag(query.get("force"))
+
+    if hub.engine_mode == "sync_external":
+        return web.json_response(
+            {"ok": False, "error": "Cannot stop external sync browser session"},
+            status=409,
+        )
+    if hub.ai_busy_count > 0 and not force:
+        return web.json_response(
+            {"ok": False, "error": "Browser is busy with an AI action; pass force=true to override"},
+            status=409,
+        )
+
     await hub.stop_hosted(notify_finished=True)
     return web.json_response({"ok": True, **hub.state_dict()})
 

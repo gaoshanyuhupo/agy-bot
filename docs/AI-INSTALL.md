@@ -167,6 +167,27 @@ Or per chat/topic live inside Telegram:
 2. Optionally set `AGY_LIVE_BROWSER_URL=http://127.0.0.1:18795` and `AGY_LIVE_BROWSER_CONFIG_DIR=$HOME/.config/agy-live-browser` in the bridge `.env`.
 3. Use `/browser` in Telegram to view status, inspect masked egress profiles, switch fingerprints (`🔄 切到 ...`), stop the browser, or open the Mini App in private chat (`https://` `public_url` required).
 
+### D. Upstream Benchmark Digest (`scripts/benchmark_digest.py`)
+
+Monitor a configurable list of benchmark repositories (non-draft releases, merged PRs, and default-branch commits) with `0o600` incremental state and zero-noise `[SILENT]` output when unchanged:
+
+```bash
+python3 scripts/benchmark_digest.py \
+  --repos-file "$HOME/.gemini/antigravity-cli/cache/benchmark_repos.json" \
+  --first-run-silent
+```
+
+### E. Fail-Closed GitHub Webhook Receiver (`bridge/github_webhook.py`)
+
+Receive HMAC-SHA256 verified GitHub events on `127.0.0.1:18798` and forward filtered alerts to Bot Bus (`--notify-bot` + `--chat-id`):
+
+```bash
+python3 bridge/github_webhook.py --print-systemd
+python3 bridge/github_webhook.py --check-config --bao-ref REPLACE_WITH_BAO_SECRET_PATH
+```
+
+> **Fail-Closed**: The webhook server refuses to start if `AGY_GH_WEBHOOK_SECRET`, `AGY_GH_WEBHOOK_SECRET_FILE`, and `AGY_GH_WEBHOOK_SECRET_BAO_REF` all resolve empty.
+
 ---
 
 ## 7. Secret Hygiene & Pre-Commit Audit

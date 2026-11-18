@@ -30,6 +30,7 @@
 - **主备模型自动降级与群聊 RBAC（`model_failover.py`、`access_control.py`）**：在产生任何工具调用或用户可见输出前，遇到 `429`/`5xx` 自动按 `AGY_TG_FALLBACK_MODELS`（或 `/model fallback`）切换备选模型；并支持按 `admin`/`readonly` 区分群成员权限（`AGY_TG_ADMIN_USERS`、`AGY_TG_READONLY_USERS`），为只读成员隔离安全会话池。
 - **Telegram `/browser` 内联控制面板**：直接在 Telegram 内查看浏览器实时状态与脱敏出口信息、切换指纹（`browser:switch:*`）或安全启停；强制仅私聊可触发 Mini App `web_app` 按钮，并拦截只读成员写操作。
 - **安装引导、环境体检与 Docker 部署（`agy-bot setup` / `agy-bot doctor`、`Dockerfile`）**：基于标准 `pyproject.toml` 提供 `agy-bot` 命令，支持单 Bot 与多 Bot 团队一键初始化（`agy-bot setup --bots ... --systemd-out ...`）、离线/联网 `doctor` 体检及非 root 容器化模板（[`Dockerfile`](./Dockerfile)、[`docker-compose.example.yml`](./docker-compose.example.yml)、[docs/AI-INSTALL.md](./docs/AI-INSTALL.md)）。
+- **Fail-Closed GitHub Webhook 接收器（`bridge/github_webhook.py`）**：纯标准库 HMAC-SHA256（`X-Hub-Signature-256`）Webhook 监听服务（`127.0.0.1:18798`），支持 OpenBao/文件/环境变量取密、`Content-Length` 上限与 `X-GitHub-Delivery` 重放去重、提示词注入清洗，并附脱敏模板 [`systemd/examples/agy-github-webhook.service.example`](./systemd/examples/agy-github-webhook.service.example)。
 - **零停机热重载**：通过哨兵文件（`AGY_TG_RELOAD_FILE`，如 `/tmp/agy_bridge_reload`）在空闲间隙自动执行优雅 `os.execv` 重载。
 
 ### 2. `.agents/skills/live-browser/` — 多指纹多出口实时浏览器与 Telegram 人工接管
@@ -56,7 +57,8 @@
 ### 5. `scripts/`、`tests/` 与 `docs/OPENBAO_SECRETOPS_GUIDE.md` — 无痕用密示例、脱敏门禁与成本核算
 - **自部署 OpenBao 无痕用密示例指南**：完全脱敏的实战范式（`0600` 本地凭据初始化、CLI 短暂环境变量注入、Python 内存动态提取与 `live-browser --proxy-bao` 零落盘代理），详见 [docs/OPENBAO_SECRETOPS_GUIDE.md](./docs/OPENBAO_SECRETOPS_GUIDE.md)。
 - **`scripts/security_audit.py`**：零泄漏结构化扫描器，覆盖明文密钥/Token、半掩码前缀、含凭证 URL、非白名单外链与裸域名、长数字/Hex/UUID ID、个人邮箱与未登记 `@handle`、硬编码 `/home/<user>` 或 `User=` 路径、非文档 IP、高危运行态文件及 Git 全量提交历史（`--check-history`），支持外部黑名单文件（`--blocklist-file` / `~/.config/agy-audit-blocklist.txt`）。
-- **`tests/`**：全离线 `unittest` 回归套件，覆盖脱敏门禁（`test_desensitization.py`）、P0 稳定性加固（`test_bridge_p0.py`）、核心引擎与撤销/相册/429（`test_bridge_core.py`）、群聊 RBAC（`test_access_control.py`）、模型主备降级（`test_model_failover.py`）、定时调度（`test_scheduler.py`）、CLI 体检向导（`test_cli_doctor.py`）、Mini App 与 `/browser` 面板（`test_browser_panel.py`）、多指纹/固定指纹隔离（`test_live_browser_profiles.py`）与多 Bot 总线及 Worktree 隔离（`test_bot_bus.py`、`test_bot_bus_worktree.py`、`test_group_chat_bus.py`）。
+- **`tests/`**：全离线 `unittest` 回归套件，覆盖脱敏门禁（`test_desensitization.py`）、P0 稳定性加固（`test_bridge_p0.py`）、核心引擎与撤销/相册/429（`test_bridge_core.py`）、群聊 RBAC（`test_access_control.py`）、模型主备降级（`test_model_failover.py`）、定时调度（`test_scheduler.py`）、CLI 体检向导（`test_cli_doctor.py`）、Mini App 与 `/browser` 面板（`test_browser_panel.py`）、多指纹/固定指纹隔离（`test_live_browser_profiles.py`）、GitHub Webhook 安全（`test_github_webhook.py`）、每周对标雷达（`test_benchmark_digest.py`）与多 Bot 总线及 Worktree 隔离（`test_bot_bus.py`、`test_bot_bus_worktree.py`、`test_group_chat_bus.py`）。
+- **`scripts/benchmark_digest.py`**：纯标准库每周对标雷达工具，通过 `--repos-file` 追踪可配置上游仓库的正式 Release、近期合并 PR 与默认分支 Commit，支持 `0600` 状态去重、无变更输出 `[SILENT]` 及外部文本防注入清洗。
 - **`scripts/calc_cycle_cost.py`**：独立命令行工具，解析 `~/.gemini/antigravity-cli/brain/*/logs/transcript.jsonl`，输出 Token 消耗、缓存命中率与估算 USD 节省。
 
 ---
@@ -67,14 +69,14 @@
 agy-bot/
 ├── .agents/                  # 通用技能（live-browser、continuous-learning-v2、altare、mem-search）与工作流
 ├── .github/                  # CI 工作流、Issue 表单模板与 PR 脱敏自检清单
-├── bridge/                   # Telegram Bridge v3（bridge.py、access_control.py、model_failover.py、scheduler.py、bot_bus*.py、cli.py、.env.example）
+├── bridge/                   # Telegram Bridge v3（bridge.py、github_webhook.py、access_control.py、model_failover.py、scheduler.py、bot_bus*.py、cli.py、.env.example）
 ├── config/                   # 脱敏后的 MCP 配置模板（mcp_config.example.json）
 ├── docs/                     # AI-INSTALL 安装指南、系统架构图、Live Browser 指南与 OpenBao 无痕用密指南
 ├── hooks/                    # hooks.json、无损 rehydrate_after_compact.py 与生命周期门控
 ├── legacy/sdk-bridge/        # 早期 SDK bridge v1 历史参考
 ├── mem-hub/                  # agy_llm_shim.py、agy_instinct_daemon.py 与隔离 observer-sandbox/
-├── scripts/                  # security_audit.py 脱敏审计器与 calc_cycle_cost.py 账单工具
-├── systemd/examples/         # 通用 systemd 单元模板（KillMode=mixed + YOUR_USER 占位符）
+├── scripts/                  # security_audit.py 脱敏审计器、benchmark_digest.py 对标雷达与 calc_cycle_cost.py 账单工具
+├── systemd/examples/         # 通用 systemd 单元模板（含 agy-github-webhook.service.example、YOUR_USER 占位符）
 ├── tests/                    # 脱敏审计、RBAC、降级、桥接核心、调度器、CLI 向导、浏览器面板与协作总线单测
 ├── workspace/                # 通用工作区 Agent 规范（AGENTS.md）
 ├── Dockerfile                # 基于 pyproject.toml 的非 root 容器镜像构建模板

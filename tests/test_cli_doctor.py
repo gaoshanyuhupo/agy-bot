@@ -418,6 +418,13 @@ class TestAgyBotSetup(unittest.TestCase):
         self.assertIn("doctor", res.stdout)
         self.assertIn("setup", res.stdout)
 
+    def test_dockerignore_excludes_recursive_env_files(self):
+        dockerignore = (REPO_ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
+        self.assertIn("**/.env", dockerignore)
+        self.assertIn("**/.env.*", dockerignore)
+        self.assertIn("!.env.example", dockerignore)
+        self.assertIn("!bridge/.env.example", dockerignore)
+
 
 if __name__ == "__main__":
     unittest.main()

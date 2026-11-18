@@ -30,6 +30,7 @@ RUNTIME_BRIDGE_FILES: Tuple[str, ...] = (
     "scheduler.py",
     "bot_bus.py",
     "bot_bus_mcp.py",
+    "github_webhook.py",
 )
 
 _PLACEHOLDER_MARKERS: Tuple[str, ...] = (

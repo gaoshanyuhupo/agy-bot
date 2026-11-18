@@ -30,6 +30,8 @@ import live_browser_server as srv  # noqa: E402
 
 
 class _FakeHTTPForbidden(Exception):
+    status = 403
+
     def __init__(self, text: str = "Forbidden") -> None:
         super().__init__(text)
         self.text = text
@@ -417,6 +419,96 @@ class TestLiveBrowserServerPanelWS(unittest.TestCase):
                 self.assertEqual(409, resp_conflict.status)
                 hub.takeover = False
                 await hub.stop_hosted(notify_finished=False)
+
+        asyncio.run(_scenario())
+
+    def test_internal_stop_concurrency_guards_and_empty_body(self) -> None:
+        async def _scenario() -> None:
+            hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "secret-local-tok")
+
+            class _FakeStopReq:
+                def __init__(
+                    self,
+                    *,
+                    raw_body: bytes = b"",
+                    query: dict[str, str] | None = None,
+                    token: str = "secret-local-tok",
+                ) -> None:
+                    self._raw = raw_body
+                    self.query = query or {}
+                    self.headers = {"X-Live-Token": token}
+                    self.remote = "127.0.0.1"
+                    self.app = {"hub": hub}
+
+                async def read(self) -> bytes:
+                    return self._raw
+
+            with (
+                mock.patch.object(srv, "web", _FakeWebModule),
+                mock.patch.object(hub, "stop_hosted", new=mock.AsyncMock(return_value=None)) as stop_mock,
+            ):
+                # 1. Empty body when idle -> 200 & calls stop_hosted(notify_finished=True)
+                resp_empty = await srv.internal_stop(_FakeStopReq(raw_body=b""))  # type: ignore[arg-type]
+                self.assertEqual(200, resp_empty.status)
+                self.assertTrue(resp_empty.data["ok"])
+                stop_mock.assert_awaited_once_with(notify_finished=True)
+
+                # 2. sync_external -> 409 Conflict (even with force=true)
+                stop_mock.reset_mock()
+                hub.engine_mode = "sync_external"
+                resp_sync = await srv.internal_stop(
+                    _FakeStopReq(raw_body=json.dumps({"force": True}).encode("utf-8"))  # type: ignore[arg-type]
+                )
+                self.assertEqual(409, resp_sync.status)
+                stop_mock.assert_not_awaited()
+
+                # 3. ai_busy_count > 0 without force -> 409 Conflict
+                hub.engine_mode = "async_hosted"
+                hub.ai_busy_count = 2
+                resp_busy = await srv.internal_stop(_FakeStopReq(raw_body=b""))  # type: ignore[arg-type]
+                self.assertEqual(409, resp_busy.status)
+                stop_mock.assert_not_awaited()
+
+                # 4. ai_busy_count > 0 with body force=true -> 200
+                resp_force_body = await srv.internal_stop(
+                    _FakeStopReq(raw_body=json.dumps({"force": True}).encode("utf-8"))  # type: ignore[arg-type]
+                )
+                self.assertEqual(200, resp_force_body.status)
+                stop_mock.assert_awaited_once_with(notify_finished=True)
+
+                # 5. ai_busy_count > 0 with query ?force=true -> 200
+                stop_mock.reset_mock()
+                resp_force_query = await srv.internal_stop(
+                    _FakeStopReq(raw_body=b"", query={"force": "true"})  # type: ignore[arg-type]
+                )
+                self.assertEqual(200, resp_force_query.status)
+                stop_mock.assert_awaited_once_with(notify_finished=True)
+
+                # 6. ai_busy_count > 0 with ?force=false / ?force=0 -> 409 Conflict
+                for q_val in ("false", "0"):
+                    stop_mock.reset_mock()
+                    resp_no_force = await srv.internal_stop(
+                        _FakeStopReq(raw_body=b"", query={"force": q_val})  # type: ignore[arg-type]
+                    )
+                    self.assertEqual(409, resp_no_force.status)
+                    stop_mock.assert_not_awaited()
+
+                # 7. Non-dict JSON body `[]` -> 400 Bad Request
+                stop_mock.reset_mock()
+                resp_list_body = await srv.internal_stop(
+                    _FakeStopReq(raw_body=b"[]")  # type: ignore[arg-type]
+                )
+                self.assertEqual(400, resp_list_body.status)
+                stop_mock.assert_not_awaited()
+
+                # 8. Unauthorized call (bad token) -> 403 Forbidden
+                stop_mock.reset_mock()
+                with self.assertRaises(_FakeHTTPForbidden) as ctx_unauth:
+                    await srv.internal_stop(
+                        _FakeStopReq(raw_body=b"", token="wrong-tok")  # type: ignore[arg-type]
+                    )
+                self.assertEqual(403, ctx_unauth.exception.status)
+                stop_mock.assert_not_awaited()
 
         asyncio.run(_scenario())
 
