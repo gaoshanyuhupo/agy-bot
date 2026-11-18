@@ -10,7 +10,7 @@ EnvironmentFile=/home/YOUR_USER/agy-tg-bridge/.env
 ExecStart=/home/YOUR_USER/agy-tg-bridge/venv/bin/python /home/YOUR_USER/agy-tg-bridge/bridge.py
 Restart=on-failure
 RestartSec=5
-KillMode=process
+KillMode=mixed
 TimeoutStopSec=90
 
 [Install]

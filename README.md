@@ -68,8 +68,9 @@ agy-bot/
 git clone https://github.com/gaoshanyuhupo/agy-bot.git
 cd agy-bot
 
-# Create bridge runtime config outside the git working tree (chmod 600)
+# Create bridge runtime directory & config outside the git working tree (chmod 600)
 mkdir -p "$HOME/agy-tg-bridge"
+cp bridge/bridge.py bridge/scheduler.py bridge/bot_bus.py bridge/bot_bus_mcp.py "$HOME/agy-tg-bridge/"
 cp bridge/.env.example "$HOME/agy-tg-bridge/.env"
 chmod 600 "$HOME/agy-tg-bridge/.env"
 # Edit $HOME/agy-tg-bridge/.env with your BotFather token and Telegram user ID
@@ -82,6 +83,9 @@ Copy & adapt [config/mcp_config.example.json](./config/mcp_config.example.json) 
 ```bash
 python3 -m venv "$HOME/agy-tg-bridge/venv"
 "$HOME/agy-tg-bridge/venv/bin/pip" install -r bridge/requirements.txt
+
+# Launch manually for foreground verification (or manage via systemd in Step 3):
+# AGY_TG_ENV_FILE="$HOME/agy-tg-bridge/.env" "$HOME/agy-tg-bridge/venv/bin/python" "$HOME/agy-tg-bridge/bridge.py"
 ```
 
 If using `.agents/skills/live-browser/`, set your tunnel token outside git (never commit secrets):
