@@ -1,0 +1,1014 @@
+#!/usr/bin/env python3
+"""Regression tests for Layer 1/2/3 group-chat Bot Bus collaboration."""
+
+from __future__ import annotations
+
+import importlib
+import json
+import os
+import sys
+import tempfile
+import threading
+import types
+import unittest
+from pathlib import Path
+from unittest import mock
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+BRIDGE_DIR = REPO_ROOT / "bridge"
+if str(BRIDGE_DIR) not in sys.path:
+    sys.path.insert(0, str(BRIDGE_DIR))
+
+
+class TestGroupChatBus(unittest.TestCase):
+    """Verify worker group speech, shared ledger, cross-process mention loop guard, and routing."""
+
+    def _load_bus(self, bus_dir: str, extra_env: dict[str, str] | None = None):
+        env_patch = {
+            "AGY_BOT_BUS_DIR": bus_dir,
+            "AGY_BOT_BUS_ENABLE": "1",
+            "AGY_BOT_BUS_ROLE": "coordinator",
+            "AGY_BOT_HANDLE": "bot_one",
+            "AGY_BOT_CHAT_ID": "-1001234567890",
+            "AGY_BOT_SCOPE_KEY": "-1001234567890",
+            "AGY_BOT_CHAIN": "",
+            "AGY_BOT_ORIGIN_MSG_ID": "0",
+            "AGY_BOT_MENTION_HOP": "0",
+        }
+        if extra_env:
+            env_patch.update(extra_env)
+        with mock.patch.dict(os.environ, env_patch, clear=False):
+            import bot_bus  # noqa: E402
+            import bot_bus_mcp  # noqa: E402
+
+            importlib.reload(bot_bus)
+            importlib.reload(bot_bus_mcp)
+            return bot_bus, bot_bus_mcp
+
+    def _load_bridge(self, tmp: str, extra_env: dict[str, str] | None = None):
+        env_patch = {
+            "AGY_BOT_BUS_DIR": tmp,
+            "AGY_TG_STATE_FILE": os.path.join(tmp, "state.json"),
+            "AGY_TG_WORKDIR": tmp,
+            "AGY_TG_ALLOWED_CHATS": "-1001234567890",
+            "AGY_TG_BOT_TOKEN": "1234567890:EXAMPLE_TOKEN_FOR_TEST_ONLY",
+            "AGY_TG_ENV_FILE": os.path.join(tmp, "nonexistent.env"),
+            "AGY_BOT_CHAIN": "",
+            "AGY_BOT_ORIGIN_MSG_ID": "0",
+            "AGY_BOT_MENTION_HOP": "0",
+        }
+        if extra_env:
+            env_patch.update(extra_env)
+        with mock.patch.dict(os.environ, env_patch, clear=False):
+            import bridge  # noqa: E402
+
+            importlib.reload(bridge)
+            return bridge
+
+    def test_worker_mcp_role_restricts_tools_and_group_say_scope(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bot_bus, bot_bus_mcp = self._load_bus(
+                tmp,
+                {
+                    "AGY_BOT_BUS_ENABLE": "1",
+                    "AGY_BOT_BUS_ROLE": "worker",
+                    "AGY_BOT_HANDLE": "bot_two",
+                    "AGY_BOT_CHAT_ID": "-1001234567890",
+                    "AGY_BOT_SCOPE_KEY": "-1001234567890",
+                },
+            )
+            env_worker = {
+                "AGY_BOT_BUS_ENABLE": "1",
+                "AGY_BOT_BUS_ROLE": "worker",
+                "AGY_BOT_HANDLE": "bot_two",
+                "AGY_BOT_CHAT_ID": "-1001234567890",
+                "AGY_BOT_SCOPE_KEY": "-1001234567890",
+            }
+            with mock.patch.dict(os.environ, env_worker, clear=False):
+                schemas = {t["name"]: t for t in bot_bus_mcp._tool_schemas()}
+                self.assertEqual({"team_roster", "group_say"}, set(schemas.keys()))
+                self.assertNotIn("team_dispatch", schemas)
+                self.assertNotIn("team_job", schemas)
+
+                # Direct call to forbidden dispatch tool must be rejected
+                captured: list[dict] = []
+                with mock.patch.object(bot_bus_mcp, "_reply_ok", side_effect=lambda _id, r: captured.append(r)):
+                    bot_bus_mcp._handle_request(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "tools/call",
+                            "params": {"name": "team_dispatch", "arguments": {"bot": "@bot_one", "prompt": "hi"}},
+                        }
+                    )
+                self.assertTrue(captured and captured[0].get("isError"))
+
+                res = bot_bus_mcp._handle_group_say({"message": "进度更新：正在跑测试"})
+                self.assertFalse(res.get("isError"), res)
+                pkts = bot_bus.pop_inbox_packets("bot_two")
+                self.assertEqual(1, len(pkts))
+                self.assertEqual("group_say", pkts[0]["type"])
+                self.assertEqual(-1001234567890, pkts[0]["chat_id"])
+                self.assertEqual("bot_two", pkts[0]["from_bot"])
+
+            # DM chat_id (>0) cannot use group_say
+            with mock.patch.dict(
+                os.environ,
+                {**env_worker, "AGY_BOT_CHAT_ID": "123456789", "AGY_BOT_SCOPE_KEY": "123456789"},
+                clear=False,
+            ):
+                dm_res = bot_bus_mcp._handle_group_say({"message": "hello"})
+                self.assertTrue(dm_res.get("isError"))
+
+    def test_extract_at_mentions_ignores_code_emails_and_urls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bot_bus, _ = self._load_bus(tmp)
+            text = (
+                "Check `@foo_bot` and ``@foo_bot`` and ``inline `code` @example_bot`` and ```\n@example_bot\n``` "
+                "and user@example.com and https://example.com/@bota; please ask @bot_one and @bot_two!"
+            )
+            self.assertEqual(["bot_one", "bot_two"], bot_bus.extract_at_mentions(text))
+
+    def test_shared_group_history_dedup_isolation_and_unseen_cursor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bot_bus, _ = self._load_bus(tmp)
+            # DM chat_id (>0) must never enter group ledger
+            self.assertIsNone(
+                bot_bus.record_group_message(
+                    123456789, msg_id=1, sender_handle="alice", is_bot=False, text="private secret"
+                )
+            )
+
+            # Same human message received by two bots deduplicates by msg_id
+            r1 = bot_bus.record_group_message(
+                -1001234567890, msg_id=101, sender_handle="alice", is_bot=False, text="大家好，开始讨论方案"
+            )
+            r2 = bot_bus.record_group_message(
+                -1001234567890, msg_id=101, sender_handle="alice", is_bot=False, text="大家好，开始讨论方案"
+            )
+            self.assertIsNotNone(r1)
+            self.assertIsNone(r2)
+
+            bot_bus.record_group_message(
+                -1001234567890, msg_id=102, sender_handle="bot_one", sender_role="coordinator", is_bot=True, text="我先拆解任务"
+            )
+            # Separate Topic thread_id=42 must remain isolated from main thread_id=None
+            bot_bus.record_group_message(
+                -1001234567890, msg_id=103, thread_id=42, sender_handle="alice", is_bot=False, text="另一个话题"
+            )
+
+            unseen_main = bot_bus.get_unseen_group_history(-1001234567890, "bot_two", thread_id=None, advance_cursor=True)
+            self.assertEqual(2, len(unseen_main))
+            self.assertEqual([], bot_bus.get_unseen_group_history(-1001234567890, "bot_two", thread_id=None, advance_cursor=True))
+
+            # New message arrives -> bot_two sees only the new one
+            bot_bus.record_group_message(
+                -1001234567890, msg_id=104, sender_handle="alice", is_bot=False, text="@bot_two 你怎么看？"
+            )
+            env_prompt = bot_bus.format_worker_envelope(
+                {
+                    "job_id": "job-abc",
+                    "from_bot": "bot_one",
+                    "target_bot": "bot_two",
+                    "label": "review",
+                    "prompt": "给出意见",
+                    "origin_chat_id": -1001234567890,
+                    "origin_msg_id": 999,
+                },
+                "/tmp/work",
+                "/tmp/out",
+            )
+            self.assertIn("你怎么看", env_prompt)
+            self.assertNotIn("另一个话题", env_prompt)
+            self.assertNotIn("我先拆解任务", env_prompt)
+
+    def test_cross_process_mention_relay_and_hop_guard(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bot_bus, _ = self._load_bus(tmp)
+            bot_bus.heartbeat_bot(
+                {"handle": "bot_one", "pid": os.getpid(), "role": "coordinator", "allowed_chats": [-1001234567890]}
+            )
+            bot_bus.heartbeat_bot(
+                {"handle": "bot_two", "pid": os.getpid(), "role": "worker", "allowed_chats": [-1001234567890]}
+            )
+
+            # Without a human anchor, bot->bot mention relay must be blocked
+            no_anchor = bot_bus.relay_group_mentions(
+                "bot_one", -1001234567890, "ping @bot_two", msg_id=201, source_hop=0
+            )
+            self.assertEqual([], no_anchor["relayed"])
+            self.assertEqual("no_active_human_anchor", no_anchor["blocked_reason"])
+
+            # Anchor by human message (msg_id=200)
+            bot_bus.mark_human_group_activity(-1001234567890, msg_id=200)
+            hop1 = bot_bus.relay_group_mentions(
+                "bot_one", -1001234567890, "请 @bot_two 跟进一下", msg_id=202, source_hop=0, max_hops=2
+            )
+            self.assertEqual(["bot_two"], hop1["relayed"])
+            pkts_two = bot_bus.pop_inbox_packets("bot_two")
+            self.assertEqual(1, len(pkts_two))
+            self.assertEqual("group_mention", pkts_two[0]["type"])
+            self.assertEqual(1, pkts_two[0]["hop"])
+
+            # Simulate separate process reload; hop 2 allowed, hop 3 blocked
+            bot_bus_proc2, _ = self._load_bus(tmp, {"AGY_BOT_HANDLE": "bot_two"})
+            hop2 = bot_bus_proc2.relay_group_mentions(
+                "bot_two", -1001234567890, "我好了 @bot_one 请查收", msg_id=203, source_hop=1, max_hops=2
+            )
+            self.assertEqual(["bot_one"], hop2["relayed"])
+            pkts_one = bot_bus_proc2.pop_inbox_packets("bot_one")
+            self.assertEqual(2, pkts_one[0]["hop"])
+
+            hop3 = bot_bus_proc2.relay_group_mentions(
+                "bot_one", -1001234567890, "收到 @bot_two 辛苦", msg_id=204, source_hop=2, max_hops=2
+            )
+            self.assertEqual([], hop3["relayed"])
+            self.assertIn("max_hops_reached", hop3["blocked_reason"])
+
+    def test_bridge_long_message_mention_and_fast_chat_classifier(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_patch = {
+                "AGY_BOT_BUS_DIR": tmp,
+                "AGY_TG_STATE_FILE": os.path.join(tmp, "state.json"),
+                "AGY_TG_WORKDIR": tmp,
+                "AGY_TG_ALLOWED_CHATS": "-1001234567890",
+                "AGY_TG_BOT_TOKEN": "1234567890:EXAMPLE_TOKEN_FOR_TEST_ONLY",
+                "AGY_BOT_CHAIN": "",
+            }
+            with mock.patch.dict(os.environ, env_patch, clear=False):
+                import bridge  # noqa: E402
+
+                importlib.reload(bridge)
+                bridge.BOT_META.update({"bot_id": 222, "handle": "bot_two", "resolved": True})
+                long_prefix = "@bot_one " + ("请帮我处理这个长上下文问题，" * 25)
+                msg_long = {
+                    "chat": {"id": -1001234567890},
+                    "text": f"{long_prefix} 以及最后点名 @bot_two 一起看一下",
+                }
+                self.assertFalse(bridge._should_ignore_group_message(msg_long))
+
+                msg_backtick = {
+                    "chat": {"id": -1001234567890},
+                    "text": "@bot_one 请把示例里的 `@bot_two` 删掉",
+                }
+                self.assertTrue(bridge._should_ignore_group_message(msg_backtick))
+
+                # Fast-chat classifier accepts short Q&A and rejects code-edit/heavy tasks
+                self.assertTrue(bridge._is_fast_chat_candidate("现在进度怎么样？"))
+                self.assertFalse(bridge._is_fast_chat_candidate("请帮我修改 bridge.py 并运行测试"))
+                self.assertFalse(bridge._is_fast_chat_candidate("/status"))
+                self.assertFalse(bridge._is_fast_chat_candidate("进度?", has_media=True))
+
+    @staticmethod
+    def _fake_tg_resp(status_code: int, payload: dict):
+        return types.SimpleNamespace(
+            status_code=status_code,
+            text=json.dumps(payload, ensure_ascii=False),
+            json=lambda: payload,
+        )
+
+    def test_reply_to_message_id_400_retry_logging_and_non_400_preservation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self._load_bridge(tmp)
+
+            # 1. HTTP 400 reply-not-found logs error, strips reply_to_message_id, and retries once
+            calls_400: list[dict] = []
+            logs_400: list[str] = []
+            resps_400 = [
+                self._fake_tg_resp(400, {"ok": False, "description": "Bad Request: message to be replied not found"}),
+                self._fake_tg_resp(200, {"ok": True, "result": {"message_id": 777}}),
+            ]
+            with (
+                mock.patch.object(bridge, "tg", side_effect=lambda method, **kw: calls_400.append({"method": method, **kw}) or resps_400.pop(0)),
+                mock.patch.object(bridge, "log", side_effect=logs_400.append),
+            ):
+                r = bridge.tg_send_in_route("sendMessage", -1001234567890, text="hi", reply_to_message_id=999)
+            self.assertEqual(200, r.status_code)
+            self.assertEqual(2, len(calls_400))
+            self.assertEqual(999, calls_400[0].get("reply_to_message_id"))
+            self.assertNotIn("reply_to_message_id", calls_400[1])
+            self.assertTrue(any("reply_to_message_id=999" in m for m in logs_400))
+
+            # 2. HTTP 400 non-reply error (HTML parse entities) must NOT strip reply_to_message_id,
+            #    and send() plain-text fallback preserves reply_to_message_id
+            calls_html: list[dict] = []
+            resps_html = [
+                self._fake_tg_resp(400, {"ok": False, "description": "Bad Request: can't parse entities"}),
+                self._fake_tg_resp(200, {"ok": True, "result": {"message_id": 778}}),
+            ]
+            with (
+                mock.patch.object(bridge, "tg", side_effect=lambda method, **kw: calls_html.append(kw) or resps_html.pop(0)),
+                mock.patch.object(bridge, "log"),
+            ):
+                mid = bridge.send(-1001234567890, "<b>broken", parse_mode="HTML", reply_to_message_id=999)
+            self.assertEqual(778, mid)
+            self.assertEqual(2, len(calls_html))
+            self.assertEqual(999, calls_html[0].get("reply_to_message_id"))
+            self.assertEqual(999, calls_html[1].get("reply_to_message_id"))
+
+            # 3. Non-400 errors (500 / 403) must NOT strip reply_to_message_id or mask status
+            calls_500: list[dict] = []
+            logs_500: list[str] = []
+            with (
+                mock.patch.object(
+                    bridge,
+                    "tg",
+                    side_effect=lambda method, **kw: calls_500.append(kw) or self._fake_tg_resp(500, {"ok": False, "description": "Internal Server Error"}),
+                ),
+                mock.patch.object(bridge, "log", side_effect=logs_500.append),
+            ):
+                r500 = bridge.tg_send_in_route("sendMessage", -1001234567890, text="hi", reply_to_message_id=999)
+            self.assertEqual(500, r500.status_code)
+            self.assertEqual(1, len(calls_500))
+            self.assertEqual(999, calls_500[0].get("reply_to_message_id"))
+            self.assertTrue(any("500" in m for m in logs_500))
+
+            # 4. send_rich() attaches reply_to_message_id only on the first chunk
+            rich_calls: list[dict] = []
+            with mock.patch.object(
+                bridge,
+                "tg_send_in_route",
+                side_effect=lambda method, chat_id, **kw: rich_calls.append(kw) or self._fake_tg_resp(200, {"ok": True, "result": {"message_id": 800 + len(rich_calls)}}),
+            ):
+                long_md = ("段落内容 " * 520) + "\n\n" + ("第二段内容 " * 520)
+                bridge.send_rich(-1001234567890, long_md, header_html="<b>Header</b>\n\n", reply_to_message_id=555)
+            self.assertGreaterEqual(len(rich_calls), 2)
+            self.assertEqual(555, rich_calls[0].get("reply_to_message_id"))
+            for later in rich_calls[1:]:
+                self.assertIsNone(later.get("reply_to_message_id"))
+
+    def test_dm_rejection_and_worker_cannot_spoof_or_broadcast(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bot_bus, bot_bus_mcp = self._load_bus(
+                tmp,
+                {
+                    "AGY_BOT_BUS_ROLE": "worker",
+                    "AGY_BOT_HANDLE": "bot_two",
+                    "AGY_BOT_CHAT_ID": "-1001234567890",
+                    "AGY_BOT_SCOPE_KEY": "-1001234567890",
+                },
+            )
+            # DM chat_id (>= 0) strictly rejected across ledger / anchor / relay / group_say
+            for dm_cid in (0, 123456789):
+                self.assertIsNone(
+                    bot_bus.record_group_message(dm_cid, msg_id=10, sender_handle="alice", is_bot=False, text="secret")
+                )
+                self.assertEqual([], bot_bus.get_unseen_group_history(dm_cid, "bot_two"))
+                self.assertIsNone(bot_bus.mark_human_group_activity(dm_cid, msg_id=10))
+                relay = bot_bus.relay_group_mentions("bot_one", dm_cid, "ping @bot_two", msg_id=11)
+                self.assertEqual([], relay["relayed"])
+                self.assertEqual("not_group_chat", relay["blocked_reason"])
+                with self.assertRaises(ValueError):
+                    bot_bus.enqueue_group_say("bot_two", dm_cid, "leak")
+            hist_dir = os.path.join(tmp, "group_history")
+            self.assertTrue(not os.path.exists(hist_dir) or os.listdir(hist_dir) == [])
+
+            # Worker blocked on all coordinator tools at both tools/list and tools/call
+            env_worker = {
+                "AGY_BOT_BUS_ENABLE": "1",
+                "AGY_BOT_BUS_ROLE": "worker",
+                "AGY_BOT_HANDLE": "bot_two",
+                "AGY_BOT_CHAT_ID": "-1001234567890",
+                "AGY_BOT_SCOPE_KEY": "-1001234567890",
+            }
+            with mock.patch.dict(os.environ, env_worker, clear=False):
+                listed = {t["name"] for t in bot_bus_mcp._tool_schemas()}
+                self.assertEqual({"team_roster", "group_say"}, listed)
+                for forbidden in ("team_dispatch", "team_job", "team_broadcast"):
+                    captured: list[dict] = []
+                    with mock.patch.object(bot_bus_mcp, "_reply_ok", side_effect=lambda _id, r: captured.append(r)):
+                        bot_bus_mcp._handle_request(
+                            {
+                                "jsonrpc": "2.0",
+                                "id": 9,
+                                "method": "tools/call",
+                                "params": {"name": forbidden, "arguments": {"message": "x", "bot": "@bot_one", "action": "list"}},
+                            }
+                        )
+                    self.assertTrue(captured and captured[0].get("isError"), forbidden)
+
+                # Even if caller passes spoofed bot/chat_id args, group_say pins sender & bound group
+                res = bot_bus_mcp._handle_group_say({"message": "进度更新", "bot": "@bot_one", "chat_id": -123456789})
+                self.assertFalse(res.get("isError"), res)
+                pkts = bot_bus.pop_inbox_packets("bot_two")
+                self.assertEqual(1, len(pkts))
+                self.assertEqual("bot_two", pkts[0]["from_bot"])
+                self.assertEqual(-1001234567890, pkts[0]["chat_id"])
+
+    def test_origin_context_dynamic_refresh_and_notify_group_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bot_bus, bot_bus_mcp = self._load_bus(
+                tmp,
+                {
+                    "AGY_BOT_BUS_ROLE": "coordinator",
+                    "AGY_BOT_HANDLE": "bot_one",
+                    "AGY_BOT_CHAT_ID": "-1001234567890",
+                    "AGY_BOT_THREAD_ID": "",
+                    "AGY_BOT_SCOPE_KEY": "-1001234567890:42",
+                    "AGY_BOT_ORIGIN_MSG_ID": "100",
+                    "AGY_BOT_CHAIN": "",
+                },
+            )
+            bot_bus.heartbeat_bot({"handle": "bot_one", "pid": os.getpid(), "role": "coordinator"})
+            bot_bus.heartbeat_bot({"handle": "bot_two", "pid": os.getpid(), "role": "worker"})
+
+            # Simulate warm AgySession receiving a newer message on topic 42
+            bot_bus.set_origin_context(
+                "-1001234567890:42",
+                bot_handle="bot_one",
+                chat_id=-1001234567890,
+                thread_id=42,
+                msg_id=555,
+                mention_hop=1,
+                chain_id="hc-555",
+            )
+            env_coord = {
+                "AGY_BOT_BUS_ENABLE": "1",
+                "AGY_BOT_BUS_ROLE": "coordinator",
+                "AGY_BOT_HANDLE": "bot_one",
+                "AGY_BOT_CHAT_ID": "-1001234567890",
+                "AGY_BOT_THREAD_ID": "",
+                "AGY_BOT_SCOPE_KEY": "-1001234567890:42",
+                "AGY_BOT_ORIGIN_MSG_ID": "100",
+                "AGY_BOT_CHAIN": "",
+            }
+            with mock.patch.dict(os.environ, env_coord, clear=False):
+                ctx = bot_bus_mcp._origin_context()
+                self.assertEqual(555, ctx["origin_msg_id"])
+                self.assertEqual(42, ctx["origin_thread_id"])
+                self.assertEqual(-1001234567890, ctx["origin_chat_id"])
+
+                # Default notify_group=True in group chat; explicit notify_group=False respected in job record
+                r_def = bot_bus_mcp._handle_team_dispatch({"bot": "@bot_two", "prompt": "check logs"})
+                self.assertFalse(r_def.get("isError"), r_def)
+                jid_def = json.loads(r_def["content"][0]["text"])["dispatched"][0]["job_id"]
+                job_def = bot_bus.get_job(jid_def)
+                self.assertTrue(job_def["notify_group"])
+                self.assertEqual(555, job_def["origin_msg_id"])
+
+                r_quiet = bot_bus_mcp._handle_team_dispatch({"bot": "@bot_two", "prompt": "silent check", "notify_group": False})
+                self.assertFalse(r_quiet.get("isError"), r_quiet)
+                jid_quiet = json.loads(r_quiet["content"][0]["text"])["dispatched"][0]["job_id"]
+                self.assertFalse(bot_bus.get_job(jid_quiet)["notify_group"])
+
+    def test_human_msg_id_idempotency_mention_caps_and_punctuation_cases(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bot_bus, _ = self._load_bus(tmp)
+            for h in ("bot_one", "bot_two", "bota", "botb", "foo_bot", "example_bot"):
+                bot_bus.heartbeat_bot(
+                    {"handle": h, "pid": os.getpid(), "role": "worker", "allowed_chats": [-1001234567890]}
+                )
+
+            cid_1 = bot_bus.mark_human_group_activity(-1001234567890, msg_id=300)
+            r1 = bot_bus.relay_group_mentions("bot_one", -1001234567890, "先看 @bot_two", msg_id=301, source_hop=0)
+            self.assertEqual(["bot_two"], r1["relayed"])
+
+            # Second bot observing the same human msg_id=300 must not reset chain_id or relays count
+            cid_2 = bot_bus.mark_human_group_activity(-1001234567890, msg_id=300)
+            self.assertEqual(cid_1, cid_2)
+            # 4 more targets in one message -> MENTION_CHAIN_MAX_RELAYS=4 allows 3 more (1+3=4) and blocks the 4th
+            r2 = bot_bus.relay_group_mentions(
+                "bot_one",
+                -1001234567890,
+                "请问 @bota，@botb、@foo_bot 和 @example_bot。",
+                msg_id=302,
+                source_hop=0,
+            )
+            self.assertEqual(["bota", "botb", "foo_bot"], r2["relayed"])
+            self.assertEqual("chain_relay_cap_reached", r2["blocked_reason"])
+
+            # loop_guard_allow blocks after max_events within window
+            for _ in range(3):
+                self.assertTrue(bot_bus.loop_guard_allow("mention:-1001234567890", max_events=3, window_sec=60.0))
+            self.assertFalse(bot_bus.loop_guard_allow("mention:-1001234567890", max_events=3, window_sec=60.0))
+
+            # Punctuation, case folding, URLs, emails, fenced & inline code
+            mentions = bot_bus.extract_at_mentions(
+                "请问@Bot_One，然后问@Bot_Two！参见 https://example.com/@bota 和 user@example.com 以及 `@foo_bot` 和 ```py\n@example_bot\n```。"
+            )
+            self.assertEqual(["bot_one", "bot_two"], mentions)
+
+    def test_should_ignore_group_message_slash_commands_and_worker_bare_messages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self._load_bridge(tmp)
+            bridge.BOT_META.update({"bot_id": 222, "handle": "bot_two", "resolved": True})
+            bridge.bot_bus.heartbeat_bot(
+                {"handle": "bot_one", "pid": os.getpid(), "role": "coordinator", "allowed_chats": [-1001234567890]}
+            )
+            bridge.bot_bus.update_bot_config("bot_two", role="worker")
+
+            # Targeted slash command routing
+            self.assertTrue(bridge._should_ignore_group_message({"chat": {"id": -1001234567890}, "text": "/status@bot_one"}))
+            self.assertFalse(bridge._should_ignore_group_message({"chat": {"id": -1001234567890}, "text": "/status@bot_two"}))
+            # Bare /delegate @bot_two should be ignored by worker so only coordinator handles it
+            self.assertTrue(bridge._should_ignore_group_message({"chat": {"id": -1001234567890}, "text": "/delegate @bot_two check tests"}))
+            # Bare message without @bot_two is ignored by worker when coordinator is online
+            self.assertTrue(bridge._should_ignore_group_message({"chat": {"id": -1001234567890}, "text": "大家好"}))
+            # Long message (>250 chars) ending with @bot_two wakes bot_two
+            long_msg = ("讨论上下文信息 " * 40) + " 最后麻烦 @bot_two 看下"
+            self.assertGreater(len(long_msg), 250)
+            self.assertFalse(bridge._should_ignore_group_message({"chat": {"id": -1001234567890}, "text": long_msg}))
+
+    def test_busy_fast_chat_isolation_semaphore_and_readonly_subprocess(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self._load_bridge(tmp)
+            bridge.BOT_META.update({"bot_id": 111, "handle": "bot_one", "resolved": True})
+
+            # Classifier boundary checks
+            self.assertTrue(bridge._is_fast_chat_candidate("收到，请问这个大概多久？"))
+            self.assertTrue(bridge._is_fast_chat_candidate("@bot_one 辛苦了", is_mention=True))
+            self.assertFalse(bridge._is_fast_chat_candidate("请 refactor 这个模块"))
+            self.assertFalse(bridge._is_fast_chat_candidate("a" * 321, is_mention=True))
+            self.assertFalse(bridge._is_fast_chat_candidate("/help"))
+            self.assertFalse(bridge._is_fast_chat_candidate("进度如何？", has_media=True))
+
+            # Simulate an active foreground worker turn
+            sentinel_sess = object()
+            with bridge.session_lock:
+                bridge.turn_running = True
+                bridge.turn_running_scope = "-1001234567890"
+                bridge.cancel_requested = False
+                bridge._session_pool["-1001234567890"] = sentinel_sess
+            with bridge.state_lock:
+                sc = bridge._ensure_scope_locked("-1001234567890")
+                sc["undo_stack"] = ["snap-1"]
+
+            in_fast_ev = threading.Event()
+            release_fast_ev = threading.Event()
+            captured_cmds: list[list[str]] = []
+            captured_envs: list[dict] = []
+            sent_replies: list[tuple] = []
+
+            def fake_subproc(cmd, cwd, timeout_s, env=None, shell=False):
+                captured_cmds.append(list(cmd))
+                captured_envs.append(dict(env or {}))
+                in_fast_ev.set()
+                release_fast_ev.wait(timeout=5.0)
+                return 0, json.dumps({"response": "当前正在处理后台任务，很快好。"}), ""
+
+            with (
+                mock.patch.object(bridge, "_run_subprocess_group", side_effect=fake_subproc),
+                mock.patch.object(
+                    bridge,
+                    "send_rich",
+                    side_effect=lambda cid, txt, **kw: sent_replies.append((cid, txt, kw)) or (456, txt),
+                ),
+                mock.patch.object(bridge, "send", side_effect=lambda *a, **kw: 457),
+                mock.patch.object(bridge, "save_state", side_effect=AssertionError("fast reply must not call save_state")),
+            ):
+                bridge.enqueue(-1001234567890, "现在进度怎么样？", origin_msg_id=321, raw_text="现在进度怎么样？")
+                self.assertTrue(in_fast_ev.wait(timeout=3.0), "fast reply thread did not start")
+
+                # While fast reply semaphore is held, a 2nd fast-chat candidate must fall back to job_q
+                q_before = bridge.job_q.qsize()
+                bridge.enqueue(-1001234567890, "还需要多久？", origin_msg_id=322, raw_text="还需要多久？")
+                self.assertEqual(q_before + 1, bridge.job_q.qsize())
+
+                release_fast_ev.set()
+                # Wait for semaphore release by acquiring & releasing
+                acquired = bridge._fast_chat_sem.acquire(timeout=3.0)
+                self.assertTrue(acquired)
+                bridge._fast_chat_sem.release()
+
+            self.assertEqual(1, len(captured_cmds))
+            self.assertNotIn("--dangerously-skip-permissions", captured_cmds[0])
+            self.assertIn("--disable-slash-commands", captured_cmds[0])
+            self.assertEqual("0", captured_envs[0].get("AGY_BOT_BUS_ENABLE"))
+            self.assertEqual("1", captured_envs[0].get("AGY_INTERNAL_OBSERVER"))
+            self.assertEqual(1, len(sent_replies))
+            self.assertEqual(321, sent_replies[0][2].get("reply_to_message_id"))
+
+            # Main worker state/session/undo remained completely untouched
+            with bridge.session_lock:
+                self.assertTrue(bridge.turn_running)
+                self.assertEqual("-1001234567890", bridge.turn_running_scope)
+                self.assertFalse(bridge.cancel_requested)
+                self.assertIs(sentinel_sess, bridge._session_pool.get("-1001234567890"))
+            self.assertEqual(["snap-1"], bridge.get_scope_value("-1001234567890", "undo_stack"))
+
+            # Exception inside fast reply still releases _fast_chat_sem cleanly
+            with (
+                mock.patch.object(bridge, "_run_subprocess_group", side_effect=RuntimeError("boom")),
+                mock.patch.object(bridge, "send", return_value=458),
+            ):
+                self.assertTrue(bridge._fast_chat_sem.acquire(blocking=False))
+                bridge._run_fast_group_reply(-1001234567890, "进度？", origin_msg_id=323)
+                self.assertTrue(bridge._fast_chat_sem.acquire(blocking=False))
+                bridge._fast_chat_sem.release()
+
+    def test_concurrent_flock_group_history_writes_and_reads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bot_bus, _ = self._load_bus(tmp)
+            errors: list[Exception] = []
+
+            def writer(tid_idx: int):
+                try:
+                    for i in range(10):
+                        # Intentional overlapping msg_ids across threads 0..1 to exercise dedup under flock
+                        mid = (i + 1) if tid_idx < 2 else (100 * tid_idx + i + 1)
+                        bot_bus.record_group_message(
+                            -1001234567890,
+                            msg_id=mid,
+                            sender_handle=f"user{tid_idx}",
+                            is_bot=False,
+                            text=f"msg {tid_idx}-{i}",
+                        )
+                        if i % 3 == 0:
+                            bot_bus.get_unseen_group_history(-1001234567890, f"reader_{tid_idx % 2}", advance_cursor=True)
+                except Exception as exc:
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=writer, args=(k,)) for k in range(5)]
+            for th in threads:
+                th.start()
+            for th in threads:
+                th.join(timeout=10.0)
+
+            self.assertEqual([], errors)
+            hist_path = os.path.join(tmp, "group_history", "-1001234567890.json")
+            with open(hist_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            entries = data["entries"]
+            # Threads 0 & 1 share msg_ids 1..10 (10 unique), threads 2..4 add 30 unique = 40 total (at GROUP_HISTORY_LIMIT)
+            self.assertEqual(40, len(entries))
+            seqs = [e["seq"] for e in entries]
+            self.assertEqual(sorted(seqs), seqs)
+            self.assertEqual(len(set(seqs)), len(seqs))
+
+    def test_shared_ledger_excludes_self_bot_messages_and_advances_cursor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bot_bus, _ = self._load_bus(tmp)
+            bot_bus.record_group_message(
+                -1001234567890, msg_id=10, sender_handle="alice", is_bot=False, text="人类需求"
+            )
+            bot_bus.record_group_message(
+                -1001234567890, msg_id=11, sender_handle="bot_one", sender_role="coordinator", is_bot=True, text="bot_one 自己的回复"
+            )
+            bot_bus.record_group_message(
+                -1001234567890, msg_id=12, sender_handle="bot_two", sender_role="worker", is_bot=True, text="bot_two 的协作回复"
+            )
+
+            # bot_one sees human + bot_two, never its own message
+            unseen_one = bot_bus.get_unseen_group_history(-1001234567890, "bot_one", advance_cursor=True)
+            self.assertEqual([10, 12], [e["msg_id"] for e in unseen_one])
+
+            # If only bot_one speaks next, unseen for bot_one is [] AND cursor still advances to seq=4
+            bot_bus.record_group_message(
+                -1001234567890, msg_id=13, sender_handle="bot_one", sender_role="coordinator", is_bot=True, text="bot_one 自言自语"
+            )
+            self.assertEqual([], bot_bus.get_unseen_group_history(-1001234567890, "bot_one", advance_cursor=True))
+            # Verify cursor advanced to seq 4 so a later bot_two message only returns seq 5
+            bot_bus.record_group_message(
+                -1001234567890, msg_id=14, sender_handle="bot_two", sender_role="worker", is_bot=True, text="bot_two 新消息"
+            )
+            unseen_one_next = bot_bus.get_unseen_group_history(-1001234567890, "bot_one", advance_cursor=True)
+            self.assertEqual([14], [e["msg_id"] for e in unseen_one_next])
+
+            # Meanwhile bot_two sees bot_one's messages (10, 11, 13) and not its own (12, 14)
+            unseen_two = bot_bus.get_unseen_group_history(-1001234567890, "bot_two", advance_cursor=True)
+            self.assertEqual([10, 11, 13], [e["msg_id"] for e in unseen_two])
+
+    def test_execute_bus_job_strictly_respects_notify_group_false(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self._load_bridge(tmp)
+            bridge.BOT_META.update({"bot_id": 222, "handle": "bot_two", "resolved": True})
+            bridge.bot_bus.heartbeat_bot(
+                {"handle": "bot_one", "pid": os.getpid(), "role": "coordinator", "allowed_chats": [-1001234567890]}
+            )
+            bridge.bot_bus.heartbeat_bot(
+                {"handle": "bot_two", "pid": os.getpid(), "role": "worker", "allowed_chats": [-1001234567890]}
+            )
+            bridge.bot_bus.update_bot_config(
+                "bot_two", role="worker", mirror_chat_id=-1001234567890, mirror_thread_id=42
+            )
+
+            class _FakeProc:
+                def __init__(self):
+                    self.pid = 99999
+                    self.returncode = 0
+                    self.stdout = iter(
+                        [
+                            json.dumps(
+                                {
+                                    "event": "result",
+                                    "result": {
+                                        "status": "SUCCESS",
+                                        "conversation_id": "conv-silent-1",
+                                        "response": "silent job ok",
+                                    },
+                                }
+                            )
+                            + "\n"
+                        ]
+                    )
+                    self.stderr = iter([])
+
+                def wait(self, timeout=None):
+                    return 0
+
+            for chat_mode in ("conversational", "card"):
+                res = bridge.bot_bus.dispatch_assignments(
+                    "bot_one",
+                    [{"bot": "bot_two", "prompt": "run silent check", "label": "silent-qa", "notify_group": False}],
+                    origin_scope_key="-1001234567890:42",
+                    origin_chat_id=-1001234567890,
+                    origin_thread_id=42,
+                    origin_msg_id=888,
+                    default_notify_group=True,
+                )
+                jid = res["jobs"][0]["job_id"]
+                tg_calls: list[tuple] = []
+                rich_calls: list[tuple] = []
+
+                with (
+                    mock.patch.object(bridge, "BUS_CHAT_MODE", chat_mode),
+                    mock.patch.object(bridge.subprocess, "Popen", return_value=_FakeProc()),
+                    mock.patch.object(
+                        bridge, "tg_send_in_route", side_effect=lambda *a, **kw: tg_calls.append((a, kw)) or None
+                    ),
+                    mock.patch.object(
+                        bridge, "send_rich", side_effect=lambda *a, **kw: rich_calls.append((a, kw)) or (999, "x")
+                    ),
+                    mock.patch.object(bridge, "send_file", side_effect=AssertionError("must not send files silently")),
+                ):
+                    bridge._execute_bus_job(jid)
+
+                self.assertEqual([], tg_calls, f"mode={chat_mode} leaked tg_send_in_route")
+                self.assertEqual([], rich_calls, f"mode={chat_mode} leaked send_rich")
+                job_after = bridge.bot_bus.get_job(jid)
+                self.assertEqual("done", job_after["status"])
+                self.assertEqual("silent job ok", job_after["result_text"])
+                self.assertFalse(job_after.get("group_delivered"))
+
+    def test_origin_context_per_bot_isolation_and_warm_mention_hop_guard(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bot_bus, bot_bus_mcp = self._load_bus(tmp)
+            bot_bus.heartbeat_bot(
+                {"handle": "bot_one", "pid": os.getpid(), "role": "coordinator", "allowed_chats": [-1001234567890]}
+            )
+            bot_bus.heartbeat_bot(
+                {"handle": "bot_two", "pid": os.getpid(), "role": "worker", "allowed_chats": [-1001234567890]}
+            )
+            chain_id = bot_bus.mark_human_group_activity(-1001234567890, thread_id=42, msg_id=700)
+
+            # Concurrent bots in the exact same group/topic do not overwrite each other
+            bot_bus.set_origin_context(
+                "-1001234567890:42",
+                bot_handle="bot_one",
+                chat_id=-1001234567890,
+                thread_id=42,
+                msg_id=701,
+                mention_hop=0,
+                chain_id=chain_id,
+            )
+            bot_bus.set_origin_context(
+                "-1001234567890:42",
+                bot_handle="bot_two",
+                chat_id=-1001234567890,
+                thread_id=42,
+                msg_id=702,
+                mention_hop=2,
+                chain_id=chain_id,
+            )
+
+            env_one = {
+                "AGY_BOT_BUS_ENABLE": "1",
+                "AGY_BOT_BUS_ROLE": "coordinator",
+                "AGY_BOT_HANDLE": "bot_one",
+                "AGY_BOT_CHAT_ID": "-1001234567890",
+                "AGY_BOT_THREAD_ID": "42",
+                "AGY_BOT_SCOPE_KEY": "-1001234567890:42",
+                "AGY_BOT_ORIGIN_MSG_ID": "100",
+                "AGY_BOT_MENTION_HOP": "0",
+            }
+            env_two_warm = {
+                **env_one,
+                "AGY_BOT_BUS_ROLE": "worker",
+                "AGY_BOT_HANDLE": "bot_two",
+                "AGY_BOT_MENTION_HOP": "0",  # frozen spawn-time env on warm AgySession!
+            }
+            with mock.patch.dict(os.environ, env_one, clear=False):
+                ctx_one = bot_bus_mcp._origin_context()
+                self.assertEqual(701, ctx_one["origin_msg_id"])
+                self.assertEqual(0, ctx_one["mention_hop"])
+
+            with mock.patch.dict(os.environ, env_two_warm, clear=False):
+                ctx_two = bot_bus_mcp._origin_context()
+                self.assertEqual(702, ctx_two["origin_msg_id"])
+                self.assertEqual(2, ctx_two["mention_hop"])
+                self.assertEqual(chain_id, ctx_two["chain_id"])
+
+                res = bot_bus_mcp._handle_group_say({"message": "接力回复 @bot_one"})
+                self.assertFalse(res.get("isError"), res)
+                pkts = bot_bus.pop_inbox_packets("bot_one")  # not delivered yet; check bot_two's outbox
+                self.assertEqual([], pkts)
+                say_pkts = bot_bus.pop_inbox_packets("bot_two")
+                self.assertEqual(1, len(say_pkts))
+                self.assertEqual(2, say_pkts[0]["source_hop"])
+
+                relay = bot_bus.relay_group_mentions(
+                    "bot_two",
+                    -1001234567890,
+                    say_pkts[0]["message"],
+                    thread_id=42,
+                    msg_id=703,
+                    source_hop=say_pkts[0]["source_hop"],
+                    max_hops=2,
+                )
+                self.assertEqual([], relay["relayed"])
+                self.assertIn("max_hops_reached", relay["blocked_reason"])
+
+            # Resetting mention_hop=0 in origin_context overrides non-zero env var back to 0
+            bot_bus.set_origin_context(
+                "-1001234567890:42",
+                bot_handle="bot_two",
+                chat_id=-1001234567890,
+                thread_id=42,
+                msg_id=705,
+                mention_hop=0,
+                chain_id=chain_id,
+            )
+            with mock.patch.dict(os.environ, {**env_two_warm, "AGY_BOT_MENTION_HOP": "2"}, clear=False):
+                self.assertEqual(0, bot_bus_mcp._origin_context()["mention_hop"])
+
+    def test_send_failure_does_not_record_ledger_or_relay_mentions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self._load_bridge(tmp)
+            bridge.BOT_META.update({"bot_id": 111, "handle": "bot_one", "resolved": True})
+            bridge.bot_bus.heartbeat_bot(
+                {"handle": "bot_one", "pid": os.getpid(), "role": "coordinator", "allowed_chats": [-1001234567890]}
+            )
+            bridge.bot_bus.heartbeat_bot(
+                {"handle": "bot_two", "pid": os.getpid(), "role": "worker", "allowed_chats": [-1001234567890]}
+            )
+            bridge.bot_bus.mark_human_group_activity(-1001234567890, msg_id=900)
+
+            with (
+                mock.patch.object(bridge, "_run_subprocess_group", return_value=(0, json.dumps({"response": "请 @bot_two 看下"}), "")),
+                mock.patch.object(bridge, "send_rich", return_value=(None, None)),
+            ):
+                self.assertTrue(bridge._fast_chat_sem.acquire(blocking=False))
+                bridge._run_fast_group_reply(-1001234567890, "进度？", origin_msg_id=900)
+
+            self.assertEqual([], bridge.bot_bus.get_unseen_group_history(-1001234567890, "bot_two"))
+            self.assertEqual([], bridge.bot_bus.pop_inbox_packets("bot_two"))
+
+            # Direct call with msg_id=0 is also ignored defensively
+            bridge._record_and_relay_bot_group_msg(-1001234567890, 0, None, "hello @bot_two")
+            self.assertEqual([], bridge.bot_bus.get_unseen_group_history(-1001234567890, "bot_two"))
+            self.assertEqual([], bridge.bot_bus.pop_inbox_packets("bot_two"))
+
+    def test_dm_busy_task_redaction_and_batch_done_group_delivered(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self._load_bridge(tmp)
+            bridge.BOT_META.update({"bot_id": 111, "handle": "bot_one", "resolved": True})
+            bridge.bot_bus.heartbeat_bot({"handle": "bot_one", "pid": os.getpid(), "role": "coordinator"})
+            bridge.bot_bus.heartbeat_bot({"handle": "bot_two", "pid": os.getpid(), "role": "worker"})
+
+            # 1. Interactive DM scope must be redacted
+            with bridge.session_lock:
+                bridge.turn_running = True
+                bridge.turn_running_scope = "987654321"
+                bridge.turn_running_chat = 987654321
+                bridge._active_bus_job_id = None
+            busy, desc, _ = bridge._describe_active_busy_task()
+            self.assertTrue(busy)
+            self.assertNotIn("987654321", desc)
+            self.assertIn("私聊", desc)
+
+            # 2. Bus job originating from DM must redact both chat_id and private label
+            res = bridge.bot_bus.dispatch_assignments(
+                "bot_one",
+                [{"bot": "bot_two", "prompt": "secret dm task", "label": "机密私聊标题"}],
+                origin_scope_key="987654321",
+                origin_chat_id=987654321,
+                default_notify_group=False,
+            )
+            jid = res["jobs"][0]["job_id"]
+            with bridge.session_lock:
+                bridge.turn_running = True
+                bridge.turn_running_scope = f"bus:{jid}"
+                bridge.turn_running_chat = 987654321
+                bridge._active_bus_job_id = jid
+            busy2, desc2, _ = bridge._describe_active_busy_task()
+            self.assertTrue(busy2)
+            self.assertNotIn("987654321", desc2)
+            self.assertNotIn("机密私聊标题", desc2)
+            self.assertIn("私聊", desc2)
+            with bridge.session_lock:
+                bridge.turn_running = False
+                bridge.turn_running_scope = None
+                bridge.turn_running_chat = None
+                bridge._active_bus_job_id = None
+
+            # 3. summarize_job_brief exposes group_delivered
+            bridge.bot_bus.update_job(jid, group_delivered=True)
+            finished = bridge.bot_bus.finish_job(jid, status="done", result_text="done")
+            brief = bridge.bot_bus.summarize_job_brief(finished)
+            self.assertTrue(brief["group_delivered"])
+
+    def test_album_real_msg_id_out_of_order_anchor_fast_reply_ctx_and_400_retry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self._load_bridge(tmp)
+            bridge.BOT_META.update({"bot_id": 111, "handle": "bot_one", "resolved": True})
+
+            # 1. Out-of-order lagging human message must not regress human_msg_id anchor
+            c_new = bridge.bot_bus.mark_human_group_activity(-1001234567890, msg_id=500)
+            c_old = bridge.bot_bus.mark_human_group_activity(-1001234567890, msg_id=450)
+            self.assertEqual(c_new, c_old)
+
+            # 2. _flush_album passes real first_msg_id instead of 0
+            bridge.ALLOWED_USERS = set()
+            bridge._note_poll_album_batch(
+                [
+                    {
+                        "message": {
+                            "message_id": 612,
+                            "chat": {"id": -1001234567890},
+                            "from": {"id": 42, "username": "alice", "is_bot": False},
+                            "media_group_id": "mg-1",
+                            "photo": [{"file_id": "f1"}],
+                            "caption": "看看这两张图",
+                        }
+                    },
+                    {
+                        "message": {
+                            "message_id": 613,
+                            "chat": {"id": -1001234567890},
+                            "from": {"id": 42, "username": "alice", "is_bot": False},
+                            "media_group_id": "mg-1",
+                            "photo": [{"file_id": "f2"}],
+                        }
+                    },
+                ]
+            )
+            akey = "-1001234567890:mg-1"
+            with bridge._album_lock:
+                bridge._album_buffers[akey]["batch_pending"] = 0
+                bridge._album_buffers[akey]["items"] = [{"dest": "/tmp/a.jpg", "rel": "a.jpg"}]
+                bridge._album_buffers[akey]["captions"] = ["看看这两张图"]
+
+            enq_calls: list[dict] = []
+            with (
+                mock.patch.object(bridge, "send", return_value=700),
+                mock.patch.object(bridge, "enqueue", side_effect=lambda *a, **kw: enq_calls.append(kw)),
+            ):
+                bridge._flush_album(akey)
+            self.assertEqual(1, len(enq_calls))
+            self.assertEqual(612, enq_calls[0]["origin_msg_id"])
+            unseen_album = bridge.bot_bus.get_unseen_group_history(-1001234567890, "bot_two")
+            self.assertEqual([612], [e["msg_id"] for e in unseen_album])
+
+            # 3. Fast reply preserves reply context and uses scope workdir
+            scope_dir = os.path.join(tmp, "custom_scope_dir")
+            os.makedirs(scope_dir, exist_ok=True)
+            with bridge.state_lock:
+                sc = bridge._ensure_scope_locked("-1001234567890")
+                sc["workdir"] = scope_dir
+            with bridge.session_lock:
+                bridge.turn_running = True
+                bridge.turn_running_scope = "-1001234567890"
+            captured_fast: list[tuple] = []
+
+            def fake_fast_subproc(cmd, cwd, timeout_s, env=None, shell=False):
+                captured_fast.append((cmd, cwd))
+                return 0, json.dumps({"response": "快答收到"}), ""
+
+            with (
+                mock.patch.object(bridge, "_run_subprocess_group", side_effect=fake_fast_subproc),
+                mock.patch.object(bridge, "send_rich", return_value=(701, "ok")),
+            ):
+                bridge.enqueue(
+                    -1001234567890,
+                    "[引用回复自 alice]:\n> 上文内容\n\n现在进度如何？",
+                    origin_msg_id=620,
+                    raw_text="现在进度如何？",
+                )
+                self.assertTrue(bridge._fast_chat_sem.acquire(timeout=3.0))
+                bridge._fast_chat_sem.release()
+            with bridge.session_lock:
+                bridge.turn_running = False
+                bridge.turn_running_scope = None
+
+            self.assertEqual(1, len(captured_fast))
+            self.assertEqual(os.path.realpath(scope_dir), captured_fast[0][1])
+            self.assertIn("[引用回复自 alice]:", captured_fast[0][0][-1])
+
+            # 4. tg_send_in_route 400 "reply message not found" strips reply_to_message_id and retries
+            calls_rmnf: list[dict] = []
+            resps_rmnf = [
+                self._fake_tg_resp(400, {"ok": False, "description": "Bad Request: reply message not found"}),
+                self._fake_tg_resp(200, {"ok": True, "result": {"message_id": 779}}),
+            ]
+            with (
+                mock.patch.object(bridge, "tg", side_effect=lambda method, **kw: calls_rmnf.append(kw) or resps_rmnf.pop(0)),
+                mock.patch.object(bridge, "log"),
+            ):
+                r_rmnf = bridge.tg_send_in_route("sendMessage", -1001234567890, text="hi", reply_to_message_id=999)
+            self.assertEqual(200, r_rmnf.status_code)
+            self.assertEqual(2, len(calls_rmnf))
+            self.assertNotIn("reply_to_message_id", calls_rmnf[1])
+
+
+if __name__ == "__main__":
+    unittest.main()

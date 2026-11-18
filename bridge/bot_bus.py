@@ -9,7 +9,9 @@ only to coordinator/peer sessions). Uses atomic temp-file writes + `fcntl.flock`
 from __future__ import annotations
 
 import contextlib
+import datetime
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -24,10 +26,14 @@ BUS_DIR = os.environ.get(
 )
 JOBS_DIR = os.path.join(BUS_DIR, "jobs")
 INBOX_DIR = os.path.join(BUS_DIR, "inbox")
+GROUP_HISTORY_DIR = os.path.join(BUS_DIR, "group_history")
 LOCK_FILE = os.path.join(BUS_DIR, "bus.lock")
 CONFIG_FILE = os.path.join(BUS_DIR, "team_config.json")
 ROSTER_FILE = os.path.join(BUS_DIR, "roster.json")
 THREADS_FILE = os.path.join(BUS_DIR, "threads.json")
+LOOP_GUARD_FILE = os.path.join(BUS_DIR, "loop_guard.json")
+MENTION_CHAINS_FILE = os.path.join(BUS_DIR, "mention_chains.json")
+ORIGIN_CTX_FILE = os.path.join(BUS_DIR, "origin_context.json")
 
 VALID_ROLES = ("coordinator", "worker", "peer")
 TERMINAL_STATUSES = frozenset({"done", "error", "cancelled"})
@@ -35,6 +41,13 @@ FAN_OUT_MAX = 8
 DEFAULT_MAX_HOPS = 2
 ONLINE_TTL_SECONDS = 45.0
 JOB_RETENTION_LIMIT = 150
+GROUP_HISTORY_LIMIT = 40
+GROUP_HISTORY_INJECT_LIMIT = 15
+GROUP_HISTORY_MAX_CHARS = 2400
+HUMAN_CHAIN_TTL_SECONDS = 1800.0
+MENTION_WINDOW_SECONDS = 300.0
+MENTION_WINDOW_MAX = 6
+MENTION_CHAIN_MAX_RELAYS = 4
 _LOOP_WINDOW_SECONDS = 300.0
 _LOOP_MAX_EVENTS = 12
 
@@ -43,6 +56,7 @@ def _ensure_dirs() -> None:
     os.makedirs(BUS_DIR, mode=0o700, exist_ok=True)
     os.makedirs(JOBS_DIR, mode=0o700, exist_ok=True)
     os.makedirs(INBOX_DIR, mode=0o700, exist_ok=True)
+    os.makedirs(GROUP_HISTORY_DIR, mode=0o700, exist_ok=True)
 
 
 @contextlib.contextmanager
@@ -422,6 +436,7 @@ def dispatch_assignments(
     origin_scope_key: str = "",
     origin_chat_id: int = 0,
     origin_thread_id: Optional[int] = None,
+    origin_msg_id: Optional[int] = None,
     parent_chain: Optional[Iterable[str]] = None,
     default_notify_group: bool = False,
     wake_on_async: bool = False,
@@ -497,11 +512,13 @@ def dispatch_assignments(
                 "origin_scope_key": origin_scope_key or "",
                 "origin_chat_id": int(origin_chat_id or 0),
                 "origin_thread_id": origin_thread_id,
+                "origin_msg_id": int(origin_msg_id or 0),
                 "chain": list(chain) + [target["handle"]],
                 "depth": len(chain),
                 "status": "queued",
                 "cancel_requested": False,
                 "cancel_reason": "",
+                "group_delivered": False,
                 "created_at": now,
                 "started_at": 0.0,
                 "finished_at": 0.0,
@@ -713,6 +730,7 @@ def retry_job(job_id: str, requester_bot: str, prompt_override: str = "") -> Dic
         origin_scope_key=prev.get("origin_scope_key") or "",
         origin_chat_id=int(prev.get("origin_chat_id") or 0),
         origin_thread_id=prev.get("origin_thread_id"),
+        origin_msg_id=int(prev.get("origin_msg_id") or 0) or None,
     )
     return res["jobs"][0]
 
@@ -769,6 +787,43 @@ def enqueue_broadcast(
         )
 
 
+def enqueue_group_say(
+    sender_bot: str,
+    chat_id: int,
+    message: str,
+    *,
+    thread_id: Optional[int] = None,
+    reply_to_message_id: Optional[int] = None,
+    source_hop: int = 0,
+    chain_id: str = "",
+) -> str:
+    """Enqueue a restricted `group_say` packet onto `sender_bot`'s own inbox."""
+    sender = normalize_handle(sender_bot)
+    if not sender:
+        raise ValueError("Sender bot handle is required")
+    cid = int(chat_id or 0)
+    if cid >= 0:
+        raise ValueError("group_say requires a group chat_id (< 0)")
+    msg = (message or "").strip()
+    if not msg:
+        raise ValueError("group_say message cannot be empty")
+    with _bus_lock():
+        return _drop_inbox_packet_unlocked(
+            sender,
+            {
+                "type": "group_say",
+                "chat_id": cid,
+                "thread_id": _norm_tid(thread_id),
+                "reply_to_message_id": int(reply_to_message_id or 0) or None,
+                "message": msg[:3000],
+                "from_bot": sender,
+                "source_hop": max(0, int(source_hop or 0)),
+                "chain_id": str(chain_id or ""),
+                "created_at": time.time(),
+            },
+        )
+
+
 # ---------------------------------------------------------------- resumable thread index
 def _thread_map_key(from_bot: str, target_bot: str, thread_key: str) -> str:
     return f"{normalize_handle(from_bot)}::{normalize_handle(target_bot)}::{thread_key.strip()}"
@@ -800,20 +855,450 @@ def thread_set(from_bot: str, target_bot: str, thread_key: str, cid: str) -> Non
         _atomic_write_json(THREADS_FILE, data)
 
 
-# ---------------------------------------------------------------- loop guard & prompt envelope
-_loop_history: Dict[str, List[float]] = {}
+# ---------------------------------------------------------------- origin context & mention parser
+def _norm_tid(tid: Any) -> Optional[int]:
+    if tid is None or tid == "":
+        return None
+    try:
+        val = int(tid)
+    except (TypeError, ValueError):
+        return None
+    return val if val > 1 else None
+
+
+_FENCED_CODE_RE = re.compile(r"```[\s\S]*?```")
+_INLINE_CODE_RE = re.compile(r"(?<!`)(`+)(?!`)([^\n]*?)(?<!`)\1(?!`)")
+_MENTION_RE = re.compile(
+    r"(?<![A-Za-z0-9_./-])@([A-Za-z0-9_]{3,32})(?![A-Za-z0-9_]*\.[A-Za-z]{2,})"
+)
+
+
+def extract_at_mentions(text: str) -> List[str]:
+    """Extract normalized `@handle` mentions from full text while ignoring code blocks and emails/URLs."""
+    if not text:
+        return []
+    stripped = _FENCED_CODE_RE.sub(" ", text)
+    stripped = _INLINE_CODE_RE.sub(" ", stripped)
+    seen: set[str] = set()
+    out: List[str] = []
+    for raw in _MENTION_RE.findall(stripped):
+        norm = normalize_handle(raw)
+        if norm and norm not in seen:
+            seen.add(norm)
+            out.append(norm)
+    return out
+
+
+def _origin_context_key(scope_key: str, bot_handle: str = "") -> str:
+    sk = (scope_key or "").strip()
+    nb = normalize_handle(bot_handle or os.environ.get("AGY_BOT_HANDLE", ""))
+    return f"{nb}:{sk}" if nb else sk
+
+
+def set_origin_context(
+    scope_key: str,
+    *,
+    bot_handle: str = "",
+    chat_id: int = 0,
+    thread_id: Optional[int] = None,
+    msg_id: int = 0,
+    mention_hop: int = 0,
+    chain_id: str = "",
+) -> None:
+    """Persist latest inbound message context per `(bot_handle, scope_key)` for warm MCP sessions."""
+    sk = (scope_key or "").strip()
+    if not sk:
+        return
+    nb = normalize_handle(bot_handle or os.environ.get("AGY_BOT_HANDLE", ""))
+    ctx_key = _origin_context_key(sk, nb)
+    with _bus_lock():
+        data = _read_json(ORIGIN_CTX_FILE, {})
+        if not isinstance(data, dict):
+            data = {}
+        data[ctx_key] = {
+            "bot_handle": nb,
+            "scope_key": sk,
+            "chat_id": int(chat_id or 0),
+            "thread_id": _norm_tid(thread_id),
+            "msg_id": int(msg_id or 0),
+            "mention_hop": max(0, int(mention_hop or 0)),
+            "chain_id": str(chain_id or ""),
+            "updated_at": time.time(),
+        }
+        if len(data) > 100:
+            oldest = sorted(data.items(), key=lambda kv: float((kv[1] or {}).get("updated_at") or 0))[:-100]
+            for old_k, _ in oldest:
+                data.pop(old_k, None)
+        _atomic_write_json(ORIGIN_CTX_FILE, data)
+
+
+def get_origin_context(scope_key: str, bot_handle: str = "") -> Dict[str, Any]:
+    sk = (scope_key or "").strip()
+    if not sk:
+        return {}
+    ctx_key = _origin_context_key(sk, bot_handle)
+    with _bus_lock():
+        data = _read_json(ORIGIN_CTX_FILE, {})
+        entry = data.get(ctx_key) if isinstance(data, dict) else None
+        return dict(entry) if isinstance(entry, dict) else {}
+
+
+# ---------------------------------------------------------------- shared group chat ledger
+def _group_history_path(chat_id: int) -> str:
+    return os.path.join(GROUP_HISTORY_DIR, f"{int(chat_id)}.json")
+
+
+def _cursor_key(bot_handle: str, thread_id: Optional[int]) -> str:
+    norm_tid = _norm_tid(thread_id)
+    return f"{normalize_handle(bot_handle)}:{norm_tid if norm_tid is not None else 'main'}"
+
+
+def record_group_message(
+    chat_id: int,
+    *,
+    msg_id: int = 0,
+    thread_id: Optional[int] = None,
+    sender_handle: str = "",
+    sender_role: str = "",
+    is_bot: bool = False,
+    text: str = "",
+    ts: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    """Append a deduplicated group message to the per-chat ring ledger (`chat_id < 0` only)."""
+    cid = int(chat_id or 0)
+    if cid >= 0:
+        return None
+    excerpt = re.sub(r"\s+", " ", (text or "")).strip()[:500]
+    if not excerpt:
+        return None
+    norm_tid = _norm_tid(thread_id)
+    mid = int(msg_id or 0)
+    now = float(ts or time.time())
+    if is_bot:
+        sender = normalize_handle(sender_handle) or "bot"
+        role = sender_role if sender_role in VALID_ROLES else "bot"
+    else:
+        sender = re.sub(r"\s+", " ", (sender_handle or "").strip().lstrip("@"))[:32] or "user"
+        role = "human"
+    fp = hashlib.sha1(f"{norm_tid}|{sender}|{excerpt[:120]}".encode("utf-8", errors="replace")).hexdigest()[:12]
+
+    path = _group_history_path(cid)
+    with _bus_lock():
+        data = _read_json(path, None)
+        if not isinstance(data, dict):
+            data = {"version": 1, "next_seq": 1, "entries": [], "cursors": {}}
+        entries = list(data.get("entries") or [])
+        if mid > 0:
+            for existing in entries:
+                if int(existing.get("msg_id") or 0) == mid:
+                    return None
+        else:
+            for existing in entries[-5:]:
+                if existing.get("fingerprint") == fp and abs(now - float(existing.get("ts") or 0)) < 5.0:
+                    return None
+
+        seq = int(data.get("next_seq") or (len(entries) + 1))
+        entry = {
+            "seq": seq,
+            "msg_id": mid,
+            "ts": now,
+            "thread_id": norm_tid,
+            "sender_handle": sender,
+            "sender_role": role,
+            "is_bot": bool(is_bot),
+            "text_excerpt": excerpt,
+            "fingerprint": fp,
+        }
+        entries.append(entry)
+        if len(entries) > GROUP_HISTORY_LIMIT:
+            entries = entries[-GROUP_HISTORY_LIMIT:]
+        data["next_seq"] = seq + 1
+        data["entries"] = entries
+        if not isinstance(data.get("cursors"), dict):
+            data["cursors"] = {}
+        _atomic_write_json(path, data)
+        return dict(entry)
+
+
+def get_unseen_group_history(
+    chat_id: int,
+    bot_handle: str,
+    *,
+    thread_id: Optional[int] = None,
+    limit: int = GROUP_HISTORY_INJECT_LIMIT,
+    exclude_msg_id: int = 0,
+    advance_cursor: bool = True,
+) -> List[Dict[str, Any]]:
+    """Return recent unseen messages in the same group/topic for `bot_handle`."""
+    cid = int(chat_id or 0)
+    norm_bot = normalize_handle(bot_handle)
+    if cid >= 0 or not norm_bot:
+        return []
+    norm_tid = _norm_tid(thread_id)
+    ex_mid = int(exclude_msg_id or 0)
+    path = _group_history_path(cid)
+
+    with _bus_lock():
+        data = _read_json(path, None)
+        if not isinstance(data, dict):
+            return []
+        entries = list(data.get("entries") or [])
+        cursors = dict(data.get("cursors") or {})
+        ckey = _cursor_key(norm_bot, norm_tid)
+        cursor = int(cursors.get(ckey) or 0)
+
+        thread_entries = [e for e in entries if _norm_tid(e.get("thread_id")) == norm_tid]
+        if not thread_entries:
+            return []
+
+        unseen = [
+            dict(e)
+            for e in thread_entries
+            if int(e.get("seq") or 0) > cursor
+            and not (ex_mid and int(e.get("msg_id") or 0) == ex_mid)
+            and not (bool(e.get("is_bot")) and normalize_handle(str(e.get("sender_handle") or "")) == norm_bot)
+        ]
+        selected = unseen[-max(1, int(limit)) :] if unseen else []
+
+        if advance_cursor:
+            max_seq = max(int(e.get("seq") or 0) for e in thread_entries)
+            if max_seq > cursor:
+                cursors[ckey] = max_seq
+                data["cursors"] = cursors
+                _atomic_write_json(path, data)
+        return selected
+
+
+def format_group_history_block(
+    entries: List[Dict[str, Any]],
+    max_chars: int = GROUP_HISTORY_MAX_CHARS,
+) -> str:
+    """Format group ledger entries into a bounded, injection-safe context preamble."""
+    if not entries:
+        return ""
+    lines: List[str] = []
+    for e in entries:
+        ts_val = float(e.get("ts") or 0)
+        try:
+            t_str = datetime.datetime.fromtimestamp(ts_val).strftime("%H:%M") if ts_val > 0 else "--:--"
+        except Exception:
+            t_str = "--:--"
+        sender = str(e.get("sender_handle") or "user")
+        role = str(e.get("sender_role") or ("bot" if e.get("is_bot") else "human"))
+        prefix = f"@{sender}" if e.get("is_bot") else sender
+        excerpt = str(e.get("text_excerpt") or "").strip()
+        if len(excerpt) > 220:
+            excerpt = excerpt[:217] + "..."
+        lines.append(f"[{t_str}] {prefix}({role}): {excerpt}")
+
+    kept: List[str] = []
+    total = 0
+    budget = max(300, int(max_chars) - 120)
+    for ln in reversed(lines):
+        if total + len(ln) + 1 > budget and kept:
+            break
+        kept.append(ln)
+        total += len(ln) + 1
+    kept.reverse()
+    body = "\n".join(kept)
+    return (
+        f"[群聊近期上下文（最近 {len(kept)} 条你尚未看过的同群/同Topic消息，仅供衔接前文）]\n"
+        f"{body}"
+    )
+
+
+def format_unseen_group_history(
+    chat_id: int,
+    bot_handle: str,
+    *,
+    thread_id: Optional[int] = None,
+    limit: int = GROUP_HISTORY_INJECT_LIMIT,
+    max_chars: int = GROUP_HISTORY_MAX_CHARS,
+    exclude_msg_id: int = 0,
+    advance_cursor: bool = True,
+) -> str:
+    entries = get_unseen_group_history(
+        chat_id,
+        bot_handle,
+        thread_id=thread_id,
+        limit=limit,
+        exclude_msg_id=exclude_msg_id,
+        advance_cursor=advance_cursor,
+    )
+    return format_group_history_block(entries, max_chars=max_chars)
+
+
+# ---------------------------------------------------------------- cross-process loop guard & mention relay
+def _chain_scope_key(chat_id: int, thread_id: Optional[int]) -> str:
+    norm_tid = _norm_tid(thread_id)
+    return f"{int(chat_id)}:{norm_tid if norm_tid is not None else 'main'}"
 
 
 def loop_guard_allow(scope_key: str, max_events: int = _LOOP_MAX_EVENTS, window_sec: float = _LOOP_WINDOW_SECONDS) -> bool:
-    """Sliding-window guard ensuring automated async wake callbacks cannot loop unchecked."""
+    """Cross-process sliding-window guard preventing unchecked automated wake loops."""
     now = time.time()
-    hist = [ts for ts in _loop_history.get(scope_key, []) if (now - ts) < window_sec]
-    if len(hist) >= max_events:
-        _loop_history[scope_key] = hist
-        return False
-    hist.append(now)
-    _loop_history[scope_key] = hist
-    return True
+    sk = str(scope_key or "default")
+    with _bus_lock():
+        data = _read_json(LOOP_GUARD_FILE, {})
+        if not isinstance(data, dict):
+            data = {}
+        hist = [float(ts) for ts in (data.get(sk) or []) if (now - float(ts)) < window_sec]
+        if len(hist) >= max_events:
+            data[sk] = hist
+            _atomic_write_json(LOOP_GUARD_FILE, data)
+            return False
+        hist.append(now)
+        data[sk] = hist
+        if len(data) > 200:
+            for k in list(data.keys()):
+                if not data[k] or (now - float(data[k][-1])) > max(window_sec, 3600.0):
+                    data.pop(k, None)
+        _atomic_write_json(LOOP_GUARD_FILE, data)
+        return True
+
+
+def mark_human_group_activity(
+    chat_id: int,
+    thread_id: Optional[int] = None,
+    msg_id: int = 0,
+) -> Optional[str]:
+    """Anchor or refresh the active human-initiated `@handle` mention chain for `(chat_id, thread_id)`."""
+    cid = int(chat_id or 0)
+    if cid >= 0:
+        return None
+    skey = _chain_scope_key(cid, thread_id)
+    mid = int(msg_id or 0)
+    now = time.time()
+    with _bus_lock():
+        data = _read_json(MENTION_CHAINS_FILE, {})
+        if not isinstance(data, dict):
+            data = {}
+        cur = data.get(skey)
+        cur_mid = int(cur.get("human_msg_id") or 0) if isinstance(cur, dict) else 0
+        if mid > 0 and cur_mid > 0 and mid <= cur_mid:
+            return str(cur.get("chain_id") or "")
+        prev_window = [
+            float(t)
+            for t in ((cur or {}).get("window_ts") or [])
+            if (now - float(t)) < MENTION_WINDOW_SECONDS
+        ]
+        chain_id = f"hc-{mid or int(now * 1000)}-{uuid.uuid4().hex[:6]}"
+        data[skey] = {
+            "chain_id": chain_id,
+            "human_ts": now,
+            "human_msg_id": mid,
+            "relays": 0,
+            "window_ts": prev_window,
+            "seen_relays": [],
+        }
+        for k in list(data.keys()):
+            if (now - float((data[k] or {}).get("human_ts") or 0)) > 86400.0:
+                data.pop(k, None)
+        _atomic_write_json(MENTION_CHAINS_FILE, data)
+        return chain_id
+
+
+def relay_group_mentions(
+    from_bot: str,
+    chat_id: int,
+    text: str,
+    *,
+    thread_id: Optional[int] = None,
+    msg_id: int = 0,
+    source_hop: int = 0,
+    max_hops: int = DEFAULT_MAX_HOPS,
+    exclude_bots: Optional[Iterable[str]] = None,
+) -> Dict[str, Any]:
+    """Relay `@handle` mentions from a bot's group message to online sibling bot inboxes under cross-process loop guards."""
+    cid = int(chat_id or 0)
+    if cid >= 0:
+        return {"relayed": [], "blocked_reason": "not_group_chat"}
+    sender = normalize_handle(from_bot)
+    if not sender:
+        return {"relayed": [], "blocked_reason": "missing_sender"}
+    excluded = {sender} | {normalize_handle(x) for x in (exclude_bots or []) if normalize_handle(x)}
+    candidates = [h for h in extract_at_mentions(text) if h not in excluded]
+    if not candidates:
+        return {"relayed": [], "blocked_reason": ""}
+
+    norm_tid = _norm_tid(thread_id)
+    skey = _chain_scope_key(cid, norm_tid)
+    now = time.time()
+    mid = int(msg_id or 0)
+    next_hop = max(0, int(source_hop or 0)) + 1
+
+    with _bus_lock():
+        roster_raw = _read_json(ROSTER_FILE, {"bots": {}})
+        cfg_raw = _load_team_config_unlocked()
+        r_bots = roster_raw.get("bots") or {}
+        c_bots = cfg_raw.get("bots") or {}
+        team_mirror = cfg_raw.get("mirror") if isinstance(cfg_raw.get("mirror"), dict) else {}
+        online_handles: set[str] = set()
+        for h in set(r_bots.keys()) | set(c_bots.keys()):
+            view = _merge_bot_view(h, r_bots.get(h), c_bots.get(h), now, team_mirror=team_mirror)
+            if view["online"] and view["handle"] not in excluded:
+                achats = [int(x) for x in (view.get("allowed_chats") or [])]
+                if not achats or cid in achats:
+                    online_handles.add(view["handle"])
+
+        targets = [h for h in candidates if h in online_handles]
+        if not targets:
+            return {"relayed": [], "blocked_reason": ""}
+
+        chains = _read_json(MENTION_CHAINS_FILE, {})
+        if not isinstance(chains, dict):
+            chains = {}
+        chain = chains.get(skey)
+        if not isinstance(chain, dict) or not float(chain.get("human_ts") or 0):
+            return {"relayed": [], "blocked_reason": "no_active_human_anchor"}
+        if (now - float(chain["human_ts"])) > HUMAN_CHAIN_TTL_SECONDS:
+            return {"relayed": [], "blocked_reason": "human_anchor_expired"}
+        if next_hop > max(1, int(max_hops or DEFAULT_MAX_HOPS)):
+            return {"relayed": [], "blocked_reason": f"max_hops_reached ({next_hop} > {max_hops})"}
+
+        window_ts = [float(t) for t in (chain.get("window_ts") or []) if (now - float(t)) < MENTION_WINDOW_SECONDS]
+        relays_used = int(chain.get("relays") or 0)
+        seen_relays = list(chain.get("seen_relays") or [])
+        chain_id = str(chain.get("chain_id") or "")
+
+        relayed: List[str] = []
+        blocked_reason = ""
+        for th in targets:
+            dedup_key = f"{chain_id}:{sender}:{th}:{mid}" if mid > 0 else ""
+            if dedup_key and dedup_key in seen_relays:
+                continue
+            if len(window_ts) >= MENTION_WINDOW_MAX:
+                blocked_reason = "window_rate_limited"
+                break
+            if relays_used >= MENTION_CHAIN_MAX_RELAYS:
+                blocked_reason = "chain_relay_cap_reached"
+                break
+            _drop_inbox_packet_unlocked(
+                th,
+                {
+                    "type": "group_mention",
+                    "chat_id": cid,
+                    "thread_id": norm_tid,
+                    "from_bot": sender,
+                    "msg_id": mid,
+                    "text_excerpt": (text or "").strip()[:600],
+                    "chain_id": chain_id,
+                    "hop": next_hop,
+                    "created_at": now,
+                },
+            )
+            relayed.append(th)
+            window_ts.append(now)
+            relays_used += 1
+            if dedup_key:
+                seen_relays.append(dedup_key)
+
+        chain["window_ts"] = window_ts[-MENTION_WINDOW_MAX:]
+        chain["relays"] = relays_used
+        chain["seen_relays"] = seen_relays[-32:]
+        chains[skey] = chain
+        _atomic_write_json(MENTION_CHAINS_FILE, chains)
+        return {"relayed": relayed, "blocked_reason": blocked_reason}
 
 
 def format_worker_envelope(
@@ -821,6 +1306,7 @@ def format_worker_envelope(
     effective_workdir: str,
     outbox_dir: str,
     worker_specialty: str = "",
+    group_history: Optional[str] = None,
 ) -> str:
     jid = job.get("job_id") or "?"
     sender = job.get("from_bot") or "coordinator"
@@ -832,12 +1318,27 @@ def format_worker_envelope(
         header += f' label="{label}"'
     header += "]"
     role_line = f"- 职责分工：{worker_specialty}\n" if worker_specialty else ""
+
+    ctx_block = group_history if group_history is not None else ""
+    origin_chat = int(job.get("origin_chat_id") or 0)
+    if group_history is None and origin_chat < 0 and job.get("target_bot"):
+        ctx_block = format_unseen_group_history(
+            origin_chat,
+            str(job.get("target_bot") or ""),
+            thread_id=job.get("origin_thread_id"),
+            exclude_msg_id=int(job.get("origin_msg_id") or 0),
+            limit=12,
+            max_chars=GROUP_HISTORY_MAX_CHARS,
+            advance_cursor=True,
+        )
+    history_section = f"{ctx_block}\n\n" if ctx_block else ""
     return (
         f"{header}\n"
         f"你正在作为专职子 Bot（@{target}）执行主控 Bot（@{sender}）分派的任务。当前无人工实时交互，请勿反问用户，直接完成职责范围内工作并用清晰、结构化、可直接验收的总结回复（列出关键发现、改动文件或验证结果）。\n"
         f"{role_line}"
         f"- 工作目录：`{effective_workdir}`\n"
         f"- 若生成截图或图片交付物，可写入 `{outbox_dir}/` 并在回复中注明完整路径。\n\n"
+        f"{history_section}"
         f"任务简报：\n{prompt}"
     )
 
@@ -853,6 +1354,7 @@ def summarize_job_brief(job: Dict[str, Any]) -> Dict[str, Any]:
         "label": job.get("label") or "",
         "status": job.get("status"),
         "duration_s": dur,
+        "group_delivered": bool(job.get("group_delivered")),
     }
     if job.get("worker_cid"):
         out["worker_cid"] = job["worker_cid"]

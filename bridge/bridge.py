@@ -103,6 +103,10 @@ ENV_BOT_ROLE = os.environ.get("AGY_TG_BOT_ROLE", "").strip().lower()
 ENV_BOT_MODEL = os.environ.get("AGY_TG_BOT_MODEL", "").strip()
 ENV_BOT_PROJECT = os.environ.get("AGY_TG_BOT_PROJECT", "").strip()
 ENV_BOT_SPECIALTY = os.environ.get("AGY_TG_BOT_SPECIALTY", "").strip()
+_raw_bus_chat_mode = os.environ.get("AGY_BUS_CHAT_MODE", "conversational").strip().lower()
+BUS_CHAT_MODE = _raw_bus_chat_mode if _raw_bus_chat_mode in ("conversational", "card") else "conversational"
+BUS_FAST_CHAT_ENABLED = os.environ.get("AGY_BUS_FAST_CHAT", "1").strip().lower() not in ("0", "false", "no")
+_fast_chat_sem = threading.Semaphore(1)
 API = "https://api.telegram.org/bot" + BOT_TOKEN
 
 BOT_META = {
@@ -593,19 +597,46 @@ def tg(method, _timeout=None, _retry_429=True, _max_429_wait=12, **params):
 
 def tg_send_in_route(method, chat_id, thread_id=None, _timeout=None, _retry_429=True, _max_429_wait=12, **params):
     """Call Telegram Bot API targeting `chat_id` (and optional topic `thread_id`),
-    retrying once without `message_thread_id` if the topic no longer exists.
+    retrying once without `message_thread_id` if the topic no longer exists and
+    retrying without `reply_to_message_id` if Telegram returns 400 message not found.
     """
     norm_tid = _normalize_thread_id(thread_id)
     kw = dict(params)
     kw["chat_id"] = chat_id
     if norm_tid is not None:
         kw["message_thread_id"] = norm_tid
+    if not kw.get("reply_to_message_id"):
+        kw.pop("reply_to_message_id", None)
+    else:
+        kw["reply_to_message_id"] = int(kw["reply_to_message_id"])
+
     r = tg(method, _timeout=_timeout, _retry_429=_retry_429, _max_429_wait=_max_429_wait, **kw)
     if norm_tid is not None and r is not None:
         j = _tg_json(r)
         if not j.get("ok") and "thread not found" in str(j.get("description", "")).lower():
+            log("tg_send_in_route %s thread_id=%s failed (%s); retrying without thread_id"
+                % (method, norm_tid, _format_tg_err(r)))
             kw.pop("message_thread_id", None)
             r = tg(method, _timeout=_timeout, _retry_429=_retry_429, _max_429_wait=_max_429_wait, **kw)
+
+    if kw.get("reply_to_message_id") and not _tg_ok(r):
+        j = _tg_json(r)
+        desc = str(j.get("description", "")).lower()
+        status_code = getattr(r, "status_code", None)
+        log("tg_send_in_route %s reply_to_message_id=%s failed (%s)"
+            % (method, kw.get("reply_to_message_id"), _format_tg_err(r)))
+        if status_code == 400 and (
+            "message not found" in desc
+            or "reply message not found" in desc
+            or "message to be replied not found" in desc
+            or "replied" in desc
+        ):
+            kw.pop("reply_to_message_id", None)
+            r = tg(method, _timeout=_timeout, _retry_429=_retry_429, _max_429_wait=_max_429_wait, **kw)
+            if not _tg_ok(r):
+                log("tg_send_in_route %s fallback without reply failed (%s)" % (method, _format_tg_err(r)))
+    elif not _tg_ok(r):
+        log("tg_send_in_route %s failed (%s)" % (method, _format_tg_err(r)))
     return r
 
 
@@ -717,8 +748,14 @@ def _current_bot_role():
     return _current_bot_cfg().get("role") or "peer"
 
 
-def _desired_bus_enable():
-    return _current_bot_role() in ("coordinator", "peer")
+def _desired_bus_enable(scope_key=None):
+    role = _current_bot_role()
+    if role in ("coordinator", "peer"):
+        return True
+    if role == "worker" and scope_key:
+        origin_chat, _ = parse_scope_key(scope_key)
+        return bool(origin_chat and int(origin_chat) < 0)
+    return False
 
 
 def _init_bot_identity():
@@ -803,16 +840,16 @@ def _should_ignore_group_message(msg):
             if target == my_handle:
                 return False
 
-    # 2. Check leading @handles (e.g. "@BotA @BotB: check this") or explicit @my_handle
-    #    Skip for bare slash commands (`/team workdir @worker ...`, `/delegate @worker ...`)
-    #    so `@worker` in command arguments does not wake workers alongside Coordinator.
+    # 2. Check leading @handles (e.g. "@BotA @BotB: check this") or explicit @my_handle across full text
+    #    (ignoring backtick code spans/blocks). Skip for bare slash commands (`/team workdir @worker ...`,
+    #    `/delegate @worker ...`) so `@worker` in command arguments does not wake workers alongside Coordinator.
     if not is_slash:
-        mentions = [bot_bus.normalize_handle(m) for m in re.findall(r"@([A-Za-z0-9_]{3,32})", text[:200])]
+        mentions = bot_bus.extract_at_mentions(text)
         if my_handle in mentions:
             return False
         leading_m = re.match(r"^(?:@[A-Za-z0-9_]{3,32}[\s,:;]*)+", text)
         if leading_m:
-            leading_handles = [bot_bus.normalize_handle(m) for m in re.findall(r"@([A-Za-z0-9_]{3,32})", leading_m.group(0))]
+            leading_handles = bot_bus.extract_at_mentions(leading_m.group(0))
             if leading_handles and my_handle not in leading_handles:
                 return True
 
@@ -952,7 +989,8 @@ class AgySession:
         self.scope_key = scope_key or PRIMARY_SCOPE_KEY
         self.project = project
         self.workdir = workdir or WORKDIR
-        self.bus_enable = _desired_bus_enable()
+        self.bus_role = _current_bot_role()
+        self.bus_enable = _desired_bus_enable(self.scope_key)
         self.spawned_at = time.time()
         self.last_used = self.spawned_at
         self.stderr_tail = collections.deque(maxlen=80)
@@ -984,12 +1022,14 @@ class AgySession:
         env["AGY_OUTBOX_DIR"] = BOT_OUTBOX_DIR
         origin_chat, origin_tid = parse_scope_key(self.scope_key)
         env["AGY_BOT_BUS_ENABLE"] = "1" if self.bus_enable else "0"
+        env["AGY_BOT_BUS_ROLE"] = self.bus_role
         env["AGY_BOT_HANDLE"] = _current_bot_handle()
         env["AGY_BOT_INSTANCE_ID"] = BOT_INSTANCE_ID
         env["AGY_BOT_SCOPE_KEY"] = self.scope_key
         env["AGY_BOT_CHAT_ID"] = str(origin_chat or 0)
         env["AGY_BOT_THREAD_ID"] = str(origin_tid) if origin_tid is not None else ""
         env["AGY_BOT_CHAIN"] = ""
+        env["AGY_BOT_MENTION_HOP"] = "0"
 
         log("Spawning persistent AgySession (conv=%s, project=%s, cwd=%s, model=%s, effort=%s, mode=%s, bus=%s)"
             % ((conv or "new")[:8], self.project or "default", self.workdir, model or "default", effort or "default", mode, self.bus_enable))
@@ -1074,7 +1114,9 @@ class AgySession:
     def matches(self, conv, mode, model, effort, project=None, workdir=None):
         if not self.is_alive():
             return False
-        if getattr(self, "bus_enable", False) != _desired_bus_enable():
+        if getattr(self, "bus_enable", False) != _desired_bus_enable(self.scope_key):
+            return False
+        if getattr(self, "bus_role", None) != _current_bot_role():
             return False
         if self.mode != mode or self.model != model or self.effort != effort:
             return False
@@ -1392,18 +1434,21 @@ def _format_tg_err(resp):
     return f"HTTP {resp.status_code}: {(resp.text or '')[:300]}"
 
 
-def send(chat_id, text, parse_mode=None, reply_markup=None, thread_id=None, _max_429_wait=45):
+def send(chat_id, text, parse_mode=None, reply_markup=None, thread_id=None, _max_429_wait=45, reply_to_message_id=None):
     """Send text with chunking and HTML parse fallback if needed. Returns last message_id."""
     text = (text or "(empty response)").strip() or "(empty response)"
     last_mid = None
     for i in range(0, len(text), 4000):
         chunk = text[i:i + 4000]
+        is_first = (i == 0)
         is_last = (i + 4000 >= len(text))
         kw = {"text": chunk}
         if parse_mode:
             kw["parse_mode"] = parse_mode
         if reply_markup and is_last:
             kw["reply_markup"] = reply_markup
+        if reply_to_message_id and is_first:
+            kw["reply_to_message_id"] = reply_to_message_id
         r = tg_send_in_route("sendMessage", chat_id, thread_id=thread_id, _max_429_wait=_max_429_wait, **kw)
         mid = _extract_msg_id(r)
         if not mid and parse_mode == "HTML":
@@ -1413,6 +1458,8 @@ def send(chat_id, text, parse_mode=None, reply_markup=None, thread_id=None, _max
                 plain_kw = {"text": re.sub(r"<[^>]+>", "", html_mod.unescape(chunk))[:4090] or chunk[:4090]}
                 if reply_markup and is_last:
                     plain_kw["reply_markup"] = reply_markup
+                if reply_to_message_id and is_first:
+                    plain_kw["reply_to_message_id"] = reply_to_message_id
                 r = tg_send_in_route("sendMessage", chat_id, thread_id=thread_id, _max_429_wait=_max_429_wait, **plain_kw)
                 mid = _extract_msg_id(r)
         if mid:
@@ -1422,7 +1469,7 @@ def send(chat_id, text, parse_mode=None, reply_markup=None, thread_id=None, _max
     return last_mid
 
 
-def send_rich_chunk(chat_id, chunk, prefix_html="", footer_html="", reply_markup=None, thread_id=None, _max_429_wait=65):
+def send_rich_chunk(chat_id, chunk, prefix_html="", footer_html="", reply_markup=None, thread_id=None, _max_429_wait=65, reply_to_message_id=None):
     """Send a single markdown chunk as HTML, returning (msg_id, sent_html_or_none)."""
     rendered = md_to_html(chunk)
     full_html = prefix_html + rendered + footer_html
@@ -1434,6 +1481,8 @@ def send_rich_chunk(chat_id, chunk, prefix_html="", footer_html="", reply_markup
         }
         if reply_markup:
             params["reply_markup"] = reply_markup
+        if reply_to_message_id:
+            params["reply_to_message_id"] = reply_to_message_id
         r = tg_send_in_route(
             "sendMessage", chat_id, thread_id=thread_id, _max_429_wait=_max_429_wait, **params
         )
@@ -1451,6 +1500,8 @@ def send_rich_chunk(chat_id, chunk, prefix_html="", footer_html="", reply_markup
     kw = {"text": plain[:4090] or "(empty)"}
     if reply_markup:
         kw["reply_markup"] = reply_markup
+    if reply_to_message_id:
+        kw["reply_to_message_id"] = reply_to_message_id
     r = tg_send_in_route(
         "sendMessage", chat_id, thread_id=thread_id, _max_429_wait=_max_429_wait, **kw
     )
@@ -1476,7 +1527,7 @@ def _rescue_deliver_text(chat_id, text, thread_id=None):
     return rescue_path
 
 
-def send_rich(chat_id, text, header_html=None, footer_str=None, reply_markup=None, thread_id=None):
+def send_rich(chat_id, text, header_html=None, footer_str=None, reply_markup=None, thread_id=None, reply_to_message_id=None):
     """HTML-rendered send with paragraph/code chunking, collapsible thinking header, and optional footer."""
     if not text or not text.strip():
         text = "(empty response)"
@@ -1488,6 +1539,7 @@ def send_rich(chat_id, text, header_html=None, footer_str=None, reply_markup=Non
     delivered_chunks = 0
     total_chunks = len(chunks)
     start_idx = 0
+    pending_reply_mid = reply_to_message_id
     if header_html:
         first_rendered = md_to_html(chunks[0])
         tail = footer_html if len(chunks) == 1 else ""
@@ -1498,7 +1550,9 @@ def send_rich(chat_id, text, header_html=None, footer_str=None, reply_markup=Non
                 footer_html=tail,
                 reply_markup=reply_markup if len(chunks) == 1 else None,
                 thread_id=thread_id,
+                reply_to_message_id=pending_reply_mid,
             )
+            pending_reply_mid = None
             if last_info[0]:
                 delivered_chunks += 1
             start_idx = 1
@@ -1507,7 +1561,9 @@ def send_rich(chat_id, text, header_html=None, footer_str=None, reply_markup=Non
                 hr = tg_send_in_route(
                     "sendMessage", chat_id, thread_id=thread_id, _max_429_wait=65,
                     text=header_html, parse_mode="HTML", link_preview_options={"is_disabled": True},
+                    reply_to_message_id=pending_reply_mid,
                 )
+                pending_reply_mid = None
                 if not _extract_msg_id(hr):
                     log("send_rich header HTML failed: %s" % _format_tg_err(hr))
             else:
@@ -1515,7 +1571,9 @@ def send_rich(chat_id, text, header_html=None, footer_str=None, reply_markup=Non
                 if plain_hdr:
                     tg_send_in_route(
                         "sendMessage", chat_id, thread_id=thread_id, _max_429_wait=65, text=plain_hdr,
+                        reply_to_message_id=pending_reply_mid,
                     )
+                    pending_reply_mid = None
             start_idx = 0
 
     for idx in range(start_idx, len(chunks)):
@@ -1527,7 +1585,9 @@ def send_rich(chat_id, text, header_html=None, footer_str=None, reply_markup=Non
             footer_html=footer_html if is_last else "",
             reply_markup=reply_markup if is_last else None,
             thread_id=thread_id,
+            reply_to_message_id=pending_reply_mid if idx == start_idx else None,
         )
+        pending_reply_mid = None
         if info[0]:
             last_info = info
             delivered_chunks += 1
@@ -3150,11 +3210,279 @@ def run_compact(chat_id, instruction="", thread_id=None, scope_key=None):
         send(chat_id, "⚠️ 上下文压缩失败：%s" % (err_str or "(unknown error)"), thread_id=thread_id)
 
 
-def run_agy(chat_id, prompt, thread_id=None, scope_key=None):
+def _record_human_group_msg(msg, text_override=None):
+    """Record a human group message into the shared Bot Bus ledger and anchor mention chains."""
+    chat = msg.get("chat") or {}
+    chat_id = chat.get("id")
+    if not chat_id or int(chat_id) >= 0:
+        return ""
+    frm = msg.get("from") or {}
+    if frm.get("is_bot"):
+        return ""
+    txt = (text_override if text_override is not None else (msg.get("text") or msg.get("caption") or "")).strip()
+    if not txt:
+        return ""
+    thread_id = _extract_thread_id(msg)
+    msg_id = int(msg.get("message_id") or 0)
+    sender = (frm.get("username") or frm.get("first_name") or "user").strip()
+    bot_bus.record_group_message(
+        int(chat_id),
+        msg_id=msg_id,
+        thread_id=thread_id,
+        sender_handle=sender,
+        sender_role="human",
+        is_bot=False,
+        text=txt,
+        ts=msg.get("date"),
+    )
+    return bot_bus.mark_human_group_activity(int(chat_id), thread_id=thread_id, msg_id=msg_id) or ""
+
+
+def _record_and_relay_bot_group_msg(
+    chat_id,
+    msg_id,
+    thread_id,
+    text,
+    *,
+    relay_mentions=True,
+    source_hop=0,
+    exclude_bots=None,
+    mention_scan_text=None,
+):
+    """Record this bot's outbound group reply in the shared ledger and relay `@handle` mentions."""
+    if not chat_id or int(chat_id) >= 0:
+        return
+    mid = int(msg_id or 0)
+    if mid <= 0:
+        return
+    body = (text or "").strip()
+    if not body:
+        return
+    my_handle = _current_bot_handle()
+    my_role = _current_bot_role()
+    norm_tid = _normalize_thread_id(thread_id)
+    bot_bus.record_group_message(
+        int(chat_id),
+        msg_id=mid,
+        thread_id=norm_tid,
+        sender_handle=my_handle,
+        sender_role=my_role,
+        is_bot=True,
+        text=body,
+    )
+    if relay_mentions:
+        scan = mention_scan_text if mention_scan_text is not None else body
+        max_hops = int(_current_bot_cfg().get("max_hops") or bot_bus.DEFAULT_MAX_HOPS)
+        res = bot_bus.relay_group_mentions(
+            my_handle,
+            int(chat_id),
+            scan,
+            thread_id=norm_tid,
+            msg_id=mid,
+            source_hop=int(source_hop or 0),
+            max_hops=max_hops,
+            exclude_bots=exclude_bots,
+        )
+        if res.get("relayed"):
+            log("Relayed group_mention from @%s -> %s (chat=%s, hop=%d)"
+                % (my_handle, res["relayed"], chat_id, int(source_hop or 0) + 1))
+        elif res.get("blocked_reason"):
+            log("Blocked group_mention relay from @%s in chat=%s: %s"
+                % (my_handle, chat_id, res["blocked_reason"]))
+
+
+_HEAVY_TASK_KEYWORDS = (
+    "修改", "改一下", "改代码", "修复", "实现", "编写", "重构", "提交", "部署",
+    "同步", "发布", "发版", "跑单测", "跑测试", "运行测试", "删除", "写入", "编辑",
+    "创建文件", "执行脚本", "commit", "push", "deploy", "sync-public", "refactor",
+    "implement", "patch", "edit ", "write ", "delete ", "run test", "pytest", "unittest",
+)
+
+_FAST_CHAT_HINTS = (
+    "?", "？", "进度", "怎么样", "到哪", "好了吗", "多久", "在吗", "怎么看",
+    "为什么", "什么", "哪个", "是否", "是不是", "能否", "可以吗", "对吗",
+    "怎么", "如何", "确认", "解释", "聊聊", "讨论", "意见", "建议", "收到",
+    "辛苦", "谢谢", "status", "progress", "why", "what", "how", "which",
+)
+
+
+def _is_fast_chat_candidate(text, *, has_media=False, is_mention=False):
+    """Conservative classifier for read-only fast group replies while the main worker is busy."""
+    if has_media:
+        return False
+    cleaned = (text or "").strip()
+    if not cleaned or cleaned.startswith("/") or len(cleaned) > 320:
+        return False
+    low = cleaned.lower()
+    if any(kw in low for kw in _HEAVY_TASK_KEYWORDS):
+        return False
+    if is_mention:
+        return True
+    return any(hint in low for hint in _FAST_CHAT_HINTS)
+
+
+def _describe_active_busy_task():
+    """Return `(busy, task_label, pending_count)` safely under `session_lock`."""
+    with session_lock:
+        busy = bool(turn_running)
+        active_jid = _active_bus_job_id
+        active_scope = turn_running_scope
+        active_chat = turn_running_chat
+    pending = job_q.qsize()
+    if not busy:
+        return False, "", pending
+    if active_jid:
+        job = bot_bus.get_job(active_jid) or {}
+        origin_cid = int(job.get("origin_chat_id") or 0)
+        if not origin_cid and job.get("origin_scope_key"):
+            parsed_cid, _ = parse_scope_key(job.get("origin_scope_key"))
+            origin_cid = int(parsed_cid or 0)
+        if origin_cid > 0 or (origin_cid == 0 and active_chat and int(active_chat) > 0):
+            return True, "后台私聊任务（已隔离上下文）", pending
+        lbl = (job.get("label") or "").strip()
+        desc = f"【{lbl}】（单号 {active_jid}）" if lbl else f"派单 {active_jid}"
+        return True, desc, pending
+    if active_scope:
+        sc_cid, _ = parse_scope_key(active_scope)
+        if (sc_cid and int(sc_cid) > 0) or (active_chat and int(active_chat) > 0):
+            return True, "后台私聊任务（已隔离上下文）", pending
+        return True, f"会话 {active_scope}", pending
+    if active_chat and int(active_chat) > 0:
+        return True, "后台私聊任务（已隔离上下文）", pending
+    return True, "上一条任务", pending
+
+
+def _run_fast_group_reply(
+    chat_id,
+    prompt_text,
+    *,
+    thread_id=None,
+    scope_key=None,
+    origin_msg_id=0,
+    mention_hop=0,
+    busy_desc="",
+):
+    """Isolated read-only fast-reply lane that never mutates `turn_running`, `state`, or `undo`."""
+    norm_tid = _normalize_thread_id(thread_id)
+    skey = scope_key or scope_key_for(chat_id, norm_tid)
+    my_handle = _current_bot_handle()
+    try:
+        with state_lock:
+            sc = _ensure_scope_locked(skey)
+            model = sc.get("model")
+            project = sc.get("project") or None
+            wdir_raw = sc.get("workdir")
+        fast_workdir = WORKDIR
+        if wdir_raw:
+            rw = os.path.realpath(os.path.expanduser(wdir_raw))
+            if os.path.isdir(rw):
+                fast_workdir = rw
+        cfg = _current_bot_cfg()
+        exec_model = model or cfg.get("default_model") or None
+        history_block = bot_bus.format_unseen_group_history(
+            chat_id,
+            my_handle,
+            thread_id=norm_tid,
+            exclude_msg_id=origin_msg_id,
+            limit=12,
+            advance_cursor=True,
+        )
+        history_section = f"{history_block}\n\n" if history_block else ""
+        fast_prompt = (
+            f"[ACB_FAST_GROUP_CHAT bot=@{my_handle}]\n"
+            f"你当前正在后台串行执行耗时任务（{busy_desc or '进行中'}），现在通过【只读快答旁路】响应群内的一条简短提问/点名。\n"
+            f"- 严禁修改任何工作区文件或执行写入/提交/部署命令（当前为只读安全模式）。\n"
+            f"- 请用 1~4 句自然、清晰的中文直接回答或同步当前进度；若需要改动代码或重任务，请说明会在后台任务结束后立即处理。\n\n"
+            f"{history_section}"
+            f"当前群消息：\n{prompt_text}"
+        )
+        cmd = [
+            AGY_BIN,
+            "--input-format", "text",
+            "--output-format", "json",
+            "--disable-slash-commands",
+            "--print-timeout", "45s",
+        ]
+        if exec_model:
+            cmd += ["--model", exec_model]
+        if project:
+            cmd += ["--project", project]
+        cmd += ["-p", fast_prompt]
+
+        env = dict(os.environ)
+        env["PATH"] = os.path.join(HOME, ".local/bin") + ":" + env.get("PATH", "")
+        env.setdefault("HOME", HOME)
+        env["AGY_BOT_BUS_ENABLE"] = "0"
+        env["AGY_INTERNAL_OBSERVER"] = "1"
+
+        rc, raw_out, raw_err = _run_subprocess_group(
+            cmd,
+            cwd=fast_workdir,
+            timeout_s=50,
+            env=env,
+            shell=False,
+        )
+        reply_text = ""
+        raw_out = (raw_out or "").strip()
+        if raw_out:
+            try:
+                parsed = json.loads(raw_out)
+            except Exception:
+                brace = raw_out.find("{")
+                try:
+                    parsed = json.loads(raw_out[brace:]) if brace >= 0 else None
+                except Exception:
+                    parsed = None
+            if isinstance(parsed, dict):
+                reply_text = (parsed.get("response") or "").strip()
+            else:
+                reply_text = raw_out
+        if not reply_text:
+            reply_text = (
+                f"⏳ 我这边正在处理 {busy_desc or '后台任务'}（刚才快答通道未返回完整文本，stderr rc={rc}），"
+                f"如需代码修改或详细排查可以再告诉我，我完成后马上跟进。"
+            )
+        sent_mid, _ = send_rich(
+            chat_id,
+            reply_text,
+            thread_id=norm_tid,
+            reply_to_message_id=origin_msg_id or None,
+        )
+        if sent_mid:
+            _record_and_relay_bot_group_msg(
+                chat_id,
+                sent_mid,
+                norm_tid,
+                reply_text,
+                relay_mentions=True,
+                source_hop=mention_hop,
+            )
+    except Exception as e:
+        log("fast_group_reply error: %r" % e)
+        send(
+            chat_id,
+            f"⏳ 我手头正在跑 {busy_desc or '后台任务'}，刚才快答遇到小波动（{type(e).__name__}），请稍候或再 @ 我一次。",
+            thread_id=norm_tid,
+            reply_to_message_id=origin_msg_id or None,
+        )
+    finally:
+        _fast_chat_sem.release()
+
+
+def run_agy(chat_id, prompt, thread_id=None, scope_key=None, origin_msg_id=0, mention_hop=0, chain_id=""):
     global turn_running, turn_running_scope, turn_running_chat, cancel_requested
 
     norm_tid = _normalize_thread_id(thread_id)
     skey = scope_key or scope_key_for(chat_id, norm_tid)
+    bot_bus.set_origin_context(
+        skey,
+        bot_handle=_current_bot_handle(),
+        chat_id=chat_id,
+        thread_id=norm_tid,
+        msg_id=origin_msg_id,
+        mention_hop=mention_hop,
+        chain_id=chain_id,
+    )
 
     with state_lock:
         sc = _ensure_scope_locked(skey)
@@ -3175,7 +3503,22 @@ def run_agy(chat_id, prompt, thread_id=None, scope_key=None):
             workdir = rw
 
     base_prompt = prompt
-    effective_prompt = f"{undo_notice}\n\n{prompt}" if undo_notice else prompt
+    prompt_parts = []
+    if undo_notice:
+        prompt_parts.append(undo_notice)
+    if chat_id and int(chat_id) < 0 and not (prompt or "").lstrip().startswith("/"):
+        history_block = bot_bus.format_unseen_group_history(
+            int(chat_id),
+            _current_bot_handle(),
+            thread_id=norm_tid,
+            exclude_msg_id=int(origin_msg_id or 0),
+            limit=15,
+            advance_cursor=True,
+        )
+        if history_block:
+            prompt_parts.append(history_block)
+    prompt_parts.append(prompt)
+    effective_prompt = "\n\n".join(prompt_parts)
 
     before_files = snapshot_workspace_files(workdir=workdir)
     undo_manifest = snapshot_undo_manifest(workdir)
@@ -3372,6 +3715,15 @@ def run_agy(chat_id, prompt, thread_id=None, scope_key=None):
                                     final_step_text, header_html=header_html,
                                     footer_str=footer_str, reply_markup=reply_markup,
                                 )
+                                if last_msg_info[0]:
+                                    _record_and_relay_bot_group_msg(
+                                        chat_id,
+                                        last_msg_info[0],
+                                        norm_tid,
+                                        final_step_text,
+                                        relay_mentions=True,
+                                        source_hop=mention_hop,
+                                    )
                                 delivered_steps += 1
                                 coalesced_final_delivered = True
                                 push_step_images(
@@ -3383,6 +3735,15 @@ def run_agy(chat_id, prompt, thread_id=None, scope_key=None):
                             else:
                                 # Intermediate step (e.g. QR code / milestone while background task runs)!
                                 last_msg_info = streamer.finalize_step(final_step_text, header_html=header_html)
+                                if last_msg_info[0]:
+                                    _record_and_relay_bot_group_msg(
+                                        chat_id,
+                                        last_msg_info[0],
+                                        norm_tid,
+                                        final_step_text,
+                                        relay_mentions=True,
+                                        source_hop=mention_hop,
+                                    )
                                 delivered_steps += 1
                                 with state_lock:
                                     sc = _ensure_scope_locked(skey)
@@ -3557,8 +3918,17 @@ def run_agy(chat_id, prompt, thread_id=None, scope_key=None):
                     th_list, tc_list, _ = get_turn_details(conv, segment_start_line)
                     header_html = build_thinking_header(th_list, tc_list)
                 out = resp or "(agy finished without a text response)"
-                send_rich(chat_id, out, header_html=header_html,
+                sent_info = send_rich(chat_id, out, header_html=header_html,
                           footer_str=footer_str, reply_markup=reply_markup, thread_id=norm_tid)
+                if sent_info[0]:
+                    _record_and_relay_bot_group_msg(
+                        chat_id,
+                        sent_info[0],
+                        norm_tid,
+                        out,
+                        relay_mentions=True,
+                        source_hop=mention_hop,
+                    )
             _maybe_post_turn_auto_compact(
                 chat_id, conv, mode, model, effort,
                 project=project, workdir=workdir, thread_id=norm_tid, scope_key=skey,
@@ -3970,28 +4340,65 @@ def _execute_bus_job(job_id):
             except Exception:
                 skip_steps = 0
 
-    mirror_chat = int(cfg.get("mirror_chat_id") or 0)
-    mirror_thread = _normalize_thread_id(cfg.get("mirror_thread_id"))
-    if not mirror_chat and job.get("notify_group") and job.get("origin_chat_id"):
-        cand_chat = int(job.get("origin_chat_id") or 0)
-        if not ALLOWED or cand_chat in ALLOWED:
-            mirror_chat = cand_chat
-            mirror_thread = _normalize_thread_id(job.get("origin_thread_id"))
+    origin_chat = int(job.get("origin_chat_id") or 0)
+    origin_thread = _normalize_thread_id(job.get("origin_thread_id"))
+    origin_msg_id = int(job.get("origin_msg_id") or 0)
+
+    silent_group = job.get("notify_group") is False
+    if silent_group:
+        mirror_chat = 0
+        mirror_thread = None
+    elif BUS_CHAT_MODE == "conversational" and origin_chat < 0 and (not ALLOWED or origin_chat in ALLOWED):
+        mirror_chat = origin_chat
+        mirror_thread = origin_thread
+    else:
+        mirror_chat = int(cfg.get("mirror_chat_id") or 0)
+        mirror_thread = _normalize_thread_id(cfg.get("mirror_thread_id"))
+        if not mirror_chat and job.get("notify_group") and origin_chat:
+            if not ALLOWED or origin_chat in ALLOWED:
+                mirror_chat = origin_chat
+                mirror_thread = origin_thread
     if mirror_chat and ALLOWED and mirror_chat not in ALLOWED:
         mirror_chat = 0
 
     mirror_msg_id = None
     label = job.get("label") or (job.get("prompt") or "")[:36]
     if mirror_chat:
-        start_html = (
-            f"🛠 <b>[@{html_mod.escape(my_handle)}] 接单执行</b>\n"
-            f"• 来自：<code>@{html_mod.escape(from_bot)}</code> · 单号：<code>{html_mod.escape(job_id)}</code>\n"
-            f"• 任务：<code>{html_mod.escape(label)}</code>"
-            + (f"\n• 模型：<code>{html_mod.escape(exec_model)}</code>" if exec_model else "")
-        )
-        r_m = tg_send_in_route("sendMessage", mirror_chat, thread_id=mirror_thread, text=start_html, parse_mode="HTML")
-        if r_m is not None and r_m.json().get("ok"):
-            mirror_msg_id = (r_m.json().get("result") or {}).get("message_id")
+        if BUS_CHAT_MODE == "conversational":
+            receipt_html = (
+                f"👋 收到来自 <code>@{html_mod.escape(from_bot)}</code> 的派单，我开始处理："
+                f"【<b>{html_mod.escape(label)}</b>】（单号 <code>{html_mod.escape(job_id)}</code>）"
+            )
+            r_m = tg_send_in_route(
+                "sendMessage",
+                mirror_chat,
+                thread_id=mirror_thread,
+                text=receipt_html,
+                parse_mode="HTML",
+                reply_to_message_id=origin_msg_id or None,
+            )
+            mirror_msg_id = _extract_msg_id(r_m)
+            if mirror_msg_id:
+                _record_and_relay_bot_group_msg(
+                    mirror_chat,
+                    mirror_msg_id,
+                    mirror_thread,
+                    f"收到来自 @{from_bot} 的派单，我开始处理：【{label}】（单号 {job_id}）",
+                    relay_mentions=False,
+                )
+            else:
+                log("Bus job %s conversational receipt send failed: %s" % (job_id, _format_tg_err(r_m)))
+        else:
+            start_html = (
+                f"🛠 <b>[@{html_mod.escape(my_handle)}] 接单执行</b>\n"
+                f"• 来自：<code>@{html_mod.escape(from_bot)}</code> · 单号：<code>{html_mod.escape(job_id)}</code>\n"
+                f"• 任务：<code>{html_mod.escape(label)}</code>"
+                + (f"\n• 模型：<code>{html_mod.escape(exec_model)}</code>" if exec_model else "")
+            )
+            r_m = tg_send_in_route("sendMessage", mirror_chat, thread_id=mirror_thread, text=start_html, parse_mode="HTML")
+            mirror_msg_id = _extract_msg_id(r_m)
+            if not mirror_msg_id:
+                log("Bus job %s card receipt send failed: %s" % (job_id, _format_tg_err(r_m)))
 
     started_ts = time.time()
     before_files = snapshot_workspace_files(workdir=exec_workdir)
@@ -4025,7 +4432,27 @@ def _execute_bus_job(job_id):
     env["PATH"] = os.path.join(HOME, ".local/bin") + ":" + env.get("PATH", "")
     env.setdefault("HOME", HOME)
     env["AGY_OUTBOX_DIR"] = BOT_OUTBOX_DIR
-    env["AGY_BOT_BUS_ENABLE"] = "0"
+    if mirror_chat and int(mirror_chat) < 0:
+        worker_skey = scope_key_for(mirror_chat, mirror_thread)
+        bot_bus.set_origin_context(
+            worker_skey,
+            bot_handle=my_handle,
+            chat_id=mirror_chat,
+            thread_id=mirror_thread,
+            msg_id=origin_msg_id,
+            mention_hop=0,
+            chain_id=str(job.get("chain_id") or ""),
+        )
+        env["AGY_BOT_BUS_ENABLE"] = "1"
+        env["AGY_BOT_BUS_ROLE"] = "worker"
+        env["AGY_BOT_CHAT_ID"] = str(mirror_chat)
+        env["AGY_BOT_THREAD_ID"] = str(mirror_thread) if mirror_thread is not None else ""
+        env["AGY_BOT_SCOPE_KEY"] = worker_skey
+        env["AGY_BOT_ORIGIN_MSG_ID"] = str(origin_msg_id or 0)
+        env["AGY_BOT_MENTION_HOP"] = "0"
+    else:
+        env["AGY_BOT_BUS_ENABLE"] = "0"
+        env["AGY_BOT_BUS_ROLE"] = "disabled"
     env["AGY_BOT_HANDLE"] = my_handle
     env["AGY_BOT_CHAIN"] = ",".join(job.get("chain") or [])
 
@@ -4195,6 +4622,73 @@ def _execute_bus_job(job_id):
             turn_running_scope = None
             turn_running_chat = None
             _active_bus_job_id = None
+
+        delivered_to_group = False
+        if mirror_chat:
+            try:
+                icon = {"done": "✅", "error": "⚠️", "cancelled": "🛑"}.get(final_status, "ℹ️")
+                dur_s = usage.get("duration_s", round(time.time() - started_ts, 1))
+                usd_s = _fmt_usd(float(usage.get("usd") or 0.0)) if usage.get("usd") else "$0.00"
+                body_raw = final_text if final_status == "done" else (err_msg or final_text or "(no output)")
+                if BUS_CHAT_MODE == "conversational":
+                    status_zh = {"done": "已完成", "error": "执行失败", "cancelled": "已取消"}.get(final_status, final_status)
+                    header_html = (
+                        f"{icon} <b>任务{status_zh}</b> · 【{html_mod.escape(label)}】\n"
+                        f"• 单号：<code>{html_mod.escape(job_id)}</code> · 派单：@{html_mod.escape(from_bot)}\n\n"
+                    )
+                    footer_str = f"🤖 {exec_model or 'default'} · ⏱ {dur_s}s · {usd_s}"
+                    sent_mid, _ = send_rich(
+                        mirror_chat,
+                        body_raw,
+                        header_html=header_html,
+                        footer_str=footer_str,
+                        thread_id=mirror_thread,
+                        reply_to_message_id=origin_msg_id or mirror_msg_id or None,
+                    )
+                    if sent_mid:
+                        delivered_to_group = True
+                        _record_and_relay_bot_group_msg(
+                            mirror_chat,
+                            sent_mid,
+                            mirror_thread,
+                            body_raw,
+                            relay_mentions=True,
+                            source_hop=0,
+                            exclude_bots=[from_bot] if job.get("wake_on_async") else None,
+                            mention_scan_text=body_raw,
+                        )
+                else:
+                    summary_html = (
+                        f"{icon} <b>[@{html_mod.escape(my_handle)}] {final_status.upper()}</b> "
+                        f"(<code>{dur_s}s · {usd_s}</code>)\n"
+                        f"• 单号：<code>{html_mod.escape(job_id)}</code> · 来自：<code>@{html_mod.escape(from_bot)}</code>\n"
+                        f"• 摘要：{html_mod.escape(body_raw[:600])}"
+                    )
+                    if mirror_msg_id:
+                        r_ed = tg("editMessageText", chat_id=mirror_chat, message_id=mirror_msg_id,
+                                  text=summary_html, parse_mode="HTML", link_preview_options={"is_disabled": True})
+                        if not _tg_ok(r_ed):
+                            log("Bus job %s card edit failed: %s" % (job_id, _format_tg_err(r_ed)))
+                        else:
+                            delivered_to_group = True
+                    else:
+                        r_sd = tg_send_in_route("sendMessage", mirror_chat, thread_id=mirror_thread,
+                                                text=summary_html, parse_mode="HTML")
+                        if _extract_msg_id(r_sd):
+                            delivered_to_group = True
+
+                img_paths = [p for p in artifacts if os.path.splitext(p)[1].lower() in IMAGE_EXTS and os.path.isfile(p)]
+                if img_paths:
+                    claimed = [p for p in img_paths if try_claim_image(p)]
+                    if len(claimed) == 1:
+                        send_file(mirror_chat, claimed[0], thread_id=mirror_thread)
+                    elif len(claimed) > 1:
+                        send_media_group(mirror_chat, claimed[:10], thread_id=mirror_thread)
+            except Exception as de:
+                log("Bus job %s group delivery failed: %r" % (job_id, de))
+
+        if delivered_to_group:
+            bot_bus.update_job(job_id, group_delivered=True)
         bot_bus.finish_job(
             job_id,
             status=final_status,
@@ -4205,30 +4699,6 @@ def _execute_bus_job(job_id):
             usage=usage,
         )
         _publish_bot_heartbeat()
-
-    if mirror_chat:
-        icon = {"done": "✅", "error": "⚠️", "cancelled": "🛑"}.get(final_status, "ℹ️")
-        dur_s = usage.get("duration_s", round(time.time() - started_ts, 1))
-        usd_s = _fmt_usd(float(usage.get("usd") or 0.0)) if usage.get("usd") else "$0.00"
-        body_raw = final_text if final_status == "done" else (err_msg or final_text or "(no output)")
-        summary_html = (
-            f"{icon} <b>[@{html_mod.escape(my_handle)}] {final_status.upper()}</b> "
-            f"(<code>{dur_s}s · {usd_s}</code>)\n"
-            f"• 单号：<code>{html_mod.escape(job_id)}</code> · 来自：<code>@{html_mod.escape(from_bot)}</code>\n"
-            f"• 摘要：{html_mod.escape(body_raw[:600])}"
-        )
-        if mirror_msg_id:
-            tg("editMessageText", chat_id=mirror_chat, message_id=mirror_msg_id,
-               text=summary_html, parse_mode="HTML", link_preview_options={"is_disabled": True})
-        else:
-            tg_send_in_route("sendMessage", mirror_chat, thread_id=mirror_thread, text=summary_html, parse_mode="HTML")
-        img_paths = [p for p in artifacts if os.path.splitext(p)[1].lower() in IMAGE_EXTS and os.path.isfile(p)]
-        if img_paths:
-            claimed = [p for p in img_paths if try_claim_image(p)]
-            if len(claimed) == 1:
-                send_file(mirror_chat, claimed[0], thread_id=mirror_thread)
-            elif len(claimed) > 1:
-                send_media_group(mirror_chat, claimed[:10], thread_id=mirror_thread)
 
 
 def _publish_bot_heartbeat():
@@ -4277,12 +4747,53 @@ def _bot_bus_loop():
             packets = bot_bus.pop_inbox_packets(_current_bot_handle())
             for pkt in packets:
                 ptype = pkt.get("type")
-                if ptype == "broadcast":
+                if ptype in ("broadcast", "group_say"):
                     c_id = int(pkt.get("chat_id") or 0)
                     t_id = _normalize_thread_id(pkt.get("thread_id"))
                     msg_txt = pkt.get("message") or ""
                     if c_id and msg_txt and (not ALLOWED or c_id in ALLOWED):
-                        send_rich(c_id, msg_txt, thread_id=t_id)
+                        sent_mid, _ = send_rich(
+                            c_id,
+                            msg_txt,
+                            thread_id=t_id,
+                            reply_to_message_id=pkt.get("reply_to_message_id"),
+                        )
+                        if c_id < 0 and sent_mid:
+                            _record_and_relay_bot_group_msg(
+                                c_id,
+                                sent_mid,
+                                t_id,
+                                msg_txt,
+                                relay_mentions=True,
+                                source_hop=int(pkt.get("source_hop") or 0),
+                            )
+                elif ptype == "group_mention":
+                    c_id = int(pkt.get("chat_id") or 0)
+                    t_id = _normalize_thread_id(pkt.get("thread_id"))
+                    skey = scope_key_for(c_id, t_id)
+                    if c_id < 0 and (not ALLOWED or c_id in ALLOWED):
+                        if not bot_bus.loop_guard_allow(f"mention:{skey}"):
+                            log("BotLoopGuard blocked group_mention wake for %s" % skey)
+                            continue
+                        from_b = pkt.get("from_bot") or "colleague"
+                        hop = int(pkt.get("hop") or 1)
+                        excerpt = (pkt.get("text_excerpt") or "").strip()
+                        mention_prompt = (
+                            f"[ACB_GROUP_MENTION from=@{from_b} hop={hop}]\n"
+                            f"同事 @{from_b} 在群里提到了你（消息摘要：{excerpt}）。\n"
+                            f"请结合上方群聊上下文自然简短回应或接力处理；若无需额外操作或话题已收尾，请简洁确认即可，避免无意义互相客套引发循环。"
+                        )
+                        enqueue(
+                            c_id,
+                            mention_prompt,
+                            thread_id=t_id,
+                            scope_key=skey,
+                            origin_msg_id=int(pkt.get("msg_id") or 0),
+                            mention_hop=hop,
+                            chain_id=str(pkt.get("chain_id") or ""),
+                            is_mention=True,
+                            raw_text=excerpt,
+                        )
                 elif ptype == "job":
                     jid = pkt.get("job_id")
                     if jid and not bot_bus.is_job_cancelled(jid):
@@ -4296,11 +4807,21 @@ def _bot_bus_loop():
                         log("BotLoopGuard blocked automated async wake for %s" % skey)
                         continue
                     jobs = [bot_bus.get_job(jid) for jid in jids if bot_bus.get_job(jid)]
-                    brief_json = json.dumps([bot_bus.summarize_job_brief(j) for j in jobs], ensure_ascii=False, indent=2)
+                    briefs = [bot_bus.summarize_job_brief(j) for j in jobs]
+                    brief_json = json.dumps(briefs, ensure_ascii=False, indent=2)
+                    all_group_delivered = bool(briefs) and all(b.get("group_delivered") for b in briefs)
+                    any_group_delivered = any(b.get("group_delivered") for b in briefs)
+                    if all_group_delivered:
+                        delivery_note = "- 注意：以上任务的 `group_delivered=true`，Worker 已在群内直接交付结果，无需整段复述，只需做简短串接、验收或下一步派单即可；\n"
+                    elif any_group_delivered:
+                        delivery_note = "- 注意：其中 `group_delivered=true` 的任务已由 Worker 在群内直接交付结果（无需整段复述），`group_delivered=false` 的任务尚未在群内交付；\n"
+                    else:
+                        delivery_note = "- 注意：`group_delivered=false`，Worker 未在群内直接交付结果，请由你汇总关键结论给用户；\n"
                     if c_id:
                         wake_prompt = (
                             f"[ACB_TEAM_ASYNC_DONE group={pkt.get('group_id')}]\n"
                             f"你此前异步分派的团队子任务已全部落定。请验收以下结果：\n"
+                            f"{delivery_note}"
                             f"- 如后续仍需接力下一步（例如开发/发版完成后，异步派发测试进行验证或采集发版后 Issue/PR/CI 反馈），"
                             f"请直接用 `team_dispatch`（默认 `wait=false`）异步派发并向用户简报当前进展后立即结束本轮；\n"
                             f"- 如全流程已闭环，请向用户简洁汇报最终结论；请勿再次重复派发完全相同的已完成任务：\n\n{brief_json}"
@@ -4332,6 +4853,17 @@ def worker():
                 execute_scheduled_task(prompt[1])
             elif isinstance(prompt, tuple) and len(prompt) == 2 and prompt[0] == "__BUS_JOB__":
                 _execute_bus_job(prompt[1])
+            elif isinstance(prompt, tuple) and len(prompt) == 2 and prompt[0] == "__CHAT_TURN__":
+                meta = prompt[1]
+                run_agy(
+                    chat_id,
+                    meta["prompt"],
+                    thread_id=thread_id,
+                    scope_key=skey,
+                    origin_msg_id=int(meta.get("origin_msg_id") or 0),
+                    mention_hop=int(meta.get("mention_hop") or 0),
+                    chain_id=str(meta.get("chain_id") or ""),
+                )
             else:
                 run_agy(chat_id, prompt, thread_id=thread_id, scope_key=skey)
         except Exception as e:
@@ -6629,7 +7161,7 @@ def cmd_team(chat_id, raw_rest="", thread_id=None, scope_key=None, edit_msg_id=N
         send(chat_id, text, parse_mode="HTML", reply_markup=kb, thread_id=norm_tid)
 
 
-def cmd_delegate(chat_id, raw_rest="", thread_id=None, scope_key=None):
+def cmd_delegate(chat_id, raw_rest="", thread_id=None, scope_key=None, origin_msg_id=None):
     """Directly dispatch `/delegate @bot1[,@bot2] <task>` over Bot Bus without waking Coordinator LLM first."""
     norm_tid = _normalize_thread_id(thread_id)
     skey = scope_key or scope_key_for(chat_id, norm_tid)
@@ -6654,6 +7186,8 @@ def cmd_delegate(chat_id, raw_rest="", thread_id=None, scope_key=None):
             origin_scope_key=skey,
             origin_chat_id=chat_id,
             origin_thread_id=norm_tid,
+            origin_msg_id=origin_msg_id,
+            default_notify_group=(int(chat_id or 0) < 0 and BUS_CHAT_MODE == "conversational"),
         )
     except Exception as e:
         send(chat_id, f"⚠️ 直派失败：<code>{html_mod.escape(str(e))}</code>", parse_mode="HTML", thread_id=norm_tid)
@@ -6671,6 +7205,8 @@ def cmd_delegate(chat_id, raw_rest="", thread_id=None, scope_key=None):
     def _wait_and_deliver():
         settled, all_done = bot_bus.wait_for_jobs(jids, timeout_sec=600.0)
         for j in settled:
+            if j.get("group_delivered"):
+                continue
             st = j.get("status")
             icon = {"done": "✅", "error": "⚠️", "cancelled": "🛑"}.get(st, "⏳")
             usage = j.get("usage") or {}
@@ -7226,19 +7762,27 @@ def _note_poll_album_batch(updates):
         thread_id = _extract_thread_id(m)
         skey = scope_key_for(chat_id, thread_id)
         akey = f"{skey}:{mg_id}"
+        m_mid = int(m.get("message_id") or 0)
+        frm = m.get("from") or {}
+        m_sender = (frm.get("username") or frm.get("first_name") or "").strip() if not frm.get("is_bot") else ""
         prev_cnt = counts[akey][3] if akey in counts else 0
-        counts[akey] = (chat_id, thread_id, skey, prev_cnt + 1)
+        prev_mid = counts[akey][4] if akey in counts else 0
+        prev_sender = counts[akey][5] if akey in counts else ""
+        first_mid = min(prev_mid, m_mid) if (prev_mid > 0 and m_mid > 0) else (prev_mid or m_mid)
+        counts[akey] = (chat_id, thread_id, skey, prev_cnt + 1, first_mid, prev_sender or m_sender)
 
     if not counts:
         return
     with _album_lock:
-        for akey, (chat_id, thread_id, skey, cnt) in counts.items():
+        for akey, (chat_id, thread_id, skey, cnt, first_mid, sender_handle) in counts.items():
             entry = _album_buffers.get(akey)
             if entry is None:
                 entry = {
                     "chat_id": chat_id,
                     "thread_id": thread_id,
                     "scope_key": skey,
+                    "first_msg_id": first_mid,
+                    "sender_handle": sender_handle or "user",
                     "batch_pending": 0,
                     "downloading": 0,
                     "items": [],
@@ -7248,6 +7792,10 @@ def _note_poll_album_batch(updates):
                     "timer": None,
                 }
                 _album_buffers[akey] = entry
+            elif first_mid > 0 and (not entry.get("first_msg_id") or first_mid < int(entry["first_msg_id"])):
+                entry["first_msg_id"] = first_mid
+            if sender_handle and entry.get("sender_handle") in ("", "user"):
+                entry["sender_handle"] = sender_handle
             entry["batch_pending"] += cnt
             t = entry.get("timer")
             if t is not None:
@@ -7300,7 +7848,30 @@ def _flush_album(akey):
     combined_prompt = "\n\n".join(parts)
 
     send(chat_id, f"📥 已收齐相册共 {len(items)} 个文件 — 正在合并提交处理", thread_id=thread_id)
-    enqueue(chat_id, combined_prompt, thread_id=thread_id, scope_key=skey)
+    first_mid = int(entry.get("first_msg_id") or 0)
+    sender_handle = entry.get("sender_handle") or "user"
+    chain_id = ""
+    if chat_id and int(chat_id) < 0:
+        bot_bus.record_group_message(
+            int(chat_id),
+            msg_id=first_mid,
+            thread_id=thread_id,
+            sender_handle=sender_handle,
+            sender_role="human",
+            is_bot=False,
+            text=f"[相册 {len(items)} 个文件] {caption_block}",
+        )
+        chain_id = bot_bus.mark_human_group_activity(int(chat_id), thread_id=thread_id, msg_id=first_mid) or ""
+    enqueue(
+        chat_id,
+        combined_prompt,
+        thread_id=thread_id,
+        scope_key=skey,
+        origin_msg_id=first_mid,
+        chain_id=chain_id,
+        has_media=True,
+        raw_text=caption_block,
+    )
 
 
 def _download_msg_media(msg, unique_album_names=False):
@@ -7329,6 +7900,9 @@ def _download_msg_media(msg, unique_album_names=False):
 
 def _handle_album_item(msg, chat_id, thread_id, skey, mg_id):
     akey = f"{skey}:{mg_id}"
+    msg_mid = int(msg.get("message_id") or 0)
+    frm = msg.get("from") or {}
+    msg_sender = (frm.get("username") or frm.get("first_name") or "").strip() if not frm.get("is_bot") else ""
     with _album_lock:
         entry = _album_buffers.get(akey)
         if entry is None:
@@ -7336,6 +7910,8 @@ def _handle_album_item(msg, chat_id, thread_id, skey, mg_id):
                 "chat_id": chat_id,
                 "thread_id": thread_id,
                 "scope_key": skey,
+                "first_msg_id": msg_mid,
+                "sender_handle": msg_sender or "user",
                 "batch_pending": 0,
                 "downloading": 0,
                 "items": [],
@@ -7346,6 +7922,10 @@ def _handle_album_item(msg, chat_id, thread_id, skey, mg_id):
             }
             _album_buffers[akey] = entry
         else:
+            if msg_mid > 0 and (not entry.get("first_msg_id") or msg_mid < int(entry["first_msg_id"])):
+                entry["first_msg_id"] = msg_mid
+            if msg_sender and entry.get("sender_handle") in ("", "user"):
+                entry["sender_handle"] = msg_sender
             t = entry.get("timer")
             if t is not None:
                 t.cancel()
@@ -7386,10 +7966,12 @@ def handle_message(msg):
     if not _is_authorized(chat_id, from_user=msg.get("from")):
         log("rejected chat %s" % chat_id)
         return
+    chain_id = _record_human_group_msg(msg) or ""
     if _should_ignore_group_message(msg):
         return
     thread_id = _extract_thread_id(msg)
     skey = scope_key_for(chat_id, thread_id)
+    msg_id = int(msg.get("message_id") or 0)
     text = (msg.get("text") or msg.get("caption") or "").strip()
     if not text:
         return
@@ -7413,7 +7995,7 @@ def handle_message(msg):
         elif cmd in ("/team", "/bots"):
             cmd_team(chat_id, raw_rest, thread_id=thread_id, scope_key=skey)
         elif cmd in ("/delegate", "/ask"):
-            cmd_delegate(chat_id, raw_rest, thread_id=thread_id, scope_key=skey)
+            cmd_delegate(chat_id, raw_rest, thread_id=thread_id, scope_key=skey, origin_msg_id=msg_id or None)
         elif cmd == "/compact":
             cmd_compact(chat_id, raw_rest, thread_id=thread_id, scope_key=skey)
         elif cmd == "/context":
@@ -7532,20 +8114,88 @@ def handle_message(msg):
         return
 
     full_prompt = _apply_reply_context(text, msg)
-    enqueue(chat_id, full_prompt, thread_id=thread_id, scope_key=skey)
+    enqueue(
+        chat_id,
+        full_prompt,
+        thread_id=thread_id,
+        scope_key=skey,
+        origin_msg_id=msg_id,
+        chain_id=chain_id,
+        raw_text=text,
+    )
 
 
-def enqueue(chat_id, prompt, thread_id=None, scope_key=None):
+def enqueue(
+    chat_id,
+    prompt,
+    thread_id=None,
+    scope_key=None,
+    *,
+    origin_msg_id=0,
+    mention_hop=0,
+    chain_id="",
+    is_mention=False,
+    has_media=False,
+    raw_text=None,
+):
     norm_tid = _normalize_thread_id(thread_id)
     skey = scope_key or scope_key_for(chat_id, norm_tid)
-    pending = job_q.qsize()
-    with session_lock:
-        busy = turn_running
+    busy, busy_desc, pending = _describe_active_busy_task()
+
+    if (
+        busy
+        and chat_id
+        and int(chat_id) < 0
+        and BUS_FAST_CHAT_ENABLED
+        and _is_fast_chat_candidate(raw_text if raw_text is not None else prompt, has_media=has_media, is_mention=is_mention)
+    ):
+        if _fast_chat_sem.acquire(blocking=False):
+            log("Routing group message to isolated read-only fast-reply lane (chat=%s, busy=%s)" % (chat_id, busy_desc))
+            threading.Thread(
+                target=_run_fast_group_reply,
+                args=(chat_id, prompt),
+                kwargs={
+                    "thread_id": norm_tid,
+                    "scope_key": skey,
+                    "origin_msg_id": int(origin_msg_id or 0),
+                    "mention_hop": int(mention_hop or 0),
+                    "busy_desc": busy_desc,
+                },
+                daemon=True,
+            ).start()
+            return
+
     if pending or busy:
-        send(chat_id,
-             "📋 Queued (position %d) — starts right after current turn (/cancel to interrupt)" % (pending + 1),
-             thread_id=norm_tid)
-    job_q.put((chat_id, norm_tid, skey, prompt))
+        if (chat_id and int(chat_id) < 0) or BUS_CHAT_MODE == "conversational":
+            if busy_desc:
+                q_text = (
+                    f"⏳ 我手头正在跑 {busy_desc}，这条需求我已接下排队（第 {pending + 1} 位），完成后马上处理。"
+                )
+            else:
+                q_text = (
+                    f"⏳ 我手头正在处理上一条任务，这条需求我已接下排队（第 {pending + 1} 位），完成后马上处理。"
+                )
+            send(chat_id, q_text, thread_id=norm_tid, reply_to_message_id=origin_msg_id or None)
+        else:
+            send(
+                chat_id,
+                "📋 Queued (position %d) — starts right after current turn (/cancel to interrupt)" % (pending + 1),
+                thread_id=norm_tid,
+            )
+
+    if origin_msg_id or mention_hop or chain_id:
+        item_payload = (
+            "__CHAT_TURN__",
+            {
+                "prompt": prompt,
+                "origin_msg_id": int(origin_msg_id or 0),
+                "mention_hop": int(mention_hop or 0),
+                "chain_id": str(chain_id or ""),
+            },
+        )
+    else:
+        item_payload = prompt
+    job_q.put((chat_id, norm_tid, skey, item_payload))
 
 
 def handle_voice(msg):
@@ -7576,8 +8226,18 @@ def handle_voice(msg):
              thread_id=thread_id)
         return
     send(chat_id, "🎙 %s" % text, thread_id=thread_id)
+    chain_id = _record_human_group_msg(msg, text_override=f"🎙 {text}") or ""
     full_prompt = _apply_reply_context(text, msg)
-    enqueue(chat_id, full_prompt, thread_id=thread_id, scope_key=skey)
+    enqueue(
+        chat_id,
+        full_prompt,
+        thread_id=thread_id,
+        scope_key=skey,
+        origin_msg_id=msg_id,
+        chain_id=chain_id,
+        has_media=True,
+        raw_text=text,
+    )
 
 
 def handle_media(msg):
@@ -7599,8 +8259,18 @@ def handle_media(msg):
         send(chat_id, err, thread_id=thread_id)
         return
     send(chat_id, "📥 Saved as %s — tasking agent" % rel, thread_id=thread_id)
+    chain_id = _record_human_group_msg(msg, text_override=f"[文件 {rel}] {caption}") or ""
     full_prompt = _apply_reply_context("%s\n(The file is saved at: %s)" % (caption, dest), msg)
-    enqueue(chat_id, full_prompt, thread_id=thread_id, scope_key=skey)
+    enqueue(
+        chat_id,
+        full_prompt,
+        thread_id=thread_id,
+        scope_key=skey,
+        origin_msg_id=int(msg.get("message_id") or 0),
+        chain_id=chain_id,
+        has_media=True,
+        raw_text=caption,
+    )
 
 
 def main():

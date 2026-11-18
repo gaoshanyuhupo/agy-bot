@@ -25,9 +25,13 @@ class TestBotBusTeamWorkflow(unittest.TestCase):
         env_patch = {
             "AGY_BOT_BUS_DIR": bus_dir,
             "AGY_BOT_BUS_ENABLE": "1",
+            "AGY_BOT_BUS_ROLE": "coordinator",
             "AGY_BOT_HANDLE": "bot_one",
             "AGY_BOT_CHAT_ID": "123456789",
             "AGY_BOT_SCOPE_KEY": "dm:123456789",
+            "AGY_BOT_CHAIN": "",
+            "AGY_BOT_ORIGIN_MSG_ID": "0",
+            "AGY_BOT_MENTION_HOP": "0",
         }
         with mock.patch.dict(os.environ, env_patch, clear=False):
             import bot_bus  # noqa: E402
@@ -53,9 +57,13 @@ class TestBotBusTeamWorkflow(unittest.TestCase):
                 os.environ,
                 {
                     "AGY_BOT_BUS_ENABLE": "1",
+                    "AGY_BOT_BUS_ROLE": "coordinator",
                     "AGY_BOT_HANDLE": "bot_one",
                     "AGY_BOT_CHAT_ID": "123456789",
                     "AGY_BOT_SCOPE_KEY": "dm:123456789",
+                    "AGY_BOT_CHAIN": "",
+                    "AGY_BOT_ORIGIN_MSG_ID": "0",
+                    "AGY_BOT_MENTION_HOP": "0",
                 },
                 clear=False,
             ):
@@ -74,7 +82,11 @@ class TestBotBusTeamWorkflow(unittest.TestCase):
     def test_tool_schema_and_instructions_reflect_async_role_division(self):
         with tempfile.TemporaryDirectory() as tmp:
             _bot_bus, bot_bus_mcp = self._load_isolated_bus(tmp)
-            with mock.patch.dict(os.environ, {"AGY_BOT_BUS_ENABLE": "1"}, clear=False):
+            with mock.patch.dict(
+                os.environ,
+                {"AGY_BOT_BUS_ENABLE": "1", "AGY_BOT_BUS_ROLE": "coordinator"},
+                clear=False,
+            ):
                 schemas = {t["name"]: t for t in bot_bus_mcp._tool_schemas()}
             wait_desc = schemas["team_dispatch"]["inputSchema"]["properties"]["wait"]["description"]
             self.assertIn("default false", wait_desc.lower())

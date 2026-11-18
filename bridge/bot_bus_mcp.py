@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Stdio MCP server exposing `acb-team` coordinator tools for agy-cli-bot.
+"""Stdio MCP server exposing `acb-team` Coordinator Bus tools for agy-cli-bot.
 
-Enabled strictly when `AGY_BOT_BUS_ENABLE=1` (injected only into coordinator/peer
-interactive bridge sessions). For all other sessions (`worker`, `agy-llm-shim`,
-terminal CLI, disposable scheduled tasks), `tools/list` returns `[]` so zero schema
-tokens or delegation tools leak into unintended contexts.
+Role-gated via `AGY_BOT_BUS_ENABLE` and `AGY_BOT_BUS_ROLE`:
+- `coordinator` / `peer` (`AGY_BOT_BUS_ENABLE=1`, `AGY_BOT_BUS_ROLE=coordinator|peer`):
+  full orchestration tools (`team_roster`, `team_dispatch`, `team_job`, `team_broadcast`, `group_say`).
+- `worker` (`AGY_BOT_BUS_ENABLE=1`, `AGY_BOT_BUS_ROLE=worker`):
+  strictly minimal group collaboration tools (`team_roster` read-only, `group_say` restricted);
+  delegation/job-control tools (`team_dispatch`, `team_job`, `team_broadcast`) are omitted and denied.
+- All other contexts (`AGY_BOT_BUS_ENABLE!=1`, terminal CLI, scheduled tasks, `agy-llm-shim`):
+  `tools/list` returns `[]` so zero schema tokens leak.
 """
 
 from __future__ import annotations
@@ -15,7 +19,7 @@ import queue
 import signal
 import sys
 import threading
-from typing import Any, Dict, List
+from typing import Any, Dict, FrozenSet, List
 
 try:
     import bot_bus
@@ -42,8 +46,40 @@ COORDINATOR_INSTRUCTIONS = (
 )
 
 
+WORKER_INSTRUCTIONS = (
+    "You have minimal group-chat collaboration tools on the local Coordinator Bus (`acb-team`).\n"
+    "- You are operating as a specialist `worker` bot. You do NOT have delegation or job-management permissions (`team_dispatch`/`team_job` are disabled).\n"
+    "- Use `team_roster` (read-only) when you need to inspect teammate `@handle`s and specialties.\n"
+    "- Use `group_say` sparingly during long-running tasks to post concise progress milestones or ask a teammate/user a brief clarifying question directly in the active group chat.\n"
+    "- Always return your full final deliverable in your normal turn response."
+)
+
+_COORDINATOR_TOOLS: FrozenSet[str] = frozenset(
+    {"team_roster", "team_dispatch", "team_job", "team_broadcast", "group_say"}
+)
+_WORKER_TOOLS: FrozenSet[str] = frozenset({"team_roster", "group_say"})
+
+
 def _bus_enabled() -> bool:
     return os.environ.get("AGY_BOT_BUS_ENABLE", "").strip() == "1"
+
+
+def _bus_role() -> str:
+    if not _bus_enabled():
+        return "disabled"
+    raw = os.environ.get("AGY_BOT_BUS_ROLE", "").strip().lower()
+    if raw in ("coordinator", "peer", "worker"):
+        return raw
+    return "coordinator"
+
+
+def _allowed_tool_names() -> FrozenSet[str]:
+    role = _bus_role()
+    if role in ("coordinator", "peer"):
+        return _COORDINATOR_TOOLS
+    if role == "worker":
+        return _WORKER_TOOLS
+    return frozenset()
 
 
 def _my_handle() -> str:
@@ -51,16 +87,45 @@ def _my_handle() -> str:
 
 
 def _origin_context() -> Dict[str, Any]:
+    scope_key = os.environ.get("AGY_BOT_SCOPE_KEY", "").strip()
     raw_tid = os.environ.get("AGY_BOT_THREAD_ID", "").strip()
     thread_id = int(raw_tid) if raw_tid.lstrip("-").isdigit() else None
     raw_chat = os.environ.get("AGY_BOT_CHAT_ID", "").strip()
     chat_id = int(raw_chat) if raw_chat.lstrip("-").isdigit() else 0
+    raw_mid = os.environ.get("AGY_BOT_ORIGIN_MSG_ID", "").strip()
+    origin_msg_id = int(raw_mid) if raw_mid.isdigit() else 0
+    raw_hop = os.environ.get("AGY_BOT_MENTION_HOP", "").strip()
+    mention_hop = int(raw_hop) if raw_hop.isdigit() else 0
+    chain_id = os.environ.get("AGY_BOT_CHAIN_ID", "").strip()
     raw_chain = os.environ.get("AGY_BOT_CHAIN", "").strip()
     chain = [bot_bus.normalize_handle(x) for x in raw_chain.split(",") if bot_bus.normalize_handle(x)]
+
+    # Warm AgySession processes inherit spawn-time env vars; read latest origin context live from bus if available.
+    me = _my_handle()
+    if scope_key:
+        live_ctx = bot_bus.get_origin_context(scope_key, bot_handle=me)
+        if live_ctx:
+            if int(live_ctx.get("chat_id") or 0):
+                chat_id = int(live_ctx["chat_id"])
+            if live_ctx.get("thread_id") is not None or int(live_ctx.get("chat_id") or 0):
+                thread_id = live_ctx.get("thread_id")
+            if int(live_ctx.get("msg_id") or 0):
+                origin_msg_id = int(live_ctx["msg_id"])
+            if "mention_hop" in live_ctx and live_ctx.get("mention_hop") is not None:
+                try:
+                    mention_hop = max(0, int(live_ctx["mention_hop"]))
+                except (TypeError, ValueError):
+                    pass
+            if "chain_id" in live_ctx and live_ctx.get("chain_id") is not None:
+                chain_id = str(live_ctx.get("chain_id") or "")
+
     return {
-        "origin_scope_key": os.environ.get("AGY_BOT_SCOPE_KEY", "").strip(),
+        "origin_scope_key": scope_key,
         "origin_chat_id": chat_id,
         "origin_thread_id": thread_id,
+        "origin_msg_id": origin_msg_id,
+        "mention_hop": mention_hop,
+        "chain_id": chain_id,
         "parent_chain": chain,
     }
 
@@ -86,9 +151,10 @@ def _tool_text(payload: Any, *, is_error: bool = False) -> Dict[str, Any]:
 
 
 def _tool_schemas() -> List[Dict[str, Any]]:
-    if not _bus_enabled():
+    allowed = _allowed_tool_names()
+    if not allowed:
         return []
-    return [
+    all_tools = [
         {
             "name": "team_roster",
             "description": "List all registered sibling bots on the local Coordinator Bus with online status, role (coordinator/worker/peer), specialty, default model/workdir, and active queue depth.",
@@ -158,7 +224,7 @@ def _tool_schemas() -> List[Dict[str, Any]]:
                     },
                     "notify_group": {
                         "type": "boolean",
-                        "description": "Mirror worker progress/completion card to configured team mirror chat/Topic (default false).",
+                        "description": "Mirror worker progress/completion message to active group chat or configured team mirror (defaults to true when dispatched from a group chat).",
                     },
                 },
             },
@@ -196,7 +262,23 @@ def _tool_schemas() -> List[Dict[str, Any]]:
                 "required": ["message"],
             },
         },
+        {
+            "name": "group_say",
+            "description": (
+                "Post a brief conversational update or question directly into the active group chat as yourself "
+                "(restricted to the bound group/topic; cannot dispatch jobs or spoof other bots)."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "message": {"type": "string", "description": "Concise markdown/text message to post to the group."},
+                    "reply_to_msg_id": {"type": "integer", "description": "Optional Telegram message_id to reply to."},
+                },
+                "required": ["message"],
+            },
+        },
     ]
+    return [tool for tool in all_tools if tool["name"] in allowed]
 
 
 def _handle_team_roster(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -251,8 +333,11 @@ def _handle_team_dispatch(args: Dict[str, Any]) -> Dict[str, Any]:
     assignments = _build_assignment_list(args)
     wait = bool(args.get("wait", False))
     timeout_sec = max(10.0, min(1500.0, float(args.get("timeout_sec", 600) or 600)))
-    notify_group = bool(args.get("notify_group", False))
     origin = _origin_context()
+    if "notify_group" in args and args.get("notify_group") is not None:
+        notify_group = bool(args.get("notify_group"))
+    else:
+        notify_group = int(origin["origin_chat_id"] or 0) < 0
 
     created = bot_bus.dispatch_assignments(
         me,
@@ -260,6 +345,7 @@ def _handle_team_dispatch(args: Dict[str, Any]) -> Dict[str, Any]:
         origin_scope_key=origin["origin_scope_key"],
         origin_chat_id=origin["origin_chat_id"],
         origin_thread_id=origin["origin_thread_id"],
+        origin_msg_id=origin["origin_msg_id"] or None,
         parent_chain=origin["parent_chain"],
         default_notify_group=notify_group,
         wake_on_async=not wait,
@@ -350,11 +436,45 @@ def _handle_team_broadcast(args: Dict[str, Any]) -> Dict[str, Any]:
     return _tool_text({"ok": True, "bot": f"@{bot_bus.normalize_handle(target_bot)}", "chat_id": chat_id, "thread_id": thread_id})
 
 
+def _handle_group_say(args: Dict[str, Any]) -> Dict[str, Any]:
+    msg = str(args.get("message") or "").strip()
+    if not msg:
+        return _tool_text("`message` cannot be empty.", is_error=True)
+    me = _my_handle()
+    if not me:
+        return _tool_text("AGY_BOT_HANDLE missing in session environment.", is_error=True)
+
+    origin = _origin_context()
+    chat_id = int(origin["origin_chat_id"] or 0)
+    thread_id = origin["origin_thread_id"]
+    if not chat_id:
+        bcfg = bot_bus.resolve_bot_config(me)
+        chat_id = int(bcfg.get("mirror_chat_id") or 0)
+        if chat_id and bcfg.get("mirror_thread_id") is not None:
+            thread_id = bcfg.get("mirror_thread_id")
+    if chat_id >= 0:
+        return _tool_text("group_say requires an active group chat context (chat_id < 0).", is_error=True)
+
+    raw_reply = args.get("reply_to_msg_id")
+    reply_mid = int(raw_reply) if raw_reply is not None and str(raw_reply).isdigit() else None
+    bot_bus.enqueue_group_say(
+        me,
+        chat_id,
+        msg,
+        thread_id=thread_id,
+        reply_to_message_id=reply_mid,
+        source_hop=origin.get("mention_hop", 0),
+        chain_id=origin.get("chain_id", ""),
+    )
+    return _tool_text({"ok": True, "bot": f"@{me}", "chat_id": chat_id, "thread_id": thread_id})
+
+
 _TOOL_DISPATCH = {
     "team_roster": _handle_team_roster,
     "team_dispatch": _handle_team_dispatch,
     "team_job": _handle_team_job,
     "team_broadcast": _handle_team_broadcast,
+    "group_say": _handle_group_say,
 }
 
 
@@ -370,7 +490,10 @@ def _handle_request(req: Dict[str, Any]) -> None:
             "capabilities": {"tools": {"listChanged": False}},
             "serverInfo": {"name": "acb-team", "version": "1.0.0"},
         }
-        if _bus_enabled():
+        role = _bus_role()
+        if role == "worker":
+            res["instructions"] = WORKER_INSTRUCTIONS
+        elif role in ("coordinator", "peer"):
             res["instructions"] = COORDINATOR_INSTRUCTIONS
         if req_id is not None:
             _reply_ok(req_id, res)
@@ -395,10 +518,16 @@ def _handle_request(req: Dict[str, Any]) -> None:
         if not _bus_enabled():
             _reply_ok(
                 req_id,
-                _tool_text("`acb-team` is disabled on this worker/non-coordinator session.", is_error=True),
+                _tool_text("`acb-team` is disabled on this session.", is_error=True),
             )
             return
         tname = params.get("name") or ""
+        if tname not in _allowed_tool_names():
+            _reply_ok(
+                req_id,
+                _tool_text(f"Tool `{tname}` is not permitted for role `{_bus_role()}`.", is_error=True),
+            )
+            return
         args = params.get("arguments") or {}
         fn = _TOOL_DISPATCH.get(tname)
         if not fn:
