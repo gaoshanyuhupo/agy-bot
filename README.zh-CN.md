@@ -2,7 +2,11 @@
 
 [English](./README.md) | [简体中文](./README.zh-CN.md)
 
-**Google Antigravity CLI (`agy`)** 开源配套生态栈：包含支持 Bot API 9.5+ `sendMessageDraft` 实时流式输出与群聊防 429 降级的多 Bot Telegram 桥接器、Telegram Mini App 实时浏览器接管与双向剪贴板中枢、`/compact` 后无损上下文重水合钩子、无状态本地观察者 LLM Shim、Continuous-Learning v2 习惯技能演化守护进程，以及全链路零泄漏脱敏门禁测试套件。
+基于官方 **Google Antigravity CLI (`agy`)** 原生基座构建的开源配套生态栈——直连本地官方 `agy` 常驻 `stream-json` 会话池（规避第三方反代链路封号风险）：
+- **Telegram 群组多 Bot 团队高效协作**：支持 Bot API 9.5+ `sendMessageDraft` 实时流式输出、群聊防 429 自适应退避、`acb-team` 异步委派与可选 Git Worktree（`worktree: true`）并发隔离。
+- **多指纹多出口 Camoufox 浏览器 + Telegram Mini App 人工接管**：支持按命名 Profile 独立配置 OS、视口分辨率、WebGL、WebRTC/GeoIP 与代理出口按需切换（隔离任务环境并应对 Cloudflare 等站点严格风控检查），同时支持对核心账号严格锁定持久化指纹 + 宿主机直出；遇到人机验证或交互确认时，可通过 Telegram Mini App 一键人工接管，处理完毕后再交还给 AI 继续执行。
+- **跨会话防遗忘与全托管运维**：支持 `/compact` 无损重水合、本地无状态观察者 Shim、Continuous-Learning v2 习惯演化、`mem-search` 检索、`/undo`/`/redo`、`/schedule`/`/cron`、`/project`、`/usage`/`/cost`、`agy-bot setup/doctor --fix` 自愈及零停机热重载。
+- **自部署 OpenBao 无痕用密示例 + 全链路脱敏门禁**：提供完全脱敏的 [OpenBao 无痕用密实战指南](./docs/OPENBAO_SECRETOPS_GUIDE.md)，配合工作区与 Git 历史结构化扫描及 Python 3.11–3.14 CI 矩阵闭环保障。
 
 - **开源协议**：[MIT](./LICENSE)
 - **代码仓库**：`https://github.com/gaoshanyuhupo/agy-bot`
@@ -26,10 +30,17 @@
 - **安装引导与环境体检 CLI（`agy-bot setup` / `agy-bot doctor`）**：通过标准 `pyproject.toml` 提供 `agy-bot` 命令，一键引导部署与只读/联网体检。
 - **零停机热重载**：通过哨兵文件（`AGY_TG_RELOAD_FILE`，如 `/tmp/agy_bridge_reload`）在空闲间隙自动执行优雅 `os.execv` 重载。
 
-### 2. `.agents/skills/live-browser/` — Telegram 实时浏览器镜像与接管
+### 2. `.agents/skills/live-browser/` — 多指纹多出口实时浏览器与 Telegram 人工接管
 - **双模实时视图**：群内单卡片 `editMessageMedia` 实况预览 + Telegram Mini App 低延迟二进制 JPEG WebSocket 流（基于 Cloudflare Tunnel 暴露 `https://live.your-domain.com`）。
-- **三态控制权仲裁**：在 AI 观看、一键人工接管（通过 `ai_allowed_event` 暂停 AI 操作）与交还给 AI 之间无缝切换。
+- **多命名 Profile、多指纹与多出口代理切换（`--profile`、`--os`、`--proxy-bao`）**：在 `~/.config/agy-live-browser/profiles.json`（`0600`）管理独立浏览器身份，按需配置 `os`（`windows`/`macos`/`linux`）、`locale`、`window`、`webgl_config`、`block_webrtc`、`geoip`、`--ephemeral` 临时目录及独立 `--proxy` 或 OpenBao 内存动态提取 `--proxy-bao`；状态与 TG 卡片中所有代理凭据均自动脱敏（如 `socks5://***@example.com:1080`）。
+- **核心持久化指纹硬锁定（Fail-Closed）**：当宿主机安装有固定 Profile 管理模块时，默认或 `--profile default` 自动锁定持久化指纹（`os="windows"`、`headless="virtual"`）与宿主机直出（`network.proxy.type=0`），任何覆写代理或指纹的企图均直接报错拒绝启动。
+- **三态控制权仲裁**：在 AI 观看、一键人工接管（通过 `ai_allowed_event` 暂停 AI，由人类在面板内完成二次确认或 Cloudflare 等人机验证）与交还给 AI 之间无缝切换。
 - **移动端/桌面端输入与 X11 剪贴板同步**：自动识别焦点输入框并弹出适配 `visualViewport` 的中文输入面板，支持外部 `xclip` 剪贴板读取与逐字拖拽选字（`document.caretPositionFromPoint`）。
+- **CLI 示例**：
+  ```bash
+  live-browser profile create us-work --os macos --locale en-US --window 1440x900 --block-webrtc --geoip --proxy-bao kv/proxies/us-west
+  live-browser start --profile us-work --restart --url "https://example.com"
+  ```
 - 完整操作与移动端指南见 [docs/TELEGRAM_LIVE_BROWSER_GUIDE.md](./docs/TELEGRAM_LIVE_BROWSER_GUIDE.md)。
 
 ### 3. `hooks/` — 无损压缩后重水合与生命周期门控
@@ -40,9 +51,10 @@
 - **`agy_llm_shim.py`**：兼容 OpenAI/Anthropic 协议的本地 HTTP Shim，由无工具隔离的 `pure-llm` 沙盒驱动（`mem-hub/observer-sandbox/`），支持无状态轮转。
 - **`agy_instinct_daemon.py`**：基于置信度提取会话经验（Instinct），维护 `.agents/rules/ecc-active-instincts.md` 并自动演化为受控上限的复用技能。
 
-### 5. `scripts/` 与 `tests/` — 严格脱敏门禁与成本核算
+### 5. `scripts/`、`tests/` 与 `docs/OPENBAO_SECRETOPS_GUIDE.md` — 无痕用密示例、脱敏门禁与成本核算
+- **自部署 OpenBao 无痕用密示例指南**：完全脱敏的实战范式（`0600` 本地凭据初始化、CLI 短暂环境变量注入、Python 内存动态提取与 `live-browser --proxy-bao` 零落盘代理），详见 [docs/OPENBAO_SECRETOPS_GUIDE.md](./docs/OPENBAO_SECRETOPS_GUIDE.md)。
 - **`scripts/security_audit.py`**：零泄漏结构化扫描器，覆盖明文密钥/Token、半掩码前缀、含凭证 URL、非白名单外链与裸域名、长数字/Hex/UUID ID、个人邮箱与未登记 `@handle`、硬编码 `/home/<user>` 或 `User=` 路径、非文档 IP、高危运行态文件及 Git 全量提交历史（`--check-history`），支持外部黑名单文件（`--blocklist-file` / `~/.config/agy-audit-blocklist.txt`）。
-- **`tests/`**：全离线 `unittest` 回归套件，覆盖脱敏门禁（`test_desensitization.py`）、P0 稳定性加固（`test_bridge_p0.py`）、核心引擎与撤销/相册/429（`test_bridge_core.py`）、定时调度（`test_scheduler.py`）、CLI 体检向导（`test_cli_doctor.py`）与多 Bot 总线及 Worktree 隔离（`test_bot_bus.py`、`test_bot_bus_worktree.py`、`test_group_chat_bus.py`）。
+- **`tests/`**：全离线 `unittest` 回归套件，覆盖脱敏门禁（`test_desensitization.py`）、P0 稳定性加固（`test_bridge_p0.py`）、核心引擎与撤销/相册/429（`test_bridge_core.py`）、定时调度（`test_scheduler.py`）、CLI 体检向导（`test_cli_doctor.py`）、多指纹/固定指纹隔离（`test_live_browser_profiles.py`）与多 Bot 总线及 Worktree 隔离（`test_bot_bus.py`、`test_bot_bus_worktree.py`、`test_group_chat_bus.py`）。
 - **`scripts/calc_cycle_cost.py`**：独立命令行工具，解析 `~/.gemini/antigravity-cli/brain/*/logs/transcript.jsonl`，输出 Token 消耗、缓存命中率与估算 USD 节省。
 
 ---
@@ -55,13 +67,13 @@ agy-bot/
 ├── .github/                  # CI 工作流、Issue 表单模板与 PR 脱敏自检清单
 ├── bridge/                   # Telegram Bridge v3（bridge.py、scheduler.py、bot_bus*.py、cli.py、.env.example）
 ├── config/                   # 脱敏后的 MCP 配置模板（mcp_config.example.json）
-├── docs/                     # 系统架构图与 Live Browser / 移动端输入指南
+├── docs/                     # 系统架构图、Live Browser 指南与 OpenBao 无痕用密指南
 ├── hooks/                    # hooks.json、无损 rehydrate_after_compact.py 与生命周期门控
 ├── legacy/sdk-bridge/        # 早期 SDK bridge v1 历史参考
 ├── mem-hub/                  # agy_llm_shim.py、agy_instinct_daemon.py 与隔离 observer-sandbox/
 ├── scripts/                  # security_audit.py 脱敏审计器与 calc_cycle_cost.py 账单工具
 ├── systemd/examples/         # 通用 systemd 单元模板（KillMode=mixed + YOUR_USER 占位符）
-├── tests/                    # 脱敏审计、桥接核心、调度器、CLI 向导与协作总线单测
+├── tests/                    # 脱敏审计、桥接核心、调度器、CLI 向导、浏览器隔离与协作总线单测
 ├── workspace/                # 通用工作区 Agent 规范（AGENTS.md）
 ├── pyproject.toml            # PEP 621 包定义、`agy-bot` CLI 入口与 Ruff 门禁配置
 ├── README.md / README.zh-CN.md
