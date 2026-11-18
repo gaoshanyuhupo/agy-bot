@@ -1308,6 +1308,71 @@ def relay_group_mentions(
         return {"relayed": relayed, "blocked_reason": blocked_reason}
 
 
+def enqueue_scheduled_handoff(
+    from_bot: str,
+    to_bot: str,
+    *,
+    chat_id: int,
+    thread_id: Optional[int] = None,
+    msg_id: int = 0,
+    task_id: str = "",
+    task_name: str = "",
+    text_excerpt: str = "",
+) -> Dict[str, Any]:
+    """Enqueue an overnight-safe `scheduled_handoff` wake packet onto `to_bot`'s inbox.
+
+    Unlike `relay_group_mentions`, scheduled handoffs do NOT require a recent human
+    anchor, while still enforcing self-handoff rejection and sliding-window rate limits
+    outside `bus.lock` to prevent lock re-entrancy deadlocks.
+    """
+    sender = normalize_handle(from_bot)
+    raw_target = (to_bot or "").strip()
+    if not raw_target:
+        return {"enqueued": False, "reason": "invalid_target"}
+
+    cid = int(chat_id or 0)
+    if cid == 0:
+        return {"enqueued": False, "reason": "invalid_chat_id"}
+
+    to_handle = ""
+    try:
+        resolved = resolve_target_bot(raw_target)
+        to_handle = str(resolved.get("handle") or "")
+    except ValueError:
+        cand = normalize_handle(raw_target)
+        if cand and cand not in VALID_ROLES:
+            to_handle = cand
+
+    if not to_handle:
+        return {"enqueued": False, "reason": "unresolved_target"}
+
+    if sender and sender == to_handle:
+        return {"enqueued": False, "reason": "self_handoff"}
+
+    # MUST run outside `with _bus_lock():` because `loop_guard_allow` acquires `bus.lock`.
+    guard_key = f"sched_handoff:{task_id}:{to_handle}"
+    if not loop_guard_allow(guard_key, max_events=2, window_sec=300):
+        return {"enqueued": False, "reason": "rate_limited", "to_bot": to_handle}
+
+    norm_tid = _norm_tid(thread_id)
+    now = time.time()
+    pkt = {
+        "type": "scheduled_handoff",
+        "from_bot": sender,
+        "to_bot": to_handle,
+        "chat_id": cid,
+        "thread_id": norm_tid,
+        "msg_id": int(msg_id or 0),
+        "task_id": str(task_id or ""),
+        "task_name": str(task_name or "")[:120],
+        "text_excerpt": (text_excerpt or "").strip()[:800],
+        "created_at": now,
+    }
+    with _bus_lock():
+        pkt_path = _drop_inbox_packet_unlocked(to_handle, pkt)
+    return {"enqueued": True, "to_bot": to_handle, "packet_path": pkt_path}
+
+
 # ---------------------------------------------------------------- git worktree isolation
 WORKTREE_DIR_NAME = ".worktrees"
 WORKTREE_BRANCH_PREFIX = "agy-team/"

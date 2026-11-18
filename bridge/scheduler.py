@@ -418,7 +418,7 @@ class TaskManager:
                     target_chat_id=None, target_thread_id=None, session_mode="isolated",
                     model="gemini-3.8-flash-low", project=None, workdir=None,
                     timeout_secs=None, silent_if_empty=None, custom_id=None,
-                    bot_instance_id=None):
+                    bot_instance_id=None, precheck_cmd=None, handoff_bot=None):
         """Validate, create, and atomically persist a new scheduled task."""
         now_utc = datetime.datetime.now(datetime.timezone.utc)
         tz, _ = get_scheduler_tz()
@@ -444,6 +444,22 @@ class TaskManager:
 
         tid = custom_id or f"task-{int(time.time() * 1000) % 1000000:06x}"
 
+        task_payload = dict(payload or {})
+        clean_precheck = str(precheck_cmd).strip() if precheck_cmd is not None else ""
+        if clean_precheck:
+            task_payload["precheck_cmd"] = clean_precheck
+
+        delivery = {
+            "target_chat_id": target_chat_id,
+            "target_thread_id": target_thread_id,
+            "silent_if_empty": bool(silent_if_empty),
+            "notify_on_failure": True,
+            "header_prefix": "⏰",
+        }
+        clean_handoff = str(handoff_bot).strip().lstrip("@").lower() if handoff_bot is not None else ""
+        if clean_handoff:
+            delivery["handoff_bot"] = clean_handoff
+
         task = {
             "id": tid,
             "name": (name or "").strip() or f"Task-{tid}",
@@ -453,7 +469,7 @@ class TaskManager:
             "schedule_expr": schedule_expr.strip(),
             "cron_expr": cron_expr,
             "task_type": task_type,  # 'agent', 'script', 'cost_report', 'browser'
-            "payload": payload or {},
+            "payload": task_payload,
             "execution": {
                 "session_mode": session_mode or "isolated",
                 "model": model or "gemini-3.8-flash-low",
@@ -461,13 +477,7 @@ class TaskManager:
                 "workdir": workdir,
                 "timeout_secs": int(timeout_secs),
             },
-            "delivery": {
-                "target_chat_id": target_chat_id,
-                "target_thread_id": target_thread_id,
-                "silent_if_empty": bool(silent_if_empty),
-                "notify_on_failure": True,
-                "header_prefix": "⏰",
-            },
+            "delivery": delivery,
             "state": {
                 "created_at": format_iso_utc(now_utc),
                 "last_run_at": None,
@@ -618,6 +628,60 @@ task_mgr = TaskManager()
 
 
 # ---------------------------------------------------------------- Telegram Panel Formatter
+def format_task_detail(t, now_utc=None, tz=None):
+    """Render HTML detail body for a scheduled task."""
+    if now_utc is None:
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+    if tz is None:
+        tz, _ = get_scheduler_tz()
+    st = t.get("state", {})
+    ex = t.get("execution", {})
+    deliv = t.get("delivery", {})
+    payload = t.get("payload") or {}
+    status_icon = "🟢 运行中" if t.get("enabled", True) else "🔴 已暂停/已完成"
+    nxt_dt = parse_iso_utc(st.get("next_run_at"))
+    rem_str = format_countdown(nxt_dt, now_utc)
+    nxt_loc_str = nxt_dt.astimezone(tz).strftime("%Y-%m-%d %H:%M:%S") if nxt_dt else "无计划"
+    last_dt = parse_iso_utc(st.get("last_run_at"))
+    last_loc_str = last_dt.astimezone(tz).strftime("%m-%d %H:%M:%S") if last_dt else "尚未运行"
+    ttype = t.get("task_type")
+    model_line = (
+        f"• <b>执行模型</b>: <code>{ex.get('model', 'default')}</code> (隔离会话)\n"
+        if ttype in ("agent", "browser")
+        else "• <b>执行通道</b>: <code>原生零 Token 直连</code>\n"
+    )
+    silent_on = bool(deliv.get("silent_if_empty", True))
+    tgt_thread = deliv.get("target_thread_id")
+    route_line = f"• <b>投递目标</b>: <code>chat {deliv.get('target_chat_id')} / Topic #{tgt_thread}</code>\n" if tgt_thread else ""
+    handoff_bot = (deliv.get("handoff_bot") or "").strip().lstrip("@").lower()
+    handoff_line = f"• <b>协同接力</b>: <code>@{html_mod.escape(handoff_bot)}</code>\n" if handoff_bot else ""
+    precheck_cmd = (payload.get("precheck_cmd") or "").strip()
+    precheck_preview = precheck_cmd if len(precheck_cmd) <= 100 else precheck_cmd[:97] + "..."
+    precheck_line = f"• <b>预检命令</b>: <code>{html_mod.escape(precheck_preview)}</code>\n" if precheck_cmd else ""
+
+    body = (
+        f"📌 <b>任务详情: {html_mod.escape(t.get('name', ''))}</b> (<code>{t['id']}</code>)\n\n"
+        f"• <b>状态</b>: {status_icon}\n"
+        f"• <b>类型</b>: <code>{ttype}</code>\n"
+        f"• <b>计划</b>: <code>{html_mod.escape(t.get('schedule_expr', ''))}</code> ({t.get('schedule_type')})\n"
+        f"• <b>下次执行</b>: <code>{nxt_loc_str}</code> (<b>{rem_str}</b>)\n"
+        f"{route_line}"
+        f"{handoff_line}"
+        f"{precheck_line}"
+        f"{model_line}"
+        f"• <b>静默空结果</b>: <code>{'开启 (无新内容不打扰)' if silent_on else '关闭 (每次必汇报)'}</code>\n"
+        f"• <b>累计执行</b>: <code>{st.get('run_count', 0)} 次</code> · 上次: <code>{last_loc_str}</code> (<code>{st.get('last_status', 'pending')}</code>)\n"
+    )
+    if st.get("last_error"):
+        body += f"⚠️ <b>最近错误</b>: <code>{html_mod.escape(st['last_error'][:240])}</code>\n"
+    if payload:
+        payload_str = json.dumps(payload, ensure_ascii=False)
+        if len(payload_str) > 160:
+            payload_str = payload_str[:160] + "..."
+        body += f"📦 <b>载荷内容</b>: <code>{html_mod.escape(payload_str)}</code>\n"
+    return body
+
+
 def build_schedule_panel(view="list", selected_task_id=None, bot_instance_id=None):
     """Render interactive Telegram HTML message and inline keyboard."""
     tz, tz_lbl = get_scheduler_tz()
@@ -636,43 +700,9 @@ def build_schedule_panel(view="list", selected_task_id=None, bot_instance_id=Non
         if not t:
             view = "list"
         else:
-            st = t.get("state", {})
-            ex = t.get("execution", {})
             deliv = t.get("delivery", {})
-            status_icon = "🟢 运行中" if t.get("enabled", True) else "🔴 已暂停/已完成"
-            nxt_dt = parse_iso_utc(st.get("next_run_at"))
-            rem_str = format_countdown(nxt_dt, now_utc)
-            nxt_loc_str = nxt_dt.astimezone(tz).strftime("%Y-%m-%d %H:%M:%S") if nxt_dt else "无计划"
-            last_dt = parse_iso_utc(st.get("last_run_at"))
-            last_loc_str = last_dt.astimezone(tz).strftime("%m-%d %H:%M:%S") if last_dt else "尚未运行"
-            ttype = t.get("task_type")
-            model_line = (
-                f"• <b>执行模型</b>: <code>{ex.get('model', 'default')}</code> (隔离会话)\n"
-                if ttype in ("agent", "browser")
-                else "• <b>执行通道</b>: <code>原生零 Token 直连</code>\n"
-            )
             silent_on = bool(deliv.get("silent_if_empty", True))
-            tgt_thread = deliv.get("target_thread_id")
-            route_line = f"• <b>投递目标</b>: <code>chat {deliv.get('target_chat_id')} / Topic #{tgt_thread}</code>\n" if tgt_thread else ""
-
-            body = (
-                f"📌 <b>任务详情: {html_mod.escape(t.get('name', ''))}</b> (<code>{t['id']}</code>)\n\n"
-                f"• <b>状态</b>: {status_icon}\n"
-                f"• <b>类型</b>: <code>{ttype}</code>\n"
-                f"• <b>计划</b>: <code>{html_mod.escape(t.get('schedule_expr', ''))}</code> ({t.get('schedule_type')})\n"
-                f"• <b>下次执行</b>: <code>{nxt_loc_str}</code> (<b>{rem_str}</b>)\n"
-                f"{route_line}"
-                f"{model_line}"
-                f"• <b>静默空结果</b>: <code>{'开启 (无新内容不打扰)' if silent_on else '关闭 (每次必汇报)'}</code>\n"
-                f"• <b>累计执行</b>: <code>{st.get('run_count', 0)} 次</code> · 上次: <code>{last_loc_str}</code> (<code>{st.get('last_status', 'pending')}</code>)\n"
-            )
-            if st.get("last_error"):
-                body += f"⚠️ <b>最近错误</b>: <code>{html_mod.escape(st['last_error'][:240])}</code>\n"
-            if t.get("payload"):
-                payload_str = json.dumps(t["payload"], ensure_ascii=False)
-                if len(payload_str) > 160:
-                    payload_str = payload_str[:160] + "..."
-                body += f"📦 <b>载荷内容</b>: <code>{html_mod.escape(payload_str)}</code>\n"
+            body = format_task_detail(t, now_utc=now_utc, tz=tz)
 
             toggle_label = "⏸ 暂停任务" if t.get("enabled", True) else "▶ 启用任务"
             silent_label = f"🔕 静默空结果: {'开' if silent_on else '关'}"

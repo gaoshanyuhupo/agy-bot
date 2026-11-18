@@ -219,6 +219,51 @@ class TestTaskManagerAtomicCRUDAndDispatch(unittest.TestCase):
             self.assertEqual("UTC", lbl)
             self.assertIsNotNone(tz)
 
+    def test_precheck_cmd_and_handoff_bot_persistence_and_detail_panel(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mgr = scheduler.TaskManager(
+                filepath=os.path.join(tmp, "scheduled_tasks.json"),
+                lockpath=os.path.join(tmp, "scheduled_tasks.lock"),
+            )
+            t = mgr.create_task(
+                name="RepoWatch",
+                schedule_expr="0 * * * *",
+                task_type="agent",
+                payload={"prompt": "Inspect repo changes"},
+                target_chat_id=-1001234567890,
+                custom_id="task-watch-1",
+                precheck_cmd="  python3 scripts/repo_watch.py --repo example/demo-repo  ",
+                handoff_bot="  @Bot_One ",
+            )
+            self.assertEqual(
+                "python3 scripts/repo_watch.py --repo example/demo-repo",
+                t["payload"]["precheck_cmd"],
+            )
+            self.assertEqual("bot_one", t["delivery"]["handoff_bot"])
+
+            # Empty/whitespace optional args omit fields cleanly
+            t_plain = mgr.create_task(
+                name="PlainTask",
+                schedule_expr="in 5m",
+                task_type="agent",
+                payload={"prompt": "hi"},
+                custom_id="task-plain-1",
+                precheck_cmd="   ",
+                handoff_bot=" @ ",
+            )
+            self.assertNotIn("precheck_cmd", t_plain["payload"])
+            self.assertNotIn("handoff_bot", t_plain["delivery"])
+
+            detail_html = scheduler.format_task_detail(t)
+            self.assertIn("@bot_one", detail_html)
+            self.assertIn("repo_watch.py --repo example/demo-repo", detail_html)
+
+            with mock.patch.object(scheduler, "task_mgr", mgr):
+                panel_html, _ = scheduler.build_schedule_panel(view="detail", selected_task_id="task-watch-1")
+            self.assertIn("协同接力", panel_html)
+            self.assertIn("@bot_one", panel_html)
+            self.assertIn("预检命令", panel_html)
+
 
 if __name__ == "__main__":
     unittest.main()

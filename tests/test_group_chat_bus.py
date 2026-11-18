@@ -1009,6 +1009,217 @@ class TestGroupChatBus(unittest.TestCase):
             self.assertEqual(2, len(calls_rmnf))
             self.assertNotIn("reply_to_message_id", calls_rmnf[1])
 
+    def test_scheduled_handoff_bus_self_guard_overnight_and_rate_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bot_bus, _ = self._load_bus(tmp)
+            bot_bus.heartbeat_bot(
+                {"handle": "bot_one", "pid": os.getpid(), "role": "coordinator", "allowed_chats": [-1001234567890]}
+            )
+            bot_bus.heartbeat_bot(
+                {"handle": "bot_two", "pid": os.getpid(), "role": "worker", "allowed_chats": [-1001234567890]}
+            )
+
+            # 1. Self-handoff blocked (explicit handle and role alias)
+            self_res = bot_bus.enqueue_scheduled_handoff(
+                "bot_one", "@bot_one", chat_id=-1001234567890, task_id="t-self", task_name="Self"
+            )
+            self.assertFalse(self_res["enqueued"])
+            self.assertEqual("self_handoff", self_res["reason"])
+
+            self_role = bot_bus.enqueue_scheduled_handoff(
+                "bot_one", "coordinator", chat_id=-1001234567890, task_id="t-self2", task_name="SelfRole"
+            )
+            self.assertFalse(self_role["enqueued"])
+            self.assertEqual("self_handoff", self_role["reason"])
+
+            # 2. Overnight handoff succeeds with zero human activity anchor
+            res1 = bot_bus.enqueue_scheduled_handoff(
+                "bot_two",
+                "@bot_one",
+                chat_id=-1001234567890,
+                thread_id=12,
+                msg_id=501,
+                task_id="t-watch",
+                task_name="HourlyWatch",
+                text_excerpt="New Issue #1",
+            )
+            self.assertTrue(res1["enqueued"], res1)
+            res2 = bot_bus.enqueue_scheduled_handoff(
+                "bot_two",
+                "coordinator",
+                chat_id=-1001234567890,
+                thread_id=12,
+                msg_id=502,
+                task_id="t-watch",
+                task_name="HourlyWatch",
+                text_excerpt="New PR #2",
+            )
+            self.assertTrue(res2["enqueued"], res2)
+
+            # 3. Third handoff for same (task_id, to_bot) within 300s is rate-limited
+            res3 = bot_bus.enqueue_scheduled_handoff(
+                "bot_two",
+                "@bot_one",
+                chat_id=-1001234567890,
+                thread_id=12,
+                msg_id=503,
+                task_id="t-watch",
+                task_name="HourlyWatch",
+                text_excerpt="Spam",
+            )
+            self.assertFalse(res3["enqueued"])
+            self.assertEqual("rate_limited", res3["reason"])
+
+            pkts = bot_bus.pop_inbox_packets("bot_one")
+            self.assertEqual(2, len(pkts))
+            self.assertEqual("scheduled_handoff", pkts[0]["type"])
+            self.assertEqual(12, pkts[0]["thread_id"])
+            self.assertEqual("t-watch", pkts[0]["task_id"])
+
+    def test_bridge_scheduled_precheck_no_handoff_and_receiver_lane(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self._load_bridge(
+                tmp,
+                {"AGY_BOT_HANDLE": "bot_two", "AGY_BOT_BUS_ROLE": "worker"},
+            )
+            bridge.BOT_META.update({"bot_id": 222, "handle": "bot_two", "resolved": True})
+            bridge.bot_bus.heartbeat_bot(
+                {"handle": "bot_one", "pid": os.getpid(), "role": "coordinator", "allowed_chats": [-1001234567890]}
+            )
+            bridge.bot_bus.heartbeat_bot(
+                {"handle": "bot_two", "pid": os.getpid(), "role": "worker", "allowed_chats": [-1001234567890]}
+            )
+
+            mgr = bridge.scheduler.TaskManager(
+                filepath=os.path.join(tmp, "scheduled_tasks.json"),
+                lockpath=os.path.join(tmp, "scheduled_tasks.lock"),
+            )
+            task_agent = mgr.create_task(
+                name="RepoWatch",
+                schedule_expr="0 * * * *",
+                task_type="agent",
+                payload={"prompt": "Check repo", "precheck_cmd": "python3 scripts/repo_watch.py --repo example/demo-repo"},
+                target_chat_id=-1001234567890,
+                custom_id="task-watch-agent",
+                handoff_bot="@bot_one",
+            )
+
+            # 1. Precheck [SILENT] skips AGY_BIN completely
+            subproc_calls = []
+            with (
+                mock.patch.object(bridge.scheduler, "task_mgr", mgr),
+                mock.patch.object(
+                    bridge,
+                    "_run_subprocess_group",
+                    side_effect=lambda cmd, **kw: subproc_calls.append((cmd, kw)) or (0, "[SILENT]\n", ""),
+                ),
+                mock.patch.object(bridge, "send_rich") as send_rich_mock,
+            ):
+                bridge.execute_scheduled_task(task_agent)
+            self.assertEqual(1, len(subproc_calls))
+            self.assertTrue(subproc_calls[0][1]["shell"])
+            send_rich_mock.assert_not_called()
+            self.assertEqual("[SILENT] via precheck", mgr.get_task("task-watch-agent")["state"]["last_output_snippet"])
+            self.assertEqual([], bridge.bot_bus.pop_inbox_packets("bot_one"))
+
+            # 2. Precheck delta + [NO_HANDOFF] strips marker, sends group msg, writes ledger, does NOT wake bot_one
+            subproc_calls.clear()
+            sent_texts = []
+
+            def fake_subproc_no_handoff(cmd, **kw):
+                subproc_calls.append(cmd)
+                if kw.get("shell"):
+                    return 0, "[REPO_WATCH_DELTA repo=example/demo-repo tier=info]\n[NO_HANDOFF_RECOMMENDED]\n- Stars: 1->2", ""
+                return 0, json.dumps({"response": "[NO_HANDOFF]\n⭐ Star +1 (1 -> 2)"}), ""
+
+            with (
+                mock.patch.object(bridge.scheduler, "task_mgr", mgr),
+                mock.patch.object(bridge, "_run_subprocess_group", side_effect=fake_subproc_no_handoff),
+                mock.patch.object(
+                    bridge,
+                    "send_rich",
+                    side_effect=lambda cid, txt, **kw: sent_texts.append(txt) or (801, "html"),
+                ),
+            ):
+                bridge.execute_scheduled_task(task_agent)
+            self.assertEqual(2, len(subproc_calls))
+            prompt_idx = subproc_calls[1].index("-p") + 1
+            self.assertIn("[预检脚本检测到变更增量", subproc_calls[1][prompt_idx])
+            self.assertEqual(["⭐ Star +1 (1 -> 2)"], sent_texts)
+            self.assertNotIn("[NO_HANDOFF]", sent_texts[0])
+            self.assertEqual([], bridge.bot_bus.pop_inbox_packets("bot_one"))
+            ledger_1 = bridge.bot_bus.get_unseen_group_history(-1001234567890, "bot_one", advance_cursor=True)
+            self.assertEqual([801], [e["msg_id"] for e in ledger_1])
+
+            # 3. Precheck failure (rc != 0) injects error into AGY_BIN + actionable reply wakes bot_one
+            subproc_calls.clear()
+
+            def fake_subproc_actionable(cmd, **kw):
+                subproc_calls.append(cmd)
+                if kw.get("shell"):
+                    return 2, "", "rate limit hit"
+                return 0, json.dumps({"response": "发现新 Issue #5 需要评估"}), ""
+
+            with (
+                mock.patch.object(bridge.scheduler, "task_mgr", mgr),
+                mock.patch.object(bridge, "_run_subprocess_group", side_effect=fake_subproc_actionable),
+                mock.patch.object(bridge, "send_rich", return_value=(802, "html")),
+            ):
+                bridge.execute_scheduled_task(task_agent)
+            prompt_idx3 = subproc_calls[1].index("-p") + 1
+            self.assertIn("[预检脚本执行异常 rc=2]\nrate limit hit", subproc_calls[1][prompt_idx3])
+            ho_pkts = bridge.bot_bus.pop_inbox_packets("bot_one")
+            self.assertEqual(1, len(ho_pkts))
+            self.assertEqual("scheduled_handoff", ho_pkts[0]["type"])
+            self.assertEqual(802, ho_pkts[0]["msg_id"])
+
+            # 4. Script task with dict-returning send() writes ledger and triggers scheduled_handoff
+            task_script = mgr.create_task(
+                name="ScriptWatch",
+                schedule_expr="0 * * * *",
+                task_type="script",
+                payload={"script": "echo delta"},
+                target_chat_id=-1001234567890,
+                custom_id="task-watch-script",
+                handoff_bot="@bot_one",
+            )
+            with (
+                mock.patch.object(bridge.scheduler, "task_mgr", mgr),
+                mock.patch.object(bridge, "_run_subprocess_group", return_value=(0, "PR #9 opened", "")),
+                mock.patch.object(bridge, "send", return_value={"ok": True, "result": {"message_id": 803}}),
+            ):
+                bridge.execute_scheduled_task(task_script)
+            ho_pkts_script = bridge.bot_bus.pop_inbox_packets("bot_one")
+            self.assertEqual(1, len(ho_pkts_script))
+            self.assertEqual(803, ho_pkts_script[0]["msg_id"])
+
+            # 5. Receiving scheduled_handoff on coordinator routes to main job_q (NOT fast_chat) even when busy
+            bridge_coord = self._load_bridge(
+                tmp,
+                {"AGY_BOT_HANDLE": "bot_one", "AGY_BOT_BUS_ROLE": "coordinator"},
+            )
+            bridge_coord.BOT_META.update({"bot_id": 111, "handle": "bot_one", "resolved": True})
+            with bridge_coord.session_lock:
+                bridge_coord.turn_running = True
+                bridge_coord.turn_running_scope = "-1001234567890"
+            try:
+                with (
+                    mock.patch.object(bridge_coord, "_run_fast_group_reply") as fast_mock,
+                    mock.patch.object(bridge_coord, "send", return_value=804),
+                ):
+                    bridge_coord._handle_bot_bus_packet(ho_pkts_script[0])
+                fast_mock.assert_not_called()
+                self.assertEqual(1, bridge_coord.job_q.qsize())
+                queued_item = bridge_coord.job_q.get()
+                self.assertEqual(-1001234567890, queued_item[0])
+                self.assertEqual("__CHAT_TURN__", queued_item[3][0])
+                self.assertIn("[ACB_SCHEDULED_HANDOFF from=@bot_two", queued_item[3][1]["prompt"])
+                bridge_coord.job_q.task_done()
+            finally:
+                with bridge_coord.session_lock:
+                    bridge_coord.turn_running = False
+                    bridge_coord.turn_running_scope = None
+
 
 if __name__ == "__main__":
     unittest.main()
