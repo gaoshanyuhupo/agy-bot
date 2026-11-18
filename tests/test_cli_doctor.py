@@ -159,6 +159,108 @@ class TestAgyBotDoctor(unittest.TestCase):
             by_name = {c["name"]: c for c in rep["checks"]}
             self.assertEqual("FAIL", by_name["dir_permissions"]["status"])
 
+    def test_doctor_readonly_warns_on_0644_and_fix_tightens_to_0600_and_creates_dirs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            missing_ws = root / "nested" / "workspace"
+            missing_state_dir = root / "state_parent"
+            lock_dir = root / "locks"
+            agy_bin = _make_fake_agy(root / "bin")
+            env_path = root / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "AGY_TG_BOT_TOKEN=123456789:TEST_VALID_BOT_TOKEN_PAYLOAD_12345",
+                        "AGY_TG_ALLOWED_CHATS=-1001234567890",
+                        f"AGY_TG_WORKDIR={missing_ws}",
+                        f"AGY_TG_AGY_BIN={agy_bin}",
+                        f"AGY_TG_STATE_FILE={missing_state_dir / 'state.json'}",
+                        f"AGY_TG_LOCK_DIR={lock_dir}",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            os.chmod(env_path, 0o644)
+
+            # Default doctor stays strictly read-only: reports WARN on 0o644 and does not create missing dirs
+            rc_ro, rep_ro = cli.run_doctor(env_file=env_path)
+            self.assertEqual(0, rc_ro)
+            self.assertEqual("warn", rep_ro["status"])
+            by_name_ro = {c["name"]: c for c in rep_ro["checks"]}
+            self.assertEqual("WARN", by_name_ro["env_file"]["status"])
+            self.assertEqual(0o644, stat.S_IMODE(env_path.stat().st_mode))
+            self.assertFalse(missing_ws.exists())
+            self.assertFalse(missing_state_dir.exists())
+
+            # `doctor --fix` tightens .env to 0o600 and creates missing writable dirs -> PASS
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc_fix = cli.main(["doctor", "--env-file", str(env_path), "--fix", "--json"])
+            self.assertEqual(0, rc_fix)
+            payload = json.loads(buf.getvalue())
+            self.assertEqual("ok", payload["status"])
+            self.assertTrue(payload["fix_mode"])
+            self.assertEqual(0, payload["summary"]["warn"])
+            self.assertEqual(0, payload["summary"]["fail"])
+            by_name_fix = {c["name"]: c for c in payload["checks"]}
+            self.assertEqual("PASS", by_name_fix["env_file"]["status"])
+            self.assertIn("auto-fixed permission -> 0o600", by_name_fix["env_file"]["message"])
+            self.assertEqual(0o600, stat.S_IMODE(env_path.stat().st_mode))
+            self.assertTrue(missing_ws.is_dir())
+            self.assertTrue(missing_state_dir.is_dir())
+            self.assertTrue(lock_dir.is_dir())
+
+    def test_doctor_agy_cli_standard_home_discovery_and_missing_warn(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_home = root / "home"
+            fake_home.mkdir()
+            workdir = root / "ws"
+            workdir.mkdir()
+            env_path = root / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "AGY_TG_BOT_TOKEN=123456789:TEST_VALID_BOT_TOKEN_PAYLOAD_12345",
+                        "AGY_TG_ALLOWED_CHATS=-1001234567890",
+                        f"AGY_TG_WORKDIR={workdir}",
+                        f"AGY_TG_STATE_FILE={workdir / 'state.json'}",
+                        f"AGY_TG_LOCK_DIR={workdir}",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            os.chmod(env_path, 0o600)
+
+            local_agy = _make_fake_agy(fake_home / ".local" / "bin")
+            env_patch = {"HOME": str(fake_home), "PATH": "/nonexistent/bin", "AGY_TG_AGY_BIN": ""}
+            with mock.patch.dict(os.environ, env_patch, clear=False):
+                rc_found, rep_found = cli.run_doctor(env_file=env_path)
+            self.assertEqual(0, rc_found)
+            by_name_found = {c["name"]: c for c in rep_found["checks"]}
+            self.assertEqual("PASS", by_name_found["agy_cli"]["status"])
+            self.assertIn(str(local_agy), by_name_found["agy_cli"]["message"])
+
+            # Removing ~/.local/bin/agy and assuming no system-wide /usr/(local/)bin/agy -> WARN
+            local_agy.unlink()
+            orig_is_file = Path.is_file
+
+            def _hide_system_agy(self: Path) -> bool:
+                if self in (Path("/usr/local/bin/agy"), Path("/usr/bin/agy")):
+                    return False
+                return orig_is_file(self)
+
+            with (
+                mock.patch.dict(os.environ, env_patch, clear=False),
+                mock.patch.object(Path, "is_file", _hide_system_agy),
+            ):
+                rc_miss, rep_miss = cli.run_doctor(env_file=env_path)
+            self.assertEqual(0, rc_miss)
+            by_name_miss = {c["name"]: c for c in rep_miss["checks"]}
+            self.assertEqual("WARN", by_name_miss["agy_cli"]["status"])
+
 
 class TestAgyBotSetup(unittest.TestCase):
     """Offline tests for `agy-bot setup` idempotency and non-overwrite guarantees."""
@@ -191,8 +293,9 @@ class TestAgyBotSetup(unittest.TestCase):
             self.assertIn("AGY_TG_BOT_TOKEN=123456789:TEST_SETUP_TOKEN_VALUE_987654321", content)
             self.assertIn("AGY_TG_ALLOWED_CHATS=-1001234567890", content)
 
-            # Mutate .env with custom setting; re-running setup without --force MUST preserve it.
+            # Mutate .env with custom setting & overly broad permissions; re-running setup without --force MUST preserve it and tighten to 0o600.
             env_file.write_text("AGY_TG_BOT_TOKEN=EXAMPLE_CUSTOM_KEEP_ME_SAFE\n", encoding="utf-8")
+            os.chmod(env_file, 0o644)
             rc2, res2 = cli.run_setup(
                 target_dir=target,
                 non_interactive=True,
@@ -200,6 +303,7 @@ class TestAgyBotSetup(unittest.TestCase):
             )
             self.assertEqual(0, rc2)
             self.assertEqual("preserved", res2["env_action"])
+            self.assertEqual(0o600, stat.S_IMODE(env_file.stat().st_mode))
             self.assertEqual("AGY_TG_BOT_TOKEN=EXAMPLE_CUSTOM_KEEP_ME_SAFE\n", env_file.read_text(encoding="utf-8"))
 
             # With --force, .env IS updated cleanly.

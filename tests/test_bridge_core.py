@@ -350,5 +350,125 @@ class TestUndoRedoCheckpoints(unittest.TestCase):
                 self.assertIsNone(bridge.get_scope_value(skey, "pending_undo_notice"))
 
 
+class TestAutoCompactAndUsageQuietSelfHeal(unittest.TestCase):
+    """Verify silent auto-compact streak gating and calm usage fallback footer."""
+
+    def test_auto_compact_transient_failures_are_silent_until_streak_and_danger_zone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = _load_isolated_bridge(tmp)
+            chat_id = 123456789
+            conv = "conv-auto-compact-streak-001"
+            skey = bridge.scope_key_for(chat_id, None)
+            danger_floor = bridge.AGY_HARD_COMPACT_CEILING - bridge._AUTO_COMPACT_DANGER_BUFFER
+
+            sent_calls: list[tuple] = []
+
+            class _DummyStreamer:
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                def set_status_override(self, _text):
+                    pass
+
+                def start(self):
+                    pass
+
+                def stop(self):
+                    pass
+
+            def _fake_tg_send(*args, **kwargs):
+                sent_calls.append((args, kwargs))
+
+            stats_high = {"exists": True, "raw_ctx_tokens": danger_floor + 5000, "total_lines": 120}
+            stats_safe = {"exists": True, "raw_ctx_tokens": danger_floor - 5000, "total_lines": 120}
+
+            with (
+                mock.patch.object(bridge, "LiveDraftStreamer", _DummyStreamer),
+                mock.patch.object(bridge, "tg_send_in_route", side_effect=_fake_tg_send),
+                mock.patch.object(bridge, "_execute_compact_on_session", return_value=(False, 1.1, "502 bad gateway")),
+            ):
+                # 1st & 2nd failures: completely silent even at high context
+                with mock.patch.object(bridge, "should_auto_compact", return_value=(True, stats_high)):
+                    bridge._maybe_post_turn_auto_compact(chat_id, conv, "auto", "m", "high", scope_key=skey)
+                    bridge._maybe_post_turn_auto_compact(chat_id, conv, "auto", "m", "high", scope_key=skey)
+                self.assertEqual([], sent_calls)
+                self.assertEqual(2, bridge._auto_compact_fail_streak.get(conv))
+
+                # 3rd failure below danger floor: still silent
+                with mock.patch.object(bridge, "should_auto_compact", return_value=(True, stats_safe)):
+                    bridge._maybe_post_turn_auto_compact(chat_id, conv, "auto", "m", "high", scope_key=skey)
+                self.assertEqual([], sent_calls)
+                self.assertEqual(3, bridge._auto_compact_fail_streak.get(conv))
+
+                # Subsequent failure at/above danger floor (>= 3 streak): sends calm reminder without ⚠️
+                with mock.patch.object(bridge, "should_auto_compact", return_value=(True, stats_high)):
+                    bridge._maybe_post_turn_auto_compact(chat_id, conv, "auto", "m", "high", scope_key=skey)
+                self.assertEqual(1, len(sent_calls))
+                warn_text = sent_calls[-1][1]["text"]
+                self.assertNotIn("⚠️", warn_text)
+                self.assertIn("/new", warn_text)
+                self.assertIn("/compact", warn_text)
+
+            # Successful compact clears streak and posts normal completion notice
+            with (
+                mock.patch.object(bridge, "LiveDraftStreamer", _DummyStreamer),
+                mock.patch.object(bridge, "tg_send_in_route", side_effect=_fake_tg_send),
+                mock.patch.object(bridge, "should_auto_compact", return_value=(True, stats_high)),
+                mock.patch.object(bridge, "_execute_compact_on_session", return_value=(True, 0.9, "")),
+                mock.patch.object(
+                    bridge,
+                    "get_context_stats",
+                    return_value={"just_compacted": True, "ctx_tokens": 14000},
+                ),
+            ):
+                bridge._maybe_post_turn_auto_compact(chat_id, conv, "auto", "m", "high", scope_key=skey)
+            self.assertNotIn(conv, bridge._auto_compact_fail_streak)
+            self.assertEqual(2, len(sent_calls))
+            self.assertIn("上下文已自动精简压缩", sent_calls[-1][1]["text"])
+
+            # Next single failure after reset is silent again
+            with (
+                mock.patch.object(bridge, "LiveDraftStreamer", _DummyStreamer),
+                mock.patch.object(bridge, "tg_send_in_route", side_effect=_fake_tg_send),
+                mock.patch.object(bridge, "should_auto_compact", return_value=(True, stats_high)),
+                mock.patch.object(bridge, "_execute_compact_on_session", return_value=(False, 1.0, "timeout")),
+            ):
+                bridge._maybe_post_turn_auto_compact(chat_id, conv, "auto", "m", "high", scope_key=skey)
+            self.assertEqual(2, len(sent_calls))
+            self.assertEqual(1, bridge._auto_compact_fail_streak.get(conv))
+
+    def test_build_usage_panel_fallback_footer_is_calm_without_warning_icon(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = _load_isolated_bridge(tmp)
+            snap = {
+                "fetched_at_epoch": 1700000000.0,
+                "groups": [
+                    {
+                        "name": "Gemini",
+                        "buckets": [
+                            {
+                                "name": "5h",
+                                "window": "5h",
+                                "remaining_fraction": 0.95,
+                                "reset_time": "2026-11-18T12:00:00Z",
+                            }
+                        ],
+                    }
+                ],
+            }
+            with mock.patch.object(bridge, "fetch_plan_quota_data", return_value=(snap, True, "read timeout")):
+                text, _kb = bridge.build_usage_panel(force_live=True)
+            footer = text.splitlines()[-1]
+            self.assertNotIn("⚠️", footer)
+            self.assertNotIn("⚠️", text)
+            self.assertIn("🕒 缓存快照于", footer)
+            self.assertIn("后续自动刷新", footer)
+
+            with mock.patch.object(bridge, "fetch_plan_quota_data", return_value=(None, False, "connect error")):
+                err_text, _kb2 = bridge.build_usage_panel(force_live=True)
+            self.assertIn("⚠️", err_text)
+            self.assertIn("暂无法获取云端总套餐实时配额", err_text)
+
+
 if __name__ == "__main__":
     unittest.main()

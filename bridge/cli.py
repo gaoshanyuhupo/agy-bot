@@ -177,6 +177,16 @@ def _check_agy_cli(cfg: Dict[str, str]) -> CheckResult:
     found_path = shutil.which("agy")
     if found_path:
         return CheckResult("agy_cli", "PASS", f"Found `agy` CLI in $PATH: {found_path}")
+    if not raw_bin:
+        standard_paths = (
+            Path.home() / ".local" / "bin" / "agy",
+            Path.home() / "bin" / "agy",
+            Path("/usr/local/bin/agy"),
+            Path("/usr/bin/agy"),
+        )
+        for std_bin in standard_paths:
+            if std_bin.is_file() and os.access(std_bin, os.X_OK):
+                return CheckResult("agy_cli", "PASS", f"Found `agy` CLI at standard path: {std_bin}")
     if raw_bin:
         return CheckResult(
             "agy_cli",
@@ -192,7 +202,7 @@ def _check_agy_cli(cfg: Dict[str, str]) -> CheckResult:
     )
 
 
-def _check_env_file(env_path: Path) -> Tuple[CheckResult, Dict[str, str]]:
+def _check_env_file(env_path: Path, fix: bool = False) -> Tuple[CheckResult, Dict[str, str]]:
     if not env_path.is_file():
         return (
             CheckResult(
@@ -217,6 +227,30 @@ def _check_env_file(env_path: Path) -> Tuple[CheckResult, Dict[str, str]]:
         )
     mode = stat.S_IMODE(env_path.stat().st_mode)
     if mode & (stat.S_IRWXG | stat.S_IRWXO):
+        if fix:
+            try:
+                os.chmod(env_path, 0o600)
+                new_mode = stat.S_IMODE(env_path.stat().st_mode)
+                if not (new_mode & (stat.S_IRWXG | stat.S_IRWXO)):
+                    return (
+                        CheckResult(
+                            "env_file",
+                            "PASS",
+                            f"Readable .env at {env_path} (auto-fixed permission -> 0o600, was {oct(mode)})",
+                        ),
+                        cfg,
+                    )
+                mode = new_mode
+            except OSError as exc:
+                return (
+                    CheckResult(
+                        "env_file",
+                        "WARN",
+                        f"Found {env_path} with permissions {oct(mode)}, auto-fix chmod 0o600 failed: {exc}",
+                        f"Restrict permissions with: chmod 600 {env_path}",
+                    ),
+                    cfg,
+                )
         return (
             CheckResult(
                 "env_file",
@@ -303,7 +337,7 @@ def _check_allowed_chats(cfg: Dict[str, str]) -> CheckResult:
     return CheckResult("allowed_chats", "PASS", f"AGY_TG_ALLOWED_CHATS configured ({len(parsed)} chat ID(s))")
 
 
-def _check_dir_permissions(cfg: Dict[str, str]) -> CheckResult:
+def _check_dir_permissions(cfg: Dict[str, str], fix: bool = False) -> CheckResult:
     raw_workdir = (cfg.get("AGY_TG_WORKDIR") or os.environ.get("AGY_TG_WORKDIR") or "$HOME/agy-workspace").strip()
     raw_state = (
         cfg.get("AGY_TG_STATE_FILE") or os.environ.get("AGY_TG_STATE_FILE") or "$HOME/.agy-tg-bridge-state.json"
@@ -317,8 +351,18 @@ def _check_dir_permissions(cfg: Dict[str, str]) -> CheckResult:
     )
     failures: List[str] = []
     checked: List[str] = []
+    created: List[str] = []
     for label, path in targets:
         ok, _probe, reason = _dir_writable_readonly(path)
+        if ok and fix and not path.exists():
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+                ok, _probe, reason = _dir_writable_readonly(path)
+                if ok:
+                    created.append(f"{label}={path}")
+            except OSError as exc:
+                ok = False
+                reason = f"auto-create failed: {exc}"
         if not ok:
             failures.append(f"{label}={path} ({reason})")
         else:
@@ -329,6 +373,12 @@ def _check_dir_permissions(cfg: Dict[str, str]) -> CheckResult:
             "FAIL",
             f"Directory permission check failed: {'; '.join(failures)}",
             "Ensure target directories (or their parent directories) exist and are writable.",
+        )
+    if created:
+        return CheckResult(
+            "dir_permissions",
+            "PASS",
+            f"Writable runtime paths verified ({', '.join(checked)}; auto-created {', '.join(created)})",
         )
     return CheckResult("dir_permissions", "PASS", f"Writable runtime paths verified ({', '.join(checked)})")
 
@@ -383,6 +433,7 @@ def run_doctor(
     *,
     env_file: Optional[Path] = None,
     online: bool = False,
+    fix: bool = False,
     http_get: Optional[Callable[..., Any]] = None,
 ) -> Tuple[int, Dict[str, Any]]:
     """Run all diagnostic checks and return `(exit_code, report_dict)`."""
@@ -391,13 +442,13 @@ def run_doctor(
         _check_python_version(),
         _check_dependencies(),
     ]
-    env_res, cfg = _check_env_file(resolved_env)
+    env_res, cfg = _check_env_file(resolved_env, fix=fix)
     checks.append(env_res)
     checks.append(_check_agy_cli(cfg))
     tok_res, valid_token = _check_bot_token(cfg, env_present=resolved_env.is_file())
     checks.append(tok_res)
     checks.append(_check_allowed_chats(cfg))
-    checks.append(_check_dir_permissions(cfg))
+    checks.append(_check_dir_permissions(cfg, fix=fix))
     if online:
         checks.append(_check_telegram_online(valid_token, http_get=http_get))
 
@@ -409,6 +460,7 @@ def run_doctor(
         "status": overall,
         "env_file": str(resolved_env),
         "online_checked": bool(online),
+        "fix_mode": bool(fix),
         "summary": {
             "pass": pass_cnt,
             "warn": warn_cnt,
@@ -563,6 +615,11 @@ def run_setup(
         env_action = "overwritten" if env_exists else "created"
     else:
         env_action = "preserved"
+        try:
+            if stat.S_IMODE(env_path.stat().st_mode) & (stat.S_IRWXG | stat.S_IRWXO):
+                os.chmod(env_path, 0o600)
+        except OSError:
+            pass
 
     return 0, {
         "status": "ok",
@@ -603,6 +660,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Also verify Telegram BOT_TOKEN connectivity via getMe (disabled by default)",
     )
+    doc_p.add_argument(
+        "--fix",
+        action="store_true",
+        help="Auto-fix safe local issues (tighten .env permissions to 0600, create missing writable dirs)",
+    )
 
     set_p = sub.add_parser("setup", help="Initialize runtime bridge directory and .env template")
     set_p.add_argument(
@@ -628,7 +690,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command == "doctor":
-        rc, report = run_doctor(env_file=args.env_file, online=args.online)
+        rc, report = run_doctor(env_file=args.env_file, online=args.online, fix=args.fix)
         if args.json:
             print(json.dumps(report, ensure_ascii=False, indent=2))
         else:

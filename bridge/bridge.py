@@ -328,6 +328,26 @@ cancel_requested = False    # True if user triggered /cancel or native Stop butt
 
 state_lock = threading.Lock()
 _last_compacted_line = {}  # cid -> transcript line count at last bridge-driven compaction
+_auto_compact_fail_streak = {}  # cid -> consecutive post-turn auto-compact failure count
+_auto_compact_fail_lock = threading.Lock()
+_AUTO_COMPACT_WARN_STREAK = 3
+_AUTO_COMPACT_DANGER_BUFFER = 20000
+
+
+def _clear_auto_compact_fail_streak(cid):
+    if not cid:
+        return
+    with _auto_compact_fail_lock:
+        _auto_compact_fail_streak.pop(cid, None)
+
+
+def _record_auto_compact_failure(cid):
+    if not cid:
+        return 0
+    with _auto_compact_fail_lock:
+        streak = _auto_compact_fail_streak.get(cid, 0) + 1
+        _auto_compact_fail_streak[cid] = streak
+        return streak
 
 PRIMARY_CHAT_ID = next((c for c in sorted(ALLOWED) if c > 0), next(iter(sorted(ALLOWED)), None))
 PRIMARY_SCOPE_KEY = str(PRIMARY_CHAT_ID) if PRIMARY_CHAT_ID is not None else "default"
@@ -3247,6 +3267,7 @@ def _maybe_post_turn_auto_compact(chat_id, conv, mode, model, effort, project=No
     if cancel_requested or shutting_down:
         return
     if ok:
+        _clear_auto_compact_fail_streak(conv)
         after_stats = get_context_stats(conv)
         after_k = "~14k" if after_stats["just_compacted"] else format_tokens_k(after_stats["ctx_tokens"])
         msg_html = (
@@ -3256,11 +3277,32 @@ def _maybe_post_turn_auto_compact(chat_id, conv, mode, model, effort, project=No
         tg_send_in_route("sendMessage", chat_id, thread_id=thread_id,
                           text=msg_html, parse_mode="HTML", disable_notification=True)
     else:
-        log("Post-turn auto-compact failed for %s: %s" % (conv[:8], err_str[:200]))
-        if mode == "auto" and chat_id and int(chat_id) > 0:
-            tg_send_in_route("sendMessage", chat_id, thread_id=thread_id,
-                             text="⚠️ <i>后台自动压缩暂遇波动，已跳过（不影响刚才回复，后续自动重试）</i>",
-                             parse_mode="HTML", disable_notification=True)
+        streak = _record_auto_compact_failure(conv)
+        raw_ctx = before_stats.get("raw_ctx_tokens") or 0
+        danger_floor = AGY_HARD_COMPACT_CEILING - _AUTO_COMPACT_DANGER_BUFFER
+        log(
+            "Post-turn auto-compact failed for %s (streak=%d, ctx=%s, err=%s)"
+            % (conv[:8], streak, before_k, err_str[:200])
+        )
+        if (
+            mode == "auto"
+            and chat_id
+            and int(chat_id) > 0
+            and streak >= _AUTO_COMPACT_WARN_STREAK
+            and raw_ctx >= danger_floor
+        ):
+            warn_html = (
+                f"💡 <b>上下文持续接近上限</b>（当前 <code>{before_k}</code>，连续 {streak} 次后台自动压缩暂未成功），"
+                f"后续可能阻塞长对话；可发送 /new 开启新会话或稍候手动执行 /compact。"
+            )
+            tg_send_in_route(
+                "sendMessage",
+                chat_id,
+                thread_id=thread_id,
+                text=warn_html,
+                parse_mode="HTML",
+                disable_notification=True,
+            )
 
 
 def run_compact(chat_id, instruction="", thread_id=None, scope_key=None):
@@ -3318,6 +3360,7 @@ def run_compact(chat_id, instruction="", thread_id=None, scope_key=None):
         send(chat_id, "🛑 已取消上下文压缩。", thread_id=thread_id)
         return
     if ok:
+        _clear_auto_compact_fail_streak(conv)
         after_stats = get_context_stats(conv)
         after_k = "~14k" if after_stats["just_compacted"] else format_tokens_k(after_stats["ctx_tokens"])
         note_line = f"\n• <b>保留侧重：</b><code>{html_mod.escape(instruction[:80])}</code>" if instruction else ""
@@ -6597,7 +6640,7 @@ def build_usage_panel(force_live=True):
     ft_loc = datetime.datetime.fromtimestamp(ft_epoch, tz)
     if is_fallback:
         footer = (
-            f"\n\n<i>⚠️ 云端刷新超时，展示 {ft_loc.strftime('%m-%d %H:%M:%S')} 最近缓存 · "
+            f"\n\n<i>🕒 缓存快照于 {ft_loc.strftime('%m-%d %H:%M:%S')}（后续自动刷新） · "
             f"本机明细请看 /cost</i>"
         )
     else:
