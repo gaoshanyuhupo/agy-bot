@@ -1,0 +1,41 @@
+# Secrets & Environment Files (NEVER COMMIT)
+.env
+.env.*
+!.env.example
+*.token
+*.key
+*.pem
+*credentials*.json
+card.json
+token.json
+antigravity-oauth-token
+
+# Python / Node / Runtime Artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+node_modules/
+dist/
+build/
+
+# State, Databases & Ephemeral Media
+*.db
+*.db-shm
+*.db-wal
+*.bak
+*.bak-*
+*.tmp
+*.log
+*.png
+*.jpg
+*.jpeg
+*.webp
+uploads/
+state/
+backups/
+
+# Dynamic Auto-Generated Memory Projection Rules
+.agents/rules/claude-mem-recent.md
+.agents/rules/ecc-active-instincts.md

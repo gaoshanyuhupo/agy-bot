@@ -1,0 +1,18 @@
+[Unit]
+Description=Antigravity ECC Continuous-Learning v2 Instinct Observer Daemon
+After=network.target agy-llm-shim.service
+Requires=agy-llm-shim.service
+
+[Service]
+Type=simple
+User=YOUR_USER
+WorkingDirectory=/home/YOUR_USER/agy-mem-hub
+Environment=PATH=/home/YOUR_USER/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=AGY_SHIM_MODEL=gemini-3.8-flash-low
+Environment=AGY_INTERNAL_OBSERVER=1
+ExecStart=/home/YOUR_USER/agy-tg-bridge/venv/bin/python /home/YOUR_USER/agy-mem-hub/agy_instinct_daemon.py daemon
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

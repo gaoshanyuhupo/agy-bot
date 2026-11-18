@@ -1,0 +1,35 @@
+{
+  "claude-mem": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "if [ \"${AGY_INTERNAL_OBSERVER:-0}\" = \"1\" ]; then printf \"{}\\n\"; exit 0; fi; /usr/bin/python3 \"$HOME/.gemini/config/hooks/claude_mem_hook_gate.py\" context",
+        "timeout": 30
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "if [ \"${AGY_INTERNAL_OBSERVER:-0}\" = \"1\" ]; then printf \"{}\\n\"; exit 0; fi; /usr/bin/python3 \"$HOME/.gemini/config/hooks/claude_mem_hook_gate.py\" session-init",
+        "timeout": 30
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "if [ \"${AGY_INTERNAL_OBSERVER:-0}\" = \"1\" ]; then printf \"{}\\n\"; exit 0; fi; /usr/bin/python3 \"$HOME/.gemini/config/hooks/claude_mem_hook_gate.py\" summarize",
+        "timeout": 30
+      }
+    ]
+  },
+  "post-compact-rehydrate": {
+    "enabled": true,
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "if [ \"${AGY_INTERNAL_OBSERVER:-0}\" = \"1\" ]; then printf \"{}\\n\"; exit 0; fi; /usr/bin/python3 \"$HOME/.gemini/config/hooks/rehydrate_after_compact.py\"",
+        "timeout": 15
+      }
+    ]
+  }
+}

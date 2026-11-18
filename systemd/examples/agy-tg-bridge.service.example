@@ -1,0 +1,17 @@
+[Unit]
+Description=Antigravity CLI Telegram Bridge - @your_bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=YOUR_USER
+Environment=AGY_TG_ENV_FILE=/home/YOUR_USER/agy-tg-bridge/.env
+EnvironmentFile=/home/YOUR_USER/agy-tg-bridge/.env
+ExecStart=/home/YOUR_USER/agy-tg-bridge/venv/bin/python /home/YOUR_USER/agy-tg-bridge/bridge.py
+Restart=on-failure
+RestartSec=5
+KillMode=process
+TimeoutStopSec=90
+
+[Install]
+WantedBy=multi-user.target

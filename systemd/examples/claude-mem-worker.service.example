@@ -1,0 +1,17 @@
+[Unit]
+Description=Claude-Mem Persistent Memory Worker for Antigravity CLI
+After=network.target agy-llm-shim.service
+Wants=agy-llm-shim.service
+
+[Service]
+Type=simple
+User=YOUR_USER
+WorkingDirectory=/home/YOUR_USER
+Environment=PATH=/home/YOUR_USER/.local/bin:/home/YOUR_USER/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=AGY_INTERNAL_OBSERVER=1
+ExecStart=/home/YOUR_USER/.bun/bin/bun /home/YOUR_USER/.claude/plugins/marketplaces/thedotmack/plugin/scripts/worker-service.cjs --daemon
+Restart=always
+RestartSec=4
+
+[Install]
+WantedBy=multi-user.target

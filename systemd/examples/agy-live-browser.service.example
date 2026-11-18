@@ -1,0 +1,18 @@
+[Unit]
+Description=AGY Live Browser Hub & Async Camoufox Daemon (Telegram Mini App + Takeover)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=YOUR_USER
+WorkingDirectory=/home/YOUR_USER/agy-workspace
+Environment=HOME=/home/YOUR_USER
+Environment=AGY_INTERNAL_OBSERVER=1
+ExecStart=/home/YOUR_USER/camoufox-env/bin/python3 /home/YOUR_USER/agy-workspace/.agents/skills/live-browser/scripts/live_browser_server.py
+Restart=on-failure
+RestartSec=3
+KillMode=control-group
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

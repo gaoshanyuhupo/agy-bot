@@ -1,0 +1,25 @@
+{
+  "mcpServers": {
+    "altare": {
+      "command": "/home/YOUR_USER/.local/bin/altr",
+      "args": [
+        "mcp"
+      ],
+      "env": {
+        "ALTARE_TOKEN": "<RETRIEVE_FROM_VAULT_OR_ENV>"
+      }
+    },
+    "claude-mem": {
+      "command": "/home/YOUR_USER/.bun/bin/bun",
+      "args": [
+        "/home/YOUR_USER/.claude/plugins/marketplaces/thedotmack/plugin/scripts/mcp-server.cjs"
+      ]
+    },
+    "acb-team": {
+      "command": "/home/YOUR_USER/agy-tg-bridge/venv/bin/python",
+      "args": [
+        "/home/YOUR_USER/agy-tg-bridge/bot_bus_mcp.py"
+      ]
+    }
+  }
+}
