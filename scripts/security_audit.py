@@ -37,6 +37,7 @@ DEFAULT_LOCAL_BLOCKLIST = Path.home() / ".config" / "agy-audit-blocklist.txt"
 
 SKIP_DIRS: Set[str] = {
     ".git",
+    ".worktrees",
     "__pycache__",
     "node_modules",
     "venv",

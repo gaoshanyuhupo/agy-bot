@@ -23,7 +23,7 @@ Open-source companion stack for **Google Antigravity CLI (`agy`)**: a real-time 
 - **Scheduled Tasks Engine (`/schedule` / `/cron`)**: Supports 5-field cron expressions and relative timers (`in 30m` / `10分钟`) with shell/script/agent/keepalive job types and Telegram inline controls.
 - **Content-Addressed Workspace Undo/Redo (`/undo`, `/redo`)**: Captures pre/post turn workspace snapshots with external-edit conflict protection and atomic rollback/replay.
 - **Smart Auto-Compact & Recovery**: Configurable auto-compaction (`/compact`, `/context`) plus automatic retry/recovery on transient errors.
-- **Multi-Bot Concurrency & Coordinator Bus (`bot_bus.py`, `bot_bus_mcp.py`)**: Per-instance media outbox isolation, `fcntl.flock` atomic media claim locking + per-bot poller `flock` (`FD_CLOEXEC`) across concurrent bots (`@bot_one`, `@bot_two`), and stdio MCP delegation tools (`acb-team`).
+- **Multi-Bot Concurrency & Coordinator Bus (`bot_bus.py`, `bot_bus_mcp.py`)**: Per-instance media outbox isolation, `fcntl.flock` atomic media claim locking + per-bot poller `flock` (`FD_CLOEXEC`) across concurrent bots (`@bot_one`, `@bot_two`), stdio MCP delegation tools (`acb-team`), and optional `worktree: true` Git worktree isolation on `team_dispatch` (`<repo>/.worktrees/<job_id>` on branch `agy-team/<job_id>`, `.git/info/exclude` zero-pollution exclusion, auto-pruning clean no-op worktrees, and post-review cleanup via `team_job(action="cleanup_worktree")`).
 - **Setup & Diagnostics CLI (`agy-bot setup` / `agy-bot doctor`)**: PEP 621 packaged CLI (`pyproject.toml`) for safe out-of-tree runtime bootstrapping and offline/online environment verification.
 - **Zero-Downtime Hot Reload**: Sentinel-file triggered (`AGY_TG_RELOAD_FILE`, e.g. `/tmp/agy_bridge_reload`) graceful `os.execv` reload between turns.
 
@@ -43,7 +43,7 @@ Open-source companion stack for **Google Antigravity CLI (`agy`)**: a real-time 
 
 ### 5. `scripts/` & `tests/` — Strict Desensitization Gate & Cost Accounting
 - **`scripts/security_audit.py`**: Zero-leak structural scanner covering raw API keys/tokens, half-masked prefixes, credentialed URLs, unallowlisted external endpoints/domains, numeric/hex/UUID IDs, emails/`@handles`, hardcoded `/home/<user>` or `User=` paths, non-doc IPs, forbidden runtime files, and Git commit history (`--check-history`). Supports optional external blocklists (`--blocklist-file` / `~/.config/agy-audit-blocklist.txt`).
-- **`tests/`**: Automated `unittest` suite covering desensitization boundaries (`test_desensitization.py`), P0 hardening (`test_bridge_p0.py`), core bridge subsystems (`test_bridge_core.py`), cron scheduler (`test_scheduler.py`), CLI diagnostics (`test_cli_doctor.py`), and multi-bot team bus (`test_bot_bus.py`, `test_group_chat_bus.py`).
+- **`tests/`**: Automated `unittest` suite covering desensitization boundaries (`test_desensitization.py`), P0 hardening (`test_bridge_p0.py`), core bridge subsystems (`test_bridge_core.py`), cron scheduler (`test_scheduler.py`), CLI diagnostics (`test_cli_doctor.py`), and multi-bot team bus & worktree isolation (`test_bot_bus.py`, `test_bot_bus_worktree.py`, `test_group_chat_bus.py`).
 - **`scripts/calc_cycle_cost.py`**: Standalone CLI calculator reading `~/.gemini/antigravity-cli/brain/*/logs/transcript.jsonl` to report token totals, cache hit rate, and estimated API USD savings.
 
 ---

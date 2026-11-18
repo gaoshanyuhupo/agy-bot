@@ -37,6 +37,7 @@ build/
 uploads/
 state/
 backups/
+.worktrees/
 
 # Dynamic Auto-Generated Memory Projection Rules
 .agents/rules/claude-mem-recent.md

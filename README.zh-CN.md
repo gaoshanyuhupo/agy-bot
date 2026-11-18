@@ -22,7 +22,7 @@
 - **订阅配额与本地开销账单（`/usage`、`/cost`）**：将云端配额实时查询（`/usage`）与本地 Transcript Token、Prefix Cache 命中率及 API USD 成本统计（`/cost`）清晰分离。
 - **自主定时任务调度器（`/schedule` / `/cron`）**：支持标准 5 段式 Cron 表达式与中英文相对倒计时（`in 30m` / `10分钟`），内置最小安全间隔下限（300s）与 Telegram 内联控制面板。
 - **内容寻址工作区撤销/重做（`/undo`、`/redo`）**：每轮自动采集工作区前后快照，支持外部修改冲突安全拦截、`force` 强行回滚与一键 Redo 重放。
-- **多 Bot 并发与协作总线（`bot_bus.py`、`bot_bus_mcp.py`）**：独立实例 Outbox 隔离、`fcntl.flock` 原子图片认领锁 + 单实例 Poller 文件锁（`FD_CLOEXEC`），支持多 Bot（如 `@bot_one`、`@bot_two`）并发与 `acb-team` stdio MCP 委派。
+- **多 Bot 并发与协作总线（`bot_bus.py`、`bot_bus_mcp.py`）**：独立实例 Outbox 隔离、`fcntl.flock` 原子图片认领锁 + 单实例 Poller 文件锁（`FD_CLOEXEC`），支持多 Bot（如 `@bot_one`、`@bot_two`）并发与 `acb-team` stdio MCP 委派；`team_dispatch` 支持可选 `worktree: true` Git Worktree 并发隔离（在 `<repo>/.worktrees/<job_id>` 与 `agy-team/<job_id>` 分支独立运行，通过 `.git/info/exclude` 零污染排除，无改动自动回收，有提交或未提交改动自动保留并可通过 `team_job(action="cleanup_worktree")` 清理）。
 - **安装引导与环境体检 CLI（`agy-bot setup` / `agy-bot doctor`）**：通过标准 `pyproject.toml` 提供 `agy-bot` 命令，一键引导部署与只读/联网体检。
 - **零停机热重载**：通过哨兵文件（`AGY_TG_RELOAD_FILE`，如 `/tmp/agy_bridge_reload`）在空闲间隙自动执行优雅 `os.execv` 重载。
 
@@ -42,7 +42,7 @@
 
 ### 5. `scripts/` 与 `tests/` — 严格脱敏门禁与成本核算
 - **`scripts/security_audit.py`**：零泄漏结构化扫描器，覆盖明文密钥/Token、半掩码前缀、含凭证 URL、非白名单外链与裸域名、长数字/Hex/UUID ID、个人邮箱与未登记 `@handle`、硬编码 `/home/<user>` 或 `User=` 路径、非文档 IP、高危运行态文件及 Git 全量提交历史（`--check-history`），支持外部黑名单文件（`--blocklist-file` / `~/.config/agy-audit-blocklist.txt`）。
-- **`tests/`**：全离线 `unittest` 回归套件，覆盖脱敏门禁（`test_desensitization.py`）、P0 稳定性加固（`test_bridge_p0.py`）、核心引擎与撤销/相册/429（`test_bridge_core.py`）、定时调度（`test_scheduler.py`）、CLI 体检向导（`test_cli_doctor.py`）与多 Bot 总线（`test_bot_bus.py`、`test_group_chat_bus.py`）。
+- **`tests/`**：全离线 `unittest` 回归套件，覆盖脱敏门禁（`test_desensitization.py`）、P0 稳定性加固（`test_bridge_p0.py`）、核心引擎与撤销/相册/429（`test_bridge_core.py`）、定时调度（`test_scheduler.py`）、CLI 体检向导（`test_cli_doctor.py`）与多 Bot 总线及 Worktree 隔离（`test_bot_bus.py`、`test_bot_bus_worktree.py`、`test_group_chat_bus.py`）。
 - **`scripts/calc_cycle_cost.py`**：独立命令行工具，解析 `~/.gemini/antigravity-cli/brain/*/logs/transcript.jsonl`，输出 Token 消耗、缓存命中率与估算 USD 节省。
 
 ---
