@@ -1,0 +1,111 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 660" width="1120" height="660" role="img" aria-label="agy-bot System Architecture">
+  <defs>
+    <linearGradient id="bgGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0f172a"/>
+      <stop offset="100%" stop-color="#1e293b"/>
+    </linearGradient>
+    <linearGradient id="cardBlue" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1d4ed8" stop-opacity="0.28"/>
+      <stop offset="100%" stop-color="#1e3a8a" stop-opacity="0.18"/>
+    </linearGradient>
+    <linearGradient id="cardTeal" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0d9488" stop-opacity="0.28"/>
+      <stop offset="100%" stop-color="#115e59" stop-opacity="0.18"/>
+    </linearGradient>
+    <linearGradient id="cardAmber" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#d97706" stop-opacity="0.26"/>
+      <stop offset="100%" stop-color="#92400e" stop-opacity="0.18"/>
+    </linearGradient>
+    <linearGradient id="cardPurple" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#7c3aed" stop-opacity="0.26"/>
+      <stop offset="100%" stop-color="#4c1d95" stop-opacity="0.18"/>
+    </linearGradient>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#94a3b8"/>
+    </marker>
+    <style>
+      .title { font: 700 22px system-ui, -apple-system, sans-serif; fill: #f8fafc; }
+      .subtitle { font: 400 13px system-ui, -apple-system, sans-serif; fill: #94a3b8; }
+      .hdr { font: 700 14px system-ui, -apple-system, sans-serif; fill: #f1f5f9; }
+      .txt { font: 400 12px ui-monospace, SFMono-Regular, Menlo, monospace; fill: #cbd5e1; }
+      .mut { font: 400 11.5px system-ui, -apple-system, sans-serif; fill: #94a3b8; }
+      .pill { font: 600 11px ui-monospace, SFMono-Regular, Menlo, monospace; fill: #e2e8f0; }
+      .edge { stroke: #94a3b8; stroke-width: 1.8; fill: none; marker-end: url(#arrow); }
+      .edge-bi { stroke: #38bdf8; stroke-width: 1.8; fill: none; marker-end: url(#arrow); marker-start: url(#arrow); }
+    </style>
+  </defs>
+
+  <rect width="1120" height="660" rx="14" fill="url(#bgGrad)"/>
+
+  <!-- Header -->
+  <text x="36" y="42" class="title">agy-bot Architecture Overview</text>
+  <text x="36" y="64" class="subtitle">Multi-Bot Telegram Bridge v3 · Warm stream-json Pool · Live Browser Takeover · Lossless Rehydration · Desensitization Gate</text>
+
+  <!-- Row 1: Telegram Clients -->
+  <rect x="36" y="92" width="290" height="122" rx="10" fill="url(#cardBlue)" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="54" y="118" class="hdr">Telegram Clients &amp; Groups</text>
+  <text x="54" y="142" class="txt">• DM / Forum Topics / Supergroups</text>
+  <text x="54" y="162" class="txt">• Multi-bot team (@bot_one, @bot_two)</text>
+  <text x="54" y="182" class="txt">• Album debounce + 429 backoff</text>
+  <text x="54" y="200" class="mut">Bot API 9.5+ sendMessageDraft + Stop btn</text>
+
+  <!-- Row 1: Telegram Bridge v3 -->
+  <rect x="392" y="92" width="376" height="156" rx="10" fill="url(#cardTeal)" stroke="#14b8a6" stroke-width="1.6"/>
+  <text x="410" y="118" class="hdr">Telegram Bridge v3 (bridge/)</text>
+  <text x="410" y="142" class="txt">• bridge.py     Streaming, /undo /redo, /project</text>
+  <text x="410" y="162" class="txt">• scheduler.py  5-field cron &amp; relative timers</text>
+  <text x="410" y="182" class="txt">• bot_bus.py    flock ledger &amp; MCP (acb-team)</text>
+  <text x="410" y="202" class="txt">• cli.py        agy-bot setup / doctor CLI</text>
+  <text x="410" y="228" class="mut">Fail-closed auth · Per-bot flock + FD_CLOEXEC · KillMode=mixed</text>
+
+  <!-- Row 1: Live Browser -->
+  <rect x="832" y="92" width="252" height="156" rx="10" fill="url(#cardPurple)" stroke="#8b5cf6" stroke-width="1.5"/>
+  <text x="850" y="118" class="hdr">Live Browser Mini App</text>
+  <text x="850" y="142" class="txt">• .agents/skills/live-browser/</text>
+  <text x="850" y="162" class="txt">• 10 FPS JPEG WebSocket</text>
+  <text x="850" y="182" class="txt">• 1-click Human Takeover</text>
+  <text x="850" y="202" class="txt">• Xvfb xclip + CJK IME sheet</text>
+  <text x="850" y="228" class="mut">https://live.your-domain.com</text>
+
+  <!-- Row 2: Antigravity CLI Core -->
+  <rect x="392" y="294" width="376" height="138" rx="10" fill="url(#cardBlue)" stroke="#38bdf8" stroke-width="1.6"/>
+  <text x="410" y="320" class="hdr">Google Antigravity CLI (agy)</text>
+  <text x="410" y="344" class="txt">• Warm persistent stream-json process pool</text>
+  <text x="410" y="364" class="txt">• Per-project resume &amp; idle TTL reaper</text>
+  <text x="410" y="384" class="txt">• Workspace $HOME/agy-workspace + outbox</text>
+  <text x="410" y="408" class="mut">Zero-downtime execv hot reload between turns</text>
+
+  <!-- Row 2 Left: Lifecycle Hooks -->
+  <rect x="36" y="294" width="290" height="138" rx="10" fill="url(#cardAmber)" stroke="#f59e0b" stroke-width="1.5"/>
+  <text x="54" y="320" class="hdr">Lifecycle Hooks (hooks/)</text>
+  <text x="54" y="344" class="txt">• hooks.json (SessionStart/Stop)</text>
+  <text x="54" y="364" class="txt">• rehydrate_after_compact.py</text>
+  <text x="54" y="384" class="txt">• claude_mem_hook_gate.py</text>
+  <text x="54" y="408" class="mut">AGY_INTERNAL_OBSERVER=1 recursion guard</text>
+
+  <!-- Row 2 Right: Memory & Instinct Hub -->
+  <rect x="832" y="294" width="252" height="138" rx="10" fill="url(#cardTeal)" stroke="#2dd4bf" stroke-width="1.5"/>
+  <text x="850" y="320" class="hdr">Memory &amp; Instinct Hub</text>
+  <text x="850" y="344" class="txt">• mem-hub/agy_llm_shim.py</text>
+  <text x="850" y="364" class="txt">• agy_instinct_daemon.py</text>
+  <text x="850" y="384" class="txt">• observer-sandbox (pure-llm)</text>
+  <text x="850" y="408" class="mut">Confidence-scored skill evolution</text>
+
+  <!-- Row 3: Security & CI Gate -->
+  <rect x="36" y="482" width="1048" height="138" rx="10" fill="#0b1220" stroke="#475569" stroke-width="1.5"/>
+  <text x="54" y="510" class="hdr">Security, Packaging &amp; Verification Gates</text>
+  <text x="54" y="536" class="txt">• scripts/security_audit.py  --mode public-release --check-history (keys, URLs, IDs, PII, /home/&lt;user&gt;)</text>
+  <text x="54" y="558" class="txt">• scripts/calc_cycle_cost.py Token, prefix-cache hit %, and API USD telemetry from brain/*/transcript.jsonl</text>
+  <text x="54" y="580" class="txt">• GitHub Actions CI          Python 3.11–3.14 matrix · py_compile · ruff check · unittest · history audit</text>
+  <text x="54" y="602" class="mut">Runtime secrets stored exclusively in chmod 600 out-of-tree .env / env vars (YOUR_USER systemd templates)</text>
+
+  <!-- Arrows -->
+  <path d="M 326 153 L 390 153" class="edge-bi"/>
+  <path d="M 768 170 L 830 170" class="edge-bi"/>
+  <path d="M 580 248 L 580 292" class="edge-bi"/>
+  <path d="M 392 363 L 328 363" class="edge-bi"/>
+  <path d="M 768 363 L 830 363" class="edge-bi"/>
+  <path d="M 181 432 L 181 480" class="edge"/>
+  <path d="M 580 432 L 580 480" class="edge"/>
+  <path d="M 958 432 L 958 480" class="edge"/>
+</svg>

@@ -44,6 +44,7 @@ SKIP_DIRS: Set[str] = {
     "backups",
     "state",
     ".pytest_cache",
+    ".ruff_cache",
 }
 
 BINARY_SUFFIXES: Set[str] = {
