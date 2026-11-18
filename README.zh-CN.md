@@ -101,7 +101,7 @@ chmod 600 "$HOME/agy-tg-bridge/.env"
 ### 2. 运行环境体检与启动
 
 ```bash
-# 默认离线只读体检（追加 --online 可联机校验 Telegram getMe 连通性）：
+# 默认离线只读体检（追加 --fix 可自动收紧 .env 至 0600 并创建缺失目录；追加 --online 可联机校验 Telegram getMe 连通性）：
 "$HOME/agy-tg-bridge/venv/bin/agy-bot" doctor --env-file "$HOME/agy-tg-bridge/.env"
 
 # 前台试运行验证（生产环境建议使用第 3 步的 systemd 管理）：

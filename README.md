@@ -102,7 +102,7 @@ Copy & adapt [config/mcp_config.example.json](./config/mcp_config.example.json) 
 ### 2. Run Environment Health Checks & Launch
 
 ```bash
-# Offline read-only diagnostics (or add --online to verify Telegram getMe):
+# Offline read-only diagnostics (add --fix to tighten .env to 0600 & create missing dirs, or --online to verify Telegram getMe):
 "$HOME/agy-tg-bridge/venv/bin/agy-bot" doctor --env-file "$HOME/agy-tg-bridge/.env"
 
 # Launch manually for foreground verification (or manage via systemd in Step 3):
