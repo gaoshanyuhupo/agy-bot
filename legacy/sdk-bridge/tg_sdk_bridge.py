@@ -10,7 +10,6 @@ import json
 import logging
 import os
 import re
-import signal
 import sys
 import time
 from typing import Dict, List, Optional

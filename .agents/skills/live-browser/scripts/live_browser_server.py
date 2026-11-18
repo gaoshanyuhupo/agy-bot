@@ -26,7 +26,6 @@ import os
 from pathlib import Path
 import secrets
 import shutil
-import signal
 import sys
 import time
 from typing import Any
@@ -45,9 +44,7 @@ if str(GOOGLE_SKILL_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(GOOGLE_SKILL_SCRIPTS))
 
 from google_browser import (  # noqa: E402
-    FORBIDDEN_OVERRIDES,
     LOCK_PATH,
-    PINNED_EMAIL,
     PINNED_FINGERPRINT,
     PROFILE_DIR,
     _clean_stale_firefox_locks,
@@ -309,7 +306,7 @@ class TelegramLiveCardPublisher:
             header = f"⏹ <b>浏览器实况已结束</b> · <code>{ts_str}</code>"
             status_line = "✅ 会话已安全关闭（保留最终画面）"
         elif self.hub.takeover:
-            header = f"🟠 <b>LIVE 浏览器实况</b> · <code>🖐 人工接管中</code>"
+            header = "🟠 <b>LIVE 浏览器实况</b> · <code>🖐 人工接管中</code>"
             reason = html.escape(self.hub.takeover_reason or "AI 已暂停，等待你在面板操作完成后交还")
             status_line = f"🖐 <b>状态</b>：{reason}"
         else:

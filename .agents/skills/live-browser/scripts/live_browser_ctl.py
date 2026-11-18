@@ -9,7 +9,6 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
-import sys
 import time
 from typing import Any
 import urllib.parse

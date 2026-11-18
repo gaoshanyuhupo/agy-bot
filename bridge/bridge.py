@@ -27,7 +27,6 @@ import queue
 import random
 import re
 import shlex
-import shutil
 import signal
 import sqlite3
 import subprocess
@@ -2548,6 +2547,16 @@ def _claim_shared_image(rp, mtime):
         return True
     except Exception:
         return True
+
+
+def try_claim_image(path):
+    """Claim `path` for this bridge instance before sending bus artifacts."""
+    try:
+        rp = os.path.realpath(path)
+        st = os.stat(rp)
+    except OSError:
+        return False
+    return _claim_shared_image(rp, st.st_mtime)
 
 
 def _extract_turn_image_context(cid, turn_start_line, turn_tool_texts):
@@ -7134,8 +7143,8 @@ def build_team_panel(scope_key=None):
     my_cfg = _current_bot_cfg()
 
     lines = [
-        f"<b>🤝 Antigravity Bot Team Bus</b>",
-        f"━━━━━━━━━━━━━━━━━━━━",
+        "<b>🤝 Antigravity Bot Team Bus</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
         f"• <b>当前 Bot</b>: <code>@{html_mod.escape(me)}</code> — {_role_badge(my_cfg.get('role'))}",
     ]
     m_chat = int(my_cfg.get("mirror_chat_id") or 0)

@@ -19,7 +19,6 @@ import glob
 import json
 import os
 import re
-import sys
 
 # 默认基础路径（自动适配用户主目录，无需硬编码用户敏感路径）
 DEFAULT_BRAIN_ROOT = os.path.expanduser("~/.gemini/antigravity-cli/brain")
@@ -333,7 +332,7 @@ def main():
     print(f"  ├─ 新输入 Token : {format_tokens(totals['inp'])}")
     print(f"  ├─ 缓存读取     : {format_tokens(totals['ca'])}")
     print(f"  └─ 输出(含思考) : {format_tokens(totals['out'])}")
-    
+
     # 可视化缓存条
     filled = min(10, max(0, int(round(cache_pct / 10.0))))
     bar = "▓" * filled + "░" * (10 - filled)

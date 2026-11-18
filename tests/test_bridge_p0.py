@@ -216,38 +216,43 @@ class TestP02SingleInstanceFlock(unittest.TestCase):
             self.assertFalse(os.path.exists(lock_dir) and os.listdir(lock_dir))
 
             # 2. Lock path & file contents must hash/redact BOT_TOKEN, and spawned children must not inherit lock fd.
-            bridge = _load_isolated_bridge(tmp, {"AGY_TG_BOT_TOKEN": secret_tok, "AGY_TG_LOCK_DIR": lock_dir})
-            lock_path = bridge._instance_lock_path()
-            self.assertNotIn(secret_tok, lock_path)
-            self.assertNotIn("987654321", lock_path)
+            with mock.patch.dict(os.environ, {"AGY_TG_LOCK_DIR": lock_dir}, clear=False):
+                bridge = _load_isolated_bridge(tmp, {"AGY_TG_BOT_TOKEN": secret_tok, "AGY_TG_LOCK_DIR": lock_dir})
+                lock_path = bridge._instance_lock_path()
+                self.assertTrue(
+                    lock_path.startswith(lock_dir + os.sep),
+                    f"Expected lock path under {lock_dir}, got {lock_path}",
+                )
+                self.assertNotIn(secret_tok, lock_path)
+                self.assertNotIn("987654321", lock_path)
 
-            fh = bridge._acquire_instance_lock()
-            try:
-                lock_txt = Path(lock_path).read_text(encoding="utf-8")
-                self.assertNotIn(secret_tok, lock_txt)
-                self.assertIn(str(os.getpid()), lock_txt)
-                # Spawn a long-lived child process while lock is held; FD_CLOEXEC prevents fd inheritance.
-                child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"])
+                bridge._acquire_instance_lock()
                 try:
-                    bridge._release_instance_lock()
-                    # Another process can acquire immediately even while child is still running.
-                    reacq = subprocess.run(
-                        [
-                            sys.executable,
-                            "-c",
-                            "import bridge; bridge._acquire_instance_lock(); bridge._release_instance_lock(); print('FREE')",
-                        ],
-                        capture_output=True,
-                        text=True,
-                        env=env,
-                    )
-                    self.assertEqual(0, reacq.returncode, reacq.stderr)
-                    self.assertIn("FREE", reacq.stdout)
+                    lock_txt = Path(lock_path).read_text(encoding="utf-8")
+                    self.assertNotIn(secret_tok, lock_txt)
+                    self.assertIn(str(os.getpid()), lock_txt)
+                    # Spawn a long-lived child process while lock is held; FD_CLOEXEC prevents fd inheritance.
+                    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"])
+                    try:
+                        bridge._release_instance_lock()
+                        # Another process can acquire immediately even while child is still running.
+                        reacq = subprocess.run(
+                            [
+                                sys.executable,
+                                "-c",
+                                "import bridge; bridge._acquire_instance_lock(); bridge._release_instance_lock(); print('FREE')",
+                            ],
+                            capture_output=True,
+                            text=True,
+                            env=env,
+                        )
+                        self.assertEqual(0, reacq.returncode, reacq.stderr)
+                        self.assertIn("FREE", reacq.stdout)
+                    finally:
+                        child.terminate()
+                        child.wait(timeout=5)
                 finally:
-                    child.terminate()
-                    child.wait(timeout=5)
-            finally:
-                bridge._release_instance_lock()
+                    bridge._release_instance_lock()
 
             # 3. Empty BOT_TOKEN falls back to STATE_FILE isolation.
             no_tok_env = {**env, "AGY_TG_BOT_TOKEN": ""}

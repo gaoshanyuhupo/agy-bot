@@ -30,7 +30,7 @@ import urllib.request
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from collections import defaultdict
 from typing import Optional
 
@@ -786,7 +786,7 @@ def cmd_status(args) -> int:
         if obs_file and Path(obs_file).exists():
             with open(obs_file, encoding="utf-8") as f:
                 obs_count = sum(1 for _ in f)
-            print(f"-" * 60)
+            print("-" * 60)
             print(f"  Observations: {obs_count} events logged")
             print(f"  File: {obs_file}")
 
@@ -1062,7 +1062,7 @@ def cmd_import(args) -> int:
         except OSError:
             pass  # best-effort removal
 
-    print(f"\nImport complete!")
+    print("\nImport complete!")
     print(f"   Scope: {target_scope}")
     print(f"   Added: {len(to_add)}")
     print(f"   Updated: {len(to_update)}")
@@ -1364,7 +1364,7 @@ def cmd_evolve(args) -> int:
             print(f"   Avg confidence: {cand['avg_confidence']:.0%}")
             print(f"   Domains: {', '.join(cand['domains'])}")
             print(f"   Scopes: {scope_info}")
-            print(f"   Instincts:")
+            print("   Instincts:")
             for inst in cand['instincts'][:3]:
                 print(f"     - {inst.get('id')} [{inst.get('scope', '?')}]")
             print()
@@ -1481,14 +1481,14 @@ def _show_promotion_candidates(project: dict) -> None:
             })
 
     if candidates:
-        print(f"\n## PROMOTION CANDIDATES (project -> global)\n")
+        print("\n## PROMOTION CANDIDATES (project -> global)\n")
         print(f"  These instincts appear in {PROMOTE_MIN_PROJECTS}+ projects with high confidence:\n")
         for cand in candidates[:10]:
             proj_names = ', '.join(pname for _, pname in cand['projects'])
             print(f"  * {cand['id']} (avg: {cand['avg_confidence']:.0%})")
             print(f"    Found in: {proj_names}")
             print()
-        print(f"  Run `instinct-cli.py promote` to promote these to global scope.\n")
+        print("  Run `instinct-cli.py promote` to promote these to global scope.\n")
 
 
 def _frontmatter_scalar(lines: list[str], key: str) -> Optional[str]:
@@ -1633,7 +1633,7 @@ def _promote_specific(project: dict, instinct_id: str, force: bool, dry_run: boo
         return 0
 
     if not force:
-        response = input(f"\nPromote to global? [y/N] ")
+        response = input("\nPromote to global? [y/N] ")
         if response.lower() != 'y':
             print("Cancelled.")
             return 0
@@ -1646,7 +1646,7 @@ def _promote_specific(project: dict, instinct_id: str, force: bool, dry_run: boo
     output_content += f"confidence: {target.get('confidence', 0.5)}\n"
     output_content += f"domain: {target.get('domain', 'general')}\n"
     output_content += f"source: {target.get('source', 'promoted')}\n"
-    output_content += f"scope: global\n"
+    output_content += "scope: global\n"
     output_content += f"promoted_from: {project['id']}\n"
     output_content += f"promoted_date: {datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')}\n"
     output_content += "---\n\n"
@@ -1696,7 +1696,7 @@ def _promote_auto(project: dict, force: bool, dry_run: bool) -> int:
         print(f"    Found in {len(cand['entries'])} projects: {proj_names}")
 
     if dry_run:
-        print(f"\n[DRY RUN] No changes made.")
+        print("\n[DRY RUN] No changes made.")
         return 0
 
     if not force:
@@ -1721,8 +1721,8 @@ def _promote_auto(project: dict, force: bool, dry_run: bool) -> int:
         output_content += f"trigger: {_yaml_quote(inst.get('trigger', 'unknown'))}\n"
         output_content += f"confidence: {cand['avg_confidence']}\n"
         output_content += f"domain: {inst.get('domain', 'general')}\n"
-        output_content += f"source: auto-promoted\n"
-        output_content += f"scope: global\n"
+        output_content += "source: auto-promoted\n"
+        output_content += "scope: global\n"
         output_content += f"promoted_date: {datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')}\n"
         output_content += f"seen_in_projects: {len(cand['entries'])}\n"
         output_content += "---\n\n"
@@ -1789,7 +1789,7 @@ def cmd_projects(args) -> int:
     # Global stats
     global_personal = len(_load_instincts_from_dir(GLOBAL_PERSONAL_DIR, "personal", "global"))
     global_inherited = len(_load_instincts_from_dir(GLOBAL_INHERITED_DIR, "inherited", "global"))
-    print(f"  GLOBAL")
+    print("  GLOBAL")
     print(f"    Instincts: {global_personal} personal, {global_inherited} inherited")
 
     print(f"\n{'='*60}\n")
@@ -1994,9 +1994,9 @@ def _generate_evolved(skill_candidates: list, workflow_instincts: list, agent_ca
         content += f"# {name}\n\n"
         content += f"Evolved from {len(cand['instincts'])} instincts "
         content += f"(avg confidence: {cand['avg_confidence']:.0%})\n\n"
-        content += f"## When to Apply\n\n"
+        content += "## When to Apply\n\n"
         content += f"Trigger: {trigger}\n\n"
-        content += f"## Actions\n\n"
+        content += "## Actions\n\n"
         for inst in cand['instincts']:
             inst_content = inst.get('content', '')
             action_match = re.search(r'## Action\s*\n\s*(.+?)(?:\n\n|\n##|$)', inst_content, re.DOTALL)
@@ -2052,7 +2052,7 @@ def _generate_evolved(skill_candidates: list, workflow_instincts: list, agent_ca
         content += f"Evolved from {len(cand['instincts'])} instincts "
         content += f"(avg confidence: {cand['avg_confidence']:.0%})\n"
         content += f"Domains: {domains}\n\n"
-        content += f"## Source Instincts\n\n"
+        content += "## Source Instincts\n\n"
         for iid in instinct_ids:
             content += f"- {iid}\n"
 
@@ -2216,7 +2216,7 @@ def main() -> int:
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
 
     # Status
-    status_parser = subparsers.add_parser('status', help='Show instinct status (project + global)')
+    subparsers.add_parser('status', help='Show instinct status (project + global)')
 
     # Import
     import_parser = subparsers.add_parser('import', help='Import instincts')
