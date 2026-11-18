@@ -3,9 +3,9 @@
 [English](./README.md) | [简体中文](./README.zh-CN.md)
 
 Open-source companion stack built natively on the **official Google Antigravity CLI (`agy`)**—connecting directly to local persistent `agy` `stream-json` sessions (avoiding third-party reverse-proxy ban risks):
-- **Telegram Group Multi-Bot Team Collaboration**: `sendMessageDraft` real-time streaming, group anti-429 adaptive fallback, `acb-team` async delegation, and optional Git Worktree (`worktree: true`) concurrent isolation.
-- **Multi-Fingerprint, Multi-Egress Camoufox Browser & Telegram Mini App Takeover**: Named profiles with per-profile OS, viewport, WebGL, WebRTC/GeoIP, and proxy egress switching to isolate tasks and handle strict anti-bot checks (such as Cloudflare challenges), while supporting locked persistent fingerprints + direct host egress for core accounts; 1-click Telegram Mini App human takeover lets you resolve interactive challenges and hand control back to AI.
-- **Cross-Session Anti-Forgetting & Managed Ops**: Lossless `/compact` transcript rehydration, stateless local observer LLM shim, Continuous-Learning v2, `mem-search`, `/undo`/`/redo`, `/schedule`/`/cron`, `/project`, `/usage`/`/cost`, `agy-bot setup/doctor --fix` self-healing, and zero-downtime hot reload.
+- **Telegram Group Multi-Bot Team Collaboration & RBAC**: `sendMessageDraft` real-time streaming, group anti-429 adaptive fallback, `acb-team` async delegation, optional Git Worktree (`worktree: true`) concurrent isolation, and group/user RBAC (`AGY_TG_ADMIN_USERS` / `AGY_TG_READONLY_USERS`).
+- **Multi-Fingerprint, Multi-Egress Camoufox Browser & Telegram Mini App Takeover**: Named profiles with per-profile OS, viewport, WebGL, WebRTC/GeoIP, and proxy egress switching to isolate tasks and handle strict anti-bot checks (such as Cloudflare challenges), while supporting locked persistent fingerprints + direct host egress for core accounts; visual in-app profile switcher drawer + Telegram `/browser` inline control panel and 1-click Mini App human takeover let you resolve interactive challenges and hand control back to AI.
+- **Cross-Session Anti-Forgetting, Model Failover & Managed Ops**: Lossless `/compact` transcript rehydration, stateless local observer LLM shim, Continuous-Learning v2, `mem-search`, `/undo`/`/redo`, `/schedule`/`/cron`, `/project`, `/usage`/`/cost`, pre-output model failover (`AGY_TG_FALLBACK_MODELS` / `/model fallback`), `agy-bot setup` (`--bots ... --systemd-out ...`) / `doctor --fix`, Docker deployment ([`Dockerfile`](./Dockerfile), [`docker-compose.example.yml`](./docker-compose.example.yml), [AI-INSTALL Guide](./docs/AI-INSTALL.md)), and zero-downtime hot reload.
 - **Zero-Trace OpenBao Secret Ops & Automated Desensitization Gate**: Sanitized [OpenBao Zero-Trace Secret Ops Guide](./docs/OPENBAO_SECRETOPS_GUIDE.md) paired with structural working-tree + Git history auditing and a Python 3.11–3.14 CI matrix.
 
 - **License**: [MIT](./LICENSE)
@@ -28,11 +28,13 @@ Open-source companion stack built natively on the **official Google Antigravity 
 - **Content-Addressed Workspace Undo/Redo (`/undo`, `/redo`)**: Captures pre/post turn workspace snapshots with external-edit conflict protection and atomic rollback/replay.
 - **Smart Auto-Compact & Recovery**: Configurable auto-compaction (`/compact`, `/context`) plus automatic retry/recovery on transient errors.
 - **Multi-Bot Concurrency & Coordinator Bus (`bot_bus.py`, `bot_bus_mcp.py`)**: Per-instance media outbox isolation, `fcntl.flock` atomic media claim locking + per-bot poller `flock` (`FD_CLOEXEC`) across concurrent bots (`@bot_one`, `@bot_two`), stdio MCP delegation tools (`acb-team`), and optional `worktree: true` Git worktree isolation on `team_dispatch` (`<repo>/.worktrees/<job_id>` on branch `agy-team/<job_id>`, `.git/info/exclude` zero-pollution exclusion, auto-pruning clean no-op worktrees, and post-review cleanup via `team_job(action="cleanup_worktree")`).
-- **Setup & Diagnostics CLI (`agy-bot setup` / `agy-bot doctor`)**: PEP 621 packaged CLI (`pyproject.toml`) for safe out-of-tree runtime bootstrapping and offline/online environment verification.
+- **Model Failover & Group RBAC (`model_failover.py`, `access_control.py`)**: Automatic pre-output model fallback across `AGY_TG_FALLBACK_MODELS` (or `/model fallback`) on `429`/`5xx` errors before any tool or user-visible output occurs, paired with `admin`/`readonly` group RBAC isolation (`AGY_TG_ADMIN_USERS`, `AGY_TG_READONLY_USERS`) and separate warm pools.
+- **Telegram `/browser` Inline Control Panel**: Inspect live browser status, switch fingerprints (`browser:switch:*`) or start/stop safely from Telegram, with private-chat-only Mini App `web_app` button enforcement and `readonly` write protection.
+- **Setup, Diagnostics & Docker (`agy-bot setup` / `agy-bot doctor`, `Dockerfile`)**: PEP 621 packaged CLI (`pyproject.toml`) supporting single-bot and multi-bot team bootstrapping (`agy-bot setup --bots ... --systemd-out ...`), offline/online `doctor` checks, and non-root container templates ([`Dockerfile`](./Dockerfile), [`docker-compose.example.yml`](./docker-compose.example.yml), [docs/AI-INSTALL.md](./docs/AI-INSTALL.md)).
 - **Zero-Downtime Hot Reload**: Sentinel-file triggered (`AGY_TG_RELOAD_FILE`, e.g. `/tmp/agy_bridge_reload`) graceful `os.execv` reload between turns.
 
 ### 2. `.agents/skills/live-browser/` — Multi-Fingerprint Live Browser & Telegram Takeover
-- **Dual-Mode Live Mirroring**: In-chat `editMessageMedia` single-photo Live Card plus a low-latency binary JPEG WebSocket stream inside a Telegram Mini App (`https://live.your-domain.com` behind Cloudflare Tunnel).
+- **Dual-Mode Live Mirroring & In-App Profile Switcher**: In-chat `editMessageMedia` single-photo Live Card + `/browser` control panel, plus a low-latency binary JPEG WebSocket stream and visual profile switcher drawer inside the Telegram Mini App (`https://live.your-domain.com` behind Cloudflare Tunnel).
 - **Multi-Fingerprint & Multi-Egress Profiles (`--profile`, `--os`, `--proxy-bao`)**: Manage isolated named profiles in `~/.config/agy-live-browser/profiles.json` (`0600`) with independent `os` (`windows`/`macos`/`linux`), `locale`, `window`, `webgl_config`, `block_webrtc`, `geoip`, `--ephemeral` temp contexts, and per-profile `--proxy` or memory-only OpenBao `--proxy-bao` egress—masking credentials (`socks5://***@example.com:1080`) in all status/card outputs.
 - **Pinned Persistent Profile Hard-Lock**: When a host-pinned profile module is installed, `default` stays fail-closed locked to its persistent fingerprint (`os="windows"`, `headless="virtual"`) and direct host egress (`network.proxy.type=0`), rejecting any proxy or fingerprint override.
 - **3-State Control Arbitration**: Switch cleanly between AI observation, 1-click human takeover (pausing AI via `ai_allowed_event` to resolve interactive verifications or Cloudflare challenges), and handing control back to AI from the updated DOM state.
@@ -55,7 +57,7 @@ Open-source companion stack built natively on the **official Google Antigravity 
 ### 5. `scripts/`, `tests/` & `docs/OPENBAO_SECRETOPS_GUIDE.md` — Zero-Trace Secret Ops, Desensitization Gate & Cost Accounting
 - **Self-Hosted OpenBao Zero-Trace Secret Guide**: Fully sanitized patterns for `0600` local Vault credentials, ephemeral CLI env injection, in-memory Python helpers, and disk-free `live-browser --proxy-bao` egress in [docs/OPENBAO_SECRETOPS_GUIDE.md](./docs/OPENBAO_SECRETOPS_GUIDE.md).
 - **`scripts/security_audit.py`**: Zero-leak structural scanner covering raw API keys/tokens, half-masked prefixes, credentialed URLs, unallowlisted external endpoints/domains, numeric/hex/UUID IDs, emails/`@handles`, hardcoded `/home/<user>` or `User=` paths, non-doc IPs, forbidden runtime files, and Git commit history (`--check-history`). Supports optional external blocklists (`--blocklist-file` / `~/.config/agy-audit-blocklist.txt`).
-- **`tests/`**: Automated `unittest` suite covering desensitization boundaries (`test_desensitization.py`), P0 hardening (`test_bridge_p0.py`), core bridge subsystems (`test_bridge_core.py`), cron scheduler (`test_scheduler.py`), CLI diagnostics (`test_cli_doctor.py`), live-browser multi-fingerprint/pinned-profile isolation (`test_live_browser_profiles.py`), and multi-bot team bus & worktree isolation (`test_bot_bus.py`, `test_bot_bus_worktree.py`, `test_group_chat_bus.py`).
+- **`tests/`**: Automated `unittest` suite covering desensitization boundaries (`test_desensitization.py`), P0 hardening (`test_bridge_p0.py`), core bridge subsystems (`test_bridge_core.py`), group RBAC (`test_access_control.py`), model failover (`test_model_failover.py`), cron scheduler (`test_scheduler.py`), CLI diagnostics (`test_cli_doctor.py`), Mini App & `/browser` panel (`test_browser_panel.py`), live-browser multi-fingerprint/pinned-profile isolation (`test_live_browser_profiles.py`), and multi-bot team bus & worktree isolation (`test_bot_bus.py`, `test_bot_bus_worktree.py`, `test_group_chat_bus.py`).
 - **`scripts/calc_cycle_cost.py`**: Standalone CLI calculator reading `~/.gemini/antigravity-cli/brain/*/logs/transcript.jsonl` to report token totals, cache hit rate, and estimated API USD savings.
 
 ---
@@ -66,16 +68,19 @@ Open-source companion stack built natively on the **official Google Antigravity 
 agy-bot/
 ├── .agents/                  # Shared skills (live-browser, continuous-learning-v2, altare, mem-search) & workflows
 ├── .github/                  # CI workflows, Issue forms, and PR desensitization checklist
-├── bridge/                   # Telegram Bridge v3 (bridge.py, scheduler.py, bot_bus*.py, cli.py, .env.example)
+├── bridge/                   # Telegram Bridge v3 (bridge.py, access_control.py, model_failover.py, scheduler.py, bot_bus*.py, cli.py, .env.example)
 ├── config/                   # Sanitized MCP configuration template (mcp_config.example.json)
-├── docs/                     # Architecture diagram, Live Browser guide & OpenBao zero-trace secret guide
+├── docs/                     # AI-INSTALL guide, architecture diagram, Live Browser guide & OpenBao zero-trace secret guide
 ├── hooks/                    # hooks.json + lossless rehydrate_after_compact.py + hook gate
 ├── legacy/sdk-bridge/        # Historical SDK bridge v1 reference
 ├── mem-hub/                  # agy_llm_shim.py, agy_instinct_daemon.py, and isolated observer-sandbox/
 ├── scripts/                  # security_audit.py and standalone calc_cycle_cost.py
 ├── systemd/examples/         # Generic systemd unit templates (KillMode=mixed, YOUR_USER placeholders)
-├── tests/                    # Automated desensitization, bridge, scheduler, CLI, live-browser & team-bus tests
+├── tests/                    # Automated desensitization, RBAC, failover, bridge, scheduler, CLI, browser panel & team-bus tests
 ├── workspace/                # Shared workspace agent delivery guidelines (AGENTS.md)
+├── Dockerfile                # Non-root container image built from pyproject.toml
+├── docker-compose.example.yml # Sanitized Coordinator + Worker Docker Compose template
+├── .dockerignore             # Docker build context exclusions
 ├── pyproject.toml            # PEP 621 package metadata, `agy-bot` CLI script & Ruff lint config
 ├── README.md / README.zh-CN.md
 ├── SECURITY.md / CONTRIBUTING.md
@@ -85,6 +90,8 @@ agy-bot/
 ---
 
 ## Quickstart
+
+> For zero-guesswork single/multi-bot installation (`agy-bot setup --bots ... --systemd-out ...`) or Docker / Compose deployment ([`Dockerfile`](./Dockerfile), [`docker-compose.example.yml`](./docker-compose.example.yml)), see **[docs/AI-INSTALL.md](./docs/AI-INSTALL.md)**.
 
 ### 1. Clone, Install CLI & Bootstrap Runtime Directory
 

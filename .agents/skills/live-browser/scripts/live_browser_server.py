@@ -438,6 +438,9 @@ def sanitize_profile_for_output(name: str, entry: dict[str, Any], *, active: boo
         "os": entry.get("os") or "windows",
         "persistent": bool(entry.get("persistent", True)),
         "egress": egress,
+        "egress_display": egress,
+        "has_proxy": bool(proxy_raw or bao_ref),
+        "bao_ref": bao_ref or None,
         "active": active,
         "source": source,
     }
@@ -1296,6 +1299,7 @@ class LiveBrowserHub:
             "takeover": self.takeover,
             "takeover_reason": self.takeover_reason,
             "ai_status": self.ai_status,
+            "ai_busy": self.ai_busy_count > 0,
             "url": self.url,
             "title": self.title,
             "vw": self.vw,
@@ -1304,6 +1308,7 @@ class LiveBrowserHub:
             "cursor": self.cursor,
             "public_url": self.config.get("public_url") or "",
             "viewers": len(self.viewers),
+            "profiles": list_profiles(active_profile=self.active_profile),
         }
 
     async def broadcast_json(self, obj: dict[str, Any]) -> None:
@@ -2196,6 +2201,41 @@ async def handle_healthz(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "running": hub.engine_mode != "idle"})
 
 
+async def _ws_send_json(ws: web.WebSocketResponse, payload: dict[str, Any]) -> None:
+    if not ws.closed:
+        await ws.send_str(json.dumps(payload, ensure_ascii=False))
+
+
+async def _ws_launch_or_switch(
+    ws: web.WebSocketResponse,
+    hub: LiveBrowserHub,
+    *,
+    profile: str | None,
+    initial_url: str | None,
+    bot_key: str,
+    restart: bool,
+    takeover: bool,
+    takeover_reason: str,
+) -> None:
+    try:
+        await hub.start_hosted(
+            initial_url=initial_url,
+            bot_hint=bot_key,
+            notify_tg=True,
+            profile=profile,
+            restart=restart,
+        )
+        if takeover and not hub.takeover:
+            await hub.set_takeover(True, takeover_reason)
+    except (ValueError, KeyError, FileNotFoundError, RuntimeError, TimeoutError) as exc:
+        await _ws_send_json(ws, {"type": "toast", "message": str(exc)})
+        await hub.broadcast_state()
+    except Exception as exc:
+        log.warning("WS launch/switch failed: %s", exc)
+        await _ws_send_json(ws, {"type": "toast", "message": f"浏览器操作失败: {exc}"})
+        await hub.broadcast_state()
+
+
 async def handle_ws(request: web.Request) -> web.WebSocketResponse:
     hub: LiveBrowserHub = request.app["hub"]
     ws = web.WebSocketResponse(heartbeat=25.0, max_msg_size=2 * 1024 * 1024)
@@ -2243,19 +2283,78 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
             mtype = data.get("type")
             if mtype == "ping":
                 await ws.send_str(json.dumps({"type": "pong", "t": data.get("t", 0)}))
+            elif mtype == "list_profiles":
+                await _ws_send_json(
+                    ws,
+                    {
+                        "type": "profiles_list",
+                        "active_profile": hub.active_profile or None,
+                        "pinned": hub.active_pinned,
+                        "running": hub.engine_mode != "idle",
+                        "ai_busy": hub.ai_busy_count > 0,
+                        "takeover": hub.takeover,
+                        "profiles": list_profiles(active_profile=hub.active_profile),
+                    },
+                )
             elif mtype == "set_takeover":
                 await hub.set_takeover(bool(data.get("active")), str(data.get("reason", "")))
             elif mtype == "start_browser":
                 if hub.engine_mode == "idle":
+                    req_profile = str(data.get("profile") or "").strip() or None
+                    req_url = str(data.get("url") or "https://www.google.com")
                     asyncio.create_task(
-                        hub.start_hosted(
-                            initial_url=str(data.get("url") or "https://www.google.com"),
-                            bot_hint=bot_key,
-                            notify_tg=True,
+                        _ws_launch_or_switch(
+                            ws,
+                            hub,
+                            profile=req_profile,
+                            initial_url=req_url,
+                            bot_key=bot_key,
+                            restart=False,
+                            takeover=bool(data.get("takeover")),
+                            takeover_reason="手动启动浏览器接管模式",
                         )
                     )
-                    if data.get("takeover"):
-                        await hub.set_takeover(True, "手动启动浏览器接管模式")
+                else:
+                    await _ws_send_json(ws, {"type": "toast", "message": "浏览器已在运行中"})
+                    await hub.broadcast_state()
+            elif mtype == "switch_profile":
+                target_profile = str(data.get("profile") or "").strip()
+                req_url = str(data.get("url") or "").strip() or None
+                try:
+                    # Validate target profile existence & pinned invariants upfront
+                    resolve_launch_spec(profile_name=target_profile or None)
+                except (ValueError, KeyError, FileNotFoundError) as exc:
+                    await _ws_send_json(ws, {"type": "toast", "message": f"❌ Profile 无效: {exc}"})
+                    await hub.broadcast_state()
+                    continue
+                if not target_profile:
+                    await _ws_send_json(ws, {"type": "toast", "message": "❌ 请指定要切换的 Profile 名称"})
+                    await hub.broadcast_state()
+                    continue
+                asyncio.create_task(
+                    _ws_launch_or_switch(
+                        ws,
+                        hub,
+                        profile=target_profile,
+                        initial_url=req_url,
+                        bot_key=bot_key,
+                        restart=True,
+                        takeover=bool(data.get("takeover")),
+                        takeover_reason=f"切换指纹 {target_profile} 并接管",
+                    )
+                )
+            elif mtype == "stop_browser":
+                if hub.engine_mode == "sync_external":
+                    await _ws_send_json(ws, {"type": "toast", "message": "当前为外部脚本联动会话，无法从面板直接关闭"})
+                    await hub.broadcast_state()
+                elif hub.engine_mode == "async_hosted":
+                    if hub.ai_busy_count > 0:
+                        await _ws_send_json(ws, {"type": "toast", "message": "AI 正在执行浏览器操作，请稍候再关闭"})
+                        await hub.broadcast_state()
+                    else:
+                        await hub.stop_hosted(notify_finished=True)
+                else:
+                    await hub.broadcast_state()
             elif mtype == "extract":
                 hub.last_activity_ts = time.monotonic()
                 if hub.engine_mode == "async_hosted":
@@ -2415,6 +2514,37 @@ async def internal_profiles_delete(request: web.Request) -> web.Response:
         return web.json_response({"ok": False, "error": str(exc)}, status=404)
     except ValueError as exc:
         return web.json_response({"ok": False, "error": str(exc)}, status=400)
+    except RuntimeError as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=409)
+    except Exception as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=500)
+
+
+async def internal_profiles_switch(request: web.Request) -> web.Response:
+    hub: LiveBrowserHub = request.app["hub"]
+    check_local_auth(request, hub)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        return web.json_response({"ok": False, "error": "Request body must be a JSON object"}, status=400)
+    target_profile = str(body.get("profile") or "").strip()
+    if not target_profile:
+        return web.json_response({"ok": False, "error": "Missing required 'profile' field"}, status=400)
+    try:
+        st = await hub.start_hosted(
+            initial_url=body.get("url") or None,
+            bot_hint=body.get("bot"),
+            notify_tg=bool(body.get("notify", True)),
+            profile=target_profile,
+            restart=bool(body.get("restart", True)),
+        )
+        return web.json_response({"ok": True, **st})
+    except ValueError as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=400)
+    except (KeyError, FileNotFoundError) as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=404)
     except RuntimeError as exc:
         return web.json_response({"ok": False, "error": str(exc)}, status=409)
     except Exception as exc:
@@ -2614,6 +2744,7 @@ def create_app() -> web.Application:
     app.router.add_post("/internal/yield-lock", internal_yield_lock)
     app.router.add_get("/internal/profiles", internal_profiles_list)
     app.router.add_post("/internal/profiles", internal_profiles_create)
+    app.router.add_post("/internal/profiles/switch", internal_profiles_switch)
     app.router.add_delete("/internal/profiles/{name}", internal_profiles_delete)
     app.router.add_post("/internal/sync/start", internal_sync_start)
     app.router.add_post("/internal/sync/push", internal_sync_push)

@@ -1,0 +1,49 @@
+# Example Docker Compose template for single-bot or dual-bot (Coordinator + Worker) deployment.
+# NEVER commit real `.env` files — copy `bridge/.env.example` to `.env.coordinator` / `.env.worker` (chmod 0600).
+
+services:
+  agy-coordinator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: agy-bot:latest
+    container_name: agy-coordinator
+    restart: unless-stopped
+    env_file:
+      - ./.env.coordinator
+    environment:
+      AGY_TG_ENV_FILE: /app/config/.env
+      AGY_TG_BOT_ROLE: coordinator
+      AGY_TG_WORKDIR: /app/workspace
+      AGY_TG_STATE_FILE: /app/.gemini/antigravity-cli/bridge-coordinator-state.json
+      AGY_BOT_BUS_DIR: /var/lib/agy/bot-bus
+    volumes:
+      - ./.env.coordinator:/app/config/.env:ro
+      - ./workspace:/app/workspace
+      - agy-state:/app/.gemini/antigravity-cli
+      - agy-bot-bus:/var/lib/agy/bot-bus
+
+  agy-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: agy-bot:latest
+    container_name: agy-worker
+    restart: unless-stopped
+    env_file:
+      - ./.env.worker
+    environment:
+      AGY_TG_ENV_FILE: /app/config/.env
+      AGY_TG_BOT_ROLE: worker
+      AGY_TG_WORKDIR: /app/workspace
+      AGY_TG_STATE_FILE: /app/.gemini/antigravity-cli/bridge-worker-state.json
+      AGY_BOT_BUS_DIR: /var/lib/agy/bot-bus
+    volumes:
+      - ./.env.worker:/app/config/.env:ro
+      - ./workspace:/app/workspace
+      - agy-state:/app/.gemini/antigravity-cli
+      - agy-bot-bus:/var/lib/agy/bot-bus
+
+volumes:
+  agy-state:
+  agy-bot-bus:

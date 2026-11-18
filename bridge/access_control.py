@@ -151,6 +151,8 @@ _VIEW_ONLY_WHEN_EMPTY_COMMANDS = frozenset({
     "/project",
     "/team",
     "/bots",
+    "/browser",
+    "/profile",
 })
 
 _SCHEDULE_COMMANDS = frozenset({"/schedule", "/cron", "/timer", "/timers"})
@@ -167,6 +169,8 @@ _READONLY_CALLBACK_EXACT = frozenset({
     "action:model",
     "action:effort",
     "action:files",
+    "action:browser",
+    "browser:refresh",
     "sched:list",
     "team:refresh",
 })

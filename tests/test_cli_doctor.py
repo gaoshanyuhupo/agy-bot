@@ -320,10 +320,92 @@ class TestAgyBotSetup(unittest.TestCase):
     def test_setup_check_only_writes_zero_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "nonexistent-runtime"
-            rc, res = cli.run_setup(target_dir=target, non_interactive=True, check_only=True)
+            systemd_dir = Path(tmp) / "nonexistent-systemd"
+            rc, res = cli.run_setup(
+                target_dir=target,
+                non_interactive=True,
+                check_only=True,
+                bots="main,dev,qa",
+                systemd_out=systemd_dir,
+            )
             self.assertEqual(0, rc)
             self.assertEqual("check_only", res["status"])
+            self.assertTrue(res["team_mode"])
+            self.assertEqual(3, len(res["env_files"]))
+            self.assertEqual(3, len(res["systemd_files"]))
             self.assertFalse(target.exists())
+            self.assertFalse(systemd_dir.exists())
+
+    def test_setup_multi_bot_team_and_systemd_generation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "runtime"
+            systemd_dir = root / "systemd"
+            bus_dir = root / "shared-bus"
+            workdir = root / "ws"
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = cli.main(
+                    [
+                        "setup",
+                        "--target-dir",
+                        str(target),
+                        "--non-interactive",
+                        "--bots",
+                        "main,dev,qa",
+                        "--roles",
+                        "coordinator,worker,peer",
+                        "--allowed-chats",
+                        "-1001234567890,123456789",
+                        "--workdir",
+                        str(workdir),
+                        "--bus-dir",
+                        str(bus_dir),
+                        "--fallback-models",
+                        "gemini-3.8-flash-high,claude-sonnet-5-5",
+                        "--systemd-out",
+                        str(systemd_dir),
+                    ]
+                )
+            self.assertEqual(0, rc)
+            expected_envs = [
+                (target / ".env", "coordinator", "main" + "_bot"),
+                (target / ".env.dev", "worker", "dev" + "_bot"),
+                (target / ".env.qa", "peer", "qa" + "_bot"),
+            ]
+            for epath, role, handle_suffix in expected_envs:
+                self.assertTrue(epath.is_file(), f"Missing {epath}")
+                self.assertEqual(0o600, stat.S_IMODE(epath.stat().st_mode))
+                txt = epath.read_text(encoding="utf-8")
+                self.assertIn(f"AGY_TG_BOT_ROLE={role}", txt)
+                self.assertIn(f"AGY_TG_BOT_HANDLE=@{handle_suffix}", txt)
+                self.assertIn("AGY_TG_ALLOWED_CHATS=-1001234567890,123456789", txt)
+                self.assertIn(f"AGY_BOT_BUS_DIR={bus_dir}", txt)
+                self.assertIn("AGY_TG_FALLBACK_MODELS=gemini-3.8-flash-high,claude-sonnet-5-5", txt)
+                if epath.name != ".env":
+                    self.assertIn("REPLACE_WITH_", txt)
+
+            expected_units = [
+                (systemd_dir / "agy-tg-bridge.service", target / ".env"),
+                (systemd_dir / "agy-tg-bridge-dev.service", target / ".env.dev"),
+                (systemd_dir / "agy-tg-bridge-qa.service", target / ".env.qa"),
+            ]
+            for upath, epath in expected_units:
+                self.assertTrue(upath.is_file(), f"Missing {upath}")
+                utxt = upath.read_text(encoding="utf-8")
+                self.assertIn(f"EnvironmentFile={epath}", utxt)
+                self.assertIn(f"ExecStart={target / 'venv' / 'bin' / 'python'} {target / 'bridge.py'}", utxt)
+                self.assertIn("Restart=on-failure", utxt)
+                self.assertIn("NoNewPrivileges=true", utxt)
+
+            # Invalid --roles count fails cleanly
+            rc_bad, res_bad = cli.run_setup(
+                target_dir=target,
+                non_interactive=True,
+                bots="main,dev,qa",
+                roles="coordinator,worker",
+            )
+            self.assertEqual(1, rc_bad)
+            self.assertEqual("error", res_bad["status"])
 
     def test_module_entrypoint_bridge_cli_help(self):
         res = subprocess.run(

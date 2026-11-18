@@ -504,6 +504,7 @@ def _render_env_content(
     bot_token: Optional[str] = None,
     allowed_chats: Optional[str] = None,
     workdir: Optional[str] = None,
+    extra_overrides: Optional[Dict[str, str]] = None,
 ) -> str:
     overrides: Dict[str, str] = {}
     if bot_token is not None and bot_token.strip():
@@ -512,6 +513,10 @@ def _render_env_content(
         overrides["AGY_TG_ALLOWED_CHATS"] = allowed_chats.strip()
     if workdir is not None and workdir.strip():
         overrides["AGY_TG_WORKDIR"] = workdir.strip()
+    if extra_overrides:
+        for k, v in extra_overrides.items():
+            if v is not None and str(v).strip():
+                overrides[k] = str(v).strip()
 
     if not overrides:
         return template
@@ -534,6 +539,90 @@ def _render_env_content(
     return "\n".join(out_lines) + "\n"
 
 
+_BOT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
+_VALID_BOT_ROLES = ("coordinator", "worker", "peer")
+
+
+def _parse_bot_team_spec(
+    *,
+    bots: Optional[str],
+    team: bool,
+    roles: Optional[str],
+) -> Tuple[bool, List[Tuple[str, str]], Optional[str]]:
+    """Parse `--bots` / `--team` / `--roles` into `(is_team, [(name, role), ...], err)`."""
+    raw_bots = (bots or "").strip()
+    is_team = bool(raw_bots or team)
+    if not is_team:
+        if roles and roles.strip():
+            role_val = roles.strip().lower()
+            if role_val not in _VALID_BOT_ROLES:
+                return False, [], f"Invalid role {role_val!r}; expected one of {', '.join(_VALID_BOT_ROLES)}"
+            return False, [("main", role_val)], None
+        return False, [("main", "")], None
+
+    names = [part.strip() for part in raw_bots.split(",") if part.strip()] if raw_bots else ["main", "dev", "qa"]
+    if not names:
+        return True, [], "Bot list in --bots must not be empty"
+
+    seen_names: set[str] = set()
+    for n in names:
+        if not _BOT_NAME_RE.match(n):
+            return True, [], f"Invalid bot name {n!r}; use 1-32 chars of [A-Za-z0-9_-]"
+        low = n.lower()
+        if low in seen_names:
+            return True, [], f"Duplicate bot name {n!r} in --bots"
+        seen_names.add(low)
+
+    parsed_roles: List[str] = []
+    if roles and roles.strip():
+        parsed_roles = [r.strip().lower() for r in roles.split(",") if r.strip()]
+        for r in parsed_roles:
+            if r not in _VALID_BOT_ROLES:
+                return True, [], f"Invalid role {r!r}; expected one of {', '.join(_VALID_BOT_ROLES)}"
+        if len(parsed_roles) not in (1, len(names)):
+            return True, [], f"--roles count ({len(parsed_roles)}) must be 1 or match --bots count ({len(names)})"
+
+    specs: List[Tuple[str, str]] = []
+    for idx, n in enumerate(names):
+        if parsed_roles:
+            role_val = parsed_roles[0] if len(parsed_roles) == 1 else parsed_roles[idx]
+        else:
+            role_val = "coordinator" if idx == 0 else "worker"
+        specs.append((n, role_val))
+    return True, specs, None
+
+
+def _render_systemd_unit(
+    *,
+    unit_desc: str,
+    dest_dir: Path,
+    env_path: Path,
+    python_bin: Path,
+) -> str:
+    bridge_script = dest_dir / "bridge.py"
+    return (
+        "[Unit]\n"
+        f"Description=Antigravity CLI Telegram Bridge ({unit_desc})\n"
+        "After=network-online.target\n"
+        "Wants=network-online.target\n"
+        "\n"
+        "[Service]\n"
+        "Type=simple\n"
+        f"Environment=AGY_TG_ENV_FILE={env_path}\n"
+        f"EnvironmentFile={env_path}\n"
+        f"WorkingDirectory={dest_dir}\n"
+        f"ExecStart={python_bin} {bridge_script}\n"
+        "Restart=on-failure\n"
+        "RestartSec=5\n"
+        "KillMode=mixed\n"
+        "TimeoutStopSec=90\n"
+        "NoNewPrivileges=true\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n"
+    )
+
+
 def _copy_if_needed(src: Path, dst: Path) -> str:
     if src.resolve() == dst.resolve():
         return "skipped_same"
@@ -553,11 +642,24 @@ def run_setup(
     bot_token: Optional[str] = None,
     allowed_chats: Optional[str] = None,
     workdir: Optional[str] = None,
+    bots: Optional[str] = None,
+    team: bool = False,
+    roles: Optional[str] = None,
+    fallback_models: Optional[str] = None,
+    bus_dir: Optional[str] = None,
+    systemd_out: Optional[Path] = None,
     input_fn: Callable[[str], str] = input,
 ) -> Tuple[int, Dict[str, Any]]:
-    """Bootstrap runtime directory with `bridge/*.py` and `.env` without clobbering existing `.env`."""
+    """Bootstrap runtime directory with `bridge/*.py`, single/multi-bot `.env*`, and optional systemd units."""
     dest_dir = _expand_path(str(target_dir)) if target_dir is not None else (Path.home() / "agy-tg-bridge")
-    env_path = dest_dir / ".env"
+
+    is_team, bot_specs, spec_err = _parse_bot_team_spec(bots=bots, team=team, roles=roles)
+    if spec_err:
+        return 1, {
+            "status": "error",
+            "target_dir": str(dest_dir),
+            "error": spec_err,
+        }
 
     missing_sources = [name for name in RUNTIME_BRIDGE_FILES if not (BRIDGE_PKG_DIR / name).is_file()]
     if missing_sources:
@@ -567,10 +669,13 @@ def run_setup(
             "error": f"Missing source bridge file(s) in {BRIDGE_PKG_DIR}: {', '.join(missing_sources)}",
         }
 
-    env_exists = env_path.is_file()
-    will_write_env = (not env_exists) or force
+    primary_is_default_env = (not is_team) or (bot_specs[0][0].lower() == "main")
+    primary_env_name = ".env" if primary_is_default_env else f".env.{bot_specs[0][0]}"
+    primary_env_path = dest_dir / primary_env_name
+    primary_env_exists = primary_env_path.is_file()
+    will_write_primary = (not primary_env_exists) or force
 
-    if will_write_env and not non_interactive and not check_only and sys.stdin.isatty():
+    if will_write_primary and not non_interactive and not check_only and sys.stdin.isatty():
         if not bot_token:
             entered = input_fn("Telegram BOT_TOKEN (leave blank to keep placeholder): ").strip()
             if entered:
@@ -584,54 +689,153 @@ def run_setup(
             if entered:
                 workdir = entered
 
+    resolved_bus_dir = (bus_dir or "").strip() or (
+        "$HOME/.gemini/antigravity-cli/bot-bus" if is_team else ""
+    )
+    resolved_fb = (fallback_models or "").strip()
+    systemd_dir = _expand_path(str(systemd_out)) if systemd_out is not None else None
+    python_bin = dest_dir / "venv" / "bin" / "python"
+
+    # Build per-bot target plan
+    bot_plan: List[Dict[str, Any]] = []
+    for idx, (bname, brole) in enumerate(bot_specs):
+        use_root_env = (idx == 0 and primary_is_default_env)
+        env_filename = ".env" if use_root_env else f".env.{bname}"
+        epath = dest_dir / env_filename
+        unit_name = "agy-tg-bridge.service" if use_root_env else f"agy-tg-bridge-{bname}.service"
+        upath = (systemd_dir / unit_name) if systemd_dir is not None else None
+
+        overrides: Dict[str, str] = {}
+        if is_team or brole:
+            overrides["AGY_TG_BOT_ROLE"] = brole or "coordinator"
+            overrides["AGY_TG_BOT_HANDLE"] = f"@{bname}_bot"
+        if is_team:
+            overrides["AGY_TG_STATE_FILE"] = (
+                "$HOME/.agy-tg-bridge-state.json"
+                if use_root_env
+                else f"$HOME/.agy-tg-bridge-{bname}-state.json"
+            )
+            overrides["AGY_TG_RELOAD_FILE"] = (
+                "/tmp/agy_bridge_reload" if use_root_env else f"/tmp/agy_bridge_{bname}_reload"
+            )
+        if resolved_bus_dir:
+            overrides["AGY_BOT_BUS_DIR"] = resolved_bus_dir
+        if resolved_fb:
+            overrides["AGY_TG_FALLBACK_MODELS"] = resolved_fb
+
+        tok_for_bot = (
+            bot_token
+            if idx == 0
+            else f"1234567890:REPLACE_WITH_{bname.upper()}_BOT_TOKEN"
+        )
+        bot_plan.append(
+            {
+                "name": bname,
+                "role": brole or "standalone",
+                "env_path": epath,
+                "unit_path": upath,
+                "token": tok_for_bot,
+                "overrides": overrides,
+            }
+        )
+
     file_actions: Dict[str, str] = {}
     if check_only:
         for fname in RUNTIME_BRIDGE_FILES:
             dst = dest_dir / fname
             file_actions[fname] = "would_update" if dst.exists() else "would_copy"
-        env_action = (
-            "would_overwrite"
-            if (env_exists and force)
-            else ("would_preserve" if env_exists else "would_create")
-        )
-        return 0, {
+
+        env_actions: Dict[str, str] = {}
+        for item in bot_plan:
+            ep = item["env_path"]
+            existed = ep.is_file()
+            env_actions[str(ep)] = (
+                "would_overwrite" if (existed and force) else ("would_preserve" if existed else "would_create")
+            )
+
+        systemd_actions: Dict[str, str] = {}
+        for item in bot_plan:
+            up = item["unit_path"]
+            if up is not None:
+                existed = up.is_file()
+                systemd_actions[str(up)] = (
+                    "would_overwrite" if (existed and force) else ("would_preserve" if existed else "would_create")
+                )
+
+        res_payload: Dict[str, Any] = {
             "status": "check_only",
             "target_dir": str(dest_dir),
-            "env_file": str(env_path),
-            "env_action": env_action,
+            "env_file": str(primary_env_path),
+            "env_action": env_actions[str(primary_env_path)],
+            "env_files": env_actions,
             "files": file_actions,
+            "team_mode": is_team,
         }
+        if systemd_actions:
+            res_payload["systemd_files"] = systemd_actions
+        return 0, res_payload
 
     dest_dir.mkdir(parents=True, exist_ok=True)
     for fname in RUNTIME_BRIDGE_FILES:
         file_actions[fname] = _copy_if_needed(BRIDGE_PKG_DIR / fname, dest_dir / fname)
 
-    if will_write_env:
-        template = _load_env_template()
-        content = _render_env_content(
-            template,
-            bot_token=bot_token,
-            allowed_chats=allowed_chats,
-            workdir=workdir,
-        )
-        env_path.write_text(content, encoding="utf-8")
-        os.chmod(env_path, 0o600)
-        env_action = "overwritten" if env_exists else "created"
-    else:
-        env_action = "preserved"
-        try:
-            if stat.S_IMODE(env_path.stat().st_mode) & (stat.S_IRWXG | stat.S_IRWXO):
-                os.chmod(env_path, 0o600)
-        except OSError:
-            pass
+    template = _load_env_template()
+    env_actions = {}
+    for item in bot_plan:
+        ep: Path = item["env_path"]
+        existed = ep.is_file()
+        if (not existed) or force:
+            content = _render_env_content(
+                template,
+                bot_token=item["token"],
+                allowed_chats=allowed_chats,
+                workdir=workdir,
+                extra_overrides=item["overrides"],
+            )
+            ep.write_text(content, encoding="utf-8")
+            os.chmod(ep, 0o600)
+            env_actions[str(ep)] = "overwritten" if existed else "created"
+        else:
+            env_actions[str(ep)] = "preserved"
+            try:
+                if stat.S_IMODE(ep.stat().st_mode) & (stat.S_IRWXG | stat.S_IRWXO):
+                    os.chmod(ep, 0o600)
+            except OSError:
+                pass
 
-    return 0, {
+    systemd_actions = {}
+    if systemd_dir is not None:
+        systemd_dir.mkdir(parents=True, exist_ok=True)
+        for item in bot_plan:
+            up: Optional[Path] = item["unit_path"]
+            if up is None:
+                continue
+            existed = up.is_file()
+            if (not existed) or force:
+                desc = f"{item['name']} · {item['role']}" if is_team else item["name"]
+                unit_txt = _render_systemd_unit(
+                    unit_desc=desc,
+                    dest_dir=dest_dir,
+                    env_path=item["env_path"],
+                    python_bin=python_bin,
+                )
+                up.write_text(unit_txt, encoding="utf-8")
+                systemd_actions[str(up)] = "overwritten" if existed else "created"
+            else:
+                systemd_actions[str(up)] = "preserved"
+
+    res_out: Dict[str, Any] = {
         "status": "ok",
         "target_dir": str(dest_dir),
-        "env_file": str(env_path),
-        "env_action": env_action,
+        "env_file": str(primary_env_path),
+        "env_action": env_actions[str(primary_env_path)],
+        "env_files": env_actions,
         "files": file_actions,
+        "team_mode": is_team,
     }
+    if systemd_actions:
+        res_out["systemd_files"] = systemd_actions
+    return 0, res_out
 
 
 def _render_setup_text(result: Dict[str, Any]) -> str:
@@ -640,8 +844,12 @@ def _render_setup_text(result: Dict[str, Any]) -> str:
     prefix = "[CHECK-ONLY] " if result.get("status") == "check_only" else "[OK] "
     lines = [
         f"{prefix}agy-bot setup -> {result['target_dir']}",
-        f"  .env ({result['env_file']}): {result['env_action']}",
     ]
+    env_files = result.get("env_files") or {result["env_file"]: result["env_action"]}
+    for epath, act in env_files.items():
+        lines.append(f"  .env ({epath}): {act}")
+    for upath, act in (result.get("systemd_files") or {}).items():
+        lines.append(f"  systemd ({upath}): {act}")
     for fname, act in result["files"].items():
         lines.append(f"  {fname}: {act}")
     if result.get("status") == "ok":
@@ -687,6 +895,37 @@ def build_parser() -> argparse.ArgumentParser:
     set_p.add_argument("--bot-token", default=None, help="Optional AGY_TG_BOT_TOKEN value")
     set_p.add_argument("--allowed-chats", default=None, help="Optional AGY_TG_ALLOWED_CHATS value")
     set_p.add_argument("--workdir", default=None, help="Optional AGY_TG_WORKDIR value")
+    set_p.add_argument(
+        "--bots",
+        default=None,
+        help="Comma-separated bot names for multi-bot team setup (e.g. main,dev,qa)",
+    )
+    set_p.add_argument(
+        "--team",
+        action="store_true",
+        help="Enable multi-bot team setup (defaults to main,dev,qa if --bots omitted)",
+    )
+    set_p.add_argument(
+        "--roles",
+        default=None,
+        help="Comma-separated roles matching --bots (coordinator,worker,peer)",
+    )
+    set_p.add_argument(
+        "--fallback-models",
+        default=None,
+        help="Optional AGY_TG_FALLBACK_MODELS value (comma-separated model slugs)",
+    )
+    set_p.add_argument(
+        "--bus-dir",
+        default=None,
+        help="Optional shared AGY_BOT_BUS_DIR path for multi-bot team coordination",
+    )
+    set_p.add_argument(
+        "--systemd-out",
+        type=Path,
+        default=None,
+        help="Optional directory to render systemd .service unit file(s)",
+    )
     return parser
 
 
@@ -709,6 +948,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             bot_token=args.bot_token,
             allowed_chats=args.allowed_chats,
             workdir=args.workdir,
+            bots=args.bots,
+            team=args.team,
+            roles=args.roles,
+            fallback_models=args.fallback_models,
+            bus_dir=args.bus_dir,
+            systemd_out=args.systemd_out,
         )
         print(_render_setup_text(res), file=sys.stderr if rc != 0 else sys.stdout)
         return rc

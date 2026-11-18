@@ -287,6 +287,95 @@
       color: var(--text); padding: 0 10px; font-size: 14px;
       user-select: text; -webkit-user-select: text;
     }
+
+    /* Multi-Fingerprint Profile Indicator & Bottom Drawer */
+    .profile-badge-btn {
+      border: 1px solid var(--border);
+      background: rgba(47, 129, 247, 0.12);
+      color: #c9d1d9;
+      border-radius: 999px;
+      padding: 2px 8px;
+      font-size: 11px;
+      font-weight: 500;
+      cursor: pointer;
+      max-width: 52vw;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+    .profile-badge-btn.pinned {
+      border-color: rgba(210, 153, 34, 0.55);
+      background: rgba(210, 153, 34, 0.14);
+      color: #f2cc60;
+    }
+    .idle-profile-wrap {
+      display: flex; flex-direction: column; align-items: center; gap: 8px;
+      width: 100%; max-width: 310px;
+    }
+    #idle-profile-select {
+      width: 100%; height: 36px;
+      background: var(--panel-2); color: var(--text);
+      border: 1px solid var(--border); border-radius: 8px;
+      padding: 0 10px; font-size: 13px;
+    }
+    #profile-backdrop {
+      position: fixed; inset: 0; z-index: 88;
+      background: rgba(0, 0, 0, 0.62);
+    }
+    #profile-sheet {
+      position: fixed; left: 0; right: 0; bottom: 0; z-index: 90;
+      background: var(--panel);
+      border-top: 1.5px solid var(--accent);
+      border-radius: 16px 16px 0 0;
+      padding: 12px 12px calc(14px + var(--safe-bottom)) 12px;
+      max-height: 78vh;
+      display: flex; flex-direction: column; gap: 10px;
+      box-shadow: 0 -10px 36px rgba(0, 0, 0, 0.78);
+    }
+    .profile-sheet-header {
+      display: flex; align-items: center; justify-content: space-between; gap: 8px;
+      font-size: 14px; font-weight: 600;
+    }
+    .profile-sheet-warn {
+      font-size: 12px; color: #f2cc60;
+      background: var(--amber-bg); border: 1px solid rgba(210, 153, 34, 0.4);
+      border-radius: 8px; padding: 6px 10px; line-height: 1.4;
+    }
+    #profile-list {
+      overflow-y: auto; display: flex; flex-direction: column; gap: 8px;
+      max-height: 50vh; padding-right: 2px;
+    }
+    .profile-card {
+      background: var(--panel-2); border: 1px solid var(--border);
+      border-radius: 10px; padding: 10px;
+      display: flex; flex-direction: column; gap: 6px;
+    }
+    .profile-card.active {
+      border-color: var(--green-bright);
+      background: rgba(35, 134, 54, 0.14);
+    }
+    .profile-card-top {
+      display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    }
+    .profile-card-name {
+      font-size: 13px; font-weight: 600; color: var(--text);
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .profile-card-tags {
+      display: flex; flex-wrap: wrap; gap: 4px; font-size: 11px; color: var(--muted);
+    }
+    .profile-tag {
+      background: #0d1117; border: 1px solid var(--border);
+      border-radius: 5px; padding: 2px 6px;
+    }
+    .profile-sheet-footer {
+      display: flex; align-items: center; justify-content: space-between; gap: 8px;
+      padding-top: 4px; border-top: 1px solid var(--border);
+    }
+    .btn-danger {
+      background: rgba(248, 81, 73, 0.16); border-color: var(--danger); color: #ff7b72;
+    }
   </style>
 </head>
 <body>
@@ -351,6 +440,7 @@
 
     <div class="banner" id="mode-banner">
       <span class="banner-text" id="banner-text">👀 观看模式 · 触屏仅缩放浏览，不会打断 AI</span>
+      <button class="profile-badge-btn" id="profile-badge" onclick="openProfileSheet()" title="查看或切换浏览器指纹与出口">🎭 默认指纹</button>
       <span id="zoom-badge" style="font-size:11px;color:var(--muted);cursor:pointer;" onclick="resetZoom()">100%</span>
     </div>
 
@@ -375,11 +465,19 @@
         <div style="font-size:34px;">🖥</div>
         <div style="font-size:15px;font-weight:600;">当前没有正在运行的浏览器任务</div>
         <div style="font-size:12px;color:var(--muted);max-width:290px;">
-          当 AI 启动浏览器时画面会自动出现；你也可以现在手动拉起浏览器直接操作。
+          当 AI 启动浏览器时画面会自动出现；你也可以选择指纹环境后手动拉起浏览器直接操作。
         </div>
-        <button class="btn btn-takeover" onclick="startBrowserManual()" style="padding:8px 16px;font-size:13px;">
-          🚀 立即启动安全浏览器
-        </button>
+        <div class="idle-profile-wrap">
+          <select id="idle-profile-select" aria-label="选择浏览器指纹"></select>
+          <div style="display:flex;gap:8px;width:100%;justify-content:center;flex-wrap:wrap;">
+            <button class="btn btn-takeover" onclick="startBrowserManual()" style="padding:8px 16px;font-size:13px;">
+              🚀 立即启动安全浏览器
+            </button>
+            <button class="btn" onclick="openProfileSheet()" style="padding:8px 12px;font-size:12px;">
+              🎭 指纹详情
+            </button>
+          </div>
+        </div>
       </div>
       <div id="toast"></div>
     </div>
@@ -404,6 +502,24 @@
         <button class="btn" onclick="sendText(false)">输入</button>
         <button class="btn btn-takeover" onclick="sendText(true)">输入+↵</button>
       </div>
+    </div>
+  </div>
+
+  <!-- Bottom Multi-Fingerprint Profile Switcher Drawer -->
+  <div id="profile-backdrop" class="hidden" onclick="closeProfileSheet()"></div>
+  <div id="profile-sheet" class="hidden" role="dialog" aria-label="浏览器多指纹与出口切换">
+    <div class="profile-sheet-header">
+      <span>🎭 浏览器多指纹与出口环境</span>
+      <div style="display:flex;gap:6px;">
+        <button class="chip" onclick="refreshProfiles()">🔄 刷新</button>
+        <button class="chip" onclick="closeProfileSheet()">关闭 ×</button>
+      </div>
+    </div>
+    <div id="profile-sheet-warn" class="profile-sheet-warn hidden"></div>
+    <div id="profile-list"></div>
+    <div class="profile-sheet-footer">
+      <button class="btn btn-danger hidden" id="stop-browser-btn" onclick="stopBrowserManual()">⏹ 关闭浏览器</button>
+      <span style="font-size:11px;color:var(--muted);margin-left:auto;">🔒 Pinned 指纹强制直连且不可修改代理</span>
     </div>
   </div>
 
@@ -445,6 +561,11 @@
     let state = {
       running: false,
       engine_mode: 'idle',
+      profile: null,
+      pinned: false,
+      egress: 'direct',
+      os: '',
+      ai_busy: false,
       takeover: false,
       takeover_reason: '',
       ai_status: '',
@@ -452,7 +573,8 @@
       title: '',
       vw: 1280,
       vh: 800,
-      tabs: []
+      tabs: [],
+      profiles: []
     };
 
     let frameCount = 0;
@@ -849,6 +971,7 @@
         document.getElementById('overlay').classList.add('hidden');
         syncViewportHeight();
         updateMetricsUi();
+        refreshProfiles();
         return;
       }
       if (msg.type === 'auth_error') {
@@ -868,6 +991,19 @@
       }
       if (msg.type === 'toast') {
         showToast(msg.message);
+        return;
+      }
+      if (msg.type === 'profiles_list') {
+        state = {
+          ...state,
+          profile: msg.active_profile !== undefined ? msg.active_profile : state.profile,
+          pinned: msg.pinned !== undefined ? !!msg.pinned : state.pinned,
+          running: msg.running !== undefined ? !!msg.running : state.running,
+          ai_busy: msg.ai_busy !== undefined ? !!msg.ai_busy : state.ai_busy,
+          takeover: msg.takeover !== undefined ? !!msg.takeover : state.takeover,
+          profiles: Array.isArray(msg.profiles) ? msg.profiles : state.profiles
+        };
+        renderProfilesUi();
         return;
       }
       if (msg.type === 'input_focused') {
@@ -974,7 +1110,210 @@
       if (state.cursor && state.cursor.ts) {
         showRemoteCursor(state.cursor);
       }
+      renderProfilesUi();
       updateMetricsUi();
+    }
+
+    function formatProfileSummary(p) {
+      if (!p) return '默认指纹';
+      const lock = p.pinned ? '🔒 ' : '';
+      const osName = p.os || 'windows';
+      const egress = p.egress_display || p.egress || 'direct';
+      return `${lock}${p.name} · ${osName} · ${egress}`;
+    }
+
+    function renderProfilesUi() {
+      const profiles = Array.isArray(state.profiles) ? state.profiles : [];
+      const badge = document.getElementById('profile-badge');
+      if (badge) {
+        const activeObj = profiles.find((p) => p.active || (state.profile && p.name === state.profile));
+        if (state.running && state.profile) {
+          const lock = state.pinned ? '🔒 ' : '🎭 ';
+          const osPart = state.os || (activeObj && activeObj.os) || 'windows';
+          const egressPart = state.egress || (activeObj && (activeObj.egress_display || activeObj.egress)) || 'direct';
+          badge.textContent = `${lock}${state.profile} · ${osPart} · ${egressPart}`;
+          badge.classList.toggle('pinned', !!state.pinned);
+        } else if (activeObj) {
+          badge.textContent = `${activeObj.pinned ? '🔒 ' : '🎭 '}${formatProfileSummary(activeObj)}`;
+          badge.classList.toggle('pinned', !!activeObj.pinned);
+        } else if (profiles.length > 0) {
+          const first = profiles[0];
+          badge.textContent = `${first.pinned ? '🔒 ' : '🎭 '}${formatProfileSummary(first)}`;
+          badge.classList.toggle('pinned', !!first.pinned);
+        } else {
+          badge.textContent = '🎭 默认指纹';
+          badge.classList.remove('pinned');
+        }
+      }
+
+      const sel = document.getElementById('idle-profile-select');
+      if (sel) {
+        const prevVal = sel.value;
+        sel.innerHTML = '';
+        if (profiles.length === 0) {
+          const opt = document.createElement('option');
+          opt.value = '';
+          opt.textContent = '🎭 默认浏览器指纹';
+          sel.appendChild(opt);
+        } else {
+          profiles.forEach((p) => {
+            const opt = document.createElement('option');
+            opt.value = p.name;
+            opt.textContent = formatProfileSummary(p);
+            sel.appendChild(opt);
+          });
+          if (prevVal && profiles.some((p) => p.name === prevVal)) {
+            sel.value = prevVal;
+          } else if (state.profile && profiles.some((p) => p.name === state.profile)) {
+            sel.value = state.profile;
+          }
+        }
+      }
+
+      const stopBtn = document.getElementById('stop-browser-btn');
+      if (stopBtn) {
+        stopBtn.classList.toggle('hidden', !(state.running && state.engine_mode === 'async_hosted'));
+      }
+
+      const warnEl = document.getElementById('profile-sheet-warn');
+      if (warnEl) {
+        if (state.engine_mode === 'sync_external') {
+          warnEl.textContent = '⚠️ 当前由外部脚本控制浏览器，暂不支持切换指纹或从面板停止。';
+          warnEl.classList.remove('hidden');
+        } else if (state.takeover) {
+          warnEl.textContent = '⚠️ 当前处于人工接管中：切换指纹前请先点击【▶️ 交还给 AI】或先【⏹ 关闭浏览器】。';
+          warnEl.classList.remove('hidden');
+        } else if (state.ai_busy) {
+          warnEl.textContent = '⏳ AI 正在执行浏览器操作，请等待当前步骤完成后再切换或关闭。';
+          warnEl.classList.remove('hidden');
+        } else {
+          warnEl.classList.add('hidden');
+        }
+      }
+
+      const sheet = document.getElementById('profile-sheet');
+      const listEl = document.getElementById('profile-list');
+      if (!listEl || !sheet) return;
+      listEl.innerHTML = '';
+      if (profiles.length === 0) {
+        const empty = document.createElement('div');
+        empty.style.cssText = 'font-size:12px;color:var(--muted);padding:12px;text-align:center;';
+        empty.textContent = '暂无已加载的指纹配置，可点击右上角【🔄 刷新】。';
+        listEl.appendChild(empty);
+        return;
+      }
+
+      profiles.forEach((p) => {
+        const isCurrent = !!state.running && ((state.profile && p.name === state.profile) || !!p.active);
+        const card = document.createElement('div');
+        card.className = 'profile-card' + (isCurrent ? ' active' : '');
+
+        const top = document.createElement('div');
+        top.className = 'profile-card-top';
+
+        const nameEl = document.createElement('div');
+        nameEl.className = 'profile-card-name';
+        nameEl.textContent = `${p.pinned ? '🔒 ' : '🎭 '}${p.name}`;
+        top.appendChild(nameEl);
+
+        const actionBtn = document.createElement('button');
+        actionBtn.className = isCurrent ? 'btn' : 'btn btn-takeover';
+        if (isCurrent) {
+          actionBtn.textContent = '🟢 运行中';
+          actionBtn.disabled = true;
+          actionBtn.style.opacity = '0.8';
+        } else {
+          actionBtn.textContent = state.running ? '🔄 切换并启动' : '🚀 使用并启动';
+          actionBtn.onclick = () => switchProfile(p.name);
+        }
+        top.appendChild(actionBtn);
+        card.appendChild(top);
+
+        const tags = document.createElement('div');
+        tags.className = 'profile-card-tags';
+        const modeTag = p.pinned ? '🔒 Pinned' : (p.persistent === false ? '💨 Ephemeral' : '💾 Persistent');
+        const tagTexts = [
+          modeTag,
+          `💻 ${p.os || 'windows'}`,
+          `🌐 ${p.egress_display || p.egress || 'direct'}`
+        ];
+        if (p.locale) tagTexts.push(`🗣 ${p.locale}`);
+        if (Array.isArray(p.window) && p.window.length === 2) tagTexts.push(`📐 ${p.window[0]}x${p.window[1]}`);
+        if (p.geoip) tagTexts.push(`📍 GeoIP`);
+        if (p.block_webrtc) tagTexts.push(`🛡 No-WebRTC`);
+
+        tagTexts.forEach((txt) => {
+          const sp = document.createElement('span');
+          sp.className = 'profile-tag';
+          sp.textContent = txt;
+          tags.appendChild(sp);
+        });
+        card.appendChild(tags);
+        listEl.appendChild(card);
+      });
+    }
+
+    function openProfileSheet() {
+      haptic('light');
+      closeClipSheet();
+      closeKbSheet();
+      renderProfilesUi();
+      document.getElementById('profile-backdrop').classList.remove('hidden');
+      document.getElementById('profile-sheet').classList.remove('hidden');
+      refreshProfiles();
+    }
+
+    function closeProfileSheet() {
+      document.getElementById('profile-backdrop').classList.add('hidden');
+      document.getElementById('profile-sheet').classList.add('hidden');
+    }
+
+    function refreshProfiles() {
+      if (ws && ws.readyState === WebSocket.OPEN && authed) {
+        ws.send(JSON.stringify({ type: 'list_profiles' }));
+      }
+    }
+
+    function switchProfile(profileName) {
+      if (!ws || ws.readyState !== WebSocket.OPEN || !authed) return;
+      if (state.engine_mode === 'sync_external') {
+        showToast('外部脚本联动中，暂不支持切换指纹');
+        return;
+      }
+      if (state.takeover) {
+        showToast('请先点击右上角【▶️ 交还给 AI】或先【⏹ 关闭浏览器】再切换');
+        haptic('medium');
+        return;
+      }
+      if (state.ai_busy) {
+        showToast('AI 正在操作浏览器，请稍候再切换');
+        return;
+      }
+      haptic('medium');
+      showToast(`🔄 正在切换至指纹 ${profileName}...`);
+      ws.send(JSON.stringify({
+        type: 'switch_profile',
+        profile: profileName,
+        url: state.url || 'https://www.google.com',
+        takeover: !state.running
+      }));
+      closeProfileSheet();
+    }
+
+    function stopBrowserManual() {
+      if (!ws || ws.readyState !== WebSocket.OPEN || !authed) return;
+      if (state.engine_mode !== 'async_hosted') {
+        showToast('当前没有可关闭的托管浏览器');
+        return;
+      }
+      if (state.ai_busy) {
+        showToast('AI 正在执行浏览器操作，请等待当前步骤完成后再关闭');
+        return;
+      }
+      haptic('medium');
+      showToast('⏹ 正在安全关闭浏览器...');
+      ws.send(JSON.stringify({ type: 'stop_browser' }));
+      closeProfileSheet();
     }
 
     let lastCursorTs = 0;
@@ -1037,8 +1376,15 @@
     function startBrowserManual() {
       if (!ws || ws.readyState !== WebSocket.OPEN || !authed) return;
       haptic('medium');
-      showToast('正在启动安全浏览器...');
-      ws.send(JSON.stringify({ type: 'start_browser', url: 'https://www.google.com', takeover: true }));
+      const sel = document.getElementById('idle-profile-select');
+      const chosenProfile = sel && sel.value ? sel.value : null;
+      showToast(chosenProfile ? `正在启动指纹 ${chosenProfile}...` : '正在启动安全浏览器...');
+      ws.send(JSON.stringify({
+        type: 'start_browser',
+        url: 'https://www.google.com',
+        profile: chosenProfile,
+        takeover: true
+      }));
     }
 
     function sendInput(payload) {
@@ -1093,7 +1439,7 @@
     // Direct physical keyboard pass-through when no local <input> is focused (Desktop / iPad keyboard)
     window.addEventListener('keydown', (e) => {
       const tag = (document.activeElement && document.activeElement.tagName || '').toUpperCase();
-      if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
       if (!state.running || !state.takeover || !ws || ws.readyState !== WebSocket.OPEN) return;
       if (e.metaKey || e.ctrlKey || e.altKey) {
         if ((e.ctrlKey || e.metaKey) && !e.altKey) {

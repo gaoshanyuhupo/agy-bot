@@ -1057,6 +1057,7 @@ _PRIVATE_COMMANDS = [
     {"command": "status", "description": "Check current state & running tasks"},
     {"command": "project", "description": "Switch Antigravity CLI project / repo workspace"},
     {"command": "model", "description": "View or switch AI model"},
+    {"command": "browser", "description": "Live-Browser status, fingerprint switch & Mini App"},
     {"command": "effort", "description": "Set reasoning effort level"},
     {"command": "thinking", "description": "Toggle thought chain & tool calls visibility"},
     {"command": "sessions", "description": "List & resume recent sessions"},
@@ -5288,9 +5289,10 @@ def make_status_keyboard(scope_key=None):
          {"text": "💰 Cost (我的)", "callback_data": "action:cost"}],
         [{"text": "⏰ Schedule", "callback_data": "action:schedule"},
          {"text": "🤝 Team (/team)", "callback_data": "action:team"}],
-        [{"text": "📁 Files", "callback_data": "action:files"},
-         {"text": "🔄 Reload", "callback_data": "action:reload"}],
-        [{"text": "🛑 Stop / Cancel", "callback_data": "action:cancel"}]
+        [{"text": "🎭 Browser", "callback_data": "action:browser"},
+         {"text": "📁 Files", "callback_data": "action:files"}],
+        [{"text": "🔄 Reload", "callback_data": "action:reload"},
+         {"text": "🛑 Stop / Cancel", "callback_data": "action:cancel"}]
     ]}
 
 
@@ -6803,6 +6805,229 @@ def cmd_status(chat_id, thread_id=None, scope_key=None):
     send(chat_id, text, parse_mode="HTML", reply_markup=kb, thread_id=norm_tid)
 
 
+# ---------------------------------------------------------------- live-browser panel (/browser)
+def _live_browser_endpoint():
+    base_url = (os.environ.get("AGY_LIVE_BROWSER_URL") or "http://127.0.0.1:18795").strip().rstrip("/")
+    cfg_dir = (
+        os.environ.get("AGY_LIVE_BROWSER_CONFIG_DIR")
+        or os.path.join(os.path.expanduser("~"), ".config", "agy-live-browser")
+    )
+    tok_path = os.path.join(cfg_dir, "local.token")
+    return base_url, tok_path
+
+
+def _live_browser_request(method, path, json_body=None, timeout=(1.5, 4.0)):
+    base_url, tok_path = _live_browser_endpoint()
+    try:
+        with open(tok_path, "r", encoding="utf-8") as fh:
+            token = fh.read().strip()
+    except OSError:
+        return False, "Live-Browser 未初始化或 local.token 不可读（服务可能未运行）"
+    if not token:
+        return False, "Live-Browser local.token 为空"
+
+    url = f"{base_url}{path}"
+    headers = {"X-Live-Token": token}
+    try:
+        if method.upper() == "GET":
+            resp = requests.get(url, headers=headers, timeout=timeout)
+        else:
+            resp = requests.post(url, headers=headers, json=json_body or {}, timeout=timeout)
+        try:
+            payload = resp.json()
+        except Exception:
+            payload = {}
+        if resp.status_code >= 400 or (isinstance(payload, dict) and payload.get("ok") is False):
+            err_msg = (payload.get("error") if isinstance(payload, dict) else "") or f"HTTP {resp.status_code}"
+            return False, str(err_msg)
+        return True, payload if isinstance(payload, dict) else {}
+    except requests.exceptions.Timeout:
+        return False, "请求 Live-Browser 超时（浏览器可能正在启动或响应缓慢）"
+    except requests.exceptions.RequestException:
+        return False, "Live-Browser 服务未运行或本机端口不可达"
+    except Exception as exc:
+        return False, f"请求 Live-Browser 失败: {type(exc).__name__}"
+
+
+def build_browser_panel(chat_id):
+    ok_st, st_data = _live_browser_request("GET", "/internal/status", timeout=(1.5, 3.0))
+    if not ok_st:
+        text = (
+            "<b>🎭 Live-Browser 控制面板</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚪ <b>状态：</b>离线 / 不可达\n"
+            f"<i>{html_mod.escape(str(st_data))}</i>\n\n"
+            "💡 可先启动 <code>agy-live-browser</code> 服务后再点击下方刷新。"
+        )
+        kb = {"inline_keyboard": [[{"text": "🔄 刷新状态", "callback_data": "browser:refresh"}]]}
+        return text, kb
+
+    ok_prof, prof_data = _live_browser_request("GET", "/internal/profiles", timeout=(1.5, 3.0))
+    profiles = (
+        prof_data.get("profiles")
+        if ok_prof and isinstance(prof_data, dict) and isinstance(prof_data.get("profiles"), list)
+        else st_data.get("profiles") or []
+    )
+
+    running = bool(st_data.get("running"))
+    engine_mode = str(st_data.get("engine_mode") or "idle")
+    active_prof = str(st_data.get("profile") or "")
+    pinned = bool(st_data.get("pinned"))
+    os_name = str(st_data.get("os") or "windows")
+    egress = str(st_data.get("egress") or "direct")
+    takeover = bool(st_data.get("takeover"))
+    ai_busy = bool(st_data.get("ai_busy"))
+    cur_url = str(st_data.get("url") or "")
+    cur_title = str(st_data.get("title") or "")
+    pub_url = str(st_data.get("public_url") or "").strip().rstrip("/")
+
+    if engine_mode == "async_hosted":
+        state_badge = "🟢 运行中 (async_hosted)"
+    elif engine_mode == "sync_external":
+        state_badge = "🔵 外部脚本联动 (sync_external)"
+    else:
+        state_badge = "⚪ 待机中 (idle)"
+
+    lines = [
+        "<b>🎭 Live-Browser 多指纹控制面板</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"• <b>运行状态：</b>{state_badge}",
+    ]
+    if running and active_prof:
+        lock_icon = "🔒 " if pinned else ""
+        lines.append(
+            f"• <b>当前指纹：</b>{lock_icon}<code>{html_mod.escape(active_prof)}</code>"
+            f" · <code>{html_mod.escape(os_name)}</code> · <code>{html_mod.escape(egress)}</code>"
+        )
+        ctrl_label = "🖐 人工接管中" if takeover else ("🤖 AI 操作中" if ai_busy else "👀 AI / 观看模式")
+        lines.append(f"• <b>控制权：</b>{ctrl_label}")
+        if cur_title:
+            lines.append(f"• <b>页面标题：</b>{html_mod.escape(cur_title[:70])}")
+        if cur_url:
+            lines.append(f"• <b>当前网址：</b><code>{html_mod.escape(cur_url[:110])}</code>")
+    else:
+        lines.append("• <b>当前指纹：</b><i>未启动（可点击下方按钮拉起）</i>")
+
+    lines.append("")
+    lines.append(f"<b>可用指纹列表 ({len(profiles)})：</b>")
+    if profiles:
+        for p in profiles[:12]:
+            pname = str(p.get("name") or "")
+            p_pinned = bool(p.get("pinned"))
+            p_os = str(p.get("os") or "windows")
+            p_egress = str(p.get("egress_display") or p.get("egress") or "direct")
+            p_persist = "Pinned" if p_pinned else ("Persistent" if p.get("persistent", True) else "Ephemeral")
+            is_cur = running and (bool(p.get("active")) or (active_prof and pname == active_prof))
+            mark = "🟢 " if is_cur else ("🔒 " if p_pinned else "· ")
+            lines.append(
+                f"{mark}<code>{html_mod.escape(pname)}</code> ({p_persist} · {html_mod.escape(p_os)} · <code>{html_mod.escape(p_egress)}</code>)"
+            )
+    else:
+        lines.append("· <i>暂无已配置指纹</i>")
+
+    is_private = False
+    try:
+        is_private = int(chat_id) > 0
+    except Exception:
+        is_private = False
+
+    buttons = []
+    if pub_url.startswith("https://"):
+        if is_private:
+            buttons.append([{"text": "🖥 打开 Live-Browser Mini App", "web_app": {"url": pub_url}}])
+        else:
+            lines.append("\n💡 <i>群聊受 Telegram 限制不显示 web_app 按钮，请私聊 Bot 打开实时画面。</i>")
+
+    action_btns = []
+    if running and engine_mode == "async_hosted":
+        for p in profiles[:8]:
+            pname = str(p.get("name") or "")
+            if not pname or (active_prof and pname == active_prof) or p.get("active"):
+                continue
+            action_btns.append({"text": f"🔄 切到 {pname[:18]}", "callback_data": f"browser:switch:{pname[:45]}"})
+        for i in range(0, len(action_btns), 2):
+            buttons.append(action_btns[i:i + 2])
+        buttons.append([
+            {"text": "⏹ 停止浏览器", "callback_data": "browser:stop"},
+            {"text": "🔄 刷新状态", "callback_data": "browser:refresh"},
+        ])
+    elif not running:
+        for p in profiles[:8]:
+            pname = str(p.get("name") or "")
+            if not pname:
+                continue
+            action_btns.append({"text": f"🚀 启动 {pname[:18]}", "callback_data": f"browser:start:{pname[:45]}"})
+        for i in range(0, len(action_btns), 2):
+            buttons.append(action_btns[i:i + 2])
+        buttons.append([{"text": "🔄 刷新状态", "callback_data": "browser:refresh"}])
+    else:
+        buttons.append([{"text": "🔄 刷新状态", "callback_data": "browser:refresh"}])
+
+    return "\n".join(lines), {"inline_keyboard": buttons}
+
+
+def cmd_browser(chat_id, arg, thread_id=None, scope_key=None):
+    norm_tid = _normalize_thread_id(thread_id)
+    raw = (arg or "").strip()
+    parts = raw.split()
+    sub = parts[0].lower() if parts else ""
+
+    if not raw or sub in ("status", "list", "panel"):
+        text, kb = build_browser_panel(chat_id)
+        send(chat_id, text, parse_mode="HTML", reply_markup=kb, thread_id=norm_tid)
+        return
+
+    if sub == "switch":
+        if len(parts) < 2:
+            send(chat_id, "用法：<code>/browser switch &lt;profile&gt; [url]</code>", parse_mode="HTML", thread_id=norm_tid)
+            return
+        target = parts[1].strip()
+        body = {"profile": target, "restart": True}
+        if len(parts) > 2:
+            body["url"] = parts[2].strip()
+        ok, res = _live_browser_request("POST", "/internal/profiles/switch", json_body=body, timeout=(2.5, 25.0))
+        if not ok:
+            send(chat_id, f"❌ 切换指纹失败：{html_mod.escape(str(res))}", parse_mode="HTML", thread_id=norm_tid)
+            return
+        text, kb = build_browser_panel(chat_id)
+        send(chat_id, text, parse_mode="HTML", reply_markup=kb, thread_id=norm_tid)
+        return
+
+    if sub == "start":
+        body = {}
+        if len(parts) > 1:
+            body["profile"] = parts[1].strip()
+        if len(parts) > 2:
+            body["url"] = parts[2].strip()
+        ok, res = _live_browser_request("POST", "/internal/start", json_body=body, timeout=(2.5, 25.0))
+        if not ok:
+            send(chat_id, f"❌ 启动浏览器失败：{html_mod.escape(str(res))}", parse_mode="HTML", thread_id=norm_tid)
+            return
+        text, kb = build_browser_panel(chat_id)
+        send(chat_id, text, parse_mode="HTML", reply_markup=kb, thread_id=norm_tid)
+        return
+
+    if sub == "stop":
+        ok, res = _live_browser_request("POST", "/internal/stop", json_body={}, timeout=(2.0, 10.0))
+        if not ok:
+            send(chat_id, f"❌ 停止浏览器失败：{html_mod.escape(str(res))}", parse_mode="HTML", thread_id=norm_tid)
+            return
+        text, kb = build_browser_panel(chat_id)
+        send(chat_id, text, parse_mode="HTML", reply_markup=kb, thread_id=norm_tid)
+        return
+
+    send(
+        chat_id,
+        "<b>🎭 /browser 用法：</b>\n"
+        "• <code>/browser</code> — 查看状态、指纹列表与控制面板\n"
+        "• <code>/browser switch &lt;name&gt; [url]</code> — 切换并重启指定指纹\n"
+        "• <code>/browser start [name] [url]</code> — 启动安全浏览器\n"
+        "• <code>/browser stop</code> — 安全停止托管浏览器",
+        parse_mode="HTML",
+        thread_id=norm_tid,
+    )
+
+
 # ---------------------------------------------------------------- callback handling
 def handle_callback(cb):
     cb_id = cb.get("id")
@@ -7092,6 +7317,13 @@ def handle_callback(cb):
         tg("answerCallbackQuery", callback_query_id=cb_id)
         cmd_files(chat_id, "", thread_id=thread_id, scope_key=skey)
 
+    elif data == "action:browser":
+        tg("answerCallbackQuery", callback_query_id=cb_id)
+        cmd_browser(chat_id, "", thread_id=thread_id, scope_key=skey)
+
+    elif data.startswith("browser:"):
+        _handle_browser_callback(cb_id, chat_id, thread_id, msg_id, data)
+
     elif data == "action:reload":
         tg("answerCallbackQuery", callback_query_id=cb_id, text="Reloading bridge...")
         with session_lock:
@@ -7170,6 +7402,52 @@ def _handle_team_callback(cb_id, chat_id, thread_id, skey, msg_id, data):
     _publish_bot_heartbeat()
     if msg_id:
         cmd_team(chat_id, "", thread_id=thread_id, scope_key=skey, edit_msg_id=msg_id)
+
+
+def _handle_browser_callback(cb_id, chat_id, thread_id, msg_id, data):
+    sub = data[8:]
+    if sub == "refresh":
+        tg("answerCallbackQuery", callback_query_id=cb_id, text="浏览器状态已刷新")
+    elif sub.startswith("switch:"):
+        target = sub[7:].strip()
+        ok, res = _live_browser_request(
+            "POST",
+            "/internal/profiles/switch",
+            json_body={"profile": target, "restart": True},
+            timeout=(2.5, 25.0),
+        )
+        if not ok:
+            tg("answerCallbackQuery", callback_query_id=cb_id, text=f"切换失败: {res}"[:180], show_alert=True)
+            return
+        tg("answerCallbackQuery", callback_query_id=cb_id, text=f"已切换至指纹 {target}")
+    elif sub.startswith("start:"):
+        target = sub[6:].strip()
+        body = {"profile": target} if target else {}
+        ok, res = _live_browser_request("POST", "/internal/start", json_body=body, timeout=(2.5, 25.0))
+        if not ok:
+            tg("answerCallbackQuery", callback_query_id=cb_id, text=f"启动失败: {res}"[:180], show_alert=True)
+            return
+        tg("answerCallbackQuery", callback_query_id=cb_id, text=f"已启动指纹 {target or 'default'}")
+    elif sub == "stop":
+        ok, res = _live_browser_request("POST", "/internal/stop", json_body={}, timeout=(2.0, 10.0))
+        if not ok:
+            tg("answerCallbackQuery", callback_query_id=cb_id, text=f"停止失败: {res}"[:180], show_alert=True)
+            return
+        tg("answerCallbackQuery", callback_query_id=cb_id, text="浏览器已安全停止")
+    else:
+        tg("answerCallbackQuery", callback_query_id=cb_id)
+        return
+
+    if msg_id:
+        panel_text, panel_kb = build_browser_panel(chat_id)
+        tg(
+            "editMessageText",
+            chat_id=chat_id,
+            message_id=msg_id,
+            text=panel_text,
+            parse_mode="HTML",
+            reply_markup=panel_kb,
+        )
 
 
 # ---------------------------------------------------------------- reply quote & album helpers
@@ -7648,6 +7926,8 @@ def handle_message(msg):
             cmd_project(chat_id, raw_rest, thread_id=thread_id, scope_key=skey)
         elif cmd == "/model":
             cmd_model(chat_id, raw_rest, thread_id=thread_id, scope_key=skey)
+        elif cmd in ("/browser", "/profile"):
+            cmd_browser(chat_id, raw_rest, thread_id=thread_id, scope_key=skey)
         elif cmd == "/effort":
             cmd_effort(chat_id, arg, thread_id=thread_id, scope_key=skey)
         elif cmd == "/thinking":
@@ -7708,10 +7988,11 @@ def handle_message(msg):
                      "/team — 查看/切换团队角色、模型、播报台与派工单\n"
                      "/delegate @bot 任务 — 绕过主控 LLM，直接向指定队员派单\n"
                      "/project [名称] — 切换本群/当前 Topic 协同的项目仓库\n"
+                     "/browser — Live-Browser 浏览器多指纹控制面板\n"
                      "/status — 查看当前主控状态、Scope 与在线队员数\n"
                      "/new — 清空本群/当前 Topic 主控上下文（不影响私聊）\n"
                      "/cancel [all] — 中止当前群内正在运行的任务\n\n"
-                     "<i>私聊各 Bot 仍保留全部 22 项个人指令与独立上下文；其余单机高阶指令（如 /undo、/model、/cost）在群里手动输入也可直接调用。</i>",
+                     "<i>私聊各 Bot 仍保留全部个人指令与独立上下文；其余单机高阶指令（如 /undo、/model fallback、/cost）在群里手动输入也可直接调用。</i>",
                      parse_mode="HTML", thread_id=thread_id)
                 return
             send(chat_id,
@@ -7735,7 +8016,8 @@ def handle_message(msg):
                  "/context — inspect active context tokens &amp; compaction stats\n"
                  "/status — check agent state, scope &amp; active jobs\n"
                  "/project [name] — switch Antigravity CLI project &amp; repo\n"
-                 "/model — switch AI models with interactive menu\n"
+                 "/model [fallback m1,m2|off] — switch AI models &amp; auto-failover\n"
+                 "/browser [switch|start|stop] — Live-Browser multi-fingerprint panel &amp; Mini App\n"
                  "/effort — configure reasoning effort\n"
                  "/thinking [on|off] — toggle live &amp; expandable thinking chain\n"
                  "/sessions — browse &amp; resume recent sessions\n"
