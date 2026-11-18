@@ -31,12 +31,14 @@ _REQ_QUEUE: "queue.Queue[Dict[str, Any]]" = queue.Queue()
 
 COORDINATOR_INSTRUCTIONS = (
     "You have `acb-team` multi-bot delegation tools on the local Coordinator Bus.\n"
-    "- Inspect live teammate bots (`role`, `specialty`, `default_model`, `online`, `busy`) with `team_roster` before delegating.\n"
-    "- Delegate bounded or specialist tasks (browser/email/light ops/parallel research) via `team_dispatch` "
-    "(single `bot`+`prompt` or parallel `assignments` fan-out up to 8 tasks). Use `wait=true` (default) to get settled results inline, "
-    "or `wait=false` for background execution with automatic batch completion wake-up.\n"
-    "- Keep workdirs/files partitioned so you and a worker never edit the exact same file concurrently.\n"
-    "- Inspect, cancel, or retry failed worker jobs via `team_job`; send plain status notices via `team_broadcast`."
+    "- Act strictly as the orchestrator (`coordinator`): break down requests, delegate execution to specialists, monitor progress, and synthesize clear reports.\n"
+    "- Keep yourself free to accept new user instructions at any time: DO NOT perform lengthy coding, full test runs, deployments, or releases inline when a specialist worker is available — delegate promptly and end your turn concisely.\n"
+    "- Inspect live teammate bots (`role`, `specialty`, `default_model`, `online`, `busy`) with `team_roster` and route by specialty:\n"
+    "  * Developer worker: code implementation, refactoring, local deploy/sync, Git commits, tags, and releases.\n"
+    "  * Tester worker: unit/security/regression verification, post-release checks, and collecting/summarizing post-release GitHub Issues, PRs, CI status, and external feedback.\n"
+    "- `team_dispatch` defaults to `wait=false` (non-blocking async with automatic `batch_done` wake-up). Keep `wait=false` for normal dev, release, test, and collection tasks so you stay immediately idle for new user instructions; on `batch_done`, verify results and asynchronously chain the next stage (e.g., Dev -> Test/Feedback) or report to the user. Pass `wait=true` only for tiny <15s read-only checks.\n"
+    "- Keep workdirs/files partitioned so concurrent workers never edit the exact same file simultaneously.\n"
+    "- Inspect, cancel, or retry background worker jobs via `team_job`; send plain status notices via `team_broadcast`."
 )
 
 
@@ -148,7 +150,7 @@ def _tool_schemas() -> List[Dict[str, Any]]:
                     },
                     "wait": {
                         "type": "boolean",
-                        "description": "Wait synchronously for completion and return full results (default true). Set false for async dispatch with completion wake-up.",
+                        "description": "Wait synchronously for completion (default false — async dispatch keeps the coordinator free for new user instructions and triggers `batch_done` automatically on settle). Set true only for quick <15s read-only checks.",
                     },
                     "timeout_sec": {
                         "type": "number",
@@ -247,7 +249,7 @@ def _handle_team_dispatch(args: Dict[str, Any]) -> Dict[str, Any]:
         return _tool_text("AGY_BOT_HANDLE missing in session environment.", is_error=True)
 
     assignments = _build_assignment_list(args)
-    wait = bool(args.get("wait", True))
+    wait = bool(args.get("wait", False))
     timeout_sec = max(10.0, min(1500.0, float(args.get("timeout_sec", 600) or 600)))
     notify_group = bool(args.get("notify_group", False))
     origin = _origin_context()
@@ -269,7 +271,7 @@ def _handle_team_dispatch(args: Dict[str, Any]) -> Dict[str, Any]:
             "mode": "async",
             "group_id": created["group_id"],
             "dispatched": [bot_bus.summarize_job_brief(j) for j in created["jobs"]],
-            "note": "Dispatched asynchronously. Batch completion will automatically notify this coordinator scope once all jobs settle.",
+            "note": "Dispatched asynchronously (default wait=false). Report this brief dispatch status and end your turn promptly so you remain free for new user instructions; `batch_done` will wake you once all jobs settle.",
         })
 
     settled, all_done = bot_bus.wait_for_jobs(

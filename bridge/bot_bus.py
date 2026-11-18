@@ -816,7 +816,12 @@ def loop_guard_allow(scope_key: str, max_events: int = _LOOP_MAX_EVENTS, window_
     return True
 
 
-def format_worker_envelope(job: Dict[str, Any], effective_workdir: str, outbox_dir: str) -> str:
+def format_worker_envelope(
+    job: Dict[str, Any],
+    effective_workdir: str,
+    outbox_dir: str,
+    worker_specialty: str = "",
+) -> str:
     jid = job.get("job_id") or "?"
     sender = job.get("from_bot") or "coordinator"
     target = job.get("target_bot") or "worker"
@@ -826,9 +831,11 @@ def format_worker_envelope(job: Dict[str, Any], effective_workdir: str, outbox_d
     if label:
         header += f' label="{label}"'
     header += "]"
+    role_line = f"- 职责分工：{worker_specialty}\n" if worker_specialty else ""
     return (
         f"{header}\n"
-        f"你正在作为专职子 Bot（@{target}）执行主控 Bot（@{sender}）分派的任务。当前无人工实时交互，请勿反问用户，直接完成任务并用清晰、结构化、可直接验收的总结回复（列出关键发现、改动文件或验证结果）。\n"
+        f"你正在作为专职子 Bot（@{target}）执行主控 Bot（@{sender}）分派的任务。当前无人工实时交互，请勿反问用户，直接完成职责范围内工作并用清晰、结构化、可直接验收的总结回复（列出关键发现、改动文件或验证结果）。\n"
+        f"{role_line}"
         f"- 工作目录：`{effective_workdir}`\n"
         f"- 若生成截图或图片交付物，可写入 `{outbox_dir}/` 并在回复中注明完整路径。\n\n"
         f"任务简报：\n{prompt}"

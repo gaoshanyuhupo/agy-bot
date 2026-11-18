@@ -3996,7 +3996,12 @@ def _execute_bus_job(job_id):
     started_ts = time.time()
     before_files = snapshot_workspace_files(workdir=exec_workdir)
     before_outbox = snapshot_workspace_files(workdir=BOT_OUTBOX_DIR) if os.path.isdir(BOT_OUTBOX_DIR) else {}
-    full_prompt = bot_bus.format_worker_envelope(job, exec_workdir, BOT_OUTBOX_DIR)
+    full_prompt = bot_bus.format_worker_envelope(
+        job,
+        exec_workdir,
+        BOT_OUTBOX_DIR,
+        worker_specialty=cfg.get("specialty") or "",
+    )
 
     cmd = [
         AGY_BIN,
@@ -4295,8 +4300,10 @@ def _bot_bus_loop():
                     if c_id:
                         wake_prompt = (
                             f"[ACB_TEAM_ASYNC_DONE group={pkt.get('group_id')}]\n"
-                            f"你此前异步分派的团队子任务已全部落定，请验收以下结果并向用户简洁汇报"
-                            f"（如其中有文件或截图产出，必要时可检查或转发；不要再次重复派发相同任务）：\n\n{brief_json}"
+                            f"你此前异步分派的团队子任务已全部落定。请验收以下结果：\n"
+                            f"- 如后续仍需接力下一步（例如开发/发版完成后，异步派发测试进行验证或采集发版后 Issue/PR/CI 反馈），"
+                            f"请直接用 `team_dispatch`（默认 `wait=false`）异步派发并向用户简报当前进展后立即结束本轮；\n"
+                            f"- 如全流程已闭环，请向用户简洁汇报最终结论；请勿再次重复派发完全相同的已完成任务：\n\n{brief_json}"
                         )
                         job_q.put((c_id, t_id, skey, wake_prompt))
         except Exception as e:
