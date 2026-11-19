@@ -559,7 +559,7 @@ class TestRecoveredAttemptErrorHandling(unittest.TestCase):
             self.assertFalse(bridge._is_recovered_attempt_error("cid-ok", 0, "HTTP 500 Internal Server Error"))
             self.assertFalse(bridge._is_recovered_attempt_error("cid-ok", 0, "status=ERROR"))
 
-            # (b6) ERROR_MESSAGE only existed BEFORE start_line -> False
+            # (b6) ERROR_MESSAGE only existed BEFORE start_line without matching text -> False
             self._write_transcript(
                 brain_root,
                 "cid-prior-err",
@@ -571,6 +571,180 @@ class TestRecoveredAttemptErrorHandling(unittest.TestCase):
                 ],
             )
             self.assertFalse(bridge._is_recovered_attempt_error("cid-prior-err", 2, err_msg))
+
+            # (d1) Historical ERROR_MESSAGE using real agy `error` field matches raw_err + clean current turn -> True
+            err_503 = (
+                "API error (attempt 1): UNAVAILABLE (code 503): "
+                "No capacity available for model gemini-4-hydrogen-xhigh on the server"
+            )
+            self._write_transcript(
+                brain_root,
+                "cid-hist-error-field",
+                [
+                    {"type": "USER_INPUT", "status": "DONE", "content": "old turn"},
+                    {"type": "ERROR_MESSAGE", "status": "DONE", "error": err_503},
+                    {"type": "PLANNER_RESPONSE", "status": "DONE", "content": "old reply"},
+                    {"type": "USER_INPUT", "status": "DONE", "content": "new turn"},
+                    {"type": "PLANNER_RESPONSE", "status": "DONE", "content": "new reply"},
+                ],
+            )
+            self.assertTrue(bridge._is_recovered_attempt_error("cid-hist-error-field", 3, err_503))
+
+            # (d2) Historical ERROR_MESSAGE using `content` field matches raw_err + clean current turn -> True
+            self._write_transcript(
+                brain_root,
+                "cid-hist-content-field",
+                [
+                    {"type": "ERROR_MESSAGE", "status": "DONE", "content": err_503},
+                    {"type": "PLANNER_RESPONSE", "status": "DONE", "content": "old reply"},
+                    {"type": "USER_INPUT", "status": "DONE", "content": "new turn"},
+                    {"type": "GENERIC", "status": "ERROR", "content": "tool exit 1"},
+                    {"type": "PLANNER_RESPONSE", "status": "DONE", "content": "new reply after tool err"},
+                ],
+            )
+            self.assertTrue(bridge._is_recovered_attempt_error("cid-hist-content-field", 2, err_503))
+
+            # (d3) NEGATIVE: Historical error A, but current turn returns DIFFERENT error B -> False
+            err_other = "API error (attempt 1): INTERNAL (code 500): different backend error"
+            self.assertFalse(bridge._is_recovered_attempt_error("cid-hist-error-field", 3, err_other))
+
+            # (d4) NEGATIVE: Historical error A matches, but current turn ends with tool-only DONE -> False
+            self._write_transcript(
+                brain_root,
+                "cid-hist-tool-only",
+                [
+                    {"type": "ERROR_MESSAGE", "status": "DONE", "error": err_503},
+                    {"type": "PLANNER_RESPONSE", "status": "DONE", "content": "old reply"},
+                    {"type": "USER_INPUT", "status": "DONE", "content": "new turn"},
+                    {
+                        "type": "PLANNER_RESPONSE",
+                        "status": "DONE",
+                        "content": "",
+                        "tool_calls": [{"name": "run_command"}],
+                    },
+                ],
+            )
+            self.assertFalse(bridge._is_recovered_attempt_error("cid-hist-tool-only", 2, err_503))
+
+            # (d5) NEGATIVE: Historical error A matches, but current turn is RUNNING -> False
+            self._write_transcript(
+                brain_root,
+                "cid-hist-running",
+                [
+                    {"type": "ERROR_MESSAGE", "status": "DONE", "error": err_503},
+                    {"type": "USER_INPUT", "status": "DONE", "content": "new turn"},
+                    {"type": "PLANNER_RESPONSE", "status": "RUNNING", "content": "partial"},
+                ],
+            )
+            self.assertFalse(bridge._is_recovered_attempt_error("cid-hist-running", 1, err_503))
+
+            # (d6) NEGATIVE: Missing or corrupted transcript JSON -> fail-closed False
+            self.assertFalse(bridge._is_recovered_attempt_error("cid-nonexistent", 0, err_503))
+            corrupt_path = brain_root / "cid-corrupt-cur" / ".system_generated/logs/transcript.jsonl"
+            corrupt_path.parent.mkdir(parents=True, exist_ok=True)
+            corrupt_path.write_text(
+                json.dumps({"type": "ERROR_MESSAGE", "status": "DONE", "error": err_503})
+                + "\n{broken json\n",
+                encoding="utf-8",
+            )
+            self.assertFalse(bridge._is_recovered_attempt_error("cid-corrupt-cur", 1, err_503))
+
+            corrupt_prior = brain_root / "cid-corrupt-prior" / ".system_generated/logs/transcript.jsonl"
+            corrupt_prior.parent.mkdir(parents=True, exist_ok=True)
+            corrupt_prior.write_text(
+                "{broken prior\n"
+                + json.dumps({"type": "ERROR_MESSAGE", "status": "DONE", "error": err_503})
+                + "\n"
+                + json.dumps({"type": "USER_INPUT", "status": "DONE", "content": "new"})
+                + "\n"
+                + json.dumps({"type": "PLANNER_RESPONSE", "status": "DONE", "content": "done"})
+                + "\n",
+                encoding="utf-8",
+            )
+            self.assertFalse(bridge._is_recovered_attempt_error("cid-corrupt-prior", 2, err_503))
+
+            # (e1) /compact (require_checkpoint=True): historical error + new CHECKPOINT DONE -> True
+            self._write_transcript(
+                brain_root,
+                "cid-compact-hist-ok",
+                [
+                    {"type": "ERROR_MESSAGE", "status": "DONE", "error": err_503},
+                    {"type": "CHECKPOINT", "status": "DONE", "content": "old ckpt"},
+                    {"type": "USER_INPUT", "status": "DONE", "content": "/compact"},
+                    {"type": "CHECKPOINT", "status": "DONE", "content": "new ckpt"},
+                ],
+            )
+            self.assertTrue(
+                bridge._is_recovered_attempt_error("cid-compact-hist-ok", 2, err_503, require_checkpoint=True)
+            )
+
+            # (e2) /compact: same-turn transient ERROR_MESSAGE followed by new CHECKPOINT DONE -> True
+            self._write_transcript(
+                brain_root,
+                "cid-compact-sameturn-ok",
+                [
+                    {"type": "USER_INPUT", "status": "DONE", "content": "/compact"},
+                    {"type": "ERROR_MESSAGE", "status": "DONE", "error": err_503},
+                    {"type": "CHECKPOINT", "status": "DONE", "content": "recovered ckpt"},
+                ],
+            )
+            self.assertTrue(
+                bridge._is_recovered_attempt_error("cid-compact-sameturn-ok", 0, err_503, require_checkpoint=True)
+            )
+
+            # (e3) NEGATIVE /compact: old CHECKPOINT before start_line, NO new CHECKPOINT in [start_line:] -> False
+            self._write_transcript(
+                brain_root,
+                "cid-compact-old-ckpt-only",
+                [
+                    {"type": "ERROR_MESSAGE", "status": "DONE", "error": err_503},
+                    {"type": "CHECKPOINT", "status": "DONE", "content": "old ckpt"},
+                    {"type": "USER_INPUT", "status": "DONE", "content": "/compact"},
+                ],
+            )
+            self.assertFalse(
+                bridge._is_recovered_attempt_error("cid-compact-old-ckpt-only", 2, err_503, require_checkpoint=True)
+            )
+
+            # (e4) NEGATIVE /compact: only PLANNER_RESPONSE DONE, no CHECKPOINT DONE -> False
+            self._write_transcript(
+                brain_root,
+                "cid-compact-chat-only",
+                [
+                    {"type": "ERROR_MESSAGE", "status": "DONE", "error": err_503},
+                    {"type": "USER_INPUT", "status": "DONE", "content": "/compact"},
+                    {"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Not a checkpoint"},
+                ],
+            )
+            self.assertFalse(
+                bridge._is_recovered_attempt_error("cid-compact-chat-only", 1, err_503, require_checkpoint=True)
+            )
+
+            # (e5) NEGATIVE /compact: CHECKPOINT not DONE or followed by ERROR_MESSAGE -> False
+            self._write_transcript(
+                brain_root,
+                "cid-compact-running",
+                [
+                    {"type": "ERROR_MESSAGE", "status": "DONE", "error": err_503},
+                    {"type": "USER_INPUT", "status": "DONE", "content": "/compact"},
+                    {"type": "CHECKPOINT", "status": "RUNNING", "content": "half"},
+                ],
+            )
+            self.assertFalse(
+                bridge._is_recovered_attempt_error("cid-compact-running", 1, err_503, require_checkpoint=True)
+            )
+            self._write_transcript(
+                brain_root,
+                "cid-compact-trailing-err",
+                [
+                    {"type": "USER_INPUT", "status": "DONE", "content": "/compact"},
+                    {"type": "CHECKPOINT", "status": "DONE", "content": "ok"},
+                    {"type": "ERROR_MESSAGE", "status": "DONE", "error": err_503},
+                ],
+            )
+            self.assertFalse(
+                bridge._is_recovered_attempt_error("cid-compact-trailing-err", 0, err_503, require_checkpoint=True)
+            )
 
             # (b7) Non-DONE terminal PLANNER_RESPONSE -> False
             self._write_transcript(
@@ -838,6 +1012,614 @@ class TestRecoveredAttemptErrorHandling(unittest.TestCase):
             self.assertEqual("Recovered interactive answer.", finalized[0][0])
             self.assertIsNotNone(finalized[0][1].get("footer_str"))
             self.assertEqual([], [m for m in sent_plain if "⚠️ agy" in m])
+
+    def test_interactive_run_agy_stale_historical_error_coalesce_postloop_and_mismatch_negative(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = _load_isolated_bridge(tmp, extra_env={"HOME": tmp})
+            brain_root = Path(tmp) / "brain"
+            bridge.BRAIN_ROOT = str(brain_root)
+            err_503 = (
+                "API error (attempt 1): UNAVAILABLE (code 503): "
+                "No capacity available for model gemini-4-hydrogen-xhigh on the server"
+            )
+            err_other = "API error (attempt 1): INTERNAL (code 500): brand new failure"
+            chat_id = -1001234567890
+            skey = bridge.scope_key_for(chat_id, None)
+
+            prior_entries = [
+                {"type": "USER_INPUT", "status": "DONE", "content": "earlier turn"},
+                {"type": "ERROR_MESSAGE", "status": "DONE", "error": err_503},
+                {"type": "PLANNER_RESPONSE", "status": "DONE", "content": "earlier answer"},
+            ]
+
+            class _FakeStreamer:
+                status_override = None
+
+                def __init__(self, *args, **kwargs):
+                    self.start_line = kwargs.get("start_line", 0)
+
+                def start(self):
+                    pass
+
+                def stop(self):
+                    pass
+
+                def set_cid(self, _c):
+                    pass
+
+                def set_status_override(self, _v):
+                    pass
+
+                def on_thinking(self, _t):
+                    pass
+
+                def on_text_delta(self, _t):
+                    pass
+
+                def start_next_segment(self, sl):
+                    self.start_line = sl
+
+                def finalize_step(self, text, **kwargs):
+                    finalized.append((text, kwargs))
+                    return (202, f"<p>{text}</p>")
+
+            # (1) imm_res coalescing with stale historical error (0 new ERROR_MESSAGE)
+            cid_imm = "conv-stale-imm-001"
+            self._write_transcript(brain_root, cid_imm, prior_entries)
+            bridge.update_scope_state(skey, conversation_id=cid_imm)
+
+            class _ImmStaleSession:
+                cid = cid_imm
+                proc = type("P", (), {"returncode": 0})()
+
+                def __init__(self):
+                    self._events = iter(
+                        [
+                            {"event": "init", "conversation_id": cid_imm},
+                            {
+                                "event": "step_update",
+                                "step_update": {
+                                    "step_type": "agent_response",
+                                    "step_index": 2,
+                                    "state": "DONE",
+                                    "text_delta": "Clean resumed answer.",
+                                },
+                            },
+                        ]
+                    )
+
+                def send_user_prompt(self, _prompt):
+                    TestRecoveredAttemptErrorHandling._write_transcript(
+                        brain_root,
+                        cid_imm,
+                        prior_entries
+                        + [
+                            {"type": "USER_INPUT", "status": "DONE", "content": "follow up"},
+                            {"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Clean resumed answer."},
+                        ],
+                    )
+
+                def next_event(self, timeout=0.25):
+                    return next(self._events, {"event": "__eof__"})
+
+                def peek_immediate_result(self, timeout=0.065):
+                    return (
+                        {"conversation_id": cid_imm, "status": "ERROR", "error": err_503, "response": ""},
+                        [],
+                    )
+
+                def get_stderr_text(self):
+                    return ""
+
+            finalized: list[tuple] = []
+            sent_plain: list[tuple] = []
+            with (
+                mock.patch.object(bridge, "_acquire_session", return_value=(_ImmStaleSession(), True)),
+                mock.patch.object(bridge, "LiveDraftStreamer", _FakeStreamer),
+                mock.patch.object(bridge, "send", side_effect=lambda _c, txt, **kw: sent_plain.append((txt, kw))),
+                mock.patch.object(bridge, "push_step_images"),
+                mock.patch.object(bridge, "_record_and_relay_bot_group_msg"),
+                mock.patch.object(bridge, "_maybe_post_turn_auto_compact"),
+            ):
+                bridge.run_agy(chat_id, "follow up", scope_key=skey)
+
+            self.assertEqual(1, len(finalized))
+            self.assertEqual("Clean resumed answer.", finalized[0][0])
+            self.assertIsNotNone(finalized[0][1].get("footer_str"))
+            self.assertEqual([], sent_plain)
+
+            # (2) Post-loop path (imm_res misses 65ms window, result arrives as next event)
+            cid_post = "conv-stale-post-002"
+            self._write_transcript(brain_root, cid_post, prior_entries)
+            bridge.update_scope_state(skey, conversation_id=cid_post)
+
+            class _PostLoopStaleSession:
+                cid = cid_post
+                proc = type("P", (), {"returncode": 0})()
+
+                def __init__(self):
+                    self._events = iter(
+                        [
+                            {"event": "init", "conversation_id": cid_post},
+                            {
+                                "event": "step_update",
+                                "step_update": {
+                                    "step_type": "agent_response",
+                                    "step_index": 2,
+                                    "state": "DONE",
+                                    "text_delta": "Delayed result answer.",
+                                },
+                            },
+                            {
+                                "event": "result",
+                                "result": {
+                                    "conversation_id": cid_post,
+                                    "status": "ERROR",
+                                    "error": err_503,
+                                    "response": "",
+                                },
+                            },
+                        ]
+                    )
+
+                def send_user_prompt(self, _prompt):
+                    TestRecoveredAttemptErrorHandling._write_transcript(
+                        brain_root,
+                        cid_post,
+                        prior_entries
+                        + [
+                            {"type": "USER_INPUT", "status": "DONE", "content": "follow up 2"},
+                            {"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Delayed result answer."},
+                        ],
+                    )
+
+                def next_event(self, timeout=0.25):
+                    return next(self._events, {"event": "__eof__"})
+
+                def peek_immediate_result(self, timeout=0.065):
+                    return None, "timeout"
+
+                def get_stderr_text(self):
+                    return ""
+
+            finalized.clear()
+            sent_plain.clear()
+            tg_edits: list[tuple] = []
+
+            class _OkResp:
+                status_code = 200
+                text = '{"ok":true}'
+
+                @staticmethod
+                def json():
+                    return {"ok": True, "result": {"message_id": 202}}
+
+            with (
+                mock.patch.object(bridge, "_acquire_session", return_value=(_PostLoopStaleSession(), True)),
+                mock.patch.object(bridge, "LiveDraftStreamer", _FakeStreamer),
+                mock.patch.object(bridge, "send", side_effect=lambda _c, txt, **kw: sent_plain.append((txt, kw))),
+                mock.patch.object(
+                    bridge,
+                    "tg",
+                    side_effect=lambda method, **kw: (tg_edits.append((method, kw)) or _OkResp()),
+                ),
+                mock.patch.object(bridge, "push_step_images"),
+                mock.patch.object(bridge, "_record_and_relay_bot_group_msg"),
+                mock.patch.object(bridge, "_maybe_post_turn_auto_compact"),
+            ):
+                bridge.run_agy(chat_id, "follow up 2", scope_key=skey)
+
+            self.assertEqual(1, len(finalized))
+            self.assertEqual([], sent_plain)
+            self.assertEqual(1, len([m for m, _kw in tg_edits if m == "editMessageText"]))
+            self.assertEqual([], [m for m, _kw in tg_edits if m == "sendMessage"])
+
+            # (3) NEGATIVE: mismatched new error B must NOT be swallowed
+            cid_mis = "conv-stale-mismatch-003"
+            self._write_transcript(brain_root, cid_mis, prior_entries)
+            bridge.update_scope_state(skey, conversation_id=cid_mis)
+
+            class _MismatchSession(_ImmStaleSession):
+                cid = cid_mis
+
+                def __init__(self):
+                    self._events = iter(
+                        [
+                            {"event": "init", "conversation_id": cid_mis},
+                            {
+                                "event": "step_update",
+                                "step_update": {
+                                    "step_type": "agent_response",
+                                    "step_index": 2,
+                                    "state": "DONE",
+                                    "text_delta": "Partial text",
+                                },
+                            },
+                        ]
+                    )
+
+                def send_user_prompt(self, _prompt):
+                    TestRecoveredAttemptErrorHandling._write_transcript(
+                        brain_root,
+                        cid_mis,
+                        prior_entries
+                        + [
+                            {"type": "USER_INPUT", "status": "DONE", "content": "follow up 3"},
+                            {"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Partial text"},
+                        ],
+                    )
+
+                def peek_immediate_result(self, timeout=0.065):
+                    return (
+                        {"conversation_id": cid_mis, "status": "ERROR", "error": err_other, "response": ""},
+                        [],
+                    )
+
+            finalized.clear()
+            sent_plain.clear()
+            with (
+                mock.patch.object(bridge, "_acquire_session", return_value=(_MismatchSession(), True)),
+                mock.patch.object(bridge, "LiveDraftStreamer", _FakeStreamer),
+                mock.patch.object(bridge, "send", side_effect=lambda _c, txt, **kw: sent_plain.append((txt, kw))),
+                mock.patch.object(bridge, "push_step_images"),
+                mock.patch.object(bridge, "_record_and_relay_bot_group_msg"),
+                mock.patch.object(bridge, "_maybe_post_turn_auto_compact"),
+            ):
+                bridge.run_agy(chat_id, "follow up 3", scope_key=skey)
+
+            self.assertTrue(any("⚠️ agy ERROR" in txt and err_other in txt for txt, _kw in sent_plain))
+
+    def test_execute_bus_job_stale_historical_error_and_mismatch_negative(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = _load_isolated_bridge(tmp, extra_env={"HOME": tmp})
+            brain_root = Path(tmp) / "brain"
+            bridge.BRAIN_ROOT = str(brain_root)
+            cid = "conv-bus-stale-001"
+            err_503 = (
+                "API error (attempt 1): UNAVAILABLE (code 503): "
+                "No capacity available for model gemini-4-hydrogen-xhigh on the server"
+            )
+            err_other = "API error (attempt 1): INTERNAL (code 500): different bus error"
+            prior_entries = [
+                {"type": "USER_INPUT", "status": "DONE", "content": "prior task"},
+                {"type": "ERROR_MESSAGE", "status": "DONE", "error": err_503},
+                {"type": "PLANNER_RESPONSE", "status": "DONE", "content": "prior done"},
+            ]
+            clean_turn = [
+                {"type": "USER_INPUT", "status": "DONE", "content": "continued task"},
+                {"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Bus resumed cleanly."},
+            ]
+
+            job_payload = {
+                "job_id": "job-stale-1",
+                "from_bot": "sgaeget_bot",
+                "to_bot": "agycli_main_bot",
+                "prompt": "continue",
+                "label": "Stale error bus check",
+                "resume_cid": cid,
+                "notify_group": False,
+            }
+
+            class _FakeProc:
+                def __init__(self, lines, turn_entries, rc=0):
+                    self.pid = 99998
+                    self.stdout = iter(lines)
+                    self.stderr = iter([])
+                    self.returncode = rc
+                    TestRecoveredAttemptErrorHandling._write_transcript(
+                        brain_root, cid, prior_entries + turn_entries
+                    )
+
+                def wait(self, timeout=None):
+                    return self.returncode
+
+            # Positive: historical err_503 matches, even when result response is empty (falls back to transcript)
+            self._write_transcript(brain_root, cid, prior_entries)
+            stream_events_ok = [
+                json.dumps({"event": "init", "conversation_id": cid}) + "\n",
+                json.dumps({
+                    "event": "result",
+                    "result": {"conversation_id": cid, "status": "ERROR", "error": err_503, "response": ""},
+                }) + "\n",
+            ]
+            finished: list[tuple] = []
+            with (
+                mock.patch.object(bridge.bot_bus, "claim_job", return_value=job_payload),
+                mock.patch.object(bridge.bot_bus, "is_job_cancelled", return_value=False),
+                mock.patch.object(bridge.bot_bus, "finish_job", side_effect=lambda jid, **kw: finished.append((jid, kw))),
+                mock.patch.object(bridge, "_publish_bot_heartbeat"),
+                mock.patch.object(
+                    bridge.subprocess,
+                    "Popen",
+                    side_effect=lambda *a, **kw: _FakeProc(stream_events_ok, clean_turn, rc=0),
+                ),
+            ):
+                bridge._execute_bus_job("job-stale-1")
+
+            self.assertEqual(1, len(finished))
+            self.assertEqual("done", finished[0][1]["status"])
+            self.assertEqual("", finished[0][1]["error"])
+            self.assertEqual("Bus resumed cleanly.", finished[0][1]["result_text"])
+
+            # Negative: different error B must stay status="error"
+            self._write_transcript(brain_root, cid, prior_entries)
+            stream_events_mismatch = [
+                json.dumps({"event": "init", "conversation_id": cid}) + "\n",
+                json.dumps({
+                    "event": "result",
+                    "result": {"conversation_id": cid, "status": "ERROR", "error": err_other, "response": "Bus resumed cleanly."},
+                }) + "\n",
+            ]
+            finished.clear()
+            with (
+                mock.patch.object(bridge.bot_bus, "claim_job", return_value=job_payload),
+                mock.patch.object(bridge.bot_bus, "is_job_cancelled", return_value=False),
+                mock.patch.object(bridge.bot_bus, "finish_job", side_effect=lambda jid, **kw: finished.append((jid, kw))),
+                mock.patch.object(bridge, "_publish_bot_heartbeat"),
+                mock.patch.object(
+                    bridge.subprocess,
+                    "Popen",
+                    side_effect=lambda *a, **kw: _FakeProc(stream_events_mismatch, clean_turn, rc=0),
+                ),
+            ):
+                bridge._execute_bus_job("job-stale-1")
+
+            self.assertEqual(1, len(finished))
+            self.assertEqual("error", finished[0][1]["status"])
+            self.assertIn("different bus error", finished[0][1]["error"])
+
+    def test_execute_compact_on_session_recovery_retry_and_fail_closed_matrix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = _load_isolated_bridge(tmp, extra_env={"HOME": tmp})
+            brain_root = Path(tmp) / "brain"
+            bridge.BRAIN_ROOT = str(brain_root)
+            err_503 = (
+                "API error (attempt 1): UNAVAILABLE (code 503): "
+                "No capacity available for model gemini-4-hydrogen-xhigh on the server"
+            )
+            skey = "-1001234567890"
+
+            class _CompactFakeSess:
+                def __init__(self, events, on_send=None, stderr_text=""):
+                    self._events = list(events)
+                    self._on_send = on_send
+                    self._stderr_text = stderr_text
+                    self.last_used = 0.0
+
+                def send_user_prompt(self, _prompt, raw_slash=False):
+                    if self._on_send:
+                        self._on_send()
+
+                def next_event(self, timeout=0.25):
+                    if self._events:
+                        return self._events.pop(0)
+                    return {"event": "__eof__"}
+
+                def get_stderr_text(self):
+                    return self._stderr_text
+
+            # (1) Positive: stale historical 503 + newly appended CHECKPOINT DONE -> True, no compact_error invalidation
+            cid_ok = "conv-compact-stale-ok"
+            prior_hist = [
+                {"type": "USER_INPUT", "status": "DONE", "content": "work"},
+                {"type": "ERROR_MESSAGE", "status": "DONE", "error": err_503},
+                {"type": "CHECKPOINT", "status": "DONE", "content": "old ckpt"},
+            ]
+            self._write_transcript(brain_root, cid_ok, prior_hist)
+            acq_calls: list[bool] = []
+            inv_reasons: list[str] = []
+
+            def _append_new_ckpt():
+                self._write_transcript(
+                    brain_root,
+                    cid_ok,
+                    prior_hist
+                    + [
+                        {"type": "USER_INPUT", "status": "DONE", "content": "/compact"},
+                        {"type": "CHECKPOINT", "status": "DONE", "content": "fresh ckpt"},
+                    ],
+                )
+
+            sess_ok = _CompactFakeSess(
+                [{"event": "result", "result": {"conversation_id": cid_ok, "status": "ERROR", "error": err_503}}],
+                on_send=_append_new_ckpt,
+            )
+            with (
+                mock.patch.object(
+                    bridge,
+                    "_acquire_session",
+                    side_effect=lambda *a, **kw: (acq_calls.append(kw.get("force_new", False)) or sess_ok, True),
+                ),
+                mock.patch.object(
+                    bridge,
+                    "invalidate_session",
+                    side_effect=lambda reason, **kw: inv_reasons.append(reason),
+                ),
+                mock.patch.object(bridge, "_sleep_interruptible", return_value=True),
+            ):
+                ok, _dur, err = bridge._execute_compact_on_session(
+                    skey, cid_ok, "auto", "m", "high", None, bridge.WORKDIR
+                )
+            self.assertTrue(ok)
+            self.assertEqual("", err)
+            self.assertEqual([False], acq_calls)
+            self.assertEqual([], inv_reasons)
+            self.assertEqual(5, bridge._last_compacted_line.get(cid_ok))
+
+            # (2) Positive transient 503 retry: attempt 1 fails with NO new CHECKPOINT -> retries attempt 2,
+            #     re-captures compact_start_line, writes CHECKPOINT DONE, and normalizes leaked attempt-1 error
+            cid_retry = "conv-compact-retry-503"
+            base_lines = [{"type": "USER_INPUT", "status": "DONE", "content": "long chat"}]
+            self._write_transcript(brain_root, cid_retry, base_lines)
+            attempt_n = [0]
+            inv_reasons.clear()
+
+            def _acq_retry(*a, **kw):
+                attempt_n[0] += 1
+                if attempt_n[0] == 1:
+                    return (
+                        _CompactFakeSess(
+                            [{"event": "result", "result": {"conversation_id": cid_retry, "status": "ERROR", "error": err_503}}],
+                            on_send=lambda: self._write_transcript(
+                                brain_root,
+                                cid_retry,
+                                base_lines
+                                + [
+                                    {"type": "USER_INPUT", "status": "DONE", "content": "/compact"},
+                                    {"type": "ERROR_MESSAGE", "status": "DONE", "error": err_503},
+                                ],
+                            ),
+                        ),
+                        True,
+                    )
+                return (
+                    _CompactFakeSess(
+                        [{"event": "result", "result": {"conversation_id": cid_retry, "status": "ERROR", "error": err_503}}],
+                        on_send=lambda: self._write_transcript(
+                            brain_root,
+                            cid_retry,
+                            base_lines
+                            + [
+                                {"type": "USER_INPUT", "status": "DONE", "content": "/compact"},
+                                {"type": "ERROR_MESSAGE", "status": "DONE", "error": err_503},
+                                {"type": "USER_INPUT", "status": "DONE", "content": "/compact"},
+                                {"type": "CHECKPOINT", "status": "DONE", "content": "retry ckpt"},
+                            ],
+                        ),
+                    ),
+                    False,
+                )
+
+            with (
+                mock.patch.object(bridge, "_acquire_session", side_effect=_acq_retry),
+                mock.patch.object(
+                    bridge,
+                    "invalidate_session",
+                    side_effect=lambda reason, **kw: inv_reasons.append(reason),
+                ),
+                mock.patch.object(bridge, "_sleep_interruptible", return_value=True),
+            ):
+                ok2, _dur2, err2 = bridge._execute_compact_on_session(
+                    skey, cid_retry, "auto", "m", "high", None, bridge.WORKDIR
+                )
+            self.assertTrue(ok2)
+            self.assertEqual("", err2)
+            self.assertEqual(2, attempt_n[0])
+            self.assertEqual(["compact_error"], inv_reasons)
+            self.assertEqual(5, bridge._last_compacted_line.get(cid_retry))
+
+            # (3) Negative: old CHECKPOINT exists before start_line, NO new CHECKPOINT appended -> False
+            cid_no_new = "conv-compact-old-only"
+            self._write_transcript(brain_root, cid_no_new, prior_hist)
+            inv_reasons.clear()
+            with (
+                mock.patch.object(
+                    bridge,
+                    "_acquire_session",
+                    side_effect=lambda *a, **kw: (
+                        _CompactFakeSess(
+                            [{"event": "result", "result": {"conversation_id": cid_no_new, "status": "ERROR", "error": err_503}}],
+                            on_send=lambda: self._write_transcript(
+                                brain_root,
+                                cid_no_new,
+                                prior_hist + [{"type": "USER_INPUT", "status": "DONE", "content": "/compact"}],
+                            ),
+                        ),
+                        False,
+                    ),
+                ),
+                mock.patch.object(
+                    bridge,
+                    "invalidate_session",
+                    side_effect=lambda reason, **kw: inv_reasons.append(reason),
+                ),
+                mock.patch.object(bridge, "_sleep_interruptible", return_value=True),
+            ):
+                ok3, _dur3, err3 = bridge._execute_compact_on_session(
+                    skey, cid_no_new, "auto", "m", "high", None, bridge.WORKDIR
+                )
+            self.assertFalse(ok3)
+            self.assertIn("code 503", err3)
+            self.assertEqual(["compact_error", "compact_error"], inv_reasons)
+
+            # (4) Negative: only PLANNER_RESPONSE DONE (no CHECKPOINT) -> False
+            cid_chat = "conv-compact-chat-reply"
+            self._write_transcript(brain_root, cid_chat, prior_hist)
+            with (
+                mock.patch.object(
+                    bridge,
+                    "_acquire_session",
+                    side_effect=lambda *a, **kw: (
+                        _CompactFakeSess(
+                            [{"event": "result", "result": {"conversation_id": cid_chat, "status": "ERROR", "error": err_503}}],
+                            on_send=lambda: self._write_transcript(
+                                brain_root,
+                                cid_chat,
+                                prior_hist
+                                + [
+                                    {"type": "USER_INPUT", "status": "DONE", "content": "/compact"},
+                                    {"type": "PLANNER_RESPONSE", "status": "DONE", "content": "just chatting"},
+                                ],
+                            ),
+                        ),
+                        False,
+                    ),
+                ),
+                mock.patch.object(bridge, "invalidate_session"),
+                mock.patch.object(bridge, "_sleep_interruptible", return_value=True),
+            ):
+                ok4, _dur4, _err4 = bridge._execute_compact_on_session(
+                    skey, cid_chat, "auto", "m", "high", None, bridge.WORKDIR
+                )
+            self.assertFalse(ok4)
+
+            # (5) Negative: EOF (res is None) and cancel_requested -> False (fail-closed)
+            cid_eof = "conv-compact-eof"
+            self._write_transcript(
+                brain_root,
+                cid_eof,
+                prior_hist + [{"type": "CHECKPOINT", "status": "DONE", "content": "already there"}],
+            )
+            with (
+                mock.patch.object(
+                    bridge,
+                    "_acquire_session",
+                    side_effect=lambda *a, **kw: (_CompactFakeSess([{"event": "__eof__"}], stderr_text="eof"), False),
+                ),
+                mock.patch.object(bridge, "invalidate_session"),
+                mock.patch.object(bridge, "_sleep_interruptible", return_value=True),
+            ):
+                ok_eof, _dur_e, _err_e = bridge._execute_compact_on_session(
+                    skey, cid_eof, "auto", "m", "high", None, bridge.WORKDIR
+                )
+            self.assertFalse(ok_eof)
+
+            def _trigger_cancel():
+                bridge.cancel_requested = True
+
+            bridge.cancel_requested = False
+            try:
+                with (
+                    mock.patch.object(
+                        bridge,
+                        "_acquire_session",
+                        return_value=(
+                            _CompactFakeSess(
+                                [{"event": "result", "result": {"conversation_id": cid_ok, "status": "ERROR", "error": err_503}}],
+                                on_send=_trigger_cancel,
+                            ),
+                            False,
+                        ),
+                    ),
+                    mock.patch.object(bridge, "invalidate_session"),
+                ):
+                    ok_cancel, _dur_c, err_cancel = bridge._execute_compact_on_session(
+                        skey, cid_ok, "auto", "m", "high", None, bridge.WORKDIR
+                    )
+                self.assertFalse(ok_cancel)
+                self.assertEqual("cancelled", err_cancel)
+            finally:
+                bridge.cancel_requested = False
 
 
 if __name__ == "__main__":

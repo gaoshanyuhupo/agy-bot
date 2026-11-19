@@ -2353,79 +2353,153 @@ def get_transcript_line_count(cid):
 _API_ATTEMPT_ERROR_RE = re.compile(r"^\s*API error \(attempt \d+\):")
 
 
-def _is_recovered_attempt_error(cid, start_line, raw_err):
-    """Return True only when an `API error (attempt N):` was recovered in transcript.jsonl.
+def _extract_transcript_error_text(obj):
+    """Extract normalized error text from a transcript ERROR_MESSAGE entry.
 
-    Recovery contract (for entries at or after `start_line`):
-    - At least one `ERROR_MESSAGE` exists in this turn, and `tail` (entries after the
-      last `ERROR_MESSAGE`) is non-empty.
-    - Intermediate tool/step failures (`type == "GENERIC"` with `status == "ERROR"`) are
-      explicitly allowed so the model can continue reasoning and finish after a failed
-      tool call; however, any unrecovered `ERROR_MESSAGE` or other non-`DONE` intermediate
-      status (e.g. `RUNNING`, `PENDING`, or non-`GENERIC` `ERROR`) rejects recovery.
-    - The terminal entry must be a `PLANNER_RESPONSE` with `status == "DONE"`, non-empty
-      string `content`, and no `tool_calls` (checks terminal completion rather than full
-      historical tool-call ID pairing).
+    Real agy v1.5.12 transcripts store the message in `error` (with `content` absent/None),
+    while some fixtures store it in `content`.
     """
-    if not cid or not raw_err:
-        return False
-    if not _API_ATTEMPT_ERROR_RE.match(str(raw_err)):
-        return False
-    tpath = os.path.join(BRAIN_ROOT, str(cid), ".system_generated/logs/transcript.jsonl")
-    if not os.path.isfile(tpath):
-        return False
-    try:
-        with open(tpath, "r", encoding="utf-8", errors="ignore") as f:
-            lines = f.readlines()
-    except Exception:
-        return False
+    if not isinstance(obj, dict):
+        return ""
+    for field in ("error", "content"):
+        val = obj.get(field)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
 
+
+def _parse_jsonl_dict_lines(raw_lines):
+    """Strictly parse JSONL lines into dicts; return None on any malformed/non-dict line."""
     objs = []
-    for raw in lines[max(0, int(start_line or 0)):]:
+    for raw in raw_lines:
         s = raw.strip()
         if not s:
             continue
         try:
             obj = json.loads(s)
         except Exception:
-            return False
+            return None
         if not isinstance(obj, dict):
-            return False
+            return None
         objs.append(obj)
+    return objs
+
+
+def _inspect_recovered_attempt_error(cid, start_line, raw_err, *, require_checkpoint=False):
+    """Verify whether an `API error (attempt N):` result was recovered or leaked from history.
+
+    Returns `(recovered: bool, terminal_text: str)`.
+
+    Fail-closed contract:
+    1. `raw_err` must match `_API_ATTEMPT_ERROR_RE`, and `transcript.jsonl` must exist and
+       parse cleanly as JSON objects (fail-closed if missing/unreadable/corrupted).
+    2. Current turn slice `[start_line:]` must be non-empty.
+       - Same-turn recovery (at least one `ERROR_MESSAGE` in `[start_line:]`):
+         `tail` is entries strictly after the last `ERROR_MESSAGE` and must be non-empty.
+       - Historical stale-error leak (0 `ERROR_MESSAGE` in `[start_line:]`):
+         `lines[:start_line]` must also parse cleanly and contain at least one `ERROR_MESSAGE`
+         whose normalized text (`error` or `content`) strictly equals `raw_err.strip()`.
+         `tail` is the full `[start_line:]` slice.
+    3. Every entry in `tail` must have no `ERROR_MESSAGE` and no unclosed non-`DONE` status.
+       Intermediate tool/step failures (`type == "GENERIC"` with `status == "ERROR"`) are
+       allowed only for normal conversational turns (`not require_checkpoint`).
+    4. Terminal closure:
+       - `require_checkpoint=False` (interactive / Bus): `tail[-1]` must be `PLANNER_RESPONSE`
+         with `status == "DONE"`, non-empty string `content`, and no `tool_calls`.
+       - `require_checkpoint=True` (`/compact`): `tail` must contain a newly appended
+         `CHECKPOINT` entry with `status == "DONE"` and no subsequent `ERROR_MESSAGE` or
+         non-`DONE` entry.
+    """
+    if not cid or not raw_err:
+        return False, ""
+    raw_err_str = str(raw_err).strip()
+    if not _API_ATTEMPT_ERROR_RE.match(raw_err_str):
+        return False, ""
+    tpath = os.path.join(BRAIN_ROOT, str(cid), ".system_generated/logs/transcript.jsonl")
+    if not os.path.isfile(tpath):
+        return False, ""
+    try:
+        with open(tpath, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+    except Exception:
+        return False, ""
+
+    start_idx = max(0, int(start_line or 0))
+    objs = _parse_jsonl_dict_lines(lines[start_idx:])
     if not objs:
-        return False
+        return False, ""
 
     last_err_idx = -1
     for idx, obj in enumerate(objs):
         if obj.get("type") == "ERROR_MESSAGE":
             last_err_idx = idx
-    if last_err_idx < 0:
-        return False
 
-    tail = objs[last_err_idx + 1:]
-    if not tail:
-        return False
+    if last_err_idx >= 0:
+        tail = objs[last_err_idx + 1:]
+        if not tail:
+            return False, ""
+    else:
+        if start_idx <= 0:
+            return False, ""
+        prior_objs = _parse_jsonl_dict_lines(lines[:start_idx])
+        if not prior_objs:
+            return False, ""
+        if not any(
+            obj.get("type") == "ERROR_MESSAGE"
+            and _extract_transcript_error_text(obj) == raw_err_str
+            for obj in prior_objs
+        ):
+            return False, ""
+        tail = objs
 
     for obj in tail:
         if obj.get("type") == "ERROR_MESSAGE":
-            return False
+            return False, ""
         st = obj.get("status")
-        # Allow intermediate tool/step GENERIC ERROR followed by model recovery;
-        # reject any other unclosed/non-DONE state or non-GENERIC error.
-        if st not in (None, "DONE") and not (obj.get("type") == "GENERIC" and st == "ERROR"):
-            return False
+        # Allow intermediate tool/step GENERIC ERROR followed by model recovery in normal turns;
+        # reject any other unclosed/non-DONE state or non-GENERIC error (and any ERROR in /compact).
+        if st not in (None, "DONE") and not (
+            not require_checkpoint and obj.get("type") == "GENERIC" and st == "ERROR"
+        ):
+            return False, ""
+
+    if require_checkpoint:
+        has_checkpoint = any(
+            obj.get("type") == "CHECKPOINT" and obj.get("status") == "DONE"
+            for obj in tail
+        )
+        return (True, "") if has_checkpoint else (False, "")
 
     last_obj = tail[-1]
     if last_obj.get("type") != "PLANNER_RESPONSE":
-        return False
+        return False, ""
     if last_obj.get("status") != "DONE":
-        return False
+        return False, ""
     content = last_obj.get("content")
     if not isinstance(content, str) or not content.strip():
-        return False
+        return False, ""
     if last_obj.get("tool_calls"):
-        return False
-    return True
+        return False, ""
+    return True, content.strip()
+
+
+def _is_recovered_attempt_error(cid, start_line, raw_err, *, require_checkpoint=False):
+    """Return True only when an `API error (attempt N):` was recovered or leaked from history."""
+    recovered, _ = _inspect_recovered_attempt_error(
+        cid, start_line, raw_err, require_checkpoint=require_checkpoint
+    )
+    return recovered
+
+
+def _latest_step_buffer_text(step_buffers):
+    """Return the latest non-empty stripped text across `step_buffers`."""
+    if not step_buffers:
+        return ""
+    for k in sorted(step_buffers.keys(), reverse=True):
+        cand = (step_buffers.get(k) or "").strip()
+        if cand:
+            return cand
+    return ""
 
 
 def get_turn_details(cid, start_line=0):
@@ -3607,6 +3681,7 @@ def _execute_compact_on_session(
             scope_key, conv, mode, model, effort, project, workdir,
             force_new=(attempt > 1), readonly=readonly, untrusted=is_untrusted,
         )
+        compact_start_line = get_transcript_line_count(conv)
         try:
             sess.send_user_prompt(slash_cmd, raw_slash=True)
         except Exception as e:
@@ -3644,6 +3719,19 @@ def _execute_compact_on_session(
         if res is not None and (res.get("status") in (None, "SUCCESS")) and not res.get("error"):
             _last_compacted_line[conv] = get_transcript_line_count(conv)
             return True, time.time() - t0, ""
+
+        if res is not None and (res.get("status") == "ERROR" or res.get("error")):
+            compact_cid = res.get("conversation_id") or conv
+            compact_err = str(res.get("error") or res.get("response") or "")
+            if _is_recovered_attempt_error(
+                compact_cid, compact_start_line, compact_err, require_checkpoint=True
+            ):
+                log(
+                    "Compact on %s recovered after historical/transient attempt error (%s); normalizing to SUCCESS"
+                    % (str(compact_cid)[:8], compact_err[:160])
+                )
+                _last_compacted_line[conv] = get_transcript_line_count(conv)
+                return True, time.time() - t0, ""
 
         last_err = str((res or {}).get("error") or (res or {}).get("response") or sess.get_stderr_text() or "compact failed")
         invalidate_session("compact_error", force=True, scope_key=scope_key)
@@ -4411,12 +4499,19 @@ def run_agy(
                             if imm_res is not None and imm_res.get("status") == "ERROR":
                                 imm_cid = imm_res.get("conversation_id") or cur_cid
                                 imm_err = str(imm_res.get("error") or imm_res.get("response") or "")
-                                if _is_recovered_attempt_error(imm_cid, turn_start_line, imm_err):
-                                    log("Interactive turn recovered after transient attempt error (%s); coalescing as SUCCESS" % imm_err[:160])
+                                imm_recovered, imm_rec_text = _inspect_recovered_attempt_error(
+                                    imm_cid, turn_start_line, imm_err
+                                )
+                                if imm_recovered:
+                                    log(
+                                        "Interactive turn recovered after historical/transient attempt error (%s); coalescing as SUCCESS"
+                                        % imm_err[:160]
+                                    )
                                     imm_res = dict(imm_res)
                                     imm_res["status"] = "SUCCESS"
+                                    imm_res.pop("error", None)
                                     if not (imm_res.get("response") or "").strip():
-                                        imm_res["response"] = final_step_text
+                                        imm_res["response"] = final_step_text or imm_rec_text
                             if imm_res is not None and imm_res.get("status") == "SUCCESS":
                                 result = imm_res
                                 fb_from = (primary_model_label or "default") if candidate_idx > 0 else None
@@ -4485,12 +4580,19 @@ def run_agy(
             if result is not None and result.get("status") == "ERROR":
                 chk_cid = result.get("conversation_id") or conv or get_scope_value(exec_skey, "conversation_id")
                 chk_err = str(result.get("error") or result.get("response") or "")
-                if _is_recovered_attempt_error(chk_cid, turn_start_line, chk_err):
-                    log("Interactive turn recovered after transient attempt error (%s); normalizing result to SUCCESS" % chk_err[:160])
+                chk_recovered, chk_rec_text = _inspect_recovered_attempt_error(
+                    chk_cid, turn_start_line, chk_err
+                )
+                if chk_recovered:
+                    log(
+                        "Interactive turn recovered after historical/transient attempt error (%s); normalizing result to SUCCESS"
+                        % chk_err[:160]
+                    )
                     result = dict(result)
                     result["status"] = "SUCCESS"
-                    if not (result.get("response") or "").strip() and step_buffers:
-                        result["response"] = step_buffers[max(step_buffers.keys())].strip()
+                    result.pop("error", None)
+                    if not (result.get("response") or "").strip():
+                        result["response"] = _latest_step_buffer_text(step_buffers) or chk_rec_text
             if result is not None and result.get("status") != "ERROR":
                 break
             if result is None and reused_warm and not got_turn_event and same_model_retries == 0 and candidate_idx == 0:
@@ -4639,12 +4741,18 @@ def run_agy(
         finished_reason = result.get("finished_reason")
         resp = (result.get("response") or "").strip()
         if not resp and step_buffers:
-            resp = step_buffers[max(step_buffers.keys())].strip()
-        if status == "ERROR" and _is_recovered_attempt_error(
-            conv, turn_start_line, str(result.get("error") or resp or "")
-        ):
-            log("Interactive turn post-loop recovered after transient attempt error; normalizing status to SUCCESS")
-            status = "SUCCESS"
+            resp = _latest_step_buffer_text(step_buffers)
+        if status == "ERROR":
+            post_recovered, post_rec_text = _inspect_recovered_attempt_error(
+                conv, turn_start_line, str(result.get("error") or resp or "")
+            )
+            if post_recovered:
+                log(
+                    "Interactive turn post-loop recovered after historical/transient attempt error; normalizing status to SUCCESS"
+                )
+                status = "SUCCESS"
+                if not resp:
+                    resp = post_rec_text
         with state_lock:
             sc_w = _ensure_scope_locked(exec_skey)
             if isinstance(sc_w.get("last_turn"), dict):
@@ -5794,7 +5902,7 @@ def _execute_bus_job(job_id):
             st = result_ev.get("status")
             resp = (result_ev.get("response") or "").strip()
             if not resp and step_buffers:
-                resp = step_buffers[max(step_buffers.keys())].strip()
+                resp = _latest_step_buffer_text(step_buffers)
             if st == "SUCCESS":
                 final_status = "done"
                 final_text = resp or "(completed with empty text)"
@@ -5802,18 +5910,19 @@ def _execute_bus_job(job_id):
                 raw_err = str(result_ev.get("error") or resp or f"status={st}")
                 rc = proc.returncode if proc else -1
                 err_start_line = pre_turn_tline if (resume_cid and new_cid == resume_cid) else 0
-                if (
-                    st == "ERROR"
-                    and rc == 0
-                    and resp
-                    and _is_recovered_attempt_error(new_cid, err_start_line, raw_err)
-                ):
-                    log("Bus job %s recovered after transient attempt error (%s); marking as done" % (
+                recovered = False
+                recovered_text = ""
+                if st == "ERROR" and rc == 0:
+                    recovered, recovered_text = _inspect_recovered_attempt_error(
+                        new_cid, err_start_line, raw_err
+                    )
+                if recovered and (resp or recovered_text):
+                    log("Bus job %s recovered after historical/transient attempt error (%s); marking as done" % (
                         job_id, raw_err[:160]
                     ))
                     final_status = "done"
                     err_msg = ""
-                    final_text = resp
+                    final_text = resp or recovered_text
                 else:
                     final_status = "error"
                     err_msg = raw_err

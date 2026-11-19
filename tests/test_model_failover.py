@@ -135,6 +135,22 @@ class TestModelFailoverHelpers(unittest.TestCase):
         self.assertFalse(model_failover.is_failover_eligible_error("SyntaxError in user prompt"))
         self.assertFalse(model_failover.is_failover_eligible_error(""))
 
+        for transient_err in (
+            "API error (attempt 1): UNAVAILABLE (code 503): No capacity available for model gemini-4-hydrogen-xhigh on the server",
+            "API error (attempt 1): BAD_GATEWAY (code 502): upstream reset",
+            "API error (attempt 1): DEADLINE_EXCEEDED (code 504): upstream timeout",
+            "No capacity available on backend server",
+        ):
+            self.assertTrue(
+                model_failover.is_transient_agy_error(transient_err),
+                f"Expected transient: {transient_err}",
+            )
+        self.assertFalse(model_failover.is_transient_agy_error("SyntaxError in user prompt"))
+        # 503 capacity error remains classified as quota/model error so run_agy keeps immediate failover priority
+        err_503 = "API error (attempt 1): UNAVAILABLE (code 503): No capacity available for model gemini-4-hydrogen-xhigh on the server"
+        self.assertTrue(model_failover.is_quota_or_model_error(err_503))
+        self.assertTrue(model_failover.is_failover_eligible_error(err_503))
+
         self.assertTrue(model_failover.can_switch_model_safely(delivered_steps=0, attempt_tools=0))
         self.assertFalse(model_failover.can_switch_model_safely(delivered_steps=1, attempt_tools=0))
         self.assertFalse(model_failover.can_switch_model_safely(delivered_steps=0, attempt_tools=1))
