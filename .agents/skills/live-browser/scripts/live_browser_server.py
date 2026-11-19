@@ -1897,7 +1897,7 @@ class LiveBrowserHub:
         self.active_tab_index: int = 0
         self.ai_busy_count: int = 0
         self.last_activity_ts: float = time.monotonic()
-        self._sync_last_push_ts: float = 0.0
+        self._sync_last_push_ts: float | None = None
 
         # Active profile & egress state (never stores plaintext proxy credentials)
         self.active_profile: str = ""
@@ -3451,7 +3451,7 @@ class LiveBrowserHub:
         """Auto-reset `sync_external` back to `idle` if external script stops pushing beyond lease TTL."""
         if self.engine_mode != "sync_external":
             return False
-        if self._sync_last_push_ts <= 0:
+        if self._sync_last_push_ts is None:
             return False
         if (time.monotonic() - self._sync_last_push_ts) <= SYNC_LEASE_TIMEOUT_SECONDS:
             return False
@@ -3460,6 +3460,7 @@ class LiveBrowserHub:
         self.session_gen += 1
         self.takeover_gen += 1
         self.engine_mode = "idle"
+        self._sync_last_push_ts = None
         self.sync_cmd_queue.clear()
         self._clear_session_caches()
         self.ai_allowed_event.set()
@@ -5013,7 +5014,7 @@ async def internal_sync_stop(request: web.Request) -> web.Response:
         hub.session_gen += 1
         hub.takeover_gen += 1
         hub.engine_mode = "idle"
-        hub._sync_last_push_ts = 0.0
+        hub._sync_last_push_ts = None
         hub.sync_cmd_queue.clear()
         hub._clear_session_caches()
         hub.ai_allowed_event.set()

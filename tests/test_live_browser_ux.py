@@ -1428,8 +1428,35 @@ class TestP2StreamingDedupSyncAndScopedRefresh(unittest.TestCase):
             expired = await hub._expire_sync_session_if_stale()
             self.assertTrue(expired)
             self.assertEqual("idle", hub.engine_mode)
+            self.assertIsNone(hub._sync_last_push_ts)
             self.assertFalse(hub.takeover)
             self.assertEqual([], hub.sync_cmd_queue)
+
+            # None _sync_last_push_ts must never falsely expire an active sync session
+            hub.engine_mode = "sync_external"
+            hub.session_gen = 2
+            hub._sync_last_push_ts = None
+            self.assertFalse(await hub._expire_sync_session_if_stale())
+            self.assertEqual("sync_external", hub.engine_mode)
+
+            # Low-uptime VM regression: monotonic() < SYNC_LEASE_TIMEOUT_SECONDS + 5.0
+            # produces a negative or zero _sync_last_push_ts and must still expire by delta
+            with mock.patch.object(srv.time, "monotonic", return_value=10.0):
+                hub.engine_mode = "sync_external"
+                hub.session_gen = 3
+                hub._sync_last_push_ts = 10.0 - (srv.SYNC_LEASE_TIMEOUT_SECONDS + 5.0)
+                self.assertLess(hub._sync_last_push_ts, 0.0)
+                self.assertTrue(await hub._expire_sync_session_if_stale())
+                self.assertEqual("idle", hub.engine_mode)
+                self.assertIsNone(hub._sync_last_push_ts)
+
+            with mock.patch.object(srv.time, "monotonic", return_value=srv.SYNC_LEASE_TIMEOUT_SECONDS + 1.0):
+                hub.engine_mode = "sync_external"
+                hub.session_gen = 4
+                hub._sync_last_push_ts = 0.0
+                self.assertTrue(await hub._expire_sync_session_if_stale())
+                self.assertEqual("idle", hub.engine_mode)
+                self.assertIsNone(hub._sync_last_push_ts)
 
         asyncio.run(_scenario())
 
