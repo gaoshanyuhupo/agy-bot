@@ -1016,6 +1016,18 @@ class SSEStreamNormalizer:
         return None
 
 
+def _build_api_key_cmd_env() -> Dict[str, str]:
+    """Build subprocess environment with user-local bin directories prepended to PATH."""
+    env = dict(os.environ)
+    raw_path = env.get("PATH", "")
+    parts = [p for p in raw_path.split(os.pathsep) if p] if raw_path else []
+    extra_dirs = [str(Path.home() / ".local" / "bin"), str(Path.home() / "bin")]
+    prepended = [d for d in extra_dirs if d not in parts]
+    if prepended:
+        env["PATH"] = os.pathsep.join(prepended + parts)
+    return env
+
+
 def _gateway_runtime_fingerprint(gateway: GatewayConfig) -> str:
     """Hash gateway endpoint, dialect, and auth source metadata (never plaintext secrets)."""
     payload = {
@@ -1115,19 +1127,28 @@ class GatewayRuntimeState:
                 return cached[1]
 
         secret_val = ""
+        cmd_env = _build_api_key_cmd_env()
         try:
             if isinstance(cmd, (list, tuple)):
                 argv = [str(x) for x in cmd if str(x)]
-                res = subprocess.run(argv, capture_output=True, text=True, timeout=10, check=False)
+                res = subprocess.run(argv, capture_output=True, text=True, timeout=10, check=False, env=cmd_env)
             else:
                 cmd_str = str(cmd).strip()
                 has_shell_ops = any(tok in cmd_str for tok in ("|", "&&", "||", ";", ">", "<", "$(", "`"))
                 if has_shell_ops:
-                    res = subprocess.run(cmd_str, shell=True, capture_output=True, text=True, timeout=10, check=False)
+                    res = subprocess.run(
+                        cmd_str, shell=True, capture_output=True, text=True, timeout=10, check=False, env=cmd_env
+                    )
                 else:
-                    res = subprocess.run(shlex.split(cmd_str), capture_output=True, text=True, timeout=10, check=False)
+                    res = subprocess.run(
+                        shlex.split(cmd_str), capture_output=True, text=True, timeout=10, check=False, env=cmd_env
+                    )
             if res.returncode == 0:
                 secret_val = (res.stdout or "").strip()
+                if not secret_val:
+                    logger.warning("api_key_cmd for gateway %s returned empty key", gateway.id)
+            else:
+                logger.warning("api_key_cmd for gateway %s exited rc=%d", gateway.id, res.returncode)
         except Exception as exc:
             logger.warning("Failed to resolve api_key_cmd for gateway %s: %s", gateway.id, type(exc).__name__)
             return ""
@@ -1165,7 +1186,8 @@ class GatewayRuntimeState:
         getter = http_get or requests.get
         try:
             resp = getter(url, headers=headers, timeout=timeout_s)
-            if getattr(resp, "status_code", 0) == 200:
+            status_code = getattr(resp, "status_code", 0)
+            if status_code == 200:
                 payload = resp.json()
                 entries: List[Any] = []
                 if isinstance(payload, dict):
@@ -1180,6 +1202,8 @@ class GatewayRuntimeState:
                         raw_ids.append(str(ent["id"]).strip())
                     elif isinstance(ent, str) and ent.strip():
                         raw_ids.append(ent.strip())
+            else:
+                logger.warning("Gateway %s /models probe returned HTTP %s", gateway.id, status_code)
         except Exception as exc:
             logger.warning("Gateway %s /models probe failed (%s)", gateway.id, type(exc).__name__)
             with self._lock:

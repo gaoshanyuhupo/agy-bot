@@ -255,6 +255,71 @@ class TestGatewayAdapterCore(unittest.TestCase):
         self.assertEqual({}, rt.get_quirks(gw2))
         self.assertEqual("KEY_V2", rt.resolve_api_key(gw2))
 
+    def test_resolve_api_key_prepends_local_bin_and_handles_nonzero_rc(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_home = Path(tmp)
+            local_bin = fake_home / ".local" / "bin"
+            local_bin.mkdir(parents=True)
+            tool = local_bin / "fake-bao"
+            tool.write_text("#!/bin/sh\necho 'KEY_FROM_LOCAL_BIN'\n", encoding="utf-8")
+            os.chmod(tool, 0o755)
+
+            rt = gateway_adapter.GatewayRuntimeState()
+            with mock.patch.dict(os.environ, {"HOME": tmp, "PATH": "/usr/bin:/bin"}, clear=False):
+                # 1) shlex.split branch
+                gw_str = gateway_adapter.parse_gateways_payload(
+                    [{"id": "gw_str", "base_url": "http://127.0.0.1:8317/v1", "dialect": "cpa", "api_key_cmd": "fake-bao"}]
+                )["gw_str"]
+                self.assertEqual("KEY_FROM_LOCAL_BIN", rt.resolve_api_key(gw_str))
+
+                # 2) list argv branch
+                gw_list = gateway_adapter.parse_gateways_payload(
+                    [{"id": "gw_list", "base_url": "http://127.0.0.1:8317/v1", "dialect": "cpa", "api_key_cmd": ["fake-bao"]}]
+                )["gw_list"]
+                self.assertEqual("KEY_FROM_LOCAL_BIN", rt.resolve_api_key(gw_list))
+
+                # 3) shell=True branch + verify ~/.local/bin and ~/bin are prepended to PATH
+                gw_shell = gateway_adapter.parse_gateways_payload(
+                    [
+                        {
+                            "id": "gw_shell",
+                            "base_url": "http://127.0.0.1:8317/v1",
+                            "dialect": "cpa",
+                            "api_key_cmd": "fake-bao && printf '%s' \"$PATH\" > /dev/null",
+                        }
+                    ]
+                )["gw_shell"]
+                self.assertEqual("KEY_FROM_LOCAL_BIN", rt.resolve_api_key(gw_shell))
+
+                env_built = gateway_adapter._build_api_key_cmd_env()
+                path_parts = env_built["PATH"].split(os.pathsep)
+                self.assertEqual(str(local_bin), path_parts[0])
+                self.assertEqual(str(fake_home / "bin"), path_parts[1])
+
+                # 4) non-zero returncode returns "" and is NOT cached
+                counter_file = fake_home / "calls.txt"
+                fail_cmd = [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import pathlib, sys; "
+                        f"p = pathlib.Path({str(counter_file)!r}); "
+                        "p.write_text(p.read_text() + 'x' if p.exists() else 'x'); "
+                        "print('SHOULD_NOT_BE_RETURNED'); sys.exit(127)"
+                    ),
+                ]
+                gw_fail = gateway_adapter.parse_gateways_payload(
+                    [{"id": "gw_fail", "base_url": "http://127.0.0.1:8317/v1", "dialect": "cpa", "api_key_cmd": fail_cmd}]
+                )["gw_fail"]
+                with self.assertLogs("agy.gateway_adapter", level="WARNING") as cm:
+                    self.assertEqual("", rt.resolve_api_key(gw_fail))
+                    self.assertEqual("", rt.resolve_api_key(gw_fail))
+                self.assertEqual("xx", counter_file.read_text(encoding="utf-8"))
+                self.assertNotIn("gw_fail", rt._key_cache)
+                joined_logs = "\n".join(cm.output)
+                self.assertIn("exited rc=127", joined_logs)
+                self.assertNotIn("SHOULD_NOT_BE_RETURNED", joined_logs)
+
     def test_transform_chat_request_dialects(self):
         strict_gw = gateway_adapter.parse_gateways_payload(
             [{"id": "strict", "base_url": "http://127.0.0.1:9001/v1", "dialect": "zhipu", "max_tokens_cap": 4096}]
