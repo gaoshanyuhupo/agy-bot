@@ -26,12 +26,22 @@ MODEL_FAMILY_LABELS = {
     "gemini-4-hydrogen": "Gemini 4 Hydrogen",
     "gemini-4-carbon": "Gemini 4 Carbon",
     "gemini-4-argon": "Gemini 4 Argon",
+    "gemini-4-neon": "Gemini 4 Neon",
     "gemini-pro-orchestrator": "Orchestrator Pro",
     "gemini-3.1-pro": "Gemini 3.1 Pro",
     "claude-opus-5-5": "Claude Opus 5.5",
     "claude-sonnet-5-5": "Claude Sonnet 5.5",
     "gpt-oss-120b": "GPT-OSS 120B",
 }
+
+
+def format_model_family_label(family: str) -> str:
+    """Return a clean human-readable display label for native or third-party gateway models."""
+    if family in MODEL_FAMILY_LABELS:
+        return MODEL_FAMILY_LABELS[family]
+    if isinstance(family, str) and family.startswith("gateway:"):
+        return f"🌐 {family[len('gateway:'):]}"
+    return str(family)
 
 
 def get_cost_tz(cost_tz_name: str = "Asia/Shanghai"):
@@ -55,11 +65,23 @@ def get_cost_tz(cost_tz_name: str = "Asia/Shanghai"):
 
 
 def canonical_model_family(raw_model):
-    """Map raw model identifiers to canonical billing family slugs."""
-    s = (raw_model or "").strip().lower()
+    """Map raw model identifiers to canonical billing family slugs.
+
+    Known Google Antigravity native models map to their official billing family;
+    third-party / gateway models (`gw:...`, `vendor/model`, `glm-*`, `gpt-*`, etc.)
+    preserve a `gateway:<model>` slug instead of being misclassified as Gemini Flash.
+    """
+    raw = (raw_model or "").strip()
+    s = raw.lower()
     if not s or s == "none":
         return "gemini-3.8-flash"
-    if "3.8" in s or "flash" in s:
+    if s.startswith("gw:"):
+        parts = raw.split(":", 2)
+        upstream = (parts[2] if len(parts) == 3 else raw).strip().lower()
+        return f"gateway:{upstream}" if upstream else "gateway:unknown"
+    if "/" in s:
+        return f"gateway:{s}"
+    if "gemini-3.8" in s or ("3.8" in s and "flash" in s) or ("gemini" in s and "flash" in s) or s.startswith("flash"):
         return "gemini-3.8-flash"
     if "hydrogen" in s:
         return "gemini-4-hydrogen"
@@ -69,24 +91,28 @@ def canonical_model_family(raw_model):
         return "gemini-4-argon"
     if "carbon" in s:
         return "gemini-4-carbon"
-    if "opus" in s:
+    if "gemini-4-neon" in s or "gemini 4 neon" in s:
+        return "gemini-4-neon"
+    if ("claude" in s and "opus" in s and ("5-5" in s or "5.5" in s)) or s.startswith("claude-opus-5-5"):
         return "claude-opus-5-5"
-    if "sonnet" in s:
+    if ("claude" in s and "sonnet" in s and ("5-5" in s or "5.5" in s)) or s.startswith("claude-sonnet-5-5"):
         return "claude-sonnet-5-5"
     if "gpt-oss" in s or "120b" in s:
         return "gpt-oss-120b"
-    if "pro" in s:
+    if "gemini" in s and "pro" in s:
         return "gemini-3.1-pro"
-    return "gemini-3.8-flash"
+    return f"gateway:{s}"
 
 
 def google_model_rates_per_m(family, ymd_utc, prompt_tokens=0):
     """Return `(uncached_input_usd, cache_read_usd, output_usd)` per 1M tokens."""
+    if isinstance(family, str) and family.startswith("gateway:"):
+        return (0.0, 0.0, 0.0)
     if family == "gemini-3.8-flash":
         return (0.75, 0.075, 3.75) if ymd_utc <= "2026-12-31" else (1.50, 0.15, 7.50)
     if family == "gemini-4-hydrogen":
         return (1.50, 0.075, 7.50)
-    if family in ("gemini-4-carbon", "gemini-4-argon", "gemini-pro-orchestrator"):
+    if family in ("gemini-4-carbon", "gemini-4-argon", "gemini-4-neon", "gemini-pro-orchestrator"):
         return (2.00, 0.10, 10.00) if ymd_utc <= "2026-11-30" else (4.00, 0.20, 20.00)
     if family == "gemini-3.1-pro":
         return (4.00, 0.40, 18.00) if prompt_tokens > 200_000 else (2.00, 0.20, 12.00)
@@ -96,7 +122,7 @@ def google_model_rates_per_m(family, ymd_utc, prompt_tokens=0):
         return (2.00, 0.10, 10.00)
     if family == "gpt-oss-120b":
         return (0.15, 0.075, 0.60)
-    return (2.00, 0.10, 10.00)
+    return (0.0, 0.0, 0.0)
 
 
 def parse_transcript_cost_steps(tpath, log_fn=None):
@@ -559,7 +585,7 @@ def render_cost_panel(
             lines = []
             for fam, magg in sorted(mdict.items(), key=lambda kv: -kv[1]["cost"]):
                 mtok, mcr, _, _, _ = agg_metrics(magg)
-                mlbl = MODEL_FAMILY_LABELS.get(fam, fam)
+                mlbl = format_model_family_label(fam)
                 lines.append(
                     f"• <code>{html_mod.escape(mlbl)}</code> · "
                     f"<code>{fmt_m_tokens(mtok)}</code> · 缓<code>{mcr:.1f}%</code> · "
@@ -615,7 +641,7 @@ def render_cost_panel(
             rows = [f"<b>{title}</b>"]
             for fam, magg in sorted(mdict.items(), key=lambda kv: -kv[1]["cost"]):
                 mtok, mcr, _, msaved, _ = agg_metrics(magg)
-                mlbl = MODEL_FAMILY_LABELS.get(fam, fam)
+                mlbl = format_model_family_label(fam)
                 tot_in = magg["inp"] + magg["ca"]
                 pi, pc, _ = google_model_rates_per_m(fam, now_utc.strftime("%Y-%m-%d"))
                 eff_in = ((magg["inp"] * pi + magg["ca"] * pc) / tot_in) if tot_in > 0 else pi

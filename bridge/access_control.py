@@ -223,7 +223,7 @@ def is_callback_allowed_for_role(role: str, callback_data: str) -> Tuple[bool, s
     data = (callback_data or "").strip()
     if data in _READONLY_CALLBACK_EXACT:
         return True, ""
-    if data.startswith("cost:") or data.startswith("sched:view:"):
+    if data.startswith("cost:") or data.startswith("sched:view:") or data.startswith("mp:"):
         return True, ""
     return False, data
 

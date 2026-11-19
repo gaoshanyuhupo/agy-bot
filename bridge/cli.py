@@ -32,6 +32,7 @@ RUNTIME_BRIDGE_FILES: Tuple[str, ...] = (
     "bot_bus.py",
     "bot_bus_mcp.py",
     "github_webhook.py",
+    "gateway_adapter.py",
 )
 
 
@@ -455,6 +456,73 @@ def _check_telegram_online(
         )
 
 
+def _check_gateways(cfg: Dict[str, str]) -> CheckResult:
+    """Validate optional multi-gateway configuration without leaking credentials."""
+    gw_file = (cfg.get("AGY_TG_GATEWAYS_FILE") or os.environ.get("AGY_TG_GATEWAYS_FILE") or "").strip()
+    gw_json = (cfg.get("AGY_TG_GATEWAYS_JSON") or os.environ.get("AGY_TG_GATEWAYS_JSON") or "").strip()
+
+    try:
+        try:
+            import gateway_adapter
+        except ImportError:
+            from bridge import gateway_adapter
+    except Exception as exc:
+        return CheckResult(
+            "gateways",
+            "WARN",
+            f"gateway_adapter unavailable ({type(exc).__name__})",
+            "Ensure bridge/gateway_adapter.py is present.",
+        )
+
+    default_file = gateway_adapter.default_gateways_file_path()
+    if not gw_file and not gw_json and not default_file.is_file():
+        return CheckResult("gateways", "PASS", "No external gateways configured (Google native mode)")
+
+    if gw_file and not gw_json:
+        expanded = _expand_path(gw_file)
+        if not expanded.is_file():
+            return CheckResult(
+                "gateways",
+                "WARN",
+                f"AGY_TG_GATEWAYS_FILE does not exist: {expanded}",
+                "Create the gateways JSON file or unset AGY_TG_GATEWAYS_FILE.",
+            )
+
+    ok, gw_map, errors, src_desc = gateway_adapter.validate_gateways_config(
+        gateways_file=gw_file or None,
+        gateways_json=gw_json or None,
+    )
+    if not ok:
+        return CheckResult(
+            "gateways",
+            "FAIL",
+            f"Gateway configuration invalid ({src_desc or 'config'}): {'; '.join(errors)}",
+            "Fix JSON syntax and required gateway fields (id, base_url, dialect).",
+        )
+
+    enabled = [gw for gw in gw_map.values() if gw.enabled]
+    if not gw_map:
+        return CheckResult("gateways", "PASS", f"Gateways config readable ({src_desc}); 0 gateways defined")
+
+    placeholder_gws = [
+        gw.id for gw in enabled if gw.api_key and _is_placeholder_value(gw.api_key)
+    ]
+    if placeholder_gws:
+        return CheckResult(
+            "gateways",
+            "WARN",
+            f"Gateways config loaded ({len(enabled)}/{len(gw_map)} enabled), placeholder api_key on: {', '.join(placeholder_gws)}",
+            "Replace placeholder api_key with api_key_env or api_key_cmd.",
+        )
+
+    summary_items = [f"{gw.id}({gw.dialect})" for gw in enabled]
+    return CheckResult(
+        "gateways",
+        "PASS",
+        f"Gateways config valid ({len(enabled)}/{len(gw_map)} enabled: {', '.join(summary_items) or 'none'})",
+    )
+
+
 def run_doctor(
     *,
     env_file: Optional[Path] = None,
@@ -475,6 +543,7 @@ def run_doctor(
     checks.append(tok_res)
     checks.append(_check_allowed_chats(cfg))
     checks.append(_check_dir_permissions(cfg, fix=fix))
+    checks.append(_check_gateways(cfg))
     if online:
         checks.append(_check_telegram_online(valid_token, http_get=http_get))
 

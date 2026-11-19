@@ -21,6 +21,7 @@ import hashlib
 import html as html_mod
 import itertools
 import json
+import math
 import os
 import py_compile
 import queue
@@ -78,6 +79,11 @@ try:
     import memory_guard
 except ImportError:
     from bridge import memory_guard
+
+try:
+    import gateway_adapter
+except ImportError:
+    from bridge import gateway_adapter
 
 # Load local .env file if present
 _env_file = os.environ.get("AGY_TG_ENV_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
@@ -143,8 +149,11 @@ STT_KEY = os.environ.get("AGY_TG_STT_KEY", "")
 STT_MODEL = os.environ.get("AGY_TG_STT_MODEL", "whisper-1")
 ENV_BOT_ROLE = os.environ.get("AGY_TG_BOT_ROLE", "").strip().lower()
 ENV_BOT_MODEL = os.environ.get("AGY_TG_BOT_MODEL", "").strip()
+ENV_BOT_EFFORT = os.environ.get("AGY_TG_BOT_EFFORT", "").strip().lower() or None
 ENV_BOT_PROJECT = os.environ.get("AGY_TG_BOT_PROJECT", "").strip()
 ENV_BOT_SPECIALTY = os.environ.get("AGY_TG_BOT_SPECIALTY", "").strip()
+GATEWAYS_FILE = os.environ.get("AGY_TG_GATEWAYS_FILE", "").strip()
+GATEWAYS_JSON = os.environ.get("AGY_TG_GATEWAYS_JSON", "").strip()
 _raw_bus_chat_mode = os.environ.get("AGY_BUS_CHAT_MODE", "conversational").strip().lower()
 BUS_CHAT_MODE = _raw_bus_chat_mode if _raw_bus_chat_mode in ("conversational", "card") else "conversational"
 BUS_FAST_CHAT_ENABLED = os.environ.get("AGY_BUS_FAST_CHAT", "1").strip().lower() not in ("0", "false", "no")
@@ -1468,6 +1477,242 @@ def register_bot_commands_async(force=True):
     threading.Thread(target=register_bot_commands, kwargs={"force": force}, daemon=True).start()
 
 
+# ---------------------------------------------------------------- gateway & model/effort routing
+_GATEWAY_ENV_PREFIX = "AGY_LLM_GATEWAY_"
+_gateway_lock = threading.Lock()
+_gateway_runtime = gateway_adapter.GatewayRuntimeState()
+_gateway_adapter_srv = None
+_native_models_lock = threading.Lock()
+_native_models_cache = (0.0, [])  # (fetched_ts, [(slug, desc), ...])
+_MODEL_CB_MAP = {}  # "ms:<12hex>" -> model_id
+
+
+def _strip_gateway_env(env):
+    """Remove all `AGY_LLM_GATEWAY_*` environment variables so native Google OAuth stays clean."""
+    for k in [key for key in list(env.keys()) if key.startswith(_GATEWAY_ENV_PREFIX)]:
+        env.pop(k, None)
+    return env
+
+
+def _get_gateways_map():
+    gw_file = os.environ.get("AGY_TG_GATEWAYS_FILE", "").strip() or GATEWAYS_FILE or None
+    gw_json = os.environ.get("AGY_TG_GATEWAYS_JSON", "").strip() or GATEWAYS_JSON or None
+    if not gw_file and not gw_json:
+        cand = os.path.join(HOME, ".config", "agy-tg-bridge", "gateways.json")
+        if os.path.isfile(cand):
+            gw_file = cand
+    gws = gateway_adapter.load_gateways_config(gateways_file=gw_file, gateways_json=gw_json)
+    with _gateway_lock:
+        if _gateway_adapter_srv is not None:
+            _gateway_adapter_srv.update_gateways(gws)
+    return gws
+
+
+def _get_gateway_adapter():
+    global _gateway_adapter_srv
+    gws = _get_gateways_map()
+    with _gateway_lock:
+        if _gateway_adapter_srv is None or not _gateway_adapter_srv.is_running():
+            _gateway_adapter_srv = gateway_adapter.GatewayAdapterServer(
+                gws,
+                host="127.0.0.1",
+                port=0,
+                runtime_state=_gateway_runtime,
+            )
+            _gateway_adapter_srv.start()
+        else:
+            _gateway_adapter_srv.update_gateways(gws)
+        return _gateway_adapter_srv
+
+
+def _stop_gateway_adapter():
+    global _gateway_adapter_srv
+    with _gateway_lock:
+        srv = _gateway_adapter_srv
+        _gateway_adapter_srv = None
+    if srv is not None:
+        srv.stop()
+
+
+def _cached_native_models_only():
+    with _native_models_lock:
+        return list(_native_models_cache[1])
+
+
+def _get_gateway_catalogs(gateways, force_refresh=False):
+    catalogs = {}
+    for gid, gw in (gateways or {}).items():
+        if not gw.enabled:
+            continue
+        catalogs[gid] = _gateway_runtime.list_gateway_models(
+            gw,
+            force_refresh=force_refresh,
+            timeout_s=3.5,
+        )
+    return catalogs
+
+
+def _cached_gateway_catalogs(gateways):
+    """Return cached or static gateway model lists without blocking on network probes."""
+    catalogs = {}
+    for gid, gw in (gateways or {}).items():
+        if not gw.enabled:
+            continue
+        with _gateway_runtime._lock:
+            cached = _gateway_runtime._catalog_cache.get(gid)
+        if cached and cached[1]:
+            catalogs[gid] = list(cached[1])
+        else:
+            catalogs[gid] = [
+                m for m in gw.models
+                if gateway_adapter.model_matches_filters(m, gw.include_models, gw.exclude_models)
+            ]
+    return catalogs
+
+
+# Built-in baseline effort map for cold-cache resolution before `agy models` populates `_native_models_cache`.
+_BUILTIN_NATIVE_EFFORTS = {
+    "gemini-4-neon": frozenset(("low", "medium", "high", "xhigh")),
+    "gemini-4-hydrogen": frozenset(("low", "medium", "high", "xhigh")),
+    "gemini-4-carbon": frozenset(("low", "medium", "high")),
+    "gemini-4-argon": frozenset(("low", "medium", "high")),
+    "gemini-3.8-flash": frozenset(("low", "medium", "high")),
+    "claude-opus-5-5": frozenset(("low", "medium", "high")),
+    "claude-sonnet-5-5": frozenset(("low", "medium", "high")),
+    "gpt-oss-120b": frozenset(("medium",)),
+}
+
+
+def _resolve_native_model_and_effort(model, effort, native_models=None):
+    """Coordinate Google native model slug with `/effort` to avoid `agy` CLI RC=1 rejections."""
+    eff = (effort or "").strip().lower() or None
+    raw_model = (model or "").strip() or None
+    nlist = list(native_models) if native_models is not None else _cached_native_models_only()
+
+    if raw_model is None:
+        if eff == "max":
+            return None, None
+        return None, eff
+
+    matched_suffix = None
+    for suf in ("xhigh", "medium", "high", "low", "max"):
+        if raw_model.endswith("-" + suf):
+            matched_suffix = suf
+            break
+
+    if matched_suffix is not None:
+        base = raw_model[:-(len(matched_suffix) + 1)]
+        if not eff:
+            return raw_model, None
+        variants = None
+        if nlist:
+            variants = {
+                s[len(base) + 1:]
+                for s, _ in nlist
+                if s.startswith(base + "-") and s[len(base) + 1:] in EFFORTS
+            }
+        elif base in _BUILTIN_NATIVE_EFFORTS:
+            variants = _BUILTIN_NATIVE_EFFORTS[base]
+        if variants is not None:
+            if len(variants) <= 1:
+                return raw_model, None
+            if eff in variants:
+                return base, eff
+            return raw_model, None
+        if base == "gpt-oss-120b" or eff in ("xhigh", "max"):
+            return raw_model, None
+        return base, eff
+
+    if not eff:
+        return raw_model, None
+
+    variants = None
+    if nlist:
+        variants = {
+            s[len(raw_model) + 1:]
+            for s, _ in nlist
+            if s.startswith(raw_model + "-") and s[len(raw_model) + 1:] in EFFORTS
+        }
+    elif raw_model in _BUILTIN_NATIVE_EFFORTS:
+        variants = _BUILTIN_NATIVE_EFFORTS[raw_model]
+    if variants is not None:
+        if not variants:
+            return raw_model, None
+        if eff in variants:
+            return raw_model, eff
+        return raw_model, None
+
+    if raw_model.startswith("gemini-pro-orchestrator") or eff in ("xhigh", "max"):
+        return raw_model, None
+    return raw_model, eff
+
+
+def _describe_model_provider(model):
+    """Resolve whether `model` targets Google native or a configured gateway without starting servers."""
+    gws = _get_gateways_map()
+    return gateway_adapter.resolve_model_target(
+        model,
+        gateways=gws,
+        native_models=_cached_native_models_only(),
+        gateway_catalogs=_cached_gateway_catalogs(gws),
+    )
+
+
+def _compute_exec_signature(model, effort):
+    res = _describe_model_provider(model)
+    if res.is_gateway:
+        with _gateway_lock:
+            port = _gateway_adapter_srv.port if (_gateway_adapter_srv and _gateway_adapter_srv.is_running()) else 0
+        eff = (effort or "").strip().lower()
+        return ("gateway", res.gateway_id, res.upstream_model, eff, res.gateway.fingerprint(), port)
+    cli_m, cli_e = _resolve_native_model_and_effort(res.upstream_model or model, effort)
+    return ("native", cli_m or "", cli_e or "")
+
+
+def _resolve_exec_target(model, effort):
+    """Resolve effective CLI model/effort and subprocess gateway env for `model` + `effort`."""
+    res = _describe_model_provider(model)
+    if res.is_gateway:
+        srv = _get_gateway_adapter()
+        route = srv.register_route(res.gateway_id, res.upstream_model, effort=effort)
+        eff = (effort or "").strip().lower()
+        sig = ("gateway", res.gateway_id, res.upstream_model, eff, res.gateway.fingerprint(), srv.port)
+        return {
+            "kind": "gateway",
+            "cli_model": res.upstream_model,
+            "cli_effort": None,
+            "env_set": {
+                "AGY_LLM_GATEWAY_URL": route.url,
+                "AGY_LLM_GATEWAY_API_KEY": route.local_api_key,
+                "AGY_LLM_GATEWAY_WIRE_PROTOCOL": "openai",
+            },
+            "gateway_id": res.gateway_id,
+            "upstream_model": res.upstream_model,
+            "effort": eff or None,
+            "signature": sig,
+        }
+
+    cli_m, cli_e = _resolve_native_model_and_effort(res.upstream_model or model, effort)
+    return {
+        "kind": "native",
+        "cli_model": cli_m,
+        "cli_effort": cli_e,
+        "env_set": {},
+        "gateway_id": None,
+        "upstream_model": cli_m,
+        "effort": cli_e,
+        "signature": ("native", cli_m or "", cli_e or ""),
+    }
+
+
+def _apply_exec_env(env, exec_plan):
+    _strip_gateway_env(env)
+    env_set = (exec_plan or {}).get("env_set") or {}
+    if env_set:
+        env.update(env_set)
+    return env
+
+
 # ---------------------------------------------------------------- persistent agy session
 class AgySession:
     """Manages a warm persistent `agy --input-format stream-json --output-format stream-json` process
@@ -1493,6 +1738,14 @@ class AgySession:
         self._pushback = collections.deque()
         self.eof_reached = False
 
+        exec_plan = _resolve_exec_target(model, effort)
+        self._exec_signature = exec_plan["signature"]
+        self._route_kind = exec_plan["kind"]
+        self._gateway_id = exec_plan["gateway_id"]
+        self._upstream_model = exec_plan["upstream_model"]
+        cli_model = exec_plan["cli_model"]
+        cli_effort = exec_plan["cli_effort"]
+
         cmd = [
             AGY_BIN,
             "--input-format", "stream-json",
@@ -1503,15 +1756,16 @@ class AgySession:
             cmd.append("--dangerously-skip-permissions")
         if self.project:
             cmd += ["--project", self.project]
-        if model:
-            cmd += ["--model", model]
-        if effort:
-            cmd += ["--effort", effort]
+        if cli_model:
+            cmd += ["--model", cli_model]
+        if cli_effort:
+            cmd += ["--effort", cli_effort]
         if conv:
             cmd += ["--conversation", conv]
         cmd += ["-p", ""]
 
         env = dict(os.environ)
+        _apply_exec_env(env, exec_plan)
         env["PATH"] = os.path.join(HOME, ".local/bin") + ":" + env.get("PATH", "")
         env.setdefault("HOME", HOME)
         env["AGY_OUTBOX_DIR"] = BOT_OUTBOX_DIR
@@ -1531,8 +1785,9 @@ class AgySession:
             env["AGY_UNTRUSTED_SESSION"] = "1"
             env["AGY_MEMORY_READONLY"] = "1"
 
-        log("Spawning persistent AgySession (conv=%s, project=%s, cwd=%s, model=%s, effort=%s, mode=%s, bus=%s, ro=%s, untrusted=%s)"
-            % ((conv or "new")[:8], self.project or "default", self.workdir, model or "default", effort or "default", self.mode, self.bus_enable, self.readonly, self.untrusted))
+        log("Spawning persistent AgySession (conv=%s, project=%s, cwd=%s, model=%s, effort=%s, route=%s, mode=%s, bus=%s, ro=%s, untrusted=%s)"
+            % ((conv or "new")[:8], self.project or "default", self.workdir, model or "default", effort or "default",
+               f"gw:{self._gateway_id}" if self._gateway_id else "native", self.mode, self.bus_enable, self.readonly, self.untrusted))
         self.proc = subprocess.Popen(
             cmd,
             cwd=self.workdir,
@@ -1625,6 +1880,8 @@ class AgySession:
         if getattr(self, "bus_role", None) != _current_bot_role():
             return False
         if self.mode != eff_mode or self.model != model or self.effort != effort:
+            return False
+        if getattr(self, "_exec_signature", None) != _compute_exec_signature(model, effort):
             return False
         if self.project != project or self.workdir != (workdir or WORKDIR):
             return False
@@ -3398,8 +3655,8 @@ def run_compact(chat_id, instruction="", thread_id=None, scope_key=None):
     skey = scope_key or scope_key_for(chat_id, thread_id)
     sc = get_scope_state(skey)
     mode = sc.get("mode", "auto")
-    model = sc.get("model")
-    effort = sc.get("effort")
+    model = sc.get("model") or (ENV_BOT_MODEL or None)
+    effort = sc.get("effort") or ENV_BOT_EFFORT
     conv = sc.get("conversation_id")
     project = current_project(skey)
     workdir = current_workdir(skey)
@@ -3627,6 +3884,7 @@ def _run_fast_group_reply(
         with state_lock:
             sc = _ensure_scope_locked(skey)
             model = sc.get("model")
+            effort = sc.get("effort") or ENV_BOT_EFFORT
             project = sc.get("project") or None
             wdir_raw = sc.get("workdir")
         fast_workdir = WORKDIR
@@ -3636,6 +3894,9 @@ def _run_fast_group_reply(
                 fast_workdir = rw
         cfg = _current_bot_cfg()
         exec_model = model or cfg.get("default_model") or None
+        exec_plan = _resolve_exec_target(exec_model, effort)
+        cli_model = exec_plan["cli_model"]
+        cli_effort = exec_plan["cli_effort"]
         history_block = bot_bus.format_unseen_group_history(
             chat_id,
             my_handle,
@@ -3662,13 +3923,16 @@ def _run_fast_group_reply(
             "--disable-slash-commands",
             "--print-timeout", "45s",
         ]
-        if exec_model:
-            cmd += ["--model", exec_model]
+        if cli_model:
+            cmd += ["--model", cli_model]
+        if cli_effort:
+            cmd += ["--effort", cli_effort]
         if project:
             cmd += ["--project", project]
         cmd += ["-p", fast_prompt]
 
         env = dict(os.environ)
+        _apply_exec_env(env, exec_plan)
         env["PATH"] = os.path.join(HOME, ".local/bin") + ":" + env.get("PATH", "")
         env.setdefault("HOME", HOME)
         env["AGY_BOT_BUS_ENABLE"] = "0"
@@ -3776,7 +4040,7 @@ def run_agy(
         mode = "safe" if session_readonly else sc.get("mode", "auto")
         model = sc.get("model")
         scope_fallback = sc.get("fallback_models")
-        effort = sc.get("effort")
+        effort = sc.get("effort") or ENV_BOT_EFFORT
         show_thinking = sc.get("thinking", True)
         project = sc.get("project") or None
         wdir_raw = sc.get("workdir")
@@ -3799,6 +4063,7 @@ def run_agy(
         model,
         scope_fallback=scope_fallback,
         env_fallback=FALLBACK_MODELS_RAW,
+        bot_default_model=ENV_BOT_MODEL or None,
     )
 
     base_prompt = prompt
@@ -4657,6 +4922,7 @@ def perform_hot_reload(notify_chat_id=None, notify_thread_id=None):
     if notify_chat_id:
         send(notify_chat_id, "🔄 正在热重载桥接服务...", thread_id=notify_thread_id)
     close_all_sessions_sync()
+    _stop_gateway_adapter()
     time.sleep(0.3)
     argv_clean = [a for a in sys.argv if a != "--self-check"]
     os.execv(sys.executable, [sys.executable] + argv_clean)
@@ -4890,11 +5156,17 @@ def execute_scheduled_task(task):
             if not prompt:
                 raise ValueError("No prompt provided for agent task")
             model = exec_cfg.get("model") or "gemini-3.8-flash-low"
+            sched_effort = exec_cfg.get("effort") or None
             project = exec_cfg.get("project") or current_project(task_scope) or "agy-cli-bot"
             timeout_s = int(exec_cfg.get("timeout_secs") or (300 if ttype == "browser" else 240))
             silent_enabled = bool(deliv_cfg.get("silent_if_empty", True))
 
+            exec_plan = _resolve_exec_target(model, sched_effort)
+            cli_model = exec_plan["cli_model"]
+            cli_effort = exec_plan["cli_effort"]
+
             env = dict(os.environ)
+            _apply_exec_env(env, exec_plan)
             env["PATH"] = os.path.join(HOME, ".local/bin") + ":" + env.get("PATH", "")
             env.setdefault("HOME", HOME)
             env["AGY_OUTBOX_DIR"] = BOT_OUTBOX_DIR
@@ -4973,8 +5245,10 @@ def execute_scheduled_task(task):
                 "--print-timeout", f"{timeout_s}s",
                 "-p", full_prompt,
             ]
-            if model:
-                cmd += ["--model", model]
+            if cli_model:
+                cmd += ["--model", cli_model]
+            if cli_effort:
+                cmd += ["--effort", cli_effort]
             if project:
                 cmd += ["--project", project]
 
@@ -5138,7 +5412,7 @@ def _execute_bus_job(job_id):
     raw_proj = job.get("project") or cfg.get("default_project") or ""
     exec_project = _resolve_project_id_by_name_or_id(raw_proj)
     exec_model = job.get("model") or cfg.get("default_model") or sc.get("model") or None
-    exec_effort = job.get("effort") or sc.get("effort") or None
+    exec_effort = job.get("effort") or sc.get("effort") or ENV_BOT_EFFORT or None
     exec_mode = job.get("mode") or sc.get("mode") or "auto"
     from_bot = job.get("from_bot") or "coordinator"
     thread_key = (job.get("thread_key") or "").strip()
@@ -5249,6 +5523,10 @@ def _execute_bus_job(job_id):
             worktree_info=wt_info,
         )
 
+        exec_plan = _resolve_exec_target(exec_model, exec_effort)
+        cli_model = exec_plan["cli_model"]
+        cli_effort = exec_plan["cli_effort"]
+
         cmd = [
             AGY_BIN,
             "--input-format", "text",
@@ -5257,10 +5535,10 @@ def _execute_bus_job(job_id):
         ]
         if exec_mode == "auto":
             cmd.append("--dangerously-skip-permissions")
-        if exec_model:
-            cmd += ["--model", exec_model]
-        if exec_effort:
-            cmd += ["--effort", exec_effort]
+        if cli_model:
+            cmd += ["--model", cli_model]
+        if cli_effort:
+            cmd += ["--effort", cli_effort]
         if exec_project:
             cmd += ["--project", exec_project]
         if resume_cid:
@@ -5268,6 +5546,7 @@ def _execute_bus_job(job_id):
         cmd += ["-p", full_prompt]
 
         env = dict(os.environ)
+        _apply_exec_env(env, exec_plan)
         env["PATH"] = os.path.join(HOME, ".local/bin") + ":" + env.get("PATH", "")
         env.setdefault("HOME", HOME)
         env["AGY_OUTBOX_DIR"] = BOT_OUTBOX_DIR
@@ -5766,8 +6045,17 @@ def worker():
 
 
 # ---------------------------------------------------------------- helpers
-def agy_models():
+def agy_native_models(use_cache=True):
+    """Fetch native Google Antigravity models via `agy models` with gateway env stripped."""
+    global _native_models_cache
+    now = time.time()
+    if use_cache:
+        with _native_models_lock:
+            ts, cached = _native_models_cache
+            if cached and (now - ts) < 120.0:
+                return list(cached)
     env = dict(os.environ)
+    _strip_gateway_env(env)
     env["PATH"] = os.path.join(HOME, ".local/bin") + ":" + env.get("PATH", "")
     try:
         r = subprocess.run([AGY_BIN, "models"], capture_output=True, text=True,
@@ -5777,10 +6065,52 @@ def agy_models():
             if "\t" in line:
                 slug, desc = line.split("\t", 1)
                 models.append((slug.strip(), desc.strip()))
+        if models:
+            with _native_models_lock:
+                _native_models_cache = (now, list(models))
         return models
     except Exception as e:
         log("agy_models failed: %s" % e)
-        return []
+        with _native_models_lock:
+            return list(_native_models_cache[1])
+
+
+def _model_callback_data(model_id):
+    """Return a Telegram-safe callback token (<= 64 bytes) for arbitrary long model IDs."""
+    digest = hashlib.sha1(model_id.encode("utf-8")).hexdigest()[:12]
+    tok = f"ms:{digest}"
+    _MODEL_CB_MAP[tok] = model_id
+    if len(_MODEL_CB_MAP) > 2000:
+        for old_k in list(_MODEL_CB_MAP.keys())[:500]:
+            if old_k != tok:
+                _MODEL_CB_MAP.pop(old_k, None)
+    return tok
+
+
+def agy_models(include_gateways=True, force_refresh=False):
+    """Return combined `(model_id, display_desc)` list across Google native and enabled gateways."""
+    native = agy_native_models(use_cache=not force_refresh)
+    combined = list(native)
+    if include_gateways:
+        gws = _get_gateways_map()
+        enabled_gws = {gid: gw for gid, gw in gws.items() if gw.enabled}
+        if enabled_gws:
+            catalogs = _get_gateway_catalogs(enabled_gws, force_refresh=force_refresh)
+            native_slugs = {slug for slug, _ in native}
+            counts = {}
+            for gid, mids in catalogs.items():
+                for mid in mids:
+                    counts[mid] = counts.get(mid, 0) + 1
+            for gid, gw in enabled_gws.items():
+                gw_label = gw.name or gw.id
+                for mid in catalogs.get(gid, ()):
+                    use_explicit = (mid in native_slugs) or (counts.get(mid, 0) > 1)
+                    slug = gateway_adapter.format_gateway_model_ref(gid, mid) if use_explicit else mid
+                    desc = f"[{gw_label}] {mid}"
+                    combined.append((slug, desc))
+    for slug, _desc in combined:
+        _model_callback_data(slug)
+    return combined
 
 
 def list_sessions(limit=8, scope_key=None):
@@ -5915,12 +6245,46 @@ def cancel_current_task(chat_id, clear_all=False, from_native_stop=False, thread
 
 
 # ---------------------------------------------------------------- keyboard builders
-def make_model_keyboard(cur_model):
-    models = agy_models()
+def _is_active_model_entry(slug, cur_model):
+    if not cur_model:
+        return False
+    if slug == cur_model:
+        return True
+    parsed_slug = gateway_adapter.parse_gateway_model_ref(slug)
+    parsed_cur = gateway_adapter.parse_gateway_model_ref(cur_model)
+    if parsed_slug and parsed_cur:
+        return parsed_slug == parsed_cur
+    if parsed_slug and parsed_slug[1] == cur_model:
+        res = _describe_model_provider(cur_model)
+        return res.is_gateway and res.gateway_id == parsed_slug[0]
+    if parsed_cur and parsed_cur[1] == slug:
+        res = _describe_model_provider(slug)
+        return res.is_gateway and res.gateway_id == parsed_cur[0]
+    return False
+
+
+def make_model_keyboard(cur_model, page=0, page_size=10, models=None):
+    all_models = agy_models() if models is None else list(models)
+    psize = max(1, int(page_size or 10))
+    total_pages = max(1, math.ceil(len(all_models) / psize)) if all_models else 1
+    cur_page = max(0, min(int(page or 0), total_pages - 1))
+    page_items = all_models[cur_page * psize : (cur_page + 1) * psize]
+
     buttons = []
-    for slug, desc in models:
-        mark = "✓ " if slug == cur_model else ""
-        buttons.append([{"text": f"{mark}{desc}", "callback_data": f"model:{slug}"}])
+    for slug, desc in page_items:
+        mark = "✓ " if _is_active_model_entry(slug, cur_model) else ""
+        cb_tok = _model_callback_data(slug)
+        buttons.append([{"text": f"{mark}{desc}"[:64], "callback_data": cb_tok}])
+
+    if total_pages > 1:
+        nav_row = []
+        if cur_page > 0:
+            nav_row.append({"text": "⬅️ 上一页", "callback_data": f"mp:{cur_page - 1}"})
+        nav_row.append({"text": f"📄 {cur_page + 1}/{total_pages}", "callback_data": f"mp:{cur_page}"})
+        if cur_page + 1 < total_pages:
+            nav_row.append({"text": "下一页 ➡️", "callback_data": f"mp:{cur_page + 1}"})
+        buttons.append(nav_row)
+
     buttons.append([{"text": "⚙️ Reset to Default (Clear)", "callback_data": "model:default"}])
     return {"inline_keyboard": buttons}
 
@@ -5989,23 +6353,42 @@ def make_status_keyboard(scope_key=None):
 
 
 # ---------------------------------------------------------------- commands
+def _render_model_panel(skey, page=0, page_size=10, models=None):
+    all_models = agy_models() if models is None else list(models)
+    sc = get_scope_state(skey)
+    cur = sc.get("model")
+    fb_desc = model_failover.describe_fallback_config(sc.get("fallback_models"), FALLBACK_MODELS_RAW)
+
+    psize = max(1, int(page_size or 10))
+    total_pages = max(1, math.ceil(len(all_models) / psize)) if all_models else 1
+    cur_page = max(0, min(int(page or 0), total_pages - 1))
+    page_items = all_models[cur_page * psize : (cur_page + 1) * psize]
+
+    page_note = f" · Page {cur_page + 1}/{total_pages} ({len(all_models)} models)" if total_pages > 1 else ""
+    lines = [f"<b>🤖 Models</b> (tap to switch{page_note}):"]
+    for slug, desc in page_items:
+        mark = "✓" if _is_active_model_entry(slug, cur) else "·"
+        lines.append(f"{mark} <code>{html_mod.escape(slug)}</code> — {html_mod.escape(desc)}")
+    if not page_items:
+        lines.append("· <i>(no models available; you can type /model &lt;slug&gt;)</i>")
+
+    cur_res = _describe_model_provider(cur) if cur else None
+    cur_label = html_mod.escape(cur or "(agy default)")
+    if cur_res and cur_res.is_gateway:
+        cur_label += f" <code>[gw:{html_mod.escape(cur_res.gateway_id)}]</code>"
+    lines.append(f"\nCurrent: <b>{cur_label}</b>")
+    lines.append(f"Fallback: <code>{html_mod.escape(fb_desc)}</code>")
+    lines.append("<i>Tip: <code>/model &lt;slug&gt;</code> · <code>/model fallback m1,m2</code></i>")
+    kb = make_model_keyboard(cur, page=cur_page, page_size=psize, models=all_models)
+    return "\n".join(lines), kb
+
+
 def cmd_model(chat_id, arg, thread_id=None, scope_key=None):
     skey = scope_key or scope_key_for(chat_id, thread_id)
     raw_arg = (arg or "").strip()
     if not raw_arg:
-        models = agy_models()
-        sc = get_scope_state(skey)
-        cur = sc.get("model")
-        fb_desc = model_failover.describe_fallback_config(sc.get("fallback_models"), FALLBACK_MODELS_RAW)
-        lines = ["<b>🤖 Models</b> (tap to switch):"]
-        for slug, desc in models:
-            mark = "✓" if slug == cur else "·"
-            lines.append(f"{mark} <code>{slug}</code> — {desc}")
-        lines.append(f"\nCurrent: <b>{html_mod.escape(cur or '(agy default)')}</b>")
-        lines.append(f"Fallback: <code>{html_mod.escape(fb_desc)}</code>")
-        lines.append("<i>Tip: <code>/model fallback m1,m2</code> · <code>/model fallback off</code></i>")
-        kb = make_model_keyboard(cur)
-        send(chat_id, "\n".join(lines), parse_mode="HTML", reply_markup=kb, thread_id=thread_id)
+        text, kb = _render_model_panel(skey, page=0)
+        send(chat_id, text, parse_mode="HTML", reply_markup=kb, thread_id=thread_id)
         return
 
     parts = raw_arg.split(None, 1)
@@ -6062,14 +6445,34 @@ def cmd_model(chat_id, arg, thread_id=None, scope_key=None):
         )
         return
 
-    new_val = None if head in ("default", "reset", "clear", "none") else parts[0]
+    if head in ("default", "reset", "clear", "none"):
+        new_val = None
+    else:
+        cand_raw = parts[0]
+        new_val = cand_raw
+        if "/" not in cand_raw and ":" not in cand_raw and not gateway_adapter.is_native_google_slug(cand_raw):
+            all_models = agy_models()
+            exact = [s for s, _ in all_models if s == cand_raw]
+            if not exact:
+                ci = [s for s, _ in all_models if s.lower() == cand_raw.lower()]
+                if len(ci) == 1:
+                    new_val = ci[0]
+                else:
+                    tail = [
+                        s for s, _ in all_models
+                        if s.lower().endswith("/" + cand_raw.lower()) or s.lower().endswith(":" + cand_raw.lower())
+                    ]
+                    if len(tail) == 1:
+                        new_val = tail[0]
     update_scope_state(skey, model=new_val)
     save_state()
     invalidate_session("model_change", scope_key=skey)
     if new_val is None:
         send(chat_id, "model → default (cleared)", thread_id=thread_id)
     else:
-        send(chat_id, f"model → {new_val} (applies from the next task)", thread_id=thread_id)
+        res = _describe_model_provider(new_val)
+        gw_note = f" [Gateway: {res.gateway_id}]" if res.is_gateway else ""
+        send(chat_id, f"model → {new_val}{gw_note} (applies from the next task)", thread_id=thread_id)
 
 
 def cmd_effort(chat_id, arg, thread_id=None, scope_key=None):
@@ -6615,6 +7018,7 @@ def fetch_plan_quota_data(force_live=True):
                 return cached, False, ""
 
         env = dict(os.environ)
+        _strip_gateway_env(env)
         env["AGY_INTERNAL_OBSERVER"] = "1"
         env["PATH"] = os.path.join(HOME, ".local/bin") + ":" + env.get("PATH", "")
         env.setdefault("HOME", HOME)
@@ -7437,8 +7841,8 @@ def cmd_status(chat_id, thread_id=None, scope_key=None):
     sc = get_scope_state(skey)
     conv = sc.get("conversation_id")
     mode = sc.get("mode", "auto")
-    model = sc.get("model")
-    effort = sc.get("effort")
+    model = sc.get("model") or (ENV_BOT_MODEL or None)
+    effort = sc.get("effort") or ENV_BOT_EFFORT
     th_on = sc.get("thinking", True)
     ac_on = bool(sc.get("auto_compact", True))
     thresh = int(sc.get("auto_compact_tokens") or DEFAULT_AUTO_COMPACT_TOKENS)
@@ -7477,6 +7881,16 @@ def cmd_status(chat_id, thread_id=None, scope_key=None):
     team_role = _current_bot_role()
     roster_online = sum(1 for b in bot_bus.list_roster(include_offline=False))
     fb_desc = model_failover.describe_fallback_config(sc.get("fallback_models"), FALLBACK_MODELS_RAW)
+    model_res = _describe_model_provider(model) if model else None
+    if model_res and model_res.is_gateway:
+        model_display = (
+            f"<code>{html_mod.escape(model_res.upstream_model)}</code> "
+            f"(Gateway: <code>{html_mod.escape(model_res.gateway_id)}</code>)"
+        )
+        effort_note = " (gateway reasoning_effort)" if effort else ""
+    else:
+        model_display = f"<code>{html_mod.escape(model or '(default)')}</code>"
+        effort_note = ""
 
     text = (f"<b>🤖 Antigravity Bridge v3.2 (Scoped Topics &amp; Bot Bus)</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -7484,9 +7898,9 @@ def cmd_status(chat_id, thread_id=None, scope_key=None):
             f"• <b>Scope:</b> <code>{html_mod.escape(scope_label)}</code> ({scope_total} isolated scopes)\n"
             f"• <b>Project:</b> <code>{html_mod.escape(proj_label)}</code> (<code>{html_mod.escape(wdir_short)}</code>)\n"
             f"• <b>Mode:</b> <code>{mode}</code>\n"
-            f"• <b>Model:</b> <code>{model or '(default)'}</code>\n"
+            f"• <b>Model:</b> {model_display}\n"
             f"• <b>Fallback:</b> <code>{html_mod.escape(fb_desc)}</code>\n"
-            f"• <b>Effort:</b> <code>{effort or '(default)'}</code>\n"
+            f"• <b>Effort:</b> <code>{html_mod.escape(effort or '(default)')}</code>{effort_note}\n"
             f"• <b>Thinking:</b> <code>{'enabled' if th_on else 'disabled'}</code>\n"
             f"• <b>Session:</b> <code>{(conv or '(none)')[:8]}</code>\n"
             f"• <b>Context:</b> {ctx_str}\n"
@@ -7900,17 +8314,42 @@ def handle_callback(cb):
            text=access_control.format_rbac_denied_message(data, is_callback=True), show_alert=True)
         return
 
-    if data.startswith("model:"):
-        target = data[6:]
-        new_model = None if target == "default" else target
+    if data.startswith("model:") or data.startswith("ms:"):
+        if data.startswith("ms:"):
+            resolved_target = _MODEL_CB_MAP.get(data)
+            if resolved_target is None:
+                agy_models()
+                resolved_target = _MODEL_CB_MAP.get(data)
+            if resolved_target is None:
+                tg("answerCallbackQuery", callback_query_id=cb_id,
+                   text="Model button expired; please re-run /model", show_alert=True)
+                return
+            new_model = resolved_target
+        else:
+            target = data[6:]
+            new_model = None if target == "default" else target
         update_scope_state(skey, model=new_model)
         save_state()
         invalidate_session("callback_model", scope_key=skey)
         tg("answerCallbackQuery", callback_query_id=cb_id,
            text=f"Model set to: {new_model or 'default'}")
         if msg_id:
-            kb = make_model_keyboard(new_model)
-            tg("editMessageReplyMarkup", chat_id=chat_id, message_id=msg_id, reply_markup=kb)
+            text, kb = _render_model_panel(skey, page=0)
+            r_ed = tg("editMessageText", chat_id=chat_id, message_id=msg_id,
+                      text=text, parse_mode="HTML", reply_markup=kb)
+            if not _tg_ok(r_ed):
+                tg("editMessageReplyMarkup", chat_id=chat_id, message_id=msg_id, reply_markup=kb)
+
+    elif data.startswith("mp:"):
+        try:
+            page_num = max(0, int(data[3:]))
+        except ValueError:
+            page_num = 0
+        tg("answerCallbackQuery", callback_query_id=cb_id)
+        if msg_id:
+            text, kb = _render_model_panel(skey, page=page_num)
+            tg("editMessageText", chat_id=chat_id, message_id=msg_id,
+               text=text, parse_mode="HTML", reply_markup=kb)
 
     elif data.startswith("effort:"):
         target = data[7:]
@@ -9216,6 +9655,7 @@ def main():
         invalidate_session("shutdown_timeout", force=True)
     else:
         close_all_sessions_sync()
+    _stop_gateway_adapter()
 
     log("Graceful shutdown complete. Exiting.")
     _release_instance_lock()
