@@ -6211,6 +6211,278 @@ class TestRound6FinalClosureRegression(unittest.TestCase):
 
             asyncio.run(_scenario())
 
+    def test_post_io_live_rbac_purge_on_non200_malformed_and_exception_exits(self) -> None:
+        """Round 11: EVERY card I/O exit (sendPhoto, editMessageMedia, editMessageCaption) —
+        including 503/ok=false, 200 missing/malformed message_id, 200 ok, and transport/JSON
+        exceptions — MUST re-verify live RBAC inside lock and immediately purge BOTH active
+        and pending-retire cards for `(bot_key, chat_id)` before returning (before any tick),
+        with ZERO follow-up Telegram requests."""
+        tok_main = "991133:TEST_ROUND11_RBAC_TOKEN"
+        with tempfile.TemporaryDirectory() as tmp:
+            bdir = Path(tmp)
+            env_path = bdir / ".env"
+
+            def _set_role(role: str) -> None:
+                if role == "admin":
+                    env_path.write_text(
+                        f"AGY_TG_BOT_TOKEN={tok_main}\n"
+                        f"AGY_TG_ALLOWED_CHATS=111\n"
+                        f"AGY_TG_ADMIN_USERS=111\n",
+                        encoding="utf-8",
+                    )
+                elif role == "readonly":
+                    env_path.write_text(
+                        f"AGY_TG_BOT_TOKEN={tok_main}\n"
+                        f"AGY_TG_ALLOWED_CHATS=111\n"
+                        f"AGY_TG_READONLY_USERS=111\n"
+                        f"AGY_TG_USER_ROLES=111:readonly\n",
+                        encoding="utf-8",
+                    )
+                else:
+                    raise ValueError(role)
+
+            class _FakeFormData:
+                def __init__(self) -> None:
+                    self.fields: dict[str, object] = {}
+
+                def add_field(self, name: str, value, **_kw) -> None:
+                    self.fields[name] = value
+
+            class _GatedTGHTTP:
+                def __init__(
+                    self,
+                    outcome: object,
+                    gate: tuple[asyncio.Event, asyncio.Event],
+                    *,
+                    json_exc: Exception | None = None,
+                ) -> None:
+                    self._outcome = outcome
+                    self._gate = gate
+                    self._json_exc = json_exc
+                    self.calls: list[tuple[str, dict]] = []
+
+                def post(self, url: str, data=None, json=None):
+                    endpoint = url.rsplit("/", 1)[-1]
+                    rec = {
+                        "endpoint": endpoint,
+                        "fields": dict(getattr(data, "fields", {})) if data is not None else None,
+                        "json": dict(json) if isinstance(json, dict) else json,
+                    }
+                    self.calls.append((endpoint, rec))
+                    outcome = self._outcome
+                    gate = self._gate
+                    json_exc = self._json_exc
+
+                    class _Resp:
+                        status = outcome.get("http_status", 200) if isinstance(outcome, dict) else 200
+
+                        async def __aenter__(self_r):
+                            entered, release = gate
+                            entered.set()
+                            await release.wait()
+                            if isinstance(outcome, Exception):
+                                raise outcome
+                            return self_r
+
+                        async def __aexit__(self_r, *_a):
+                            return False
+
+                        async def json(self_r):
+                            if json_exc is not None:
+                                raise json_exc
+                            return outcome
+
+                    return _Resp()
+
+            def _seed_hub(http_obj) -> object:
+                hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "sec-tok")
+                hub.tg.http = http_obj
+                hub.engine_mode = "hosted"
+                hub.session_gen = 7
+                hub.session_owner = ("main", 111)
+                hub.latest_jpeg = b"JPEG_R11_LIVE_FRAME"
+                hub.tg.cards[("main", 111)] = {
+                    "bot_key": "main",
+                    "chat_id": 111,
+                    "message_id": 702,
+                    "session_gen": 7,
+                    "owner": ("main", 111),
+                    "last_sha1": "prev_sha",
+                    "last_caption": "prev_cap",
+                    "last_markup": None,
+                    "last_ts": 0.0,
+                }
+                hub.tg.pending_retire_cards[("main", 111, 701)] = {
+                    "bot_key": "main",
+                    "chat_id": 111,
+                    "message_id": 701,
+                    "session_gen": 7,
+                    "owner": ("main", 111),
+                }
+                return hub
+
+            async def _scenario() -> None:
+                with (
+                    mock.patch.object(srv, "_BRIDGE_DIR", bdir),
+                    mock.patch.object(srv, "BRIDGE_ENV_FILES", {"main": env_path}),
+                    mock.patch.object(srv, "FormData", _FakeFormData),
+                ):
+                    # 1. ensure_card(force_new=True) sendPhoto non-success / malformed / exception exits
+                    send_cases = [
+                        (
+                            "sendPhoto_503_ok_false",
+                            {"http_status": 503, "ok": False, "description": "Service Unavailable"},
+                            None,
+                        ),
+                        (
+                            "sendPhoto_200_missing_message_id",
+                            {"http_status": 200, "ok": True, "result": {}},
+                            None,
+                        ),
+                        (
+                            "sendPhoto_200_malformed_message_id",
+                            {"http_status": 200, "ok": True, "result": {"message_id": "not-an-int"}},
+                            None,
+                        ),
+                        (
+                            "sendPhoto_transport_exception",
+                            ConnectionError("simulated transport drop"),
+                            None,
+                        ),
+                        (
+                            "sendPhoto_json_decode_exception",
+                            {"http_status": 200},
+                            ValueError("simulated malformed JSON"),
+                        ),
+                    ]
+                    for label, outcome, json_exc in send_cases:
+                        _set_role("admin")
+                        entered, release = asyncio.Event(), asyncio.Event()
+                        http_obj = _GatedTGHTTP(outcome, (entered, release), json_exc=json_exc)
+                        hub = _seed_hub(http_obj)
+
+                        task = asyncio.create_task(
+                            hub.tg.ensure_card("main", force_new=True, preferred_user_id=111)
+                        )
+                        await asyncio.wait_for(entered.wait(), timeout=2.0)
+
+                        # Downgrade real temp .env RBAC admin -> readonly while sendPhoto is in flight
+                        _set_role("readonly")
+                        self.assertEqual(
+                            "readonly", srv.load_bot_credentials_with_rbac()[4]["main"][111]
+                        )
+                        release.set()
+                        res = await asyncio.wait_for(task, timeout=2.0)
+
+                        self.assertIsNone(res, f"{label}: ensure_card must return None")
+                        self.assertEqual(
+                            ["sendPhoto"],
+                            [c[0] for c in http_obj.calls],
+                            f"{label}: must emit ONLY the already-in-flight sendPhoto",
+                        )
+                        # IMMEDIATELY upon ensure_card() return — BEFORE any tick_updates()!
+                        self.assertNotIn(
+                            ("main", 111),
+                            hub.tg.cards,
+                            f"{label}: active card 702 MUST be purged immediately on return",
+                        )
+                        self.assertEqual(
+                            [],
+                            [k for k in hub.tg.pending_retire_cards if k[0] == "main" and k[1] == 111],
+                            f"{label}: pending card 701 MUST be purged immediately on return",
+                        )
+
+                    # 2. _update_card_locked(finished=False) editMessageMedia in-flight downgrade
+                    #    on 503, transport exception, and 200 ok
+                    edit_cases = [
+                        (
+                            "editMessageMedia_503",
+                            {"http_status": 503, "ok": False, "description": "Service Unavailable"},
+                            None,
+                        ),
+                        (
+                            "editMessageMedia_transport_exception",
+                            ConnectionError("simulated editMessageMedia drop"),
+                            None,
+                        ),
+                        (
+                            "editMessageMedia_json_exception",
+                            {"http_status": 200},
+                            ValueError("simulated editMessageMedia bad JSON"),
+                        ),
+                        (
+                            "editMessageMedia_200_ok_revoked_in_flight",
+                            {"http_status": 200, "ok": True, "result": {"message_id": 702}},
+                            None,
+                        ),
+                    ]
+                    for label, outcome, json_exc in edit_cases:
+                        _set_role("admin")
+                        entered, release = asyncio.Event(), asyncio.Event()
+                        http_obj = _GatedTGHTTP(outcome, (entered, release), json_exc=json_exc)
+                        hub = _seed_hub(http_obj)
+
+                        async def _run_update():
+                            async with hub.tg._lock:
+                                return await hub.tg._update_card_locked(
+                                    ("main", 111),
+                                    tok_main,
+                                    finished=False,
+                                    force=True,
+                                )
+
+                        task = asyncio.create_task(_run_update())
+                        await asyncio.wait_for(entered.wait(), timeout=2.0)
+
+                        _set_role("readonly")
+                        self.assertEqual(
+                            "readonly", srv.load_bot_credentials_with_rbac()[4]["main"][111]
+                        )
+                        release.set()
+                        ok_edit = await asyncio.wait_for(task, timeout=2.0)
+
+                        self.assertFalse(ok_edit, f"{label}: revoked _update_card_locked must return False")
+                        self.assertEqual(
+                            ["editMessageMedia"],
+                            [c[0] for c in http_obj.calls],
+                            f"{label}: must emit ONLY the already-in-flight editMessageMedia",
+                        )
+                        self.assertNotIn(
+                            ("main", 111),
+                            hub.tg.cards,
+                            f"{label}: active card 702 MUST be purged immediately on return",
+                        )
+                        self.assertEqual(
+                            [],
+                            [k for k in hub.tg.pending_retire_cards if k[0] == "main" and k[1] == 111],
+                            f"{label}: pending card 701 MUST be purged immediately on return",
+                        )
+
+                    # 3. _retire_card_record_locked caption-only (editMessageCaption) transport exception
+                    #    with in-flight downgrade MUST purge BOTH active 702 & pending 701 immediately
+                    _set_role("admin")
+                    entered, release = asyncio.Event(), asyncio.Event()
+                    http_cap = _GatedTGHTTP(
+                        ConnectionError("simulated caption drop"), (entered, release)
+                    )
+                    hub_cap = _seed_hub(http_cap)
+
+                    async def _run_retire_cap():
+                        async with hub_cap.tg._lock:
+                            return await hub_cap.tg._retire_card_record_locked(("main", 111, 701))
+
+                    task_cap = asyncio.create_task(_run_retire_cap())
+                    await asyncio.wait_for(entered.wait(), timeout=2.0)
+                    _set_role("readonly")
+                    release.set()
+                    ok_cap = await asyncio.wait_for(task_cap, timeout=2.0)
+                    self.assertFalse(ok_cap)
+                    self.assertEqual(["editMessageCaption"], [c[0] for c in http_cap.calls])
+                    self.assertNotIn(("main", 111), hub_cap.tg.cards)
+                    self.assertEqual({}, hub_cap.tg.pending_retire_cards)
+
+            asyncio.run(_scenario())
+
 
 if __name__ == "__main__":
     unittest.main()

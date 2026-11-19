@@ -1483,6 +1483,17 @@ class TelegramLiveCardPublisher:
         for rk in [k for k in self.pending_retire_cards if k[0] == bot_key and k[1] == chat_id]:
             self.pending_retire_cards.pop(rk, None)
 
+    def _recheck_auth_or_drop_locked(self, bot_key: str, chat_id: int) -> str | None:
+        """Re-check live admin RBAC while holding `self._lock`; drop all active & pending cards if revoked."""
+        bots, _, _, allowed_by_bot, bot_roles = _load_auth_context()
+        live_token = self._is_card_currently_authorized(
+            bot_key, chat_id, bots, allowed_by_bot, bot_roles
+        )
+        if not live_token:
+            self._drop_revoked_cards(bot_key, chat_id)
+            return None
+        return live_token
+
     async def start(self) -> None:
         from aiohttp import ClientSession, ClientTimeout
         self.http = ClientSession(timeout=ClientTimeout(total=15), trust_env=True)
@@ -1783,45 +1794,45 @@ class TelegramLiveCardPublisher:
             return False
         if not self.http:
             return False
-        if jpeg_override:
-            retired_ok = await self._update_card_locked(
-                (bot_key, chat_id),
-                live_token,
-                finished=True,
-                force=True,
-                allow_stale_gen=True,
-                jpeg_override=jpeg_override,
-                card_override=card,
-            )
-            if retire_key not in self.pending_retire_cards:
-                return retired_ok
-        else:
-            retired_ok = await self._retire_orphan_card_message(live_token, chat_id, mid)
+        try:
+            if jpeg_override:
+                retired_ok = await self._update_card_locked(
+                    (bot_key, chat_id),
+                    live_token,
+                    finished=True,
+                    force=True,
+                    allow_stale_gen=True,
+                    jpeg_override=jpeg_override,
+                    card_override=card,
+                )
+                if retire_key not in self.pending_retire_cards:
+                    return retired_ok
+            else:
+                retired_ok = await self._retire_orphan_card_message(live_token, chat_id, mid)
+        except BaseException:
+            self._recheck_auth_or_drop_locked(bot_key, chat_id)
+            raise
         if retired_ok:
             self.pending_retire_cards.pop(retire_key, None)
             if (bot_key, chat_id) in self.cards or any(
                 k[0] == bot_key and k[1] == chat_id for k in self.pending_retire_cards
             ):
-                bots2, _, _, allowed2, roles2 = _load_auth_context()
-                if not self._is_card_currently_authorized(bot_key, chat_id, bots2, allowed2, roles2):
+                if not self._recheck_auth_or_drop_locked(bot_key, chat_id):
                     log.info(
                         "Dropping remaining revoked cards bot=%s chat_id=%s after retire request",
                         bot_key,
                         chat_id,
                     )
-                    self._drop_revoked_cards(bot_key, chat_id)
             return True
         # Re-check live RBAC after failed outbound request: if revoked mid-flight, drop all
         # active & pending cards for `(bot_key, chat_id)` immediately rather than retaining for retry.
-        bots2, _, _, allowed2, roles2 = _load_auth_context()
-        if not self._is_card_currently_authorized(bot_key, chat_id, bots2, allowed2, roles2):
+        if not self._recheck_auth_or_drop_locked(bot_key, chat_id):
             log.info(
                 "Dropping revoked cards bot=%s chat_id=%s mid=%s after failed retire request",
                 bot_key,
                 chat_id,
                 mid,
             )
-            self._drop_revoked_cards(bot_key, chat_id)
             return False
         attempts = int(card.get("retire_attempts") or 0) + 1
         card["retire_attempts"] = attempts
@@ -1935,80 +1946,111 @@ class TelegramLiveCardPublisher:
                 content_type="image/jpeg",
             )
 
+            send_ok = False
+            mid = 0
             try:
                 async with self.http.post(
                     f"https://api.telegram.org/bot{live_token}/sendPhoto", data=form
                 ) as resp:
-                    data = await resp.json()
-                    if data.get("ok") and data.get("result"):
-                        mid = int(data["result"]["message_id"])
-                        # Re-check session generation, owner & live auth AFTER Telegram response!
-                        bots2, _, _, allowed2, roles2 = _load_auth_context()
-                        still_token = self._is_card_currently_authorized(
-                            bot_key, chat_id, bots2, allowed2, roles2
+                    status = getattr(resp, "status", 200)
+                    if isinstance(status, int) and status >= 400:
+                        try:
+                            err_data = await resp.json()
+                        except Exception:
+                            err_data = None
+                        desc = (
+                            err_data.get("description")
+                            if isinstance(err_data, dict)
+                            else f"HTTP {status}"
                         )
-                        if not still_token:
-                            log.info(
-                                "Discarding orphan live card bot=%s chat_id=%s mid=%s: authorization revoked in-flight",
-                                bot_key,
-                                chat_id,
-                                mid,
-                            )
-                            self._drop_revoked_cards(bot_key, chat_id)
-                            return None
+                        log.warning("sendPhoto failed (%s, HTTP %s): %s", bot_key, status, desc)
+                    else:
+                        data = await resp.json()
                         if (
-                            self.hub.engine_mode == "idle"
-                            or self.hub.session_gen != card_gen
-                            or self.hub.session_owner != card_owner
-                            or not self._matches_session_owner(bot_key, chat_id)
+                            isinstance(data, dict)
+                            and data.get("ok")
+                            and isinstance(data.get("result"), dict)
                         ):
-                            log.info(
-                                "Discarding & retiring orphan live card bot=%s chat_id=%s mid=%s (card_gen=%d cur_gen=%d)",
-                                bot_key,
-                                chat_id,
-                                mid,
-                                card_gen,
-                                self.hub.session_gen,
-                            )
-                            staged = self._stage_card_for_retire(
-                                {
-                                    "bot_key": bot_key,
-                                    "chat_id": chat_id,
-                                    "message_id": mid,
-                                    "session_gen": card_gen,
-                                    "owner": card_owner,
-                                }
-                            )
-                            if staged is not None:
-                                await self._retire_card_record_locked(staged[0], still_token)
-                            return None
-                        prev = self.cards.get(card_key)
-                        if prev is not None and int(prev.get("message_id") or 0) != mid:
-                            self._stage_card_for_retire(prev, card_key=card_key)
-                        sha = hashlib.sha1(snap_jpeg).hexdigest()
-                        self.cards[card_key] = {
-                            "bot_key": bot_key,
-                            "chat_id": chat_id,
-                            "message_id": mid,
-                            "session_gen": card_gen,
-                            "owner": card_owner,
-                            "last_sha1": sha,
-                            "last_caption": caption,
-                            "last_markup": markup,
-                            "last_ts": time.monotonic(),
-                        }
-                        log.info(
-                            "Created Telegram live card bot=%s chat_id=%s message_id=%s gen=%d",
-                            bot_key,
-                            chat_id,
-                            mid,
-                            card_gen,
-                        )
-                        return self.cards[card_key]
-                    log.warning("sendPhoto failed (%s): %s", bot_key, data.get("description"))
+                            raw_mid = data["result"].get("message_id")
+                            if isinstance(raw_mid, bool) or isinstance(raw_mid, float):
+                                raise ValueError(f"invalid message_id: {raw_mid!r}")
+                            parsed_mid = int(raw_mid)
+                            if parsed_mid <= 0:
+                                raise ValueError(f"non-positive message_id: {parsed_mid}")
+                            mid = parsed_mid
+                            send_ok = True
+                        else:
+                            desc = data.get("description") if isinstance(data, dict) else data
+                            log.warning("sendPhoto failed (%s): %s", bot_key, desc)
             except Exception as exc:
                 log.warning("sendPhoto error (%s): %s", bot_key, exc)
-            return None
+            except BaseException:
+                self._recheck_auth_or_drop_locked(bot_key, chat_id)
+                raise
+
+            # Re-check live admin RBAC inside lock after EVERY sendPhoto I/O exit
+            # (200 ok, non-200 / ok=false, missing/malformed message_id, or transport/JSON exception).
+            still_token = self._recheck_auth_or_drop_locked(bot_key, chat_id)
+            if not still_token:
+                log.info(
+                    "Discarding live cards bot=%s chat_id=%s mid=%s: authorization revoked in-flight during sendPhoto",
+                    bot_key,
+                    chat_id,
+                    mid,
+                )
+                return None
+            if not send_ok:
+                return None
+
+            if (
+                self.hub.engine_mode == "idle"
+                or self.hub.session_gen != card_gen
+                or self.hub.session_owner != card_owner
+                or not self._matches_session_owner(bot_key, chat_id)
+            ):
+                log.info(
+                    "Discarding & retiring orphan live card bot=%s chat_id=%s mid=%s (card_gen=%d cur_gen=%d)",
+                    bot_key,
+                    chat_id,
+                    mid,
+                    card_gen,
+                    self.hub.session_gen,
+                )
+                staged = self._stage_card_for_retire(
+                    {
+                        "bot_key": bot_key,
+                        "chat_id": chat_id,
+                        "message_id": mid,
+                        "session_gen": card_gen,
+                        "owner": card_owner,
+                    }
+                )
+                if staged is not None:
+                    await self._retire_card_record_locked(staged[0], still_token)
+                return None
+            prev = self.cards.get(card_key)
+            if prev is not None and int(prev.get("message_id") or 0) != mid:
+                self._stage_card_for_retire(prev, card_key=card_key)
+            sha = hashlib.sha1(snap_jpeg).hexdigest()
+            self.cards[card_key] = {
+                "bot_key": bot_key,
+                "chat_id": chat_id,
+                "message_id": mid,
+                "session_gen": card_gen,
+                "owner": card_owner,
+                "last_sha1": sha,
+                "last_caption": caption,
+                "last_markup": markup,
+                "last_ts": time.monotonic(),
+            }
+            log.info(
+                "Created Telegram live card bot=%s chat_id=%s message_id=%s gen=%d",
+                bot_key,
+                chat_id,
+                mid,
+                card_gen,
+            )
+            return self.cards[card_key]
 
     async def retire_cards(
         self,
@@ -2127,6 +2169,8 @@ class TelegramLiveCardPublisher:
             if not ok_v2 or not live_token:
                 return False, msg_v2
             await self._update_card_locked(card_key, live_token, finished=False, force=True)
+            if card_key not in self.cards:
+                return False, "当前私聊卡片未授权或权限已撤销"
             return True, "ok"
 
     async def tick_updates(
@@ -2282,6 +2326,7 @@ class TelegramLiveCardPublisher:
             content_type="image/jpeg",
         )
 
+        result = False
         try:
             async with self.http.post(
                 f"https://api.telegram.org/bot{token}/editMessageMedia", data=form
@@ -2289,27 +2334,44 @@ class TelegramLiveCardPublisher:
                 status = getattr(resp, "status", 200)
                 if isinstance(status, int) and (status == 429 or status >= 500):
                     log.debug("editMessageMedia transient HTTP %s (%s)", status, bot_key)
-                    return False
-                data = await resp.json()
-                if isinstance(data, dict) and data.get("ok"):
-                    card["last_sha1"] = sha
-                    card["last_caption"] = caption
-                    card["last_markup"] = markup
-                    card["last_ts"] = time.monotonic()
-                    return True
-                if isinstance(data, dict):
-                    desc = str(data.get("description", ""))
-                    retry = (data.get("parameters") or {}).get("retry_after")
-                    if retry:
-                        card["last_ts"] = time.monotonic() + float(retry)
-                    elif "message is not modified" not in desc.lower():
-                        log.debug("editMessageMedia (%s): %s", bot_key, desc)
-                if finished:
-                    return self._is_tg_retire_terminal_response(status, data)
-                return False
+                else:
+                    data = await resp.json()
+                    if (
+                        isinstance(data, dict)
+                        and data.get("ok")
+                        and not (isinstance(status, int) and status >= 400)
+                    ):
+                        card["last_sha1"] = sha
+                        card["last_caption"] = caption
+                        card["last_markup"] = markup
+                        card["last_ts"] = time.monotonic()
+                        result = True
+                    else:
+                        if isinstance(data, dict):
+                            desc = str(data.get("description", ""))
+                            retry = (data.get("parameters") or {}).get("retry_after")
+                            if retry:
+                                card["last_ts"] = time.monotonic() + float(retry)
+                            elif "message is not modified" not in desc.lower():
+                                log.debug("editMessageMedia (%s): %s", bot_key, desc)
+                        if finished:
+                            result = self._is_tg_retire_terminal_response(status, data)
         except Exception as exc:
             log.debug("editMessageMedia error (%s): %s", bot_key, exc)
-            return False
+        except BaseException:
+            self._recheck_auth_or_drop_locked(bot_key, chat_id)
+            raise
+
+        # Re-check live admin RBAC inside lock after EVERY editMessageMedia I/O exit
+        # (200 ok, 429/5xx, non-200 / ok=false, malformed response, or transport/JSON exception).
+        if not self._recheck_auth_or_drop_locked(bot_key, chat_id):
+            log.info(
+                "Dropping revoked live cards bot=%s chat_id=%s after editMessageMedia I/O",
+                bot_key,
+                chat_id,
+            )
+            return result if finished else False
+        return result
 
     async def send_clip_message(
         self, bot_key: str, text: str, preferred_user_id: int | None = None
