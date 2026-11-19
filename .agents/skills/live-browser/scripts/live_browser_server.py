@@ -1434,7 +1434,54 @@ class TelegramLiveCardPublisher:
         self.http: Any = None
         # Active card state keyed by `(bot_key, chat_id)` with `session_gen` binding
         self.cards: dict[tuple[str, int], dict[str, Any]] = {}
+        # Stale / retiring card records isolated by `(bot_key, chat_id, message_id)` so fast
+        # same-owner rollovers, `force_new` replacements, and rejected stale-card callbacks never
+        # overwrite or drop bounded retirement retries (`retire_attempts` capped at 3).
+        self.pending_retire_cards: dict[tuple[str, int, int], dict[str, Any]] = {}
         self._lock = asyncio.Lock()
+
+    def _stage_card_for_retire(
+        self,
+        card: dict[str, Any] | None,
+        *,
+        card_key: tuple[str, int] | None = None,
+    ) -> tuple[tuple[str, int, int], dict[str, Any]] | None:
+        """Move a stale/superseded card into `pending_retire_cards[(bot_key, chat_id, message_id)]`
+        preserving any existing `retire_attempts`. Only removes `card_key` from `self.cards` when
+        it still refers to the same card/message_id.
+        """
+        if not isinstance(card, dict):
+            if card_key is not None:
+                self.cards.pop(card_key, None)
+            return None
+        bot_key = str(card.get("bot_key") or (card_key[0] if card_key else ""))
+        chat_id = int(card.get("chat_id") or (card_key[1] if card_key else 0))
+        mid = int(card.get("message_id") or 0)
+        if card_key is not None:
+            cur = self.cards.get(card_key)
+            if cur is card or (cur is not None and int(cur.get("message_id") or 0) == mid):
+                self.cards.pop(card_key, None)
+        if not bot_key or chat_id <= 0 or mid <= 0:
+            return None
+        retire_key = (bot_key, chat_id, mid)
+        existing = self.pending_retire_cards.get(retire_key)
+        if existing is not None:
+            existing["retire_attempts"] = max(
+                int(existing.get("retire_attempts") or 0),
+                int(card.get("retire_attempts") or 0),
+            )
+            return retire_key, existing
+        card["bot_key"] = bot_key
+        card["chat_id"] = chat_id
+        card["message_id"] = mid
+        self.pending_retire_cards[retire_key] = card
+        return retire_key, card
+
+    def _drop_revoked_cards(self, bot_key: str, chat_id: int) -> None:
+        """Drop active & pending-retire cards for a revoked `(bot_key, chat_id)` without calling Telegram."""
+        self.cards.pop((bot_key, chat_id), None)
+        for rk in [k for k in self.pending_retire_cards if k[0] == bot_key and k[1] == chat_id]:
+            self.pending_retire_cards.pop(rk, None)
 
     async def start(self) -> None:
         from aiohttp import ClientSession, ClientTimeout
@@ -1522,7 +1569,7 @@ class TelegramLiveCardPublisher:
         bots, _, _, allowed_by_bot, bot_roles = _load_auth_context()
         token = self._is_card_currently_authorized(bot_key, chat_id, bots, allowed_by_bot, bot_roles)
         if not token:
-            self.cards.pop((bot_key, chat_id), None)
+            self._drop_revoked_cards(bot_key, chat_id)
             return False, "当前私聊卡片未授权或权限已撤销", None
         if not self._matches_session_owner(bot_key, chat_id):
             return False, "该实况卡片不属于当前浏览器会话归属者", None
@@ -1534,9 +1581,12 @@ class TelegramLiveCardPublisher:
                 or message_id <= 0
             ):
                 return False, "缺少有效的实况卡片 message_id", None
-            card = self.cards.get((bot_key, chat_id))
+            card_key = (bot_key, chat_id)
+            card = self.cards.get(card_key)
             if not card or card.get("session_gen") != self.hub.session_gen:
-                self.cards.pop((bot_key, chat_id), None)
+                if card is not None:
+                    # Reject stale callback without dropping retirement retry tracking
+                    self._stage_card_for_retire(card, card_key=card_key)
                 return False, "该实况卡片已过期或不属于当前浏览器会话", None
             if int(card.get("message_id", -1)) != int(message_id):
                 return False, "该实况卡片已不是最新卡片", None
@@ -1696,36 +1746,40 @@ class TelegramLiveCardPublisher:
 
     async def _retire_card_record_locked(
         self,
-        card_key: tuple[str, int],
-        card: dict[str, Any],
+        retire_key: tuple[str, int, int],
         token: str,
         *,
         jpeg_override: bytes | None = None,
     ) -> bool:
-        """Retire a stale card record in Telegram; pop only on confirmed retire or bounded retry cap.
+        """Retire a staged stale card record in `pending_retire_cards`; pop only on confirmed retire
+        or bounded retry cap.
 
-        Shared by explicit `retire_cards()` (both caption-only and final-JPEG `editMessageMedia` paths)
-        and periodic `tick_updates()` / `_update_card_locked()` retirement paths so both observe the same
-        Telegram response verification and shared per-card `retire_attempts` counter (capped at 3).
+        Shared by explicit `retire_cards()` (both caption-only and final-JPEG `editMessageMedia` paths),
+        orphan card cleanup in `ensure_card()`, and periodic `tick_updates()` / `_update_card_locked()`
+        retirement paths so all observe the same Telegram response verification and shared per-card
+        `retire_attempts` counter (capped at 3).
         """
-        bot_key, chat_id = card_key
-        mid = int(card.get("message_id") or 0)
+        card = self.pending_retire_cards.get(retire_key)
+        if card is None:
+            return False
+        bot_key, chat_id, mid = retire_key
         if mid <= 0:
-            self.cards.pop(card_key, None)
+            self.pending_retire_cards.pop(retire_key, None)
             return True
         if jpeg_override:
             retired_ok = await self._update_card_locked(
-                card_key,
+                (bot_key, chat_id),
                 token,
                 finished=True,
                 force=True,
                 allow_stale_gen=True,
                 jpeg_override=jpeg_override,
+                card_override=card,
             )
         else:
             retired_ok = await self._retire_orphan_card_message(token, chat_id, mid)
         if retired_ok:
-            self.cards.pop(card_key, None)
+            self.pending_retire_cards.pop(retire_key, None)
             return True
         attempts = int(card.get("retire_attempts") or 0) + 1
         card["retire_attempts"] = attempts
@@ -1737,7 +1791,7 @@ class TelegramLiveCardPublisher:
                 mid,
                 attempts,
             )
-            self.cards.pop(card_key, None)
+            self.pending_retire_cards.pop(retire_key, None)
             return False
         return False
 
@@ -1812,13 +1866,16 @@ class TelegramLiveCardPublisher:
             bots, _, _, allowed_by_bot, bot_roles = _load_auth_context()
             live_token = self._is_card_currently_authorized(bot_key, chat_id, bots, allowed_by_bot, bot_roles)
             if not live_token:
-                self.cards.pop(card_key, None)
+                self._drop_revoked_cards(bot_key, chat_id)
                 return None
 
             existing = self.cards.get(card_key)
             if existing and not force_new and existing.get("session_gen") == card_gen:
                 await self._update_card_locked(card_key, live_token, finished=False, force=True)
                 return self.cards.get(card_key)
+            if existing and existing.get("session_gen") != card_gen:
+                # Preserve stale card's retirement retry tracking before sending a new card
+                self._stage_card_for_retire(existing, card_key=card_key)
 
             snap_jpeg = self.hub.latest_jpeg
             caption = self._build_caption(finished=False)
@@ -1863,8 +1920,24 @@ class TelegramLiveCardPublisher:
                                 card_gen,
                                 self.hub.session_gen,
                             )
-                            await self._retire_orphan_card_message(live_token, chat_id, mid)
+                            if still_token:
+                                staged = self._stage_card_for_retire(
+                                    {
+                                        "bot_key": bot_key,
+                                        "chat_id": chat_id,
+                                        "message_id": mid,
+                                        "session_gen": card_gen,
+                                        "owner": card_owner,
+                                    }
+                                )
+                                if staged is not None:
+                                    await self._retire_card_record_locked(staged[0], still_token)
+                            else:
+                                await self._retire_orphan_card_message(live_token, chat_id, mid)
                             return None
+                        prev = self.cards.get(card_key)
+                        if prev is not None and int(prev.get("message_id") or 0) != mid:
+                            self._stage_card_for_retire(prev, card_key=card_key)
                         sha = hashlib.sha1(snap_jpeg).hexdigest()
                         self.cards[card_key] = {
                             "bot_key": bot_key,
@@ -1897,16 +1970,19 @@ class TelegramLiveCardPublisher:
         mark_finished: bool = True,
         final_jpeg: bytes | None = None,
     ) -> int:
-        """Retire active cards (optionally matching `session_gen`) using strictly stateless finished copy.
+        """Retire active & pending-retire cards (optionally matching `session_gen`) using strictly
+        stateless finished copy.
 
-        Shares the same Telegram confirmation/permanent-error verification and bounded 3-attempt
+        Stages matching active cards into `pending_retire_cards[(bot_key, chat_id, message_id)]`
+        and shares the same Telegram confirmation/permanent-error verification and bounded 3-attempt
         retry state machine (`_retire_card_record_locked`) as periodic `tick_updates()` across both
         caption-only (`editMessageCaption`) and final-JPEG (`editMessageMedia`) paths.
         """
-        if not self.cards:
+        if not self.cards and not self.pending_retire_cards:
             return 0
         retired = 0
         async with self._lock:
+            staged_from_active: dict[tuple[str, int, int], bytes | None] = {}
             for card_key in list(self.cards.keys()):
                 card = self.cards.get(card_key)
                 if not card:
@@ -1917,23 +1993,44 @@ class TelegramLiveCardPublisher:
                     self.cards.pop(card_key, None)
                     retired += 1
                     continue
-                bot_key, chat_id = card_key
-                bots, _, _, allowed_by_bot, bot_roles = _load_auth_context()
-                token = self._is_card_currently_authorized(
-                    bot_key, chat_id, bots, allowed_by_bot, bot_roles
-                )
-                if not token or not self.http:
-                    self.cards.pop(card_key, None)
-                    retired += 1
-                    continue
                 same_gen_jpeg = (
                     self.hub.latest_jpeg
                     if card.get("session_gen") == self.hub.session_gen
                     else None
                 )
                 jpeg_for_finish = final_jpeg if final_jpeg is not None else same_gen_jpeg
+                staged = self._stage_card_for_retire(card, card_key=card_key)
+                if staged is None:
+                    retired += 1
+                    continue
+                staged_from_active[staged[0]] = jpeg_for_finish
+
+            bots, _, _, allowed_by_bot, bot_roles = _load_auth_context()
+            for retire_key in list(self.pending_retire_cards.keys()):
+                card = self.pending_retire_cards.get(retire_key)
+                if not card:
+                    continue
+                if session_gen is not None and card.get("session_gen") != session_gen:
+                    continue
+                if not mark_finished:
+                    self.pending_retire_cards.pop(retire_key, None)
+                    retired += 1
+                    continue
+                bot_key, chat_id, _mid = retire_key
+                token = self._is_card_currently_authorized(
+                    bot_key, chat_id, bots, allowed_by_bot, bot_roles
+                )
+                if not token or not self.http:
+                    self.pending_retire_cards.pop(retire_key, None)
+                    retired += 1
+                    continue
+                jpeg_for_finish = (
+                    staged_from_active[retire_key]
+                    if retire_key in staged_from_active
+                    else (final_jpeg if final_jpeg is not None else None)
+                )
                 if await self._retire_card_record_locked(
-                    card_key, card, token, jpeg_override=jpeg_for_finish
+                    retire_key, token, jpeg_override=jpeg_for_finish
                 ):
                     retired += 1
         return retired
@@ -1977,7 +2074,7 @@ class TelegramLiveCardPublisher:
     async def tick_updates(
         self, finished: bool = False, force: bool = False, *, bot_filter: str | None = None
     ) -> None:
-        if not self.cards:
+        if not self.cards and not self.pending_retire_cards:
             return
         if finished:
             await self.retire_cards(mark_finished=True)
@@ -1985,6 +2082,7 @@ class TelegramLiveCardPublisher:
         if not self.http:
             return
         async with self._lock:
+            attempted_retire_keys: set[tuple[str, int, int]] = set()
             for card_key in list(self.cards.keys()):
                 bot_key, chat_id = card_key
                 if bot_filter is not None and bot_key != bot_filter:
@@ -1998,21 +2096,49 @@ class TelegramLiveCardPublisher:
                 )
                 if not token:
                     log.info("Retiring live card bot=%s chat_id=%s: authorization revoked", bot_key, chat_id)
-                    self.cards.pop(card_key, None)
+                    self._drop_revoked_cards(bot_key, chat_id)
                     continue
                 if (
                     self.hub.engine_mode == "idle"
                     or card.get("session_gen") != self.hub.session_gen
                     or not self._matches_session_owner(bot_key, chat_id)
                 ):
-                    # If a queued periodic update wins the card lock ahead of `retire_cards()`,
-                    # retire the stale Telegram message (finished caption + empty keyboard) BEFORE
-                    # popping the card record; retain for bounded retry on transient Telegram failure!
-                    await self._retire_card_record_locked(card_key, card, token)
+                    # Stage stale card into `pending_retire_cards` so the retirement pass below
+                    # retries it (stateless finished caption + empty keyboard) up to the shared cap.
+                    self._stage_card_for_retire(card, card_key=card_key)
                     continue
                 if not self.hub.latest_jpeg:
                     continue
-                await self._update_card_locked(card_key, token, finished=False, force=force)
+                await self._update_card_locked(
+                    card_key,
+                    token,
+                    finished=False,
+                    force=force,
+                    attempted_retire_keys=attempted_retire_keys,
+                )
+
+            # Independently drain `pending_retire_cards` regardless of idle/no-frame or whether a
+            # newer active card exists for the same `(bot_key, chat_id)`.
+            for retire_key in list(self.pending_retire_cards.keys()):
+                bot_key, chat_id, mid = retire_key
+                if bot_filter is not None and bot_key != bot_filter:
+                    continue
+                if retire_key in attempted_retire_keys or retire_key not in self.pending_retire_cards:
+                    continue
+                bots, _, _, allowed_by_bot, bot_roles = _load_auth_context()
+                token = self._is_card_currently_authorized(
+                    bot_key, chat_id, bots, allowed_by_bot, bot_roles
+                )
+                if not token:
+                    log.info(
+                        "Dropping pending-retire card bot=%s chat_id=%s mid=%s: authorization revoked",
+                        bot_key,
+                        chat_id,
+                        mid,
+                    )
+                    self._drop_revoked_cards(bot_key, chat_id)
+                    continue
+                await self._retire_card_record_locked(retire_key, token)
 
     async def _update_card_locked(
         self,
@@ -2022,8 +2148,10 @@ class TelegramLiveCardPublisher:
         force: bool = False,
         allow_stale_gen: bool = False,
         jpeg_override: bytes | None = None,
+        card_override: dict[str, Any] | None = None,
+        attempted_retire_keys: set[tuple[str, int, int]] | None = None,
     ) -> bool:
-        card = self.cards.get(card_key)
+        card = card_override if card_override is not None else self.cards.get(card_key)
         bot_key, chat_id = card_key
         if not card or not self.http:
             return False
@@ -2037,7 +2165,7 @@ class TelegramLiveCardPublisher:
                 bot_key, chat_id, bots, allowed_by_bot, bot_roles
             )
             if not live_token:
-                self.cards.pop(card_key, None)
+                self._drop_revoked_cards(bot_key, chat_id)
                 return False
             if (
                 self.hub.engine_mode == "idle"
@@ -2046,7 +2174,11 @@ class TelegramLiveCardPublisher:
                 or self.hub.session_owner != snap_owner
                 or not self._matches_session_owner(bot_key, chat_id)
             ):
-                await self._retire_card_record_locked(card_key, card, live_token)
+                staged = self._stage_card_for_retire(card, card_key=card_key)
+                if staged is not None:
+                    if attempted_retire_keys is not None:
+                        attempted_retire_keys.add(staged[0])
+                    await self._retire_card_record_locked(staged[0], live_token)
                 return False
             token = live_token
             jpeg_bytes = jpeg_override if jpeg_override is not None else self.hub.latest_jpeg
@@ -4972,7 +5104,7 @@ class LiveBrowserHub:
         while True:
             try:
                 await self._expire_sync_session_if_stale()
-                if self.tg.cards:
+                if self.tg.cards or self.tg.pending_retire_cards:
                     await self.tg.tick_updates(finished=False, force=False)
                 now = time.monotonic()
                 if (now - last_cleanup) >= 60.0:

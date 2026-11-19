@@ -4872,13 +4872,15 @@ class TestRound6FinalClosureRegression(unittest.TestCase):
                         "last_markup": "m",
                         "last_ts": 0.0,
                     }
-                    # Attempt 1: transient failure -> card MUST remain retained with retire_attempts == 1
+                    # Attempt 1: transient failure -> card MUST move to pending_retire_cards with retire_attempts == 1
                     await hub.tg.tick_updates(force=True)
-                    self.assertIn(("main", 111), hub.tg.cards)
-                    self.assertEqual(1, hub.tg.cards[("main", 111)].get("retire_attempts"))
+                    self.assertNotIn(("main", 111), hub.tg.cards)
+                    self.assertIn(("main", 111, 888), hub.tg.pending_retire_cards)
+                    self.assertEqual(1, hub.tg.pending_retire_cards[("main", 111, 888)].get("retire_attempts"))
                     # Attempt 2: succeeds -> card MUST be removed
                     await hub.tg.tick_updates(force=True)
                     self.assertNotIn(("main", 111), hub.tg.cards)
+                    self.assertNotIn(("main", 111, 888), hub.tg.pending_retire_cards)
                     self.assertEqual(2, len(flaky_http.calls))
 
                     # Bounded 3-attempt cap: 3 consecutive 500s -> retained on attempts 1 & 2, dropped on attempt 3
@@ -4902,11 +4904,17 @@ class TestRound6FinalClosureRegression(unittest.TestCase):
                         "last_ts": 0.0,
                     }
                     await hub.tg.tick_updates(force=True)
-                    self.assertIn(("main", 111), hub.tg.cards)
+                    self.assertNotIn(("main", 111), hub.tg.cards)
+                    self.assertIn(("main", 111, 8881), hub.tg.pending_retire_cards)
                     await hub.tg.tick_updates(force=True)
-                    self.assertIn(("main", 111), hub.tg.cards)
+                    self.assertIn(("main", 111, 8881), hub.tg.pending_retire_cards)
                     await hub.tg.tick_updates(force=True)
-                    self.assertNotIn(("main", 111), hub.tg.cards, "Card MUST drop after bounded 3 failed retire attempts")
+                    self.assertNotIn(("main", 111), hub.tg.cards)
+                    self.assertNotIn(
+                        ("main", 111, 8881),
+                        hub.tg.pending_retire_cards,
+                        "Card MUST drop after bounded 3 failed retire attempts",
+                    )
 
                     # Real concurrent lock contention: tick_updates wins lock first, retire_cards waits behind it!
                     gate = asyncio.Event()
@@ -5343,13 +5351,19 @@ class TestRound6FinalClosureRegression(unittest.TestCase):
                     _, retired_cnt = await asyncio.gather(t_tick, t_retire)
 
                     self.assertEqual(0, retired_cnt, "Transient 503 in explicit retire_cards() MUST NOT claim retired")
-                    self.assertIn(("main", 111), hub.tg.cards, "Card MUST remain retained after 429 + 503 (< 3 cap)")
-                    self.assertEqual(2, hub.tg.cards[("main", 111)].get("retire_attempts"))
+                    self.assertNotIn(("main", 111), hub.tg.cards)
+                    self.assertIn(
+                        ("main", 111, 901),
+                        hub.tg.pending_retire_cards,
+                        "Card MUST remain retained in pending_retire_cards after 429 + 503 (< 3 cap)",
+                    )
+                    self.assertEqual(2, hub.tg.pending_retire_cards[("main", 111, 901)].get("retire_attempts"))
                     self.assertEqual(2, len(http_cross.calls))
 
                     # Next idle/no-frame periodic maintenance tick succeeds (attempt 3) and removes card
                     await hub.tg.tick_updates(force=False)
                     self.assertNotIn(("main", 111), hub.tg.cards)
+                    self.assertNotIn(("main", 111, 901), hub.tg.pending_retire_cards)
                     self.assertEqual(3, len(http_cross.calls))
 
                     # 2. Explicit retire_cards() WITH final_jpeg (editMessageMedia path):
@@ -5370,12 +5384,18 @@ class TestRound6FinalClosureRegression(unittest.TestCase):
                         session_gen=16, mark_finished=True, final_jpeg=b"FINAL_JPEG_BYTES"
                     )
                     self.assertEqual(0, retired_m1)
-                    self.assertIn(("main", 111), hub.tg.cards, "editMessageMedia 503 MUST retain card for retry")
-                    self.assertEqual(1, hub.tg.cards[("main", 111)].get("retire_attempts"))
+                    self.assertNotIn(("main", 111), hub.tg.cards)
+                    self.assertIn(
+                        ("main", 111, 902),
+                        hub.tg.pending_retire_cards,
+                        "editMessageMedia 503 MUST retain card in pending_retire_cards for retry",
+                    )
+                    self.assertEqual(1, hub.tg.pending_retire_cards[("main", 111, 902)].get("retire_attempts"))
                     self.assertTrue(http_media.calls[0][0].endswith("/editMessageMedia"))
 
                     await hub.tg.tick_updates(force=False)
                     self.assertNotIn(("main", 111), hub.tg.cards)
+                    self.assertNotIn(("main", 111, 902), hub.tg.pending_retire_cards)
                     self.assertTrue(http_media.calls[1][0].endswith("/editMessageCaption"))
                     self.assertEqual(2, len(http_media.calls))
 
@@ -5392,6 +5412,7 @@ class TestRound6FinalClosureRegression(unittest.TestCase):
                     )
                     self.assertEqual(1, retired_perm)
                     self.assertNotIn(("main", 111), hub.tg.cards)
+                    self.assertNotIn(("main", 111, 903), hub.tg.pending_retire_cards)
 
                     # 4. Shared 3-attempt cap across explicit (editMessageMedia + caption) & periodic paths
                     http_cap = _FlakyHTTP(
@@ -5408,20 +5429,370 @@ class TestRound6FinalClosureRegression(unittest.TestCase):
                         0,
                         await hub.tg.retire_cards(session_gen=16, mark_finished=True, final_jpeg=b"FINAL_JPEG_BYTES"),
                     )
-                    self.assertIn(("main", 111), hub.tg.cards)
-                    self.assertEqual(1, hub.tg.cards[("main", 111)].get("retire_attempts"))
+                    self.assertNotIn(("main", 111), hub.tg.cards)
+                    self.assertIn(("main", 111, 904), hub.tg.pending_retire_cards)
+                    self.assertEqual(1, hub.tg.pending_retire_cards[("main", 111, 904)].get("retire_attempts"))
 
                     self.assertEqual(0, await hub.tg.retire_cards(session_gen=16, mark_finished=True))
-                    self.assertIn(("main", 111), hub.tg.cards)
-                    self.assertEqual(2, hub.tg.cards[("main", 111)].get("retire_attempts"))
+                    self.assertIn(("main", 111, 904), hub.tg.pending_retire_cards)
+                    self.assertEqual(2, hub.tg.pending_retire_cards[("main", 111, 904)].get("retire_attempts"))
 
                     await hub.tg.tick_updates(force=False)
+                    self.assertNotIn(("main", 111), hub.tg.cards)
                     self.assertNotIn(
-                        ("main", 111),
-                        hub.tg.cards,
+                        ("main", 111, 904),
+                        hub.tg.pending_retire_cards,
                         "Card MUST be dropped once shared retire_attempts reaches cap of 3",
                     )
                     self.assertEqual(3, len(http_cap.calls))
+
+            asyncio.run(_scenario())
+
+    def test_round9_pending_retire_isolated_across_fast_same_owner_rollover_and_stale_callback(self) -> None:
+        """Round 9 Blocker: Fast same-owner rollover (new card 702) and early stale callback (701) must never drop 701's retirement retry record."""
+        tok_main = "991122:TEST_ROUND9_ROLLOVER_TOKEN"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bdir = root / "bridge"
+            bdir.mkdir()
+            (bdir / ".env").write_text(
+                f"AGY_TG_BOT_TOKEN={tok_main}\nAGY_TG_ALLOWED_CHATS=111\nAGY_TG_ADMIN_USERS=111\n",
+                encoding="utf-8",
+            )
+            cfg_dir = root / "cfg"
+            cfg_dir.mkdir()
+            prof_dir = root / "profs"
+            prof_dir.mkdir()
+
+            class _HostedPage(_FakePage):
+                def __init__(self, url: str, title: str, jpeg_bytes: bytes) -> None:
+                    super().__init__(url, title)
+                    self._jpeg = jpeg_bytes
+                    self.closed = False
+                    self.goto = mock.AsyncMock()  # type: ignore[method-assign]
+
+                def on(self, _ev: str, _cb) -> None:
+                    pass
+
+                def is_closed(self) -> bool:
+                    return self.closed
+
+                async def screenshot(self, **_kw):
+                    return self._jpeg
+
+                async def close(self) -> None:
+                    self.closed = True
+
+            class _HostedCtx:
+                def __init__(self, page: _HostedPage) -> None:
+                    self.pages = [page]
+
+                def on(self, _ev: str, _cb) -> None:
+                    pass
+
+                async def route(self, _pat: str, _cb) -> None:
+                    pass
+
+            session_seq = {"n": 0}
+
+            class _RolloverCM:
+                def __init__(self, **_kw) -> None:
+                    session_seq["n"] += 1
+                    idx = session_seq["n"]
+                    self.page = _HostedPage(
+                        f"https://example.com/session-{idx}/secret-{idx}",
+                        f"Session {idx} Private Title",
+                        f"JPEG_FRAME_SESSION_{idx}".encode("ascii"),
+                    )
+                    self.ctx = _HostedCtx(self.page)
+                    self.exited = False
+
+                async def __aenter__(self):
+                    return self.ctx
+
+                async def __aexit__(self, *_a):
+                    self.exited = True
+
+            class _ScriptedTGHTTP:
+                def __init__(self, outcomes: dict[str, list[object]]) -> None:
+                    self._outcomes = {k: list(v) for k, v in outcomes.items()}
+                    self.calls: list[tuple[str, dict]] = []
+
+                def post(self, url: str, data=None, json=None):
+                    endpoint = url.rsplit("/", 1)[-1]
+                    rec = {
+                        "endpoint": endpoint,
+                        "fields": dict(getattr(data, "fields", {})) if data is not None else None,
+                        "json": dict(json) if isinstance(json, dict) else json,
+                    }
+                    self.calls.append((endpoint, rec))
+                    queue = self._outcomes.get(endpoint)
+                    outcome = queue.pop(0) if queue else {"ok": True}
+
+                    class _Resp:
+                        status = outcome.get("http_status", 200) if isinstance(outcome, dict) else 200
+
+                        async def __aenter__(self_r):
+                            if isinstance(outcome, Exception):
+                                raise outcome
+                            return self_r
+
+                        async def __aexit__(self_r, *_a):
+                            return False
+
+                        async def json(self_r):
+                            assert isinstance(outcome, dict)
+                            return outcome
+
+                    return _Resp()
+
+            async def _setup_retired_503_card(
+                http_mock: _ScriptedTGHTTP,
+            ) -> srv.LiveBrowserHub:
+                """Start a real hosted session, publish card 701, stop_hosted -> editMessageMedia(701) hits 503."""
+                hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "sec-tok")
+                hub.tg.http = http_mock
+                await hub.start_hosted(
+                    profile="r9-prof",
+                    notify_tg=False,
+                    actor=("main", 111),
+                    source="tg_cmd",
+                )
+                hub.latest_jpeg = b"GEN1_FRAME_701"
+                card1 = await hub.tg.ensure_card("main", preferred_user_id=111)
+                self.assertIsNotNone(card1)
+                assert card1 is not None
+                self.assertEqual(701, card1["message_id"])
+                self.assertIn(("main", 111), hub.tg.cards)
+
+                await hub.stop_hosted(notify_finished=True)
+                self.assertEqual("idle", hub.engine_mode)
+                self.assertNotIn(("main", 111), hub.tg.cards)
+                self.assertIn(("main", 111, 701), hub.tg.pending_retire_cards)
+                self.assertEqual(1, hub.tg.pending_retire_cards[("main", 111, 701)].get("retire_attempts"))
+                media_calls = [c for c in http_mock.calls if c[0] == "editMessageMedia"]
+                self.assertEqual(1, len(media_calls))
+                self.assertEqual("701", media_calls[0][1]["fields"]["message_id"])
+                return hub
+
+            async def _scenario() -> None:
+                with (
+                    mock.patch.object(srv, "_BRIDGE_DIR", bdir),
+                    mock.patch.object(srv, "CONFIG_DIR", cfg_dir),
+                    mock.patch.object(srv, "PROFILES_FILE", cfg_dir / "profiles.json"),
+                    mock.patch.object(srv, "PROFILES_DATA_DIR", prof_dir),
+                    mock.patch.object(srv, "discover_pinned_host_profile", return_value=None),
+                    mock.patch.object(srv, "resolve_camoufox_display", return_value=None),
+                    mock.patch.object(srv, "read_x11_clipboard_async", new=mock.AsyncMock(return_value="")),
+                    mock.patch.object(srv, "FormData", _FakeFormData),
+                    mock.patch.dict(
+                        sys.modules,
+                        {
+                            "camoufox": types.SimpleNamespace(),
+                            "camoufox.async_api": types.SimpleNamespace(AsyncCamoufox=_RolloverCM),
+                        },
+                    ),
+                ):
+                    srv.create_profile("r9-prof", {"os": "linux", "persistent": False})
+
+                    # Branch 1 (Control): stay idle (latest_jpeg=None, hub.tg.cards empty) ->
+                    # real `_tg_maintenance_loop` iteration drains `pending_retire_cards` & retires 701!
+                    http_ctrl = _ScriptedTGHTTP(
+                        {
+                            "sendPhoto": [{"ok": True, "result": {"message_id": 701}}],
+                            "editMessageMedia": [
+                                {"http_status": 503, "ok": False, "description": "Service Unavailable"}
+                            ],
+                            "editMessageCaption": [{"ok": True, "result": {"message_id": 701}}],
+                        }
+                    )
+                    hub1 = await _setup_retired_503_card(http_ctrl)
+                    self.assertIsNone(hub1.latest_jpeg)
+                    self.assertEqual({}, hub1.tg.cards)
+
+                    async def _stop_after_one_tick(_delay: float) -> None:
+                        raise asyncio.CancelledError()
+
+                    with mock.patch.object(srv.asyncio, "sleep", side_effect=_stop_after_one_tick):
+                        await hub1._tg_maintenance_loop()
+                    self.assertNotIn(("main", 111, 701), hub1.tg.pending_retire_cards)
+                    cap_calls1 = [c for c in http_ctrl.calls if c[0] == "editMessageCaption"]
+                    self.assertEqual(1, len(cap_calls1))
+                    self.assertEqual(701, cap_calls1[0][1]["json"]["message_id"])
+                    self.assertEqual({"inline_keyboard": []}, cap_calls1[0][1]["json"]["reply_markup"])
+                    self.assertIn("远端浏览器会话已结束", cap_calls1[0][1]["json"]["caption"])
+
+                    # Branch 2 (Fast same-owner rollover + new card 702):
+                    # New card 702 MUST NOT overwrite 701's retry record; maintenance updates 702 AND retires 701!
+                    http_roll = _ScriptedTGHTTP(
+                        {
+                            "sendPhoto": [
+                                {"ok": True, "result": {"message_id": 701}},
+                                {"ok": True, "result": {"message_id": 702}},
+                                {"ok": True, "result": {"message_id": 703}},
+                            ],
+                            "editMessageMedia": [
+                                {"http_status": 503, "ok": False, "description": "Service Unavailable"},
+                                {"ok": True, "result": {"message_id": 702}},
+                                {"ok": True, "result": {"message_id": 702}},
+                            ],
+                            "editMessageCaption": [
+                                {"ok": True, "result": {"message_id": 701}},
+                                {"ok": True, "result": {"message_id": 702}},
+                            ],
+                        }
+                    )
+                    hub2 = await _setup_retired_503_card(http_roll)
+                    await hub2.start_hosted(
+                        profile="r9-prof",
+                        notify_tg=False,
+                        actor=("main", 111),
+                        source="tg_cmd",
+                    )
+                    hub2.title = "TOP_SECRET_NEW_SESSION_TITLE"
+                    hub2.url = "https://secret-new-session.example/vault"
+                    hub2.latest_jpeg = b"GEN2_FRAME_702"
+                    card2 = await hub2.tg.ensure_card("main", preferred_user_id=111)
+                    self.assertIsNotNone(card2)
+                    assert card2 is not None
+                    self.assertEqual(702, card2["message_id"])
+                    self.assertEqual(702, hub2.tg.cards[("main", 111)]["message_id"])
+                    self.assertIn(
+                        ("main", 111, 701),
+                        hub2.tg.pending_retire_cards,
+                        "Publishing new card 702 MUST NOT overwrite 701's pending_retire_cards entry",
+                    )
+                    self.assertEqual(1, hub2.tg.pending_retire_cards[("main", 111, 701)].get("retire_attempts"))
+
+                    # Maintenance tick while new session + card 702 are active:
+                    # - updates active card 702 via editMessageMedia
+                    # - retires stale card 701 via stateless editMessageCaption (fixed copy + empty keyboard)
+                    hub2.latest_jpeg = b"GEN2_FRAME_702_UPDATED"
+                    await hub2.tg.tick_updates(force=True)
+                    self.assertEqual(702, hub2.tg.cards[("main", 111)]["message_id"])
+                    self.assertNotIn(("main", 111, 701), hub2.tg.pending_retire_cards)
+                    cap_calls2 = [c for c in http_roll.calls if c[0] == "editMessageCaption"]
+                    self.assertEqual(1, len(cap_calls2))
+                    self.assertEqual(701, cap_calls2[0][1]["json"]["message_id"])
+                    self.assertEqual({"inline_keyboard": []}, cap_calls2[0][1]["json"]["reply_markup"])
+                    self.assertIn("远端浏览器会话已结束", cap_calls2[0][1]["json"]["caption"])
+                    self.assertNotIn("TOP_SECRET_NEW_SESSION_TITLE", cap_calls2[0][1]["json"]["caption"])
+                    self.assertNotIn("secret-new-session.example", cap_calls2[0][1]["json"]["caption"])
+                    live_media_702 = [
+                        c for c in http_roll.calls
+                        if c[0] == "editMessageMedia" and c[1]["fields"]["message_id"] == "702"
+                    ]
+                    self.assertEqual(1, len(live_media_702))
+
+                    # Subsequent maintenance tick MUST NOT retry 701 again, while 702 continues updating
+                    hub2.latest_jpeg = b"GEN2_FRAME_702_UPDATED_2"
+                    await hub2.tg.tick_updates(force=True)
+                    self.assertEqual(1, len([c for c in http_roll.calls if c[0] == "editMessageCaption"]))
+                    self.assertEqual(
+                        2,
+                        len([
+                            c for c in http_roll.calls
+                            if c[0] == "editMessageMedia" and c[1]["fields"]["message_id"] == "702"
+                        ]),
+                    )
+
+                    # force_new replacement (702 -> 703) also stages 702 into pending_retire_cards without dropping it
+                    card3 = await hub2.tg.ensure_card("main", force_new=True, preferred_user_id=111)
+                    self.assertIsNotNone(card3)
+                    assert card3 is not None
+                    self.assertEqual(703, card3["message_id"])
+                    self.assertIn(("main", 111, 702), hub2.tg.pending_retire_cards)
+                    await hub2.tg.tick_updates(force=False)
+                    self.assertNotIn(("main", 111, 702), hub2.tg.pending_retire_cards)
+                    self.assertEqual(
+                        [701, 702],
+                        [c[1]["json"]["message_id"] for c in http_roll.calls if c[0] == "editMessageCaption"],
+                    )
+                    await hub2.stop_hosted(notify_finished=False)
+
+                    # Branch 3 (Fast same-owner rollover + stale callback for 701 arrives BEFORE new card 702):
+                    # Stale callback MUST be strictly rejected AND MUST NOT delete 701's retry record!
+                    http_cb = _ScriptedTGHTTP(
+                        {
+                            "sendPhoto": [{"ok": True, "result": {"message_id": 701}}],
+                            "editMessageMedia": [
+                                {"http_status": 503, "ok": False, "description": "Service Unavailable"}
+                            ],
+                            "editMessageCaption": [
+                                {"ok": True, "result": {"message_id": 701}},
+                                {"http_status": 503, "ok": False, "description": "Service Unavailable"},
+                                {"http_status": 429, "ok": False, "description": "Too Many Requests"},
+                            ],
+                        }
+                    )
+                    hub3 = await _setup_retired_503_card(http_cb)
+                    await hub3.start_hosted(
+                        profile="r9-prof",
+                        notify_tg=False,
+                        actor=("main", 111),
+                        source="tg_cmd",
+                    )
+                    # New session is running, NO new card published yet; old button callback (701) arrives first!
+                    ok_v, _msg_v, tok_v = hub3.tg.verify_card_control(
+                        "main", 111, message_id=701, require_card=True, require_running=True
+                    )
+                    self.assertFalse(ok_v, "Old card 701 callback MUST be rejected in new session")
+                    self.assertIsNone(tok_v)
+                    ok_to, _msg_to, _sgen_to, _tgen_to = await hub3.set_takeover(
+                        True,
+                        reason="stale-btn",
+                        actor=("main", 111),
+                        card_message_id=701,
+                        require_card=True,
+                    )
+                    self.assertFalse(ok_to, "Old card 701 MUST NOT take over new session")
+                    self.assertFalse(hub3.takeover)
+                    self.assertIn(
+                        ("main", 111, 701),
+                        hub3.tg.pending_retire_cards,
+                        "Rejecting old callback MUST NOT delete 701's pending_retire_cards record",
+                    )
+                    self.assertEqual(1, hub3.tg.pending_retire_cards[("main", 111, 701)].get("retire_attempts"))
+
+                    # Maintenance tick retires 701 cleanly even before any new card is created
+                    await hub3.tg.tick_updates(force=False)
+                    self.assertNotIn(("main", 111, 701), hub3.tg.pending_retire_cards)
+                    cap_calls3 = [c for c in http_cb.calls if c[0] == "editMessageCaption"]
+                    self.assertEqual(1, len(cap_calls3))
+                    self.assertEqual(701, cap_calls3[0][1]["json"]["message_id"])
+
+                    # Branch 3b: If a stale card (mid=705, retire_attempts=1) is STILL in `hub.tg.cards`
+                    # when its old callback arrives, verify_card_control MUST reject AND migrate it to
+                    # `pending_retire_cards` preserving `retire_attempts`, then cap cleanly at 3!
+                    hub3.tg.cards[("main", 111)] = {
+                        "bot_key": "main",
+                        "chat_id": 111,
+                        "message_id": 705,
+                        "session_gen": hub3.session_gen - 1,
+                        "owner": ("main", 111),
+                        "retire_attempts": 1,
+                        "last_sha1": "s",
+                        "last_caption": "c",
+                        "last_markup": "m",
+                        "last_ts": 0.0,
+                    }
+                    ok_v2, _msg_v2, _tok_v2 = hub3.tg.verify_card_control(
+                        "main", 111, message_id=705, require_card=True, require_running=True
+                    )
+                    self.assertFalse(ok_v2)
+                    self.assertNotIn(("main", 111), hub3.tg.cards)
+                    self.assertIn(("main", 111, 705), hub3.tg.pending_retire_cards)
+                    self.assertEqual(1, hub3.tg.pending_retire_cards[("main", 111, 705)].get("retire_attempts"))
+
+                    # Attempt 2 (503) -> retained with retire_attempts == 2
+                    await hub3.tg.tick_updates(force=False)
+                    self.assertIn(("main", 111, 705), hub3.tg.pending_retire_cards)
+                    self.assertEqual(2, hub3.tg.pending_retire_cards[("main", 111, 705)].get("retire_attempts"))
+
+                    # Attempt 3 (429) -> reaches shared cap of 3 and is safely dropped!
+                    await hub3.tg.tick_updates(force=False)
+                    self.assertNotIn(("main", 111, 705), hub3.tg.pending_retire_cards)
+                    await hub3.stop_hosted(notify_finished=False)
 
             asyncio.run(_scenario())
 
