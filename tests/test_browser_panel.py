@@ -1127,8 +1127,7 @@ class TestBridgeBrowserPanelAndRbac(unittest.TestCase):
             cfg_dir.mkdir(parents=True, exist_ok=True)
             (cfg_dir / "local.token").write_text("r6-group-tok\n", encoding="utf-8")
             bridge, _ac = _load_isolated_bridge(tmp, extra_env={"AGY_TG_BOT_USERNAME": "example_bot"})
-            bridge.BOT_META["handle"] = "example_bot"
-            bridge.BOT_META["bot_key"] = "main"
+            bridge.BOT_META.update({"bot_id": 100, "handle": "example_bot", "bot_key": "main", "resolved": True})
 
             class _FakeResp:
                 def __init__(self, status_code: int, payload: dict) -> None:
@@ -1302,8 +1301,7 @@ class TestBridgeBrowserPanelAndRbac(unittest.TestCase):
             cfg_dir.mkdir(parents=True, exist_ok=True)
             (cfg_dir / "local.token").write_text("r7-group-tok\n", encoding="utf-8")
             bridge, _ac = _load_isolated_bridge(tmp, extra_env={"AGY_TG_BOT_USERNAME": "example_bot"})
-            bridge.BOT_META["handle"] = "example_bot"
-            bridge.BOT_META["bot_key"] = "main"
+            bridge.BOT_META.update({"bot_id": 100, "handle": "example_bot", "bot_key": "main", "resolved": True})
 
             class _FakeResp:
                 def __init__(self, status_code: int, payload: dict) -> None:
