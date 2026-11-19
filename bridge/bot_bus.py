@@ -490,12 +490,17 @@ def _job_path(job_id: str) -> str:
     return os.path.join(JOBS_DIR, f"{safe_id}.json")
 
 
+_PKT_SEQ = 0
+
+
 def _drop_inbox_packet_unlocked(target_handle: str, packet: Dict[str, Any]) -> str:
+    global _PKT_SEQ
     norm = normalize_handle(target_handle)
     bot_inbox = os.path.join(INBOX_DIR, norm)
     os.makedirs(bot_inbox, mode=0o700, exist_ok=True)
-    ts_ms = int(time.time() * 1000)
-    pkt_name = f"{ts_ms:013d}_{uuid.uuid4().hex[:8]}.json"
+    _PKT_SEQ = (_PKT_SEQ + 1) % 1_000_000
+    ts_ns = time.time_ns()
+    pkt_name = f"{ts_ns:020d}_{_PKT_SEQ:06d}_{uuid.uuid4().hex[:8]}.json"
     pkt_path = os.path.join(bot_inbox, pkt_name)
     _atomic_write_json(pkt_path, packet)
     return pkt_path
