@@ -8993,7 +8993,7 @@ def _live_browser_endpoint():
     return base_url, tok_path
 
 
-def _live_browser_request(method, path, json_body=None, timeout=(1.5, 4.0)):
+def _live_browser_request(method, path, json_body=None, timeout=(1.5, 4.0), params=None):
     base_url, tok_path = _live_browser_endpoint()
     try:
         with open(tok_path, "r", encoding="utf-8") as fh:
@@ -9007,7 +9007,10 @@ def _live_browser_request(method, path, json_body=None, timeout=(1.5, 4.0)):
     headers = {"X-Live-Token": token}
     try:
         if method.upper() == "GET":
-            resp = requests.get(url, headers=headers, timeout=timeout)
+            req_kw = {"headers": headers, "timeout": timeout}
+            if params:
+                req_kw["params"] = params
+            resp = requests.get(url, **req_kw)
         else:
             resp = requests.post(url, headers=headers, json=json_body or {}, timeout=timeout)
         try:
@@ -9059,8 +9062,16 @@ def _resolve_bot_username():
     return env_uname
 
 
-def build_browser_panel(chat_id):
-    ok_st, st_data = _live_browser_request("GET", "/internal/status", timeout=(1.5, 3.0))
+def build_browser_panel(chat_id, from_user=None):
+    bot_hint = _live_browser_bot_hint()
+    owner_uid = _live_browser_owner_uid(chat_id, from_user=from_user)
+    status_params = {"source": "tg_cmd"}
+    if bot_hint:
+        status_params["bot"] = str(bot_hint)
+    if owner_uid is not None:
+        status_params["user_id"] = str(owner_uid)
+
+    ok_st, st_data = _live_browser_request("GET", "/internal/status", timeout=(1.5, 3.0), params=status_params)
     if not ok_st:
         text = (
             "<b>🎭 Live-Browser 控制面板</b>\n"
@@ -9072,26 +9083,29 @@ def build_browser_panel(chat_id):
         kb = {"inline_keyboard": [[{"text": "🔄 刷新状态", "callback_data": "browser:refresh"}]]}
         return text, kb
 
-    ok_prof, prof_data = _live_browser_request("GET", "/internal/profiles", timeout=(1.5, 3.0))
+    ok_prof, prof_data = _live_browser_request("GET", "/internal/profiles", timeout=(1.5, 3.0), params=status_params)
     profiles = (
         prof_data.get("profiles")
         if ok_prof and isinstance(prof_data, dict) and isinstance(prof_data.get("profiles"), list)
         else st_data.get("profiles") or []
     )
 
-    running = bool(st_data.get("running"))
+    restricted = bool(st_data.get("session_restricted"))
+    running = bool(st_data.get("running")) and not restricted
     engine_mode = str(st_data.get("engine_mode") or "idle")
-    active_prof = str(st_data.get("profile") or "")
-    pinned = bool(st_data.get("pinned"))
-    os_name = str(st_data.get("os") or "windows")
-    egress = str(st_data.get("egress") or "direct")
-    takeover = bool(st_data.get("takeover"))
-    ai_busy = bool(st_data.get("ai_busy"))
-    cur_url = str(st_data.get("url") or "")
-    cur_title = str(st_data.get("title") or "")
+    active_prof = "" if restricted else str(st_data.get("profile") or "")
+    pinned = False if restricted else bool(st_data.get("pinned"))
+    os_name = "" if restricted else str(st_data.get("os") or "windows")
+    egress = "" if restricted else str(st_data.get("egress") or "direct")
+    takeover = False if restricted else bool(st_data.get("takeover"))
+    ai_busy = False if restricted else bool(st_data.get("ai_busy"))
+    cur_url = "" if restricted else str(st_data.get("url") or "")
+    cur_title = "" if restricted else str(st_data.get("title") or "")
     pub_url = str(st_data.get("public_url") or "").strip().rstrip("/")
 
-    if engine_mode == "async_hosted":
+    if restricted:
+        state_badge = "🔒 已占用（其他授权会话或本机 CLI 持有，详情已隔离）"
+    elif engine_mode == "async_hosted":
         state_badge = "🟢 运行中 (async_hosted)"
     elif engine_mode == "sync_external":
         state_badge = "🔵 外部脚本联动 (sync_external)"
@@ -9103,7 +9117,9 @@ def build_browser_panel(chat_id):
         "━━━━━━━━━━━━━━━━━━━━",
         f"• <b>运行状态：</b>{state_badge}",
     ]
-    if running and active_prof:
+    if restricted:
+        lines.append("• <b>当前会话：</b><i>由其他授权用户或本机 CLI 持有，当前页面与指纹信息已脱敏隔离</i>")
+    elif running and active_prof:
         lock_icon = "🔒 " if pinned else ""
         lines.append(
             f"• <b>当前指纹：</b>{lock_icon}<code>{html_mod.escape(active_prof)}</code>"
@@ -9127,7 +9143,7 @@ def build_browser_panel(chat_id):
             p_os = str(p.get("os") or "windows")
             p_egress = str(p.get("egress_display") or p.get("egress") or "direct")
             p_persist = "Pinned" if p_pinned else ("Persistent" if p.get("persistent", True) else "Ephemeral")
-            is_cur = running and (bool(p.get("active")) or (active_prof and pname == active_prof))
+            is_cur = running and not restricted and (bool(p.get("active")) or (active_prof and pname == active_prof))
             mark = "🟢 " if is_cur else ("🔒 " if p_pinned else "· ")
             lines.append(
                 f"{mark}<code>{html_mod.escape(pname)}</code> ({p_persist} · {html_mod.escape(p_os)} · <code>{html_mod.escape(p_egress)}</code>)"
@@ -9160,7 +9176,9 @@ def build_browser_panel(chat_id):
             lines.append("\n💡 <i>群聊受 Telegram 限制不显示 web_app 按钮，点击上方按钮可一键跳转私聊打开实时画面。</i>")
 
     action_btns = []
-    if running and engine_mode == "async_hosted":
+    if restricted:
+        buttons.append([{"text": "🔄 刷新状态", "callback_data": "browser:refresh"}])
+    elif running and engine_mode == "async_hosted":
         for p in profiles[:8]:
             pname = str(p.get("name") or "")
             if not pname or (active_prof and pname == active_prof) or p.get("active"):
@@ -9214,7 +9232,7 @@ def cmd_browser(chat_id, arg, thread_id=None, scope_key=None, from_user=None):
     sub = parts[0].lower() if parts else ""
 
     if not raw or sub in ("status", "list", "panel"):
-        text, kb = build_browser_panel(chat_id)
+        text, kb = build_browser_panel(chat_id, from_user=from_user)
         send(chat_id, text, parse_mode="HTML", reply_markup=kb, thread_id=norm_tid)
         return
 
@@ -9229,7 +9247,7 @@ def cmd_browser(chat_id, arg, thread_id=None, scope_key=None, from_user=None):
             send(chat_id, "用法：<code>/browser switch &lt;profile&gt; [url]</code>", parse_mode="HTML", thread_id=norm_tid)
             return
         target = parts[1].strip()
-        body = {"profile": target, "restart": True, "bot": bot_hint}
+        body = {"profile": target, "restart": True, "bot": bot_hint, "source": "tg_cmd"}
         if owner_uid is not None:
             body["user_id"] = owner_uid
         if len(parts) > 2:
@@ -9238,12 +9256,12 @@ def cmd_browser(chat_id, arg, thread_id=None, scope_key=None, from_user=None):
         if not ok:
             send(chat_id, f"❌ 切换指纹失败：{html_mod.escape(str(res))}", parse_mode="HTML", thread_id=norm_tid)
             return
-        text, kb = build_browser_panel(chat_id)
+        text, kb = build_browser_panel(chat_id, from_user=from_user)
         send(chat_id, text, parse_mode="HTML", reply_markup=kb, thread_id=norm_tid)
         return
 
     if sub == "start":
-        body = {"bot": bot_hint}
+        body = {"bot": bot_hint, "source": "tg_cmd"}
         if owner_uid is not None:
             body["user_id"] = owner_uid
         if len(parts) > 1:
@@ -9254,19 +9272,19 @@ def cmd_browser(chat_id, arg, thread_id=None, scope_key=None, from_user=None):
         if not ok:
             send(chat_id, f"❌ 启动浏览器失败：{html_mod.escape(str(res))}", parse_mode="HTML", thread_id=norm_tid)
             return
-        text, kb = build_browser_panel(chat_id)
+        text, kb = build_browser_panel(chat_id, from_user=from_user)
         send(chat_id, text, parse_mode="HTML", reply_markup=kb, thread_id=norm_tid)
         return
 
     if sub == "stop":
-        body = {"bot": bot_hint}
+        body = {"bot": bot_hint, "source": "tg_cmd"}
         if owner_uid is not None:
             body["user_id"] = owner_uid
         ok, res = _live_browser_request("POST", "/internal/stop", json_body=body, timeout=(2.0, 10.0))
         if not ok:
             send(chat_id, f"❌ 停止浏览器失败：{html_mod.escape(str(res))}", parse_mode="HTML", thread_id=norm_tid)
             return
-        text, kb = build_browser_panel(chat_id)
+        text, kb = build_browser_panel(chat_id, from_user=from_user)
         send(chat_id, text, parse_mode="HTML", reply_markup=kb, thread_id=norm_tid)
         return
 
@@ -9937,7 +9955,7 @@ def _handle_browser_callback(cb_id, chat_id, thread_id, msg_id, data, from_user=
         tg("answerCallbackQuery", callback_query_id=cb_id, text="浏览器状态已刷新")
     elif sub.startswith("switch:"):
         target = sub[7:].strip()
-        body = {"profile": target, "restart": True, "bot": bot_hint}
+        body = {"profile": target, "restart": True, "bot": bot_hint, "source": "tg_cmd"}
         if owner_uid is not None:
             body["user_id"] = owner_uid
         ok, res = _live_browser_request(
@@ -9952,7 +9970,7 @@ def _handle_browser_callback(cb_id, chat_id, thread_id, msg_id, data, from_user=
         tg("answerCallbackQuery", callback_query_id=cb_id, text=f"已切换至指纹 {target}")
     elif sub.startswith("start:"):
         target = sub[6:].strip()
-        body = {"bot": bot_hint}
+        body = {"bot": bot_hint, "source": "tg_cmd"}
         if owner_uid is not None:
             body["user_id"] = owner_uid
         if target:
@@ -9963,7 +9981,7 @@ def _handle_browser_callback(cb_id, chat_id, thread_id, msg_id, data, from_user=
             return
         tg("answerCallbackQuery", callback_query_id=cb_id, text=f"已启动指纹 {target or 'default'}")
     elif sub == "stop":
-        body = {"bot": bot_hint}
+        body = {"bot": bot_hint, "source": "tg_cmd"}
         if owner_uid is not None:
             body["user_id"] = owner_uid
         ok, res = _live_browser_request("POST", "/internal/stop", json_body=body, timeout=(2.0, 10.0))
@@ -9976,7 +9994,7 @@ def _handle_browser_callback(cb_id, chat_id, thread_id, msg_id, data, from_user=
         return
 
     if msg_id:
-        panel_text, panel_kb = build_browser_panel(chat_id)
+        panel_text, panel_kb = build_browser_panel(chat_id, from_user=from_user)
         tg(
             "editMessageText",
             chat_id=chat_id,

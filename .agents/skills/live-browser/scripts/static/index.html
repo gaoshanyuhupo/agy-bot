@@ -574,7 +574,7 @@
       <span id="upload-sheet-title">📤 网页请求选择文件上传</span>
       <button class="chip" onclick="cancelFileChooser()">取消 ×</button>
     </div>
-    <div class="clip-hint" id="upload-sheet-desc">点击下方按钮从手机相册或文件管理器选择文件（单次上限 25MB）：</div>
+    <div class="clip-hint" id="upload-sheet-desc">点击下方按钮从手机相册或文件管理器选择文件（单次上限 25 MiB）：</div>
     <input id="file-upload-input" type="file" class="hidden" />
     <div class="kb-actions">
       <button class="btn btn-takeover" id="upload-pick-btn" style="flex:1;justify-content:center;" onclick="triggerFilePick()">📁 选择文件 / 相册</button>
@@ -853,6 +853,7 @@
       ws.send(JSON.stringify({
         type: 'extract',
         session_gen: state.session_gen,
+        takeover_gen: state.takeover_gen,
         ...payload
       }));
       return true;
@@ -1307,7 +1308,7 @@
         ? '📤 网页请求上传文件（支持多选）'
         : '📤 网页请求上传文件';
       document.getElementById('upload-sheet-desc').textContent =
-        '点击下方按钮从手机相册或文件管理器选择文件（单次上限 25MB）：';
+        '点击下方按钮从手机相册或文件管理器选择文件（单次上限 25 MiB）：';
       document.getElementById('upload-pick-btn').disabled = false;
       document.getElementById('upload-sheet').classList.remove('hidden');
       haptic('medium');
@@ -1338,13 +1339,13 @@
       const maxBytes = 25 * 1024 * 1024;
       const total = files.reduce((acc, f) => acc + (f.size || 0), 0);
       if (total > maxBytes) {
-        showToast('❌ 所选文件超过 25MB 限制');
+        showToast('❌ 所选文件超过 25 MiB 限制');
         return;
       }
       const pickBtn = document.getElementById('upload-pick-btn');
       pickBtn.disabled = true;
       document.getElementById('upload-sheet-desc').textContent =
-        `⏳ 正在上传 ${files.length} 个文件 (${(total / 1024).toFixed(1)} KB)...`;
+        `⏳ 正在上传 ${files.length} 个文件 (${(total / 1024).toFixed(1)} KiB)...`;
 
       const form = new FormData();
       form.append('chooser_id', uploadedChooserId);
@@ -1392,8 +1393,8 @@
 
     function formatBytes(n) {
       if (!n || n < 1024) return `${n || 0} B`;
-      if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-      return `${(n / (1024 * 1024)).toFixed(2)} MB`;
+      if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KiB`;
+      return `${(n / (1024 * 1024)).toFixed(2)} MiB`;
     }
 
     function showDownloadBanner(msg) {
@@ -1403,7 +1404,7 @@
       document.getElementById('dl-meta').textContent = msg.auto_sent
         ? `${formatBytes(sizeBytes)} · ✅ 已自动发往私聊 TG`
         : (sizeBytes > MAX_TG_DOWNLOAD_BYTES
-          ? `${formatBytes(sizeBytes)} · 超过 TG 20MB 限制，请点右侧【💾 下载】`
+          ? `${formatBytes(sizeBytes)} · 超过 TG 20 MiB 限制，请点右侧【💾 下载】`
           : `${formatBytes(sizeBytes)} · 点击右侧发回 TG 或直接下载`);
       document.getElementById('download-banner').classList.remove('hidden');
       haptic('light');
@@ -1424,7 +1425,7 @@
       if (!latestDownload || !latestDownload.download_id) return;
       const sizeBytes = Number(latestDownload.size || 0);
       if (sizeBytes > MAX_DOWNLOAD_BYTES) {
-        showToast('⚠️ 文件超过服务端 50MB 单文件下载上限');
+        showToast('⚠️ 文件超过服务端 50 MiB 单文件下载上限');
         return;
       }
       const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
@@ -1960,15 +1961,23 @@
         clearPendingUrlGoto();
         const ownerBotOk = currentBotKey === null || msg.owner_bot === undefined || msg.owner_bot === currentBotKey;
         const ownerUidOk = currentUserId === null || msg.owner_uid === undefined || msg.owner_uid === currentUserId;
-        const genOk = msg.session_gen === undefined || reqCtx.sessionGen === undefined || msg.session_gen === reqCtx.sessionGen;
-        if (msg.ok === true && msg.takeover === true && ownerBotOk && ownerUidOk && genOk) {
+        const sgenOk = (
+          msg.session_gen !== undefined
+          && Number(msg.session_gen) === Number(state.session_gen)
+          && (reqCtx.sessionGen === undefined || Number(msg.session_gen) === Number(reqCtx.sessionGen))
+        );
+        const tgenOk = (
+          msg.takeover_gen !== undefined
+          && Number(msg.takeover_gen) >= Number(state.takeover_gen)
+        );
+        if (msg.ok === true && msg.takeover === true && ownerBotOk && ownerUidOk && sgenOk && tgenOk) {
           state.takeover = true;
-          if (msg.session_gen !== undefined) state.session_gen = msg.session_gen;
-          if (msg.takeover_gen !== undefined) state.takeover_gen = msg.takeover_gen;
+          state.session_gen = msg.session_gen;
+          state.takeover_gen = msg.takeover_gen;
           if (ws && ws.readyState === WebSocket.OPEN && authed) {
             sendWsInput({ action: 'goto', url: reqCtx.url });
           }
-        } else if (msg.error) {
+        } else if (msg.ok === false && msg.error) {
           showToast(msg.error);
         }
         return;
@@ -2047,14 +2056,19 @@
       if (msg.type === 'state') {
         const prevUrl = state.url;
         const prevSessionGen = state.session_gen;
+        const prevTakeoverGen = state.takeover_gen;
         const prevRunning = !!state.running;
         const sessionGenChanged = msg.session_gen !== undefined && prevSessionGen !== undefined && msg.session_gen !== prevSessionGen;
+        const takeoverGenAdvanced = msg.takeover_gen !== undefined && prevTakeoverGen !== undefined && Number(msg.takeover_gen) > Number(prevTakeoverGen);
         const stoppedOrRestricted = (msg.running === false && prevRunning) || !!msg.session_restricted;
         if (sessionGenChanged || stoppedOrRestricted) {
           invalidateFrameSurface(true);
           if (sessionGenChanged) {
             clearPendingUrlGoto();
           }
+        }
+        if (takeoverGenAdvanced && msg.takeover === false) {
+          clearPendingUrlGoto();
         }
         state = { ...state, ...msg };
         renderState(prevUrl !== state.url);
@@ -2361,7 +2375,8 @@
         type: 'switch_profile',
         profile: profileName,
         url: nextUrl,
-        takeover: !state.running
+        takeover: !state.running,
+        session_gen: state.session_gen
       }));
       closeProfileSheet();
     }
@@ -2378,7 +2393,7 @@
       }
       haptic('medium');
       showToast('⏹ 正在安全关闭浏览器...');
-      ws.send(JSON.stringify({ type: 'stop_browser' }));
+      ws.send(JSON.stringify({ type: 'stop_browser', session_gen: state.session_gen }));
       closeProfileSheet();
     }
 
@@ -2462,10 +2477,16 @@
       haptic('medium');
       const nextActive = !state.takeover;
       if (!nextActive) {
-        // Send mouseup BEFORE set_takeover(false) so drag/hold releases cleanly ahead of handback
+        // Invalidate any pending URL intent & send mouseup BEFORE set_takeover(false)
+        clearPendingUrlGoto();
         releaseActiveDragBeforeHandback();
       }
-      ws.send(JSON.stringify({ type: 'set_takeover', active: nextActive, session_gen: state.session_gen }));
+      ws.send(JSON.stringify({
+        type: 'set_takeover',
+        active: nextActive,
+        session_gen: state.session_gen,
+        takeover_gen: state.takeover_gen
+      }));
     }
 
     function startBrowserManual() {
@@ -2484,7 +2505,8 @@
         type: 'start_browser',
         url: defaultUrl,
         profile: chosenProfile,
-        takeover: true
+        takeover: true,
+        session_gen: state.session_gen
       }));
     }
 
@@ -2529,6 +2551,7 @@
             url,
             reqId,
             sessionGen: state.session_gen,
+            takeoverGen: state.takeover_gen,
             timer: setTimeout(() => {
               if (pendingUrlGoto && pendingUrlGoto.reqId === reqId) {
                 pendingUrlGoto = null;
@@ -2540,7 +2563,8 @@
             active: true,
             reason: '地址栏快速跳转',
             req_id: reqId,
-            session_gen: state.session_gen
+            session_gen: state.session_gen,
+            takeover_gen: state.takeover_gen
           }));
         }
         urlInputEl.blur();
@@ -2827,7 +2851,8 @@
           const midDelta = Math.hypot(curMidX - twoFingerTrackpad.startMidX, curMidY - twoFingerTrackpad.startMidY);
           const distDelta = Math.abs(dist - twoFingerTrackpad.startDist);
           if (!twoFingerTrackpad.mode && twoFingerTrackpad.movedIds.size >= 2) {
-            // Strictly require paired displacement samples from BOTH pointers before locking pinch vs scroll!
+            // Require meaningful displacement from BOTH fingers (|d0| >= 4 && |d1| >= 4) and use direction cosine
+            // so staggered same-direction two-finger pans NEVER misclassify as pinch!
             const [id0, id1] = twoFingerTrackpad.ids || [];
             const p0 = pointers.get(id0);
             const p1 = pointers.get(id1);
@@ -2840,22 +2865,34 @@
               const d1y = p1.y - s1.y;
               const len0 = Math.hypot(d0x, d0y);
               const len1 = Math.hypot(d1x, d1y);
-              const dot = d0x * d1x + d0y * d1y;
-              // Opposing spread/pinch vectors (including wide near-vertical symmetric pinch) -> pinch
-              if (
-                twoFingerTrackpad.startDist > 10
-                && dot < 0
-                && (distDelta >= 6 || (Math.min(len0, len1) >= 12 && distDelta >= 3))
-              ) {
-                twoFingerTrackpad.mode = 'pinch';
-                twoFingerTrackpad.moved = true;
-              } else if (dot > 0 && midDelta >= 12 && distDelta < midDelta * 0.45) {
-                // Parallel same-direction movement -> two-finger wheel scroll
-                twoFingerTrackpad.mode = 'scroll';
-                twoFingerTrackpad.moved = true;
-              } else if (twoFingerTrackpad.startDist > 10 && distDelta >= 14 && distDelta > midDelta * 1.15) {
-                twoFingerTrackpad.mode = 'pinch';
-                twoFingerTrackpad.moved = true;
+              if (len0 >= 4 && len1 >= 4) {
+                const dot = d0x * d1x + d0y * d1y;
+                const cosTheta = dot / (len0 * len1);
+                if (cosTheta > 0.5) {
+                  // Parallel / same-direction (< 60 deg): strictly scroll, NEVER pinch even when staggered!
+                  if (midDelta >= 10) {
+                    twoFingerTrackpad.mode = 'scroll';
+                    twoFingerTrackpad.moved = true;
+                    lastWheelSent = 0;
+                  }
+                } else if (cosTheta < -0.25) {
+                  // Opposing spread/pinch (> 104.5 deg, incl. wide near-vertical symmetric pinch) -> pinch
+                  if (
+                    twoFingerTrackpad.startDist > 10
+                    && (distDelta >= 6 || (Math.min(len0, len1) >= 12 && distDelta >= 3))
+                  ) {
+                    twoFingerTrackpad.mode = 'pinch';
+                    twoFingerTrackpad.moved = true;
+                  }
+                } else if (
+                  cosTheta < 0.2
+                  && twoFingerTrackpad.startDist > 10
+                  && distDelta >= 18
+                  && distDelta > midDelta * 1.5
+                ) {
+                  twoFingerTrackpad.mode = 'pinch';
+                  twoFingerTrackpad.moved = true;
+                }
               }
             }
           }

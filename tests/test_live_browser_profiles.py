@@ -28,6 +28,10 @@ class _FakePage:
     def __init__(self, url: str = "https://example.com") -> None:
         self.url = url
         self.viewport_size = {"width": 1280, "height": 800}
+        self._callbacks: dict[str, list] = {}
+
+    def on(self, event: str, cb) -> None:
+        self._callbacks.setdefault(event, []).append(cb)
 
     async def title(self) -> str:
         return "Example Page"
@@ -711,6 +715,62 @@ class TestLiveBrowserProfiles(unittest.TestCase):
                 self.assertEqual(200, r_verified.status)
                 self.assertTrue(hub.active_pinned)
                 self.assertTrue(hub.active_pinned_verified)
+
+        asyncio.run(_scenario())
+
+    def test_round5_p0_03_framenavigated_listener_failure_fails_closed(self) -> None:
+        """Round 5 P0-03: non-pinned context fails closed & closes CM if page.on('framenavigated') missing or raises."""
+        pinned_dir = self.root / "pinned_r5"
+        pinned_dir.mkdir(parents=True, exist_ok=True)
+        pinned_lock = self.root / "pinned_r5.lock"
+        fake_pinned = {
+            "name": "pinned_r5",
+            "profile_dir": pinned_dir,
+            "lock_path": pinned_lock,
+            "fingerprint": {"os": "windows"},
+        }
+        srv.create_profile("nonpin-r5", {"os": "linux", "persistent": False})
+
+        class _NoOnPage:
+            url = "about:blank"
+            viewport_size = {"width": 1280, "height": 800}
+
+        class _RaisingOnPage:
+            url = "about:blank"
+            viewport_size = {"width": 1280, "height": 800}
+
+            def on(self, ev: str, _cb) -> None:
+                if ev == "framenavigated":
+                    raise RuntimeError("framenavigated unsupported")
+
+        async def _scenario() -> None:
+            for page_cls in (_NoOnPage, _RaisingOnPage):
+                cm_instances: list[object] = []
+
+                class _BadPageCM:
+                    def __init__(self, **_kw) -> None:
+                        self.exited = False
+                        self.ctx = _FakeContext()
+                        self.ctx.pages = [page_cls()]
+                        cm_instances.append(self)
+
+                    async def __aenter__(self):
+                        return self.ctx
+
+                    async def __aexit__(self, *_a):
+                        self.exited = True
+
+                fake_mod = types.SimpleNamespace(AsyncCamoufox=_BadPageCM)
+                hub = srv.LiveBrowserHub({"public_url": ""}, "sec-tok")
+                with (
+                    mock.patch.object(srv, "discover_pinned_host_profile", return_value=fake_pinned),
+                    mock.patch.dict(sys.modules, {"camoufox": types.SimpleNamespace(), "camoufox.async_api": fake_mod}),
+                ):
+                    with self.assertRaises(RuntimeError):
+                        await hub.start_hosted(profile="nonpin-r5", notify_tg=False)
+                self.assertEqual("idle", hub.engine_mode)
+                self.assertIsNone(hub.ctx)
+                self.assertTrue(cm_instances and cm_instances[0].exited, "Failed non-pinned CM must be closed fail-closed")
 
         asyncio.run(_scenario())
 

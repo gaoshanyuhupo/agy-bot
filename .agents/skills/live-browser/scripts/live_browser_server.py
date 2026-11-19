@@ -1547,7 +1547,19 @@ class TelegramLiveCardPublisher:
             for k, c in self.cards.items()
         )
 
+    @staticmethod
+    def _build_finished_caption() -> str:
+        """Strictly stateless retired-card caption: NEVER reads live hub title/url/profile/egress."""
+        ts_str = time.strftime("%H:%M:%S", time.localtime())
+        return (
+            f"🔴 <b>远端浏览器会话已结束</b> · <code>{ts_str}</code>\n"
+            "✅ 会话已安全关闭（历史画面仅供留档）"
+        )
+
     def _build_markup(self, bot_key: str, finished: bool = False) -> str | None:
+        if finished:
+            # Stateless empty keyboard so retired cards never reflect a newer session's takeover state
+            return json.dumps({"inline_keyboard": []}, ensure_ascii=False)
         pub = (self.hub.config.get("public_url") or "").strip().rstrip("/")
         rows: list[list[dict[str, Any]]] = []
         if pub.startswith("https://"):
@@ -1557,31 +1569,29 @@ class TelegramLiveCardPublisher:
                 else "🖥 打开实时画面 / 人工接管"
             )
             rows.append([{"text": btn_text, "web_app": {"url": f"{pub}/?bot={bot_key}"}}])
-        if not finished:
-            takeover_btn = (
-                {"text": "▶️ 交还 AI", "callback_data": "browser:takeover_off"}
-                if self.hub.takeover
-                else {"text": "🖐 接管", "callback_data": "browser:takeover_on"}
-            )
-            rows.append(
-                [
-                    takeover_btn,
-                    {"text": "📸 刷新", "callback_data": "browser:card_refresh"},
-                    {"text": "⏹ 关闭", "callback_data": "browser:card_stop"},
-                ]
-            )
+        takeover_btn = (
+            {"text": "▶️ 交还 AI", "callback_data": "browser:takeover_off"}
+            if self.hub.takeover
+            else {"text": "🖐 接管", "callback_data": "browser:takeover_on"}
+        )
+        rows.append(
+            [
+                takeover_btn,
+                {"text": "📸 刷新", "callback_data": "browser:card_refresh"},
+                {"text": "⏹ 关闭", "callback_data": "browser:card_stop"},
+            ]
+        )
         if not rows:
             return None
         return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
 
     def _build_caption(self, finished: bool = False) -> str:
+        if finished:
+            return self._build_finished_caption()
         ts_str = time.strftime("%H:%M:%S", time.localtime())
         title = html.escape((self.hub.title or "加载中...")[:70])
         url = html.escape((self.hub.url or "about:blank")[:120])
-        if finished:
-            header = f"⏹ <b>浏览器实况已结束</b> · <code>{ts_str}</code>"
-            status_line = "✅ 会话已安全关闭（保留最终画面）"
-        elif self.hub.takeover:
+        if self.hub.takeover:
             header = "🟠 <b>LIVE 浏览器实况</b> · <code>🖐 人工接管中</code>"
             reason = html.escape(self.hub.takeover_reason or "AI 已暂停，等待你在面板操作完成后交还")
             status_line = f"🖐 <b>状态</b>：{reason}"
@@ -1609,11 +1619,11 @@ class TelegramLiveCardPublisher:
         return "\n".join(lines)
 
     async def _retire_orphan_card_message(self, token: str, chat_id: int, message_id: int) -> None:
-        """Silently retire an orphaned Telegram card created just before session stop/switch/revocation."""
+        """Silently retire an orphaned Telegram card using strictly stateless fixed copy (zero hub reads)."""
         if not self.http or not token or chat_id <= 0 or message_id <= 0:
             return
         try:
-            finished_caption = self._build_caption(finished=True)
+            finished_caption = self._build_finished_caption()
             async with self.http.post(
                 f"https://api.telegram.org/bot{token}/editMessageCaption",
                 json={
@@ -1784,10 +1794,9 @@ class TelegramLiveCardPublisher:
         mark_finished: bool = True,
         final_jpeg: bytes | None = None,
     ) -> int:
-        """Retire active cards (optionally matching `session_gen`) so old sessions never receive new frames."""
+        """Retire active cards (optionally matching `session_gen`) using strictly stateless finished copy."""
         if not self.cards:
             return 0
-        bots, _, _, allowed_by_bot, bot_roles = _load_auth_context()
         retired = 0
         async with self._lock:
             for card_key in list(self.cards.keys()):
@@ -1797,19 +1806,30 @@ class TelegramLiveCardPublisher:
                 if session_gen is not None and card.get("session_gen") != session_gen:
                     continue
                 bot_key, chat_id = card_key
+                bots, _, _, allowed_by_bot, bot_roles = _load_auth_context()
                 token = self._is_card_currently_authorized(
                     bot_key, chat_id, bots, allowed_by_bot, bot_roles
                 )
-                jpeg_for_finish = final_jpeg if final_jpeg is not None else self.hub.latest_jpeg
-                if mark_finished and token and jpeg_for_finish and self.http:
-                    await self._update_card_locked(
-                        card_key,
-                        token,
-                        finished=True,
-                        force=True,
-                        allow_stale_gen=True,
-                        jpeg_override=jpeg_for_finish,
-                    )
+                same_gen_jpeg = (
+                    self.hub.latest_jpeg
+                    if card.get("session_gen") == self.hub.session_gen
+                    else None
+                )
+                jpeg_for_finish = final_jpeg if final_jpeg is not None else same_gen_jpeg
+                if mark_finished and token and self.http:
+                    if jpeg_for_finish:
+                        await self._update_card_locked(
+                            card_key,
+                            token,
+                            finished=True,
+                            force=True,
+                            allow_stale_gen=True,
+                            jpeg_override=jpeg_for_finish,
+                        )
+                    else:
+                        mid = int(card.get("message_id") or 0)
+                        if mid > 0:
+                            await self._retire_orphan_card_message(token, chat_id, mid)
                 self.cards.pop(card_key, None)
                 retired += 1
         return retired
@@ -1860,7 +1880,6 @@ class TelegramLiveCardPublisher:
             return
         if not self.hub.latest_jpeg or not self.http:
             return
-        bots, _, _, allowed_by_bot, bot_roles = _load_auth_context()
         async with self._lock:
             for card_key in list(self.cards.keys()):
                 bot_key, chat_id = card_key
@@ -1869,9 +1888,14 @@ class TelegramLiveCardPublisher:
                 card = self.cards.get(card_key)
                 if not card:
                     continue
-                if card.get("session_gen") != self.hub.session_gen or not self._matches_session_owner(bot_key, chat_id):
+                if (
+                    self.hub.engine_mode == "idle"
+                    or card.get("session_gen") != self.hub.session_gen
+                    or not self._matches_session_owner(bot_key, chat_id)
+                ):
                     self.cards.pop(card_key, None)
                     continue
+                bots, _, _, allowed_by_bot, bot_roles = _load_auth_context()
                 token = self._is_card_currently_authorized(
                     bot_key, chat_id, bots, allowed_by_bot, bot_roles
                 )
@@ -1891,19 +1915,46 @@ class TelegramLiveCardPublisher:
         jpeg_override: bytes | None = None,
     ) -> None:
         card = self.cards.get(card_key)
-        jpeg_bytes = jpeg_override if jpeg_override is not None else self.hub.latest_jpeg
-        if not card or not jpeg_bytes or not self.http:
+        bot_key, chat_id = card_key
+        if not card or not self.http:
             return
-        if not allow_stale_gen and card.get("session_gen") != self.hub.session_gen:
-            self.cards.pop(card_key, None)
+        if not finished and not allow_stale_gen:
+            # Capture coherent same-generation snapshot and re-verify live RBAC, owner & session_gen
+            # right before invoking Telegram API!
+            snap_gen = self.hub.session_gen
+            snap_owner = self.hub.session_owner
+            if (
+                self.hub.engine_mode == "idle"
+                or card.get("session_gen") != snap_gen
+                or not self._matches_session_owner(bot_key, chat_id)
+            ):
+                self.cards.pop(card_key, None)
+                return
+            bots, _, _, allowed_by_bot, bot_roles = _load_auth_context()
+            live_token = self._is_card_currently_authorized(
+                bot_key, chat_id, bots, allowed_by_bot, bot_roles
+            )
+            if (
+                not live_token
+                or self.hub.engine_mode == "idle"
+                or self.hub.session_gen != snap_gen
+                or self.hub.session_owner != snap_owner
+                or not self._matches_session_owner(bot_key, chat_id)
+            ):
+                self.cards.pop(card_key, None)
+                return
+            token = live_token
+            jpeg_bytes = jpeg_override if jpeg_override is not None else self.hub.latest_jpeg
+        else:
+            jpeg_bytes = jpeg_override
+        if not jpeg_bytes:
             return
-        bot_key = card_key[0]
         now = time.monotonic()
         if not force and not finished and (now - card["last_ts"]) < 3.0:
             return
 
         sha = hashlib.sha1(jpeg_bytes).hexdigest()
-        caption = self._build_caption(finished=finished)
+        caption = self._build_finished_caption() if finished else self._build_caption(finished=False)
         markup = self._build_markup(bot_key, finished=finished)
 
         if (
@@ -2146,6 +2197,7 @@ class LiveBrowserHub:
         self.viewer_meta: dict[Any, dict[str, Any]] = {}
         self.input_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=250)
         self.sync_cmd_queue: list[dict[str, Any]] = []
+        self._pending_sync_extracts: dict[str, dict[str, Any]] = {}
         self._engine_lock = asyncio.Lock()
 
         # Background tasks
@@ -2723,6 +2775,7 @@ class LiveBrowserHub:
         *,
         owner: tuple[str, int | None] | None = None,
         expected_session_gen: int | None = None,
+        expected_takeover_gen: int | None = None,
         actor: tuple[str, int] | None = None,
         card_message_id: int | None = None,
         require_card: bool = False,
@@ -2731,6 +2784,8 @@ class LiveBrowserHub:
         async with self._takeover_lock:
             if expected_session_gen is not None and self.session_gen != expected_session_gen:
                 return False, "会话代次已变更，已拒绝过期接管/交还请求", self.session_gen, self.takeover_gen
+            if expected_takeover_gen is not None and self.takeover_gen != expected_takeover_gen:
+                return False, "接管代次已变更，已拒绝过期接管/交还请求", self.session_gen, self.takeover_gen
             if want_active and self.engine_mode == "idle" and (actor is not None or require_card):
                 return False, "当前浏览器未运行", self.session_gen, self.takeover_gen
             if actor is not None:
@@ -2787,6 +2842,7 @@ class LiveBrowserHub:
                                     "session_gen": self.session_gen,
                                     "takeover_gen": self.takeover_gen,
                                     "cleanup": True,
+                                    "_server_internal": True,
                                 }
                             )
                         self._sync_buttons_down.clear()
@@ -2883,20 +2939,31 @@ class LiveBrowserHub:
         except Exception as exc:
             raise RuntimeError(f"非 Pinned 导航防护安装失败，已中止启动（fail-closed）: {exc}") from exc
 
-    def _attach_page_listeners(self, page: Any) -> None:
+    def _attach_page_listeners(self, page: Any, *, require_nav_guard: bool = False) -> None:
         """Attach native Playwright listeners for metadata dirtying, Google guard, dialog, filechooser & download."""
         pid = id(page)
         if pid in self._attached_pages:
             return
+        strict_guard = bool(require_nav_guard)
+        if not strict_guard and self.engine_mode == "async_hosted" and not self._is_active_pinned_verified():
+            try:
+                strict_guard = discover_pinned_host_profile() is not None
+            except Exception:
+                strict_guard = True  # fail-closed
+
         on_fn = getattr(page, "on", None)
         if not callable(on_fn):
+            if strict_guard:
+                raise RuntimeError("非 Pinned 浏览器页面不支持 page.on('framenavigated') 监听，已拒绝启动（fail-closed）")
             return
         self._attached_pages.add(pid)
 
         def _mark_dirty(*_args: Any) -> None:
+            self._tab_select_rev += 1
             self.mark_active(mark_tabs_dirty=True)
 
         def _on_framenavigated(frame: Any = None, *_args: Any) -> None:
+            self._tab_select_rev += 1
             self.mark_active(mark_tabs_dirty=True)
             if self._is_active_pinned_verified():
                 return
@@ -2916,6 +2983,7 @@ class LiveBrowserHub:
 
         def _on_close(*_args: Any) -> None:
             self._attached_pages.discard(pid)
+            self._tab_select_rev += 1
             self._tabs_dirty = True
             try:
                 loop = asyncio.get_running_loop()
@@ -2972,6 +3040,14 @@ class LiveBrowserHub:
 
         try:
             on_fn("framenavigated", _on_framenavigated)
+        except Exception as exc:
+            self._attached_pages.discard(pid)
+            if strict_guard:
+                raise RuntimeError(f"非 Pinned 导航监听 framenavigated 注册失败（fail-closed）: {exc}") from exc
+            log.debug("Failed attaching framenavigated listener: %s", exc)
+            return
+
+        try:
             on_fn("load", _mark_dirty)
             on_fn("close", _on_close)
             on_fn("dialog", _on_dialog)
@@ -2979,7 +3055,7 @@ class LiveBrowserHub:
             on_fn("download", _on_download)
             on_fn("response", _on_response)
         except Exception as exc:
-            log.debug("Failed attaching page listeners: %s", exc)
+            log.debug("Failed attaching secondary page listeners: %s", exc)
 
     async def _handle_page_dialog(self, dialog: Any, page: Any | None = None) -> None:
         dtype = str(getattr(dialog, "type", "alert") or "alert")
@@ -3170,6 +3246,7 @@ class LiveBrowserHub:
                     owner_bot=info.get("owner_bot"),
                     owner_uid=info.get("owner_uid"),
                     require_admin=True,
+                    expected_session_gen=info.get("session_gen"),
                 )
 
     async def _handle_page_download(
@@ -3436,44 +3513,48 @@ class LiveBrowserHub:
         self._sync_lease_id = None
         self._mouse_buttons_down.clear()
         self._sync_buttons_down.clear()
+        self._pending_sync_extracts.clear()
 
     async def _stop_hosted_locked(self, *, notify_finished: bool = True) -> None:
         if self.engine_mode != "async_hosted":
             return
-        # 1. Capture final frame for card retirement if any active cards exist
-        if notify_finished and self.tg.cards:
-            try:
-                await self._capture_once(force_broadcast=True)
-            except Exception:
-                pass
-        # 2. Retire all active cards for this session BEFORE clearing caches / incrementing gen
-        await self.tg.retire_cards(mark_finished=notify_finished)
+        # 1. Capture coherent handles & final JPEG synchronously, then IMMEDIATELY advance generations,
+        #    flip mode to `idle`, clear owner/takeover/queues/caches BEFORE ANY await!
+        old_gen = self.session_gen
+        final_jpeg = self.latest_jpeg
+        old_page = self._current_page()
+        cm = self.camoufox_cm
+        fd = self.lock_fd
+        ephemeral_dir = self._ephemeral_dir
+        held_buttons = list(self._mouse_buttons_down)
 
-        # 3. Advance generations & drain input queue + release held buttons under barrier
         self.session_gen += 1
         self.takeover_gen += 1
-        self.takeover = False
-        self.takeover_reason = ""
-        self.takeover_owner = None
+        self.engine_mode = "idle"
+        self.camoufox_cm = None
+        self.ctx = None
+        self.lock_fd = None
+        self._ephemeral_dir = None
         self._drain_input_queue()
-        async with self._exec_lock:
-            await self._release_held_mouse_buttons_locked()
+        self._clear_session_caches()
+        self.ai_allowed_event.set()
+
+        # 2. Release any held mouse buttons on the detached page under execution barrier
+        if held_buttons and old_page is not None:
+            async with self._exec_lock:
+                for btn in held_buttons:
+                    try:
+                        await asyncio.wait_for(old_page.mouse.up(button=btn), timeout=1.5)
+                    except Exception as exc:
+                        log.debug("Stop fallback mouse.up(%s) error: %s", btn, exc)
+
+        # 3. Retire all cards for `old_gen` with strictly stateless finished copy
+        await self.tg.retire_cards(session_gen=old_gen, mark_finished=notify_finished, final_jpeg=final_jpeg)
 
         # 4. Clean pending dialogs/choosers & cancel/await background tasks (e.g. in-flight save_as)
         await self._cleanup_pending_dialogs()
         await self._cleanup_pending_filechoosers_async()
         await self._cancel_and_await_bg_tasks(timeout=2.0)
-
-        cm = self.camoufox_cm
-        fd = self.lock_fd
-        ephemeral_dir = self._ephemeral_dir
-        self.camoufox_cm = None
-        self.ctx = None
-        self.lock_fd = None
-        self._ephemeral_dir = None
-        self.engine_mode = "idle"
-        self._clear_session_caches()
-        self.ai_allowed_event.set()
         self._cleanup_transfer_dir(force_all=True)
 
         if cm is not None:
@@ -3500,8 +3581,36 @@ class LiveBrowserHub:
         overrides: dict[str, Any] | None = None,
         restart: bool = False,
         preferred_user_id: int | None = None,
+        *,
+        actor: tuple[str, int] | None = None,
+        source: str = "cli",
+        expected_session_gen: int | None = None,
     ) -> dict[str, Any]:
         async with self._engine_lock:
+            is_remote_actor = (source != "cli") or (actor is not None)
+            if is_remote_actor:
+                if (
+                    actor is None
+                    or not actor[0]
+                    or not isinstance(actor[1], int)
+                    or isinstance(actor[1], bool)
+                    or actor[1] <= 0
+                ):
+                    raise PermissionError("缺少有效的 Bot 或私聊用户身份")
+                a_bot, a_uid = str(actor[0]), int(actor[1])
+                live_role = _check_live_user_role(a_bot, a_uid)
+                if live_role != "admin":
+                    raise PermissionError("当前用户未授权或不是管理员")
+                if expected_session_gen is not None and self.session_gen != expected_session_gen:
+                    raise PermissionError("会话代次已变更，已拒绝过期启动/切换请求")
+                if self.engine_mode != "idle":
+                    if not self._viewer_can_mutate(a_bot, a_uid, live_role):
+                        raise PermissionError("🔒 当前浏览器会话由其他 Bot/用户或本机 CLI 持有，无权复用、导航或切换")
+                    if source == "ws" and not restart:
+                        raise RuntimeError("浏览器已在运行中")
+                bot_hint = a_bot
+                preferred_user_id = a_uid
+
             self.mark_active(mark_tabs_dirty=True)
             if self.engine_mode == "sync_external":
                 raise RuntimeError("当前已有外部同步脚本持有浏览器会话。")
@@ -3557,10 +3666,15 @@ class LiveBrowserHub:
                 cm: Any = None
                 cm_entered = False
                 pinned_verified_flag = bool(spec.get("pinned_verified"))
+                try:
+                    host_has_pinned = discover_pinned_host_profile() is not None
+                except Exception:
+                    host_has_pinned = True  # fail-closed
+                require_non_pinned_guard = (not pinned_verified_flag) and host_has_pinned
 
                 def _on_new_page(new_page: Any) -> None:
                     try:
-                        self._attach_page_listeners(new_page)
+                        self._attach_page_listeners(new_page, require_nav_guard=require_non_pinned_guard)
                         if self.ctx is not None:
                             pages = list(self.ctx.pages)
                             if new_page in pages:
@@ -3597,14 +3711,14 @@ class LiveBrowserHub:
                     ctx_on = getattr(ctx, "on", None)
                     if callable(ctx_on):
                         ctx_on("page", _on_new_page)
-                    elif not pinned_verified_flag and discover_pinned_host_profile() is not None:
+                    elif require_non_pinned_guard:
                         raise RuntimeError("非 Pinned 浏览器上下文不支持 ctx.on('page') 监听，已拒绝启动（fail-closed）")
 
                     for existing_page in list(ctx.pages):
-                        self._attach_page_listeners(existing_page)
+                        self._attach_page_listeners(existing_page, require_nav_guard=require_non_pinned_guard)
                     if not ctx.pages:
                         created_page = await ctx.new_page()
-                        self._attach_page_listeners(created_page)
+                        self._attach_page_listeners(created_page, require_nav_guard=require_non_pinned_guard)
                 except Exception:
                     if cm_entered and cm is not None:
                         try:
@@ -3672,25 +3786,65 @@ class LiveBrowserHub:
 
             await self._capture_once(force_broadcast=True)
             await self.broadcast_state()
+            result_state = self.state_dict()
 
         if notify_tg:
             bot_key = self.resolve_bot_key(bot_hint)
             if bot_key is not None:
                 asyncio.create_task(self.tg.ensure_card(bot_key, preferred_user_id=preferred_user_id))
 
-        return self.state_dict()
+        return result_state
 
     async def stop_hosted(
         self,
         notify_finished: bool = True,
         *,
         pre_stop_verify: Any | None = None,
+        actor: tuple[str, int] | None = None,
+        source: str = "cli",
+        expected_session_gen: int | None = None,
+        card_message_id: int | None = None,
+        require_card: bool = False,
+        force: bool = False,
     ) -> tuple[bool, str]:
         async with self._engine_lock:
             if callable(pre_stop_verify):
                 ok_v, msg_v = pre_stop_verify()
                 if not ok_v:
                     return False, str(msg_v)
+            if source != "cli" or actor is not None:
+                if (
+                    actor is None
+                    or not actor[0]
+                    or not isinstance(actor[1], int)
+                    or isinstance(actor[1], bool)
+                    or actor[1] <= 0
+                ):
+                    return False, "缺少有效的 Bot 或私聊用户身份"
+                a_bot, a_uid = str(actor[0]), int(actor[1])
+                if require_card:
+                    ok_cv, msg_cv, _ = self.tg.verify_card_control(
+                        a_bot,
+                        a_uid,
+                        message_id=card_message_id,
+                        require_card=True,
+                        require_running=False,
+                        expected_session_gen=expected_session_gen,
+                    )
+                    if not ok_cv:
+                        return False, msg_cv
+                else:
+                    if expected_session_gen is not None and self.session_gen != expected_session_gen:
+                        return False, "会话代次已变更，已拒绝过期停止请求"
+                    live_role = _check_live_user_role(a_bot, a_uid)
+                    if live_role != "admin":
+                        return False, "当前用户未授权或不是管理员"
+                    if self.engine_mode != "idle" and not self._viewer_can_mutate(a_bot, a_uid, live_role):
+                        return False, "🔒 无权关闭其他 Bot/用户或本机 CLI 持有的浏览器会话"
+                if self.engine_mode == "sync_external":
+                    return False, "当前为外部脚本联动会话，无法直接关闭"
+                if self.ai_busy_count > 0 and not force:
+                    return False, "AI 正在执行浏览器操作，请稍候再关闭"
             if self.engine_mode != "async_hosted":
                 return True, "ok"
             await self._stop_hosted_locked(notify_finished=notify_finished)
@@ -4492,9 +4646,12 @@ class LiveBrowserHub:
             if c_sgen is not None and int(c_sgen) != self.session_gen:
                 continue
             act = cmd.get("action")
-            is_cleanup_up = act == "mouseup" and bool(cmd.get("cleanup"))
+            # ONLY trust server-generated internal cleanup markers (NEVER client-supplied flags!)
+            is_cleanup_up = act == "mouseup" and bool(cmd.get("_server_internal"))
             if is_cleanup_up:
-                valid.append({k: v for k, v in cmd.items() if not str(k).startswith("_")})
+                out_clean = {k: v for k, v in cmd.items() if not str(k).startswith("_")}
+                out_clean["cleanup"] = True
+                valid.append(out_clean)
                 continue
             actor_bot = cmd.get("_bot_key")
             actor_uid = cmd.get("_user_id")
@@ -4509,14 +4666,14 @@ class LiveBrowserHub:
                     if live_role != "admin":
                         continue
             if act == "extract":
-                valid.append({k: v for k, v in cmd.items() if not str(k).startswith("_")})
+                valid.append({k: v for k, v in cmd.items() if k != "cleanup" and not str(k).startswith("_")})
                 continue
             if not self.takeover:
                 continue
             c_tgen = cmd.get("takeover_gen")
             if c_tgen is not None and int(c_tgen) != self.takeover_gen:
                 continue
-            valid.append({k: v for k, v in cmd.items() if not str(k).startswith("_")})
+            valid.append({k: v for k, v in cmd.items() if k != "cleanup" and not str(k).startswith("_")})
         return valid
 
     async def _input_loop(self) -> None:
@@ -4529,7 +4686,9 @@ class LiveBrowserHub:
                 self.mark_active()
 
                 if self.engine_mode == "sync_external":
-                    clean_cmd = {k: v for k, v in cmd.items() if not str(k).startswith("_")}
+                    clean_cmd = {
+                        k: v for k, v in cmd.items() if k != "cleanup" and not str(k).startswith("_")
+                    }
                     if "_session_gen" in cmd:
                         clean_cmd["session_gen"] = cmd["_session_gen"]
                     if "_takeover_gen" in cmd:
@@ -4585,13 +4744,13 @@ class LiveBrowserHub:
                     await page.mouse.down(button=button)
                     pressed = True
                 finally:
-                    if pressed and not self._is_human_cmd_still_valid(cmd):
+                    if pressed and not self._is_human_cmd_still_valid(cmd, check_live_rbac=True):
                         self._mouse_buttons_down.discard(button)
                         try:
                             await asyncio.wait_for(page.mouse.up(button=button), timeout=1.5)
                         except Exception as exc:
                             log.debug("Post-mousedown fallback mouse.up(%s) error: %s", button, exc)
-                if self._is_human_cmd_still_valid(cmd):
+                if self._is_human_cmd_still_valid(cmd, check_live_rbac=True):
                     await self._capture_once()
                 return
 
@@ -4603,10 +4762,14 @@ class LiveBrowserHub:
                     button = "left"
                 self.cursor = {"x": x, "y": y, "actor": "human", "kind": "up", "ts": time.time()}
                 await page.mouse.move(x, y)
+                was_held = button in self._mouse_buttons_down
+                if not was_held and not await self._enforce_human_cmd_live_auth_locked(cmd):
+                    return
                 self._mouse_buttons_down.discard(button)
                 await page.mouse.up(button=button)
-                await self._capture_once()
-                await self.broadcast_state()
+                if self._is_human_cmd_still_valid(cmd, check_live_rbac=True):
+                    await self._capture_once()
+                    await self.broadcast_state()
                 return
 
             if act == "rightclick":
@@ -4614,8 +4777,9 @@ class LiveBrowserHub:
                 y = float(cmd.get("y", 0))
                 self.cursor = {"x": x, "y": y, "actor": "human", "kind": "rightclick", "ts": time.time()}
                 await page.mouse.click(x, y, button="right")
-                await self._capture_once()
-                await self.broadcast_state()
+                if self._is_human_cmd_still_valid(cmd, check_live_rbac=True):
+                    await self._capture_once()
+                    await self.broadcast_state()
                 return
 
             if act in ("click", "dblclick"):
@@ -4637,6 +4801,9 @@ class LiveBrowserHub:
                         await page.mouse.click(x, y)
                     else:
                         await page.mouse.click(x, y, button=button, click_count=click_count)
+                # Re-verify live RBAC & generations before querying focused DOM element!
+                if not await self._enforce_human_cmd_live_auth_locked(cmd):
+                    return
                 # Detect if the user just clicked an editable input/textarea/contenteditable on the page
                 try:
                     focus_info = await asyncio.wait_for(
@@ -4658,7 +4825,7 @@ class LiveBrowserHub:
                         ),
                         timeout=0.6,
                     )
-                    if focus_info:
+                    if focus_info and await self._enforce_human_cmd_live_auth_locked(cmd):
                         owner_bot, owner_uid = self._effective_resource_owner()
                         if owner_bot is not None and owner_uid is not None:
                             await self.broadcast_json_to_owners(
@@ -4675,13 +4842,19 @@ class LiveBrowserHub:
                 text = str(cmd.get("text", ""))
                 if cmd.get("replace"):
                     await page.keyboard.press("Control+A")
+                    if not await self._enforce_human_cmd_live_auth_locked(cmd):
+                        return
                     await page.keyboard.press("Backspace")
+                    if not await self._enforce_human_cmd_live_auth_locked(cmd):
+                        return
                 if text:
                     if text.isascii() and len(text) <= 64:
                         await page.keyboard.type(text, delay=15)
                     else:
                         await page.keyboard.insert_text(text)
                 if cmd.get("submit"):
+                    if not await self._enforce_human_cmd_live_auth_locked(cmd):
+                        return
                     await page.keyboard.press("Enter")
             elif act == "press":
                 key = str(cmd.get("key", ""))
@@ -4689,6 +4862,8 @@ class LiveBrowserHub:
                     await page.keyboard.press(key)
             elif act == "clear_field":
                 await page.keyboard.press("Control+A")
+                if not await self._enforce_human_cmd_live_auth_locked(cmd):
+                    return
                 await page.keyboard.press("Backspace")
             elif act == "goto":
                 url = str(cmd.get("url", "")).strip()
@@ -4728,6 +4903,8 @@ class LiveBrowserHub:
                     self._attach_page_listeners(np)
                     self.active_tab_index = list(self.ctx.pages).index(np)
                     self._tab_select_rev += 1
+                    if not await self._enforce_human_cmd_live_auth_locked(cmd):
+                        return
                     new_tab_url = "https://www.google.com" if self._is_active_pinned_verified() else "about:blank"
                     await np.goto(new_tab_url, wait_until="domcontentloaded", timeout=30000)
             elif act == "close_tab":
@@ -4737,8 +4914,9 @@ class LiveBrowserHub:
                     self.active_tab_index = max(0, min(self.active_tab_index, len(self.ctx.pages) - 1))
                     self._tab_select_rev += 1
 
-            await self._capture_once()
-            await self.broadcast_state()
+            if self._is_human_cmd_still_valid(cmd, check_live_rbac=True):
+                await self._capture_once()
+                await self.broadcast_state()
 
     # ---------------- AI Agent Action RPC ----------------
 
@@ -4935,19 +5113,33 @@ async def _ws_launch_or_switch(
     takeover: bool,
     takeover_reason: str,
     preferred_user_id: int | None = None,
+    expected_session_gen: int | None = None,
 ) -> None:
     try:
-        await hub.start_hosted(
+        actor = (bot_key, int(preferred_user_id)) if preferred_user_id is not None and int(preferred_user_id) > 0 else None
+        st = await hub.start_hosted(
             initial_url=initial_url,
             bot_hint=bot_key,
             notify_tg=True,
             profile=profile,
             restart=restart,
             preferred_user_id=preferred_user_id,
+            actor=actor,
+            source="ws",
+            expected_session_gen=expected_session_gen,
         )
+        started_sgen = _parse_strict_int(st.get("session_gen"))
+        started_tgen = _parse_strict_int(st.get("takeover_gen"))
         if takeover and not hub.takeover:
-            await hub.set_takeover(True, takeover_reason, owner=(bot_key, preferred_user_id))
-    except (ValueError, KeyError, FileNotFoundError, RuntimeError, TimeoutError) as exc:
+            await hub.set_takeover(
+                True,
+                takeover_reason,
+                owner=(bot_key, preferred_user_id),
+                expected_session_gen=started_sgen,
+                expected_takeover_gen=started_tgen,
+                actor=actor,
+            )
+    except (PermissionError, ValueError, KeyError, FileNotFoundError, RuntimeError, TimeoutError) as exc:
         await _ws_send_json(ws, {"type": "toast", "message": str(exc)})
         await hub.broadcast_state()
     except Exception as exc:
@@ -5057,6 +5249,7 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                             owner_bot=exp_c.get("owner_bot"),
                             owner_uid=exp_c.get("owner_uid"),
                             require_admin=True,
+                            expected_session_gen=exp_c.get("session_gen"),
                         )
                     )
                 except RuntimeError:
@@ -5197,10 +5390,16 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                             },
                         )
                     continue
-                # Require explicit integer `session_gen` — NEVER auto-fill server generation!
+                # Require explicit integer BOTH `session_gen` AND `takeover_gen` — NEVER auto-fill!
                 cli_sgen = _parse_strict_int(data.get("session_gen"))
-                if cli_sgen is None or cli_sgen != hub.session_gen:
-                    err_msg = "缺少或过期的 session_gen，已拒绝接管请求"
+                cli_tgen = _parse_strict_int(data.get("takeover_gen"))
+                if (
+                    cli_sgen is None
+                    or cli_sgen != hub.session_gen
+                    or cli_tgen is None
+                    or cli_tgen != hub.takeover_gen
+                ):
+                    err_msg = "缺少或过期的 session_gen/takeover_gen，已拒绝接管请求"
                     if req_id is not None:
                         await _ws_send_json(
                             ws,
@@ -5255,18 +5454,20 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                     str(data.get("reason", "")),
                     owner=(bot_key, user_id) if want else None,
                     expected_session_gen=cli_sgen,
+                    expected_takeover_gen=cli_tgen,
                     actor=(bot_key, user_id),
                 )
                 if not ok_tk and not req_id:
                     await _ws_send_json(ws, {"type": "toast", "message": err_tk})
                 if req_id is not None:
+                    # Bind ACK strictly to the locked `(ack_sgen, ack_tgen, want)` snapshot (never post-await hub.takeover!)
                     await _ws_send_json(
                         ws,
                         {
                             "type": "takeover_ack",
                             "req_id": str(req_id),
-                            "ok": bool(ok_tk and hub.takeover == want),
-                            "takeover": hub.takeover if ok_tk else False,
+                            "ok": bool(ok_tk),
+                            "takeover": bool(want) if ok_tk else False,
                             "session_gen": ack_sgen,
                             "takeover_gen": ack_tgen,
                             "owner_bot": bot_key,
@@ -5314,6 +5515,7 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                     owner_bot=entry.get("owner_bot"),
                     owner_uid=entry.get("owner_uid"),
                     require_admin=True,
+                    expected_session_gen=entry.get("session_gen"),
                 )
             elif mtype == "send_download_to_tg":
                 if not await _require_live_admin("发送下载文件到 TG"):
@@ -5370,6 +5572,8 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
             elif mtype == "start_browser":
                 if not await _require_live_admin("启动浏览器"):
                     continue
+                ws_sgen = _parse_strict_int(data.get("session_gen"))
+                exp_sgen = ws_sgen if ws_sgen is not None else hub.session_gen
                 if hub.engine_mode == "idle":
                     req_profile = str(data.get("profile") or "").strip() or None
                     raw_url = str(data.get("url") or "").strip()
@@ -5396,6 +5600,7 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                             takeover=bool(data.get("takeover")),
                             takeover_reason="手动启动浏览器接管模式",
                             preferred_user_id=user_id,
+                            expected_session_gen=exp_sgen,
                         )
                     )
                 else:
@@ -5404,6 +5609,8 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
             elif mtype == "switch_profile":
                 if not await _require_live_admin("切换浏览器指纹"):
                     continue
+                ws_sgen = _parse_strict_int(data.get("session_gen"))
+                exp_sgen = ws_sgen if ws_sgen is not None else hub.session_gen
                 if hub.engine_mode != "idle" and not hub._viewer_can_mutate(bot_key, user_id, role):
                     await _ws_send_json(ws, {"type": "toast", "message": "🔒 无权切换其他 Bot/用户持有的浏览器会话"})
                     continue
@@ -5438,11 +5645,14 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                         takeover=bool(data.get("takeover")),
                         takeover_reason=f"切换指纹 {target_profile} 并接管",
                         preferred_user_id=user_id,
+                        expected_session_gen=exp_sgen,
                     )
                 )
             elif mtype == "stop_browser":
                 if not await _require_live_admin("关闭浏览器"):
                     continue
+                ws_sgen = _parse_strict_int(data.get("session_gen"))
+                exp_sgen = ws_sgen if ws_sgen is not None else hub.session_gen
                 if hub.engine_mode == "sync_external":
                     await _ws_send_json(ws, {"type": "toast", "message": "当前为外部脚本联动会话，无法从面板直接关闭"})
                     await hub.broadcast_state()
@@ -5454,7 +5664,14 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                         await _ws_send_json(ws, {"type": "toast", "message": "AI 正在执行浏览器操作，请稍候再关闭"})
                         await hub.broadcast_state()
                     else:
-                        await hub.stop_hosted(notify_finished=True)
+                        ok_st_ws, err_st_ws = await hub.stop_hosted(
+                            notify_finished=True,
+                            actor=(bot_key, user_id),
+                            source="ws",
+                            expected_session_gen=exp_sgen,
+                        )
+                        if not ok_st_ws:
+                            await _ws_send_json(ws, {"type": "toast", "message": err_st_ws})
                 else:
                     await hub.broadcast_state()
             elif mtype == "extract":
@@ -5462,9 +5679,15 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                     if ws.closed:
                         break
                     continue
-                # Require explicit integer `session_gen` — NEVER auto-fill!
+                # Require explicit integer BOTH `session_gen` AND `takeover_gen` — NEVER auto-fill!
                 cli_sgen = _parse_strict_int(data.get("session_gen"))
-                if cli_sgen is None or cli_sgen != hub.session_gen:
+                cli_tgen = _parse_strict_int(data.get("takeover_gen"))
+                if (
+                    cli_sgen is None
+                    or cli_sgen != hub.session_gen
+                    or cli_tgen is None
+                    or cli_tgen != hub.takeover_gen
+                ):
                     continue
                 req_gen = hub.session_gen
                 req_owner = hub.session_owner
@@ -5499,9 +5722,11 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                     if mode not in _SYNC_EXTRACT_ALLOWED_MODES:
                         await _ws_send_json(ws, {"type": "toast", "message": "不支持的提取模式"})
                         continue
+                    ext_req_id = secrets.token_hex(8)
                     safe_extract: dict[str, Any] = {
                         "action": "extract",
                         "mode": mode,
+                        "req_id": ext_req_id,
                         "session_gen": req_gen,
                         "_bot_key": bot_key,
                         "_user_id": user_id,
@@ -5526,6 +5751,18 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                                     safe_extract["extract_gen"] = eg
                     except (TypeError, ValueError):
                         continue
+                    now_ext = time.monotonic()
+                    if len(hub._pending_sync_extracts) >= 128:
+                        for old_k, old_v in list(hub._pending_sync_extracts.items()):
+                            if (now_ext - float(old_v.get("created_ts", 0.0))) > 60.0 or len(hub._pending_sync_extracts) >= 128:
+                                hub._pending_sync_extracts.pop(old_k, None)
+                    hub._pending_sync_extracts[ext_req_id] = {
+                        "bot_key": bot_key,
+                        "user_id": user_id,
+                        "session_gen": req_gen,
+                        "ws": ws,
+                        "created_ts": now_ext,
+                    }
                     hub._enqueue_sync_cmd(safe_extract)
                 else:
                     await ws.send_str(json.dumps({"type": "toast", "message": "当前浏览器未运行"}))
@@ -5608,7 +5845,7 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                 clean_payload = {
                     k: v
                     for k, v in data.items()
-                    if k not in ("session_gen", "takeover_gen") and not str(k).startswith("_")
+                    if k not in ("session_gen", "takeover_gen", "cleanup") and not str(k).startswith("_")
                 }
                 enriched = {
                     **clean_payload,
@@ -5671,6 +5908,7 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                                     "session_gen": hub.session_gen,
                                     "takeover_gen": hub.takeover_gen,
                                     "cleanup": True,
+                                    "_server_internal": True,
                                 }
                             )
                         hub._sync_buttons_down.clear()
@@ -5776,6 +6014,7 @@ async def handle_api_upload(request: web.Request) -> web.Response:
                 owner_bot=popped_stale.get("owner_bot"),
                 owner_uid=popped_stale.get("owner_uid"),
                 require_admin=True,
+                expected_session_gen=popped_stale.get("session_gen"),
             )
         return web.json_response({"ok": False, "error": "文件选择会话已过期"}, status=404)
     if not hub._can_access_resource(entry_preview, bot_key, user_id, role, require_admin=True):
@@ -5787,7 +6026,7 @@ async def handle_api_upload(request: web.Request) -> web.Response:
     raw_cl = request.headers.get("Content-Length", "")
     if raw_cl.isdigit() and int(raw_cl) > max_req_bytes:
         return web.json_response(
-            {"ok": False, "error": f"上传请求总大小超过 {MAX_UPLOAD_BYTES // (1024 * 1024)}MB 限制"},
+            {"ok": False, "error": f"上传请求总大小超过 {MAX_UPLOAD_BYTES // (1024 * 1024)} MiB 限制"},
             status=413,
         )
 
@@ -5924,6 +6163,14 @@ async def handle_api_upload(request: web.Request) -> web.Response:
             saved_paths.append(dest)
             saved_names.append(unique_fn)
 
+        # Drain the underlying aiohttp decoded request body stream to true EOF through the SAME
+        # byte-counting wrapper BEFORE calling `set_files()` (accounts for any trailing/epilogue bytes!)
+        if counting_stream is not None:
+            while not counting_stream.at_eof():
+                trailing = await counting_stream.read(65536)
+                if not trailing:
+                    break
+
         if not saved_paths:
             return web.json_response({"ok": False, "error": "未选择任何文件"}, status=400)
 
@@ -5942,6 +6189,7 @@ async def handle_api_upload(request: web.Request) -> web.Response:
                     owner_bot=popped_exp.get("owner_bot"),
                     owner_uid=popped_exp.get("owner_uid"),
                     require_admin=True,
+                    expected_session_gen=popped_exp.get("session_gen"),
                 )
             return web.json_response({"ok": False, "error": "文件选择会话在上传期间已超时过期"}, status=404)
         if not hub._can_access_resource(entry, bot_key, user_id, live_role, require_admin=True):
@@ -5949,6 +6197,7 @@ async def handle_api_upload(request: web.Request) -> web.Response:
         hub.pending_filechoosers.pop(chooser_id, None)
 
         chooser = entry["chooser"]
+        entry_sgen = entry.get("session_gen")
         closed_payload = {"type": "filechooser_closed", "chooser_id": chooser_id}
         closed_notified = False
         try:
@@ -5956,7 +6205,7 @@ async def handle_api_upload(request: web.Request) -> web.Response:
             await chooser.set_files(target_arg)
             committed = True
         except asyncio.CancelledError:
-            # Cancellation-safe notification so UI never hangs with a dead chooser panel
+            # Cancellation-safe notification bound strictly to `entry["session_gen"]`
             if entry.get("owner_bot") is not None and entry.get("owner_uid") is not None:
                 try:
                     asyncio.get_running_loop().create_task(
@@ -5965,6 +6214,7 @@ async def handle_api_upload(request: web.Request) -> web.Response:
                             owner_bot=entry.get("owner_bot"),
                             owner_uid=entry.get("owner_uid"),
                             require_admin=True,
+                            expected_session_gen=entry_sgen,
                         )
                     )
                     closed_notified = True
@@ -5977,6 +6227,7 @@ async def handle_api_upload(request: web.Request) -> web.Response:
                 owner_bot=entry.get("owner_bot"),
                 owner_uid=entry.get("owner_uid"),
                 require_admin=True,
+                expected_session_gen=entry_sgen,
             )
             closed_notified = True
             return web.json_response({"ok": False, "error": f"写入网页文件选择器失败: {exc}"}, status=500)
@@ -5989,6 +6240,7 @@ async def handle_api_upload(request: web.Request) -> web.Response:
                             owner_bot=entry.get("owner_bot"),
                             owner_uid=entry.get("owner_uid"),
                             require_admin=True,
+                            expected_session_gen=entry_sgen,
                         )
                     )
                 except RuntimeError:
@@ -6001,7 +6253,7 @@ async def handle_api_upload(request: web.Request) -> web.Response:
         return web.json_response({"ok": True, "files": saved_names, "total_bytes": total_file_bytes})
     except _UploadPayloadTooLargeError:
         return web.json_response(
-            {"ok": False, "error": f"上传原始请求流体积超过 {MAX_UPLOAD_BYTES // (1024 * 1024)}MB 限制"},
+            {"ok": False, "error": f"上传请求体总大小超过 {MAX_UPLOAD_BYTES // (1024 * 1024)} MiB 限制"},
             status=413,
         )
     except asyncio.CancelledError:
@@ -6056,9 +6308,47 @@ async def handle_api_download(request: web.Request) -> web.StreamResponse:
 # ---------------- Localhost Internal IPC Endpoints ----------------
 
 
+def _resolve_internal_tg_reader(
+    hub: LiveBrowserHub, query: Any
+) -> tuple[bool, bool]:
+    """Inspect internal GET query params for Telegram caller context.
+
+    Returns `(is_tg_caller, can_read_active_session)`.
+    Localhost CLI queries without `source=tg_*` or `user_id`/`chat_id` return `(False, True)`.
+    """
+    raw_source = str(query.get("source") or "").strip().lower()
+    raw_bot = query.get("bot") or query.get("bot_key")
+    raw_uid = query.get("user_id")
+    raw_cid = query.get("chat_id")
+    is_tg = (
+        raw_source in ("tg_cmd", "tg_card", "tg")
+        or raw_uid is not None
+        or raw_cid is not None
+    )
+    if not is_tg:
+        return False, True
+    if hub.engine_mode == "idle":
+        return True, True
+    # Fail-closed: Telegram status queries require explicit resolvable bot + positive user_id
+    if raw_bot is None or not str(raw_bot).strip():
+        return True, False
+    target_bot = hub.resolve_bot_key(str(raw_bot))
+    uid_val = _parse_positive_int(raw_uid if raw_uid is not None else raw_cid)
+    if not target_bot or not uid_val:
+        return True, False
+    live_role = _check_live_user_role(target_bot, uid_val)
+    if live_role not in ("admin", "readonly"):
+        return True, False
+    return True, hub._viewer_can_read_session(target_bot, uid_val, live_role)
+
+
 async def internal_status(request: web.Request) -> web.Response:
     hub: LiveBrowserHub = request.app["hub"]
     check_local_auth(request, hub)
+    query = getattr(request, "query", {}) or {}
+    is_tg, can_read = _resolve_internal_tg_reader(hub, query)
+    if is_tg and not can_read:
+        return web.json_response({"ok": True, **hub._redacted_state_dict()})
     return web.json_response({"ok": True, **hub.state_dict()})
 
 
@@ -6097,7 +6387,12 @@ def _verify_internal_caller_control(
     cid_val = _parse_positive_int(raw_cid if raw_cid is not None else raw_uid)
     mid_val = _parse_positive_int(raw_mid)
 
-    has_tg_identity = from_card or (raw_uid is not None) or (raw_cid is not None)
+    has_tg_identity = (
+        from_card
+        or raw_source in ("tg_cmd", "tg_card", "tg")
+        or (raw_uid is not None)
+        or (raw_cid is not None)
+    )
     if not has_tg_identity:
         if raw_bot is not None and str(raw_bot).strip():
             bkey = hub.resolve_bot_key(str(raw_bot))
@@ -6106,7 +6401,10 @@ def _verify_internal_caller_control(
             return True, "ok", (bkey, None), {"is_tg": False}
         return True, "ok", None, {"is_tg": False}
 
-    target_bot = hub.resolve_bot_key(str(raw_bot) if raw_bot is not None else None)
+    # Strictly require explicit `bot` for Telegram callers — NEVER fall back to single-bot auto-resolution!
+    if raw_bot is None or not str(raw_bot).strip():
+        return False, "缺少必填的 bot 身份参数", None, {}
+    target_bot = hub.resolve_bot_key(str(raw_bot))
     if not target_bot or not cid_val:
         return False, "缺少有效的 Bot 或私聊用户身份", None, {}
 
@@ -6131,6 +6429,7 @@ def _verify_internal_caller_control(
             {
                 "is_tg": True,
                 "from_card": True,
+                "source": "tg_card",
                 "bot_key": target_bot,
                 "chat_id": cid_val,
                 "message_id": mid_val,
@@ -6143,7 +6442,7 @@ def _verify_internal_caller_control(
     if live_role != "admin":
         return False, "当前用户未授权或不是管理员", None, {}
     if hub.engine_mode != "idle" and not hub._viewer_can_mutate(target_bot, cid_val, live_role):
-        return False, "无权操作其他 Bot/用户持有的浏览器会话", None, {}
+        return False, "无权操作其他 Bot/用户或本机 CLI 持有的浏览器会话", None, {}
     return (
         True,
         "ok",
@@ -6151,6 +6450,7 @@ def _verify_internal_caller_control(
         {
             "is_tg": True,
             "from_card": False,
+            "source": raw_source or "tg_cmd",
             "bot_key": target_bot,
             "chat_id": cid_val,
             "message_id": None,
@@ -6192,7 +6492,15 @@ async def internal_takeover(request: web.Request) -> web.Response:
 async def internal_start(request: web.Request) -> web.Response:
     hub: LiveBrowserHub = request.app["hub"]
     check_local_auth(request, hub)
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        return web.json_response({"ok": False, "error": "Request body must be a JSON object"}, status=400)
+    ok_ctrl, err_ctrl, _, auth_ctx = _verify_internal_caller_control(hub, body, require_running=False)
+    if not ok_ctrl:
+        return web.json_response({"ok": False, "error": err_ctrl}, status=403)
     overrides: dict[str, Any] = {}
     for key in (
         "os",
@@ -6213,6 +6521,9 @@ async def internal_start(request: web.Request) -> web.Response:
         if key in body and body[key] is not None:
             overrides[key] = body[key]
     pref_uid = _parse_positive_int(body.get("user_id"))
+    actor_arg = (auth_ctx["bot_key"], auth_ctx["chat_id"]) if auth_ctx.get("is_tg") else None
+    source_arg = str(auth_ctx.get("source") or "tg_cmd") if auth_ctx.get("is_tg") else "cli"
+    exp_gen = auth_ctx.get("expected_gen") if auth_ctx.get("is_tg") else None
     try:
         st = await hub.start_hosted(
             initial_url=body.get("url"),
@@ -6222,8 +6533,13 @@ async def internal_start(request: web.Request) -> web.Response:
             overrides=overrides or None,
             restart=bool(body.get("restart", False)),
             preferred_user_id=pref_uid,
+            actor=actor_arg,
+            source=source_arg,
+            expected_session_gen=exp_gen,
         )
         return web.json_response({"ok": True, **st})
+    except PermissionError as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=403)
     except ValueError as exc:
         return web.json_response({"ok": False, "error": str(exc)}, status=400)
     except (KeyError, FileNotFoundError) as exc:
@@ -6237,14 +6553,17 @@ async def internal_start(request: web.Request) -> web.Response:
 async def internal_profiles_list(request: web.Request) -> web.Response:
     hub: LiveBrowserHub = request.app["hub"]
     check_local_auth(request, hub)
+    query = getattr(request, "query", {}) or {}
+    is_tg, can_read = _resolve_internal_tg_reader(hub, query)
+    visible_active = hub.active_profile if (not is_tg or can_read) else ""
     try:
-        profs = list_profiles(active_profile=hub.active_profile)
+        profs = list_profiles(active_profile=visible_active)
     except RuntimeError as exc:
         return web.json_response({"ok": False, "error": str(exc)}, status=500)
     return web.json_response(
         {
             "ok": True,
-            "active_profile": hub.active_profile or None,
+            "active_profile": visible_active or None,
             "profiles": profs,
         }
     )
@@ -6295,11 +6614,13 @@ async def internal_profiles_switch(request: web.Request) -> web.Response:
     target_profile = str(body.get("profile") or "").strip()
     if not target_profile:
         return web.json_response({"ok": False, "error": "Missing required 'profile' field"}, status=400)
+    ok_ctrl, err_ctrl, _, auth_ctx = _verify_internal_caller_control(hub, body, require_running=False)
+    if not ok_ctrl:
+        return web.json_response({"ok": False, "error": err_ctrl}, status=403)
     pref_uid = _parse_positive_int(body.get("user_id"))
-    if body.get("user_id") is not None or body.get("chat_id") is not None:
-        ok_ctrl, err_ctrl, _, _ = _verify_internal_caller_control(hub, body, require_running=False)
-        if not ok_ctrl:
-            return web.json_response({"ok": False, "error": err_ctrl}, status=403)
+    actor_arg = (auth_ctx["bot_key"], auth_ctx["chat_id"]) if auth_ctx.get("is_tg") else None
+    source_arg = str(auth_ctx.get("source") or "tg_cmd") if auth_ctx.get("is_tg") else "cli"
+    exp_gen = auth_ctx.get("expected_gen") if auth_ctx.get("is_tg") else None
     try:
         st = await hub.start_hosted(
             initial_url=body.get("url") or None,
@@ -6308,8 +6629,13 @@ async def internal_profiles_switch(request: web.Request) -> web.Response:
             profile=target_profile,
             restart=bool(body.get("restart", True)),
             preferred_user_id=pref_uid,
+            actor=actor_arg,
+            source=source_arg,
+            expected_session_gen=exp_gen,
         )
         return web.json_response({"ok": True, **st})
+    except PermissionError as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=403)
     except ValueError as exc:
         return web.json_response({"ok": False, "error": str(exc)}, status=400)
     except (KeyError, FileNotFoundError) as exc:
@@ -6370,39 +6696,23 @@ async def internal_stop(request: web.Request) -> web.Response:
             status=409,
         )
 
-    def _in_lock_stop_verify() -> tuple[bool, str]:
-        if not auth_ctx.get("is_tg"):
-            return True, "ok"
-        bkey = auth_ctx["bot_key"]
-        cid_v = auth_ctx["chat_id"]
-        exp_g = auth_ctx["expected_gen"]
-        if auth_ctx.get("from_card"):
-            ok_v, msg_v, _ = hub.tg.verify_card_control(
-                bkey,
-                cid_v,
-                message_id=auth_ctx.get("message_id"),
-                require_card=True,
-                require_running=False,
-                expected_session_gen=exp_g,
-            )
-            return ok_v, msg_v
-        if hub.session_gen != exp_g:
-            return False, "会话代次已变更，已拒绝过期停止请求"
-        live_role = _check_live_user_role(bkey, cid_v)
-        if live_role != "admin":
-            return False, "当前用户未授权或不是管理员"
-        if hub.engine_mode != "idle" and not hub._viewer_can_mutate(bkey, cid_v, live_role):
-            return False, "无权操作其他 Bot/用户持有的浏览器会话"
-        return True, "ok"
-
     if auth_ctx.get("is_tg"):
-        stop_res = await hub.stop_hosted(notify_finished=True, pre_stop_verify=_in_lock_stop_verify)
+        stop_res = await hub.stop_hosted(
+            notify_finished=True,
+            actor=(auth_ctx["bot_key"], auth_ctx["chat_id"]),
+            source=str(auth_ctx.get("source") or "tg_cmd"),
+            expected_session_gen=auth_ctx.get("expected_gen"),
+            card_message_id=auth_ctx.get("message_id"),
+            require_card=bool(auth_ctx.get("from_card")),
+            force=force,
+        )
     else:
         stop_res = await hub.stop_hosted(notify_finished=True)
     if isinstance(stop_res, tuple) and len(stop_res) == 2:
         ok_stop, err_stop = stop_res
         if not ok_stop:
-            return web.json_response({"ok": False, "error": err_stop}, status=403)
+            status_code = 409 if ("外部脚本" in err_stop or "AI 正在执行" in err_stop) else 403
+            return web.json_response({"ok": False, "error": err_stop}, status=status_code)
     return web.json_response({"ok": True, **hub.state_dict()})
 
 
@@ -6450,7 +6760,9 @@ async def internal_config(request: web.Request) -> web.Response:
             target_cid = _parse_positive_int(raw_cid)
             if not target_cid:
                 return web.json_response({"ok": False, "error": "Invalid chat_id"}, status=400)
-            target_bot = hub.resolve_bot_key(str(raw_bot) if raw_bot else None)
+            if raw_bot is None or not str(raw_bot).strip():
+                return web.json_response({"ok": False, "error": "Telegram 卡片刷新缺少必填的 bot 身份参数"}, status=403)
+            target_bot = hub.resolve_bot_key(str(raw_bot))
             mid_val = _parse_positive_int(raw_mid)
             if mid_val is None or mid_val <= 0:
                 return web.json_response({"ok": False, "error": "Telegram 卡片刷新缺少有效的正整数 message_id"}, status=403)
@@ -6513,74 +6825,82 @@ async def internal_sync_start(request: web.Request) -> web.Response:
     hub: LiveBrowserHub = request.app["hub"]
     check_local_auth(request, hub)
     body = await request.json()
-    if hub.engine_mode == "async_hosted":
-        await hub.stop_hosted(notify_finished=False)
-    elif hub.engine_mode == "sync_external":
-        old_gen, final_jpeg = hub._invalidate_sync_session_sync()
-        await hub.tg.retire_cards(session_gen=old_gen, mark_finished=True, final_jpeg=final_jpeg)
-    hub.session_gen += 1
-    hub.takeover_gen += 1
-    hub._clear_session_caches()
-    lease_id = secrets.token_hex(12)
-    hub.engine_mode = "sync_external"
-    hub._sync_lease_id = lease_id
-    bot_key = hub.resolve_bot_key(body.get("bot"))
-    pref_uid = _parse_positive_int(body.get("user_id"))
-    hub.session_owner = (bot_key, pref_uid) if bot_key is not None else None
+    prev_sync_retire: tuple[int, bytes | None] | None = None
 
-    # Never infer producer `pinned=True` from host discovery alone!
-    # Only verify pinned when the Sync launch explicitly passes a matching canonical pinned `profile_dir`.
-    raw_pdir = str(body.get("profile_dir") or "").strip()
-    pinned_claim = body.get("pinned_launch") is True
-    pinned_verified = False
-    host_pinned = None
-    if raw_pdir and pinned_claim:
-        try:
-            host_pinned = discover_pinned_host_profile()
-        except Exception:
-            host_pinned = None
-        if host_pinned is not None:
+    async with hub._engine_lock:
+        if hub.engine_mode == "async_hosted":
+            await hub._stop_hosted_locked(notify_finished=False)
+        elif hub.engine_mode == "sync_external":
+            prev_sync_retire = hub._invalidate_sync_session_sync()
+        hub.session_gen += 1
+        hub.takeover_gen += 1
+        hub._clear_session_caches()
+        lease_id = secrets.token_hex(12)
+        hub.engine_mode = "sync_external"
+        hub._sync_lease_id = lease_id
+        bot_key = hub.resolve_bot_key(body.get("bot"))
+        pref_uid = _parse_positive_int(body.get("user_id"))
+        hub.session_owner = (bot_key, pref_uid) if bot_key is not None else None
+
+        # Never infer producer `pinned=True` from host discovery alone!
+        # Only verify pinned when the Sync launch explicitly passes a matching canonical pinned `profile_dir`.
+        raw_pdir = str(body.get("profile_dir") or "").strip()
+        pinned_claim = body.get("pinned_launch") is True
+        pinned_verified = False
+        host_pinned = None
+        if raw_pdir and pinned_claim:
             try:
-                p_res = Path(raw_pdir).resolve()
-                h_res = Path(host_pinned["profile_dir"]).resolve()
-                if p_res == h_res and p_res.is_dir():
-                    pinned_verified = True
-            except OSError:
-                pinned_verified = False
+                host_pinned = discover_pinned_host_profile()
+            except Exception:
+                host_pinned = None
+            if host_pinned is not None:
+                try:
+                    p_res = Path(raw_pdir).resolve()
+                    h_res = Path(host_pinned["profile_dir"]).resolve()
+                    if p_res == h_res and p_res.is_dir():
+                        pinned_verified = True
+                except OSError:
+                    pinned_verified = False
 
-    if pinned_verified and host_pinned is not None:
-        hub.active_profile = host_pinned["name"]
-        hub.active_profile_dir = Path(host_pinned["profile_dir"])
-        hub.active_pinned = True
-        hub.active_pinned_verified = True
-        hub.active_egress = "direct"
-        hub.active_os = str(host_pinned["fingerprint"].get("os", "windows"))
-        hub.active_fingerprint = {"os": hub.active_os, "persistent": True}
-    else:
-        hub.active_profile = str(body.get("profile") or "").strip()
-        hub.active_profile_dir = None
-        hub.active_pinned = False
-        hub.active_pinned_verified = False
-        hub.active_egress = "direct"
-        hub.active_os = str(body.get("os") or "")
-        hub.active_fingerprint = {}
+        if pinned_verified and host_pinned is not None:
+            hub.active_profile = host_pinned["name"]
+            hub.active_profile_dir = Path(host_pinned["profile_dir"])
+            hub.active_pinned = True
+            hub.active_pinned_verified = True
+            hub.active_egress = "direct"
+            hub.active_os = str(host_pinned["fingerprint"].get("os", "windows"))
+            hub.active_fingerprint = {"os": hub.active_os, "persistent": True}
+        else:
+            hub.active_profile = str(body.get("profile") or "").strip()
+            hub.active_profile_dir = None
+            hub.active_pinned = False
+            hub.active_pinned_verified = False
+            hub.active_egress = "direct"
+            hub.active_os = str(body.get("os") or "")
+            hub.active_fingerprint = {}
 
-    hub.sync_cmd_queue.clear()
-    hub.ai_status = str(body.get("ai_status") or "外部脚本运行中")
-    now = time.monotonic()
-    hub.last_activity_ts = now
-    hub._sync_last_push_ts = now
-    await hub.broadcast_state()
-    return web.json_response(
-        {
+        hub.sync_cmd_queue.clear()
+        hub.ai_status = str(body.get("ai_status") or "外部脚本运行中")
+        now = time.monotonic()
+        hub.last_activity_ts = now
+        hub._sync_last_push_ts = now
+
+        # Capture atomic locked snapshot for response (NEVER read mutable hub fields after awaits!)
+        resp_payload = {
             "ok": True,
             "bot_key": bot_key,
             "session_gen": hub.session_gen,
+            "takeover_gen": hub.takeover_gen,
             "sync_lease_id": lease_id,
             "pinned": hub.active_pinned,
             "pinned_verified": hub.active_pinned_verified,
         }
-    )
+
+    if prev_sync_retire is not None:
+        old_gen, final_jpeg = prev_sync_retire
+        await hub.tg.retire_cards(session_gen=old_gen, mark_finished=True, final_jpeg=final_jpeg)
+    await hub.broadcast_state()
+    return web.json_response(resp_payload)
 
 
 def _check_sync_lease_active(
@@ -6589,11 +6909,32 @@ def _check_sync_lease_active(
     *,
     expected_gen: int | None = None,
 ) -> tuple[bool, int, str]:
-    """Verify active sync_external lease + optional expected session_gen synchronously."""
+    """Verify active sync_external lease + built-in TTL expiration + optional expected session_gen synchronously."""
     if hub.engine_mode == "async_hosted" or hub.ctx is not None:
         return False, 409, "Active hosted browser session cannot be mutated by sync producer"
     if hub.engine_mode != "sync_external" or not hub._sync_lease_id:
         return False, 410, "Sync session is idle or lease expired; call /internal/sync/start first"
+    # Built-in TTL check: immediately revoke an expired lease even if maintenance tick hasn't run yet!
+    if (
+        hub._sync_last_push_ts is not None
+        and (time.monotonic() - hub._sync_last_push_ts) > SYNC_LEASE_TIMEOUT_SECONDS
+    ):
+        log.warning(
+            "Sync external session lease expired on validator check (>%.0fs without push); revoking immediately",
+            SYNC_LEASE_TIMEOUT_SECONDS,
+        )
+        old_gen, final_jpeg = hub._invalidate_sync_session_sync()
+        try:
+            loop = asyncio.get_running_loop()
+            hub._track_bg_task(
+                loop.create_task(
+                    hub.tg.retire_cards(session_gen=old_gen, mark_finished=True, final_jpeg=final_jpeg)
+                )
+            )
+            hub._track_bg_task(loop.create_task(hub.broadcast_state()))
+        except RuntimeError:
+            pass
+        return False, 410, "Sync session lease expired; call /internal/sync/start first"
     if not req_lease or not hmac.compare_digest(req_lease, hub._sync_lease_id):
         return False, 409, "Invalid or stale sync_lease_id"
     if expected_gen is not None and hub.session_gen != expected_gen:
@@ -6687,27 +7028,52 @@ async def internal_sync_clipboard(request: web.Request) -> web.Response:
     check_local_auth(request, hub)
     q = getattr(request, "query", {}) or {}
     hdr_lease = str(request.headers.get("X-Sync-Lease-Id") or q.get("lease_id") or "").strip()
+    hdr_sgen = _parse_strict_int(q.get("session_gen") or request.headers.get("X-Sync-Session-Gen"))
 
-    # 1. Pre-read validation
-    if hub.engine_mode == "async_hosted" or hub.ctx is not None:
-        return web.json_response({"ok": False, "error": "Active hosted browser session"}, status=409)
-    if hub.engine_mode != "sync_external" or not hub._sync_lease_id:
-        return web.json_response({"ok": False, "error": "No active sync session"}, status=410)
-    if hdr_lease and not hmac.compare_digest(hdr_lease, hub._sync_lease_id):
-        return web.json_response({"ok": False, "error": "Stale sync_lease_id"}, status=409)
+    # 1. Mandatory pre-read lease validation BEFORE reading request body!
+    if not hdr_lease:
+        return web.json_response({"ok": False, "error": "Missing required X-Sync-Lease-Id header or lease_id query"}, status=409)
+    ok_pre, st_pre, err_pre = _check_sync_lease_active(hub, hdr_lease, expected_gen=hdr_sgen)
+    if not ok_pre:
+        return web.json_response({"ok": False, "error": err_pre}, status=st_pre)
     start_gen = hub.session_gen
 
     body = await request.json()
-    req_lease = str(body.get("lease_id") or hdr_lease or "").strip()
+    body_lease = str(body.get("lease_id") or "").strip()
+    if body_lease and not hmac.compare_digest(body_lease, hdr_lease):
+        return web.json_response({"ok": False, "error": "Mismatched sync_lease_id"}, status=409)
     req_sgen = _parse_strict_int(body.get("session_gen")) if body.get("session_gen") is not None else None
 
-    # 2. Post-read validation BEFORE writing clipboard or broadcasting!
+    # 2. Post-read validation BEFORE writing clipboard or sending to viewer!
     if req_sgen is not None and req_sgen != start_gen:
         return web.json_response({"ok": False, "error": "Stale sync session_gen"}, status=409)
-    ok_post, st_post, err_post = _check_sync_lease_active(hub, req_lease, expected_gen=start_gen)
+    ok_post, st_post, err_post = _check_sync_lease_active(hub, hdr_lease, expected_gen=start_gen)
     if not ok_post:
         return web.json_response({"ok": False, "error": err_post}, status=st_post)
 
+    async def _send_targeted_extract_reply(req_id_val: str, payload_obj: dict[str, Any]) -> bool:
+        pending = hub._pending_sync_extracts.pop(req_id_val, None)
+        if not pending or pending.get("session_gen") != start_gen or hub.session_gen != start_gen:
+            return True  # dropped stale/unknown extract reply
+        p_bot = str(pending.get("bot_key") or "")
+        p_uid = int(pending.get("user_id") or 0)
+        live_role = _check_live_user_role(p_bot, p_uid)
+        if live_role not in ("admin", "readonly") or not hub._viewer_can_read_session(p_bot, p_uid, live_role):
+            return True
+        target_ws = pending.get("ws")
+        if target_ws is not None and target_ws in hub.viewers and not getattr(target_ws, "closed", False):
+            await _ws_send_json(target_ws, payload_obj)
+        else:
+            await hub.broadcast_json_to_owners(
+                payload_obj,
+                owner_bot=p_bot,
+                owner_uid=p_uid,
+                require_admin=False,
+                expected_session_gen=start_gen,
+            )
+        return True
+
+    req_id_str = str(body.get("req_id") or "").strip()
     if body.get("preview"):
         preview_payload: dict[str, Any] = {
             "type": "selection_preview",
@@ -6717,7 +7083,18 @@ async def internal_sync_clipboard(request: web.Request) -> web.Response:
             eg = _parse_strict_int(body.get("extract_gen"))
             if eg is not None:
                 preview_payload["extract_gen"] = eg
-        await hub.broadcast_json(preview_payload)
+        if req_id_str:
+            await _send_targeted_extract_reply(req_id_str, preview_payload)
+        else:
+            owner_bot, owner_uid = hub._effective_resource_owner()
+            if owner_bot is not None and owner_uid is not None:
+                await hub.broadcast_json_to_owners(
+                    preview_payload,
+                    owner_bot=owner_bot,
+                    owner_uid=owner_uid,
+                    require_admin=False,
+                    expected_session_gen=start_gen,
+                )
         return web.json_response({"ok": True})
 
     text = str(body.get("text") or "")
@@ -6731,7 +7108,19 @@ async def internal_sync_clipboard(request: web.Request) -> web.Response:
             "ts": time.time(),
         }
         hub.latest_clip = clip_obj
-        await hub.broadcast_json({"type": "clipboard", **clip_obj})
+        clip_msg = {"type": "clipboard", **clip_obj}
+        if req_id_str:
+            await _send_targeted_extract_reply(req_id_str, clip_msg)
+        else:
+            owner_bot, owner_uid = hub._effective_resource_owner()
+            if owner_bot is not None and owner_uid is not None:
+                await hub.broadcast_json_to_owners(
+                    clip_msg,
+                    owner_bot=owner_bot,
+                    owner_uid=owner_uid,
+                    require_admin=False,
+                    expected_session_gen=start_gen,
+                )
     return web.json_response({"ok": True})
 
 
@@ -6740,14 +7129,14 @@ async def internal_sync_stop(request: web.Request) -> web.Response:
     check_local_auth(request, hub)
     q = getattr(request, "query", {}) or {}
     hdr_lease = str(request.headers.get("X-Sync-Lease-Id") or q.get("lease_id") or "").strip()
+    hdr_sgen = _parse_strict_int(q.get("session_gen") or request.headers.get("X-Sync-Session-Gen"))
 
-    # 1. Pre-read validation
-    if hub.engine_mode == "async_hosted" or hub.ctx is not None:
-        return web.json_response({"ok": False, "error": "Active hosted browser session"}, status=409)
-    if hub.engine_mode != "sync_external" or not hub._sync_lease_id:
-        return web.json_response({"ok": False, "error": "No active sync session"}, status=410)
-    if hdr_lease and not hmac.compare_digest(hdr_lease, hub._sync_lease_id):
-        return web.json_response({"ok": False, "error": "Stale sync_lease_id"}, status=409)
+    # 1. Mandatory pre-read lease validation BEFORE reading request body!
+    if not hdr_lease:
+        return web.json_response({"ok": False, "error": "Missing required X-Sync-Lease-Id header or lease_id query"}, status=409)
+    ok_pre, st_pre, err_pre = _check_sync_lease_active(hub, hdr_lease, expected_gen=hdr_sgen)
+    if not ok_pre:
+        return web.json_response({"ok": False, "error": err_pre}, status=st_pre)
     start_gen = hub.session_gen
 
     body: dict[str, Any] = {}
@@ -6771,18 +7160,20 @@ async def internal_sync_stop(request: web.Request) -> web.Response:
         except Exception:
             body = {}
 
-    req_lease = str(body.get("lease_id") or hdr_lease or "").strip()
+    body_lease = str(body.get("lease_id") or "").strip()
+    if body_lease and not hmac.compare_digest(body_lease, hdr_lease):
+        return web.json_response({"ok": False, "error": "Mismatched sync_lease_id"}, status=409)
     req_sgen = _parse_strict_int(body.get("session_gen")) if body.get("session_gen") is not None else None
     if req_sgen is not None and req_sgen != start_gen:
         return web.json_response({"ok": False, "error": "Stale sync session_gen"}, status=409)
 
-    # 2. Post-read validation BEFORE invalidating!
-    ok_post, st_post, err_post = _check_sync_lease_active(hub, req_lease, expected_gen=start_gen)
-    if not ok_post:
-        return web.json_response({"ok": False, "error": err_post}, status=st_post)
+    # 2. Post-read validation + synchronous invalidation INSIDE `_engine_lock`!
+    async with hub._engine_lock:
+        ok_post, st_post, err_post = _check_sync_lease_active(hub, hdr_lease, expected_gen=start_gen)
+        if not ok_post:
+            return web.json_response({"ok": False, "error": err_post}, status=st_post)
+        old_gen, final_jpeg = hub._invalidate_sync_session_sync()
 
-    # 3. Invalidate lease, mode, generations & caches SYNCHRONOUSLY FIRST, THEN retire cards & broadcast!
-    old_gen, final_jpeg = hub._invalidate_sync_session_sync()
     await hub.tg.retire_cards(session_gen=old_gen, mark_finished=True, final_jpeg=final_jpeg)
     await hub.broadcast_state()
     return web.json_response({"ok": True})

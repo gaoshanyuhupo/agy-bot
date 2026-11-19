@@ -102,6 +102,10 @@ class _FakePage:
     def __init__(self, url: str = "https://example.com") -> None:
         self.url = url
         self.viewport_size = {"width": 1280, "height": 800}
+        self._callbacks: dict[str, list] = {}
+
+    def on(self, event: str, cb) -> None:
+        self._callbacks.setdefault(event, []).append(cb)
 
     async def title(self) -> str:
         return "Example Browser Page"
@@ -951,6 +955,89 @@ class TestBridgeBrowserPanelAndRbac(unittest.TestCase):
                 self.assertEqual([], post_calls)
                 self.assertTrue(send_mock.called)
                 self.assertGreaterEqual(tg_mock.call_count, 3)
+
+    def test_round5_tg_browser_status_passes_source_and_renders_redacted_restricted_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_dir = Path(tmp) / "live-cfg"
+            cfg_dir.mkdir(parents=True, exist_ok=True)
+            (cfg_dir / "local.token").write_text("sec-tok", encoding="utf-8")
+            bridge, _ac = _load_isolated_bridge(tmp, extra_env={"AGY_LIVE_BROWSER_CONFIG_DIR": str(cfg_dir)})
+            bridge._env_file = "/tmp/.env"
+            bridge.BOT_META["bot_id"] = 100
+
+            get_calls: list[tuple[str, dict | None]] = []
+            post_calls: list[tuple[str, dict]] = []
+
+            class _FakeResp:
+                def __init__(self, status_code: int, payload: dict) -> None:
+                    self.status_code = status_code
+                    self._payload = payload
+
+                def json(self) -> dict:
+                    return self._payload
+
+            restricted_status = {
+                "ok": True,
+                "running": False,
+                "session_restricted": True,
+                "engine_mode": "idle",
+                "profile": None,
+                "url": "",
+                "title": "",
+                "public_url": "https://live.example.com",
+                "profiles": [
+                    {"name": "default", "pinned": False, "os": "windows", "egress_display": "direct", "active": False}
+                ],
+            }
+
+            def _fake_get(url: str, **kw):
+                get_calls.append((url, kw.get("params")))
+                if url.endswith("/internal/status"):
+                    return _FakeResp(200, restricted_status)
+                if url.endswith("/internal/profiles"):
+                    return _FakeResp(200, {"ok": True, "active_profile": None, "profiles": restricted_status["profiles"]})
+                return _FakeResp(404, {"ok": False})
+
+            def _fake_post(url: str, json=None, **_kw):
+                post_calls.append((url, dict(json or {})))
+                return _FakeResp(200, {"ok": True})
+
+            with (
+                mock.patch.dict(os.environ, {"AGY_LIVE_BROWSER_CONFIG_DIR": str(cfg_dir)}, clear=False),
+                mock.patch.object(bridge.requests, "get", side_effect=_fake_get),
+                mock.patch.object(bridge.requests, "post", side_effect=_fake_post),
+                mock.patch.object(bridge, "send", return_value=1),
+            ):
+                text, kb = bridge.build_browser_panel(111, from_user={"id": 111})
+                # Verify /internal/status & /internal/profiles received source=tg_cmd, bot, user_id
+                self.assertEqual(2, len(get_calls))
+                for _url, params in get_calls:
+                    self.assertIsInstance(params, dict)
+                    assert params is not None
+                    self.assertEqual("tg_cmd", params.get("source"))
+                    self.assertEqual("main", params.get("bot"))
+                    self.assertEqual("111", params.get("user_id"))
+                # Verify redacted panel copy and NO start/switch/stop control buttons when restricted!
+                self.assertIn("已占用", text)
+                self.assertIn("脱敏隔离", text)
+                cb_datas = [
+                    btn.get("callback_data", "")
+                    for row in kb.get("inline_keyboard", [])
+                    for btn in row
+                    if isinstance(btn, dict)
+                ]
+                self.assertFalse(any(cb.startswith(("browser:start:", "browser:switch:")) or cb == "browser:stop" for cb in cb_datas))
+                self.assertIn("browser:refresh", cb_datas)
+
+                # Verify /browser start, switch, stop all include source='tg_cmd'
+                bridge.cmd_browser(111, "start default https://example.com", from_user={"id": 111})
+                bridge.cmd_browser(111, "switch default", from_user={"id": 111})
+                bridge.cmd_browser(111, "stop", from_user={"id": 111})
+                self.assertEqual(3, len(post_calls))
+                for url, payload in post_calls:
+                    self.assertEqual("tg_cmd", payload.get("source"), f"Missing source='tg_cmd' on {url}")
+                    self.assertEqual("main", payload.get("bot"))
+                    self.assertEqual(111, payload.get("user_id"))
 
 
 if __name__ == "__main__":

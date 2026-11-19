@@ -236,7 +236,9 @@ class SyncLiveBridge:
         self.enabled = self.client.is_alive() and bool(self.client.token)
         self.active_idx = 0
         self._in_checkpoint = False
-        self._held_buttons: set[str] = set()
+        self._held_buttons: dict[str, Any] = {}
+        self._pinned_verified: bool = False
+        self._profile_dir: Path | None = Path(profile_dir) if profile_dir is not None else None
         self._sync_lease_id: str | None = None
         self._sync_session_gen: int | None = None
         self._x11_display: str | None = self._resolve_display()
@@ -264,6 +266,7 @@ class SyncLiveBridge:
                 if isinstance(start_data, dict):
                     self._sync_lease_id = start_data.get("sync_lease_id")
                     self._sync_session_gen = start_data.get("session_gen")
+                    self._pinned_verified = bool(start_data.get("pinned_verified"))
             except Exception:
                 self.enabled = False
 
@@ -516,19 +519,73 @@ class SyncLiveBridge:
                 self._release_held_buttons_sync()
             self._in_checkpoint = False
 
+    @staticmethod
+    def _is_raw_page_closed(page: Any) -> bool:
+        fn = getattr(page, "is_closed", None)
+        if callable(fn):
+            try:
+                return bool(fn())
+            except Exception:
+                return False
+        return bool(fn) if fn is not None else False
+
+    def _is_sync_google_nav_blocked(self, url: str) -> bool:
+        """Enforce non-pinned Google domain navigation block matching hosted policy."""
+        if getattr(self, "_pinned_verified", False):
+            return False
+        try:
+            script_dir = str(Path(__file__).resolve().parent)
+            if script_dir not in sys.path:
+                sys.path.insert(0, script_dir)
+            import live_browser_server as _srv  # type: ignore[import-not-found]
+
+            try:
+                _srv.enforce_google_profile_policy(
+                    url,
+                    is_pinned=False,
+                    profile_dir=getattr(self, "_profile_dir", None),
+                )
+                return False
+            except ValueError:
+                return True
+        except Exception:
+            # Fail-closed regex fallback matching live_browser_server._GOOGLE_HOST_RE
+            import re as _re
+
+            host = (urllib.parse.urlparse(url).hostname or "").lower()
+            is_g = bool(
+                _re.match(
+                    r"^(?:[a-z0-9-]+\.)*(?:"
+                    r"google\.[a-z]{2,3}(?:\.[a-z]{2})?|"
+                    r"gmail\.com|googlemail\.com|"
+                    r"youtube\.com|youtu\.be|"
+                    r"googleapis\.com|googleusercontent\.com|gstatic\.com|googlevideo\.com|withgoogle\.com|"
+                    r"g\.co|goo\.gl"
+                    r")$",
+                    host,
+                )
+            )
+            return is_g and (os.environ.get("AGY_LIVE_BROWSER_REQUIRE_PINNED", "").strip() == "1")
+
     def _release_held_buttons_sync(self) -> None:
         held = getattr(self, "_held_buttons", None)
         if not held:
             return
-        page = self._active_raw_page()
-        buttons = list(held)
-        held.clear()
-        if page is not None:
-            for btn in buttons:
-                try:
-                    page.mouse.up(button=btn)
-                except Exception:
-                    pass
+        if isinstance(held, dict):
+            entries = list(held.items())
+            held.clear()
+        else:
+            fallback_page = self._active_raw_page()
+            entries = [(btn, fallback_page) for btn in list(held)]
+            held.clear()
+        for btn, orig_page in entries:
+            target_page = orig_page if orig_page is not None else self._active_raw_page()
+            if target_page is None or self._is_raw_page_closed(target_page):
+                continue
+            try:
+                target_page.mouse.up(button=btn)
+            except Exception:
+                pass
 
     def _exec_human_sync(self, cmd: dict[str, Any]) -> tuple[float, float, str] | None:
         page = self._active_raw_page()
@@ -536,7 +593,7 @@ class SyncLiveBridge:
             return None
         held = getattr(self, "_held_buttons", None)
         if held is None:
-            held = set()
+            held = {}
             self._held_buttons = held
         act = cmd.get("action")
         cursor_out: tuple[float, float, str] | None = None
@@ -552,7 +609,10 @@ class SyncLiveBridge:
                     btn = "left"
                 cursor_out = (x, y, "human")
                 page.mouse.move(x, y)
-                held.add(btn)
+                if isinstance(held, dict):
+                    held[btn] = page
+                else:
+                    held.add(btn)
                 page.mouse.down(button=btn)
             elif act == "mouseup":
                 x, y = float(cmd.get("x", 0)), float(cmd.get("y", 0))
@@ -560,9 +620,15 @@ class SyncLiveBridge:
                 if btn not in ("left", "right", "middle"):
                     btn = "left"
                 cursor_out = (x, y, "human")
-                page.mouse.move(x, y)
-                held.discard(btn)
-                page.mouse.up(button=btn)
+                orig_page = held.pop(btn, None) if isinstance(held, dict) else None
+                if not isinstance(held, dict):
+                    held.discard(btn)
+                if orig_page is not None and orig_page is not page and not self._is_raw_page_closed(orig_page):
+                    # Tab switched while button was held: release precisely on the original pressed page!
+                    orig_page.mouse.up(button=btn)
+                else:
+                    page.mouse.move(x, y)
+                    page.mouse.up(button=btn)
             elif act == "rightclick":
                 x, y = float(cmd.get("x", 0)), float(cmd.get("y", 0))
                 cursor_out = (x, y, "human")
@@ -607,7 +673,7 @@ class SyncLiveBridge:
                 page.keyboard.press("Backspace")
             elif act == "goto":
                 u = str(cmd.get("url", "")).strip()
-                if u:
+                if u and not self._is_sync_google_nav_blocked(u):
                     page.goto(u, wait_until="domcontentloaded", timeout=45000)
             elif act == "back":
                 page.go_back(wait_until="domcontentloaded", timeout=15000)
@@ -623,7 +689,7 @@ class SyncLiveBridge:
             elif act == "new_tab":
                 np = self.raw_ctx.new_page()
                 self.active_idx = list(self.raw_ctx.pages).index(np)
-                np.goto("https://www.google.com", wait_until="domcontentloaded", timeout=30000)
+                np.goto("about:blank", wait_until="domcontentloaded", timeout=30000)
             elif act == "close_tab":
                 idx = int(cmd.get("index", -1))
                 if len(self.raw_ctx.pages) > 1 and 0 <= idx < len(self.raw_ctx.pages):
@@ -631,12 +697,20 @@ class SyncLiveBridge:
                     self.active_idx = max(0, min(self.active_idx, len(self.raw_ctx.pages) - 1))
             elif act == "extract":
                 mode = str(cmd.get("mode") or "point")
+                req_id = cmd.get("req_id")
+
+                def _emit_extract(payload_dict: dict[str, Any]) -> None:
+                    out_p = dict(payload_dict)
+                    if req_id:
+                        out_p["req_id"] = str(req_id)
+                    self._push_clip(out_p)
+
                 if mode == "page":
                     txt = page.evaluate("() => (document.body && document.body.innerText || '').trim().slice(0, 25000)")
                     if txt:
-                        self._push_clip({"text": txt, "source": "整页可见文字"})
+                        _emit_extract({"text": txt, "source": "整页可见文字"})
                 elif mode == "url":
-                    self._push_clip({"text": page.url, "href": page.url, "source": "当前网页网址"})
+                    _emit_extract({"text": page.url, "href": page.url, "source": "当前网页网址"})
                 elif mode == "selection":
                     sel_txt = page.evaluate(
                         """() => {
@@ -655,7 +729,7 @@ class SyncLiveBridge:
                         }"""
                     )
                     if sel_txt:
-                        self._push_clip(
+                        _emit_extract(
                             {
                                 "text": sel_txt,
                                 "href": page.url,
@@ -724,9 +798,9 @@ class SyncLiveBridge:
                         prev_body: dict[str, Any] = {"preview": True, "text": cleaned_rt}
                         if "extract_gen" in cmd:
                             prev_body["extract_gen"] = cmd["extract_gen"]
-                        self._push_clip(prev_body)
+                        _emit_extract(prev_body)
                     elif cleaned_rt:
-                        self._push_clip(
+                        _emit_extract(
                             {
                                 "text": cleaned_rt,
                                 "source": f"涂抹选定 ({len(cleaned_rt)}字)",
@@ -736,7 +810,7 @@ class SyncLiveBridge:
                     x, y = float(cmd.get("x", 0)), float(cmd.get("y", 0))
                     ext = page.evaluate(
                         """({x, y}) => {
-                            const el = document.elementFromPoint(x, y);
+                            let el = document.elementFromPoint(x, y);
                             if (!el) return null;
                             const tag = (el.tagName || '').toUpperCase();
                             if (tag === 'INPUT' || tag === 'TEXTAREA') {
@@ -745,16 +819,71 @@ class SyncLiveBridge:
                                 const nm = ((el.name || '') + ' ' + (el.id || '')).toLowerCase();
                                 const isSensitive = tp === 'password' || ac.includes('password') || ac.includes('cc-') || ac.includes('one-time-code') || /\\b(otp|cvv|cvc|passcode|pin|card[-_]?num)\\b/.test(nm);
                                 const val = isSensitive ? '' : String(el.value || el.placeholder || '').trim();
-                                return val ? { text: val.slice(0, 20000), href: '', source: '输入框内容' } : null;
+                                return val ? { text: val.slice(0, 20000), blockText: '', href: '', source: '输入框内容' } : null;
                             }
-                            const link = el.closest('a[href]');
-                            const txt = (el.innerText || el.textContent || '').trim();
-                            return txt ? { text: txt.slice(0, 20000), href: link ? link.href : '', source: '点字提取' } : null;
+                            const linkEl = el.closest('a[href]');
+                            const href = linkEl ? String(linkEl.href || '') : '';
+                            const codeEl = el.closest('code, pre, samp, kbd');
+                            if (codeEl && (codeEl.innerText || '').trim()) {
+                                return {
+                                    text: codeEl.innerText.trim().slice(0, 20000),
+                                    blockText: '',
+                                    href: href.slice(0, 4000),
+                                    source: `<${codeEl.tagName.toLowerCase()}> 代码块`
+                                };
+                            }
+                            // Container-margin guard (parity with hosted extract_content_async): avoid grabbing huge wrapper containers!
+                            if (el.children && el.children.length > 0 && ((el.innerText || '').trim().length > 220)) {
+                                const candidates = el.querySelectorAll('p, li, td, th, h1, h2, h3, h4, h5, h6, blockquote, code, pre, a, span');
+                                let nearest = null;
+                                let bestDist = 999999;
+                                for (const c of candidates) {
+                                    const ct = (c.innerText || '').trim();
+                                    if (!ct || ct.length > 1500) continue;
+                                    const rect = c.getBoundingClientRect();
+                                    if (!rect.width || !rect.height) continue;
+                                    const dx = x < rect.left ? (rect.left - x) : (x > rect.right ? x - rect.right : 0);
+                                    const dy = y < rect.top ? (rect.top - y) : (y > rect.bottom ? y - rect.bottom : 0);
+                                    const d = Math.hypot(dx, dy);
+                                    if (d < bestDist && d <= 60) {
+                                        bestDist = d;
+                                        nearest = c;
+                                    }
+                                }
+                                if (nearest) el = nearest;
+                            }
+                            let cur = el;
+                            let targetNode = el;
+                            let bestText = '';
+                            let bestTag = (el.tagName || '').toLowerCase();
+                            while (cur && cur !== document.body && cur !== document.documentElement) {
+                                const t = (cur.innerText || cur.textContent || '').trim();
+                                if (t) {
+                                    bestText = t;
+                                    targetNode = cur;
+                                    bestTag = (cur.tagName || '').toLowerCase();
+                                    if (t.length >= 2) break;
+                                }
+                                cur = cur.parentElement;
+                            }
+                            if (!bestText || bestText.length > 4000) return null;
+                            let blockText = '';
+                            const blockEl = targetNode.closest('p, li, td, th, blockquote, h1, h2, h3, h4');
+                            if (blockEl && blockEl !== targetNode) {
+                                const bt = (blockEl.innerText || '').trim();
+                                if (bt && bt !== bestText && bt.length <= 4000) blockText = bt;
+                            }
+                            return {
+                                text: bestText.slice(0, 20000),
+                                blockText: blockText.slice(0, 20000),
+                                href: href.slice(0, 4000),
+                                source: `点选段落 <${bestTag}>`
+                            };
                         }""",
                         {"x": x, "y": y},
                     )
                     if ext:
-                        self._push_clip(ext)
+                        _emit_extract(ext)
         except Exception:
             pass
         return cursor_out
