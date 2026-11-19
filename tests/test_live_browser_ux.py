@@ -5796,6 +5796,421 @@ class TestRound6FinalClosureRegression(unittest.TestCase):
 
             asyncio.run(_scenario())
 
+    def test_round10_live_rbac_recheck_before_every_retire_and_orphan_request(self) -> None:
+        """Round 10 Final Fix: Re-verify live RBAC inside lock right before EVERY outbound retire/orphan TG request; drop all active & pending cards immediately on revocation with zero new requests."""
+        tok_main = "991122:TEST_ROUND10_RBAC_TOKEN"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bdir = root / "bridge"
+            bdir.mkdir()
+            env_path = bdir / ".env"
+
+            def _set_role(role: str) -> None:
+                if role == "admin":
+                    env_path.write_text(
+                        f"AGY_TG_BOT_TOKEN={tok_main}\n"
+                        f"AGY_TG_ALLOWED_CHATS=111\n"
+                        f"AGY_TG_ADMIN_USERS=111\n",
+                        encoding="utf-8",
+                    )
+                elif role == "readonly":
+                    env_path.write_text(
+                        f"AGY_TG_BOT_TOKEN={tok_main}\n"
+                        f"AGY_TG_ALLOWED_CHATS=111\n"
+                        f"AGY_TG_READONLY_USERS=111\n"
+                        f"AGY_TG_USER_ROLES=111:readonly\n",
+                        encoding="utf-8",
+                    )
+                else:
+                    raise ValueError(role)
+
+            _set_role("admin")
+            cfg_dir = root / "cfg"
+            cfg_dir.mkdir()
+            prof_dir = root / "profs"
+            prof_dir.mkdir()
+
+            class _HostedPage(_FakePage):
+                def __init__(self, url: str, title: str, jpeg_bytes: bytes) -> None:
+                    super().__init__(url, title)
+                    self._jpeg = jpeg_bytes
+                    self.closed = False
+                    self.goto = mock.AsyncMock()  # type: ignore[method-assign]
+
+                def on(self, _ev: str, _cb) -> None:
+                    pass
+
+                def is_closed(self) -> bool:
+                    return self.closed
+
+                async def screenshot(self, **_kw):
+                    return self._jpeg
+
+                async def close(self) -> None:
+                    self.closed = True
+
+            class _HostedCtx:
+                def __init__(self, page: _HostedPage) -> None:
+                    self.pages = [page]
+
+                def on(self, _ev: str, _cb) -> None:
+                    pass
+
+                async def route(self, _pat: str, _cb) -> None:
+                    pass
+
+            class _CM:
+                def __init__(self, **_kw) -> None:
+                    self.page = _HostedPage(
+                        "https://example.com/r10",
+                        "Round 10 Hosted",
+                        b"JPEG_R10_FRAME",
+                    )
+                    self.ctx = _HostedCtx(self.page)
+
+                async def __aenter__(self):
+                    return self.ctx
+
+                async def __aexit__(self, *_a):
+                    return False
+
+            class _GatedTGHTTP:
+                """Mock aiohttp session supporting deterministic mid-flight gates per endpoint/call."""
+
+                def __init__(
+                    self,
+                    outcomes: dict[str, list[object]],
+                    gates: dict[tuple[str, int], tuple[asyncio.Event, asyncio.Event]] | None = None,
+                ) -> None:
+                    self._outcomes = {k: list(v) for k, v in outcomes.items()}
+                    self._gates = gates or {}
+                    self._ep_counts: dict[str, int] = {}
+                    self.calls: list[tuple[str, dict]] = []
+
+                def post(self, url: str, data=None, json=None):
+                    endpoint = url.rsplit("/", 1)[-1]
+                    idx = self._ep_counts.get(endpoint, 0) + 1
+                    self._ep_counts[endpoint] = idx
+                    rec = {
+                        "endpoint": endpoint,
+                        "fields": dict(getattr(data, "fields", {})) if data is not None else None,
+                        "json": dict(json) if isinstance(json, dict) else json,
+                    }
+                    self.calls.append((endpoint, rec))
+                    queue = self._outcomes.get(endpoint)
+                    outcome = queue.pop(0) if queue else {"ok": True}
+                    gate = self._gates.get((endpoint, idx))
+
+                    class _Resp:
+                        status = outcome.get("http_status", 200) if isinstance(outcome, dict) else 200
+
+                        async def __aenter__(self_r):
+                            if gate is not None:
+                                entered, release = gate
+                                entered.set()
+                                await release.wait()
+                            if isinstance(outcome, Exception):
+                                raise outcome
+                            return self_r
+
+                        async def __aexit__(self_r, *_a):
+                            return False
+
+                        async def json(self_r):
+                            assert isinstance(outcome, dict)
+                            return outcome
+
+                    return _Resp()
+
+            async def _scenario() -> None:
+                with (
+                    mock.patch.object(srv, "_BRIDGE_DIR", bdir),
+                    mock.patch.object(srv, "BRIDGE_ENV_FILES", {"main": env_path}),
+                    mock.patch.object(srv, "CONFIG_DIR", cfg_dir),
+                    mock.patch.object(srv, "PROFILES_FILE", cfg_dir / "profiles.json"),
+                    mock.patch.object(srv, "PROFILES_DATA_DIR", prof_dir),
+                    mock.patch.object(srv, "discover_pinned_host_profile", return_value=None),
+                    mock.patch.object(srv, "resolve_camoufox_display", return_value=None),
+                    mock.patch.object(srv, "read_x11_clipboard_async", new=mock.AsyncMock(return_value="")),
+                    mock.patch.object(srv, "FormData", _FakeFormData),
+                    mock.patch.dict(
+                        sys.modules,
+                        {
+                            "camoufox": types.SimpleNamespace(),
+                            "camoufox.async_api": types.SimpleNamespace(AsyncCamoufox=_CM),
+                        },
+                    ),
+                ):
+                    srv.create_profile("r10-prof", {"os": "linux", "persistent": False})
+
+                    # ------------------------------------------------------------------
+                    # Case 1 (Round 9 Blocker exact repro): Batch retire mid-flight downgrade
+                    # Same gen publishes 701, then force_new publishes 702 (701 in pending, 702 active).
+                    # Real stop_hosted() suspends on editMessageMedia(701); downgrade 111 admin -> readonly
+                    # while 701 is in flight; release 701 with 503 -> MUST NEVER send 702 AND MUST drop
+                    # all active + pending cards for ("main", 111) immediately!
+                    # ------------------------------------------------------------------
+                    _set_role("admin")
+                    g1_entered, g1_release = asyncio.Event(), asyncio.Event()
+                    http1 = _GatedTGHTTP(
+                        outcomes={
+                            "sendPhoto": [
+                                {"ok": True, "result": {"message_id": 701}},
+                                {"ok": True, "result": {"message_id": 702}},
+                            ],
+                            "editMessageMedia": [
+                                {"http_status": 503, "ok": False, "description": "Service Unavailable"},
+                                {"ok": True, "result": {"message_id": 702}},
+                            ],
+                        },
+                        gates={("editMessageMedia", 1): (g1_entered, g1_release)},
+                    )
+                    hub1 = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "sec-tok")
+                    hub1.tg.http = http1
+                    await hub1.start_hosted(
+                        profile="r10-prof",
+                        notify_tg=False,
+                        actor=("main", 111),
+                        source="tg_cmd",
+                    )
+                    hub1.latest_jpeg = b"GEN1_FRAME_R10"
+                    c701 = await hub1.tg.ensure_card("main", preferred_user_id=111)
+                    c702 = await hub1.tg.ensure_card("main", force_new=True, preferred_user_id=111)
+                    self.assertIsNotNone(c701)
+                    self.assertIsNotNone(c702)
+                    self.assertIn(("main", 111, 701), hub1.tg.pending_retire_cards)
+                    self.assertEqual(702, hub1.tg.cards[("main", 111)]["message_id"])
+
+                    stop_task = asyncio.create_task(hub1.stop_hosted(notify_finished=True))
+                    await asyncio.wait_for(g1_entered.wait(), timeout=2.0)
+
+                    # Downgrade user from admin -> readonly while 701 is in flight
+                    _set_role("readonly")
+                    self.assertEqual("readonly", srv.load_bot_credentials_with_rbac()[4]["main"][111])
+                    g1_release.set()
+                    await asyncio.wait_for(stop_task, timeout=2.0)
+
+                    media_calls1 = [c for c in http1.calls if c[0] == "editMessageMedia"]
+                    cap_calls1 = [c for c in http1.calls if c[0] == "editMessageCaption"]
+                    self.assertEqual(
+                        ["701"],
+                        [c[1]["fields"]["message_id"] for c in media_calls1],
+                        "MUST NOT initiate editMessageMedia(702) after mid-flight RBAC downgrade!",
+                    )
+                    self.assertEqual([], cap_calls1, "MUST NOT initiate editMessageCaption(702) after downgrade!")
+                    self.assertNotIn(("main", 111), hub1.tg.cards)
+                    self.assertEqual(
+                        [],
+                        [k for k in hub1.tg.pending_retire_cards if k[0] == "main" and k[1] == 111],
+                        "All pending_retire_cards for revoked (main, 111) MUST be cleared immediately",
+                    )
+
+                    # Bonus sub-check: direct _update_card_locked(..., finished=True) and retire_cards(session_gen=old)
+                    # while revoked MUST also send ZERO requests and clear BOTH active & pending cards for (main, 111).
+                    hub1.tg.cards[("main", 111)] = {
+                        "bot_key": "main",
+                        "chat_id": 111,
+                        "message_id": 790,
+                        "session_gen": 99,
+                        "owner": ("main", 111),
+                        "last_sha1": "s",
+                        "last_caption": "c",
+                        "last_markup": "m",
+                        "last_ts": 0.0,
+                    }
+                    hub1.tg.pending_retire_cards[("main", 111, 789)] = {
+                        "bot_key": "main",
+                        "chat_id": 111,
+                        "message_id": 789,
+                        "session_gen": 98,
+                        "owner": ("main", 111),
+                    }
+                    calls_before = len(http1.calls)
+                    async with hub1.tg._lock:
+                        ok_fin = await hub1.tg._update_card_locked(
+                            ("main", 111),
+                            tok_main,
+                            finished=True,
+                            force=True,
+                            allow_stale_gen=True,
+                            jpeg_override=b"STALE_JPEG",
+                            card_override=hub1.tg.pending_retire_cards[("main", 111, 789)],
+                        )
+                    self.assertFalse(ok_fin)
+                    self.assertEqual(calls_before, len(http1.calls), "_update_card_locked(finished=True) MUST re-check live RBAC")
+                    self.assertNotIn(("main", 111), hub1.tg.cards)
+                    self.assertEqual({}, hub1.tg.pending_retire_cards)
+
+                    # Also check retire_cards(session_gen=old) when already revoked clears newer-gen active card too
+                    hub1.tg.cards[("main", 111)] = {
+                        "bot_key": "main",
+                        "chat_id": 111,
+                        "message_id": 792,
+                        "session_gen": 100,
+                        "owner": ("main", 111),
+                    }
+                    hub1.tg.pending_retire_cards[("main", 111, 791)] = {
+                        "bot_key": "main",
+                        "chat_id": 111,
+                        "message_id": 791,
+                        "session_gen": 99,
+                        "owner": ("main", 111),
+                    }
+                    await hub1.tg.retire_cards(session_gen=99, mark_finished=True)
+                    self.assertEqual(calls_before, len(http1.calls))
+                    self.assertNotIn(("main", 111), hub1.tg.cards)
+                    self.assertEqual({}, hub1.tg.pending_retire_cards)
+
+                    # ------------------------------------------------------------------
+                    # Case 2: tick_updates() with multiple pending_retire_cards (701, 702)
+                    # Suspend editMessageCaption(701), downgrade admin -> readonly, release 503 ->
+                    # MUST NOT send 702 and MUST clear all active + pending cards immediately!
+                    # ------------------------------------------------------------------
+                    _set_role("admin")
+                    g2_entered, g2_release = asyncio.Event(), asyncio.Event()
+                    http2 = _GatedTGHTTP(
+                        outcomes={
+                            "editMessageCaption": [
+                                {"http_status": 503, "ok": False, "description": "Service Unavailable"},
+                                {"ok": True, "result": {"message_id": 702}},
+                            ],
+                        },
+                        gates={("editMessageCaption", 1): (g2_entered, g2_release)},
+                    )
+                    hub2 = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "sec-tok")
+                    hub2.tg.http = http2
+                    hub2.engine_mode = "idle"
+                    hub2.tg.pending_retire_cards[("main", 111, 701)] = {
+                        "bot_key": "main",
+                        "chat_id": 111,
+                        "message_id": 701,
+                        "session_gen": 1,
+                        "owner": ("main", 111),
+                    }
+                    hub2.tg.pending_retire_cards[("main", 111, 702)] = {
+                        "bot_key": "main",
+                        "chat_id": 111,
+                        "message_id": 702,
+                        "session_gen": 1,
+                        "owner": ("main", 111),
+                    }
+
+                    tick_task = asyncio.create_task(hub2.tg.tick_updates(force=False))
+                    await asyncio.wait_for(g2_entered.wait(), timeout=2.0)
+
+                    _set_role("readonly")
+                    g2_release.set()
+                    await asyncio.wait_for(tick_task, timeout=2.0)
+
+                    cap_calls2 = [c for c in http2.calls if c[0] == "editMessageCaption"]
+                    self.assertEqual(
+                        [701],
+                        [c[1]["json"]["message_id"] for c in cap_calls2],
+                        "tick_updates() MUST NOT initiate editMessageCaption(702) after mid-flight downgrade!",
+                    )
+                    self.assertEqual({}, hub2.tg.cards)
+                    self.assertEqual({}, hub2.tg.pending_retire_cards)
+
+                    # ------------------------------------------------------------------
+                    # Case 3: ensure_card() sendPhoto in-flight downgrade -> ZERO orphan editMessageCaption!
+                    # Suspend sendPhoto, downgrade admin -> readonly, release sendPhoto returning 709 ->
+                    # MUST send ZERO editMessageCaption(709), register NO active/pending card, and drop prior records!
+                    # ------------------------------------------------------------------
+                    _set_role("admin")
+                    g3_entered, g3_release = asyncio.Event(), asyncio.Event()
+                    http3 = _GatedTGHTTP(
+                        outcomes={
+                            "sendPhoto": [{"ok": True, "result": {"message_id": 709}}],
+                            "editMessageCaption": [{"ok": True, "result": {"message_id": 709}}],
+                        },
+                        gates={("sendPhoto", 1): (g3_entered, g3_release)},
+                    )
+                    hub3 = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "sec-tok")
+                    hub3.tg.http = http3
+                    await hub3.start_hosted(
+                        profile="r10-prof",
+                        notify_tg=False,
+                        actor=("main", 111),
+                        source="tg_cmd",
+                    )
+                    hub3.latest_jpeg = b"GEN1_FRAME_709"
+                    # Pre-existing pending record for same (main, 111) should also be dropped on revocation
+                    hub3.tg.pending_retire_cards[("main", 111, 700)] = {
+                        "bot_key": "main",
+                        "chat_id": 111,
+                        "message_id": 700,
+                        "session_gen": 0,
+                        "owner": ("main", 111),
+                    }
+
+                    send_task = asyncio.create_task(hub3.tg.ensure_card("main", preferred_user_id=111))
+                    await asyncio.wait_for(g3_entered.wait(), timeout=2.0)
+
+                    _set_role("readonly")
+                    g3_release.set()
+                    res_card = await asyncio.wait_for(send_task, timeout=2.0)
+                    self.assertIsNone(res_card)
+                    self.assertEqual(
+                        ["sendPhoto"],
+                        [c[0] for c in http3.calls],
+                        "Revoked in-flight sendPhoto MUST NOT follow up with orphan editMessageCaption(709)!",
+                    )
+                    self.assertNotIn(("main", 111), hub3.tg.cards)
+                    self.assertEqual({}, hub3.tg.pending_retire_cards)
+                    await hub3.stop_hosted(notify_finished=False)
+
+                    # ------------------------------------------------------------------
+                    # Case 4: Authorized control (admin unchanged)
+                    # force_new dual-card stop retries both 701 & 702 cleanly and enforces shared 3-attempt cap per card.
+                    # ------------------------------------------------------------------
+                    _set_role("admin")
+                    http4 = _GatedTGHTTP(
+                        outcomes={
+                            "sendPhoto": [
+                                {"ok": True, "result": {"message_id": 701}},
+                                {"ok": True, "result": {"message_id": 702}},
+                            ],
+                            "editMessageMedia": [
+                                {"http_status": 503, "ok": False, "description": "Service Unavailable"},
+                                {"http_status": 429, "ok": False, "description": "Too Many Requests"},
+                            ],
+                            "editMessageCaption": [
+                                {"http_status": 503, "ok": False, "description": "Service Unavailable"},
+                                {"ok": True, "result": {"message_id": 702}},
+                                {"http_status": 503, "ok": False, "description": "Service Unavailable"},
+                            ],
+                        },
+                    )
+                    hub4 = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "sec-tok")
+                    hub4.tg.http = http4
+                    await hub4.start_hosted(
+                        profile="r10-prof",
+                        notify_tg=False,
+                        actor=("main", 111),
+                        source="tg_cmd",
+                    )
+                    hub4.latest_jpeg = b"GEN1_AUTH_OK"
+                    await hub4.tg.ensure_card("main", preferred_user_id=111)
+                    await hub4.tg.ensure_card("main", force_new=True, preferred_user_id=111)
+
+                    await hub4.stop_hosted(notify_finished=True)
+                    media_mids4 = [c[1]["fields"]["message_id"] for c in http4.calls if c[0] == "editMessageMedia"]
+                    self.assertEqual(["701", "702"], media_mids4, "Authorized admin stop MUST attempt both 701 & 702")
+                    self.assertEqual(1, hub4.tg.pending_retire_cards[("main", 111, 701)].get("retire_attempts"))
+                    self.assertEqual(1, hub4.tg.pending_retire_cards[("main", 111, 702)].get("retire_attempts"))
+
+                    # Tick 2: 701 gets 503 (attempt 2 -> retained), 702 gets 200 ok (retired & popped)
+                    await hub4.tg.tick_updates(force=False)
+                    self.assertEqual(2, hub4.tg.pending_retire_cards[("main", 111, 701)].get("retire_attempts"))
+                    self.assertNotIn(("main", 111, 702), hub4.tg.pending_retire_cards)
+
+                    # Tick 3: 701 gets 503 (attempt 3 -> hits shared cap of 3 and is popped)
+                    await hub4.tg.tick_updates(force=False)
+                    self.assertNotIn(("main", 111, 701), hub4.tg.pending_retire_cards)
+                    self.assertEqual({}, hub4.tg.pending_retire_cards)
+
+            asyncio.run(_scenario())
+
 
 if __name__ == "__main__":
     unittest.main()
