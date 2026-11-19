@@ -228,6 +228,7 @@ class SyncLiveBridge:
         self.enabled = self.client.is_alive() and bool(self.client.token)
         self.active_idx = 0
         self._in_checkpoint = False
+        self._held_buttons: set[str] = set()
         self._x11_display: str | None = self._resolve_display()
         self._last_clip: str = self._read_x11_clip()
         if self.enabled:
@@ -374,9 +375,18 @@ class SyncLiveBridge:
                 if cur_clip and cur_clip != self._last_clip:
                     self._last_clip = cur_clip
                     self._push_clip({"text": cur_clip, "source": "网页复制按钮 / Ctrl+C"})
-                for cmd in data.get("commands") or []:
+                is_takeover = bool(data.get("takeover"))
+                cmds = data.get("commands") or []
+                for cmd in cmds:
+                    act = cmd.get("action")
+                    # Strictly honor takeover barrier: once takeover is released, only run
+                    # cleanup `mouseup` or read-only `extract`; discard stale mutating commands.
+                    if not is_takeover and act not in ("mouseup", "extract"):
+                        continue
                     cursor = self._exec_human_sync(cmd)
-                if not allow_takeover_loop or not data.get("takeover"):
+                if not is_takeover:
+                    self._release_held_buttons_sync()
+                if not allow_takeover_loop or not is_takeover:
                     break
                 ai_status = "人工接管中（脚本已挂起等待）"
                 time.sleep(0.09)
@@ -385,10 +395,28 @@ class SyncLiveBridge:
         finally:
             self._in_checkpoint = False
 
+    def _release_held_buttons_sync(self) -> None:
+        held = getattr(self, "_held_buttons", None)
+        if not held:
+            return
+        page = self._active_raw_page()
+        buttons = list(held)
+        held.clear()
+        if page is not None:
+            for btn in buttons:
+                try:
+                    page.mouse.up(button=btn)
+                except Exception:
+                    pass
+
     def _exec_human_sync(self, cmd: dict[str, Any]) -> tuple[float, float, str] | None:
         page = self._active_raw_page()
         if not page:
             return None
+        held = getattr(self, "_held_buttons", None)
+        if held is None:
+            held = set()
+            self._held_buttons = held
         act = cmd.get("action")
         cursor_out: tuple[float, float, str] | None = None
         try:
@@ -403,6 +431,7 @@ class SyncLiveBridge:
                     btn = "left"
                 cursor_out = (x, y, "human")
                 page.mouse.move(x, y)
+                held.add(btn)
                 page.mouse.down(button=btn)
             elif act == "mouseup":
                 x, y = float(cmd.get("x", 0)), float(cmd.get("y", 0))
@@ -411,6 +440,7 @@ class SyncLiveBridge:
                     btn = "left"
                 cursor_out = (x, y, "human")
                 page.mouse.move(x, y)
+                held.discard(btn)
                 page.mouse.up(button=btn)
             elif act == "rightclick":
                 x, y = float(cmd.get("x", 0)), float(cmd.get("y", 0))

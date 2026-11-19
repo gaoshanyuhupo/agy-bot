@@ -346,11 +346,11 @@
     }
     #idle-card.hidden { display: none; }
 
-    /* Sharp Precision Small Arrow Cursor (Tip strictly anchored at 0,0) */
-    #remote-cursor {
+    /* Sharp Precision Small Arrow Cursors (Tip strictly anchored at 0,0; Human & AI separated) */
+    #remote-cursor, #ai-cursor {
       position: absolute;
       left: 0; top: 0;
-      width: 17px; height: 21px;
+      width: 18px; height: 22px;
       pointer-events: none;
       z-index: 28;
       transform-origin: 0 0;
@@ -358,14 +358,15 @@
       filter: drop-shadow(0 1px 1.6px rgba(0, 0, 0, 0.72));
       will-change: left, top, transform, opacity;
     }
-    #remote-cursor svg {
+    #ai-cursor { z-index: 27; }
+    #remote-cursor svg, #ai-cursor svg {
       display: block;
       overflow: visible;
     }
     #remote-cursor.human .cursor-body { fill: #ffffff; stroke: #0d1117; }
-    #remote-cursor.ai .cursor-body { fill: #58a6ff; stroke: #0d1117; }
     #remote-cursor.drag .cursor-body { fill: #f2cc60; stroke: #0d1117; }
-    #remote-cursor.faded { opacity: 0.28; }
+    #ai-cursor .cursor-body { fill: #58a6ff; stroke: #0d1117; }
+    #remote-cursor.faded, #ai-cursor.faded { opacity: 0.28; }
 
     /* Delicate Precision Click Ring at Arrow Tip (Replaces old blobby ripple) */
     .click-ring {
@@ -656,11 +657,17 @@
     <div id="stage">
       <div id="canvas-wrap">
         <canvas id="screen" width="1280" height="800"></canvas>
-        <!-- Sharp Precision Small Arrow Cursor (Tip strictly at 0,0) -->
+        <!-- Sharp Precision Small Arrow Cursors (Geometric tip strictly at 0,0; Human & AI separated) -->
         <div id="remote-cursor" class="hidden human" aria-hidden="true">
-          <svg width="17" height="21" viewBox="0 0 17 21" fill="none" xmlns="http://www.w3.org/2000/svg">
-            <path d="M0.6 0.6L0.6 15.8L4.7 12.1L7.6 18.6L9.9 17.5L7.0 11.0L12.6 11.0L0.6 0.6Z"
-                  class="cursor-body" stroke-width="1.35" stroke-linejoin="round" />
+          <svg width="18" height="22" viewBox="0 0 18 22" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <path d="M0 0L0 15.6L4.2 11.8L7.2 18.4L9.5 17.3L6.5 10.7L12.2 10.7L0 0Z"
+                  class="cursor-body" stroke-width="1.35" stroke-linejoin="miter" stroke-miterlimit="3" />
+          </svg>
+        </div>
+        <div id="ai-cursor" class="hidden ai" aria-hidden="true">
+          <svg width="18" height="22" viewBox="0 0 18 22" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <path d="M0 0L0 15.6L4.2 11.8L7.2 18.4L9.5 17.3L6.5 10.7L12.2 10.7L0 0Z"
+                  class="cursor-body" stroke-width="1.35" stroke-linejoin="miter" stroke-miterlimit="3" />
           </svg>
         </div>
         <div id="drag-sel-box" class="hidden"></div>
@@ -759,6 +766,7 @@
     const stage = document.getElementById('stage');
     const canvasWrap = document.getElementById('canvas-wrap');
     const remoteCursorEl = document.getElementById('remote-cursor');
+    const aiCursorEl = document.getElementById('ai-cursor');
 
     function syncViewportHeight() {
       const vv = window.visualViewport;
@@ -777,15 +785,19 @@
     window.addEventListener('resize', syncViewportHeight);
 
     let ws = null;
+    let wsConnGen = 0;
     let authed = false;
     let authRejected = false;
+    let userRole = 'admin';
     let reconnectAttempt = 0;
     let reconnectTimer = null;
     const RECONNECT_DELAYS = [1000, 2000, 4000, 8000];
+    let pendingUrlGoto = null;
 
     let state = {
       running: false,
       engine_mode: 'idle',
+      session_gen: 0,
       profile: null,
       pinned: false,
       egress: 'direct',
@@ -807,13 +819,14 @@
     let immersiveMode = false;
     let tgFullscreenActive = false;
 
-    let frameCount = 0;
+    let renderedFrameCount = 0;
     let currentFps = 0;
     let rttMs = 0;
     let lastFpsTick = performance.now();
 
     // Latest-frame single-slot decoder (zero frame backlog on mobile)
     let pendingFrameBlob = null;
+    let pendingFrameConnGen = 0;
     let decodingFrame = false;
 
     // Zoom & Pan state
@@ -828,8 +841,14 @@
     let trackpadInitialized = false;
     let trackpadHolding = false;
     let cursorFadeTimer = null;
+    let aiCursorFadeTimer = null;
 
-    // Active P2 dialog / filechooser / download state
+    // Normalized remote coordinates for resize re-projection (separate Human & AI cursors)
+    let humanCursorState = { rx: null, ry: null, mode: 'human', visible: false };
+    let aiCursorState = { rx: null, ry: null, visible: false };
+
+    // Active P2 multi-dialog queue / filechooser / download state
+    let pendingDialogs = [];
     let activeDialogId = null;
     let activeChooserId = null;
     let latestDownload = null;
@@ -847,24 +866,45 @@
       toastTimer = setTimeout(() => el.classList.remove('show'), 2200);
     }
 
-    // ---------------- Sharp Small Arrow Cursor ----------------
+    // ---------------- Sharp Small Arrow Cursors (Human & AI Separated, Resize Re-Projected) ----------------
     function updateCursorInverseScale() {
       const inv = 1 / Math.max(1, scale);
-      remoteCursorEl.style.transform = `scale(${inv.toFixed(4)})`;
+      const tf = `scale(${inv.toFixed(4)})`;
+      remoteCursorEl.style.transform = tf;
+      if (aiCursorEl) aiCursorEl.style.transform = tf;
     }
 
-    function positionArrowCursor(remoteX, remoteY, actor = 'human', keepVisible = false) {
+    function applyCursorElementPosition(el, rx, ry) {
+      const localX = rx * (screenCanvas.clientWidth || 1);
+      const localY = ry * (screenCanvas.clientHeight || 1);
+      el.style.left = localX.toFixed(2) + 'px';
+      el.style.top = localY.toFixed(2) + 'px';
+      return { localX, localY };
+    }
+
+    function reprojectCursors() {
+      if (humanCursorState.visible && humanCursorState.rx !== null && humanCursorState.ry !== null) {
+        applyCursorElementPosition(remoteCursorEl, humanCursorState.rx, humanCursorState.ry);
+      }
+      if (aiCursorEl && aiCursorState.visible && aiCursorState.rx !== null && aiCursorState.ry !== null) {
+        applyCursorElementPosition(aiCursorEl, aiCursorState.rx, aiCursorState.ry);
+      }
+      updateCursorInverseScale();
+    }
+
+    function positionHumanCursor(remoteX, remoteY, mode = 'human', keepVisible = false) {
       const vw = Math.max(1, state.vw || 1280);
       const vh = Math.max(1, state.vh || 800);
       const clampedX = Math.max(0, Math.min(vw, remoteX));
       const clampedY = Math.max(0, Math.min(vh, remoteY));
-      const localX = (clampedX / vw) * (screenCanvas.clientWidth || 1);
-      const localY = (clampedY / vh) * (screenCanvas.clientHeight || 1);
+      const rx = clampedX / vw;
+      const ry = clampedY / vh;
+      const cls = mode === 'drag' ? 'drag' : 'human';
+      humanCursorState = { rx, ry, mode: cls, visible: true };
+      const { localX, localY } = applyCursorElementPosition(remoteCursorEl, rx, ry);
 
-      remoteCursorEl.style.left = localX.toFixed(2) + 'px';
-      remoteCursorEl.style.top = localY.toFixed(2) + 'px';
-      remoteCursorEl.classList.remove('hidden', 'faded', 'human', 'ai', 'drag');
-      remoteCursorEl.classList.add(actor === 'ai' ? 'ai' : (actor === 'drag' ? 'drag' : 'human'));
+      remoteCursorEl.classList.remove('hidden', 'faded', 'human', 'drag');
+      remoteCursorEl.classList.add(cls);
       updateCursorInverseScale();
 
       clearTimeout(cursorFadeTimer);
@@ -876,6 +916,36 @@
         }, 3500);
       }
       return { localX, localY, x: clampedX, y: clampedY };
+    }
+
+    function positionAiCursor(remoteX, remoteY) {
+      const vw = Math.max(1, state.vw || 1280);
+      const vh = Math.max(1, state.vh || 800);
+      const clampedX = Math.max(0, Math.min(vw, remoteX));
+      const clampedY = Math.max(0, Math.min(vh, remoteY));
+      const rx = clampedX / vw;
+      const ry = clampedY / vh;
+      aiCursorState = { rx, ry, visible: true };
+      const targetEl = aiCursorEl || remoteCursorEl;
+      const { localX, localY } = applyCursorElementPosition(targetEl, rx, ry);
+
+      if (aiCursorEl) {
+        aiCursorEl.classList.remove('hidden', 'faded');
+        aiCursorEl.classList.add('ai');
+        updateCursorInverseScale();
+        clearTimeout(aiCursorFadeTimer);
+        aiCursorFadeTimer = setTimeout(() => {
+          aiCursorEl.classList.add('faded');
+        }, 3500);
+      }
+      return { localX, localY, x: clampedX, y: clampedY };
+    }
+
+    function positionArrowCursor(remoteX, remoteY, actor = 'human', keepVisible = false) {
+      if (actor === 'ai') {
+        return positionAiCursor(remoteX, remoteY);
+      }
+      return positionHumanCursor(remoteX, remoteY, actor, keepVisible);
     }
 
     function spawnClickRing(localX, localY, cls = 'human') {
@@ -930,8 +1000,9 @@
       screenCanvas.style.height = dispH + 'px';
       applyTransform();
       if (gestureMode === 'trackpad' && state.running) {
-        positionArrowCursor(trackpadX, trackpadY, trackpadHolding ? 'drag' : 'human', true);
+        positionHumanCursor(trackpadX, trackpadY, trackpadHolding ? 'drag' : 'human', true);
       }
+      reprojectCursors();
     }
 
     function applyTransform() {
@@ -1033,6 +1104,9 @@
       if (gestureMode === 'trackpad' && mode !== 'trackpad') {
         releaseTrackpadHoldIfNeeded();
       }
+      if (gestureMode === 'drag' && mode !== 'drag') {
+        releaseActiveDragBeforeHandback();
+      }
       gestureMode = mode;
       document.getElementById('mode-touch-btn').classList.toggle('active', mode === 'interact');
       document.getElementById('mode-trackpad-btn').classList.toggle('active', mode === 'trackpad');
@@ -1110,8 +1184,18 @@
       ws.send(JSON.stringify({ type: 'send_hd_screenshot' }));
     }
 
-    // ---------------- P2 Native Dialogs (alert / confirm / prompt) ----------------
-    function openDialogSheet(msg) {
+    // ---------------- P2 Native Dialogs (Multi-Dialog Queue: alert / confirm / prompt) ----------------
+    function renderActiveDialog() {
+      const sheet = document.getElementById('dialog-sheet');
+      const inp = document.getElementById('dialog-prompt-input');
+      const cancelBtn = document.getElementById('dialog-cancel-btn');
+      if (!pendingDialogs.length) {
+        activeDialogId = null;
+        inp.blur();
+        sheet.classList.add('hidden');
+        return;
+      }
+      const msg = pendingDialogs[0];
       activeDialogId = msg.dialog_id;
       const typeLabels = {
         alert: '⚠️ 网页提示 (alert)',
@@ -1119,10 +1203,9 @@
         prompt: '✏️ 网页输入 (prompt)',
         beforeunload: '🚪 离开页面确认'
       };
-      document.getElementById('dialog-type-label').textContent = typeLabels[msg.dialog_type] || '💬 网页弹窗';
+      const extra = pendingDialogs.length > 1 ? ` · 队列 +${pendingDialogs.length - 1}` : '';
+      document.getElementById('dialog-type-label').textContent = (typeLabels[msg.dialog_type] || '💬 网页弹窗') + extra;
       document.getElementById('dialog-msg').textContent = msg.message || '(无内容)';
-      const inp = document.getElementById('dialog-prompt-input');
-      const cancelBtn = document.getElementById('dialog-cancel-btn');
       if (msg.dialog_type === 'prompt') {
         inp.value = msg.default_value || '';
         inp.classList.remove('hidden');
@@ -1131,21 +1214,38 @@
         inp.classList.add('hidden');
       }
       cancelBtn.classList.toggle('hidden', msg.dialog_type === 'alert');
-      document.getElementById('dialog-sheet').classList.remove('hidden');
+      sheet.classList.remove('hidden');
+    }
+
+    function openDialogSheet(msg) {
+      if (!msg || !msg.dialog_id) return;
+      if (!pendingDialogs.some((d) => d.dialog_id === msg.dialog_id)) {
+        pendingDialogs.push(msg);
+      }
+      renderActiveDialog();
       haptic('medium');
     }
 
+    function removeDialogById(dialogId) {
+      if (!dialogId) {
+        pendingDialogs = [];
+      } else {
+        pendingDialogs = pendingDialogs.filter((d) => d.dialog_id !== dialogId);
+      }
+      renderActiveDialog();
+    }
+
     function closeDialogSheet() {
-      activeDialogId = null;
-      document.getElementById('dialog-prompt-input').blur();
-      document.getElementById('dialog-sheet').classList.add('hidden');
+      pendingDialogs = [];
+      renderActiveDialog();
     }
 
     function submitDialog(accept) {
-      if (!activeDialogId) return closeDialogSheet();
-      const did = activeDialogId;
+      if (!pendingDialogs.length) return closeDialogSheet();
+      const head = pendingDialogs.shift();
+      const did = head.dialog_id;
       const promptText = document.getElementById('dialog-prompt-input').value;
-      closeDialogSheet();
+      renderActiveDialog();
       if (ws && ws.readyState === WebSocket.OPEN && authed) {
         ws.send(JSON.stringify({
           type: 'dialog_response',
@@ -1218,7 +1318,10 @@
         const initData = (tg && tg.initData) ? tg.initData : '';
         const resp = await fetch(`/api/upload?chooser_id=${encodeURIComponent(activeChooserId)}`, {
           method: 'POST',
-          headers: { 'X-TG-Init-Data': initData },
+          headers: {
+            'X-TG-Init-Data': initData,
+            'X-Chooser-Id': activeChooserId
+          },
           body: form
         });
         const res = await resp.json().catch(() => ({}));
@@ -1266,13 +1369,22 @@
 
     async function downloadLatestFile() {
       if (!latestDownload || !latestDownload.download_id) return;
+      const sizeBytes = Number(latestDownload.size || 0);
+      if (sizeBytes > 25 * 1024 * 1024) {
+        showToast('⚠️ 文件超过 25MB，移动端面板内存有限，建议在桌面端下载');
+        return;
+      }
+      const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      const timer = ctrl ? setTimeout(() => ctrl.abort(), 30000) : null;
       try {
+        showToast(`⏳ 正在拉取 ${latestDownload.filename || '文件'}...`);
         const initData = (tg && tg.initData) ? tg.initData : '';
         const resp = await fetch(`/api/download/${encodeURIComponent(latestDownload.download_id)}`, {
-          headers: { 'X-TG-Init-Data': initData }
+          headers: { 'X-TG-Init-Data': initData },
+          signal: ctrl ? ctrl.signal : undefined
         });
         if (!resp.ok) {
-          showToast('❌ 文件下载失败或已过期');
+          showToast(resp.status === 403 ? '🔒 无权下载该文件' : '❌ 文件下载失败或已过期');
           return;
         }
         const blob = await resp.blob();
@@ -1284,8 +1396,10 @@
         a.click();
         document.body.removeChild(a);
         setTimeout(() => URL.revokeObjectURL(url), 4000);
-      } catch (_) {
-        showToast('❌ 文件下载失败');
+      } catch (err) {
+        showToast(err && err.name === 'AbortError' ? '❌ 下载超时，请重试或发回 TG' : '❌ 文件下载失败');
+      } finally {
+        if (timer) clearTimeout(timer);
       }
     }
 
@@ -1536,37 +1650,72 @@
       if (e.key === 'Escape') { e.preventDefault(); closeKbSheet(); }
     });
 
-    // ---------------- Latest-Frame Single-Slot Decoder ----------------
-    async function decodeAndDrawBlob(blob) {
-      try {
-        if (window.createImageBitmap) {
-          const bmp = await createImageBitmap(blob);
+    // ---------------- Latest-Frame Single-Slot Decoder (Safe Resource Cleanup & Connection Gen) ----------------
+    async function decodeAndDrawBlob(blob, connGen) {
+      if (connGen !== wsConnGen) return false;
+      let drew = false;
+      if (window.createImageBitmap) {
+        let bmp = null;
+        try {
+          bmp = await createImageBitmap(blob);
+          if (connGen !== wsConnGen) return false;
           if (screenCanvas.width !== bmp.width || screenCanvas.height !== bmp.height) {
             screenCanvas.width = bmp.width;
             screenCanvas.height = bmp.height;
             fitCanvasLayout();
           }
           ctx.drawImage(bmp, 0, 0);
-          bmp.close();
-        } else {
-          await new Promise((resolve) => {
-            const url = URL.createObjectURL(blob);
-            const img = new Image();
-            img.onload = () => {
-              if (screenCanvas.width !== img.naturalWidth || screenCanvas.height !== img.naturalHeight) {
-                screenCanvas.width = img.naturalWidth;
-                screenCanvas.height = img.naturalHeight;
-                fitCanvasLayout();
-              }
-              ctx.drawImage(img, 0, 0);
-              URL.revokeObjectURL(url);
-              resolve();
-            };
-            img.onerror = () => { URL.revokeObjectURL(url); resolve(); };
-            img.src = url;
-          });
+          drew = true;
+        } catch (_) {
+          drew = false;
+        } finally {
+          if (bmp) {
+            try { bmp.close(); } catch (_) {}
+          }
         }
-      } catch (_) {}
+      }
+
+      if (!drew && connGen === wsConnGen) {
+        await new Promise((resolve) => {
+          const url = URL.createObjectURL(blob);
+          const img = new Image();
+          let settled = false;
+          const finish = () => {
+            if (settled) return;
+            settled = true;
+            try { URL.revokeObjectURL(url); } catch (_) {}
+            resolve();
+          };
+          img.onload = () => {
+            try {
+              if (connGen === wsConnGen) {
+                if (screenCanvas.width !== img.naturalWidth || screenCanvas.height !== img.naturalHeight) {
+                  screenCanvas.width = img.naturalWidth;
+                  screenCanvas.height = img.naturalHeight;
+                  fitCanvasLayout();
+                }
+                ctx.drawImage(img, 0, 0);
+                drew = true;
+              }
+            } catch (_) {
+              drew = false;
+            } finally {
+              finish();
+            }
+          };
+          img.onerror = finish;
+          try {
+            img.src = url;
+          } catch (_) {
+            finish();
+          }
+        });
+      }
+
+      if (drew && connGen === wsConnGen) {
+        renderedFrameCount++;
+      }
+      return drew;
     }
 
     async function pumpFrameDecoder() {
@@ -1575,8 +1724,9 @@
       try {
         while (pendingFrameBlob) {
           const blob = pendingFrameBlob;
+          const connGen = pendingFrameConnGen;
           pendingFrameBlob = null;
-          await decodeAndDrawBlob(blob);
+          await decodeAndDrawBlob(blob, connGen);
         }
       } finally {
         decodingFrame = false;
@@ -1584,15 +1734,59 @@
     }
 
     // ---------------- Reliable Exponential Backoff WebSocket ----------------
+    function clearPendingUrlGoto() {
+      if (pendingUrlGoto && pendingUrlGoto.timer) {
+        clearTimeout(pendingUrlGoto.timer);
+      }
+      pendingUrlGoto = null;
+    }
+
+    function resetConnectionControlState() {
+      authed = false;
+      pendingFrameBlob = null;
+      pendingFrameConnGen = wsConnGen;
+      clearPendingUrlGoto();
+      state.takeover = false;
+      prevTakeoverState = false;
+      trackpadHolding = false;
+      const holdBtn = document.getElementById('trackpad-hold-btn');
+      if (holdBtn) {
+        holdBtn.classList.remove('hold-active');
+        holdBtn.textContent = '✋ 按住拖曳';
+      }
+      closeDialogSheet();
+      closeUploadSheet();
+      closeKbSheet();
+      pointers.clear();
+      clearLongPressTimer();
+      gestureStart = null;
+      pinchState = null;
+      twoFingerTrackpad = null;
+    }
+
+    function showAuthRejectedUi(errMsg) {
+      authed = false;
+      authRejected = true;
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+      clearPendingUrlGoto();
+      document.getElementById('reconnect-bar').classList.add('hidden');
+      document.getElementById('conn-dot').className = 'dot offline';
+      document.getElementById('metrics-text').textContent = '未授权 (403)';
+      const ov = document.getElementById('overlay');
+      ov.classList.remove('hidden');
+      document.getElementById('ov-icon').textContent = '⛔';
+      document.getElementById('ov-title').textContent = '403 Forbidden · 拒绝访问';
+      document.getElementById('ov-desc').textContent = errMsg || '请从你本人的授权 Telegram 机器人对话内点击【实时画面 / 人工接管】按钮打开。';
+      document.getElementById('ov-reconnect-btn').classList.add('hidden');
+    }
+
     function manualReconnect() {
       clearTimeout(reconnectTimer);
       reconnectTimer = null;
       authRejected = false;
       reconnectAttempt = 0;
       document.getElementById('reconnect-text').textContent = '正在重新连接...';
-      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
-        try { ws.close(); } catch (_) {}
-      }
       connectWs();
     }
 
@@ -1616,36 +1810,50 @@
     function connectWs() {
       clearTimeout(reconnectTimer);
       reconnectTimer = null;
+      const oldWs = ws;
+      wsConnGen++;
+      const myGen = wsConnGen;
+      resetConnectionControlState();
+      if (oldWs && (oldWs.readyState === WebSocket.OPEN || oldWs.readyState === WebSocket.CONNECTING)) {
+        try { oldWs.close(); } catch (_) {}
+      }
+
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
       const sock = new WebSocket(`${proto}//${location.host}/ws`);
       ws = sock;
       sock.binaryType = 'blob';
 
       sock.onopen = () => {
-        if (sock !== ws) return;
+        if (sock !== ws || myGen !== wsConnGen) return;
         const initData = (tg && tg.initData) ? tg.initData : '';
         sock.send(JSON.stringify({ type: 'auth', initData }));
       };
 
       sock.onmessage = (ev) => {
-        if (sock !== ws) return;
+        if (sock !== ws || myGen !== wsConnGen) return;
         if (typeof ev.data === 'string') {
           const msg = JSON.parse(ev.data);
           handleJsonMessage(msg);
         } else if (ev.data instanceof Blob) {
-          frameCount++;
           pendingFrameBlob = ev.data;
+          pendingFrameConnGen = myGen;
           pumpFrameDecoder();
         }
       };
 
-      sock.onclose = () => {
-        if (sock !== ws) return;
-        document.getElementById('conn-dot').className = 'dot offline';
-        document.getElementById('metrics-text').textContent = '连接已断开，重连中...';
-        if (!authRejected) {
-          scheduleReconnect();
+      sock.onclose = (ev) => {
+        if (sock !== ws || myGen !== wsConnGen) return;
+        if (ev && ev.code === 4003) {
+          showAuthRejectedUi('Telegram 身份鉴权未通过或权限已被撤销。');
+          return;
         }
+        document.getElementById('conn-dot').className = 'dot offline';
+        if (authRejected) {
+          document.getElementById('metrics-text').textContent = '未授权 (403)';
+          return;
+        }
+        document.getElementById('metrics-text').textContent = '连接已断开，重连中...';
+        scheduleReconnect();
       };
     }
 
@@ -1653,6 +1861,7 @@
       if (msg.type === 'auth_ok') {
         authed = true;
         authRejected = false;
+        userRole = msg.role || 'admin';
         reconnectAttempt = 0;
         clearTimeout(reconnectTimer);
         document.getElementById('overlay').classList.add('hidden');
@@ -1664,17 +1873,8 @@
         return;
       }
       if (msg.type === 'auth_error') {
-        authed = false;
-        authRejected = true;
-        clearTimeout(reconnectTimer);
-        document.getElementById('reconnect-bar').classList.add('hidden');
-        const ov = document.getElementById('overlay');
-        ov.classList.remove('hidden');
-        document.getElementById('ov-icon').textContent = '⛔';
-        document.getElementById('ov-title').textContent = '403 Forbidden · 拒绝访问';
-        document.getElementById('ov-desc').textContent = msg.error || '请从你本人的授权 Telegram 机器人对话内点击【实时画面 / 人工接管】按钮打开。';
-        document.getElementById('ov-reconnect-btn').classList.add('hidden');
-        if (ws) ws.close();
+        showAuthRejectedUi(msg.error);
+        if (ws && ws.readyState === WebSocket.OPEN) ws.close();
         return;
       }
       if (msg.type === 'pong') {
@@ -1691,7 +1891,7 @@
         return;
       }
       if (msg.type === 'dialog_closed') {
-        if (!msg.dialog_id || msg.dialog_id === activeDialogId) closeDialogSheet();
+        removeDialogById(msg.dialog_id);
         return;
       }
       if (msg.type === 'filechooser_open') {
@@ -1763,10 +1963,23 @@
       if (!state.running) {
         dot.className = 'dot';
         remoteCursorEl.classList.add('hidden');
+        humanCursorState.visible = false;
+        if (aiCursorEl) aiCursorEl.classList.add('hidden');
+        aiCursorState.visible = false;
+        clearPendingUrlGoto();
       } else if (state.takeover) {
         dot.className = 'dot takeover';
       } else {
         dot.className = 'dot live';
+      }
+
+      // Execute pending URL auto-takeover goto ONLY after server confirms takeover=true ACK
+      if (state.running && state.takeover && pendingUrlGoto) {
+        const targetUrl = pendingUrlGoto.url;
+        clearPendingUrlGoto();
+        if (ws && ws.readyState === WebSocket.OPEN && authed) {
+          ws.send(JSON.stringify({ type: 'input', action: 'goto', url: targetUrl }));
+        }
       }
 
       // Sync Telegram Closing Confirmation during active human takeover
@@ -2004,6 +2217,20 @@
       }
     }
 
+    function isGoogleUrlClient(url) {
+      try {
+        const host = new URL(url).hostname.toLowerCase();
+        return /(^|\.)(google\.com|gmail\.com|googlemail\.com|youtube\.com|youtu\.be|googleapis\.com|google\.[a-z]{2,3}(\.[a-z]{2})?)$/.test(host);
+      } catch (_) {
+        return false;
+      }
+    }
+
+    function findProfileByName(name) {
+      const list = Array.isArray(state.profiles) ? state.profiles : [];
+      return list.find((p) => p.name === name) || null;
+    }
+
     function switchProfile(profileName) {
       if (!ws || ws.readyState !== WebSocket.OPEN || !authed) return;
       if (state.engine_mode === 'sync_external') {
@@ -2019,12 +2246,20 @@
         showToast('AI 正在操作浏览器，请稍候再切换');
         return;
       }
+      const targetProf = findProfileByName(profileName);
+      const isPinned = !!(targetProf && targetProf.pinned);
+      let nextUrl = state.url || '';
+      if (!isPinned && (!nextUrl || isGoogleUrlClient(nextUrl))) {
+        nextUrl = 'about:blank';
+      } else if (isPinned && !nextUrl) {
+        nextUrl = 'https://www.google.com';
+      }
       haptic('medium');
       showToast(`🔄 正在切换至指纹 ${profileName}...`);
       ws.send(JSON.stringify({
         type: 'switch_profile',
         profile: profileName,
-        url: state.url || 'https://www.google.com',
+        url: nextUrl,
         takeover: !state.running
       }));
       closeProfileSheet();
@@ -2051,14 +2286,20 @@
       if (!c || c.ts === lastCursorTs) return;
       lastCursorTs = c.ts;
       if (c.actor === 'ai') {
-        const pos = positionArrowCursor(c.x || 0, c.y || 0, 'ai', false);
+        // AI cursor uses its own `#ai-cursor` element and NEVER overwrites human/trackpad cursor!
+        const pos = positionAiCursor(c.x || 0, c.y || 0);
         spawnClickRing(pos.localX, pos.localY, 'ai');
       } else if (gestureMode !== 'trackpad' && c.kind !== 'move') {
-        positionArrowCursor(c.x || 0, c.y || 0, 'human', false);
+        positionHumanCursor(c.x || 0, c.y || 0, 'human', false);
       }
     }
 
     function updateMetricsUi() {
+      if (authRejected) {
+        document.getElementById('conn-dot').className = 'dot offline';
+        document.getElementById('metrics-text').textContent = '未授权 (403)';
+        return;
+      }
       const modeMap = { idle: '空闲', async_hosted: '实时', sync_external: '联动' };
       const m = modeMap[state.engine_mode] || state.engine_mode;
       document.getElementById('metrics-text').textContent = state.running
@@ -2069,9 +2310,10 @@
     setInterval(() => {
       const now = performance.now();
       const dt = (now - lastFpsTick) / 1000;
-      currentFps = Math.round(frameCount / Math.max(0.1, dt));
-      frameCount = 0;
+      currentFps = Math.round(renderedFrameCount / Math.max(0.1, dt));
+      renderedFrameCount = 0;
       lastFpsTick = now;
+      if (authRejected) return;
       if (ws && ws.readyState === WebSocket.OPEN && authed) {
         ws.send(JSON.stringify({ type: 'ping', t: Date.now() }));
       }
@@ -2083,6 +2325,10 @@
         showToast('浏览器尚未运行，可点击中间按钮启动');
         return false;
       }
+      if (userRole === 'readonly') {
+        showToast('🔒 当前为只读权限（readonly），仅支持观看与选字提取');
+        return false;
+      }
       if (!state.takeover) {
         showToast('当前为观看模式，请先点右上角【🖐 接管】');
         haptic('medium');
@@ -2091,21 +2337,47 @@
       return true;
     }
 
+    function releaseActiveDragBeforeHandback() {
+      releaseTrackpadHoldIfNeeded();
+      if (gestureStart && gestureStart.dragDownSent) {
+        const pt = gestureStart.lastValidRemote || gestureStart.startRemote;
+        gestureStart.dragDownSent = false;
+        if (pt && state.running && state.takeover && ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'input', action: 'mouseup', x: pt.x, y: pt.y, button: 'left' }));
+        }
+      }
+    }
+
     function toggleTakeover() {
       if (!ws || ws.readyState !== WebSocket.OPEN || !authed) return;
+      if (userRole === 'readonly') {
+        showToast('🔒 只读权限不可接管控制');
+        return;
+      }
       haptic('medium');
-      ws.send(JSON.stringify({ type: 'set_takeover', active: !state.takeover }));
+      const nextActive = !state.takeover;
+      if (!nextActive) {
+        // Send mouseup BEFORE set_takeover(false) so drag/hold releases cleanly ahead of handback
+        releaseActiveDragBeforeHandback();
+      }
+      ws.send(JSON.stringify({ type: 'set_takeover', active: nextActive }));
     }
 
     function startBrowserManual() {
       if (!ws || ws.readyState !== WebSocket.OPEN || !authed) return;
+      if (userRole === 'readonly') {
+        showToast('🔒 只读权限不可启动浏览器');
+        return;
+      }
       haptic('medium');
       const sel = document.getElementById('idle-profile-select');
       const chosenProfile = sel && sel.value ? sel.value : null;
+      const profObj = chosenProfile ? findProfileByName(chosenProfile) : (Array.isArray(state.profiles) ? state.profiles[0] : null);
+      const defaultUrl = (profObj && profObj.pinned) ? 'https://www.google.com' : 'about:blank';
       showToast(chosenProfile ? `正在启动指纹 ${chosenProfile}...` : '正在启动安全浏览器...');
       ws.send(JSON.stringify({
         type: 'start_browser',
-        url: 'https://www.google.com',
+        url: defaultUrl,
         profile: chosenProfile,
         takeover: true
       }));
@@ -2133,19 +2405,30 @@
     function submitUrl() {
       const raw = urlInputEl.value.trim();
       if (!raw) return;
-      const url = /^https?:\/\//i.test(raw) ? raw : 'https://' + raw;
+      const url = /^(https?:\/\/|about:)/i.test(raw) ? raw : 'https://' + raw;
       if (!state.running) {
         showToast('浏览器尚未运行');
         return;
       }
-      if (!state.takeover && !state.ai_busy && ws && ws.readyState === WebSocket.OPEN && authed) {
-        ws.send(JSON.stringify({ type: 'set_takeover', active: true, reason: '地址栏快速跳转' }));
-        state.takeover = true;
-        setTimeout(() => {
-          if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'input', action: 'goto', url }));
-          }
-        }, 60);
+      if (userRole === 'readonly') {
+        showToast('🔒 只读权限不可操作地址栏');
+        return;
+      }
+      if (!state.takeover) {
+        if (state.ai_busy) {
+          showToast('AI 正在执行操作，请等待完成后再跳转');
+          return;
+        }
+        if (ws && ws.readyState === WebSocket.OPEN && authed) {
+          clearPendingUrlGoto();
+          pendingUrlGoto = {
+            url,
+            timer: setTimeout(() => {
+              pendingUrlGoto = null;
+            }, 4000)
+          };
+          ws.send(JSON.stringify({ type: 'set_takeover', active: true, reason: '地址栏快速跳转' }));
+        }
         urlInputEl.blur();
         return;
       }
@@ -2298,8 +2581,10 @@
           x: e.clientX, y: e.clientY,
           lastX: e.clientX, lastY: e.clientY,
           startRemote,
+          lastValidRemote: startRemote,
           panX, panY,
           moved: false,
+          wasPinch: false,
           longPressed: false,
           dragDownSent: false,
           t: Date.now()
@@ -2317,7 +2602,7 @@
         clearLongPressTimer();
         if (gestureMode === 'interact' && e.pointerType !== 'mouse' && startRemote) {
           longPressTimer = setTimeout(() => {
-            if (!gestureStart || gestureStart.moved || pointers.size !== 1) return;
+            if (!gestureStart || gestureStart.moved || gestureStart.wasPinch || pointers.size !== 1) return;
             gestureStart.longPressed = true;
             if (!ensureTakeoverOrWarn()) return;
             haptic('heavy');
@@ -2330,13 +2615,18 @@
       } else if (pointers.size === 2) {
         clearLongPressTimer();
         if (gestureStart && gestureStart.dragDownSent) {
-          const cur = clientToRemoteCoords(gestureStart.lastX, gestureStart.lastY) || gestureStart.startRemote;
+          const cur = clientToRemoteCoords(gestureStart.lastX, gestureStart.lastY)
+            || gestureStart.lastValidRemote
+            || gestureStart.startRemote;
           if (cur && ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: 'input', action: 'mouseup', x: cur.x, y: cur.y, button: 'left' }));
           }
           gestureStart.dragDownSent = false;
         }
-        if (gestureStart) gestureStart.moved = true;
+        if (gestureStart) {
+          gestureStart.moved = true;
+          gestureStart.wasPinch = true;
+        }
         document.getElementById('drag-sel-box').classList.add('hidden');
         document.getElementById('live-sel-pill').classList.add('hidden');
 
@@ -2345,17 +2635,22 @@
         const midX = (pts[0].x + pts[1].x) / 2 - stageRect.left;
         const midY = (pts[0].y + pts[1].y) / 2 - stageRect.top;
         const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+        const { baseLeft, baseTop } = getStageBaseOffset();
 
         if (gestureMode === 'trackpad') {
           twoFingerTrackpad = {
             startMidX: midX, startMidY: midY,
             lastMidX: midX, lastMidY: midY,
+            startDist: dist,
+            startScale: scale,
+            anchorLx: (midX - baseLeft - panX) / scale,
+            anchorLy: (midY - baseTop - panY) / scale,
+            mode: null, // 'pinch' | 'scroll' | null
             moved: false,
             t: Date.now()
           };
           pinchState = null;
         } else {
-          const { baseLeft, baseTop } = getStageBaseOffset();
           pinchState = {
             startDist: dist,
             startScale: scale,
@@ -2393,12 +2688,30 @@
         const stageRect = stage.getBoundingClientRect();
         const curMidX = (pts[0].x + pts[1].x) / 2 - stageRect.left;
         const curMidY = (pts[0].y + pts[1].y) / 2 - stageRect.top;
+        const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
 
         if (gestureMode === 'trackpad' && twoFingerTrackpad) {
-          if (Math.hypot(curMidX - twoFingerTrackpad.startMidX, curMidY - twoFingerTrackpad.startMidY) > 7) {
-            twoFingerTrackpad.moved = true;
+          const midDelta = Math.hypot(curMidX - twoFingerTrackpad.startMidX, curMidY - twoFingerTrackpad.startMidY);
+          const distDelta = Math.abs(dist - twoFingerTrackpad.startDist);
+          if (!twoFingerTrackpad.mode) {
+            if (twoFingerTrackpad.startDist > 10 && distDelta > 14 && distDelta > midDelta * 1.15) {
+              twoFingerTrackpad.mode = 'pinch';
+              twoFingerTrackpad.moved = true;
+            } else if (midDelta > 8) {
+              twoFingerTrackpad.mode = 'scroll';
+              twoFingerTrackpad.moved = true;
+            }
           }
-          if (twoFingerTrackpad.moved && state.running && state.takeover) {
+          if (twoFingerTrackpad.mode === 'pinch' && twoFingerTrackpad.startDist > 10) {
+            const newScale = Math.min(3.5, Math.max(1.0, twoFingerTrackpad.startScale * (dist / twoFingerTrackpad.startDist)));
+            const { baseLeft, baseTop } = getStageBaseOffset();
+            scale = newScale;
+            panX = curMidX - baseLeft - twoFingerTrackpad.anchorLx * newScale;
+            panY = curMidY - baseTop - twoFingerTrackpad.anchorLy * newScale;
+            applyTransform();
+            return;
+          }
+          if (twoFingerTrackpad.mode === 'scroll' && state.running && state.takeover) {
             const now = Date.now();
             if (now - lastWheelSent >= 40) {
               const stepX = twoFingerTrackpad.lastMidX - curMidX;
@@ -2420,7 +2733,6 @@
         }
 
         if (pinchState && pinchState.startDist > 10) {
-          const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
           const newScale = Math.min(3.5, Math.max(1.0, pinchState.startScale * (dist / pinchState.startDist)));
           const { baseLeft, baseTop } = getStageBaseOffset();
           scale = newScale;
@@ -2466,6 +2778,7 @@
           if (curPt) {
             gestureStart.lastX = e.clientX;
             gestureStart.lastY = e.clientY;
+            gestureStart.lastValidRemote = curPt;
             positionArrowCursor(curPt.x, curPt.y, 'drag', true);
             sendRemoteMoveThrottled(curPt.x, curPt.y, 35);
           }
@@ -2475,9 +2788,10 @@
         if (!gestureStart.moved) return;
 
         // Extract mode: drag-to-select characters
-        if (gestureMode === 'extract' && state.running && gestureStart.startRemote) {
+        if (gestureMode === 'extract' && state.running && gestureStart.startRemote && !gestureStart.wasPinch) {
           const curPt = clientToRemoteCoords(e.clientX, e.clientY);
           if (curPt) {
+            gestureStart.lastValidRemote = curPt;
             const box = document.getElementById('drag-sel-box');
             const left = Math.min(gestureStart.startRemote.localX, curPt.localX);
             const top = Math.min(gestureStart.startRemote.localY, curPt.localY);
@@ -2547,6 +2861,30 @@
       }));
     }
 
+    function onPointerCancel(e) {
+      if (!pointers.has(e.pointerId)) return;
+      pointers.delete(e.pointerId);
+      clearLongPressTimer();
+      document.getElementById('drag-sel-box').classList.add('hidden');
+      document.getElementById('live-sel-pill').classList.add('hidden');
+
+      if (gestureStart && gestureStart.dragDownSent) {
+        const endPt = gestureStart.lastValidRemote || gestureStart.startRemote;
+        gestureStart.dragDownSent = false;
+        if (endPt && state.running && state.takeover && ws && ws.readyState === WebSocket.OPEN) {
+          positionArrowCursor(endPt.x, endPt.y, 'human', false);
+          ws.send(JSON.stringify({ type: 'input', action: 'mouseup', x: endPt.x, y: endPt.y, button: 'left' }));
+        }
+      }
+      if (pointers.size < 2) {
+        pinchState = null;
+        twoFingerTrackpad = null;
+      }
+      if (pointers.size === 0) {
+        gestureStart = null;
+      }
+    }
+
     function onPointerEnd(e) {
       if (!pointers.has(e.pointerId)) return;
       pointers.delete(e.pointerId);
@@ -2556,7 +2894,7 @@
       if (gestureMode === 'trackpad' && twoFingerTrackpad && pointers.size < 2) {
         const tf = twoFingerTrackpad;
         if (pointers.size === 0) twoFingerTrackpad = null;
-        if (!tf.moved && (Date.now() - tf.t) < 280) {
+        if (!tf.moved && !tf.mode && (Date.now() - tf.t) < 280) {
           twoFingerTrackpad = null;
           if (ensureTakeoverOrWarn()) {
             haptic('medium');
@@ -2578,9 +2916,12 @@
         pinchState = null;
       }
 
-      // Drag mode release
+      // Drag mode release: always fall back to lastValidRemote (never snap back to startRemote)
       if (pointers.size === 0 && gestureStart && gestureStart.dragDownSent) {
-        const endPt = clientToRemoteCoords(e.clientX, e.clientY) || gestureStart.startRemote;
+        const endPt = clientToRemoteCoords(e.clientX, e.clientY)
+          || gestureStart.lastValidRemote
+          || gestureStart.startRemote;
+        gestureStart.dragDownSent = false;
         if (endPt && ws && ws.readyState === WebSocket.OPEN) {
           positionArrowCursor(endPt.x, endPt.y, 'human', false);
           ws.send(JSON.stringify({ type: 'input', action: 'mouseup', x: endPt.x, y: endPt.y, button: 'left' }));
@@ -2589,11 +2930,15 @@
         return;
       }
 
-      // Extract mode finish
+      // Extract mode finish (never trigger extract after a 2-finger pinch!)
       if (pointers.size === 0 && gestureStart && gestureMode === 'extract') {
         document.getElementById('drag-sel-box').classList.add('hidden');
         document.getElementById('live-sel-pill').classList.add('hidden');
-        const endPt = clientToRemoteCoords(e.clientX, e.clientY);
+        if (gestureStart.wasPinch) {
+          gestureStart = null;
+          return;
+        }
+        const endPt = clientToRemoteCoords(e.clientX, e.clientY) || gestureStart.lastValidRemote;
         if (state.running && endPt) {
           haptic('light');
           if (gestureStart.moved && gestureStart.startRemote) {
@@ -2619,21 +2964,23 @@
         return;
       }
 
-      // Trackpad single-finger tap -> click at arrow tip!
-      if (pointers.size === 0 && gestureStart && gestureMode === 'trackpad' && !gestureStart.moved && (Date.now() - gestureStart.t) < 280) {
-        if (ensureTakeoverOrWarn()) {
-          haptic('light');
-          const rx = Math.round(trackpadX * 10) / 10;
-          const ry = Math.round(trackpadY * 10) / 10;
-          const pos = positionArrowCursor(rx, ry, 'human', true);
-          fireSmartClick(rx, ry, pos.localX, pos.localY);
+      // Trackpad mode: any unmoved single-finger tap (0..470ms) ONLY clicks at arrow tip (never falls through to touch coords!)
+      if (pointers.size === 0 && gestureMode === 'trackpad') {
+        if (gestureStart && !gestureStart.moved && !gestureStart.wasPinch && (Date.now() - gestureStart.t) < 470) {
+          if (ensureTakeoverOrWarn()) {
+            haptic('light');
+            const rx = Math.round(trackpadX * 10) / 10;
+            const ry = Math.round(trackpadY * 10) / 10;
+            const pos = positionArrowCursor(rx, ry, 'human', true);
+            fireSmartClick(rx, ry, pos.localX, pos.localY);
+          }
         }
         gestureStart = null;
         return;
       }
 
-      // Interact mode tap -> left click (unless long-press right-click already fired)
-      if (pointers.size === 0 && gestureStart && !gestureStart.moved && !gestureStart.longPressed && (Date.now() - gestureStart.t) < 470) {
+      // Interact mode tap -> left click (unless long-press right-click or pinch already fired)
+      if (pointers.size === 0 && gestureStart && !gestureStart.moved && !gestureStart.wasPinch && !gestureStart.longPressed && (Date.now() - gestureStart.t) < 470) {
         const pt = clientToRemoteCoords(e.clientX, e.clientY);
         if (pt) {
           if (!ensureTakeoverOrWarn()) {
@@ -2648,7 +2995,8 @@
     }
 
     stage.addEventListener('pointerup', onPointerEnd);
-    stage.addEventListener('pointercancel', onPointerEnd);
+    stage.addEventListener('pointercancel', onPointerCancel);
+    stage.addEventListener('lostpointercapture', onPointerCancel);
 
     stage.addEventListener('wheel', (e) => {
       e.preventDefault();

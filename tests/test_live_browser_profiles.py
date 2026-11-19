@@ -391,6 +391,85 @@ class TestLiveBrowserProfiles(unittest.TestCase):
             res_del = client.delete_profile("cli-demo")
             self.assertTrue(res_del["ok"])
 
+    def test_private_host_pinned_fail_closed_and_google_destination_policy(self) -> None:
+        # 1. Explicit AGY_GOOGLE_SKILL_SCRIPTS="" keeps standalone mode working
+        with mock.patch.dict(os.environ, {"AGY_GOOGLE_SKILL_SCRIPTS": "", "AGY_LIVE_BROWSER_REQUIRE_PINNED": ""}, clear=False):
+            self.assertIsNone(srv.discover_pinned_host_profile())
+
+        # 2. Private host with existing google-profile skill dir but missing google_browser.py -> RuntimeError (fail-closed)
+        empty_skill_scripts = self.root / "google-profile" / "scripts"
+        empty_skill_scripts.mkdir(parents=True, exist_ok=True)
+        with mock.patch.dict(os.environ, {"AGY_GOOGLE_SKILL_SCRIPTS": str(empty_skill_scripts)}, clear=False):
+            with self.assertRaises(RuntimeError):
+                srv.discover_pinned_host_profile()
+            with self.assertRaises(RuntimeError):
+                srv.resolve_launch_spec(None)
+
+        # 3. Private host with broken google_browser.py -> RuntimeError (fail-closed)
+        (empty_skill_scripts / "google_browser.py").write_text("raise ImportError('broken pinned module')\n", encoding="utf-8")
+        sys.modules.pop("google_browser", None)
+        with mock.patch.dict(os.environ, {"AGY_GOOGLE_SKILL_SCRIPTS": str(empty_skill_scripts)}, clear=False):
+            with self.assertRaises(RuntimeError):
+                srv.discover_pinned_host_profile()
+
+        # 4. AGY_LIVE_BROWSER_REQUIRE_PINNED=1 fails closed even if AGY_GOOGLE_SKILL_SCRIPTS=""
+        with mock.patch.dict(
+            os.environ,
+            {"AGY_GOOGLE_SKILL_SCRIPTS": "", "AGY_LIVE_BROWSER_REQUIRE_PINNED": "1"},
+            clear=False,
+        ):
+            with self.assertRaises(RuntimeError):
+                srv.discover_pinned_host_profile()
+
+        # 5. Valid pinned host: non-pinned profile is blocked from Google/Gmail/YouTube destinations
+        self._install_mock_google_browser("pinned_acct")
+        srv.create_profile("nonpin", {"os": "linux"})
+        for bad_url in (
+            "https://www.google.com/search?q=test",
+            "https://mail.google.com/mail/u/0/#inbox",
+            "https://accounts.google.com/signin",
+            "https://" + ".".join(("accounts", "google", "co", "jp")) + "/signin",
+            "https://" + ".".join(("gmail", "com")),
+            "https://" + ".".join(("www", "youtube", "com")) + "/watch?v=1",
+            "https://generativelanguage.googleapis.com/v1",
+        ):
+            with self.subTest(bad_url=bad_url):
+                self.assertTrue(srv.is_google_destination_url(bad_url))
+                with self.assertRaises(ValueError):
+                    srv.enforce_google_profile_policy(bad_url, is_pinned=False)
+                # Pinned profile is permitted
+                srv.enforce_google_profile_policy(bad_url, is_pinned=True)
+
+        # Non-Google URL is allowed on non-pinned profile
+        self.assertFalse(srv.is_google_destination_url("https://example.com"))
+        srv.enforce_google_profile_policy("https://example.com", is_pinned=False)
+
+        # Verify hub start_hosted & AI goto enforce Google destination policy before launch/nav
+        fake_mod = types.ModuleType("camoufox.async_api")
+        fake_mod.AsyncCamoufox = _FakeAsyncCamoufoxCM  # type: ignore[attr-defined]
+        fake_pkg = types.ModuleType("camoufox")
+        fake_pkg.async_api = fake_mod  # type: ignore[attr-defined]
+
+        async def _scenario() -> None:
+            hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "tok")
+            with mock.patch.dict(sys.modules, {"camoufox": fake_pkg, "camoufox.async_api": fake_mod}):
+                with self.assertRaises(ValueError):
+                    await hub.start_hosted(initial_url="https://www.google.com", profile="nonpin", notify_tg=False)
+                self.assertEqual("idle", hub.engine_mode)
+
+                await hub.start_hosted(initial_url="https://example.com", profile="nonpin", notify_tg=False)
+                self.assertFalse(hub.active_pinned)
+                with self.assertRaises(ValueError):
+                    await hub.execute_ai_action({"action": "goto", "url": "https://mail.google.com", "notify": False})
+
+                # Human new_tab on non-pinned opens about:blank (NOT Google homepage)
+                hub.takeover = True
+                await hub._execute_human_cmd_async({"action": "new_tab"})
+                self.assertEqual("about:blank", hub._current_page().url)
+                await hub.stop_hosted(notify_finished=False)
+
+        asyncio.run(_scenario())
+
 
 if __name__ == "__main__":
     unittest.main()

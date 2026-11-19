@@ -9585,7 +9585,7 @@ def handle_callback(cb):
         cmd_browser(chat_id, "", thread_id=thread_id, scope_key=skey)
 
     elif data.startswith("browser:"):
-        _handle_browser_callback(cb_id, chat_id, thread_id, msg_id, data)
+        _handle_browser_callback(cb_id, chat_id, thread_id, msg_id, data, from_user=from_user)
 
     elif data == "action:reload":
         tg("answerCallbackQuery", callback_query_id=cb_id, text="Reloading bridge...")
@@ -9731,51 +9731,97 @@ def _handle_team_callback(cb_id, chat_id, thread_id, skey, msg_id, data):
         cmd_team(chat_id, "", thread_id=thread_id, scope_key=skey, edit_msg_id=msg_id)
 
 
-def _handle_browser_callback(cb_id, chat_id, thread_id, msg_id, data):
+def _live_browser_bot_hint():
+    env_name = os.path.basename(_env_file or "")
+    if env_name == ".env":
+        return "main"
+    if env_name.startswith(".env.") and len(env_name) > 5:
+        return env_name[5:]
+    bid = BOT_META.get("bot_id")
+    if bid:
+        return str(bid)
+    tok = os.environ.get("AGY_TG_BOT_TOKEN", "")
+    if ":" in tok:
+        return tok.split(":", 1)[0]
+    return "main"
+
+
+def _handle_browser_callback(cb_id, chat_id, thread_id, msg_id, data, from_user=None):
     sub = data[8:]
-    if sub == "takeover_on":
-        ok, res = _live_browser_request(
-            "POST",
-            "/internal/takeover",
-            json_body={"active": True, "reason": "从 Telegram 实况卡片点击接管"},
-            timeout=(1.5, 5.0),
-        )
-        if not ok:
-            tg("answerCallbackQuery", callback_query_id=cb_id, text=f"接管失败: {res}"[:180], show_alert=True)
+    if sub in ("takeover_on", "takeover_off", "card_refresh", "card_stop"):
+        uid = access_control.extract_user_id(from_user)
+        try:
+            priv_cid = int(chat_id)
+        except Exception:
+            priv_cid = 0
+        strict_role = _get_user_role(chat_id, from_user=from_user, allow_uid_fallback=False)
+        if strict_role != "admin" or priv_cid <= 0 or (uid is not None and priv_cid != uid):
+            tg(
+                "answerCallbackQuery",
+                callback_query_id=cb_id,
+                text="🔒 仅授权私聊实况卡片本人管理员可执行此操作",
+                show_alert=True,
+            )
             return
-        tg("answerCallbackQuery", callback_query_id=cb_id, text="🟠 已切换为人工接管模式")
-        return
-    elif sub == "takeover_off":
-        ok, res = _live_browser_request(
-            "POST",
-            "/internal/takeover",
-            json_body={"active": False},
-            timeout=(1.5, 5.0),
-        )
-        if not ok:
-            tg("answerCallbackQuery", callback_query_id=cb_id, text=f"交还失败: {res}"[:180], show_alert=True)
+        bot_hint = _live_browser_bot_hint()
+        if sub == "takeover_on":
+            ok, res = _live_browser_request(
+                "POST",
+                "/internal/takeover",
+                json_body={
+                    "active": True,
+                    "reason": "从 Telegram 实况卡片点击接管",
+                    "bot": bot_hint,
+                    "user_id": priv_cid,
+                },
+                timeout=(1.5, 5.0),
+            )
+            if not ok:
+                tg("answerCallbackQuery", callback_query_id=cb_id, text=f"接管失败: {res}"[:180], show_alert=True)
+                return
+            tg("answerCallbackQuery", callback_query_id=cb_id, text="🟠 已切换为人工接管模式")
             return
-        tg("answerCallbackQuery", callback_query_id=cb_id, text="▶️ 已交还给 AI 继续执行")
-        return
-    elif sub == "card_refresh":
-        ok, res = _live_browser_request(
-            "POST",
-            "/internal/config",
-            json_body={"refresh_card": True},
-            timeout=(1.5, 8.0),
-        )
-        if not ok:
-            tg("answerCallbackQuery", callback_query_id=cb_id, text=f"刷新失败: {res}"[:180], show_alert=True)
+        elif sub == "takeover_off":
+            ok, res = _live_browser_request(
+                "POST",
+                "/internal/takeover",
+                json_body={"active": False, "bot": bot_hint, "user_id": priv_cid},
+                timeout=(1.5, 5.0),
+            )
+            if not ok:
+                tg("answerCallbackQuery", callback_query_id=cb_id, text=f"交还失败: {res}"[:180], show_alert=True)
+                return
+            tg("answerCallbackQuery", callback_query_id=cb_id, text="▶️ 已交还给 AI 继续执行")
             return
-        tg("answerCallbackQuery", callback_query_id=cb_id, text="📸 实况卡片已刷新")
-        return
-    elif sub == "card_stop":
-        ok, res = _live_browser_request("POST", "/internal/stop", json_body={}, timeout=(2.0, 10.0))
-        if not ok:
-            tg("answerCallbackQuery", callback_query_id=cb_id, text=f"关闭失败: {res}"[:180], show_alert=True)
+        elif sub == "card_refresh":
+            ok, res = _live_browser_request(
+                "POST",
+                "/internal/config",
+                json_body={
+                    "refresh_card": True,
+                    "bot": bot_hint,
+                    "chat_id": priv_cid,
+                    "message_id": msg_id,
+                },
+                timeout=(1.5, 8.0),
+            )
+            if not ok:
+                tg("answerCallbackQuery", callback_query_id=cb_id, text=f"刷新失败: {res}"[:180], show_alert=True)
+                return
+            tg("answerCallbackQuery", callback_query_id=cb_id, text="📸 实况卡片已刷新")
             return
-        tg("answerCallbackQuery", callback_query_id=cb_id, text="⏹ 浏览器已安全关闭")
-        return
+        elif sub == "card_stop":
+            ok, res = _live_browser_request(
+                "POST",
+                "/internal/stop",
+                json_body={"bot": bot_hint, "user_id": priv_cid},
+                timeout=(2.0, 10.0),
+            )
+            if not ok:
+                tg("answerCallbackQuery", callback_query_id=cb_id, text=f"关闭失败: {res}"[:180], show_alert=True)
+                return
+            tg("answerCallbackQuery", callback_query_id=cb_id, text="⏹ 浏览器已安全关闭")
+            return
     elif sub == "menu_set":
         try:
             is_priv = int(chat_id) > 0

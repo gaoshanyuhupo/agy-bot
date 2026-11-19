@@ -755,6 +755,23 @@ class TestBridgeBrowserPanelAndRbac(unittest.TestCase):
                     })
                     self.assertTrue(any(u.endswith(expected_ep) for u, _ in post_calls), f"Missing POST {expected_ep} for {cb_data}")
                     self.assertFalse(any(m == "editMessageText" for m, _ in tg_calls), f"Should not editMessageText on photo card for {cb_data}")
+                    if cb_data == "browser:card_refresh":
+                        self.assertTrue(
+                            any(b.get("refresh_card") is True and b.get("chat_id") == 111 and b.get("message_id") == 99 for _, b in post_calls),
+                            f"Expected scoped card_refresh payload, got {post_calls}",
+                        )
+
+                # Group chat card_refresh must be rejected even for admin (card callbacks are DM-only)
+                post_calls.clear()
+                tg_calls.clear()
+                bridge.handle_callback({
+                    "id": "cb-grp-card",
+                    "from": {"id": 111},
+                    "message": {"chat": {"id": -1001234567890}, "message_id": 99},
+                    "data": "browser:card_refresh",
+                })
+                self.assertEqual([], post_calls)
+                self.assertTrue(any("私聊" in kw.get("text", "") for _, kw in tg_calls))
 
                 # Private menu_set & menu_reset call setChatMenuButton
                 tg_calls.clear()
@@ -839,6 +856,7 @@ class TestBridgeBrowserPanelAndRbac(unittest.TestCase):
                     "browser:stop",
                     "browser:takeover_on",
                     "browser:takeover_off",
+                    "browser:card_refresh",
                     "browser:card_stop",
                     "browser:menu_set",
                     "browser:menu_reset",
