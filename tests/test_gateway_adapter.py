@@ -1239,6 +1239,7 @@ class TestPreheaderKeepaliveAndDisconnectSafety(unittest.TestCase):
             self.assertEqual(200, r_err.status_code)
             txt_err = r_err.content.decode("utf-8")
             self.assertIn(": keepalive\n\n", txt_err)
+            self.assertIn("data: UPSTREAM_ERROR ", txt_err)
             self.assertIn('"type": "upstream_error"', txt_err)
             self.assertIn('"code": 503', txt_err)
             self.assertIn("capacity exhausted", txt_err)
@@ -1338,6 +1339,294 @@ class TestPreheaderKeepaliveAndDisconnectSafety(unittest.TestCase):
             adapter.stop()
             up.shutdown()
             up.server_close()
+
+    def test_fast_headers_slow_first_frame_and_interframe_keepalive(self):
+        class _SlowFirstFrameHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format, *args):  # noqa: A002
+                return
+
+            def do_POST(self):  # noqa: N802
+                clen = int(self.headers.get("Content-Length") or "0")
+                _ = self.rfile.read(clen)
+                # Return 200 text/event-stream headers immediately (< keepalive threshold)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.flush()
+                # Slow first frame (thinking pause)
+                time.sleep(0.18)
+                c1 = {
+                    "id": "cmpl-first",
+                    "object": "chat.completion.chunk",
+                    "choices": [{"index": 0, "delta": {"content": "first chunk "}, "finish_reason": None}],
+                }
+                self.wfile.write(f"data: {json.dumps(c1)}\n\n".encode("utf-8"))
+                self.wfile.flush()
+                # Slow inter-frame pause
+                time.sleep(0.12)
+                c2 = {
+                    "id": "cmpl-first",
+                    "object": "chat.completion.chunk",
+                    "choices": [{"index": 0, "delta": {"content": "second chunk"}, "finish_reason": None}],
+                }
+                c3 = {
+                    "id": "cmpl-first",
+                    "object": "chat.completion.chunk",
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                }
+                self.wfile.write(f"data: {json.dumps(c2)}\n\n".encode("utf-8"))
+                self.wfile.write(f"data: {json.dumps(c3)}\n\n".encode("utf-8"))
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+
+        up = ThreadingHTTPServer(("127.0.0.1", 0), _SlowFirstFrameHandler)
+        threading.Thread(target=up.serve_forever, daemon=True).start()
+        gws = gateway_adapter.parse_gateways_payload(
+            [{"id": "cpa", "base_url": f"http://127.0.0.1:{up.server_address[1]}/v1", "dialect": "cpa"}]
+        )
+        adapter = gateway_adapter.GatewayAdapterServer(
+            gws,
+            port=0,
+            preheader_keepalive_after_s=0.06,
+            preheader_keepalive_interval_s=0.03,
+        )
+        adapter.start()
+        try:
+            rt = adapter.register_route("cpa", "team/gpt-6.1-sol", effort="high")
+            resp = requests.post(
+                f"{rt.url}/chat/completions",
+                json={"model": "team/gpt-6.1-sol", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+                stream=True,
+                timeout=5,
+            )
+            self.assertEqual(200, resp.status_code)
+            body = resp.content.decode("utf-8")
+            self.assertGreaterEqual(body.count(": keepalive\n\n"), 2)
+            self.assertIn("first chunk ", body)
+            self.assertIn("second chunk", body)
+            self.assertIn("data: [DONE]\n\n", body)
+        finally:
+            adapter.stop()
+            up.shutdown()
+            up.server_close()
+
+    def test_upstream_sse_error_chunk_rewritten_with_upstream_error_prefix(self):
+        norm = gateway_adapter.SSEStreamNormalizer()
+        out = norm.process_line('data: {"error": {"message": "upstream overloaded", "code": 503}}')
+        self.assertIsNotNone(out)
+        txt = out.decode("utf-8")
+        self.assertTrue(txt.startswith("data: UPSTREAM_ERROR "))
+        self.assertIn("upstream overloaded", txt)
+        self.assertIn("503", txt)
+        self.assertTrue(norm.saw_error)
+        self.assertIsNone(norm.finalize())
+
+    def test_transform_chat_request_nonfinite_max_tokens_safe(self):
+        gws = gateway_adapter.parse_gateways_payload(
+            [{"id": "cpa", "base_url": "http://127.0.0.1:9999/v1", "dialect": "cpa", "max_tokens_cap": 2048}]
+        )
+        gw = gws["cpa"]
+
+        # 1e309 parses to float('inf') in Python json.loads; must not raise OverflowError
+        raw_inf_req = json.loads(
+            '{"model": "team/gpt-6.1-sol", "stream": true, "max_tokens": 1e309, "messages": [{"role": "user", "content": "hi"}]}'
+        )
+        out_inf = gateway_adapter.transform_chat_request(raw_inf_req, gw, upstream_model="team/gpt-6.1-sol")
+        self.assertNotIn("max_tokens", out_inf)
+        self.assertNotIn("max_completion_tokens", out_inf)
+
+        for bad_val in (float("-inf"), float("nan"), True, False, "1e309", "not-a-num"):
+            out_bad = gateway_adapter.transform_chat_request(
+                {"model": "m", "max_completion_tokens": bad_val, "messages": []},
+                gw,
+                upstream_model="m",
+            )
+            self.assertNotIn("max_tokens", out_bad)
+            self.assertNotIn("max_completion_tokens", out_bad)
+
+        # Valid finite value is still preserved and capped
+        out_ok = gateway_adapter.transform_chat_request(
+            {"model": "m", "max_tokens": 4096, "messages": []},
+            gw,
+            upstream_model="m",
+        )
+        self.assertEqual(2048, out_ok.get("max_completion_tokens"))
+
+    def test_streaming_nonfinite_max_tokens_request_completes_without_hang(self):
+        seen_payloads = []
+
+        class _CaptureHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format, *args):  # noqa: A002
+                return
+
+            def do_POST(self):  # noqa: N802
+                clen = int(self.headers.get("Content-Length") or "0")
+                seen_payloads.append(json.loads(self.rfile.read(clen).decode("utf-8")))
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                chunk = {
+                    "id": "cmpl-inf",
+                    "object": "chat.completion.chunk",
+                    "choices": [{"index": 0, "delta": {"content": "ok"}, "finish_reason": "stop"}],
+                }
+                self.wfile.write(f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n".encode("utf-8"))
+                self.wfile.flush()
+
+        up = ThreadingHTTPServer(("127.0.0.1", 0), _CaptureHandler)
+        threading.Thread(target=up.serve_forever, daemon=True).start()
+        gws = gateway_adapter.parse_gateways_payload(
+            [{"id": "cpa", "base_url": f"http://127.0.0.1:{up.server_address[1]}/v1", "dialect": "cpa"}]
+        )
+        adapter = gateway_adapter.GatewayAdapterServer(
+            gws,
+            port=0,
+            preheader_keepalive_after_s=0.06,
+            preheader_keepalive_interval_s=0.03,
+        )
+        adapter.start()
+        try:
+            rt = adapter.register_route("cpa", "team/gpt-6.1-sol", effort="high")
+            raw_body = (
+                '{"model": "team/gpt-6.1-sol", "stream": true, "max_tokens": 1e309, '
+                '"messages": [{"role": "user", "content": "hi"}]}'
+            ).encode("utf-8")
+            resp = requests.post(
+                f"{rt.url}/chat/completions",
+                data=raw_body,
+                headers={"Content-Type": "application/json"},
+                stream=True,
+                timeout=3,
+            )
+            self.assertEqual(200, resp.status_code)
+            body = resp.content.decode("utf-8")
+            self.assertIn("data: [DONE]\n\n", body)
+            self.assertEqual(1, len(seen_payloads))
+            self.assertNotIn("max_tokens", seen_payloads[0])
+            self.assertNotIn("max_completion_tokens", seen_payloads[0])
+        finally:
+            adapter.stop()
+            up.shutdown()
+            up.server_close()
+
+    def test_worker_unexpected_exception_sets_done_ev_before_and_after_keepalive(self):
+        gws = gateway_adapter.parse_gateways_payload(
+            [{"id": "cpa", "base_url": "http://127.0.0.1:9/v1", "dialect": "cpa"}]
+        )
+        adapter = gateway_adapter.GatewayAdapterServer(
+            gws,
+            port=0,
+            preheader_keepalive_after_s=0.08,
+            preheader_keepalive_interval_s=0.03,
+        )
+        adapter.start()
+        try:
+            rt = adapter.register_route("cpa", "team/gpt-6.1-sol", effort="high")
+
+            # Case A: Fast unexpected exception before keepalive headers -> immediate HTTP 502 JSON, no hang
+            with mock.patch.object(
+                gateway_adapter,
+                "transform_chat_request",
+                side_effect=RuntimeError("sensitive-secret-details"),
+            ):
+                t0 = time.monotonic()
+                resp_fast = requests.post(
+                    f"{rt.url}/chat/completions",
+                    json={"model": "team/gpt-6.1-sol", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+                    timeout=2.0,
+                )
+                elapsed_fast = time.monotonic() - t0
+            self.assertLess(elapsed_fast, 1.0)
+            self.assertEqual(502, resp_fast.status_code)
+            err_msg = resp_fast.json()["error"]["message"]
+            self.assertIn("RuntimeError", err_msg)
+            self.assertNotIn("sensitive-secret-details", err_msg)
+
+            # Case B: Delayed unexpected exception after keepalive headers -> SSE UPSTREAM_ERROR + [DONE], no hang
+            def _slow_boom(*args, **kwargs):
+                time.sleep(0.14)
+                raise OverflowError("cannot convert float infinity to integer")
+
+            with mock.patch.object(gateway_adapter, "transform_chat_request", side_effect=_slow_boom):
+                t1 = time.monotonic()
+                resp_slow = requests.post(
+                    f"{rt.url}/chat/completions",
+                    json={"model": "team/gpt-6.1-sol", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+                    stream=True,
+                    timeout=2.0,
+                )
+                body_slow = resp_slow.content.decode("utf-8")
+                elapsed_slow = time.monotonic() - t1
+            self.assertLess(elapsed_slow, 1.5)
+            self.assertEqual(200, resp_slow.status_code)
+            self.assertIn(": keepalive\n\n", body_slow)
+            self.assertIn("data: UPSTREAM_ERROR ", body_slow)
+            self.assertIn("OverflowError", body_slow)
+            self.assertIn("data: [DONE]\n\n", body_slow)
+        finally:
+            adapter.stop()
+
+    def test_sse_reader_exception_emits_sse_error_without_hanging(self):
+        class _DummyBrokenStreamResp:
+            status_code = 200
+            headers = {"Content-Type": "text/event-stream; charset=utf-8"}
+
+            def iter_lines(self, chunk_size=None, decode_unicode=False):
+                chunk = {
+                    "id": "cmpl-partial",
+                    "object": "chat.completion.chunk",
+                    "choices": [{"index": 0, "delta": {"content": "partial"}, "finish_reason": None}],
+                }
+                yield f"data: {json.dumps(chunk)}".encode("utf-8")
+                raise RuntimeError("mid-stream reset")
+
+            def close(self):
+                return None
+
+        gws = gateway_adapter.parse_gateways_payload(
+            [{"id": "cpa", "base_url": "http://127.0.0.1:9/v1", "dialect": "cpa"}]
+        )
+        adapter = gateway_adapter.GatewayAdapterServer(
+            gws,
+            port=0,
+            preheader_keepalive_after_s=0.06,
+            preheader_keepalive_interval_s=0.03,
+        )
+        adapter.start()
+        try:
+            rt = adapter.register_route("cpa", "team/gpt-6.1-sol", effort="high")
+            real_post = requests.post
+
+            def _selective_post(url, *args, **kwargs):
+                if str(url).startswith("http://127.0.0.1:9/"):
+                    return _DummyBrokenStreamResp()
+                return real_post(url, *args, **kwargs)
+
+            with mock.patch.object(gateway_adapter.requests, "post", side_effect=_selective_post):
+                t0 = time.monotonic()
+                resp = real_post(
+                    f"{rt.url}/chat/completions",
+                    json={"model": "team/gpt-6.1-sol", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+                    stream=True,
+                    timeout=2.0,
+                )
+                body = resp.content.decode("utf-8")
+                elapsed = time.monotonic() - t0
+            self.assertLess(elapsed, 1.0)
+            self.assertEqual(200, resp.status_code)
+            self.assertIn("partial", body)
+            self.assertIn("data: UPSTREAM_ERROR ", body)
+            self.assertIn("RuntimeError", body)
+            self.assertIn("data: [DONE]\n\n", body)
+        finally:
+            adapter.stop()
 
 
 if __name__ == "__main__":

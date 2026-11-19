@@ -583,6 +583,55 @@ class TestRecoveredAttemptErrorHandling(unittest.TestCase):
             )
             self.assertFalse(bridge._is_recovered_attempt_error("cid-running", 0, err_msg))
 
+            # (c1) Intermediate GENERIC(ERROR) (e.g. failed tool call) recovered by final DONE PLANNER_RESPONSE -> True
+            self._write_transcript(
+                brain_root,
+                "cid-generic-err-recovered",
+                [
+                    {"type": "USER_INPUT", "status": "DONE", "content": "run check"},
+                    {"type": "ERROR_MESSAGE", "status": "DONE"},
+                    {"type": "PLANNER_RESPONSE", "status": "DONE", "tool_calls": [{"name": "run_command"}]},
+                    {"type": "GENERIC", "status": "ERROR", "content": "command exited 1"},
+                    {"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Handled tool failure and completed."},
+                ],
+            )
+            self.assertTrue(bridge._is_recovered_attempt_error("cid-generic-err-recovered", 0, err_msg))
+
+            # (c2) Trailing GENERIC(ERROR) with no closing DONE PLANNER_RESPONSE -> False
+            self._write_transcript(
+                brain_root,
+                "cid-generic-err-trailing",
+                [
+                    {"type": "ERROR_MESSAGE", "status": "DONE"},
+                    {"type": "GENERIC", "status": "ERROR", "content": "command exited 1"},
+                ],
+            )
+            self.assertFalse(bridge._is_recovered_attempt_error("cid-generic-err-trailing", 0, err_msg))
+
+            # (c3) Unclosed intermediate GENERIC(RUNNING) before terminal PLANNER_RESPONSE -> False
+            self._write_transcript(
+                brain_root,
+                "cid-generic-running",
+                [
+                    {"type": "ERROR_MESSAGE", "status": "DONE"},
+                    {"type": "GENERIC", "status": "RUNNING", "content": "still running"},
+                    {"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Finished"},
+                ],
+            )
+            self.assertFalse(bridge._is_recovered_attempt_error("cid-generic-running", 0, err_msg))
+
+            # (c4) Non-GENERIC intermediate ERROR (PLANNER_RESPONSE status=ERROR) -> False
+            self._write_transcript(
+                brain_root,
+                "cid-planner-err-mid",
+                [
+                    {"type": "ERROR_MESSAGE", "status": "DONE"},
+                    {"type": "PLANNER_RESPONSE", "status": "ERROR", "content": "aborted"},
+                    {"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Finished"},
+                ],
+            )
+            self.assertFalse(bridge._is_recovered_attempt_error("cid-planner-err-mid", 0, err_msg))
+
     def test_execute_bus_job_recovers_false_error_and_preserves_true_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             bridge = _load_isolated_bridge(tmp, extra_env={"HOME": tmp})

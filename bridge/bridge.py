@@ -2354,7 +2354,19 @@ _API_ATTEMPT_ERROR_RE = re.compile(r"^\s*API error \(attempt \d+\):")
 
 
 def _is_recovered_attempt_error(cid, start_line, raw_err):
-    """Return True only when an `API error (attempt N):` was fully recovered in transcript.jsonl."""
+    """Return True only when an `API error (attempt N):` was recovered in transcript.jsonl.
+
+    Recovery contract (for entries at or after `start_line`):
+    - At least one `ERROR_MESSAGE` exists in this turn, and `tail` (entries after the
+      last `ERROR_MESSAGE`) is non-empty.
+    - Intermediate tool/step failures (`type == "GENERIC"` with `status == "ERROR"`) are
+      explicitly allowed so the model can continue reasoning and finish after a failed
+      tool call; however, any unrecovered `ERROR_MESSAGE` or other non-`DONE` intermediate
+      status (e.g. `RUNNING`, `PENDING`, or non-`GENERIC` `ERROR`) rejects recovery.
+    - The terminal entry must be a `PLANNER_RESPONSE` with `status == "DONE"`, non-empty
+      string `content`, and no `tool_calls` (checks terminal completion rather than full
+      historical tool-call ID pairing).
+    """
     if not cid or not raw_err:
         return False
     if not _API_ATTEMPT_ERROR_RE.match(str(raw_err)):
@@ -2398,6 +2410,8 @@ def _is_recovered_attempt_error(cid, start_line, raw_err):
         if obj.get("type") == "ERROR_MESSAGE":
             return False
         st = obj.get("status")
+        # Allow intermediate tool/step GENERIC ERROR followed by model recovery;
+        # reject any other unclosed/non-DONE state or non-GENERIC error.
         if st not in (None, "DONE") and not (obj.get("type") == "GENERIC" and st == "ERROR"):
             return False
 

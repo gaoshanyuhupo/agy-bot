@@ -26,8 +26,10 @@ import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import logging
+import math
 import os
 from pathlib import Path
+import queue
 import re
 import secrets
 import shlex
@@ -660,16 +662,27 @@ def transform_chat_request(
     out.pop("max_tokens", None)
 
     if raw_max is not None and max_tokens_field != "omit":
-        try:
-            tok_val = int(raw_max)
-            if max_tokens_cap is not None and int(max_tokens_cap) > 0:
-                tok_val = min(tok_val, int(max_tokens_cap))
-            if max_tokens_field == "max_completion_tokens":
-                out["max_completion_tokens"] = tok_val
-            elif max_tokens_field == "max_tokens":
-                out["max_tokens"] = tok_val
-        except (TypeError, ValueError):
-            pass
+        if not isinstance(raw_max, bool) and (not isinstance(raw_max, float) or math.isfinite(raw_max)):
+            try:
+                tok_val: Optional[int] = int(raw_max)
+            except (TypeError, ValueError, OverflowError):
+                tok_val = None
+            if tok_val is not None:
+                if (
+                    max_tokens_cap is not None
+                    and not isinstance(max_tokens_cap, bool)
+                    and (not isinstance(max_tokens_cap, float) or math.isfinite(max_tokens_cap))
+                ):
+                    try:
+                        cap_val = int(max_tokens_cap)
+                        if cap_val > 0:
+                            tok_val = min(tok_val, cap_val)
+                    except (TypeError, ValueError, OverflowError):
+                        pass
+                if max_tokens_field == "max_completion_tokens":
+                    out["max_completion_tokens"] = tok_val
+                elif max_tokens_field == "max_tokens":
+                    out["max_tokens"] = tok_val
 
     return out
 
@@ -835,7 +848,7 @@ def _normalize_tool_calls_list(
                     last_idx_box[0] = idx_int
                     if idx_int >= next_idx_box[0]:
                         next_idx_box[0] = idx_int + 1
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 pass
         out.append(item)
     return out
@@ -961,6 +974,7 @@ class SSEStreamNormalizer:
         self._next_tc_idx: Dict[int, List[int]] = {}
         self._last_tc_idx: Dict[int, List[int]] = {}
         self.saw_done: bool = False
+        self.saw_error: bool = False
 
     def process_line(self, raw_line: str) -> Optional[bytes]:
         line = raw_line.rstrip("\r\n")
@@ -986,12 +1000,27 @@ class SSEStreamNormalizer:
         if not isinstance(chunk, dict):
             return (line + "\n\n").encode("utf-8")
 
+        if chunk.get("error") and not chunk.get("choices"):
+            self.saw_error = True
+            return f"data: UPSTREAM_ERROR {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8")
+
         choices = chunk.get("choices")
         if isinstance(choices, list):
             for pos, ch in enumerate(choices):
                 if not isinstance(ch, dict):
                     continue
-                c_idx = int(ch.get("index") if ch.get("index") is not None else pos)
+                raw_c_idx = ch.get("index")
+                if (
+                    raw_c_idx is not None
+                    and not isinstance(raw_c_idx, bool)
+                    and (not isinstance(raw_c_idx, float) or math.isfinite(raw_c_idx))
+                ):
+                    try:
+                        c_idx = int(raw_c_idx)
+                    except (TypeError, ValueError, OverflowError):
+                        c_idx = pos
+                else:
+                    c_idx = pos
                 delta = ch.get("delta")
                 if isinstance(delta, dict) and isinstance(delta.get("tool_calls"), list) and delta["tool_calls"]:
                     self._saw_tool_calls[c_idx] = True
@@ -1010,7 +1039,7 @@ class SSEStreamNormalizer:
         return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8")
 
     def finalize(self) -> Optional[bytes]:
-        if not self.saw_done:
+        if not self.saw_done and not self.saw_error:
             self.saw_done = True
             return b"data: [DONE]\n\n"
         return None
@@ -1419,7 +1448,10 @@ class GatewayAdapterServer:
                             "code": code,
                         }
                     }
-                    frame = f"data: {json.dumps(err_obj, ensure_ascii=False)}\n\n".encode("utf-8")
+                    # Prefix with UPSTREAM_ERROR so strict OpenAI SSE clients (including `agy`,
+                    # which ignores top-level `error` keys in JSON SSE chunks) fail fast with
+                    # the upstream status/message instead of treating the stream as empty output.
+                    frame = f"data: UPSTREAM_ERROR {json.dumps(err_obj, ensure_ascii=False)}\n\n".encode("utf-8")
                     if not self._safe_write(frame, flush=False):
                         return False
                     return self._safe_write(b"data: [DONE]\n\n", flush=True)
@@ -1601,11 +1633,107 @@ class GatewayAdapterServer:
 
                         if resp is None:
                             return {"kind": "no_response", "resp": None, "exc": None, "status": 502, "ctype": "", "body": b""}
+                        ctype_low = (resp.headers.get("Content-Type") or "").lower()
+                        if resp.status_code != 200 or "text/event-stream" not in ctype_low:
+                            try:
+                                _ = resp.content
+                            except Exception as exc:
+                                return {"kind": "conn_error", "resp": None, "exc": exc, "status": 502, "ctype": "", "body": b""}
                         res = {"kind": "response", "resp": resp, "exc": None, "status": resp.status_code, "ctype": "", "body": b""}
                         resp = None
                         return res
                     finally:
                         self._close_resp_quiet(resp)
+
+                def _stream_sse_with_keepalive(
+                    self,
+                    resp: Any,
+                    norm: SSEStreamNormalizer,
+                    cancel_ev: Optional[threading.Event],
+                    req_started_at: float,
+                    keepalive_active: bool,
+                ) -> None:
+                    line_q: "queue.Queue[Tuple[str, Any]]" = queue.Queue(maxsize=256)
+                    effective_cancel = cancel_ev if cancel_ev is not None else threading.Event()
+
+                    def _put_item(item: Tuple[str, Any]) -> bool:
+                        while not effective_cancel.is_set():
+                            try:
+                                line_q.put(item, timeout=0.2)
+                                return True
+                            except queue.Full:
+                                continue
+                        return False
+
+                    def _reader() -> None:
+                        terminal_sent = False
+                        try:
+                            for raw_line in resp.iter_lines(chunk_size=None, decode_unicode=False):
+                                if effective_cancel.is_set():
+                                    return
+                                if raw_line is None:
+                                    continue
+                                if not _put_item(("line", raw_line)):
+                                    return
+                            terminal_sent = True
+                            _put_item(("eof", None))
+                        except Exception as exc:
+                            logger.warning("Gateway SSE reader failed: %s", type(exc).__name__)
+                            terminal_sent = True
+                            _put_item(("err", exc))
+                        finally:
+                            if not terminal_sent and not effective_cancel.is_set():
+                                _put_item(("err", RuntimeError("sse reader terminated unexpectedly")))
+
+                    threading.Thread(target=_reader, daemon=True, name="agy-gw-sse-reader").start()
+                    last_activity_at = time.monotonic() if keepalive_active else req_started_at
+                    try:
+                        while True:
+                            if effective_cancel.is_set():
+                                return
+                            if keepalive_active:
+                                wait_s = adapter.preheader_keepalive_interval_s
+                            else:
+                                elapsed = max(0.0, time.monotonic() - last_activity_at)
+                                wait_s = max(0.01, adapter.preheader_keepalive_after_s - elapsed)
+                            try:
+                                kind, payload = line_q.get(timeout=wait_s)
+                            except queue.Empty:
+                                if not self._safe_write(b": keepalive\n\n", flush=True):
+                                    effective_cancel.set()
+                                    self._close_resp_quiet(resp)
+                                    return
+                                keepalive_active = True
+                                last_activity_at = time.monotonic()
+                                continue
+
+                            if kind == "eof":
+                                tail = norm.finalize()
+                                if tail:
+                                    if not self._safe_write(tail, flush=True):
+                                        effective_cancel.set()
+                                return
+                            if kind == "err":
+                                if not norm.saw_done:
+                                    self._send_sse_error(f"upstream stream error: {type(payload).__name__}", code=502)
+                                return
+                            if kind == "line":
+                                raw_line = payload
+                                line_str = (
+                                    bytes(raw_line).decode("utf-8", errors="replace")
+                                    if isinstance(raw_line, (bytes, bytearray))
+                                    else str(raw_line)
+                                )
+                                frame = norm.process_line(line_str)
+                                if frame:
+                                    if not self._safe_write(frame, flush=True):
+                                        effective_cancel.set()
+                                        self._close_resp_quiet(resp)
+                                        return
+                                    last_activity_at = time.monotonic()
+                    finally:
+                        if cancel_ev is None:
+                            effective_cancel.set()
 
                 def _write_chat_outcome(
                     self,
@@ -1613,6 +1741,9 @@ class GatewayAdapterServer:
                     client_wants_stream: bool,
                     sse_headers_sent: bool,
                     cancel_ev: Optional[threading.Event] = None,
+                    *,
+                    req_started_at: Optional[float] = None,
+                    keepalive_active: bool = False,
                 ) -> None:
                     kind = outcome.get("kind")
                     resp = outcome.get("resp")
@@ -1663,6 +1794,15 @@ class GatewayAdapterServer:
                                         cancel_ev.set()
                                     return
                             norm = SSEStreamNormalizer()
+                            if client_wants_stream and adapter.preheader_keepalive_after_s > 0:
+                                self._stream_sse_with_keepalive(
+                                    resp,
+                                    norm,
+                                    cancel_ev,
+                                    req_started_at if req_started_at is not None else time.monotonic(),
+                                    keepalive_active,
+                                )
+                                return
                             for raw_line in resp.iter_lines(chunk_size=None, decode_unicode=False):
                                 if cancel_ev is not None and cancel_ev.is_set():
                                     return
@@ -1758,6 +1898,9 @@ class GatewayAdapterServer:
                     except Exception:
                         self._send_json(400, {"error": {"message": "invalid JSON request body"}})
                         return
+                    if not isinstance(req_json, dict):
+                        self._send_json(400, {"error": {"message": "JSON request body must be an object"}})
+                        return
 
                     client_wants_stream = bool(req_json.get("stream"))
                     route_model = route.upstream_model if route else None
@@ -1783,6 +1926,7 @@ class GatewayAdapterServer:
                     done_ev = threading.Event()
                     cancel_ev = threading.Event()
                     outcome_lock = threading.Lock()
+                    req_started_at = time.monotonic()
                     shared_outcome: Dict[str, Any] = {
                         "kind": None,
                         "resp": None,
@@ -1793,23 +1937,81 @@ class GatewayAdapterServer:
                     }
 
                     def _worker() -> None:
-                        res = self._perform_chat_attempts(
-                            gw,
-                            target_url,
-                            req_json,
-                            headers,
-                            route_model,
-                            route_effort,
-                            cancel_ev=cancel_ev,
-                        )
-                        with outcome_lock:
-                            if cancel_ev.is_set():
-                                self._close_resp_quiet(res.get("resp"))
-                                res["resp"] = None
-                                shared_outcome["kind"] = "cancelled"
-                            else:
-                                shared_outcome.update(res)
-                        done_ev.set()
+                        res: Dict[str, Any] = {
+                            "kind": "conn_error",
+                            "resp": None,
+                            "exc": RuntimeError("worker terminated unexpectedly"),
+                            "status": 502,
+                            "ctype": "",
+                            "body": b"",
+                        }
+                        try:
+                            try:
+                                res = self._perform_chat_attempts(
+                                    gw,
+                                    target_url,
+                                    req_json,
+                                    headers,
+                                    route_model,
+                                    route_effort,
+                                    cancel_ev=cancel_ev,
+                                )
+                            except Exception as exc:
+                                logger.warning(
+                                    "Gateway %s upstream worker failed: %s",
+                                    gw.id,
+                                    type(exc).__name__,
+                                )
+                                res = {
+                                    "kind": "conn_error",
+                                    "resp": None,
+                                    "exc": exc,
+                                    "status": 502,
+                                    "ctype": "",
+                                    "body": b"",
+                                }
+                            with outcome_lock:
+                                if cancel_ev.is_set():
+                                    self._close_resp_quiet(res.get("resp") if isinstance(res, dict) else None)
+                                    if isinstance(res, dict):
+                                        res["resp"] = None
+                                    shared_outcome["kind"] = "cancelled"
+                                elif isinstance(res, dict):
+                                    shared_outcome.update(res)
+                                else:
+                                    shared_outcome.update(
+                                        {
+                                            "kind": "conn_error",
+                                            "resp": None,
+                                            "exc": TypeError("unexpected worker outcome"),
+                                            "status": 502,
+                                            "ctype": "",
+                                            "body": b"",
+                                        }
+                                    )
+                        except Exception as exc:
+                            logger.warning(
+                                "Gateway %s worker publish failed: %s",
+                                gw.id,
+                                type(exc).__name__,
+                            )
+                            self._close_resp_quiet(res.get("resp") if isinstance(res, dict) else None)
+                            with outcome_lock:
+                                if cancel_ev.is_set():
+                                    shared_outcome["kind"] = "cancelled"
+                                else:
+                                    shared_outcome.update(
+                                        {
+                                            "kind": "conn_error",
+                                            "resp": None,
+                                            "exc": exc,
+                                            "status": 502,
+                                            "ctype": "",
+                                            "body": b"",
+                                        }
+                                    )
+                        finally:
+                            done_ev.set()
 
                     threading.Thread(target=_worker, daemon=True, name="agy-gw-upstream").start()
 
@@ -1836,6 +2038,8 @@ class GatewayAdapterServer:
                             client_wants_stream,
                             sse_headers_sent=sse_headers_sent,
                             cancel_ev=cancel_ev,
+                            req_started_at=req_started_at,
+                            keepalive_active=sse_headers_sent,
                         )
                     finally:
                         cancel_ev.set()
