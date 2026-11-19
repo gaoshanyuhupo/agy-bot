@@ -1925,7 +1925,15 @@ class TelegramLiveCardPublisher:
             existing = self.cards.get(card_key)
             if existing and not force_new and existing.get("session_gen") == card_gen:
                 await self._update_card_locked(card_key, live_token, finished=False, force=True)
-                return self.cards.get(card_key)
+                if (
+                    self.hub.engine_mode == "idle"
+                    or self.hub.session_gen != card_gen
+                    or self.hub.session_owner != card_owner
+                    or not self._matches_session_owner(bot_key, chat_id)
+                ):
+                    return None
+                cur = self.cards.get(card_key)
+                return cur if (cur is not None and cur.get("session_gen") == card_gen) else None
             if existing and existing.get("session_gen") != card_gen:
                 # Preserve stale card's retirement retry tracking before sending a new card
                 self._stage_card_for_retire(existing, card_key=card_key)
@@ -2181,11 +2189,24 @@ class TelegramLiveCardPublisher:
             )
             if not ok_v2 or not live_token:
                 return False, msg_v2, 403
+            snap_gen = (
+                expected_session_gen
+                if expected_session_gen is not None
+                else self.hub.session_gen
+            )
             updated = await self._update_card_locked(
                 card_key, live_token, finished=False, force=True
             )
-            if card_key not in self.cards:
-                return False, "当前私聊卡片未授权或权限已撤销", 403
+            ok_post, msg_post, _ = self.verify_card_control(
+                bot_key,
+                chat_id,
+                message_id=message_id,
+                require_card=True,
+                require_running=True,
+                expected_session_gen=snap_gen,
+            )
+            if not ok_post:
+                return False, msg_post, 403
             if not updated:
                 return False, "Telegram 实况卡片刷新失败，请稍后重试", 502
             return True, "ok", 200
@@ -2301,6 +2322,8 @@ class TelegramLiveCardPublisher:
             self._drop_revoked_cards(bot_key, chat_id)
             return False
         token = live_token
+        snap_gen: int | None = None
+        snap_owner: tuple[str, int] | None = None
         if not finished and not allow_stale_gen:
             # Capture coherent same-generation snapshot and re-verify owner & session_gen
             # right before invoking Telegram API!
@@ -2360,11 +2383,11 @@ class TelegramLiveCardPublisher:
             content_type="image/jpeg",
         )
 
-        result = False
+        io_ok_clean = False
+        io_result = False
+        io_media_ok = False
+        io_retry_after: float | None = None
         try:
-            io_result = False
-            io_media_ok = False
-            io_retry_after: float | None = None
             async with self.http.post(
                 f"https://api.telegram.org/bot{token}/editMessageMedia", data=form
             ) as resp:
@@ -2399,23 +2422,19 @@ class TelegramLiveCardPublisher:
                                 log.debug("editMessageMedia (%s): %s", bot_key, desc)
                         if finished:
                             io_result = self._is_tg_retire_terminal_response(status, data)
-            # Commit card state & success only after async with __aexit__ exits cleanly
-            if io_media_ok:
-                card["last_sha1"] = sha
-                card["last_caption"] = caption
-                card["last_markup"] = markup
-                card["last_ts"] = time.monotonic()
-            elif io_retry_after is not None:
-                card["last_ts"] = time.monotonic() + io_retry_after
-            result = io_result
+            # Mark I/O clean only after async with __aexit__ exits cleanly
+            io_ok_clean = True
         except Exception as exc:
-            result = False
+            io_ok_clean = False
+            io_result = False
+            io_media_ok = False
+            io_retry_after = None
             log.debug("editMessageMedia error (%s): %s", bot_key, exc)
         except BaseException:
             self._recheck_auth_or_drop_locked(bot_key, chat_id)
             raise
 
-        # Re-check live admin RBAC inside lock after EVERY editMessageMedia I/O exit
+        # 1. Re-check live admin RBAC inside lock after EVERY editMessageMedia I/O exit
         # (200 ok, 429/5xx, non-200 / ok=false, malformed response, or transport/JSON exception).
         if not self._recheck_auth_or_drop_locked(bot_key, chat_id):
             log.info(
@@ -2423,8 +2442,34 @@ class TelegramLiveCardPublisher:
                 bot_key,
                 chat_id,
             )
-            return result if finished else False
-        return result
+            return (io_result if io_ok_clean else False) if finished else False
+
+        # 2. For live edits, re-verify session generation, owner, and card identity BEFORE
+        # committing any cache fields or returning success. Never pop `self.cards[card_key]`
+        # here so any concurrent `retire_cards()` waiting on `self._lock` completes retirement.
+        if not finished and not allow_stale_gen:
+            session_still_valid = (
+                self.hub.engine_mode != "idle"
+                and self.hub.session_gen == snap_gen
+                and self.hub.session_owner == snap_owner
+                and self._matches_session_owner(bot_key, chat_id)
+                and card.get("session_gen") == snap_gen
+                and (card_override is not None or self.cards.get(card_key) is card)
+            )
+            if not session_still_valid:
+                return False
+
+        if not io_ok_clean:
+            return False
+
+        if io_media_ok:
+            card["last_sha1"] = sha
+            card["last_caption"] = caption
+            card["last_markup"] = markup
+            card["last_ts"] = time.monotonic()
+        elif io_retry_after is not None:
+            card["last_ts"] = time.monotonic() + io_retry_after
+        return io_result
 
     async def send_clip_message(
         self, bot_key: str, text: str, preferred_user_id: int | None = None

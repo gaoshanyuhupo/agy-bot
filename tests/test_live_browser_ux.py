@@ -7377,5 +7377,563 @@ class TestRound13RefreshStatusAndNotModifiedRegression(unittest.TestCase):
             asyncio.run(_scenario())
 
 
+class TestRound14InFlightSessionInvalidation(unittest.TestCase):
+    """Round 14 regression: post-I/O session & card re-validation before cache commit or
+    returning success in `_update_card_locked`, `_refresh_single_card_with_status`, and `ensure_card`."""
+
+    @staticmethod
+    def _write_admin_env(env_path: Path, tok_main: str) -> None:
+        env_path.write_text(
+            f"AGY_TG_BOT_TOKEN={tok_main}\n"
+            f"AGY_TG_ALLOWED_CHATS=111\n"
+            f"AGY_TG_ADMIN_USERS=111\n",
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _seed_sync_hub(http_obj: Any, *, lease_id: str = "r14-lease-8") -> Any:
+        hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "sec-tok")
+        hub.tg.http = http_obj
+        hub.engine_mode = "sync_external"
+        hub.session_gen = 8
+        hub.session_owner = ("main", 111)
+        hub._sync_lease_id = lease_id
+        hub.latest_jpeg = b"JPEG_R14_SYNC_FRAME"
+        hub.tg.cards[("main", 111)] = {
+            "bot_key": "main",
+            "chat_id": 111,
+            "message_id": 702,
+            "session_gen": 8,
+            "owner": ("main", 111),
+            "last_sha1": "prev_sha",
+            "last_caption": "prev_cap",
+            "last_markup": "prev_markup",
+            "last_ts": 12.5,
+        }
+        hub.tg.pending_retire_cards[("main", 111, 701)] = {
+            "bot_key": "main",
+            "chat_id": 111,
+            "message_id": 701,
+            "session_gen": 7,
+            "owner": ("main", 111),
+            "last_sha1": "old_sha",
+            "last_caption": "old_cap",
+            "last_markup": None,
+            "last_ts": 0.0,
+        }
+        return hub
+
+    @staticmethod
+    def _make_refresh_req(hub: Any, *, mid: int = 702) -> Any:
+        return types.SimpleNamespace(
+            headers={"X-Live-Token": "sec-tok"},
+            remote="127.0.0.1",
+            app={"hub": hub},
+            json=mock.AsyncMock(
+                return_value={
+                    "refresh_card": True,
+                    "bot": "main",
+                    "chat_id": 111,
+                    "message_id": mid,
+                    "from_card": True,
+                    "source": "tg_card",
+                }
+            ),
+        )
+
+    @staticmethod
+    def _make_stop_req(hub: Any, *, lease_id: str = "r14-lease-8", session_gen: int = 8) -> Any:
+        return types.SimpleNamespace(
+            headers={
+                "X-Live-Token": "sec-tok",
+                "X-Sync-Lease-Id": lease_id,
+                "X-Sync-Session-Gen": str(session_gen),
+            },
+            query={},
+            remote="127.0.0.1",
+            app={"hub": hub},
+        )
+
+    def test_inflight_real_sync_stop_during_refresh_returns_403_no_stale_cache_and_retires_cleanly(self) -> None:
+        """Keep admin + sync_external (gen=8, card=702). Pause editMessageMedia in __aexit__
+        across 400 not modified, 200 ok, 503 ok=false, and 200 ok + __aexit__ ConnectionError
+        while real `internal_sync_stop` invalidates gen 8 -> 9 and waits on publisher lock:
+        - ALL cases MUST return HTTP 403 / ok=false (never 200 or 502)
+        - Bridge card_refresh callback MUST alert failure (never '📸 实况卡片已刷新')
+        - 702 cache (last_sha1/last_caption/last_markup/last_ts) MUST NOT be written before retire
+        - Waiting `retire_cards` MUST acquire lock and finish retiring 702 cleanly."""
+        import importlib
+        import os
+
+        tok_main = "991401:TEST_ROUND14_STOP_RACE"
+        with tempfile.TemporaryDirectory() as tmp:
+            bdir = Path(tmp)
+            env_path = bdir / ".env"
+            self._write_admin_env(env_path, tok_main)
+
+            class _StopRaceHTTP:
+                def __init__(
+                    self,
+                    status_code: int,
+                    payload: dict,
+                    reached_aexit: asyncio.Event,
+                    release_aexit: asyncio.Event,
+                    aexit_exc: Exception | None = None,
+                ) -> None:
+                    self._status = status_code
+                    self._payload = payload
+                    self._reached_aexit = reached_aexit
+                    self._release_aexit = release_aexit
+                    self._aexit_exc = aexit_exc
+                    self.calls: list[tuple[str, int, bool]] = []
+                    self.publisher_ref: Any = None
+
+                def post(self, url: str, data=None, json=None):
+                    method = url.rsplit("/", 1)[-1]
+                    fields = dict(getattr(data, "fields", {}) or {}) if data is not None else dict(json or {})
+                    mid = int(fields.get("message_id") or 0)
+                    locked_now = bool(self.publisher_ref is not None and self.publisher_ref._lock.locked())
+                    is_first = len(self.calls) == 0
+                    self.calls.append((method, mid, locked_now))
+
+                    if not is_first:
+                        class _RetireResp:
+                            status = 200
+
+                            async def __aenter__(self_r):
+                                return self_r
+
+                            async def __aexit__(self_r, *_a):
+                                return False
+
+                            async def json(self_r):
+                                return {"ok": True, "result": {"message_id": mid}}
+
+                        return _RetireResp()
+
+                    status_code = self._status
+                    payload = self._payload
+                    reached_aexit = self._reached_aexit
+                    release_aexit = self._release_aexit
+                    aexit_exc = self._aexit_exc
+
+                    class _RefreshResp:
+                        status = status_code
+
+                        async def __aenter__(self_r):
+                            return self_r
+
+                        async def json(self_r):
+                            return payload
+
+                        async def __aexit__(self_r, *_a):
+                            reached_aexit.set()
+                            await release_aexit.wait()
+                            if aexit_exc is not None:
+                                raise aexit_exc
+                            return False
+
+                    return _RefreshResp()
+
+            cases = [
+                (
+                    "400_not_modified",
+                    400,
+                    {
+                        "ok": False,
+                        "error_code": 400,
+                        "description": "Bad Request: message is not modified",
+                    },
+                    None,
+                ),
+                (
+                    "200_ok_true",
+                    200,
+                    {"ok": True, "result": {"message_id": 702}},
+                    None,
+                ),
+                (
+                    "503_ok_false",
+                    503,
+                    {"ok": False, "error_code": 503, "description": "Service Unavailable"},
+                    None,
+                ),
+                (
+                    "200_ok_aexit_connection_error",
+                    200,
+                    {"ok": True, "result": {"message_id": 702}},
+                    ConnectionError("close drop after 200 during concurrent stop"),
+                ),
+            ]
+
+            collected_responses: dict[str, Any] = {}
+
+            async def _scenario() -> None:
+                for label, status_code, payload, aexit_exc in cases:
+                    reached_aexit, release_aexit = asyncio.Event(), asyncio.Event()
+                    http_obj = _StopRaceHTTP(
+                        status_code, payload, reached_aexit, release_aexit, aexit_exc=aexit_exc
+                    )
+                    hub = self._seed_sync_hub(http_obj)
+                    http_obj.publisher_ref = hub.tg
+                    record = hub.tg.cards[("main", 111)]
+
+                    pre_retire_cache_snapshots: list[tuple[Any, Any, Any, Any]] = []
+
+                    with (
+                        mock.patch.object(srv, "_BRIDGE_DIR", bdir),
+                        mock.patch.object(srv, "BRIDGE_ENV_FILES", {"main": env_path}),
+                        mock.patch.object(srv, "FormData", _FakeFormData),
+                        mock.patch.object(srv, "web", _FakeWeb),
+                    ):
+                        refresh_task = asyncio.create_task(
+                            srv.internal_config(self._make_refresh_req(hub))  # type: ignore[arg-type]
+                        )
+                        await asyncio.wait_for(reached_aexit.wait(), timeout=2.0)
+
+                        # Real internal_sync_stop invalidates gen 8 -> 9 and blocks on hub.tg._lock
+                        stop_task = asyncio.create_task(
+                            srv.internal_sync_stop(self._make_stop_req(hub))  # type: ignore[arg-type]
+                        )
+                        for _ in range(20):
+                            if hub.engine_mode == "idle" and hub.session_gen == 9:
+                                break
+                            await asyncio.sleep(0)
+
+                        self.assertEqual("idle", hub.engine_mode, label)
+                        self.assertEqual(9, hub.session_gen, label)
+                        self.assertIsNone(hub.session_owner, label)
+                        self.assertIsNone(hub._sync_lease_id, label)
+                        self.assertIsNone(hub.latest_jpeg, label)
+                        self.assertTrue(hub.tg._lock.locked(), label)
+                        self.assertIs(hub.tg.cards.get(("main", 111)), record, label)
+                        self.assertFalse(stop_task.done(), label)
+
+                        # Snapshot card cache inside refresh_task BEFORE retire_cards runs on `record`
+                        def _inspecting_json_response(data, status=200):
+                            if asyncio.current_task() is refresh_task:
+                                pre_retire_cache_snapshots.append(
+                                    (
+                                        record["last_sha1"],
+                                        record["last_caption"],
+                                        record["last_markup"],
+                                        record["last_ts"],
+                                    )
+                                )
+                            return _FakeWeb.json_response(data, status=status)
+
+                        with mock.patch.object(
+                            srv,
+                            "web",
+                            types.SimpleNamespace(
+                                json_response=_inspecting_json_response,
+                                HTTPForbidden=_FakeWeb.HTTPForbidden,
+                            ),
+                        ):
+                            release_aexit.set()
+                            refresh_resp, stop_resp = await asyncio.wait_for(
+                                asyncio.gather(refresh_task, stop_task), timeout=2.0
+                            )
+
+                        collected_responses[label] = refresh_resp
+                        self.assertEqual(403, refresh_resp.status, f"{label}: must return HTTP 403")
+                        self.assertFalse(refresh_resp.data.get("ok"), f"{label}: ok must be False")
+                        self.assertEqual(
+                            [("prev_sha", "prev_cap", "prev_markup", 12.5)],
+                            pre_retire_cache_snapshots,
+                            f"{label}: stale refresh must NOT write card cache before retire",
+                        )
+
+                        # Real stop handler must complete retirement of 702 cleanly
+                        self.assertEqual(200, stop_resp.status, label)
+                        self.assertTrue(stop_resp.data.get("ok"), label)
+                        self.assertNotIn(("main", 111), hub.tg.cards, f"{label}: 702 must be retired")
+                        self.assertNotIn(
+                            ("main", 111, 702),
+                            hub.tg.pending_retire_cards,
+                            f"{label}: 702 retirement must complete cleanly",
+                        )
+                        self.assertIn(
+                            ("main", 111, 701),
+                            hub.tg.pending_retire_cards,
+                            f"{label}: gen-7 pending card 701 must remain untouched",
+                        )
+                        self.assertEqual(
+                            [("editMessageMedia", 702, True), ("editMessageMedia", 702, True)],
+                            http_obj.calls,
+                            f"{label}: retire_cards must execute final-JPEG editMessageMedia under lock",
+                        )
+
+            asyncio.run(_scenario())
+
+            # Verify bridge `browser:card_refresh` alerts failure on 403 (never '📸 实况卡片已刷新')
+            cfg_dir = bdir / "live-cfg"
+            cfg_dir.mkdir(parents=True, exist_ok=True)
+            (cfg_dir / "local.token").write_text("sec-tok", encoding="utf-8")
+            bridge_dir = str(REPO_ROOT / "bridge")
+            added_path = bridge_dir not in sys.path
+            if added_path:
+                sys.path.insert(0, bridge_dir)
+            try:
+                env_patch = {
+                    "AGY_BOT_BUS_DIR": str(bdir / "bus"),
+                    "AGY_TG_STATE_FILE": str(bdir / "state.json"),
+                    "AGY_TG_WORKDIR": str(bdir / "workdir"),
+                    "AGY_TG_LOCK_DIR": str(bdir / "locks"),
+                    "AGY_TG_ALLOWED_CHATS": "111",
+                    "AGY_TG_ADMIN_USERS": "111",
+                    "AGY_TG_BOT_TOKEN": tok_main,
+                    "AGY_TG_ENV_FILE": str(env_path),
+                    "AGY_LIVE_BROWSER_URL": "http://127.0.0.1:18795",
+                    "AGY_LIVE_BROWSER_CONFIG_DIR": str(cfg_dir),
+                }
+                with mock.patch.dict(os.environ, env_patch, clear=False):
+                    import access_control  # noqa: E402
+                    import bot_bus  # noqa: E402
+                    import bridge  # noqa: E402
+
+                    importlib.reload(access_control)
+                    importlib.reload(bot_bus)
+                    importlib.reload(bridge)
+                    os.makedirs(bridge.WORKDIR, exist_ok=True)
+                    os.makedirs(bridge.UPLOADDIR, exist_ok=True)
+                    bridge.BOT_META.update({"bot_id": 991401, "handle": "test_r14_bot", "resolved": True})
+
+                    for label, srv_resp in collected_responses.items():
+                        tg_calls: list[tuple[str, dict]] = []
+
+                        def _fake_tg(method: str, **kw):
+                            tg_calls.append((method, dict(kw)))
+                            return {"ok": True}
+
+                        def _fake_post(_url: str, headers=None, json=None, timeout=None, _r=srv_resp):
+                            return types.SimpleNamespace(status_code=_r.status, json=lambda: _r.data)
+
+                        with (
+                            mock.patch.object(bridge, "tg", side_effect=_fake_tg),
+                            mock.patch.object(bridge.requests, "post", side_effect=_fake_post),
+                        ):
+                            bridge.handle_callback(
+                                {
+                                    "id": f"cb-r14-{label}",
+                                    "from": {"id": 111},
+                                    "message": {"chat": {"id": 111}, "message_id": 702},
+                                    "data": "browser:card_refresh",
+                                }
+                            )
+
+                        answers = [kw for m, kw in tg_calls if m == "answerCallbackQuery"]
+                        self.assertEqual(1, len(answers), label)
+                        self.assertTrue(answers[0].get("show_alert"), label)
+                        self.assertNotIn("📸 实况卡片已刷新", str(answers[0].get("text") or ""), label)
+            finally:
+                if added_path and bridge_dir in sys.path:
+                    sys.path.remove(bridge_dir)
+
+    def test_inflight_same_owner_reopen_rejects_refresh_without_expected_gen_and_ensure_card_reuse(self) -> None:
+        """Control tests for same-owner rapid reopen (session_gen 8 -> 9, engine_mode != idle)
+        and `ensure_card(force_new=False)` reuse during in-flight stop:
+        1) Direct `refresh_single_card(..., expected_session_gen=None)` and `internal_config`
+           both reject (False / HTTP 403), do NOT commit stale cache, and leave old card in `cards`
+           for concurrent `retire_cards(session_gen=8)`.
+        2) `ensure_card(force_new=False)` when session stops in flight returns `None`, does NOT
+           commit stale cache, and lets `internal_sync_stop` retire card 702 cleanly."""
+        tok_main = "991402:TEST_ROUND14_REOPEN_AND_ENSURE"
+        with tempfile.TemporaryDirectory() as tmp:
+            bdir = Path(tmp)
+            env_path = bdir / ".env"
+            self._write_admin_env(env_path, tok_main)
+
+            class _GatedAexitHTTP:
+                def __init__(
+                    self,
+                    status_code: int,
+                    payload: dict,
+                    reached: asyncio.Event,
+                    release: asyncio.Event,
+                ) -> None:
+                    self._status = status_code
+                    self._payload = payload
+                    self._reached = reached
+                    self._release = release
+                    self.calls: list[tuple[str, int]] = []
+
+                def post(self, url: str, data=None, json=None):
+                    method = url.rsplit("/", 1)[-1]
+                    fields = dict(getattr(data, "fields", {}) or {}) if data is not None else dict(json or {})
+                    mid = int(fields.get("message_id") or 0)
+                    is_first = len(self.calls) == 0
+                    self.calls.append((method, mid))
+                    if not is_first:
+                        class _OkResp:
+                            status = 200
+
+                            async def __aenter__(self_r):
+                                return self_r
+
+                            async def __aexit__(self_r, *_a):
+                                return False
+
+                            async def json(self_r):
+                                return {"ok": True, "result": {"message_id": mid}}
+
+                        return _OkResp()
+
+                    status_code = self._status
+                    payload = self._payload
+                    reached = self._reached
+                    release = self._release
+
+                    class _FirstResp:
+                        status = status_code
+
+                        async def __aenter__(self_r):
+                            return self_r
+
+                        async def json(self_r):
+                            return payload
+
+                        async def __aexit__(self_r, *_a):
+                            reached.set()
+                            await release.wait()
+                            return False
+
+                    return _FirstResp()
+
+            payloads = [
+                ("200_ok", 200, {"ok": True, "result": {"message_id": 702}}),
+                (
+                    "400_not_modified",
+                    400,
+                    {
+                        "ok": False,
+                        "error_code": 400,
+                        "description": "Bad Request: message is not modified",
+                    },
+                ),
+            ]
+
+            async def _scenario() -> None:
+                with (
+                    mock.patch.object(srv, "_BRIDGE_DIR", bdir),
+                    mock.patch.object(srv, "BRIDGE_ENV_FILES", {"main": env_path}),
+                    mock.patch.object(srv, "FormData", _FakeFormData),
+                    mock.patch.object(srv, "web", _FakeWeb),
+                ):
+                    # 1. In-flight stop + immediate same-owner reopen (gen 8 -> 9, engine_mode != idle)
+                    for label, status_code, payload in payloads:
+                        # 1a. Direct refresh_single_card WITHOUT expected_session_gen
+                        reached, release = asyncio.Event(), asyncio.Event()
+                        http_direct = _GatedAexitHTTP(status_code, payload, reached, release)
+                        hub_direct = self._seed_sync_hub(http_direct)
+                        rec_direct = hub_direct.tg.cards[("main", 111)]
+
+                        task_direct = asyncio.create_task(
+                            hub_direct.tg.refresh_single_card("main", 111, message_id=702)
+                        )
+                        await asyncio.wait_for(reached.wait(), timeout=2.0)
+
+                        # Simulate stop + immediate reopen by the SAME owner (gen 8 -> 9)
+                        hub_direct._invalidate_sync_session_sync()
+                        hub_direct.engine_mode = "sync_external"
+                        hub_direct.session_owner = ("main", 111)
+                        hub_direct.latest_jpeg = b"JPEG_R14_GEN9_FRAME"
+                        self.assertEqual(9, hub_direct.session_gen, label)
+
+                        release.set()
+                        ok_d, msg_d = await asyncio.wait_for(task_direct, timeout=2.0)
+                        self.assertFalse(ok_d, f"{label} direct: must reject stale gen even without expected_session_gen")
+                        self.assertIn("代次", msg_d, label)
+                        self.assertIs(hub_direct.tg.cards.get(("main", 111)), rec_direct, label)
+                        self.assertEqual("prev_sha", rec_direct["last_sha1"], label)
+                        self.assertEqual("prev_cap", rec_direct["last_caption"], label)
+                        self.assertEqual("prev_markup", rec_direct["last_markup"], label)
+                        self.assertEqual(12.5, rec_direct["last_ts"], label)
+
+                        # 1b. internal_config under the same reopen race -> HTTP 403, no cache commit
+                        reached2, release2 = asyncio.Event(), asyncio.Event()
+                        http_cfg = _GatedAexitHTTP(status_code, payload, reached2, release2)
+                        hub_cfg = self._seed_sync_hub(http_cfg)
+                        rec_cfg = hub_cfg.tg.cards[("main", 111)]
+
+                        task_cfg = asyncio.create_task(
+                            srv.internal_config(self._make_refresh_req(hub_cfg))  # type: ignore[arg-type]
+                        )
+                        await asyncio.wait_for(reached2.wait(), timeout=2.0)
+
+                        hub_cfg._invalidate_sync_session_sync()
+                        hub_cfg.engine_mode = "sync_external"
+                        hub_cfg.session_owner = ("main", 111)
+                        hub_cfg.latest_jpeg = b"JPEG_R14_GEN9_FRAME"
+
+                        release2.set()
+                        resp_cfg = await asyncio.wait_for(task_cfg, timeout=2.0)
+                        self.assertEqual(403, resp_cfg.status, f"{label} cfg: must return HTTP 403")
+                        self.assertFalse(resp_cfg.data.get("ok"), label)
+                        self.assertIs(hub_cfg.tg.cards.get(("main", 111)), rec_cfg, label)
+                        self.assertEqual("prev_sha", rec_cfg["last_sha1"], label)
+                        self.assertEqual("prev_cap", rec_cfg["last_caption"], label)
+                        self.assertEqual("prev_markup", rec_cfg["last_markup"], label)
+                        self.assertEqual(12.5, rec_cfg["last_ts"], label)
+
+                        # 2. ensure_card(force_new=False) reuse during real internal_sync_stop
+                        reached3, release3 = asyncio.Event(), asyncio.Event()
+                        http_ens = _GatedAexitHTTP(status_code, payload, reached3, release3)
+                        hub_ens = self._seed_sync_hub(http_ens)
+                        rec_ens = hub_ens.tg.cards[("main", 111)]
+
+                        pre_retire_cache: list[tuple[Any, Any, Any, Any]] = []
+                        orig_retire = hub_ens.tg._retire_card_record_locked
+
+                        async def _spy_retire(*args, **kwargs):
+                            pre_retire_cache.append(
+                                (
+                                    rec_ens["last_sha1"],
+                                    rec_ens["last_caption"],
+                                    rec_ens["last_markup"],
+                                    rec_ens["last_ts"],
+                                )
+                            )
+                            return await orig_retire(*args, **kwargs)
+
+                        hub_ens.tg._retire_card_record_locked = _spy_retire
+
+                        ens_task = asyncio.create_task(
+                            hub_ens.tg.ensure_card("main", force_new=False, preferred_user_id=111)
+                        )
+                        await asyncio.wait_for(reached3.wait(), timeout=2.0)
+
+                        stop_task = asyncio.create_task(
+                            srv.internal_sync_stop(self._make_stop_req(hub_ens))  # type: ignore[arg-type]
+                        )
+                        for _ in range(20):
+                            if hub_ens.engine_mode == "idle" and hub_ens.session_gen == 9:
+                                break
+                            await asyncio.sleep(0)
+                        self.assertEqual("idle", hub_ens.engine_mode, label)
+                        self.assertFalse(stop_task.done(), label)
+
+                        release3.set()
+                        ens_res, stop_resp = await asyncio.wait_for(
+                            asyncio.gather(ens_task, stop_task), timeout=2.0
+                        )
+                        self.assertIsNone(ens_res, f"{label} ensure_card: must return None when stopped in flight")
+                        self.assertEqual(200, stop_resp.status, label)
+                        self.assertTrue(stop_resp.data.get("ok"), label)
+                        self.assertEqual(
+                            [("prev_sha", "prev_cap", "prev_markup", 12.5)],
+                            pre_retire_cache,
+                            f"{label} ensure_card: stale reuse must NOT write cache before retire",
+                        )
+                        self.assertNotIn(("main", 111), hub_ens.tg.cards, label)
+                        self.assertEqual(
+                            [("editMessageMedia", 702), ("editMessageMedia", 702)],
+                            http_ens.calls,
+                            label,
+                        )
+
+            asyncio.run(_scenario())
+
+
 if __name__ == "__main__":
     unittest.main()
