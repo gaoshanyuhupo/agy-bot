@@ -608,6 +608,17 @@ class SyncLiveBridge:
                 if btn not in ("left", "right", "middle"):
                     btn = "left"
                 cursor_out = (x, y, "human")
+                # If this same button is already recorded as held on another page, release that
+                # original page first (if still open) so overwriting `held[btn]` never strands it!
+                if isinstance(held, dict):
+                    prev_page = held.get(btn)
+                    if prev_page is not None and prev_page is not page:
+                        held.pop(btn, None)
+                        if not self._is_raw_page_closed(prev_page):
+                            try:
+                                prev_page.mouse.up(button=btn)
+                            except Exception:
+                                pass
                 page.mouse.move(x, y)
                 if isinstance(held, dict):
                     held[btn] = page
@@ -623,9 +634,15 @@ class SyncLiveBridge:
                 orig_page = held.pop(btn, None) if isinstance(held, dict) else None
                 if not isinstance(held, dict):
                     held.discard(btn)
-                if orig_page is not None and orig_page is not page and not self._is_raw_page_closed(orig_page):
-                    # Tab switched while button was held: release precisely on the original pressed page!
-                    orig_page.mouse.up(button=btn)
+                if orig_page is not None and orig_page is not page:
+                    # Button was originally pressed on another page: release ONLY on that page if
+                    # still open; if the original page is already closed, drop the stale record and
+                    # NEVER fall back to sending mouse.up to an unrelated current page!
+                    if not self._is_raw_page_closed(orig_page):
+                        orig_page.mouse.up(button=btn)
+                elif orig_page is None and cmd.get("cleanup"):
+                    # Server-internal cleanup for a button not currently held: no-op
+                    pass
                 else:
                     page.mouse.move(x, y)
                     page.mouse.up(button=btn)
@@ -698,11 +715,17 @@ class SyncLiveBridge:
             elif act == "extract":
                 mode = str(cmd.get("mode") or "point")
                 req_id = cmd.get("req_id")
+                cmd_sgen = cmd.get("session_gen")
+                cmd_tgen = cmd.get("takeover_gen")
 
                 def _emit_extract(payload_dict: dict[str, Any]) -> None:
                     out_p = dict(payload_dict)
                     if req_id:
                         out_p["req_id"] = str(req_id)
+                    if cmd_sgen is not None:
+                        out_p["session_gen"] = cmd_sgen
+                    if cmd_tgen is not None:
+                        out_p["takeover_gen"] = cmd_tgen
                     self._push_clip(out_p)
 
                 if mode == "page":

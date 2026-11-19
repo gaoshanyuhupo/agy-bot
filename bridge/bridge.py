@@ -9063,9 +9063,22 @@ def _resolve_bot_username():
 
 
 def build_browser_panel(chat_id, from_user=None):
+    is_private = False
+    try:
+        is_private = int(chat_id) > 0
+    except Exception:
+        is_private = False
+
     bot_hint = _live_browser_bot_hint()
     owner_uid = _live_browser_owner_uid(chat_id, from_user=from_user)
-    status_params = {"source": "tg_cmd"}
+    status_params = {
+        "source": "tg_cmd",
+        "chat_scope": "private" if is_private else "group",
+    }
+    try:
+        status_params["chat_id"] = str(int(chat_id))
+    except Exception:
+        pass
     if bot_hint:
         status_params["bot"] = str(bot_hint)
     if owner_uid is not None:
@@ -9082,6 +9095,44 @@ def build_browser_panel(chat_id, from_user=None):
         )
         kb = {"inline_keyboard": [[{"text": "🔄 刷新状态", "callback_data": "browser:refresh"}]]}
         return text, kb
+
+    pub_url = str(st_data.get("public_url") or "").strip().rstrip("/")
+    direct_app_url = _resolve_live_browser_direct_app_url(st_data)
+
+    # Delivery-scope redaction: group chats NEVER display private session details
+    # (title, URL, profile, OS, egress, or profile list), even when invoked by the session owner.
+    if not is_private:
+        engine_mode_grp = str(st_data.get("engine_mode") or "idle")
+        is_busy_grp = (
+            bool(st_data.get("running"))
+            or bool(st_data.get("session_restricted"))
+            or engine_mode_grp != "idle"
+        )
+        state_badge_grp = (
+            "🔒 已占用 / 运行中（群聊已脱敏隔离，详情请前往私聊查看）"
+            if is_busy_grp
+            else "⚪ 待机中 (idle)"
+        )
+        lines = [
+            "<b>🎭 Live-Browser 控制面板</b>",
+            "━━━━━━━━━━━━━━━━━━━━",
+            f"• <b>运行状态：</b>{state_badge_grp}",
+            "• <b>隐私保护：</b><i>群聊仅展示安全占用/空闲状态，不展示会话标题、网址、指纹或出口信息，请前往私聊查看与控制。</i>",
+        ]
+        buttons = []
+        if direct_app_url.startswith("https://"):
+            buttons.append([{"text": "🖥 打开实时画面 (Direct App)", "url": direct_app_url}])
+            lines.append("\n💡 <i>群聊支持点击上方 Direct Link 入口打开实时画面。</i>")
+        elif pub_url.startswith("https://"):
+            bot_uname = _resolve_bot_username()
+            if bot_uname:
+                buttons.append([{
+                    "text": "🖥 去私聊一键打开实时画面",
+                    "url": f"https://t.me/{bot_uname}?start=browser",
+                }])
+            lines.append("\n💡 <i>群聊受 Telegram 限制不显示 web_app 按钮，点击上方按钮可一键跳转私聊查看详情并打开实时画面。</i>")
+        buttons.append([{"text": "🔄 刷新状态", "callback_data": "browser:refresh"}])
+        return "\n".join(lines), {"inline_keyboard": buttons}
 
     ok_prof, prof_data = _live_browser_request("GET", "/internal/profiles", timeout=(1.5, 3.0), params=status_params)
     profiles = (
@@ -9101,7 +9152,6 @@ def build_browser_panel(chat_id, from_user=None):
     ai_busy = False if restricted else bool(st_data.get("ai_busy"))
     cur_url = "" if restricted else str(st_data.get("url") or "")
     cur_title = "" if restricted else str(st_data.get("title") or "")
-    pub_url = str(st_data.get("public_url") or "").strip().rstrip("/")
 
     if restricted:
         state_badge = "🔒 已占用（其他授权会话或本机 CLI 持有，详情已隔离）"
@@ -9151,29 +9201,9 @@ def build_browser_panel(chat_id, from_user=None):
     else:
         lines.append("· <i>暂无已配置指纹</i>")
 
-    is_private = False
-    try:
-        is_private = int(chat_id) > 0
-    except Exception:
-        is_private = False
-
     buttons = []
-    direct_app_url = _resolve_live_browser_direct_app_url(st_data)
-    if is_private:
-        if pub_url.startswith("https://"):
-            buttons.append([{"text": "🖥 打开 Live-Browser Mini App", "web_app": {"url": pub_url}}])
-    else:
-        if direct_app_url.startswith("https://"):
-            buttons.append([{"text": "🖥 打开实时画面 (Direct App)", "url": direct_app_url}])
-            lines.append("\n💡 <i>群聊支持点击上方 Direct Link 入口直接打开实时画面。</i>")
-        elif pub_url.startswith("https://"):
-            bot_uname = _resolve_bot_username()
-            if bot_uname:
-                buttons.append([{
-                    "text": "🖥 去私聊一键打开实时画面",
-                    "url": f"https://t.me/{bot_uname}?start=browser",
-                }])
-            lines.append("\n💡 <i>群聊受 Telegram 限制不显示 web_app 按钮，点击上方按钮可一键跳转私聊打开实时画面。</i>")
+    if pub_url.startswith("https://"):
+        buttons.append([{"text": "🖥 打开 Live-Browser Mini App", "web_app": {"url": pub_url}}])
 
     action_btns = []
     if restricted:
@@ -9202,7 +9232,7 @@ def build_browser_panel(chat_id, from_user=None):
     else:
         buttons.append([{"text": "🔄 刷新状态", "callback_data": "browser:refresh"}])
 
-    if is_private and pub_url.startswith("https://"):
+    if pub_url.startswith("https://"):
         buttons.append([
             {"text": "📌 设为左下角菜单", "callback_data": "browser:menu_set"},
             {"text": "↩️ 恢复默认菜单", "callback_data": "browser:menu_reset"},

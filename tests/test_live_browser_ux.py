@@ -2245,14 +2245,16 @@ class TestRound2QABlockersAdversarialRegression(unittest.TestCase):
 
                     # 4. Sync extract forwarding applies strict field whitelist (strips rogue fields, blocks unknown modes & missing session_gen/takeover_gen)
                     hub.engine_mode = "sync_external"
+                    hub.takeover = False
                     hub.sync_cmd_queue.clear()
+                    ext_tgen = hub.takeover_gen
                     ws_sync_ext = _FakeWSViewer(
                         [
                             {"type": "auth", "initData": _signed_init_data(tok_main, 111)},
                             {"type": "extract", "mode": "point", "x": 12, "y": 34},  # missing both gens -> dropped!
                             {"type": "extract", "mode": "point", "x": 12, "y": 34, "session_gen": 4},  # missing takeover_gen -> dropped!
-                            {"type": "extract", "mode": "point", "x": 12, "y": 34, "session_gen": 4, "takeover_gen": hub.takeover_gen, "evil": "rm -rf /", "action": "goto"},
-                            {"type": "extract", "mode": "evil_mode", "x": 1, "y": 2, "session_gen": 4, "takeover_gen": hub.takeover_gen},
+                            {"type": "extract", "mode": "point", "x": 12, "y": 34, "session_gen": 4, "takeover_gen": ext_tgen, "evil": "rm -rf /", "action": "goto"},
+                            {"type": "extract", "mode": "evil_mode", "x": 1, "y": 2, "session_gen": 4, "takeover_gen": ext_tgen},
                         ]
                     )
                     with mock.patch.object(srv, "web", types.SimpleNamespace(WebSocketResponse=lambda **_kw: ws_sync_ext)):
@@ -2262,7 +2264,7 @@ class TestRound2QABlockersAdversarialRegression(unittest.TestCase):
                     self.assertEqual(1, len(popped_ext))
                     self.assertTrue(bool(popped_ext[0].get("req_id")))
                     self.assertEqual(
-                        {"action": "extract", "mode": "point", "session_gen": 4, "x": 12.0, "y": 34.0},
+                        {"action": "extract", "mode": "point", "session_gen": 4, "takeover_gen": ext_tgen, "x": 12.0, "y": 34.0},
                         {k: v for k, v in popped_ext[0].items() if k != "req_id"},
                     )
 
@@ -2873,17 +2875,20 @@ class TestRound4FinalClosureAdversarialRegression(unittest.TestCase):
                     hub.viewers.clear()
                     hub.viewer_meta.clear()
 
-                    # 4. Hosted extract post-await generation check: gen advances during extract -> result dropped!
+                    # 4. Hosted extract post-await dual-generation check: session_gen or takeover_gen advances -> dropped!
                     cur_g = hub.session_gen
+                    cur_t = hub.takeover_gen
+                    extract_called: list[str] = []
 
                     async def _slow_extract(_data: dict) -> dict:
+                        extract_called.append("sgen")
                         hub.session_gen += 1
                         return {"text": "LEAKED_OLD_GEN", "source": "point", "url": hub.url, "ts": time.time()}
 
                     ws_ext_stale = _FakeWSViewer(
                         [
                             {"type": "auth", "initData": _signed_init_data(tok_main, 111)},
-                            {"type": "extract", "mode": "point", "x": 10, "y": 10, "session_gen": cur_g},
+                            {"type": "extract", "mode": "point", "x": 10, "y": 10, "session_gen": cur_g, "takeover_gen": cur_t},
                         ]
                     )
                     with (
@@ -2891,9 +2896,36 @@ class TestRound4FinalClosureAdversarialRegression(unittest.TestCase):
                         mock.patch.object(srv, "web", types.SimpleNamespace(WebSocketResponse=lambda **_kw: ws_ext_stale)),
                     ):
                         await srv.handle_ws(req)  # type: ignore[arg-type]
+                    self.assertEqual(["sgen"], extract_called, "Test must enter extract_content_async before post-await drop")
                     self.assertFalse(
                         any(m.get("type") == "clipboard" for m in ws_ext_stale.sent_json),
-                        "Post-await stale-gen extract result MUST be dropped",
+                        "Post-await stale-session_gen extract result MUST be dropped",
+                    )
+
+                    # Also verify post-await takeover_gen change drops hosted extract result!
+                    cur_g2 = hub.session_gen
+                    cur_t2 = hub.takeover_gen
+
+                    async def _slow_extract_tgen(_data: dict) -> dict:
+                        extract_called.append("tgen")
+                        hub.takeover_gen += 1
+                        return {"text": "LEAKED_OLD_TGEN", "source": "point", "url": hub.url, "ts": time.time()}
+
+                    ws_ext_stale_t = _FakeWSViewer(
+                        [
+                            {"type": "auth", "initData": _signed_init_data(tok_main, 111)},
+                            {"type": "extract", "mode": "point", "x": 10, "y": 10, "session_gen": cur_g2, "takeover_gen": cur_t2},
+                        ]
+                    )
+                    with (
+                        mock.patch.object(hub, "extract_content_async", side_effect=_slow_extract_tgen),
+                        mock.patch.object(srv, "web", types.SimpleNamespace(WebSocketResponse=lambda **_kw: ws_ext_stale_t)),
+                    ):
+                        await srv.handle_ws(req)  # type: ignore[arg-type]
+                    self.assertEqual(["sgen", "tgen"], extract_called)
+                    self.assertFalse(
+                        any(m.get("type") == "clipboard" for m in ws_ext_stale_t.sent_json),
+                        "Post-await stale-takeover_gen extract result MUST be dropped",
                     )
 
                     # 5. Missing session_gen / takeover_gen on remote WS input, set_takeover & extract MUST be rejected!
@@ -3842,6 +3874,8 @@ class TestRound5FinalPolishRegression(unittest.TestCase):
                         "bot_key": "main",
                         "user_id": 111,
                         "session_gen": sgen,
+                        "takeover_gen": hub.takeover_gen,
+                        "owner": hub.session_owner,
                         "ws": ws_req,
                         "created_ts": time.monotonic(),
                     }
@@ -4123,6 +4157,550 @@ class TestRound5FinalPolishRegression(unittest.TestCase):
         ctl_src = (REPO_ROOT / ".agents/skills/live-browser/scripts/live_browser_ctl.py").read_text(encoding="utf-8")
         self.assertIn("Container-margin guard", ctl_src)
         self.assertIn("bestDist && d <= 60", ctl_src)
+
+
+class TestRound6FinalClosureRegression(unittest.TestCase):
+    """Round 6 synthetic regressions closing every remaining Round 5 QA gap."""
+
+    def test_round6_ws_lifecycle_strict_gen_commit_rbac_and_periodic_retire_race(self) -> None:
+        """Round 6 §3: strict lifecycle session_gen, pre-commit & pre-goto RBAC re-check, and periodic-update vs retire race."""
+        tok_main = "100:MAIN_TOK_R6_LIFE"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bdir = root / "bridge"
+            bdir.mkdir(parents=True, exist_ok=True)
+            env_main = bdir / ".env"
+            env_main.write_text(
+                f"AGY_TG_BOT_TOKEN={tok_main}\nAGY_TG_ALLOWED_CHATS=111,112\nAGY_TG_ADMIN_USERS=111\n",
+                encoding="utf-8",
+            )
+            cfg_dir = root / "cfg"
+            cfg_dir.mkdir(parents=True, exist_ok=True)
+            prof_dir = root / "profs"
+            prof_dir.mkdir(parents=True, exist_ok=True)
+
+            async def _scenario() -> None:
+                hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "sec-tok")
+                hub.session_gen = 5
+                fake_ws_type = types.SimpleNamespace(TEXT="TEXT", CLOSE="CLOSE")
+                req = types.SimpleNamespace(app={"hub": hub}, remote="127.0.0.1")
+
+                with (
+                    mock.patch.object(srv, "_BRIDGE_DIR", bdir),
+                    mock.patch.object(srv, "CONFIG_DIR", cfg_dir),
+                    mock.patch.object(srv, "PROFILES_FILE", cfg_dir / "profiles.json"),
+                    mock.patch.object(srv, "PROFILES_DATA_DIR", prof_dir),
+                    mock.patch.object(srv, "discover_pinned_host_profile", return_value=None),
+                    mock.patch.object(srv, "WSMsgType", fake_ws_type),
+                ):
+                    srv.create_profile("r6-prof", {"os": "linux", "persistent": False})
+
+                    # 3a. Missing/invalid/stale session_gen on start_browser / switch_profile / stop_browser MUST be rejected!
+                    start_spy = mock.AsyncMock()
+                    stop_spy = mock.AsyncMock(return_value=(True, "ok"))
+                    ws_bad_life = _FakeWSViewer(
+                        [
+                            {"type": "auth", "initData": _signed_init_data(tok_main, 111)},
+                            {"type": "start_browser", "profile": "r6-prof"},  # missing
+                            {"type": "start_browser", "profile": "r6-prof", "session_gen": "not-an-int"},  # invalid
+                            {"type": "start_browser", "profile": "r6-prof", "session_gen": 4},  # stale
+                            {"type": "switch_profile", "profile": "r6-prof"},  # missing
+                            {"type": "switch_profile", "profile": "r6-prof", "session_gen": 4},  # stale
+                            {"type": "stop_browser"},  # missing
+                            {"type": "stop_browser", "session_gen": 99},  # stale
+                        ]
+                    )
+                    with (
+                        mock.patch.object(srv, "web", types.SimpleNamespace(WebSocketResponse=lambda **_kw: ws_bad_life)),
+                        mock.patch.object(hub, "start_hosted", side_effect=start_spy),
+                        mock.patch.object(hub, "stop_hosted", side_effect=stop_spy),
+                    ):
+                        await srv.handle_ws(req)  # type: ignore[arg-type]
+                        await asyncio.sleep(0.02)
+                    start_spy.assert_not_called()
+                    stop_spy.assert_not_called()
+                    life_toasts = [m.get("message", "") for m in ws_bad_life.sent_json if m.get("type") == "toast"]
+                    self.assertGreaterEqual(len(life_toasts), 7)
+                    self.assertTrue(all("代次" in t for t in life_toasts))
+
+                    # 3b-1. Revoke admin RBAC during async CM __aenter__ -> MUST abort before publishing & close CM!
+                    cm_pre_commit: list[object] = []
+
+                    class _RevokeDuringEnterCM:
+                        def __init__(self, **_kw) -> None:
+                            self.exited = False
+                            self.page = _FakePage()
+                            self.page.goto = mock.AsyncMock()  # type: ignore[method-assign]
+                            self.ctx = _FakeCtx([self.page])
+                            cm_pre_commit.append(self)
+
+                        async def __aenter__(self):
+                            # Admin 111 revoked while Camoufox is starting!
+                            env_main.write_text(
+                                f"AGY_TG_BOT_TOKEN={tok_main}\nAGY_TG_ALLOWED_CHATS=112\nAGY_TG_ADMIN_USERS=112\n",
+                                encoding="utf-8",
+                            )
+                            return self.ctx
+
+                        async def __aexit__(self, *_a):
+                            self.exited = True
+
+                    with mock.patch.dict(
+                        sys.modules,
+                        {
+                            "camoufox": types.SimpleNamespace(),
+                            "camoufox.async_api": types.SimpleNamespace(AsyncCamoufox=_RevokeDuringEnterCM),
+                        },
+                    ):
+                        with self.assertRaises(PermissionError):
+                            await hub.start_hosted(
+                                initial_url="https://example.com/secret",
+                                profile="r6-prof",
+                                notify_tg=False,
+                                actor=("main", 111),
+                                source="ws",
+                                expected_session_gen=5,
+                            )
+                    self.assertEqual("idle", hub.engine_mode)
+                    self.assertIsNone(hub.ctx)
+                    self.assertTrue(cm_pre_commit and cm_pre_commit[0].exited)  # type: ignore[attr-defined]
+                    cm_pre_commit[0].page.goto.assert_not_called()  # type: ignore[attr-defined]
+
+                    # Restore admin 111
+                    env_main.write_text(
+                        f"AGY_TG_BOT_TOKEN={tok_main}\nAGY_TG_ALLOWED_CHATS=111,112\nAGY_TG_ADMIN_USERS=111\n",
+                        encoding="utf-8",
+                    )
+
+                    # 3b-2. Revoke admin RBAC during `await broadcast_state()` right before `page.goto()` -> abort, close CM, NO goto!
+                    cm_pre_goto: list[object] = []
+
+                    class _NormalCM:
+                        def __init__(self, **_kw) -> None:
+                            self.exited = False
+                            self.page = _FakePage()
+                            self.page.goto = mock.AsyncMock()  # type: ignore[method-assign]
+                            self.ctx = _FakeCtx([self.page])
+                            cm_pre_goto.append(self)
+
+                        async def __aenter__(self):
+                            return self.ctx
+
+                        async def __aexit__(self, *_a):
+                            self.exited = True
+
+                    async def _revoke_on_bcast() -> None:
+                        env_main.write_text(
+                            f"AGY_TG_BOT_TOKEN={tok_main}\nAGY_TG_ALLOWED_CHATS=112\nAGY_TG_ADMIN_USERS=112\n",
+                            encoding="utf-8",
+                        )
+
+                    with (
+                        mock.patch.dict(
+                            sys.modules,
+                            {
+                                "camoufox": types.SimpleNamespace(),
+                                "camoufox.async_api": types.SimpleNamespace(AsyncCamoufox=_NormalCM),
+                            },
+                        ),
+                        mock.patch.object(hub, "broadcast_state", side_effect=_revoke_on_bcast),
+                    ):
+                        with self.assertRaises(PermissionError):
+                            await hub.start_hosted(
+                                initial_url="https://example.com/must-not-goto",
+                                profile="r6-prof",
+                                notify_tg=False,
+                                actor=("main", 111),
+                                source="ws",
+                                expected_session_gen=5,
+                            )
+                    self.assertEqual("idle", hub.engine_mode)
+                    self.assertIsNone(hub.ctx)
+                    self.assertTrue(cm_pre_goto and cm_pre_goto[0].exited)  # type: ignore[attr-defined]
+                    cm_pre_goto[0].page.goto.assert_not_called()  # type: ignore[attr-defined]
+
+                    # Restore admin 111 for 3c
+                    env_main.write_text(
+                        f"AGY_TG_BOT_TOKEN={tok_main}\nAGY_TG_ALLOWED_CHATS=111,112\nAGY_TG_ADMIN_USERS=111\n",
+                        encoding="utf-8",
+                    )
+
+                    # 3c. Queued periodic `tick_updates()` acquires card lock ahead of `retire_cards()` after session_gen changed:
+                    #     MUST still edit Telegram card to stateless finished copy + empty keyboard before removing card!
+                    class _RetireSpyHTTP:
+                        def __init__(self) -> None:
+                            self.calls: list[tuple[str, dict]] = []
+
+                        def post(self, url: str, **kw):
+                            self.calls.append((url, kw))
+
+                            class _Resp:
+                                async def __aenter__(self_r):
+                                    return self_r
+
+                                async def __aexit__(self_r, *_a):
+                                    return False
+
+                                async def json(self_r):
+                                    return {"ok": True, "result": {"message_id": 777}}
+
+                            return _Resp()
+
+                    spy_http = _RetireSpyHTTP()
+                    hub.tg.http = spy_http
+                    hub.engine_mode = "idle"
+                    hub.session_gen = 9
+                    hub.session_owner = None
+                    hub.latest_jpeg = b"OLD_FRAME_STILL_IN_FLIGHT"
+                    hub.tg.cards[("main", 111)] = {
+                        "bot_key": "main",
+                        "chat_id": 111,
+                        "message_id": 777,
+                        "session_gen": 8,  # stale gen (stopped session)
+                        "owner": ("main", 111),
+                        "last_sha1": "old",
+                        "last_caption": "live",
+                        "last_markup": "live",
+                        "last_ts": 0.0,
+                    }
+                    await hub.tg.tick_updates(force=True)
+                    self.assertNotIn(("main", 111), hub.tg.cards)
+                    edit_caps = [c for c in spy_http.calls if c[0].endswith("/editMessageCaption")]
+                    self.assertEqual(1, len(edit_caps), "Periodic update beating retire_cards MUST still retire Telegram card!")
+                    cap_body = edit_caps[0][1]["json"]
+                    self.assertEqual(777, cap_body["message_id"])
+                    self.assertIn("远端浏览器会话已结束", cap_body["caption"])
+                    self.assertEqual({"inline_keyboard": []}, cap_body["reply_markup"])
+
+            asyncio.run(_scenario())
+
+    def test_round6_sync_extract_dual_gen_no_fallback_broadcast_compound_tab_auth_and_sync_mouseup_edges(self) -> None:
+        """Round 6 §4, §5, §6: Sync extract dual-gen + no fallback + cache order, new_tab/close_tab/capture auth, Sync mouseup edges, MiB units."""
+        tok_main = "100:MAIN_TOK_R6_EXT"
+        with tempfile.TemporaryDirectory() as tmp:
+            bdir = Path(tmp) / "bridge"
+            bdir.mkdir(parents=True, exist_ok=True)
+            env_main = bdir / ".env"
+            env_main.write_text(
+                f"AGY_TG_BOT_TOKEN={tok_main}\nAGY_TG_ALLOWED_CHATS=111\nAGY_TG_ADMIN_USERS=111\n",
+                encoding="utf-8",
+            )
+
+            async def _scenario() -> None:
+                hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "sec-tok")
+                fake_ws_type = types.SimpleNamespace(TEXT="TEXT", CLOSE="CLOSE")
+
+                with (
+                    mock.patch.object(srv, "_BRIDGE_DIR", bdir),
+                    mock.patch.object(srv, "WSMsgType", fake_ws_type),
+                    mock.patch.object(srv, "web", _FakeWeb),
+                ):
+                    # 4a & 4b: Sync extract dual-gen, offline target_ws drops strictly (no fallback to ws_b), stale/unknown req_id does NOT pollute latest_clip!
+                    r_sync = await srv.internal_sync_start(
+                        types.SimpleNamespace(
+                            headers={"X-Live-Token": "sec-tok"},
+                            remote="127.0.0.1",
+                            app={"hub": hub},
+                            json=mock.AsyncMock(return_value={"bot": "main", "user_id": 111}),
+                        )  # type: ignore[arg-type]
+                    )
+                    lease_id = r_sync.data["sync_lease_id"]
+                    sgen = r_sync.data["session_gen"]
+                    tgen = hub.takeover_gen
+                    hub.latest_clip = {"text": "INITIAL_SAFE_CLIP"}
+
+                    ws_a = _FakeWSViewer()
+                    ws_b = _FakeWSViewer()
+                    hub.viewers = {ws_a, ws_b}  # type: ignore[assignment]
+                    hub.viewer_meta = {
+                        ws_a: {"bot_key": "main", "user_id": 111, "role": "admin"},
+                        ws_b: {"bot_key": "main", "user_id": 111, "role": "admin"},
+                    }
+
+                    # (i) Unknown req_id MUST NOT write latest_clip or send to anyone
+                    await srv.internal_sync_clipboard(
+                        types.SimpleNamespace(
+                            headers={"X-Live-Token": "sec-tok", "X-Sync-Lease-Id": lease_id},
+                            remote="127.0.0.1",
+                            app={"hub": hub},
+                            query={},
+                            json=mock.AsyncMock(return_value={"text": "POLLUTED_UNKNOWN_REQ", "req_id": "unknown-999"}),
+                        )  # type: ignore[arg-type]
+                    )
+                    self.assertEqual("INITIAL_SAFE_CLIP", hub.latest_clip.get("text"))
+                    self.assertEqual([], ws_a.sent_json)
+                    self.assertEqual([], ws_b.sent_json)
+
+                    # (ii) Valid pending req_id, but takeover_gen changed before reply -> dropped & latest_clip untouched!
+                    hub._pending_sync_extracts["req-tgen-stale"] = {
+                        "bot_key": "main",
+                        "user_id": 111,
+                        "session_gen": sgen,
+                        "takeover_gen": tgen,
+                        "owner": hub.session_owner,
+                        "ws": ws_a,
+                        "created_ts": time.monotonic(),
+                    }
+                    hub.takeover_gen = tgen + 1
+                    await srv.internal_sync_clipboard(
+                        types.SimpleNamespace(
+                            headers={"X-Live-Token": "sec-tok", "X-Sync-Lease-Id": lease_id},
+                            remote="127.0.0.1",
+                            app={"hub": hub},
+                            query={},
+                            json=mock.AsyncMock(
+                                return_value={"text": "STALE_TGEN_CLIP", "req_id": "req-tgen-stale", "takeover_gen": tgen}
+                            ),
+                        )  # type: ignore[arg-type]
+                    )
+                    self.assertEqual("INITIAL_SAFE_CLIP", hub.latest_clip.get("text"))
+                    self.assertEqual([], ws_a.sent_json)
+                    self.assertEqual([], ws_b.sent_json)
+
+                    # (iii) Originating ws_a closes/disconnects -> reply DROPPED, NEVER falls back to ws_b, latest_clip untouched!
+                    cur_tgen = hub.takeover_gen
+                    hub._pending_sync_extracts["req-ws-closed"] = {
+                        "bot_key": "main",
+                        "user_id": 111,
+                        "session_gen": sgen,
+                        "takeover_gen": cur_tgen,
+                        "owner": hub.session_owner,
+                        "ws": ws_a,
+                        "created_ts": time.monotonic(),
+                    }
+                    ws_a.closed = True
+                    hub.viewers.discard(ws_a)
+                    await srv.internal_sync_clipboard(
+                        types.SimpleNamespace(
+                            headers={"X-Live-Token": "sec-tok", "X-Sync-Lease-Id": lease_id},
+                            remote="127.0.0.1",
+                            app={"hub": hub},
+                            query={},
+                            json=mock.AsyncMock(
+                                return_value={"text": "MUST_NOT_FALLBACK_TO_WS_B", "req_id": "req-ws-closed", "takeover_gen": cur_tgen}
+                            ),
+                        )  # type: ignore[arg-type]
+                    )
+                    self.assertEqual("INITIAL_SAFE_CLIP", hub.latest_clip.get("text"))
+                    self.assertEqual([], ws_b.sent_json, "Offline requester WS MUST drop reply, NEVER broadcast to ws_b!")
+
+                    # (iv) Sync extract queued in sync_cmd_queue with old takeover_gen is dropped on pop_sync_cmds!
+                    hub.sync_cmd_queue = [
+                        {
+                            "action": "extract",
+                            "mode": "point",
+                            "req_id": "r-stale-q",
+                            "session_gen": sgen,
+                            "takeover_gen": cur_tgen - 1,
+                            "_bot_key": "main",
+                            "_user_id": 111,
+                        },
+                        {
+                            "action": "extract",
+                            "mode": "point",
+                            "req_id": "r-ok-q",
+                            "session_gen": sgen,
+                            "takeover_gen": cur_tgen,
+                            "_bot_key": "main",
+                            "_user_id": 111,
+                        },
+                    ]
+                    popped_q = hub.pop_sync_cmds()
+                    self.assertEqual(1, len(popped_q))
+                    self.assertEqual("r-ok-q", popped_q[0]["req_id"])
+
+                    # 4c. Compound inputs: new_tab, close_tab, and capture -> broadcast_state mid-await revocation!
+                    p0 = _FakePage()
+                    p1 = _FakePage()
+                    created_pages: list[object] = []
+
+                    class _RevokingNewTabPage(_FakePage):
+                        def __init__(self) -> None:
+                            super().__init__()
+                            self.closed = False
+                            self.goto = mock.AsyncMock()  # type: ignore[method-assign]
+
+                        def is_closed(self) -> bool:
+                            return self.closed
+
+                        async def close(self) -> None:
+                            self.closed = True
+
+                    class _RevokingCtx:
+                        def __init__(self) -> None:
+                            self.pages = [p0, p1]
+
+                        async def new_page(self):
+                            np = _RevokingNewTabPage()
+                            self.pages.append(np)
+                            created_pages.append(np)
+                            # Revoke admin 111 during await new_page()!
+                            env_main.write_text(
+                                f"AGY_TG_BOT_TOKEN={tok_main}\nAGY_TG_ALLOWED_CHATS=999\nAGY_TG_ADMIN_USERS=999\n",
+                                encoding="utf-8",
+                            )
+                            return np
+
+                    hub.engine_mode = "async_hosted"
+                    hub.ctx = _RevokingCtx()
+                    hub.active_tab_index = 0
+                    hub.session_owner = ("main", 111)
+                    hub.takeover = True
+                    hub.takeover_owner = ("main", 111)
+                    hub.session_gen = 30
+                    hub.takeover_gen = 10
+                    rev_before_nt = hub._tab_select_rev
+                    await hub._execute_human_cmd_async(
+                        {
+                            "action": "new_tab",
+                            "_bot_key": "main",
+                            "_user_id": 111,
+                            "_session_gen": 30,
+                            "_takeover_gen": 10,
+                        }
+                    )
+                    self.assertEqual(1, len(created_pages))
+                    self.assertTrue(created_pages[0].closed, "Revoked new_tab MUST close newly created page!")  # type: ignore[attr-defined]
+                    created_pages[0].goto.assert_not_called()  # type: ignore[attr-defined]
+                    self.assertEqual(0, hub.active_tab_index)
+                    self.assertEqual(rev_before_nt, hub._tab_select_rev)
+
+                    # close_tab: revoke during await close() -> MUST NOT update active_tab_index or _tab_select_rev!
+                    env_main.write_text(
+                        f"AGY_TG_BOT_TOKEN={tok_main}\nAGY_TG_ALLOWED_CHATS=111\nAGY_TG_ADMIN_USERS=111\n",
+                        encoding="utf-8",
+                    )
+
+                    class _RevokingClosePage(_FakePage):
+                        async def close(self) -> None:
+                            env_main.write_text(
+                                f"AGY_TG_BOT_TOKEN={tok_main}\nAGY_TG_ALLOWED_CHATS=999\nAGY_TG_ADMIN_USERS=999\n",
+                                encoding="utf-8",
+                            )
+
+                    cp0 = _FakePage()
+                    cp1 = _RevokingClosePage()
+                    hub.ctx = _FakeCtx([cp0, cp1])
+                    hub.active_tab_index = 1
+                    hub.takeover = True
+                    hub.takeover_owner = ("main", 111)
+                    hub.takeover_gen = 11
+                    rev_before_ct = hub._tab_select_rev
+                    await hub._execute_human_cmd_async(
+                        {
+                            "action": "close_tab",
+                            "index": 1,
+                            "_bot_key": "main",
+                            "_user_id": 111,
+                            "_session_gen": 30,
+                            "_takeover_gen": 11,
+                        }
+                    )
+                    self.assertEqual(1, hub.active_tab_index, "Revoked close_tab MUST NOT update active_tab_index")
+                    self.assertEqual(rev_before_ct, hub._tab_select_rev)
+
+                    # Final capture -> broadcast_state: revoke during _capture_once() -> MUST skip broadcast_state()!
+                    env_main.write_text(
+                        f"AGY_TG_BOT_TOKEN={tok_main}\nAGY_TG_ALLOWED_CHATS=111\nAGY_TG_ADMIN_USERS=111\n",
+                        encoding="utf-8",
+                    )
+                    hub.ctx = _FakeCtx([_FakePage()])
+                    hub.active_tab_index = 0
+                    hub.takeover = True
+                    hub.takeover_owner = ("main", 111)
+                    hub.takeover_gen = 12
+                    bcast_spy = mock.AsyncMock()
+
+                    async def _revoke_mid_capture(**_kw) -> None:
+                        env_main.write_text(
+                            f"AGY_TG_BOT_TOKEN={tok_main}\nAGY_TG_ALLOWED_CHATS=999\nAGY_TG_ADMIN_USERS=999\n",
+                            encoding="utf-8",
+                        )
+
+                    with (
+                        mock.patch.object(hub, "_capture_once", side_effect=_revoke_mid_capture),
+                        mock.patch.object(hub, "broadcast_state", side_effect=bcast_spy),
+                    ):
+                        await hub._execute_human_cmd_async(
+                            {
+                                "action": "press",
+                                "key": "Escape",
+                                "_bot_key": "main",
+                                "_user_id": 111,
+                                "_session_gen": 30,
+                                "_takeover_gen": 12,
+                            }
+                        )
+                    bcast_spy.assert_not_called()
+
+            asyncio.run(_scenario())
+
+        # 5. Sync mouseup/mousedown edges (live_browser_ctl.py):
+        #    (a) original pressed page already closed -> mouseup does NOT fall back to current page!
+        #    (b) same button pressed on Page A then again on Page B -> Page A released first!
+        import live_browser_ctl as ctl
+
+        class _EdgeMouse:
+            def __init__(self) -> None:
+                self.downs: list[str] = []
+                self.ups: list[str] = []
+
+            def move(self, _x: float, _y: float) -> None:
+                pass
+
+            def down(self, button: str = "left") -> None:
+                self.downs.append(button)
+
+            def up(self, button: str = "left") -> None:
+                self.ups.append(button)
+
+        class _EdgePage:
+            def __init__(self) -> None:
+                self.url = "about:blank"
+                self.closed = False
+                self.mouse = _EdgeMouse()
+
+            def is_closed(self) -> bool:
+                return self.closed
+
+            def bring_to_front(self) -> None:
+                pass
+
+        pa = _EdgePage()
+        pb = _EdgePage()
+        bridge = ctl.SyncLiveBridge.__new__(ctl.SyncLiveBridge)
+        bridge.raw_ctx = types.SimpleNamespace(pages=[pa, pb])
+        bridge.active_idx = 0
+        bridge.enabled = True
+        bridge._held_buttons = {}
+        bridge._pinned_verified = False
+        bridge._profile_dir = None
+
+        # (a) Press on Page A -> Page A closes -> switch to Page B -> explicit mouseup MUST NOT hit Page B!
+        bridge._exec_human_sync({"action": "mousedown", "x": 5, "y": 5, "button": "left"})
+        pa.closed = True
+        bridge.active_idx = 1
+        bridge._exec_human_sync({"action": "mouseup", "x": 20, "y": 20, "button": "left"})
+        self.assertEqual([], pb.mouse.ups, "Closed original page mouseup MUST NOT fall back to current page!")
+        self.assertEqual({}, bridge._held_buttons)
+
+        # (b) Re-open Page A: press left on Page A -> switch to Page B -> press left on Page B -> Page A MUST release first!
+        pa.closed = False
+        bridge.active_idx = 0
+        bridge._exec_human_sync({"action": "mousedown", "x": 5, "y": 5, "button": "left"})
+        bridge.active_idx = 1
+        bridge._exec_human_sync({"action": "mousedown", "x": 15, "y": 15, "button": "left"})
+        self.assertEqual(["left"], pa.mouse.ups, "Re-pressing same button on Page B MUST release Page A first!")
+        self.assertEqual(["left"], pb.mouse.downs)
+        bridge._exec_human_sync({"action": "mouseup", "x": 15, "y": 15, "button": "left"})
+        self.assertEqual(["left"], pb.mouse.ups)
+
+        # 6. Binary unit consistency (MiB, zero stale MB user-facing strings or wire-level comments)
+        srv_src = (REPO_ROOT / ".agents/skills/live-browser/scripts/live_browser_server.py").read_text(encoding="utf-8")
+        self.assertNotIn("}MB", srv_src)
+        self.assertNotIn("wire-level", srv_src)
+        self.assertIn("MiB 限制", srv_src)
+        self.assertIn("MiB 服务端单文件上限", srv_src)
 
 
 if __name__ == "__main__":

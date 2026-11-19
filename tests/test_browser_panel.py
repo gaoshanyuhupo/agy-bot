@@ -294,10 +294,10 @@ class TestLiveBrowserServerPanelWS(unittest.TestCase):
             incoming = [
                 _FakeWSMessage(json.dumps({"type": "auth", "initData": init_data})),
                 _FakeWSMessage(json.dumps({"type": "list_profiles"})),
-                _FakeWSMessage(json.dumps({"type": "start_browser", "profile": "mac-exit", "url": "https://example.com"})),
-                _FakeWSMessage(json.dumps({"type": "switch_profile", "profile": "nonexistent-prof"})),
-                _FakeWSMessage(json.dumps({"type": "switch_profile", "profile": "default", "url": "https://example.org"})),
-                _FakeWSMessage(json.dumps({"type": "stop_browser"})),
+                _FakeWSMessage(json.dumps({"type": "start_browser", "profile": "mac-exit", "url": "https://example.com", "session_gen": 0})),
+                _FakeWSMessage(json.dumps({"type": "switch_profile", "profile": "nonexistent-prof", "session_gen": 1})),
+                _FakeWSMessage(json.dumps({"type": "switch_profile", "profile": "default", "url": "https://example.org", "session_gen": 1})),
+                _FakeWSMessage(json.dumps({"type": "stop_browser", "session_gen": 3})),
             ]
             ws_inst = _FakeWebSocketResponse(incoming)
 
@@ -355,7 +355,7 @@ class TestLiveBrowserServerPanelWS(unittest.TestCase):
 
             incoming = [
                 _FakeWSMessage(json.dumps({"type": "auth", "initData": init_data})),
-                _FakeWSMessage(json.dumps({"type": "switch_profile", "profile": "alt-prof"})),
+                _FakeWSMessage(json.dumps({"type": "switch_profile", "profile": "alt-prof", "session_gen": 0})),
             ]
             ws_inst = _FakeWebSocketResponse(incoming)
 
@@ -1038,6 +1038,181 @@ class TestBridgeBrowserPanelAndRbac(unittest.TestCase):
                     self.assertEqual("tg_cmd", payload.get("source"), f"Missing source='tg_cmd' on {url}")
                     self.assertEqual("main", payload.get("bot"))
                     self.assertEqual(111, payload.get("user_id"))
+
+    def test_round6_group_browser_panel_redacted_for_session_owner(self) -> None:
+        """Round 6 §1: Group `/browser` MUST redact title/url/profile/egress even when invoked by the session owner."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_dir = Path(tmp) / "live-cfg"
+            cfg_dir.mkdir(parents=True, exist_ok=True)
+            (cfg_dir / "local.token").write_text("r6-group-tok\n", encoding="utf-8")
+            bridge, _ac = _load_isolated_bridge(tmp, extra_env={"AGY_TG_BOT_USERNAME": "example_bot"})
+            bridge.BOT_META["handle"] = "example_bot"
+            bridge.BOT_META["bot_key"] = "main"
+
+            class _FakeResp:
+                def __init__(self, status_code: int, payload: dict) -> None:
+                    self.status_code = status_code
+                    self._payload = payload
+
+                def json(self) -> dict:
+                    return self._payload
+
+            owner_full_status = {
+                "ok": True,
+                "running": True,
+                "engine_mode": "async_hosted",
+                "profile": "secret-owner-profile",
+                "pinned": True,
+                "os": "windows",
+                "egress": "socks5://***@" + "proxy.example.com:1080",
+                "takeover": True,
+                "ai_busy": False,
+                "url": "https://private-banking.example/secret-account",
+                "title": "CONFIDENTIAL OWNER DASHBOARD",
+                "public_url": "https://live.example.com",
+            }
+            get_calls: list[tuple[str, dict | None]] = []
+
+            def _fake_get(url: str, **kw):
+                get_calls.append((url, kw.get("params")))
+                if url.endswith("/internal/status"):
+                    return _FakeResp(200, owner_full_status)
+                if url.endswith("/internal/profiles"):
+                    return _FakeResp(
+                        200,
+                        {
+                            "ok": True,
+                            "active_profile": "secret-owner-profile",
+                            "profiles": [
+                                {
+                                    "name": "secret-owner-profile",
+                                    "pinned": True,
+                                    "os": "windows",
+                                    "persistent": True,
+                                    "egress_display": "socks5://***@" + "proxy.example.com:1080",
+                                    "active": True,
+                                }
+                            ],
+                        },
+                    )
+                return _FakeResp(404, {"ok": False})
+
+            sent: list[tuple[int, str, dict]] = []
+            with (
+                mock.patch.dict(os.environ, {"AGY_LIVE_BROWSER_CONFIG_DIR": str(cfg_dir)}, clear=False),
+                mock.patch.object(bridge.requests, "get", side_effect=_fake_get),
+                mock.patch.object(bridge, "send", side_effect=lambda cid, txt, **kw: sent.append((cid, txt, kw)) or 1),
+            ):
+                # 1. Session owner (uid=111) invokes `/browser` in a group chat -> MUST be fully redacted!
+                bridge.handle_message(
+                    {
+                        "chat": {"id": -1001234567890, "type": "supergroup"},
+                        "from": {"id": 111},
+                        "message_id": 501,
+                        "text": "/browser",
+                    }
+                )
+                self.assertEqual(1, len(sent))
+                grp_cid, grp_text, grp_kw = sent[0]
+                self.assertEqual(-1001234567890, grp_cid)
+                for secret in (
+                    "CONFIDENTIAL OWNER DASHBOARD",
+                    "private-banking.example",
+                    "secret-account",
+                    "secret-owner-profile",
+                    "proxy.example.com",
+                    "socks5://",
+                ):
+                    self.assertNotIn(secret, grp_text, f"Group /browser body leaked {secret}!")
+                self.assertIn("已占用", grp_text)
+                grp_kb = grp_kw["reply_markup"]["inline_keyboard"]
+                self.assertFalse(any("web_app" in btn for row in grp_kb for btn in row))
+                self.assertTrue(
+                    any(btn.get("url") == "https://t.me/example_bot?start=browser" for row in grp_kb for btn in row)
+                )
+                self.assertTrue(any(btn.get("callback_data") == "browser:refresh" for row in grp_kb for btn in row))
+                # Verify query params conveyed group delivery scope to /internal/status
+                st_params = next(p for u, p in get_calls if u.endswith("/internal/status"))
+                assert st_params is not None
+                self.assertEqual("group", st_params.get("chat_scope"))
+                self.assertEqual("-1001234567890", st_params.get("chat_id"))
+
+                # 2. Same owner in private DM (chat_id=111) still receives full details!
+                sent.clear()
+                bridge.handle_message(
+                    {
+                        "chat": {"id": 111, "type": "private"},
+                        "from": {"id": 111},
+                        "message_id": 502,
+                        "text": "/browser",
+                    }
+                )
+                self.assertEqual(1, len(sent))
+                dm_text = sent[0][1]
+                self.assertIn("CONFIDENTIAL OWNER DASHBOARD", dm_text)
+                self.assertIn("https://private-banking.example/secret-account", dm_text)
+                self.assertIn("secret-owner-profile", dm_text)
+                self.assertIn("proxy.example.com", dm_text)
+
+            # 3. Server-side /internal/status & _resolve_internal_tg_reader also redact group scope even for session owner!
+            async def _server_check() -> None:
+                bdir = Path(tmp) / "bridge-srv"
+                bdir.mkdir(parents=True, exist_ok=True)
+                (bdir / ".env").write_text(
+                    "AGY_TG_BOT_TOKEN=123456789:EXAMPLE_GROUP_SCOPE_TOKEN_1\nAGY_TG_ALLOWED_CHATS=111,-1001234567890\nAGY_TG_ADMIN_USERS=111\n",
+                    encoding="utf-8",
+                )
+                hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "r6-srv-tok")
+                hub.engine_mode = "async_hosted"
+                hub.session_owner = ("main", 111)
+                hub.active_profile = "secret-owner-profile"
+                hub.active_egress = "socks5://***@" + "proxy.example.com:1080"
+                hub.url = "https://private-banking.example/secret-account"
+                hub.title = "CONFIDENTIAL OWNER DASHBOARD"
+
+                class _FakeReq:
+                    def __init__(self, query: dict[str, str]) -> None:
+                        self.query = query
+                        self.headers = {"X-Live-Token": "r6-srv-tok"}
+                        self.remote = "127.0.0.1"
+                        self.app = {"hub": hub}
+
+                with (
+                    mock.patch.object(srv, "_BRIDGE_DIR", bdir),
+                    mock.patch.object(srv, "web", _FakeWebModule),
+                ):
+                    r_grp = await srv.internal_status(
+                        _FakeReq(
+                            {
+                                "source": "tg_cmd",
+                                "bot": "main",
+                                "user_id": "111",
+                                "chat_id": "-1001234567890",
+                                "chat_scope": "group",
+                            }
+                        )  # type: ignore[arg-type]
+                    )
+                    self.assertTrue(r_grp.data.get("session_restricted"))
+                    self.assertEqual("", r_grp.data.get("url"))
+                    self.assertEqual("", r_grp.data.get("title"))
+                    self.assertIsNone(r_grp.data.get("profile"))
+
+                    r_dm = await srv.internal_status(
+                        _FakeReq(
+                            {
+                                "source": "tg_cmd",
+                                "bot": "main",
+                                "user_id": "111",
+                                "chat_id": "111",
+                                "chat_scope": "private",
+                            }
+                        )  # type: ignore[arg-type]
+                    )
+                    self.assertFalse(r_dm.data.get("session_restricted"))
+                    self.assertEqual("CONFIDENTIAL OWNER DASHBOARD", r_dm.data.get("title"))
+                    self.assertEqual("https://private-banking.example/secret-account", r_dm.data.get("url"))
+
+            asyncio.run(_server_check())
 
 
 if __name__ == "__main__":

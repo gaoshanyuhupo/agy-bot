@@ -774,6 +774,130 @@ class TestLiveBrowserProfiles(unittest.TestCase):
 
         asyncio.run(_scenario())
 
+    def test_round6_hosted_subsequent_new_page_guard_failure_fails_closed(self) -> None:
+        """Round 6 §2: Non-pinned hosted ctx.on('page') MUST close unguarded new page (or abort session if close fails)."""
+        pinned_dir = self.root / "pinned_r6"
+        pinned_dir.mkdir(parents=True, exist_ok=True)
+        pinned_lock = self.root / "pinned_r6.lock"
+        fake_pinned = {
+            "name": "pinned_r6",
+            "profile_dir": pinned_dir,
+            "lock_path": pinned_lock,
+            "fingerprint": {"os": "windows"},
+        }
+        srv.create_profile("nonpin-r6", {"os": "linux", "persistent": False})
+
+        class _GoodPage:
+            def __init__(self, url: str = "about:blank") -> None:
+                self.url = url
+                self.viewport_size = {"width": 1280, "height": 800}
+                self.closed = False
+                self.listeners: dict[str, list] = {}
+
+            def is_closed(self) -> bool:
+                return self.closed
+
+            async def close(self) -> None:
+                self.closed = True
+
+            async def goto(self, url: str, **_kw) -> None:
+                self.url = url
+
+            async def title(self) -> str:
+                return "Good"
+
+            async def screenshot(self, **_kw) -> bytes:
+                return b"JPEG"
+
+            def on(self, ev: str, cb) -> None:
+                self.listeners.setdefault(ev, []).append(cb)
+
+        class _BadPopupPage(_GoodPage):
+            def __init__(self, *, fail_close: bool = False) -> None:
+                super().__init__("https://popup.example")
+                self._fail_close = fail_close
+
+            def on(self, ev: str, cb) -> None:
+                if ev == "framenavigated":
+                    raise RuntimeError("popup framenavigated registration failed")
+                super().on(ev, cb)
+
+            async def close(self) -> None:
+                if self._fail_close:
+                    raise RuntimeError("popup close failed")
+                self.closed = True
+
+        class _PartialSecondaryPage(_GoodPage):
+            def on(self, ev: str, cb) -> None:
+                if ev == "load":
+                    raise RuntimeError("load unsupported")
+                super().on(ev, cb)
+
+        class _EventCtx(_FakeContext):
+            def __init__(self, initial_page) -> None:
+                super().__init__()
+                self.pages = [initial_page]
+                self.ctx_listeners: dict[str, list] = {}
+
+            def on(self, ev: str, cb) -> None:
+                self.ctx_listeners.setdefault(ev, []).append(cb)
+
+        async def _scenario() -> None:
+            # Case A: popup fails framenavigated -> closed fail-closed & NOT kept active/guarded
+            cm_a_list: list[object] = []
+
+            class _CM_A:
+                def __init__(self, **_kw) -> None:
+                    self.exited = False
+                    self.init_page = _GoodPage()
+                    self.ctx = _EventCtx(self.init_page)
+                    cm_a_list.append(self)
+
+                async def __aenter__(self):
+                    return self.ctx
+
+                async def __aexit__(self, *_a):
+                    self.exited = True
+
+            hub = srv.LiveBrowserHub({"public_url": ""}, "sec-tok")
+            with (
+                mock.patch.object(srv, "discover_pinned_host_profile", return_value=fake_pinned),
+                mock.patch.dict(
+                    sys.modules,
+                    {"camoufox": types.SimpleNamespace(), "camoufox.async_api": types.SimpleNamespace(AsyncCamoufox=_CM_A)},
+                ),
+            ):
+                await hub.start_hosted(profile="nonpin-r6", notify_tg=False)
+                self.assertEqual("async_hosted", hub.engine_mode)
+                cm_a = cm_a_list[0]
+                popup = _BadPopupPage(fail_close=False)
+                cm_a.ctx.pages.append(popup)  # type: ignore[attr-defined]
+                for cb in cm_a.ctx.ctx_listeners.get("page", []):  # type: ignore[attr-defined]
+                    cb(popup)
+                # Let scheduled fail-closed close task run
+                await asyncio.sleep(0.05)
+                self.assertTrue(popup.closed, "Unguarded subsequent popup MUST be closed fail-closed")
+                self.assertNotIn(id(popup), hub._attached_pages)
+                self.assertIs(hub._current_page(), cm_a.init_page)  # type: ignore[attr-defined]
+
+                # Secondary listener isolation: `load` raising MUST NOT skip `close` listener
+                partial_p = _PartialSecondaryPage()
+                hub._attach_page_listeners(partial_p, require_nav_guard=True)
+                self.assertIn("framenavigated", partial_p.listeners)
+                self.assertIn("close", partial_p.listeners)
+
+                # Case B: popup fails framenavigated AND close() fails -> hosted session MUST abort to idle!
+                unclosable = _BadPopupPage(fail_close=True)
+                cm_a.ctx.pages.append(unclosable)  # type: ignore[attr-defined]
+                for cb in cm_a.ctx.ctx_listeners.get("page", []):  # type: ignore[attr-defined]
+                    cb(unclosable)
+                await asyncio.sleep(0.05)
+                self.assertEqual("idle", hub.engine_mode, "Session MUST abort fail-closed when unguarded page cannot close")
+                self.assertIsNone(hub.ctx)
+                self.assertTrue(cm_a.exited)  # type: ignore[attr-defined]
+
+        asyncio.run(_scenario())
+
 
 if __name__ == "__main__":
     unittest.main()
