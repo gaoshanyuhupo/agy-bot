@@ -1017,17 +1017,17 @@ def _apply_scope_model_change(skey, new_model, *, reason="model_change", sync_bu
         _publish_bot_heartbeat()
 
 
-def _apply_local_group_model_sync(model_mode, model="", *, chat_id=0, thread_id=None):
-    """Apply a team-level group model update to this bot's group scope(s), evict warm sessions, and refresh heartbeat."""
+def _model_target_val_for(model_mode, model=""):
     norm_mode = str(model_mode or bot_bus.MODEL_MODE_DEFAULT).strip().lower()
     clean_model = str(model or "").strip()
     if norm_mode == bot_bus.MODEL_MODE_FOLLOW:
-        target_val = MODEL_FOLLOW_DM
-    elif norm_mode == bot_bus.MODEL_MODE_CUSTOM and clean_model and clean_model != MODEL_FOLLOW_DM:
-        target_val = clean_model
-    else:
-        target_val = None
+        return MODEL_FOLLOW_DM
+    if norm_mode == bot_bus.MODEL_MODE_CUSTOM and clean_model and clean_model != MODEL_FOLLOW_DM:
+        return clean_model
+    return None
 
+
+def _group_sync_target_scopes(chat_id=0, thread_id=None):
     target_skeys = []
     for cid in sorted(ALLOWED):
         try:
@@ -1043,7 +1043,22 @@ def _apply_local_group_model_sync(model_mode, model="", *, chat_id=0, thread_id=
     if chat_id and int(chat_id) < 0:
         norm_tid = _normalize_thread_id(thread_id)
         target_skeys.append(scope_key_for(int(chat_id), norm_tid))
-    target_skeys = list(dict.fromkeys(target_skeys))
+    return list(dict.fromkeys(target_skeys))
+
+
+def _apply_local_group_model_sync(model_mode, model="", *, chat_id=0, thread_id=None, only_changed=False):
+    """Apply a team-level group model update to this bot's group scope(s), evict warm sessions, and refresh heartbeat."""
+    target_val = _model_target_val_for(model_mode, model)
+    target_skeys = _group_sync_target_scopes(chat_id=chat_id, thread_id=thread_id)
+    if only_changed:
+        with state_lock:
+            scopes = state.get("scopes") or {}
+            target_skeys = [
+                g_skey for g_skey in target_skeys
+                if not isinstance(scopes.get(g_skey), dict) or scopes[g_skey].get("model") != target_val
+            ]
+        if not target_skeys:
+            return []
 
     for g_skey in target_skeys:
         update_scope_state(g_skey, model=target_val)
@@ -1061,26 +1076,23 @@ def _apply_local_group_model_sync(model_mode, model="", *, chat_id=0, thread_id=
 
 
 def _set_team_bot_model(target_h, model_mode, model="", *, chat_id=0, thread_id=None):
-    """Persist a team bot's model config in Bot Bus and push immediate group sync."""
+    """Persist a team bot's model config in Bot Bus and push immediate group sync atomically."""
     norm_h = bot_bus.normalize_handle(target_h)
     norm_mode = str(model_mode or bot_bus.MODEL_MODE_DEFAULT).strip().lower()
     clean_model = str(model or "").strip() if norm_mode == bot_bus.MODEL_MODE_CUSTOM else ""
-    bot_bus.set_bot_model_config(norm_h, norm_mode, clean_model)
     me = _current_bot_handle()
-    if norm_h == me:
+    is_self = norm_h == me
+    bot_bus.set_bot_model_and_notify(
+        norm_h,
+        norm_mode,
+        clean_model,
+        from_bot=me,
+        chat_id=int(chat_id or 0),
+        thread_id=_normalize_thread_id(thread_id),
+        notify_target=not is_self,
+    )
+    if is_self:
         _apply_local_group_model_sync(norm_mode, clean_model, chat_id=chat_id, thread_id=thread_id)
-    else:
-        try:
-            bot_bus.notify_bot_model_sync(
-                norm_h,
-                model_mode=norm_mode,
-                model=clean_model,
-                from_bot=me,
-                chat_id=int(chat_id or 0),
-                thread_id=_normalize_thread_id(thread_id),
-            )
-        except Exception as e:
-            log("notify_bot_model_sync(%s) failed: %r" % (norm_h, e))
 
 
 def current_workdir(scope_key=None):
@@ -1639,14 +1651,18 @@ def register_bot_commands(force=False):
             # so stale per-chat menus never shadow `all_private_chats` or `all_group_chats`.
             ok_def = _tg_ok(tg("deleteMyCommands", _timeout=15, scope={"type": "default"}))
             _tg_ok(tg("deleteMyCommands", _timeout=15, scope={"type": "all_chat_administrators"}))
+            ok_cleanup = True
             for cid in sorted(ALLOWED):
                 try:
                     cid_int = int(cid)
                 except Exception:
                     continue
                 if cid_int != 0:
-                    tg("deleteMyCommands", _timeout=15, scope={"type": "chat", "chat_id": cid_int})
-                    tg("deleteMyCommands", _timeout=15, scope={"type": "chat_administrators", "chat_id": cid_int})
+                    if not _tg_ok(tg("deleteMyCommands", _timeout=15, scope={"type": "chat", "chat_id": cid_int})):
+                        ok_cleanup = False
+                    res_admin = tg("deleteMyCommands", _timeout=15, scope={"type": "chat_administrators", "chat_id": cid_int})
+                    if cid_int < 0 and not _tg_ok(res_admin):
+                        ok_cleanup = False
 
             ok_priv = _tg_ok(tg(
                 "setMyCommands",
@@ -1670,11 +1686,14 @@ def register_bot_commands(force=False):
                 ))
                 grp_cnt = 0
 
-            if ok_def and ok_priv and ok_grp:
+            if ok_def and ok_cleanup and ok_priv and ok_grp:
                 _LAST_REGISTERED_CMD_ROLE = role
                 log("Bot commands registered (role=%s, dm=%d, group=%d)" % (role, len(_PRIVATE_COMMANDS), grp_cnt))
                 return True
-            log("register_bot_commands incomplete (role=%s, def=%s, priv=%s, grp=%s)" % (role, ok_def, ok_priv, ok_grp))
+            log(
+                "register_bot_commands incomplete (role=%s, def=%s, cleanup=%s, priv=%s, grp=%s)"
+                % (role, ok_def, ok_cleanup, ok_priv, ok_grp)
+            )
             return False
         except Exception as e:
             log("register_bot_commands failed: %s" % e)
@@ -6337,6 +6356,7 @@ def _publish_bot_heartbeat():
             "env_default_model": ENV_BOT_MODEL or "",
             "model_mode": cfg.get("model_mode") or bot_bus.MODEL_MODE_DEFAULT,
             "configured_model": cfg.get("configured_model") or "",
+            "model_rev": int(cfg.get("model_rev") or 0),
             "workdir": sc.get("workdir") or WORKDIR,
             "project": current_project(PRIMARY_SCOPE_KEY) or "",
             "allowed_chats": sorted(ALLOWED),
@@ -6440,9 +6460,54 @@ def _handle_bot_bus_packet(pkt):
         m_slug = str(pkt.get("model") or "").strip()
         c_id = int(pkt.get("chat_id") or 0)
         t_id = _normalize_thread_id(pkt.get("thread_id"))
-        log("Received sync_group_model from @%s: mode=%s model=%s"
-            % (pkt.get("from_bot") or "?", m_mode, m_slug or "(none)"))
-        _apply_local_group_model_sync(m_mode, m_slug, chat_id=c_id, thread_id=t_id)
+        auth_cfg = _current_bot_cfg()
+        auth_rev = int(auth_cfg.get("model_rev") or 0)
+        auth_upd = int(auth_cfg.get("model_updated_at") or 0)
+        auth_mode = str(auth_cfg.get("model_mode") or bot_bus.MODEL_MODE_DEFAULT).strip().lower()
+        auth_model = str(auth_cfg.get("configured_model") or "").strip() if auth_mode == bot_bus.MODEL_MODE_CUSTOM else ""
+
+        raw_rev = pkt.get("model_rev")
+        pkt_rev = None
+        if raw_rev is not None and str(raw_rev).strip() != "":
+            try:
+                pkt_rev = int(raw_rev)
+            except (TypeError, ValueError):
+                pkt_rev = None
+        try:
+            pkt_created = float(pkt.get("created_at") or 0)
+        except (TypeError, ValueError):
+            pkt_created = 0.0
+
+        stale_by_rev = pkt_rev is not None and auth_rev > 0 and pkt_rev < auth_rev
+        stale_untagged = pkt_rev is None and (
+            auth_rev > 0 or (auth_upd > 0 and (pkt_created <= 0 or pkt_created < auth_upd))
+        )
+        if stale_by_rev or stale_untagged:
+            log(
+                "Rejected stale sync_group_model from @%s (pkt_rev=%s auth_rev=%s pkt_ts=%.3f auth_upd=%s pkt=%s/%s auth=%s/%s)"
+                % (
+                    pkt.get("from_bot") or "?",
+                    pkt_rev,
+                    auth_rev,
+                    pkt_created,
+                    auth_upd,
+                    m_mode,
+                    m_slug or "(none)",
+                    auth_mode,
+                    auth_model or "(none)",
+                )
+            )
+            _apply_local_group_model_sync(
+                auth_mode,
+                auth_model,
+                chat_id=c_id,
+                thread_id=None,
+                only_changed=True,
+            )
+        else:
+            log("Received sync_group_model from @%s: mode=%s model=%s rev=%s"
+                % (pkt.get("from_bot") or "?", m_mode, m_slug or "(none)", pkt_rev))
+            _apply_local_group_model_sync(m_mode, m_slug, chat_id=c_id, thread_id=t_id)
     elif ptype == "job":
         jid = pkt.get("job_id")
         if jid and not bot_bus.is_job_cancelled(jid):

@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -262,7 +264,7 @@ class TestBotBusTeamWorkflow(unittest.TestCase):
             self.assertEqual("gemini-3.8-flash-low", roster["bot_two"]["effective_model"])
             self.assertEqual("gemini-3.8-flash-low", roster["bot_two"]["default_model"])
 
-            # notify_bot_model_sync delivers sync_group_model packet cleanly
+            # notify_bot_model_sync delivers sync_group_model packet cleanly with current model_rev
             bot_bus.notify_bot_model_sync(
                 "bot_two",
                 model_mode=bot_bus.MODEL_MODE_FOLLOW,
@@ -274,6 +276,146 @@ class TestBotBusTeamWorkflow(unittest.TestCase):
             self.assertEqual("sync_group_model", pkts[0]["type"])
             self.assertEqual(bot_bus.MODEL_MODE_FOLLOW, pkts[0]["model_mode"])
             self.assertEqual(-1001234567890, pkts[0]["chat_id"])
+            self.assertEqual(2, pkts[0]["model_rev"])
+
+    def _load_fresh_bus_instance(self, bus_dir: str, mod_name: str):
+        """Load an independent `bot_bus` module instance simulating a separate OS process."""
+        spec = importlib.util.spec_from_file_location(mod_name, str(BRIDGE_DIR / "bot_bus.py"))
+        assert spec and spec.loader
+        mod = importlib.util.module_from_spec(spec)
+        with mock.patch.dict(os.environ, {"AGY_BOT_BUS_DIR": bus_dir}, clear=False):
+            spec.loader.exec_module(mod)
+        return mod
+
+    def test_mixed_ms_and_ns_inbox_fifo_ordering(self):
+        """Legacy 13-digit ms packets MUST always pop before newer 20-digit ns packets (QA-01)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            bot_bus, _ = self._load_isolated_bus(tmp)
+            bot_inbox = os.path.join(bot_bus.INBOX_DIR, "bot_two")
+            os.makedirs(bot_inbox, mode=0o700, exist_ok=True)
+
+            # Lexicographically "01795..." < "1795...", and UUID "aaaaaaaa" < "deadbeef"
+            bot_bus._atomic_write_json(
+                os.path.join(bot_inbox, "01795074421000000000_000001_aaaaaaaa.json"),
+                {"type": "sync_group_model", "seq": "NEW"},
+            )
+            bot_bus._atomic_write_json(
+                os.path.join(bot_inbox, "1795074420000_deadbeef.json"),
+                {"type": "sync_group_model", "seq": "OLD"},
+            )
+            # Legacy ms packet with all-digit suffix in the exact same millisecond as a newer ns packet
+            bot_bus._atomic_write_json(
+                os.path.join(bot_inbox, "1795074420500_99999999.json"),
+                {"type": "sync_group_model", "seq": "OLD_MID"},
+            )
+            bot_bus._atomic_write_json(
+                os.path.join(bot_inbox, "01795074420500000001_000001_00000001.json"),
+                {"type": "sync_group_model", "seq": "NEW_MID"},
+            )
+
+            pkts = bot_bus.pop_inbox_packets("bot_two")
+            self.assertEqual(["OLD", "OLD_MID", "NEW_MID", "NEW"], [p["seq"] for p in pkts])
+
+    def test_cross_process_monotonic_inbox_fifo_same_ns_and_clock_rollback(self):
+        """Cross-process watermark guarantees FIRST -> SECOND on same-ns collision & wall-clock rollback (QA-04)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            proc_a = self._load_fresh_bus_instance(tmp, "bot_bus_proc_a")
+            proc_b = self._load_fresh_bus_instance(tmp, "bot_bus_proc_b")
+
+            # 1. Exact same nanosecond across two independent processes + adversarial UUID ordering
+            fixed_ns = 1_795_074_421_000_000_000
+            with (
+                mock.patch.object(proc_a.time, "time_ns", return_value=fixed_ns),
+                mock.patch.object(proc_a.uuid, "uuid4", return_value=mock.Mock(hex="ffffffff11111111")),
+            ):
+                with proc_a._bus_lock():
+                    proc_a._drop_inbox_packet_unlocked("bot_two", {"tag": "FIRST"})
+
+            with (
+                mock.patch.object(proc_b.time, "time_ns", return_value=fixed_ns),
+                mock.patch.object(proc_b.uuid, "uuid4", return_value=mock.Mock(hex="0000000011111111")),
+            ):
+                with proc_b._bus_lock():
+                    proc_b._drop_inbox_packet_unlocked("bot_two", {"tag": "SECOND"})
+
+            pkts_same_ns = proc_a.pop_inbox_packets("bot_two")
+            self.assertEqual(["FIRST", "SECOND"], [p["tag"] for p in pkts_same_ns])
+
+            # 2. Wall-clock step backward between process A and process B
+            with mock.patch.object(proc_a.time, "time_ns", return_value=1_795_074_430_000_000_000):
+                with proc_a._bus_lock():
+                    proc_a._drop_inbox_packet_unlocked("bot_two", {"tag": "FIRST_BEFORE_ROLLBACK"})
+
+            with mock.patch.object(proc_b.time, "time_ns", return_value=1_795_074_400_000_000_000):
+                with proc_b._bus_lock():
+                    proc_b._drop_inbox_packet_unlocked("bot_two", {"tag": "SECOND_AFTER_ROLLBACK"})
+
+            pkts_rollback = proc_b.pop_inbox_packets("bot_two")
+            self.assertEqual(["FIRST_BEFORE_ROLLBACK", "SECOND_AFTER_ROLLBACK"], [p["tag"] for p in pkts_rollback])
+
+    def test_monotonic_model_rev_and_atomic_set_bot_model_and_notify(self):
+        """model_rev increments monotonically and set_bot_model_and_notify prevents config/inbox interleaving (QA-02)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            bot_bus, _ = self._load_isolated_bus(tmp)
+
+            # Starts at 0 before any model change
+            self.assertEqual(0, bot_bus.resolve_bot_config("bot_two")["model_rev"])
+
+            # Non-model update does NOT bump model_rev
+            bot_bus.update_bot_config("bot_two", role="worker", specialty="QA")
+            self.assertEqual(0, bot_bus.resolve_bot_config("bot_two")["model_rev"])
+
+            # Model updates strictly bump model_rev
+            r1 = bot_bus.set_bot_model_config("bot_two", bot_bus.MODEL_MODE_FOLLOW)
+            self.assertEqual(1, r1["model_rev"])
+            r2 = bot_bus.set_bot_model_config("bot_two", bot_bus.MODEL_MODE_CUSTOM, "model-a")
+            self.assertEqual(2, r2["model_rev"])
+            r3 = bot_bus.update_bot_config("bot_two", default_model=None)
+            self.assertEqual(3, r3["model_rev"])
+
+            # promote_sole_coordinator bumps model_rev when setting worker default model
+            bot_bus.promote_sole_coordinator("bot_one", worker_default_model="gemini-3.8-flash-low")
+            self.assertEqual(4, bot_bus.resolve_bot_config("bot_two")["model_rev"])
+
+            # Roster _merge_bot_view exposes model_rev
+            roster_map = {b["handle"]: b for b in bot_bus.list_roster(include_offline=True)}
+            self.assertEqual(4, roster_map["bot_two"]["model_rev"])
+
+            # Concurrent set_bot_model_and_notify calls must produce strictly ordered packets matching final config
+            errors = []
+            barrier = threading.Barrier(4)
+
+            def _worker(worker_idx: int):
+                try:
+                    barrier.wait(timeout=5)
+                    for step in range(5):
+                        bot_bus.set_bot_model_and_notify(
+                            "bot_two",
+                            bot_bus.MODEL_MODE_CUSTOM,
+                            f"model-w{worker_idx}-s{step}",
+                            from_bot=f"setter_{worker_idx}",
+                            chat_id=-1001234567890,
+                            notify_target=True,
+                        )
+                except Exception as exc:
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=_worker, args=(i,)) for i in range(4)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=10)
+            self.assertEqual([], errors)
+
+            pkts = bot_bus.pop_inbox_packets("bot_two")
+            self.assertEqual(20, len(pkts))
+            revs = [p["model_rev"] for p in pkts]
+            self.assertEqual(list(range(5, 25)), revs)
+
+            final_cfg = bot_bus.resolve_bot_config("bot_two")
+            self.assertEqual(pkts[-1]["model_rev"], final_cfg["model_rev"])
+            self.assertEqual(pkts[-1]["model_mode"], final_cfg["model_mode"])
+            self.assertEqual(pkts[-1]["model"], final_cfg["configured_model"])
 
 
 if __name__ == "__main__":

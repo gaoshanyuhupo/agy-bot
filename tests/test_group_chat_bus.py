@@ -9,6 +9,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -1723,6 +1724,215 @@ class TestModelSelectionAndFollowSync(unittest.TestCase):
             self.assertIsNone(bridge.get_scope_value("-1001234567890", "model"))
             self.assertEqual("team/gpt-6.1-sol", bridge._resolve_effective_model("-1001234567890"))
             self.assertEqual(["team/gpt-6.1-sol"], _run_one_bus_job("default-check"))
+
+    def test_stale_sync_group_model_rejection_and_mixed_ms_ns_safety(self):
+        """Stale rev, untagged delayed, and mixed ms/ns sync packets must NOT clobber newer model/scope/warm session (QA-01/02)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self._load_bridge(
+                tmp,
+                {
+                    "AGY_BOT_BUS_ROLE": "worker",
+                    "AGY_TG_BOT_MODEL": "team/gpt-6.1-sol",
+                },
+            )
+            bridge.BOT_META.update({"bot_id": 222, "handle": "bot_two", "resolved": True})
+
+            # Remote setter initially queues OLD (rev=1)
+            rec_old = bridge.bot_bus.set_bot_model_and_notify(
+                "bot_two",
+                bridge.bot_bus.MODEL_MODE_CUSTOM,
+                "model-old",
+                from_bot="bot_one",
+                chat_id=-1001234567890,
+                thread_id=42,
+                notify_target=True,
+            )
+            self.assertEqual(1, rec_old["model_rev"])
+            stale_pkts = bridge.bot_bus.pop_inbox_packets("bot_two")
+            self.assertEqual(1, len(stale_pkts))
+            stale_rev_pkt = stale_pkts[0]
+            self.assertEqual(1, stale_rev_pkt["model_rev"])
+
+            # Local group /model switches to NEW (bumps rev=2, updates scope & heartbeat)
+            with mock.patch.object(bridge, "send", return_value=1):
+                bridge.cmd_model(-1001234567890, "model-new")
+                # Isolate topic 42 with its own override
+                bridge.cmd_model(-1001234567890, "model-topic-42", thread_id=42)
+
+            self.assertEqual(2, bridge.bot_bus.resolve_bot_config("bot_two")["model_rev"])
+            self.assertEqual("model-new", bridge.get_scope_value("-1001234567890", "model"))
+            self.assertEqual("model-topic-42", bridge.get_scope_value("-1001234567890:42", "model"))
+
+            # Seed an active warm session for NEW on the main group scope
+            warm_new = mock.MagicMock()
+            warm_new.is_alive.return_value = True
+            with bridge.session_lock:
+                bridge._session_pool["-1001234567890"] = warm_new
+
+            def _assert_all_stay_new():
+                cfg = bridge.bot_bus.resolve_bot_config("bot_two", env_model="team/gpt-6.1-sol")
+                self.assertEqual(bridge.bot_bus.MODEL_MODE_CUSTOM, cfg["model_mode"])
+                self.assertEqual("model-new", cfg["configured_model"])
+                self.assertEqual(2, cfg["model_rev"])
+                self.assertEqual("model-new", bridge.get_scope_value("-1001234567890", "model"))
+                self.assertEqual("model-new", bridge._resolve_effective_model("-1001234567890"))
+                self.assertEqual("model-topic-42", bridge.get_scope_value("-1001234567890:42", "model"))
+                self.assertIs(warm_new, bridge._session_pool.get("-1001234567890"))
+                roster = {b["handle"]: b for b in bridge.bot_bus.list_roster(include_offline=True)}
+                self.assertEqual("model-new", roster["bot_two"]["configured_model"])
+                self.assertEqual("model-new", roster["bot_two"]["effective_model"])
+                self.assertEqual(2, roster["bot_two"]["model_rev"])
+
+            # (a) Stale pkt_rev < auth_rev after local /model NEW
+            bridge._handle_bot_bus_packet(stale_rev_pkt)
+            _assert_all_stay_new()
+
+            # (b) Untagged delayed packet created_at=1 vs authoritative NEW
+            bridge._handle_bot_bus_packet(
+                {
+                    "type": "sync_group_model",
+                    "from_bot": "bot_one",
+                    "target_bot": "bot_two",
+                    "model_mode": bridge.bot_bus.MODEL_MODE_CUSTOM,
+                    "model": "model-stale-untagged",
+                    "chat_id": -1001234567890,
+                    "thread_id": 42,
+                    "created_at": 1,
+                }
+            )
+            _assert_all_stay_new()
+
+            # (c) Legacy 13-digit ms stale packet arriving AFTER NEW
+            bot_inbox = os.path.join(bridge.bot_bus.INBOX_DIR, "bot_two")
+            os.makedirs(bot_inbox, mode=0o700, exist_ok=True)
+            legacy_sec = int(time.time()) - 600
+            legacy_ms = legacy_sec * 1000
+            bridge.bot_bus._atomic_write_json(
+                os.path.join(bot_inbox, f"{legacy_ms}_deadbeef.json"),
+                {
+                    "type": "sync_group_model",
+                    "from_bot": "bot_one",
+                    "target_bot": "bot_two",
+                    "model_mode": bridge.bot_bus.MODEL_MODE_CUSTOM,
+                    "model": "model-legacy-ms-stale",
+                    "chat_id": -1001234567890,
+                    "thread_id": 42,
+                    "created_at": legacy_sec,
+                },
+            )
+            for pkt in bridge.bot_bus.pop_inbox_packets("bot_two"):
+                bridge._handle_bot_bus_packet(pkt)
+            _assert_all_stay_new()
+
+            # (d) Mixed legacy ms OLD + fresh ns NEWEST (rev=3) popped together converge to NEWEST
+            bridge.bot_bus._atomic_write_json(
+                os.path.join(bot_inbox, f"{legacy_ms}_ffffffff.json"),
+                {
+                    "type": "sync_group_model",
+                    "from_bot": "bot_one",
+                    "target_bot": "bot_two",
+                    "model_mode": bridge.bot_bus.MODEL_MODE_CUSTOM,
+                    "model": "model-legacy-ms-old",
+                    "chat_id": -1001234567890,
+                    "thread_id": None,
+                    "created_at": legacy_sec,
+                },
+            )
+            rec_newest = bridge.bot_bus.set_bot_model_and_notify(
+                "bot_two",
+                bridge.bot_bus.MODEL_MODE_CUSTOM,
+                "model-newest",
+                from_bot="bot_one",
+                chat_id=-1001234567890,
+                thread_id=None,
+                notify_target=True,
+            )
+            self.assertEqual(3, rec_newest["model_rev"])
+            mixed_pkts = bridge.bot_bus.pop_inbox_packets("bot_two")
+            self.assertEqual(2, len(mixed_pkts))
+            self.assertEqual("model-legacy-ms-old", mixed_pkts[0]["model"])
+            self.assertEqual("model-newest", mixed_pkts[1]["model"])
+            for pkt in mixed_pkts:
+                bridge._handle_bot_bus_packet(pkt)
+            self.assertEqual("model-newest", bridge.get_scope_value("-1001234567890", "model"))
+            self.assertEqual("model-newest", bridge._resolve_effective_model("-1001234567890"))
+            self.assertEqual("model-topic-42", bridge.get_scope_value("-1001234567890:42", "model"))
+            self.assertNotIn("-1001234567890", bridge._session_pool)
+
+        # (e) Pure synthetic compat: untagged packet applies cleanly when neither auth_rev nor auth_upd exists
+        with tempfile.TemporaryDirectory() as tmp_syn:
+            bridge_syn = self._load_bridge(tmp_syn, {"AGY_TG_BOT_ROLE": "worker"})
+            bridge_syn.BOT_META.update({"bot_id": 223, "handle": "bot_fresh", "resolved": True})
+            bridge_syn._handle_bot_bus_packet(
+                {
+                    "type": "sync_group_model",
+                    "from_bot": "bot_one",
+                    "target_bot": "bot_fresh",
+                    "model_mode": bridge_syn.bot_bus.MODEL_MODE_CUSTOM,
+                    "model": "synthetic-model",
+                    "chat_id": -1001234567890,
+                    "thread_id": None,
+                }
+            )
+            self.assertEqual("synthetic-model", bridge_syn.get_scope_value("-1001234567890", "model"))
+
+    def test_register_bot_commands_scope_cleanup_gate_and_retry(self):
+        """Failed DM/group chat cleanup prevents caching & retries; inapplicable private chat_administrators does not (QA-03)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self._load_bridge(tmp, {"AGY_TG_BOT_ROLE": "worker"})
+            bridge.BOT_META.update({"bot_id": 222, "handle": "bot_two", "resolved": True})
+            bridge._LAST_REGISTERED_CMD_ROLE = None
+
+            resp_ok = mock.MagicMock(status_code=200, json=lambda: {"ok": True})
+            resp_400 = mock.MagicMock(status_code=400, json=lambda: {"ok": False, "error_code": 400})
+
+            # 1. Positive DM `chat` deleteMyCommands returns HTTP 400 -> returns False, does NOT cache, retries on force=False
+            calls_1 = []
+
+            def _tg_fail_dm_chat(method, **kw):
+                calls_1.append((method, kw.get("scope")))
+                if method == "deleteMyCommands" and kw.get("scope") == {"type": "chat", "chat_id": 111}:
+                    return resp_400
+                return resp_ok
+
+            with mock.patch.object(bridge, "tg", side_effect=_tg_fail_dm_chat):
+                self.assertFalse(bridge.register_bot_commands(force=True))
+                self.assertIsNone(bridge._LAST_REGISTERED_CMD_ROLE)
+                prev_len = len(calls_1)
+                self.assertFalse(bridge.register_bot_commands(force=False))
+                self.assertGreater(len(calls_1), prev_len)
+
+            # 2. Private `chat_administrators` returning HTTP 400 is best-effort and MUST allow caching
+            calls_2 = []
+
+            def _tg_fail_private_admin_only(method, **kw):
+                calls_2.append((method, kw.get("scope")))
+                if method == "deleteMyCommands" and kw.get("scope") == {"type": "chat_administrators", "chat_id": 111}:
+                    return resp_400
+                return resp_ok
+
+            with mock.patch.object(bridge, "tg", side_effect=_tg_fail_private_admin_only):
+                self.assertTrue(bridge.register_bot_commands(force=False))
+                self.assertEqual("worker", bridge._LAST_REGISTERED_CMD_ROLE)
+                self.assertIn(("deleteMyCommands", {"type": "chat_administrators", "chat_id": 111}), calls_2)
+                cached_len = len(calls_2)
+                self.assertTrue(bridge.register_bot_commands(force=False))
+                self.assertEqual(cached_len, len(calls_2))
+
+            # 3. Negative group `chat_administrators` returning HTTP 400 MUST block caching
+            bridge._LAST_REGISTERED_CMD_ROLE = None
+
+            def _tg_fail_group_admin(method, **kw):
+                if method == "deleteMyCommands" and kw.get("scope") == {
+                    "type": "chat_administrators",
+                    "chat_id": -1001234567890,
+                }:
+                    return resp_400
+                return resp_ok
+
+            with mock.patch.object(bridge, "tg", side_effect=_tg_fail_group_admin):
+                self.assertFalse(bridge.register_bot_commands(force=True))
+                self.assertIsNone(bridge._LAST_REGISTERED_CMD_ROLE)
 
 
 if __name__ == "__main__":
