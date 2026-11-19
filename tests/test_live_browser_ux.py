@@ -7,7 +7,6 @@ import asyncio
 import hashlib
 import hmac
 import json
-import os
 from pathlib import Path
 import sys
 import tempfile
