@@ -35,7 +35,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 from urllib.parse import urlparse
 
 import requests
