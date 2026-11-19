@@ -2880,7 +2880,7 @@ class TestRound4FinalClosureAdversarialRegression(unittest.TestCase):
                     cur_t = hub.takeover_gen
                     extract_called: list[str] = []
 
-                    async def _slow_extract(_data: dict) -> dict:
+                    async def _slow_extract(_data: dict, **_kw) -> dict:
                         extract_called.append("sgen")
                         hub.session_gen += 1
                         return {"text": "LEAKED_OLD_GEN", "source": "point", "url": hub.url, "ts": time.time()}
@@ -2906,7 +2906,7 @@ class TestRound4FinalClosureAdversarialRegression(unittest.TestCase):
                     cur_g2 = hub.session_gen
                     cur_t2 = hub.takeover_gen
 
-                    async def _slow_extract_tgen(_data: dict) -> dict:
+                    async def _slow_extract_tgen(_data: dict, **_kw) -> dict:
                         extract_called.append("tgen")
                         hub.takeover_gen += 1
                         return {"text": "LEAKED_OLD_TGEN", "source": "point", "url": hub.url, "ts": time.time()}
@@ -3885,7 +3885,14 @@ class TestRound5FinalPolishRegression(unittest.TestCase):
                             remote="127.0.0.1",
                             app={"hub": hub},
                             query={},
-                            json=mock.AsyncMock(return_value={"text": "ONLY_FOR_REQUESTER", "req_id": "req-target-1"}),
+                            json=mock.AsyncMock(
+                                return_value={
+                                    "text": "ONLY_FOR_REQUESTER",
+                                    "req_id": "req-target-1",
+                                    "session_gen": sgen,
+                                    "takeover_gen": hub.takeover_gen,
+                                }
+                            ),
                         )  # type: ignore[arg-type]
                     )
                     self.assertEqual(200, r_clip.status)
@@ -4424,7 +4431,14 @@ class TestRound6FinalClosureRegression(unittest.TestCase):
                             remote="127.0.0.1",
                             app={"hub": hub},
                             query={},
-                            json=mock.AsyncMock(return_value={"text": "POLLUTED_UNKNOWN_REQ", "req_id": "unknown-999"}),
+                            json=mock.AsyncMock(
+                                return_value={
+                                    "text": "POLLUTED_UNKNOWN_REQ",
+                                    "req_id": "unknown-999",
+                                    "session_gen": sgen,
+                                    "takeover_gen": tgen,
+                                }
+                            ),
                         )  # type: ignore[arg-type]
                     )
                     self.assertEqual("INITIAL_SAFE_CLIP", hub.latest_clip.get("text"))
@@ -4449,7 +4463,12 @@ class TestRound6FinalClosureRegression(unittest.TestCase):
                             app={"hub": hub},
                             query={},
                             json=mock.AsyncMock(
-                                return_value={"text": "STALE_TGEN_CLIP", "req_id": "req-tgen-stale", "takeover_gen": tgen}
+                                return_value={
+                                    "text": "STALE_TGEN_CLIP",
+                                    "req_id": "req-tgen-stale",
+                                    "session_gen": sgen,
+                                    "takeover_gen": tgen,
+                                }
                             ),
                         )  # type: ignore[arg-type]
                     )
@@ -4477,7 +4496,12 @@ class TestRound6FinalClosureRegression(unittest.TestCase):
                             app={"hub": hub},
                             query={},
                             json=mock.AsyncMock(
-                                return_value={"text": "MUST_NOT_FALLBACK_TO_WS_B", "req_id": "req-ws-closed", "takeover_gen": cur_tgen}
+                                return_value={
+                                    "text": "MUST_NOT_FALLBACK_TO_WS_B",
+                                    "req_id": "req-ws-closed",
+                                    "session_gen": sgen,
+                                    "takeover_gen": cur_tgen,
+                                }
                             ),
                         )  # type: ignore[arg-type]
                     )
@@ -4695,12 +4719,538 @@ class TestRound6FinalClosureRegression(unittest.TestCase):
         bridge._exec_human_sync({"action": "mouseup", "x": 15, "y": 15, "button": "left"})
         self.assertEqual(["left"], pb.mouse.ups)
 
-        # 6. Binary unit consistency (MiB, zero stale MB user-facing strings or wire-level comments)
+        # 6. Binary unit consistency (MiB, zero stale MB user-facing strings or wire-level/raw multipart comments)
         srv_src = (REPO_ROOT / ".agents/skills/live-browser/scripts/live_browser_server.py").read_text(encoding="utf-8")
         self.assertNotIn("}MB", srv_src)
         self.assertNotIn("wire-level", srv_src)
+        self.assertNotIn("raw incoming multipart stream", srv_src)
+        self.assertNotIn("raw multipart request", srv_src)
         self.assertIn("MiB 限制", srv_src)
         self.assertIn("MiB 服务端单文件上限", srv_src)
+
+    def test_round7_unicode_int_card_retire_retry_hosted_extract_sync_dual_gen_real_events_and_origin_gen(self) -> None:
+        """Round 7 §3, §4, §6: Unicode digit safety, card retire retry + lock contention, Hosted extract dual-gen cache, Sync mandatory dual-gen, real page/close events, synchronous origin_session_gen."""
+        tok_main = "100:MAIN_TOK_R7_FULL"
+        with tempfile.TemporaryDirectory() as tmp:
+            bdir = Path(tmp) / "bridge"
+            bdir.mkdir(parents=True, exist_ok=True)
+            env_main = bdir / ".env"
+            env_main.write_text(
+                f"AGY_TG_BOT_TOKEN={tok_main}\nAGY_TG_ALLOWED_CHATS=111\nAGY_TG_ADMIN_USERS=111\n",
+                encoding="utf-8",
+            )
+
+            # 3a. Strict integer parser rejects Unicode digits like "²" and "٢" safely
+            self.assertIsNone(srv._parse_strict_int("²"))
+            self.assertIsNone(srv._parse_strict_int("٢"))
+            self.assertIsNone(srv._parse_strict_int(True))
+            self.assertEqual(42, srv._parse_strict_int("42"))
+            self.assertEqual(-7, srv._parse_strict_int("-7"))
+
+            async def _scenario() -> None:
+                hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "sec-tok")
+                fake_ws_type = types.SimpleNamespace(TEXT="TEXT", CLOSE="CLOSE")
+                init_111 = _signed_init_data(tok_main, 111)
+
+                with (
+                    mock.patch.object(srv, "_BRIDGE_DIR", bdir),
+                    mock.patch.object(srv, "WSMsgType", fake_ws_type),
+                    mock.patch.object(srv, "web", _FakeWeb),
+                ):
+                    # 3a-ws: Sending Unicode "²" in start_browser/switch_profile/stop_browser cleanly rejects WITHOUT crashing/disconnecting WS!
+                    class _LifecycleWS:
+                        def __init__(self, msgs: list[dict]) -> None:
+                            self._msgs = [
+                                types.SimpleNamespace(type="TEXT", data=json.dumps(m))
+                                for m in msgs
+                            ]
+                            self.sent: list[dict] = []
+                            self.closed = False
+
+                        async def prepare(self, _req) -> None:
+                            return None
+
+                        async def receive(self):
+                            return self._msgs.pop(0) if self._msgs else types.SimpleNamespace(type="CLOSE", data="")
+
+                        async def send_str(self, s: str) -> None:
+                            self.sent.append(json.loads(s))
+
+                        async def send_bytes(self, _b: bytes) -> None:
+                            pass
+
+                        async def close(self, **_kw) -> None:
+                            self.closed = True
+
+                        def __aiter__(self):
+                            return self
+
+                        async def __anext__(self):
+                            if self._msgs:
+                                return self._msgs.pop(0)
+                            raise StopAsyncIteration
+
+                    ws_u = _LifecycleWS(
+                        [
+                            {"type": "auth", "initData": init_111},
+                            {"type": "start_browser", "session_gen": "²"},
+                            {"type": "switch_profile", "profile": "default", "session_gen": "²"},
+                            {"type": "stop_browser", "session_gen": "²"},
+                            {"type": "list_profiles"},
+                        ]
+                    )
+
+                    class _WSWeb(_FakeWeb):
+                        @staticmethod
+                        def WebSocketResponse(**_kw):
+                            return ws_u
+
+                    with mock.patch.object(srv, "web", _WSWeb):
+                        await srv.handle_ws(types.SimpleNamespace(remote="127.0.0.1", app={"hub": hub}))  # type: ignore[arg-type]
+
+                    self.assertFalse(ws_u.closed, "Unicode digit '²' MUST NOT crash/close WebSocket")
+                    toasts = [m.get("message", "") for m in ws_u.sent if m.get("type") == "toast"]
+                    self.assertEqual(3, sum("会话代次缺失或已变更" in t for t in toasts))
+                    self.assertTrue(
+                        any(m.get("type") == "profiles_list" for m in ws_u.sent),
+                        "WS MUST stay alive after rejecting '²' and still serve subsequent messages!",
+                    )
+
+                    # 3b. Periodic card retirement: transient failure retains card for retry (even with latest_jpeg=None & idle);
+                    #     succeeding retry removes card; bounded 3-attempt cap; real concurrent tick_updates vs retire_cards lock contention!
+                    class _FlakyRetireHTTP:
+                        def __init__(self, outcomes: list[object], *, hold_first_gate: asyncio.Event | None = None) -> None:
+                            self._outcomes = list(outcomes)
+                            self._hold_first_gate = hold_first_gate
+                            self.first_entered = asyncio.Event()
+                            self.calls: list[tuple[str, dict]] = []
+
+                        def post(self, url: str, **kw):
+                            self.calls.append((url, kw))
+                            outcome = self._outcomes.pop(0) if self._outcomes else {"ok": True}
+                            idx = len(self.calls)
+                            outer = self
+
+                            class _Resp:
+                                status = outcome.get("http_status", 200) if isinstance(outcome, dict) else 200
+
+                                async def __aenter__(self_r):
+                                    if idx == 1 and outer._hold_first_gate is not None:
+                                        outer.first_entered.set()
+                                        await outer._hold_first_gate.wait()
+                                    if isinstance(outcome, Exception):
+                                        raise outcome
+                                    return self_r
+
+                                async def __aexit__(self_r, *_a):
+                                    return False
+
+                                async def json(self_r):
+                                    assert isinstance(outcome, dict)
+                                    return outcome
+
+                            return _Resp()
+
+                    flaky_http = _FlakyRetireHTTP(
+                        [
+                            RuntimeError("transient network timeout"),
+                            {"ok": True, "result": {"message_id": 888}},
+                        ]
+                    )
+                    hub.tg.http = flaky_http
+                    hub.engine_mode = "idle"
+                    hub.session_gen = 15
+                    hub.latest_jpeg = None  # Even without a frame, stale card retry MUST run!
+                    hub.tg.cards[("main", 111)] = {
+                        "bot_key": "main",
+                        "chat_id": 111,
+                        "message_id": 888,
+                        "session_gen": 14,
+                        "owner": ("main", 111),
+                        "last_sha1": "s",
+                        "last_caption": "c",
+                        "last_markup": "m",
+                        "last_ts": 0.0,
+                    }
+                    # Attempt 1: transient failure -> card MUST remain retained with retire_attempts == 1
+                    await hub.tg.tick_updates(force=True)
+                    self.assertIn(("main", 111), hub.tg.cards)
+                    self.assertEqual(1, hub.tg.cards[("main", 111)].get("retire_attempts"))
+                    # Attempt 2: succeeds -> card MUST be removed
+                    await hub.tg.tick_updates(force=True)
+                    self.assertNotIn(("main", 111), hub.tg.cards)
+                    self.assertEqual(2, len(flaky_http.calls))
+
+                    # Bounded 3-attempt cap: 3 consecutive 500s -> retained on attempts 1 & 2, dropped on attempt 3
+                    cap_http = _FlakyRetireHTTP(
+                        [
+                            {"http_status": 500, "ok": False, "description": "Internal Server Error"},
+                            {"http_status": 429, "ok": False, "description": "Too Many Requests"},
+                            {"http_status": 502, "ok": False, "description": "Bad Gateway"},
+                        ]
+                    )
+                    hub.tg.http = cap_http
+                    hub.tg.cards[("main", 111)] = {
+                        "bot_key": "main",
+                        "chat_id": 111,
+                        "message_id": 8881,
+                        "session_gen": 14,
+                        "owner": ("main", 111),
+                        "last_sha1": "s",
+                        "last_caption": "c",
+                        "last_markup": "m",
+                        "last_ts": 0.0,
+                    }
+                    await hub.tg.tick_updates(force=True)
+                    self.assertIn(("main", 111), hub.tg.cards)
+                    await hub.tg.tick_updates(force=True)
+                    self.assertIn(("main", 111), hub.tg.cards)
+                    await hub.tg.tick_updates(force=True)
+                    self.assertNotIn(("main", 111), hub.tg.cards, "Card MUST drop after bounded 3 failed retire attempts")
+
+                    # Real concurrent lock contention: tick_updates wins lock first, retire_cards waits behind it!
+                    gate = asyncio.Event()
+                    conc_http = _FlakyRetireHTTP(
+                        [{"ok": True, "result": {"message_id": 889}}],
+                        hold_first_gate=gate,
+                    )
+                    hub.tg.http = conc_http
+                    hub.tg.cards[("main", 111)] = {
+                        "bot_key": "main",
+                        "chat_id": 111,
+                        "message_id": 889,
+                        "session_gen": 14,
+                        "owner": ("main", 111),
+                        "last_sha1": "s",
+                        "last_caption": "c",
+                        "last_markup": "m",
+                        "last_ts": 0.0,
+                    }
+                    t_tick = asyncio.create_task(hub.tg.tick_updates(force=True))
+                    await conc_http.first_entered.wait()
+                    t_retire = asyncio.create_task(hub.tg.retire_cards(session_gen=14, mark_finished=True))
+                    await asyncio.sleep(0)
+                    # While tick_updates holds _lock, retire_cards is genuinely contending on _lock (not done yet)
+                    self.assertFalse(t_retire.done())
+                    gate.set()
+                    await asyncio.gather(t_tick, t_retire)
+                    self.assertNotIn(("main", 111), hub.tg.cards)
+                    self.assertEqual(1, len(conc_http.calls), "Serialized lock contention must retire exactly once")
+
+                    # 4a. Hosted `extract_content_async` (`point` & `range`): takeover_gen change mid-extract MUST NOT pollute `latest_clip`!
+                    class _GenBumpingPage(_FakePage):
+                        def __init__(self, target_hub, ret_val) -> None:
+                            super().__init__("https://extract.example", "Extract")
+                            self._hub = target_hub
+                            self._ret_val = ret_val
+
+                        async def evaluate(self, _script: str, _arg=None):
+                            self._hub.takeover_gen += 1
+                            return self._ret_val
+
+                    hub.engine_mode = "async_hosted"
+                    hub.session_gen = 20
+                    hub.takeover_gen = 5
+                    hub.session_owner = ("main", 111)
+                    hub.latest_clip = {"text": "SAFE_BEFORE_EXTRACT"}
+
+                    hub.ctx = _FakeCtx(
+                        [_GenBumpingPage(hub, {"text": "STALE_POINT", "label": "p"})]
+                    )
+                    res_pt = await hub.extract_content_async(
+                        {"mode": "point", "x": 10, "y": 10},
+                        expected_session_gen=20,
+                        expected_takeover_gen=5,
+                        expected_owner=("main", 111),
+                        check_owner=True,
+                    )
+                    self.assertIsNone(res_pt)
+                    self.assertEqual("SAFE_BEFORE_EXTRACT", hub.latest_clip.get("text"))
+
+                    hub.takeover_gen = 6
+                    hub.ctx = _FakeCtx([_GenBumpingPage(hub, "STALE_RANGE_TEXT")])
+                    res_rg = await hub.extract_content_async(
+                        {"mode": "range", "x1": 1, "y1": 1, "x2": 20, "y2": 20},
+                        expected_session_gen=20,
+                        expected_takeover_gen=6,
+                        expected_owner=("main", 111),
+                        check_owner=True,
+                    )
+                    self.assertIsNone(res_rg)
+                    self.assertEqual("SAFE_BEFORE_EXTRACT", hub.latest_clip.get("text"))
+
+                    # 4b. Sync `/internal/sync/clipboard` mandatory dual-gen on non-empty `req_id`
+                    r_sync = await srv.internal_sync_start(
+                        types.SimpleNamespace(
+                            headers={"X-Live-Token": "sec-tok"},
+                            remote="127.0.0.1",
+                            app={"hub": hub},
+                            json=mock.AsyncMock(return_value={"bot": "main", "user_id": 111}),
+                        )  # type: ignore[arg-type]
+                    )
+                    lease_id = r_sync.data["sync_lease_id"]
+                    sgen = r_sync.data["session_gen"]
+                    tgen = hub.takeover_gen
+                    ws_t = _FakeWSViewer()
+                    hub.viewers = {ws_t}  # type: ignore[assignment]
+                    hub.viewer_meta = {ws_t: {"bot_key": "main", "user_id": 111, "role": "admin"}}
+                    hub.latest_clip = {"text": "SAFE_SYNC_CLIP"}
+                    hub._pending_sync_extracts["req-strict-1"] = {
+                        "bot_key": "main",
+                        "user_id": 111,
+                        "session_gen": sgen,
+                        "takeover_gen": tgen,
+                        "owner": hub.session_owner,
+                        "ws": ws_t,
+                        "created_ts": time.monotonic(),
+                    }
+                    for bad_body in (
+                        {"text": "NO_GENS", "req_id": "req-strict-1"},
+                        {"text": "MISSING_TGEN", "req_id": "req-strict-1", "session_gen": sgen},
+                        {"text": "MISSING_SGEN", "req_id": "req-strict-1", "takeover_gen": tgen},
+                        {"text": "UNICODE_TGEN", "req_id": "req-strict-1", "session_gen": sgen, "takeover_gen": "²"},
+                        {"text": "UNICODE_SGEN", "req_id": "req-strict-1", "session_gen": "²", "takeover_gen": tgen},
+                    ):
+                        r_bad = await srv.internal_sync_clipboard(
+                            types.SimpleNamespace(
+                                headers={"X-Live-Token": "sec-tok", "X-Sync-Lease-Id": lease_id},
+                                remote="127.0.0.1",
+                                app={"hub": hub},
+                                query={},
+                                json=mock.AsyncMock(return_value=bad_body),
+                            )  # type: ignore[arg-type]
+                        )
+                        self.assertEqual(400, r_bad.status, f"Expected 400 for {bad_body}")
+                    self.assertEqual("SAFE_SYNC_CLIP", hub.latest_clip.get("text"))
+                    self.assertEqual([], ws_t.sent_json)
+
+                    # 4c. Real `page` and `close` callbacks during `new_tab` / `close_tab` revocation!
+                    class _EventfulPage(_FakePage):
+                        def __init__(self, url: str = "https://ev.example", *, fail_close: bool = False, on_close_hook=None) -> None:
+                            super().__init__(url, "Ev")
+                            self.closed = False
+                            self._fail_close = fail_close
+                            self._on_close_hook = on_close_hook
+                            self.listeners: dict[str, list] = {}
+                            self.goto = mock.AsyncMock()  # type: ignore[method-assign]
+
+                        def on(self, ev: str, cb) -> None:
+                            self.listeners.setdefault(ev, []).append(cb)
+
+                        def is_closed(self) -> bool:
+                            return self.closed
+
+                        async def close(self) -> None:
+                            if self._on_close_hook is not None:
+                                self._on_close_hook()
+                            if self._fail_close:
+                                raise RuntimeError("revoked new_tab close failed")
+                            self.closed = True
+                            for cb in list(self.listeners.get("close", [])):
+                                cb()
+
+                    class _EventfulCtx:
+                        def __init__(self, pages: list[object], new_page_factory=None) -> None:
+                            self.pages = list(pages)
+                            self.ctx_listeners: dict[str, list] = {}
+                            self._factory = new_page_factory
+
+                        def on(self, ev: str, cb) -> None:
+                            self.ctx_listeners.setdefault(ev, []).append(cb)
+
+                        async def route(self, _pat: str, _cb) -> None:
+                            pass
+
+                        async def new_page(self):
+                            p = self._factory()
+                            self.pages.append(p)
+                            for cb in list(self.ctx_listeners.get("page", [])):
+                                cb(p)
+                            return p
+
+                    # Start a real hosted session with _EventfulCtx so real `_on_new_page` is registered!
+                    created_rev_pages: list[_EventfulPage] = []
+
+                    def _make_revoked_page(*, fail_close: bool = False):
+                        p = _EventfulPage("about:blank", fail_close=fail_close)
+                        created_rev_pages.append(p)
+                        # Revoke admin 111 during new_page() (BEFORE new_page returns!)
+                        env_main.write_text(
+                            f"AGY_TG_BOT_TOKEN={tok_main}\nAGY_TG_ALLOWED_CHATS=999\nAGY_TG_ADMIN_USERS=999\n",
+                            encoding="utf-8",
+                        )
+                        return p
+
+                    ev_cm_list: list[object] = []
+
+                    class _EvCM:
+                        def __init__(self, **_kw) -> None:
+                            self.exited = False
+                            self.p0 = _EventfulPage("https://p0.example")
+                            self.p1 = _EventfulPage("https://p1.example")
+                            self.ctx = _EventfulCtx([self.p0, self.p1], new_page_factory=lambda: _make_revoked_page(fail_close=False))
+                            ev_cm_list.append(self)
+
+                        async def __aenter__(self):
+                            return self.ctx
+
+                        async def __aexit__(self, *_a):
+                            self.exited = True
+
+                    hub_ev = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "sec-tok")
+                    with (
+                        mock.patch.object(srv, "discover_pinned_host_profile", return_value=None),
+                        mock.patch.object(srv, "resolve_camoufox_display", return_value=None),
+                        mock.patch.object(srv, "read_x11_clipboard_async", new=mock.AsyncMock(return_value="")),
+                        mock.patch.dict(
+                            sys.modules,
+                            {"camoufox": types.SimpleNamespace(), "camoufox.async_api": types.SimpleNamespace(AsyncCamoufox=_EvCM)},
+                        ),
+                    ):
+                        await hub_ev.start_hosted(actor=("main", 111), source="ws", notify_tg=False)
+                        hub_ev.active_tab_index = 0
+                        hub_ev.takeover = True
+                        hub_ev.takeover_owner = ("main", 111)
+                        rev_nt = hub_ev._tab_select_rev
+                        await hub_ev._execute_human_cmd_async(
+                            {
+                                "action": "new_tab",
+                                "_bot_key": "main",
+                                "_user_id": 111,
+                                "_session_gen": hub_ev.session_gen,
+                                "_takeover_gen": hub_ev.takeover_gen,
+                            }
+                        )
+                        self.assertEqual(1, len(created_rev_pages))
+                        self.assertTrue(created_rev_pages[0].closed)
+                        self.assertEqual(0, hub_ev.active_tab_index, "Real ctx.on('page') MUST NOT preemptively switch active_tab_index before post-await auth!")
+                        self.assertEqual(rev_nt, hub_ev._tab_select_rev)
+
+                        # Real `close` listener during revoked `close_tab` MUST NOT mutate active_tab_index or _tab_select_rev!
+                        env_main.write_text(
+                            f"AGY_TG_BOT_TOKEN={tok_main}\nAGY_TG_ALLOWED_CHATS=111\nAGY_TG_ADMIN_USERS=111\n",
+                            encoding="utf-8",
+                        )
+                        hub_ev.takeover = True
+                        hub_ev.takeover_owner = ("main", 111)
+                        ev_cm = ev_cm_list[-1]
+                        ev_cm.p1._on_close_hook = lambda: env_main.write_text(  # type: ignore[attr-defined]
+                            f"AGY_TG_BOT_TOKEN={tok_main}\nAGY_TG_ALLOWED_CHATS=999\nAGY_TG_ADMIN_USERS=999\n",
+                            encoding="utf-8",
+                        )
+                        hub_ev.active_tab_index = 1
+                        rev_ct = hub_ev._tab_select_rev
+                        await hub_ev._execute_human_cmd_async(
+                            {
+                                "action": "close_tab",
+                                "index": 1,
+                                "_bot_key": "main",
+                                "_user_id": 111,
+                                "_session_gen": hub_ev.session_gen,
+                                "_takeover_gen": hub_ev.takeover_gen,
+                            }
+                        )
+                        self.assertTrue(ev_cm.p1.closed, "close_tab must have actually executed p1.close() and fired close listener")  # type: ignore[attr-defined]
+                        self.assertEqual(1, hub_ev.active_tab_index)
+                        self.assertEqual(rev_ct, hub_ev._tab_select_rev)
+
+                        # Revoked `new_tab` whose `close()` ALSO fails -> fail-closed cleanup aborts hosted session cleanly!
+                        env_main.write_text(
+                            f"AGY_TG_BOT_TOKEN={tok_main}\nAGY_TG_ALLOWED_CHATS=111\nAGY_TG_ADMIN_USERS=111\n",
+                            encoding="utf-8",
+                        )
+                        hub_ev.takeover = True
+                        hub_ev.takeover_owner = ("main", 111)
+                        ev_cm.ctx._factory = lambda: _make_revoked_page(fail_close=True)  # type: ignore[attr-defined]
+                        await asyncio.wait_for(
+                            hub_ev._execute_human_cmd_async(
+                                {
+                                    "action": "new_tab",
+                                    "_bot_key": "main",
+                                    "_user_id": 111,
+                                    "_session_gen": hub_ev.session_gen,
+                                    "_takeover_gen": hub_ev.takeover_gen,
+                                }
+                            ),
+                            timeout=3.0,
+                        )
+                        self.assertEqual("idle", hub_ev.engine_mode, "Revoked new_tab whose close() fails MUST abort session fail-closed")
+                        self.assertTrue(ev_cm.exited)  # type: ignore[attr-defined]
+
+                    # 6a. Synchronous origin_session_gen capture on dialog & filechooser:
+                    #     if session_gen advances BEFORE the scheduled task runs, task MUST NOT register/broadcast into the newer gen!
+                    env_main.write_text(
+                        f"AGY_TG_BOT_TOKEN={tok_main}\nAGY_TG_ALLOWED_CHATS=111\nAGY_TG_ADMIN_USERS=111\n",
+                        encoding="utf-8",
+                    )
+                    hub_og = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "sec-tok")
+                    hub_og.engine_mode = "async_hosted"
+                    hub_og.session_gen = 50
+                    hub_og.session_owner = ("main", 111)
+                    hub_og.takeover = True
+                    ws_og = _FakeWSViewer()
+                    hub_og.viewers = {ws_og}  # type: ignore[assignment]
+                    hub_og.viewer_meta = {ws_og: {"bot_key": "main", "user_id": 111, "role": "admin"}}
+                    og_page = _EventfulPage("https://og.example")
+                    hub_og._attach_page_listeners(og_page)
+
+                    fake_dialog = types.SimpleNamespace(
+                        type="alert",
+                        message="Stale Gen Alert",
+                        default_value="",
+                        dismiss=mock.AsyncMock(),
+                    )
+                    fake_chooser = types.SimpleNamespace(is_multiple=lambda: False)
+                    # Fire both callbacks synchronously at gen=50, then IMMEDIATELY bump session_gen to 51 BEFORE event loop yields!
+                    og_page.listeners["dialog"][0](fake_dialog)
+                    og_page.listeners["filechooser"][0](fake_chooser)
+                    hub_og.session_gen = 51
+                    await asyncio.sleep(0.02)
+                    fake_dialog.dismiss.assert_awaited_once()
+                    self.assertEqual({}, hub_og.pending_dialogs)
+                    self.assertEqual({}, hub_og.pending_filechoosers)
+                    self.assertEqual([], ws_og.sent_json, "Stale-origin dialog/filechooser MUST NOT broadcast into newer session_gen 51!")
+
+                    # Google ctx.route synchronous origin_session_gen capture: session_gen advances during await route.abort()
+                    route_cb_holder: list[object] = []
+
+                    class _RouteCtx:
+                        async def route(self, _pat: str, cb) -> None:
+                            route_cb_holder.append(cb)
+
+                    with mock.patch.object(
+                        srv, "discover_pinned_host_profile", return_value={"name": "pin", "profile_dir": Path(tmp)}
+                    ):
+                        await hub_og._install_non_pinned_google_guard(_RouteCtx(), is_pinned_verified=False)
+
+                    class _GenBumpingRoute:
+                        def __init__(self) -> None:
+                            self.aborted = False
+                            self.request = types.SimpleNamespace(
+                                url="https://accounts.google.com/signin",
+                                is_navigation_request=lambda: True,
+                                resource_type="document",
+                            )
+
+                        async def abort(self, *_a) -> None:
+                            self.aborted = True
+                            hub_og.session_gen = 52
+
+                        async def continue_(self) -> None:
+                            pass
+
+                    r_bump = _GenBumpingRoute()
+                    await route_cb_holder[0](r_bump, r_bump.request)  # type: ignore[operator]
+                    await asyncio.sleep(0.02)
+                    self.assertTrue(r_bump.aborted)
+                    self.assertEqual([], ws_og.sent_json, "Google block toast captured at gen=51 MUST NOT deliver into gen=52!")
+
+                    # Verify 413 message explicitly reflects 25 MiB files + 64 KiB multipart overhead
+                    srv_txt = (REPO_ROOT / ".agents/skills/live-browser/scripts/live_browser_server.py").read_text(encoding="utf-8")
+                    self.assertIn("MiB 文件", srv_txt)
+                    self.assertIn("KiB multipart 开销限制", srv_txt)
+
+            asyncio.run(_scenario())
 
 
 if __name__ == "__main__":

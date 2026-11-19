@@ -15,6 +15,7 @@ import types
 import unittest
 import urllib.parse
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 import requests
@@ -56,11 +57,23 @@ class _FakeWSMessage:
 
 
 class _FakeWebSocketResponse:
-    def __init__(self, incoming: list[_FakeWSMessage]) -> None:
+    def __init__(
+        self,
+        incoming: list[_FakeWSMessage],
+        *,
+        step_waits: list[Any] | None = None,
+        final_wait: Any = None,
+        wait_timeout: float = 5.0,
+    ) -> None:
         self._incoming = list(incoming)
+        self._step_waits = list(step_waits) if step_waits is not None else []
+        self._final_wait = final_wait
+        self._wait_timeout = float(wait_timeout)
         self.closed = False
         self.sent_text: list[str] = []
         self.sent_bytes: list[bytes] = []
+        self.parsed_frames: list[dict] = []
+        self._frame_event = asyncio.Event()
 
     async def prepare(self, _request) -> None:
         return None
@@ -72,21 +85,53 @@ class _FakeWebSocketResponse:
 
     async def send_str(self, payload: str) -> None:
         self.sent_text.append(payload)
+        try:
+            self.parsed_frames.append(json.loads(payload))
+        except Exception:
+            pass
+        self._frame_event.set()
 
     async def send_bytes(self, payload: bytes) -> None:
         self.sent_bytes.append(payload)
 
     async def close(self) -> None:
         self.closed = True
+        self._frame_event.set()
+
+    async def _wait_for_predicate(self, pred: Any) -> None:
+        if pred is None:
+            return
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._wait_timeout
+        while not pred(self.parsed_frames):
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise AssertionError(
+                    f"Timed out waiting for WS state/frame predicate; observed frames: {self.parsed_frames}"
+                )
+            self._frame_event.clear()
+            if pred(self.parsed_frames):
+                return
+            try:
+                await asyncio.wait_for(self._frame_event.wait(), timeout=min(0.25, remaining))
+            except asyncio.TimeoutError:
+                pass
 
     def __aiter__(self):
         return self
 
     async def __anext__(self) -> _FakeWSMessage:
-        # Yield briefly so background tasks scheduled on the previous frame can run
-        await asyncio.sleep(0.01)
         if self._incoming:
+            wait_pred = self._step_waits.pop(0) if self._step_waits else None
+            if wait_pred is not None:
+                await self._wait_for_predicate(wait_pred)
+            else:
+                await asyncio.sleep(0)
             return self._incoming.pop(0)
+        if self._final_wait is not None:
+            pred = self._final_wait
+            self._final_wait = None
+            await self._wait_for_predicate(pred)
         raise StopAsyncIteration
 
 
@@ -299,7 +344,35 @@ class TestLiveBrowserServerPanelWS(unittest.TestCase):
                 _FakeWSMessage(json.dumps({"type": "switch_profile", "profile": "default", "url": "https://example.org", "session_gen": 1})),
                 _FakeWSMessage(json.dumps({"type": "stop_browser", "session_gen": 3})),
             ]
-            ws_inst = _FakeWebSocketResponse(incoming)
+            ws_inst = _FakeWebSocketResponse(
+                incoming,
+                step_waits=[
+                    # Before list_profiles: wait for initial auth_ok + state
+                    lambda frames: any(f.get("type") == "state" for f in frames),
+                    # Before start_browser(gen=0): wait for profiles_list
+                    lambda frames: any(f.get("type") == "profiles_list" for f in frames),
+                    # Before switch_profile(nonexistent, gen=1): wait for state confirming session_gen==1 & running
+                    lambda frames: any(
+                        f.get("type") == "state" and f.get("running") and f.get("session_gen") == 1
+                        for f in frames
+                    ),
+                    # Before switch_profile(default, gen=1): wait for invalid profile toast
+                    lambda frames: any(
+                        f.get("type") == "toast"
+                        and ("Profile 无效" in str(f.get("message", "")) or "not found" in str(f.get("message", "")))
+                        for f in frames
+                    ),
+                    # Before stop_browser(gen=3): wait for state confirming session_gen==3 & running
+                    lambda frames: any(
+                        f.get("type") == "state" and f.get("running") and f.get("session_gen") == 3
+                        for f in frames
+                    ),
+                ],
+                final_wait=lambda frames: any(
+                    f.get("type") == "state" and f.get("engine_mode") == "idle" and int(f.get("session_gen", 0)) >= 4
+                    for f in frames
+                ),
+            )
 
             class _FakeWebWithWS(_FakeWebModule):
                 @staticmethod
@@ -315,6 +388,8 @@ class TestLiveBrowserServerPanelWS(unittest.TestCase):
                 mock.patch.object(srv, "web", _FakeWebWithWS),
                 mock.patch.object(srv, "WSMsgType", _FakeWSMsgType),
                 mock.patch.object(srv, "load_bot_credentials", return_value=({"main": bot_token}, {}, {111})),
+                mock.patch.object(srv, "resolve_camoufox_display", return_value=None),
+                mock.patch.object(srv, "read_x11_clipboard_async", new=mock.AsyncMock(return_value="")),
                 mock.patch.object(hub.tg, "ensure_card", new=mock.AsyncMock(return_value=None)),
                 mock.patch.object(hub.tg, "tick_updates", new=mock.AsyncMock(return_value=None)),
             ):
@@ -357,7 +432,13 @@ class TestLiveBrowserServerPanelWS(unittest.TestCase):
                 _FakeWSMessage(json.dumps({"type": "auth", "initData": init_data})),
                 _FakeWSMessage(json.dumps({"type": "switch_profile", "profile": "alt-prof", "session_gen": 0})),
             ]
-            ws_inst = _FakeWebSocketResponse(incoming)
+            ws_inst = _FakeWebSocketResponse(
+                incoming,
+                step_waits=[lambda frames: any(f.get("type") == "state" for f in frames)],
+                final_wait=lambda frames: any(
+                    f.get("type") == "toast" and "人工接管" in str(f.get("message", "")) for f in frames
+                ),
+            )
 
             class _FakeWebWithWS(_FakeWebModule):
                 @staticmethod
@@ -1211,6 +1292,184 @@ class TestBridgeBrowserPanelAndRbac(unittest.TestCase):
                     self.assertFalse(r_dm.data.get("session_restricted"))
                     self.assertEqual("CONFIDENTIAL OWNER DASHBOARD", r_dm.data.get("title"))
                     self.assertEqual("https://private-banking.example/secret-account", r_dm.data.get("url"))
+
+            asyncio.run(_server_check())
+
+    def test_round7_group_browser_errors_and_restricted_profile_catalog_redacted(self) -> None:
+        """Round 7 §2: Group `/browser` errors NEVER echo active profile/backend error; restricted/group status & profiles return profiles=[]."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_dir = Path(tmp) / "live-cfg"
+            cfg_dir.mkdir(parents=True, exist_ok=True)
+            (cfg_dir / "local.token").write_text("r7-group-tok\n", encoding="utf-8")
+            bridge, _ac = _load_isolated_bridge(tmp, extra_env={"AGY_TG_BOT_USERNAME": "example_bot"})
+            bridge.BOT_META["handle"] = "example_bot"
+            bridge.BOT_META["bot_key"] = "main"
+
+            class _FakeResp:
+                def __init__(self, status_code: int, payload: dict) -> None:
+                    self.status_code = status_code
+                    self._payload = payload
+
+                def json(self) -> dict:
+                    return self._payload
+
+            post_bodies: list[tuple[str, dict]] = []
+
+            def _fake_post_conflict(url: str, json=None, **_kw):
+                post_bodies.append((url, dict(json or {})))
+                return _FakeResp(
+                    409,
+                    {
+                        "ok": False,
+                        "error": "当前正在运行 Profile 'ultra-secret-profile'，请先执行 `live-browser stop` 或传入 `--restart`。",
+                    },
+                )
+
+            def _fake_get_down(_url: str, **_kw):
+                raise RuntimeError("http://127.0.0.1:18795/internal/status backend-secret-trace")
+
+            sent: list[tuple[int, str, dict]] = []
+            with (
+                mock.patch.dict(os.environ, {"AGY_LIVE_BROWSER_CONFIG_DIR": str(cfg_dir)}, clear=False),
+                mock.patch.object(bridge.requests, "post", side_effect=_fake_post_conflict),
+                mock.patch.object(bridge.requests, "get", side_effect=_fake_get_down),
+                mock.patch.object(bridge, "send", side_effect=lambda cid, txt, **kw: sent.append((cid, txt, kw)) or 1),
+            ):
+                # 1. Group `/browser start`, `switch`, `stop` on 409 conflict MUST NOT echo profile name or backend details!
+                for sub_cmd in ("start other-prof", "switch other-prof", "stop"):
+                    sent.clear()
+                    bridge.cmd_browser(-1001234567890, sub_cmd, from_user={"id": 111})
+                    self.assertEqual(1, len(sent))
+                    grp_err_text = sent[0][1]
+                    self.assertNotIn("ultra-secret-profile", grp_err_text)
+                    self.assertNotIn("live-browser stop", grp_err_text)
+                    self.assertIn("私聊", grp_err_text)
+                self.assertTrue(all(body.get("chat_scope") == "group" for _, body in post_bodies))
+
+                # 2. Group `/browser` when status endpoint is unreachable MUST NOT echo raw backend exception text!
+                sent.clear()
+                bridge.cmd_browser(-1001234567890, "", from_user={"id": 111})
+                self.assertEqual(1, len(sent))
+                self.assertNotIn("backend-secret-trace", sent[0][1])
+                self.assertNotIn("127.0.0.1:18795", sent[0][1])
+                self.assertIn("私聊", sent[0][1])
+
+                # 3. Private DM `/browser start` still shows detailed error to the owner
+                sent.clear()
+                bridge.cmd_browser(111, "start other-prof", from_user={"id": 111})
+                self.assertEqual(1, len(sent))
+                self.assertIn("ultra-secret-profile", sent[0][1])
+
+            # 4. Server-side: redacted status dict, group/restricted /internal/profiles, and group /internal/start 409!
+            async def _server_check() -> None:
+                bdir = Path(tmp) / "bridge-r7"
+                bdir.mkdir(parents=True, exist_ok=True)
+                (bdir / ".env").write_text(
+                    "AGY_TG_BOT_TOKEN=123456789:EXAMPLE_R7_GROUP_TOKEN_1\nAGY_TG_ALLOWED_CHATS=111,-1001234567890\nAGY_TG_ADMIN_USERS=111\n",
+                    encoding="utf-8",
+                )
+                hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "r7-srv-tok")
+                hub.engine_mode = "async_hosted"
+                hub.session_owner = ("main", 111)
+                hub.active_profile = "ultra-secret-profile"
+
+                class _FakeReq:
+                    def __init__(self, query: dict[str, str] | None = None, body: dict | None = None) -> None:
+                        self.query = query or {}
+                        self._body = body or {}
+                        self.headers = {"X-Live-Token": "r7-srv-tok"}
+                        self.remote = "127.0.0.1"
+                        self.app = {"hub": hub}
+
+                    async def json(self) -> dict:
+                        return self._body
+
+                with (
+                    mock.patch.object(srv, "_BRIDGE_DIR", bdir),
+                    mock.patch.object(srv, "web", _FakeWebModule),
+                    mock.patch.object(srv, "discover_pinned_host_profile", return_value=None),
+                    mock.patch.object(
+                        srv,
+                        "list_profiles",
+                        return_value=[{"name": "ultra-secret-profile", "os": "windows", "active": True}],
+                    ),
+                ):
+                    # Redacted status dict itself has profiles == []
+                    self.assertEqual([], hub._redacted_state_dict().get("profiles"))
+
+                    # Group-scoped /internal/status & /internal/profiles return profiles == []
+                    r_st_grp = await srv.internal_status(
+                        _FakeReq(
+                            query={
+                                "source": "tg_cmd",
+                                "bot": "main",
+                                "user_id": "111",
+                                "chat_id": "-1001234567890",
+                                "chat_scope": "group",
+                            }
+                        )  # type: ignore[arg-type]
+                    )
+                    self.assertTrue(r_st_grp.data.get("session_restricted"))
+                    self.assertEqual([], r_st_grp.data.get("profiles"))
+
+                    r_prof_grp = await srv.internal_profiles_list(
+                        _FakeReq(
+                            query={
+                                "source": "tg_cmd",
+                                "bot": "main",
+                                "user_id": "111",
+                                "chat_id": "-1001234567890",
+                                "chat_scope": "group",
+                            }
+                        )  # type: ignore[arg-type]
+                    )
+                    self.assertEqual([], r_prof_grp.data.get("profiles"))
+                    self.assertIsNone(r_prof_grp.data.get("active_profile"))
+
+                    # Group-scoped /internal/start hitting 409 conflict does NOT leak active_profile!
+                    r_start_grp = await srv.internal_start(
+                        _FakeReq(
+                            body={
+                                "source": "tg_cmd",
+                                "chat_scope": "group",
+                                "bot": "main",
+                                "user_id": 111,
+                                "profile": "default",
+                                "restart": False,
+                            }
+                        )  # type: ignore[arg-type]
+                    )
+                    self.assertEqual(409, r_start_grp.status)
+                    self.assertNotIn("ultra-secret-profile", str(r_start_grp.data.get("error", "")))
+
+                    # Even when idle, group-scoped /internal/status and /internal/profiles do NOT expose profile catalog!
+                    hub.engine_mode = "idle"
+                    r_st_idle_grp = await srv.internal_status(
+                        _FakeReq(
+                            query={
+                                "source": "tg_cmd",
+                                "bot": "main",
+                                "user_id": "111",
+                                "chat_id": "-1001234567890",
+                                "chat_scope": "group",
+                            }
+                        )  # type: ignore[arg-type]
+                    )
+                    self.assertFalse(bool(r_st_idle_grp.data.get("session_restricted")))
+                    self.assertEqual([], r_st_idle_grp.data.get("profiles"))
+
+                    r_prof_idle_grp = await srv.internal_profiles_list(
+                        _FakeReq(
+                            query={
+                                "source": "tg_cmd",
+                                "bot": "main",
+                                "user_id": "111",
+                                "chat_id": "-1001234567890",
+                                "chat_scope": "group",
+                            }
+                        )  # type: ignore[arg-type]
+                    )
+                    self.assertEqual([], r_prof_idle_grp.data.get("profiles"))
 
             asyncio.run(_server_check())
 

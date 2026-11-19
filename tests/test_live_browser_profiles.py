@@ -898,6 +898,269 @@ class TestLiveBrowserProfiles(unittest.TestCase):
 
         asyncio.run(_scenario())
 
+    def test_round7_hosted_new_tab_lock_reentry_visible_pages_dedup_and_startup_guard(self) -> None:
+        """Round 7 §1: No `_exec_lock <-> _engine_lock` deadlock with held buttons, unified `_visible_pages()`, single deduped close task, and pre-publish startup guard abort."""
+        pinned_dir = self.root / "pinned_r7"
+        pinned_dir.mkdir(parents=True, exist_ok=True)
+        pinned_lock = self.root / "pinned_r7.lock"
+        fake_pinned = {
+            "name": "pinned_r7",
+            "profile_dir": pinned_dir,
+            "lock_path": pinned_lock,
+            "fingerprint": {"os": "windows"},
+        }
+        srv.create_profile("nonpin-r7", {"os": "linux", "persistent": False})
+
+        class _MouseSpy:
+            def __init__(self) -> None:
+                self.ups: list[str] = []
+
+            async def up(self, button: str = "left") -> None:
+                self.ups.append(button)
+
+        class _GoodPage:
+            def __init__(self, url: str = "about:blank", title_str: str = "Good") -> None:
+                self.url = url
+                self._title = title_str
+                self.viewport_size = {"width": 1280, "height": 800}
+                self.closed = False
+                self.listeners: dict[str, list] = {}
+                self.mouse = _MouseSpy()
+                self.front_calls = 0
+
+            def is_closed(self) -> bool:
+                return self.closed
+
+            async def close(self) -> None:
+                self.closed = True
+                for cb in list(self.listeners.get("close", [])):
+                    cb()
+
+            async def bring_to_front(self) -> None:
+                self.front_calls += 1
+
+            async def goto(self, url: str, **_kw) -> None:
+                self.url = url
+
+            async def title(self) -> str:
+                return self._title
+
+            async def screenshot(self, **_kw) -> bytes:
+                return b"JPEG"
+
+            def on(self, ev: str, cb) -> None:
+                self.listeners.setdefault(ev, []).append(cb)
+
+        class _BadPage(_GoodPage):
+            def __init__(self, *, fail_close: bool = False, close_gate: asyncio.Event | None = None) -> None:
+                super().__init__("https://bad-popup.example", "Bad")
+                self._fail_close = fail_close
+                self._close_gate = close_gate
+                self.close_calls = 0
+
+            def on(self, ev: str, cb) -> None:
+                if ev == "framenavigated":
+                    raise RuntimeError("framenavigated failed")
+                super().on(ev, cb)
+
+            async def close(self) -> None:
+                self.close_calls += 1
+                if self._close_gate is not None:
+                    await self._close_gate.wait()
+                if self._fail_close:
+                    raise RuntimeError("close failed")
+                self.closed = True
+
+        class _RealEventCtx(_FakeContext):
+            def __init__(self, pages: list[object], next_new_page_factory=None) -> None:
+                super().__init__()
+                self.pages = list(pages)
+                self.ctx_listeners: dict[str, list] = {}
+                self._next_new_page_factory = next_new_page_factory
+
+            def on(self, ev: str, cb) -> None:
+                self.ctx_listeners.setdefault(ev, []).append(cb)
+
+            async def new_page(self):
+                p = self._next_new_page_factory()
+                self.pages.append(p)
+                for cb in list(self.ctx_listeners.get("page", [])):
+                    cb(p)
+                return p
+
+        async def _scenario() -> None:
+            # (a) Held mouse button + explicit `new_tab` guard failure + `close()` raises -> NO DEADLOCK,
+            #     releases held button, exits CM, transitions cleanly to `idle`!
+            # Also checks (c): real `ctx.on('page')` callback + explicit `new_tab` branch merge into ONE close task!
+            cm_a_list: list[object] = []
+            bad_unclosable = _BadPage(fail_close=True)
+
+            class _CM_A:
+                def __init__(self, **_kw) -> None:
+                    self.exited = False
+                    self.init_page = _GoodPage("https://p0.example", "P0")
+                    self.ctx = _RealEventCtx([self.init_page], next_new_page_factory=lambda: bad_unclosable)
+                    cm_a_list.append(self)
+
+                async def __aenter__(self):
+                    return self.ctx
+
+                async def __aexit__(self, *_a):
+                    self.exited = True
+
+            hub = srv.LiveBrowserHub({"public_url": ""}, "sec-tok")
+            with (
+                mock.patch.object(srv, "discover_pinned_host_profile", return_value=fake_pinned),
+                mock.patch.object(srv, "resolve_camoufox_display", return_value=None),
+                mock.patch.object(srv, "read_x11_clipboard_async", new=mock.AsyncMock(return_value="")),
+                mock.patch.dict(
+                    sys.modules,
+                    {"camoufox": types.SimpleNamespace(), "camoufox.async_api": types.SimpleNamespace(AsyncCamoufox=_CM_A)},
+                ),
+            ):
+                await hub.start_hosted(profile="nonpin-r7", notify_tg=False)
+                self.assertEqual("async_hosted", hub.engine_mode)
+                cm_a = cm_a_list[0]
+                hub.takeover = True
+                hub._mouse_buttons_down.add("left")
+                # Must finish promptly without `_exec_lock <-> _engine_lock` deadlock!
+                await asyncio.wait_for(
+                    hub._execute_human_cmd_async(
+                        {
+                            "action": "new_tab",
+                            "_session_gen": hub.session_gen,
+                            "_takeover_gen": hub.takeover_gen,
+                        }
+                    ),
+                    timeout=3.0,
+                )
+                self.assertEqual("idle", hub.engine_mode, "Session MUST abort cleanly to idle without deadlocking")
+                self.assertIsNone(hub.ctx)
+                self.assertTrue(cm_a.exited)  # type: ignore[attr-defined]
+                self.assertEqual(["left"], cm_a.init_page.mouse.ups, "Held mouse button MUST be released during stop")  # type: ignore[attr-defined]
+                self.assertEqual(
+                    1,
+                    bad_unclosable.close_calls,
+                    "Callback and explicit new_tab branch MUST deduplicate into a single close task!",
+                )
+
+            # (b) Unified `_visible_pages()` during pending-close: switch_tab & close_tab never touch quarantined page
+            #     and index consistently against the visible page set!
+            close_gate = asyncio.Event()
+            bad_pending = _BadPage(fail_close=False, close_gate=close_gate)
+            p0 = _GoodPage("https://p0.example", "P0")
+            p2 = _GoodPage("https://p2.example", "P2")
+            cm_b_list: list[object] = []
+
+            class _CM_B:
+                def __init__(self, **_kw) -> None:
+                    self.exited = False
+                    self.ctx = _RealEventCtx([p0])
+                    cm_b_list.append(self)
+
+                async def __aenter__(self):
+                    return self.ctx
+
+                async def __aexit__(self, *_a):
+                    self.exited = True
+
+            hub_b = srv.LiveBrowserHub({"public_url": ""}, "sec-tok")
+            with (
+                mock.patch.object(srv, "discover_pinned_host_profile", return_value=fake_pinned),
+                mock.patch.object(srv, "resolve_camoufox_display", return_value=None),
+                mock.patch.object(srv, "read_x11_clipboard_async", new=mock.AsyncMock(return_value="")),
+                mock.patch.dict(
+                    sys.modules,
+                    {"camoufox": types.SimpleNamespace(), "camoufox.async_api": types.SimpleNamespace(AsyncCamoufox=_CM_B)},
+                ),
+            ):
+                await hub_b.start_hosted(profile="nonpin-r7", notify_tg=False)
+                cm_b = cm_b_list[0]
+                # Insert quarantined page at raw index 1 (between p0 and p2) and trigger ctx.on('page')
+                cm_b.ctx.pages.append(bad_pending)  # type: ignore[attr-defined]
+                for cb in list(cm_b.ctx.ctx_listeners.get("page", [])):  # type: ignore[attr-defined]
+                    cb(bad_pending)
+                await asyncio.sleep(0)  # Let scheduled fail-closed close task enter close_gate.wait()
+                cm_b.ctx.pages.append(p2)  # type: ignore[attr-defined]
+                hub_b._attach_page_listeners(p2, require_nav_guard=True)
+                hub_b.active_tab_index = 0
+                hub_b.takeover = True
+
+                # Visible pages MUST exclude bad_pending -> [p0, p2]
+                self.assertEqual([p0, p2], hub_b._visible_pages())
+                self.assertIs(p0, hub_b._current_page())
+
+                # switch_tab(index=1) MUST switch to p2 (NOT bad_pending!)
+                await hub_b._execute_human_cmd_async(
+                    {
+                        "action": "switch_tab",
+                        "index": 1,
+                        "_session_gen": hub_b.session_gen,
+                        "_takeover_gen": hub_b.takeover_gen,
+                    }
+                )
+                self.assertEqual(1, p2.front_calls, "switch_tab(1) must target visible page p2")
+                self.assertEqual(0, bad_pending.front_calls, "switch_tab MUST NEVER call bring_to_front on quarantined page")
+                self.assertIs(p2, hub_b._current_page())
+
+                # close_tab(index=1) MUST close p2 (NOT bad_pending!)
+                await hub_b._execute_human_cmd_async(
+                    {
+                        "action": "close_tab",
+                        "index": 1,
+                        "_session_gen": hub_b.session_gen,
+                        "_takeover_gen": hub_b.takeover_gen,
+                    }
+                )
+                self.assertTrue(p2.closed, "close_tab(1) must close visible page p2")
+                self.assertEqual(1, bad_pending.close_calls, "close_tab must NOT invoke a second close on quarantined page")
+                self.assertIs(p0, hub_b._current_page())
+
+                close_gate.set()
+                await hub_b.stop_hosted(notify_finished=False)
+
+            # (d) Startup-phase popup guard failure before publish -> aborts directly inside start_hosted's _engine_lock!
+            cm_d_list: list[object] = []
+            startup_popup = _BadPage(fail_close=True)
+
+            class _CM_D:
+                def __init__(self, **_kw) -> None:
+                    self.exited = False
+                    self.ctx = _RealEventCtx([_GoodPage("https://start.example", "Start")])
+                    cm_d_list.append(self)
+
+                async def __aenter__(self):
+                    return self.ctx
+
+                async def __aexit__(self, *_a):
+                    self.exited = True
+
+            async def _x11_fires_popup(_display):
+                cm_d = cm_d_list[-1]
+                cm_d.ctx.pages.append(startup_popup)  # type: ignore[attr-defined]
+                for cb in list(cm_d.ctx.ctx_listeners.get("page", [])):  # type: ignore[attr-defined]
+                    cb(startup_popup)
+                await asyncio.sleep(0)
+                return ""
+
+            hub_d = srv.LiveBrowserHub({"public_url": ""}, "sec-tok")
+            with (
+                mock.patch.object(srv, "discover_pinned_host_profile", return_value=fake_pinned),
+                mock.patch.object(srv, "resolve_camoufox_display", return_value=":99"),
+                mock.patch.object(srv, "read_x11_clipboard_async", side_effect=_x11_fires_popup),
+                mock.patch.dict(
+                    sys.modules,
+                    {"camoufox": types.SimpleNamespace(), "camoufox.async_api": types.SimpleNamespace(AsyncCamoufox=_CM_D)},
+                ),
+            ):
+                with self.assertRaises(RuntimeError):
+                    await asyncio.wait_for(hub_d.start_hosted(profile="nonpin-r7", notify_tg=False), timeout=3.0)
+                self.assertEqual("idle", hub_d.engine_mode, "Startup guard failure MUST block publish fail-closed")
+                self.assertIsNone(hub_d.ctx)
+                self.assertTrue(cm_d_list[-1].exited)  # type: ignore[attr-defined]
+
+        asyncio.run(_scenario())
+
 
 if __name__ == "__main__":
     unittest.main()

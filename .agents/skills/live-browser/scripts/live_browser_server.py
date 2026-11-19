@@ -106,10 +106,10 @@ PINNED_FORBIDDEN_OVERRIDES = frozenset(
 )
 
 MOBILE_WINDOW_PRESET: list[int] = [430, 932]
-MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MiB max file payload per upload
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MiB max total file payload per upload
 MAX_UPLOAD_META_BYTES = 64 * 1024  # 64 KiB max non-file multipart overhead
 MAX_UPLOAD_TOTAL_BYTES = MAX_UPLOAD_BYTES + MAX_UPLOAD_META_BYTES
-MAX_UPLOAD_TOTAL_REQUEST_BYTES = MAX_UPLOAD_TOTAL_BYTES  # Decoded HTTP request body byte budget (request.content drained to EOF)
+MAX_UPLOAD_TOTAL_REQUEST_BYTES = MAX_UPLOAD_TOTAL_BYTES  # Decoded HTTP multipart request body byte budget (25 MiB files + 64 KiB overhead, drained to EOF)
 MAX_UPLOAD_NONFILE_FIELD_BYTES = 8 * 1024  # 8 KiB per non-file multipart field
 MAX_UPLOAD_NONFILE_TOTAL_BYTES = 32 * 1024  # 32 KiB combined non-file fields budget
 MAX_UPLOAD_FILES = 10
@@ -1619,10 +1619,28 @@ class TelegramLiveCardPublisher:
             lines.append("💡 <i>绑定 HTTPS 隧道域名后将自动显示【实时画面/人工接管】按钮</i>")
         return "\n".join(lines)
 
-    async def _retire_orphan_card_message(self, token: str, chat_id: int, message_id: int) -> None:
-        """Silently retire an orphaned Telegram card using strictly stateless fixed copy (zero hub reads)."""
-        if not self.http or not token or chat_id <= 0 or message_id <= 0:
-            return
+    _CARD_RETIRE_MAX_ATTEMPTS = 3
+    _PERMANENT_TG_RETIRE_ERRORS = (
+        "message is not modified",
+        "message to edit not found",
+        "chat not found",
+        "message_id_invalid",
+        "message can't be edited",
+        "bot was blocked by the user",
+        "user is deactivated",
+    )
+
+    async def _retire_orphan_card_message(self, token: str, chat_id: int, message_id: int) -> bool:
+        """Silently retire an orphaned Telegram card using strictly stateless fixed copy (zero hub reads).
+
+        Returns True when Telegram confirms `ok=true` or returns a permanent terminal error
+        (e.g., message already gone / not modified / chat not found). Returns False on transient
+        network/HTTP 5xx/429/unexpected failures so callers can retain the record and retry.
+        """
+        if not token or chat_id <= 0 or message_id <= 0:
+            return True
+        if not self.http:
+            return False
         try:
             finished_caption = self._build_finished_caption()
             async with self.http.post(
@@ -1634,10 +1652,61 @@ class TelegramLiveCardPublisher:
                     "parse_mode": "HTML",
                     "reply_markup": {"inline_keyboard": []},
                 },
-            ) as _resp:
-                pass
+            ) as resp:
+                status = getattr(resp, "status", 200)
+                if isinstance(status, int) and (status == 429 or status >= 500):
+                    log.debug(
+                        "Orphan card retire transient HTTP %s (chat_id=%s mid=%s)",
+                        status,
+                        chat_id,
+                        message_id,
+                    )
+                    return False
+                data = await resp.json()
+                if not isinstance(data, dict):
+                    return False
+                if data.get("ok"):
+                    return True
+                err_code = data.get("error_code")
+                desc = str(data.get("description") or "").lower()
+                if any(marker in desc for marker in self._PERMANENT_TG_RETIRE_ERRORS):
+                    return True
+                if err_code == 429 or (isinstance(err_code, int) and err_code >= 500):
+                    return False
+                if err_code == 400 and ("not found" in desc or "not modified" in desc or "invalid" in desc):
+                    return True
+                log.debug("Orphan card retire non-ok response (chat_id=%s mid=%s): %s", chat_id, message_id, data)
+                return False
         except Exception as exc:
-            log.debug("Orphan card retire ignored (chat_id=%s mid=%s): %s", chat_id, message_id, exc)
+            log.debug("Orphan card retire transient error (chat_id=%s mid=%s): %s", chat_id, message_id, exc)
+            return False
+
+    async def _retire_card_record_locked(
+        self, card_key: tuple[str, int], card: dict[str, Any], token: str
+    ) -> bool:
+        """Retire a stale card record in Telegram; pop only on confirmed retire or bounded retry cap."""
+        bot_key, chat_id = card_key
+        mid = int(card.get("message_id") or 0)
+        if mid <= 0:
+            self.cards.pop(card_key, None)
+            return True
+        retired_ok = await self._retire_orphan_card_message(token, chat_id, mid)
+        if retired_ok:
+            self.cards.pop(card_key, None)
+            return True
+        attempts = int(card.get("retire_attempts") or 0) + 1
+        card["retire_attempts"] = attempts
+        if attempts >= self._CARD_RETIRE_MAX_ATTEMPTS:
+            log.warning(
+                "Dropping stale card record bot=%s chat_id=%s mid=%s after %d failed retire attempts",
+                bot_key,
+                chat_id,
+                mid,
+                attempts,
+            )
+            self.cards.pop(card_key, None)
+            return False
+        return False
 
     async def ensure_card(
         self,
@@ -1879,7 +1948,7 @@ class TelegramLiveCardPublisher:
         if finished:
             await self.retire_cards(mark_finished=True)
             return
-        if not self.hub.latest_jpeg or not self.http:
+        if not self.http:
             return
         async with self._lock:
             for card_key in list(self.cards.keys()):
@@ -1904,11 +1973,10 @@ class TelegramLiveCardPublisher:
                 ):
                     # If a queued periodic update wins the card lock ahead of `retire_cards()`,
                     # retire the stale Telegram message (finished caption + empty keyboard) BEFORE
-                    # popping the card record so the old card never stays stuck live!
-                    mid = int(card.get("message_id") or 0)
-                    if mid > 0:
-                        await self._retire_orphan_card_message(token, chat_id, mid)
-                    self.cards.pop(card_key, None)
+                    # popping the card record; retain for bounded retry on transient Telegram failure!
+                    await self._retire_card_record_locked(card_key, card, token)
+                    continue
+                if not self.hub.latest_jpeg:
                     continue
                 await self._update_card_locked(card_key, token, finished=False, force=force)
 
@@ -1944,10 +2012,7 @@ class TelegramLiveCardPublisher:
                 or self.hub.session_owner != snap_owner
                 or not self._matches_session_owner(bot_key, chat_id)
             ):
-                mid = int(card.get("message_id") or 0)
-                if mid > 0:
-                    await self._retire_orphan_card_message(live_token, chat_id, mid)
-                self.cards.pop(card_key, None)
+                await self._retire_card_record_locked(card_key, card, live_token)
                 return
             token = live_token
             jpeg_bytes = jpeg_override if jpeg_override is not None else self.hub.latest_jpeg
@@ -2179,6 +2244,10 @@ class LiveBrowserHub:
         # Native Playwright page event state (zero page JS injection)
         self._attached_pages: set[int] = set()
         self._closing_unguarded_pages: set[int] = set()
+        self._unguarded_close_tasks: dict[int, asyncio.Task[Any]] = {}
+        self._startup_guard_failed_ctx: set[int] = set()
+        self._explicit_new_tab_in_flight: int = 0
+        self._explicit_close_tab_in_flight: int = 0
         self._recent_response_cl: dict[str, int] = {}
         self.pending_dialogs: dict[str, dict[str, Any]] = {}
         self.pending_filechoosers: dict[str, dict[str, Any]] = {}
@@ -2542,7 +2611,7 @@ class LiveBrowserHub:
             "public_url": self.config.get("public_url") or "",
             "direct_app_url": self.config.get("direct_app_url") or "",
             "viewers": len(self.viewers),
-            "profiles": list_profiles(active_profile=""),
+            "profiles": [],
         }
 
     def state_dict_for_viewer(self, bot_key: str, user_id: int, role: str) -> dict[str, Any]:
@@ -2879,14 +2948,22 @@ class LiveBrowserHub:
 
     # ---------------- Native Page Listeners (Dialog / FileChooser / Download) ----------------
 
-    def _schedule_google_block_toast(self, blocked_url: str) -> None:
+    def _schedule_google_block_toast(
+        self,
+        blocked_url: str,
+        *,
+        origin_session_gen: int | None = None,
+        owner_bot: str | None = None,
+        owner_uid: int | None = None,
+    ) -> None:
         msg = (
             "安全策略拦截：此主机已锁定 Pinned Google Profile，禁止非 Pinned Profile 访问 Google/Gmail/YouTube 域。"
         )
         try:
             loop = asyncio.get_running_loop()
-            owner_bot, owner_uid = self._effective_resource_owner()
-            gen = self.session_gen
+            if owner_bot is None and owner_uid is None:
+                owner_bot, owner_uid = self._effective_resource_owner()
+            gen = self.session_gen if origin_session_gen is None else origin_session_gen
             if owner_bot is not None and owner_uid is not None:
                 self._track_bg_task(
                     loop.create_task(
@@ -2902,8 +2979,24 @@ class LiveBrowserHub:
         except RuntimeError:
             pass
 
-    async def _enforce_non_pinned_blank(self, page: Any, blocked_url: str) -> None:
-        self._schedule_google_block_toast(blocked_url)
+    async def _enforce_non_pinned_blank(
+        self,
+        page: Any,
+        blocked_url: str,
+        *,
+        origin_session_gen: int | None = None,
+        owner_bot: str | None = None,
+        owner_uid: int | None = None,
+    ) -> None:
+        gen = self.session_gen if origin_session_gen is None else origin_session_gen
+        if gen != self.session_gen:
+            return
+        self._schedule_google_block_toast(
+            blocked_url,
+            origin_session_gen=gen,
+            owner_bot=owner_bot,
+            owner_uid=owner_uid,
+        )
         try:
             is_closed_fn = getattr(page, "is_closed", None)
             if callable(is_closed_fn) and is_closed_fn():
@@ -2936,6 +3029,8 @@ class LiveBrowserHub:
             raise RuntimeError("非 Pinned 浏览器上下文不支持 ctx.route 导航拦截，已拒绝启动（fail-closed）")
 
         async def _route_google_guard(route: Any, request: Any | None = None) -> None:
+            origin_gen = self.session_gen
+            origin_owner_bot, origin_owner_uid = self._effective_resource_owner()
             req = request if request is not None else getattr(route, "request", None)
             url = str(getattr(req, "url", "") or "")
             is_nav_attr = getattr(req, "is_navigation_request", None)
@@ -2947,7 +3042,12 @@ class LiveBrowserHub:
                     await route.abort("blockedbyclient")
                 except TypeError:
                     await route.abort()
-                self._schedule_google_block_toast(url)
+                self._schedule_google_block_toast(
+                    url,
+                    origin_session_gen=origin_gen,
+                    owner_bot=origin_owner_bot,
+                    owner_uid=origin_owner_uid,
+                )
                 return
             await route.continue_()
 
@@ -2980,6 +3080,8 @@ class LiveBrowserHub:
             self.mark_active(mark_tabs_dirty=True)
 
         def _on_framenavigated(frame: Any = None, *_args: Any) -> None:
+            origin_gen = self.session_gen
+            origin_owner_bot, origin_owner_uid = self._effective_resource_owner()
             self._tab_select_rev += 1
             self.mark_active(mark_tabs_dirty=True)
             if self._is_active_pinned_verified():
@@ -2994,13 +3096,25 @@ class LiveBrowserHub:
                     log.warning("Fallback framenavigated blocked non-pinned Google URL: %s", frame_url[:120])
                     try:
                         loop = asyncio.get_running_loop()
-                        self._track_bg_task(loop.create_task(self._enforce_non_pinned_blank(page, frame_url)))
+                        self._track_bg_task(
+                            loop.create_task(
+                                self._enforce_non_pinned_blank(
+                                    page,
+                                    frame_url,
+                                    origin_session_gen=origin_gen,
+                                    owner_bot=origin_owner_bot,
+                                    owner_uid=origin_owner_uid,
+                                )
+                            )
+                        )
                     except RuntimeError:
                         pass
 
         def _on_close(*_args: Any) -> None:
             self._attached_pages.discard(pid)
-            self._tab_select_rev += 1
+            was_quarantined = pid in self._closing_unguarded_pages
+            if not was_quarantined and self._explicit_close_tab_in_flight <= 0:
+                self._tab_select_rev += 1
             self._tabs_dirty = True
             try:
                 loop = asyncio.get_running_loop()
@@ -3010,16 +3124,40 @@ class LiveBrowserHub:
                 self._cleanup_pending_filechoosers(page_id=pid)
 
         def _on_dialog(dialog: Any) -> None:
+            origin_gen = self.session_gen
+            origin_owner_bot, origin_owner_uid = self._effective_resource_owner()
             try:
                 loop = asyncio.get_running_loop()
-                self._track_bg_task(loop.create_task(self._handle_page_dialog(dialog, page)))
+                self._track_bg_task(
+                    loop.create_task(
+                        self._handle_page_dialog(
+                            dialog,
+                            page,
+                            origin_session_gen=origin_gen,
+                            owner_bot=origin_owner_bot,
+                            owner_uid=origin_owner_uid,
+                        )
+                    )
+                )
             except RuntimeError:
                 pass
 
         def _on_filechooser(chooser: Any) -> None:
+            origin_gen = self.session_gen
+            origin_owner_bot, origin_owner_uid = self._effective_resource_owner()
             try:
                 loop = asyncio.get_running_loop()
-                self._track_bg_task(loop.create_task(self._handle_page_filechooser(chooser, page)))
+                self._track_bg_task(
+                    loop.create_task(
+                        self._handle_page_filechooser(
+                            chooser,
+                            page,
+                            origin_session_gen=origin_gen,
+                            owner_bot=origin_owner_bot,
+                            owner_uid=origin_owner_uid,
+                        )
+                    )
+                )
             except RuntimeError:
                 pass
 
@@ -3077,13 +3215,68 @@ class LiveBrowserHub:
             except Exception as exc:
                 log.debug("Failed attaching secondary page listener %s: %s", ev_name, exc)
 
-    async def _fail_closed_close_unguarded_page(
-        self, new_page: Any, *, expected_ctx: Any = None
-    ) -> None:
-        """Fail-closed cleanup when a non-pinned new page cannot install its navigation guard.
+    def _schedule_fail_closed_close_unguarded_page(
+        self,
+        new_page: Any,
+        *,
+        expected_ctx: Any = None,
+        startup_ctx_id: int | None = None,
+        bump_tab_rev: bool = True,
+    ) -> asyncio.Task[Any] | None:
+        """Synchronously quarantine `new_page` and deduplicate fail-closed close into a single task per page id.
 
-        Closes the unguarded page immediately; if closing fails, aborts the entire hosted session
-        under `_engine_lock` so no unguarded page can ever remain active.
+        Never acquires `_engine_lock` synchronously or inside `_exec_lock`.
+        """
+        pid = id(new_page)
+        self._closing_unguarded_pages.add(pid)
+        existing = self._unguarded_close_tasks.get(pid)
+        if existing is not None and not existing.done():
+            return existing
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            close_fn = getattr(new_page, "close", None)
+            close_ok = self._is_page_closed(new_page)
+            if not close_ok and callable(close_fn):
+                try:
+                    res = close_fn()
+                    if inspect.isawaitable(res):
+                        res.close()
+                    else:
+                        close_ok = True
+                except Exception:
+                    close_ok = False
+            if not close_ok and startup_ctx_id is not None:
+                self._startup_guard_failed_ctx.add(startup_ctx_id)
+            return None
+
+        task = self._track_bg_task(
+            loop.create_task(
+                self._fail_closed_close_unguarded_page(
+                    new_page,
+                    expected_ctx=expected_ctx,
+                    startup_ctx_id=startup_ctx_id,
+                    bump_tab_rev=bump_tab_rev,
+                )
+            )
+        )
+        self._unguarded_close_tasks[pid] = task
+        task.add_done_callback(lambda _t, _pid=pid: self._unguarded_close_tasks.pop(_pid, None))
+        return task
+
+    async def _fail_closed_close_unguarded_page(
+        self,
+        new_page: Any,
+        *,
+        expected_ctx: Any = None,
+        startup_ctx_id: int | None = None,
+        bump_tab_rev: bool = True,
+    ) -> None:
+        """Fail-closed cleanup when a page cannot install its navigation guard or is revoked during new_tab.
+
+        Closes the quarantined page immediately; if closing fails, marks any unpublished startup ctx
+        synchronously and aborts a published hosted session under `_engine_lock` (never called while
+        holding `_exec_lock`).
         """
         pid = id(new_page)
         self._closing_unguarded_pages.add(pid)
@@ -3099,9 +3292,18 @@ class LiveBrowserHub:
                         await asyncio.wait_for(res, timeout=5.0)
                     close_ok = True
         except Exception as close_exc:
-            log.error("Fail-closed close of unguarded non-pinned page failed: %s", close_exc)
+            log.error("Fail-closed close of quarantined page failed: %s", close_exc)
         if not close_ok:
-            log.error("Aborting hosted non-pinned session fail-closed after unguarded page could not be closed")
+            if startup_ctx_id is not None:
+                self._startup_guard_failed_ctx.add(startup_ctx_id)
+            # If the context has not been published yet (`self.ctx is not expected_ctx`),
+            # `start_hosted()` will abort directly inside its own `_engine_lock` via `_startup_guard_failed_ctx`.
+            if expected_ctx is not None and self.ctx is not expected_ctx:
+                log.error(
+                    "Marked unpublished startup context fail-closed after quarantined page could not be closed"
+                )
+                return
+            log.error("Aborting hosted session fail-closed after quarantined page could not be closed")
             try:
                 async with self._engine_lock:
                     if expected_ctx is None or self.ctx is expected_ctx:
@@ -3109,17 +3311,30 @@ class LiveBrowserHub:
             except Exception as stop_exc:
                 log.error("Fail-closed hosted session abort error: %s", stop_exc)
             return
-        self._tab_select_rev += 1
+        if bump_tab_rev:
+            self._tab_select_rev += 1
         self.mark_active(mark_tabs_dirty=True)
 
-    async def _handle_page_dialog(self, dialog: Any, page: Any | None = None) -> None:
+    async def _handle_page_dialog(
+        self,
+        dialog: Any,
+        page: Any | None = None,
+        *,
+        origin_session_gen: int | None = None,
+        owner_bot: str | None = None,
+        owner_uid: int | None = None,
+    ) -> None:
+        dlg_gen = self.session_gen if origin_session_gen is None else origin_session_gen
         dtype = str(getattr(dialog, "type", "alert") or "alert")
         message = str(getattr(dialog, "message", "") or "")
         default_val = str(getattr(dialog, "default_value", "") or "")
-        owner_bot, owner_uid = self._effective_resource_owner()
+        if owner_bot is None and owner_uid is None:
+            owner_bot, owner_uid = self._effective_resource_owner()
 
-        if not self._has_eligible_admin_viewer(owner_bot, owner_uid) and not self.takeover:
-            log.info("Auto-dismissing dialog (%s) with no eligible admin viewers/takeover", dtype)
+        if dlg_gen != self.session_gen or (
+            not self._has_eligible_admin_viewer(owner_bot, owner_uid) and not self.takeover
+        ):
+            log.info("Auto-dismissing dialog (%s) with stale gen or no eligible admin viewers/takeover", dtype)
             try:
                 await dialog.dismiss()
             except Exception as exc:
@@ -3135,7 +3350,7 @@ class LiveBrowserHub:
             "message": message[:2000],
             "default_value": default_val[:500],
             "created_ts": time.monotonic(),
-            "session_gen": self.session_gen,
+            "session_gen": dlg_gen,
             "owner_bot": owner_bot,
             "owner_uid": owner_uid,
             "resolved": False,
@@ -3253,7 +3468,18 @@ class LiveBrowserHub:
                 log.info("Auto-dismissing orphaned dialog %s after eligible admin disconnect", did)
                 await self.resolve_dialog(did, accept=False)
 
-    async def _handle_page_filechooser(self, chooser: Any, page: Any | None = None) -> None:
+    async def _handle_page_filechooser(
+        self,
+        chooser: Any,
+        page: Any | None = None,
+        *,
+        origin_session_gen: int | None = None,
+        owner_bot: str | None = None,
+        owner_uid: int | None = None,
+    ) -> None:
+        fc_gen = self.session_gen if origin_session_gen is None else origin_session_gen
+        if fc_gen != self.session_gen:
+            return
         chooser_id = secrets.token_hex(8)
         multiple = False
         try:
@@ -3261,8 +3487,8 @@ class LiveBrowserHub:
             multiple = bool(is_mult() if callable(is_mult) else is_mult)
         except Exception:
             multiple = False
-        owner_bot, owner_uid = self._effective_resource_owner()
-        fc_gen = self.session_gen
+        if owner_bot is None and owner_uid is None:
+            owner_bot, owner_uid = self._effective_resource_owner()
         self.pending_filechoosers[chooser_id] = {
             "id": chooser_id,
             "chooser": chooser,
@@ -3565,6 +3791,10 @@ class LiveBrowserHub:
         self.active_fingerprint = {}
         self._attached_pages.clear()
         self._closing_unguarded_pages.clear()
+        self._unguarded_close_tasks.clear()
+        self._startup_guard_failed_ctx.clear()
+        self._explicit_new_tab_in_flight = 0
+        self._explicit_close_tab_in_flight = 0
         self._recent_response_cl.clear()
         self._tabs_dirty = True
         self._tab_select_rev += 1
@@ -3606,14 +3836,20 @@ class LiveBrowserHub:
         self._clear_session_caches()
         self.ai_allowed_event.set()
 
-        # 2. Release any held mouse buttons on the detached page under execution barrier
+        # 2. Release any held mouse buttons on the detached page under a bounded execution barrier
         if held_buttons and old_page is not None:
-            async with self._exec_lock:
-                for btn in held_buttons:
-                    try:
-                        await asyncio.wait_for(old_page.mouse.up(button=btn), timeout=1.5)
-                    except Exception as exc:
-                        log.debug("Stop fallback mouse.up(%s) error: %s", btn, exc)
+            async def _release_held_buttons() -> None:
+                async with self._exec_lock:
+                    for btn in held_buttons:
+                        try:
+                            await asyncio.wait_for(old_page.mouse.up(button=btn), timeout=1.5)
+                        except Exception as exc:
+                            log.debug("Stop fallback mouse.up(%s) error: %s", btn, exc)
+
+            try:
+                await asyncio.wait_for(_release_held_buttons(), timeout=2.5)
+            except Exception as exc:
+                log.warning("Bounded stop mouse.up release timed out/failed: %s", exc)
 
         # 3. Retire all cards for `old_gen` with strictly stateless finished copy
         await self.tg.retire_cards(session_gen=old_gen, mark_finished=notify_finished, final_jpeg=final_jpeg)
@@ -3712,6 +3948,10 @@ class LiveBrowserHub:
 
             newly_started = False
             if self.engine_mode != "async_hosted":
+                pre_launch_gen = self.session_gen
+                pre_launch_owner = (
+                    (self.resolve_bot_key(bot_hint), preferred_user_id) if is_remote_actor else None
+                )
                 ephemeral_dir: Path | None = None
                 if spec["persistent"]:
                     user_data_dir = Path(spec["profile_dir"])
@@ -3734,6 +3974,8 @@ class LiveBrowserHub:
                 cm: Any = None
                 cm_entered = False
                 ctx: Any = None
+                published = False
+                startup_guard_failed = False
                 pinned_verified_flag = bool(spec.get("pinned_verified"))
                 try:
                     host_has_pinned = discover_pinned_host_profile() is not None
@@ -3742,36 +3984,27 @@ class LiveBrowserHub:
                 require_non_pinned_guard = (not pinned_verified_flag) and host_has_pinned
 
                 def _on_new_page(new_page: Any) -> None:
+                    nonlocal startup_guard_failed
                     try:
                         self._attach_page_listeners(new_page, require_nav_guard=require_non_pinned_guard)
                     except Exception as exc:
                         if require_non_pinned_guard:
                             log.error("Non-pinned new page guard attachment failed (fail-closed): %s", exc)
-                            self._closing_unguarded_pages.add(id(new_page))
-                            try:
-                                loop = asyncio.get_running_loop()
-                                self._track_bg_task(
-                                    loop.create_task(
-                                        self._fail_closed_close_unguarded_page(new_page, expected_ctx=ctx)
-                                    )
-                                )
-                            except RuntimeError:
-                                close_fn = getattr(new_page, "close", None)
-                                if callable(close_fn):
-                                    try:
-                                        res = close_fn()
-                                        if inspect.isawaitable(res):
-                                            res.close()
-                                    except Exception:
-                                        pass
+                            if not published:
+                                startup_guard_failed = True
+                            self._schedule_fail_closed_close_unguarded_page(
+                                new_page,
+                                expected_ctx=ctx,
+                                startup_ctx_id=(id(ctx) if (ctx is not None and not published) else None),
+                            )
+                        return
+                    # Do NOT preemptively switch active_tab_index while an explicit human `new_tab`
+                    # command is awaiting post-await authorization/guard verification!
+                    if self._explicit_new_tab_in_flight > 0:
                         return
                     try:
                         if self.ctx is not None:
-                            pages = [
-                                p
-                                for p in list(self.ctx.pages)
-                                if not self._is_page_closed(p) and id(p) not in self._closing_unguarded_pages
-                            ]
+                            pages = self._visible_pages(self.ctx)
                             if new_page in pages:
                                 self.active_tab_index = pages.index(new_page)
                                 self._tab_select_rev += 1
@@ -3822,12 +4055,27 @@ class LiveBrowserHub:
                     resolved_display = resolve_camoufox_display(ctx, user_data_dir)
                     initial_x11_clip = await read_x11_clipboard_async(resolved_display)
 
-                    # Final pre-commit RBAC & state re-verification AFTER all async launch awaits
-                    # and BEFORE publishing the new session (fail-closed: closes unpublished CM!).
+                    # Pre-publish startup guard gate: if any popup/new page failed guard installation
+                    # during startup, abort directly inside the current `_engine_lock` without re-entering!
+                    if startup_guard_failed or (ctx is not None and id(ctx) in self._startup_guard_failed_ctx):
+                        raise RuntimeError("启动期间弹出页面导航守卫安装失败，已中止发布（fail-closed）")
+
+                    # Final pre-commit RBAC, idle, generation & owner re-verification AFTER all async
+                    # launch awaits and BEFORE publishing the new session (fail-closed: closes unpublished CM!).
                     if is_remote_actor:
-                        if _check_live_user_role(a_bot, a_uid) != "admin" or self.engine_mode != "idle":
-                            raise PermissionError("会话发布前管理员权限已撤销或状态已变更，已中止启动（fail-closed）")
+                        resolved_owner_check = (self.resolve_bot_key(bot_hint), preferred_user_id)
+                        if (
+                            _check_live_user_role(a_bot, a_uid) != "admin"
+                            or self.engine_mode != "idle"
+                            or self.session_gen != pre_launch_gen
+                            or (expected_session_gen is not None and not restart and self.session_gen != expected_session_gen)
+                            or resolved_owner_check != pre_launch_owner
+                            or resolved_owner_check != (a_bot, a_uid)
+                        ):
+                            raise PermissionError("会话发布前管理员权限已撤销或状态/代次/归属已变更，已中止启动（fail-closed）")
                 except Exception:
+                    if ctx is not None:
+                        self._startup_guard_failed_ctx.discard(id(ctx))
                     if cm_entered and cm is not None:
                         try:
                             await cm.__aexit__(None, None, None)
@@ -3842,6 +4090,8 @@ class LiveBrowserHub:
                         shutil.rmtree(ephemeral_dir, ignore_errors=True)
                     raise
 
+                published = True
+                self._startup_guard_failed_ctx.discard(id(ctx))
                 self.session_gen += 1
                 resolved_owner_bot = self.resolve_bot_key(bot_hint)
                 self.session_owner = (
@@ -3869,7 +4119,7 @@ class LiveBrowserHub:
                 self._last_x11_clip = initial_x11_clip
                 log.info("Resolved Camoufox X11 display=%s", self.x11_display)
 
-                self.active_tab_index = max(0, len(ctx.pages) - 1)
+                self.active_tab_index = max(0, len(self._visible_pages(ctx)) - 1)
                 self._tab_select_rev += 1
                 self._tabs_dirty = True
                 self._last_normal_sig = None
@@ -3986,14 +4236,22 @@ class LiveBrowserHub:
         await self.broadcast_state()
         return True, "ok"
 
-    def _current_page(self) -> Any | None:
-        if not self.ctx or not self.ctx.pages:
-            return None
-        pages = [
+    def _visible_pages(self, ctx: Any | None = None) -> list[Any]:
+        """Return the unified list of open, non-quarantined pages for tab indexing & selection."""
+        target_ctx = self.ctx if ctx is None else ctx
+        if not target_ctx:
+            return []
+        raw_pages = getattr(target_ctx, "pages", None)
+        if not raw_pages:
+            return []
+        return [
             p
-            for p in list(self.ctx.pages)
+            for p in list(raw_pages)
             if not self._is_page_closed(p) and id(p) not in self._closing_unguarded_pages
         ]
+
+    def _current_page(self) -> Any | None:
+        pages = self._visible_pages()
         if not pages:
             return None
         if self.active_tab_index >= len(pages):
@@ -4023,11 +4281,7 @@ class LiveBrowserHub:
         snap_gen = self.session_gen
         snap_rev = self._tab_select_rev
         raw_pages = list(snap_ctx.pages)
-        pages = [
-            p
-            for p in raw_pages
-            if not self._is_page_closed(p) and id(p) not in self._closing_unguarded_pages
-        ]
+        pages = self._visible_pages(snap_ctx)
         if not pages:
             return False
         active_idx = max(0, min(self.active_tab_index, len(pages) - 1))
@@ -4061,8 +4315,8 @@ class LiveBrowserHub:
             if self._tab_select_rev != snap_rev:
                 self._tabs_dirty = True
                 return False
-            cur_live = list(snap_ctx.pages)
-            if self._is_page_closed(p) or p not in cur_live:
+            cur_live = self._visible_pages(snap_ctx)
+            if p not in cur_live:
                 closed_during_snap = True
                 continue
             collected.append((p, t_title, p.url))
@@ -4077,11 +4331,11 @@ class LiveBrowserHub:
             self._tabs_dirty = True
             return False
 
-        # Second pass against current live ctx.pages to drop any page closed while awaiting subsequent titles
-        final_live = [p for p in list(snap_ctx.pages) if not self._is_page_closed(p)]
+        # Second pass against current visible pages to drop any page closed/quarantined while awaiting titles
+        final_live = self._visible_pages(snap_ctx)
         kept: list[tuple[Any, str, str]] = []
         for p, t_title, p_url in collected:
-            if p in final_live and not self._is_page_closed(p):
+            if p in final_live:
                 kept.append((p, t_title, p_url))
             else:
                 closed_during_snap = True
@@ -4145,11 +4399,7 @@ class LiveBrowserHub:
         if self._tab_select_rev != snap_rev:
             self._tabs_dirty = True
             return False
-        live_after_all = [
-            p
-            for p in list(snap_ctx.pages)
-            if not self._is_page_closed(p) and id(p) not in self._closing_unguarded_pages
-        ]
+        live_after_all = self._visible_pages(snap_ctx)
         if live_after_all != kept_pages:
             # Tab set mutated during viewport await: discard stale snapshot & keep dirty
             self._tabs_dirty = True
@@ -4290,13 +4540,33 @@ class LiveBrowserHub:
             log.info("Detected X11 clipboard update (%d chars)", len(clip))
             await self.broadcast_json({"type": "clipboard", **self.latest_clip})
 
-    async def extract_content_async(self, req: dict[str, Any]) -> dict[str, Any] | None:
+    async def extract_content_async(
+        self,
+        req: dict[str, Any],
+        *,
+        expected_session_gen: int | None = None,
+        expected_takeover_gen: int | None = None,
+        expected_owner: tuple[str, int | None] | None = None,
+        check_owner: bool = False,
+    ) -> dict[str, Any] | None:
         """Read-only DOM extraction for mobile/desktop cross-system copy without altering page prototypes."""
         page = self._current_page()
         if not page:
             return None
-        cap_gen = self.session_gen
-        cap_owner = self.session_owner
+        cap_gen = self.session_gen if expected_session_gen is None else expected_session_gen
+        cap_tgen = self.takeover_gen if expected_takeover_gen is None else expected_takeover_gen
+        cap_owner = expected_owner if check_owner else self.session_owner
+
+        def _still_coherent() -> bool:
+            return (
+                self.engine_mode == "async_hosted"
+                and self.session_gen == cap_gen
+                and self.takeover_gen == cap_tgen
+                and self.session_owner == cap_owner
+            )
+
+        if not _still_coherent():
+            return None
         mode = str(req.get("mode") or "point")
         try:
             if mode == "url":
@@ -4316,7 +4586,7 @@ class LiveBrowserHub:
                     page.evaluate("() => (document.body && document.body.innerText || '').trim().slice(0, 25000)"),
                     timeout=1.8,
                 )
-                if not body_txt or self.engine_mode != "async_hosted" or self.session_gen != cap_gen:
+                if not body_txt or not _still_coherent():
                     return None
                 return {
                     "text": body_txt,
@@ -4387,7 +4657,7 @@ class LiveBrowserHub:
                     ),
                     timeout=0.9,
                 )
-                if self.engine_mode != "async_hosted" or self.session_gen != cap_gen or self.session_owner != cap_owner:
+                if not _still_coherent():
                     return None
                 if mode == "range_preview":
                     return {"preview": True, "text": (sel_res or "").strip()}
@@ -4395,7 +4665,7 @@ class LiveBrowserHub:
                 if not cleaned_sel:
                     return None
                 await self._capture_once()
-                if self.engine_mode != "async_hosted" or self.session_gen != cap_gen or self.session_owner != cap_owner:
+                if not _still_coherent():
                     return None
                 out_range = {
                     "text": cleaned_sel,
@@ -4427,7 +4697,7 @@ class LiveBrowserHub:
                     ),
                     timeout=0.8,
                 )
-                if self.engine_mode != "async_hosted" or self.session_gen != cap_gen or self.session_owner != cap_owner:
+                if not _still_coherent():
                     return None
                 if sel_txt:
                     return {
@@ -4544,10 +4814,10 @@ class LiveBrowserHub:
             )
             if not extracted or not extracted.get("text"):
                 return None
-            if self.engine_mode != "async_hosted" or self.session_gen != cap_gen or self.session_owner != cap_owner:
+            if not _still_coherent():
                 return None
             await self._capture_once()
-            if self.engine_mode != "async_hosted" or self.session_gen != cap_gen or self.session_owner != cap_owner:
+            if not _still_coherent():
                 return None
             out = {
                 "text": extracted["text"],
@@ -4659,7 +4929,7 @@ class LiveBrowserHub:
         while True:
             try:
                 await self._expire_sync_session_if_stale()
-                if self.engine_mode != "idle" and self.tg.cards:
+                if self.tg.cards:
                     await self.tg.tick_updates(finished=False, force=False)
                 now = time.monotonic()
                 if (now - last_cleanup) >= 60.0:
@@ -4861,6 +5131,7 @@ class LiveBrowserHub:
                 log.warning("Human input execution error: %s", exc)
 
     async def _execute_human_cmd_async(self, cmd: dict[str, Any]) -> None:
+        post_exec_cleanup_task: asyncio.Task[Any] | None = None
         async with self._exec_lock:
             if not await self._enforce_human_cmd_live_auth_locked(cmd):
                 return
@@ -5049,63 +5320,77 @@ class LiveBrowserHub:
                 await page.reload(wait_until="domcontentloaded", timeout=30000)
             elif act == "switch_tab":
                 idx = int(cmd.get("index", 0))
-                if self.ctx and 0 <= idx < len(self.ctx.pages):
+                pages_vis = self._visible_pages()
+                if 0 <= idx < len(pages_vis):
+                    target_page = pages_vis[idx]
                     self.active_tab_index = idx
                     self._tab_select_rev += 1
-                    await self.ctx.pages[idx].bring_to_front()
+                    await target_page.bring_to_front()
             elif act == "new_tab":
                 if self.ctx:
                     cur_ctx = self.ctx
-                    np = await cur_ctx.new_page()
-                    # Re-verify (session_gen, takeover_gen, owner, live admin RBAC) AFTER `await new_page()`
-                    # BEFORE updating tab selection or navigating; close newly created page if revoked!
-                    if not await self._enforce_human_cmd_live_auth_locked(cmd) or self.ctx is not cur_ctx:
-                        try:
-                            close_fn = getattr(np, "close", None)
-                            if callable(close_fn):
-                                res = close_fn()
-                                if inspect.isawaitable(res):
-                                    await asyncio.wait_for(res, timeout=5.0)
-                        except Exception as close_exc:
-                            log.debug("Closing revoked new_tab page failed: %s", close_exc)
-                        return
+                    self._explicit_new_tab_in_flight += 1
                     try:
-                        self._attach_page_listeners(np)
-                    except Exception as guard_exc:
-                        log.error("new_tab listener attachment failed (fail-closed): %s", guard_exc)
-                        await self._fail_closed_close_unguarded_page(np, expected_ctx=cur_ctx)
-                        return
-                    pages_now = [
-                        p
-                        for p in list(self.ctx.pages)
-                        if not self._is_page_closed(p) and id(p) not in self._closing_unguarded_pages
-                    ]
-                    if np in pages_now:
-                        self.active_tab_index = pages_now.index(np)
-                        self._tab_select_rev += 1
-                    new_tab_url = "https://www.google.com" if self._is_active_pinned_verified() else "about:blank"
-                    await np.goto(new_tab_url, wait_until="domcontentloaded", timeout=30000)
+                        np = await cur_ctx.new_page()
+                    finally:
+                        self._explicit_new_tab_in_flight = max(0, self._explicit_new_tab_in_flight - 1)
+                    # Re-verify (session_gen, takeover_gen, owner, live admin RBAC) AFTER `await new_page()`
+                    # BEFORE updating tab selection or navigating; quarantine & fail-closed close outside `_exec_lock` if revoked!
+                    if not await self._enforce_human_cmd_live_auth_locked(cmd) or self.ctx is not cur_ctx:
+                        post_exec_cleanup_task = self._schedule_fail_closed_close_unguarded_page(
+                            np, expected_ctx=cur_ctx, bump_tab_rev=False
+                        )
+                    elif id(np) in self._closing_unguarded_pages:
+                        # Callback `ctx.on('page')` already caught a guard failure during `new_page()`:
+                        # merge onto the same deduplicated cleanup task and release `_exec_lock` before awaiting!
+                        post_exec_cleanup_task = self._schedule_fail_closed_close_unguarded_page(
+                            np, expected_ctx=cur_ctx
+                        )
+                    else:
+                        try:
+                            self._attach_page_listeners(np)
+                        except Exception as guard_exc:
+                            log.error("new_tab listener attachment failed (fail-closed): %s", guard_exc)
+                            post_exec_cleanup_task = self._schedule_fail_closed_close_unguarded_page(
+                                np, expected_ctx=cur_ctx
+                            )
+                        else:
+                            pages_now = self._visible_pages(cur_ctx)
+                            if np in pages_now:
+                                self.active_tab_index = pages_now.index(np)
+                                self._tab_select_rev += 1
+                            new_tab_url = (
+                                "https://www.google.com" if self._is_active_pinned_verified() else "about:blank"
+                            )
+                            await np.goto(new_tab_url, wait_until="domcontentloaded", timeout=30000)
             elif act == "close_tab":
                 idx = int(cmd.get("index", -1))
-                if self.ctx and len(self.ctx.pages) > 1 and 0 <= idx < len(self.ctx.pages):
+                pages_vis = self._visible_pages()
+                if self.ctx and len(pages_vis) > 1 and 0 <= idx < len(pages_vis):
                     cur_ctx = self.ctx
-                    await cur_ctx.pages[idx].close()
+                    target_page = pages_vis[idx]
+                    self._explicit_close_tab_in_flight += 1
+                    try:
+                        await target_page.close()
+                    finally:
+                        self._explicit_close_tab_in_flight = max(0, self._explicit_close_tab_in_flight - 1)
                     # Re-verify (session_gen, takeover_gen, owner, live admin RBAC) AFTER `await close()`
                     # BEFORE updating selected tab index!
                     if not await self._enforce_human_cmd_live_auth_locked(cmd) or self.ctx is not cur_ctx:
                         return
-                    rem_pages = [
-                        p
-                        for p in list(self.ctx.pages)
-                        if not self._is_page_closed(p) and id(p) not in self._closing_unguarded_pages
-                    ]
+                    rem_pages = self._visible_pages(cur_ctx)
                     self.active_tab_index = max(0, min(self.active_tab_index, len(rem_pages) - 1)) if rem_pages else 0
                     self._tab_select_rev += 1
 
-            if self._is_human_cmd_still_valid(cmd, check_live_rbac=True):
+            if post_exec_cleanup_task is None and self._is_human_cmd_still_valid(cmd, check_live_rbac=True):
                 await self._capture_once()
                 if self._is_human_cmd_still_valid(cmd, check_live_rbac=True):
                     await self.broadcast_state()
+
+        # Await deduplicated fail-closed close/teardown strictly AFTER releasing `_exec_lock`
+        # so `_stop_hosted_locked()` can acquire `_exec_lock` to release held mouse buttons with zero deadlock!
+        if post_exec_cleanup_task is not None:
+            await post_exec_cleanup_task
 
     # ---------------- AI Agent Action RPC ----------------
 
@@ -5338,15 +5623,22 @@ async def _ws_launch_or_switch(
 
 
 def _parse_strict_int(raw: Any) -> int | None:
-    """Parse an integer strictly (rejecting None, bool, floats, and non-numeric strings)."""
+    """Parse an integer strictly (rejecting None, bool, floats, and non-ASCII/non-numeric strings)."""
     if raw is None or isinstance(raw, bool):
         return None
     if isinstance(raw, int):
         return raw
     if isinstance(raw, str):
         s = raw.strip()
-        if s and (s.isdigit() or (s.startswith("-") and s[1:].isdigit())):
+        if not s:
+            return None
+        digits = s[1:] if s.startswith("-") else s
+        if not digits or not digits.isascii() or not digits.isdigit():
+            return None
+        try:
             return int(s)
+        except (TypeError, ValueError):
+            return None
     return None
 
 
@@ -5893,7 +6185,13 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                 req_owner = hub.session_owner
                 hub.mark_active()
                 if hub.engine_mode == "async_hosted":
-                    clip_res = await hub.extract_content_async(data)
+                    clip_res = await hub.extract_content_async(
+                        data,
+                        expected_session_gen=req_gen,
+                        expected_takeover_gen=req_tgen,
+                        expected_owner=req_owner,
+                        check_owner=True,
+                    )
                     # Post-await live auth, owner & BOTH generations re-verification before sending extract result!
                     if not await _require_live_auth():
                         break
@@ -5976,17 +6274,25 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                         break
                     continue
                 req_gen = hub.session_gen
+                req_tgen = hub.takeover_gen
                 req_owner = hub.session_owner
                 hub.mark_active()
                 if hub.engine_mode == "idle":
                     await ws.send_str(json.dumps({"type": "toast", "message": "当前浏览器未运行"}))
                 elif hub.engine_mode == "async_hosted":
-                    clip_res = await hub.extract_content_async({"mode": "selection"})
+                    clip_res = await hub.extract_content_async(
+                        {"mode": "selection"},
+                        expected_session_gen=req_gen,
+                        expected_takeover_gen=req_tgen,
+                        expected_owner=req_owner,
+                        check_owner=True,
+                    )
                     if not await _require_live_auth():
                         break
                     if (
                         hub.engine_mode != "async_hosted"
                         or hub.session_gen != req_gen
+                        or hub.takeover_gen != req_tgen
                         or hub.session_owner != req_owner
                         or not hub._viewer_can_read_session(bot_key, user_id, role)
                     ):
@@ -6132,11 +6438,11 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
 
 
 class _UploadPayloadTooLargeError(Exception):
-    """Raised immediately when raw incoming multipart stream exceeds MAX_UPLOAD_TOTAL_REQUEST_BYTES."""
+    """Raised immediately when decoded HTTP multipart request body exceeds MAX_UPLOAD_TOTAL_REQUEST_BYTES."""
 
 
 class _CountingStreamReader:
-    """Byte-counting wrapper around aiohttp StreamReader enforcing decoded HTTP request body byte limits."""
+    """Byte-counting wrapper around aiohttp StreamReader enforcing decoded HTTP multipart request body byte limits."""
 
     def __init__(self, inner: Any, max_bytes: int) -> None:
         self._inner = inner
@@ -6155,7 +6461,7 @@ class _CountingStreamReader:
         self.bytes_read += n
         if self.bytes_read > self.max_bytes:
             raise _UploadPayloadTooLargeError(
-                f"raw multipart request exceeded {self.max_bytes} bytes"
+                f"decoded HTTP multipart request body exceeded {self.max_bytes} bytes"
             )
         return data
 
@@ -6228,9 +6534,16 @@ async def handle_api_upload(request: web.Request) -> web.Response:
 
     # Reject declared oversized requests before reading body
     raw_cl = request.headers.get("Content-Length", "")
-    if raw_cl.isdigit() and int(raw_cl) > max_req_bytes:
+    parsed_cl = _parse_strict_int(raw_cl)
+    if parsed_cl is not None and parsed_cl > max_req_bytes:
         return web.json_response(
-            {"ok": False, "error": f"上传请求总大小超过 {MAX_UPLOAD_BYTES // (1024 * 1024)} MiB 限制"},
+            {
+                "ok": False,
+                "error": (
+                    f"上传请求体总大小超过 {MAX_UPLOAD_BYTES // (1024 * 1024)} MiB 文件"
+                    f" + {MAX_UPLOAD_META_BYTES // 1024} KiB multipart 开销限制"
+                ),
+            },
             status=413,
         )
 
@@ -6458,7 +6771,13 @@ async def handle_api_upload(request: web.Request) -> web.Response:
         return web.json_response({"ok": True, "files": saved_names, "total_bytes": total_file_bytes})
     except _UploadPayloadTooLargeError:
         return web.json_response(
-            {"ok": False, "error": f"上传请求体总大小超过 {MAX_UPLOAD_BYTES // (1024 * 1024)} MiB 限制"},
+            {
+                "ok": False,
+                "error": (
+                    f"上传请求体总大小超过 {MAX_UPLOAD_BYTES // (1024 * 1024)} MiB 文件"
+                    f" + {MAX_UPLOAD_META_BYTES // 1024} KiB multipart 开销限制"
+                ),
+            },
             status=413,
         )
     except asyncio.CancelledError:
@@ -6562,6 +6881,19 @@ def _resolve_internal_tg_reader(
     return True, hub._viewer_can_read_session(target_bot, uid_val, live_role)
 
 
+def _is_group_internal_scope(mapping: Any) -> bool:
+    """Return True when an internal query/body indicates a Telegram group/non-private chat delivery scope."""
+    if not mapping or not hasattr(mapping, "get"):
+        return False
+    raw_scope = str(mapping.get("chat_scope") or "").strip().lower()
+    if raw_scope in ("group", "supergroup", "channel"):
+        return True
+    raw_cid = mapping.get("chat_id")
+    if raw_cid is not None and _parse_positive_int(raw_cid) is None:
+        return True
+    return False
+
+
 async def internal_status(request: web.Request) -> web.Response:
     hub: LiveBrowserHub = request.app["hub"]
     check_local_auth(request, hub)
@@ -6569,17 +6901,15 @@ async def internal_status(request: web.Request) -> web.Response:
     is_tg, can_read = _resolve_internal_tg_reader(hub, query)
     if is_tg and not can_read:
         return web.json_response({"ok": True, **hub._redacted_state_dict()})
-    return web.json_response({"ok": True, **hub.state_dict()})
+    state = hub.state_dict()
+    if _is_group_internal_scope(query):
+        state = {**state, "profiles": []}
+    return web.json_response({"ok": True, **state})
 
 
 def _parse_positive_int(raw: Any) -> int | None:
-    if raw is None or isinstance(raw, bool):
-        return None
-    try:
-        val = int(str(raw).strip())
-    except (TypeError, ValueError):
-        return None
-    return val if val > 0 else None
+    val = _parse_strict_int(raw)
+    return val if (val is not None and val > 0) else None
 
 
 def _verify_internal_caller_control(
@@ -6744,6 +7074,7 @@ async def internal_start(request: web.Request) -> web.Response:
     actor_arg = (auth_ctx["bot_key"], auth_ctx["chat_id"]) if auth_ctx.get("is_tg") else None
     source_arg = str(auth_ctx.get("source") or "tg_cmd") if auth_ctx.get("is_tg") else "cli"
     exp_gen = auth_ctx.get("expected_gen") if auth_ctx.get("is_tg") else None
+    is_group_scope = _is_group_internal_scope(body)
     try:
         st = await hub.start_hosted(
             initial_url=body.get("url"),
@@ -6759,15 +7090,20 @@ async def internal_start(request: web.Request) -> web.Response:
         )
         return web.json_response({"ok": True, **st})
     except PermissionError as exc:
-        return web.json_response({"ok": False, "error": str(exc)}, status=403)
+        err_msg = "当前操作未获授权，请前往私聊查看与操作" if is_group_scope else str(exc)
+        return web.json_response({"ok": False, "error": err_msg}, status=403)
     except ValueError as exc:
-        return web.json_response({"ok": False, "error": str(exc)}, status=400)
+        err_msg = "请求参数无效，请前往私聊检查" if is_group_scope else str(exc)
+        return web.json_response({"ok": False, "error": err_msg}, status=400)
     except (KeyError, FileNotFoundError) as exc:
-        return web.json_response({"ok": False, "error": str(exc)}, status=404)
+        err_msg = "请求的浏览器配置不可用，请前往私聊检查" if is_group_scope else str(exc)
+        return web.json_response({"ok": False, "error": err_msg}, status=404)
     except RuntimeError as exc:
-        return web.json_response({"ok": False, "error": str(exc)}, status=409)
+        err_msg = "当前浏览器会话冲突或正忙，请前往私聊查看与操作" if is_group_scope else str(exc)
+        return web.json_response({"ok": False, "error": err_msg}, status=409)
     except Exception as exc:
-        return web.json_response({"ok": False, "error": str(exc)}, status=500)
+        err_msg = "浏览器服务暂不可用，请前往私聊重试" if is_group_scope else str(exc)
+        return web.json_response({"ok": False, "error": err_msg}, status=500)
 
 
 async def internal_profiles_list(request: web.Request) -> web.Response:
@@ -6775,7 +7111,15 @@ async def internal_profiles_list(request: web.Request) -> web.Response:
     check_local_auth(request, hub)
     query = getattr(request, "query", {}) or {}
     is_tg, can_read = _resolve_internal_tg_reader(hub, query)
-    visible_active = hub.active_profile if (not is_tg or can_read) else ""
+    if (is_tg and not can_read) or _is_group_internal_scope(query):
+        return web.json_response(
+            {
+                "ok": True,
+                "active_profile": None,
+                "profiles": [],
+            }
+        )
+    visible_active = hub.active_profile
     try:
         profs = list_profiles(active_profile=visible_active)
     except RuntimeError as exc:
@@ -6841,6 +7185,7 @@ async def internal_profiles_switch(request: web.Request) -> web.Response:
     actor_arg = (auth_ctx["bot_key"], auth_ctx["chat_id"]) if auth_ctx.get("is_tg") else None
     source_arg = str(auth_ctx.get("source") or "tg_cmd") if auth_ctx.get("is_tg") else "cli"
     exp_gen = auth_ctx.get("expected_gen") if auth_ctx.get("is_tg") else None
+    is_group_scope = _is_group_internal_scope(body)
     try:
         st = await hub.start_hosted(
             initial_url=body.get("url") or None,
@@ -6855,15 +7200,20 @@ async def internal_profiles_switch(request: web.Request) -> web.Response:
         )
         return web.json_response({"ok": True, **st})
     except PermissionError as exc:
-        return web.json_response({"ok": False, "error": str(exc)}, status=403)
+        err_msg = "当前操作未获授权，请前往私聊查看与操作" if is_group_scope else str(exc)
+        return web.json_response({"ok": False, "error": err_msg}, status=403)
     except ValueError as exc:
-        return web.json_response({"ok": False, "error": str(exc)}, status=400)
+        err_msg = "请求参数无效，请前往私聊检查" if is_group_scope else str(exc)
+        return web.json_response({"ok": False, "error": err_msg}, status=400)
     except (KeyError, FileNotFoundError) as exc:
-        return web.json_response({"ok": False, "error": str(exc)}, status=404)
+        err_msg = "请求的浏览器配置不可用，请前往私聊检查" if is_group_scope else str(exc)
+        return web.json_response({"ok": False, "error": err_msg}, status=404)
     except RuntimeError as exc:
-        return web.json_response({"ok": False, "error": str(exc)}, status=409)
+        err_msg = "当前浏览器会话冲突或正忙，请前往私聊查看与操作" if is_group_scope else str(exc)
+        return web.json_response({"ok": False, "error": err_msg}, status=409)
     except Exception as exc:
-        return web.json_response({"ok": False, "error": str(exc)}, status=500)
+        err_msg = "浏览器服务暂不可用，请前往私聊重试" if is_group_scope else str(exc)
+        return web.json_response({"ok": False, "error": err_msg}, status=500)
 
 
 def _parse_bool_flag(raw: Any) -> bool:
@@ -7262,7 +7612,10 @@ async def internal_sync_clipboard(request: web.Request) -> web.Response:
     body_lease = str(body.get("lease_id") or "").strip()
     if body_lease and not hmac.compare_digest(body_lease, hdr_lease):
         return web.json_response({"ok": False, "error": "Mismatched sync_lease_id"}, status=409)
-    req_sgen = _parse_strict_int(body.get("session_gen")) if body.get("session_gen") is not None else None
+    raw_sgen_body = body.get("session_gen")
+    req_sgen = _parse_strict_int(raw_sgen_body)
+    if raw_sgen_body is not None and req_sgen is None:
+        return web.json_response({"ok": False, "error": "Invalid sync session_gen"}, status=400)
 
     # 2. Post-read validation BEFORE writing clipboard or sending to viewer!
     if req_sgen is not None and req_sgen != start_gen:
@@ -7271,23 +7624,33 @@ async def internal_sync_clipboard(request: web.Request) -> web.Response:
     if not ok_post:
         return web.json_response({"ok": False, "error": err_post}, status=st_post)
 
-    req_tgen_body = _parse_strict_int(body.get("takeover_gen")) if body.get("takeover_gen") is not None else None
+    raw_tgen_body = body.get("takeover_gen")
+    req_tgen_body = _parse_strict_int(raw_tgen_body)
+    if raw_tgen_body is not None and req_tgen_body is None:
+        return web.json_response({"ok": False, "error": "Invalid sync takeover_gen"}, status=400)
+
+    req_id_str = str(body.get("req_id") or "").strip()
+    if req_id_str and (req_sgen is None or req_tgen_body is None):
+        return web.json_response(
+            {"ok": False, "error": "Targeted extract reply requires valid integer session_gen and takeover_gen"},
+            status=400,
+        )
 
     def _validate_targeted_extract_reply(req_id_val: str) -> Any | None:
-        """Strictly validate a pending Sync extract `req_id` against BOTH generations, owner, live RBAC, and live WS.
+        """Strictly validate a pending Sync extract `req_id` against BOTH mandatory body generations, owner, live RBAC, and live WS.
 
         Returns the originating `target_ws` ONLY when all checks pass AND `target_ws` is still live & open.
         Returns `None` (drop without writing `latest_clip` or broadcasting) on any mismatch or if `target_ws` closed.
         """
+        if req_sgen is None or req_tgen_body is None:
+            return None
         pending = hub._pending_sync_extracts.pop(req_id_val, None)
         if not pending:
             return None
-        if pending.get("session_gen") != start_gen or hub.session_gen != start_gen:
+        if pending.get("session_gen") != start_gen or hub.session_gen != start_gen or req_sgen != start_gen:
             return None
         p_tgen = pending.get("takeover_gen")
-        if p_tgen is None or p_tgen != hub.takeover_gen:
-            return None
-        if req_tgen_body is not None and req_tgen_body != p_tgen:
+        if p_tgen is None or p_tgen != hub.takeover_gen or req_tgen_body != p_tgen:
             return None
         if pending.get("owner") != hub.session_owner:
             return None
@@ -7302,7 +7665,6 @@ async def internal_sync_clipboard(request: web.Request) -> web.Response:
             return None
         return target_ws
 
-    req_id_str = str(body.get("req_id") or "").strip()
     if body.get("preview"):
         preview_payload: dict[str, Any] = {
             "type": "selection_preview",

@@ -9086,6 +9086,14 @@ def build_browser_panel(chat_id, from_user=None):
 
     ok_st, st_data = _live_browser_request("GET", "/internal/status", timeout=(1.5, 3.0), params=status_params)
     if not ok_st:
+        if not is_private:
+            text = (
+                "<b>🎭 Live-Browser 控制面板</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "⚪ <b>状态：</b>暂不可用（群聊已脱敏隔离，请前往私聊查看详情）"
+            )
+            kb = {"inline_keyboard": [[{"text": "🔄 刷新状态", "callback_data": "browser:refresh"}]]}
+            return text, kb
         text = (
             "<b>🎭 Live-Browser 控制面板</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
@@ -9272,26 +9280,40 @@ def cmd_browser(chat_id, arg, thread_id=None, scope_key=None, from_user=None):
         return
     owner_uid = _live_browser_owner_uid(chat_id, from_user=from_user)
 
+    try:
+        is_private = int(chat_id) > 0
+    except Exception:
+        is_private = False
+    chat_scope = "private" if is_private else "group"
+
     if sub == "switch":
         if len(parts) < 2:
             send(chat_id, "用法：<code>/browser switch &lt;profile&gt; [url]</code>", parse_mode="HTML", thread_id=norm_tid)
             return
         target = parts[1].strip()
-        body = {"profile": target, "restart": True, "bot": bot_hint, "source": "tg_cmd"}
+        body = {"profile": target, "restart": True, "bot": bot_hint, "source": "tg_cmd", "chat_scope": chat_scope}
         if owner_uid is not None:
             body["user_id"] = owner_uid
         if len(parts) > 2:
             body["url"] = parts[2].strip()
         ok, res = _live_browser_request("POST", "/internal/profiles/switch", json_body=body, timeout=(2.5, 25.0))
         if not ok:
-            send(chat_id, f"❌ 切换指纹失败：{html_mod.escape(str(res))}", parse_mode="HTML", thread_id=norm_tid)
+            if not is_private:
+                send(
+                    chat_id,
+                    "❌ 切换指纹未完成（群聊已脱敏隔离，不显示后端详情，请前往私聊执行与查看）",
+                    parse_mode="HTML",
+                    thread_id=norm_tid,
+                )
+            else:
+                send(chat_id, f"❌ 切换指纹失败：{html_mod.escape(str(res))}", parse_mode="HTML", thread_id=norm_tid)
             return
         text, kb = build_browser_panel(chat_id, from_user=from_user)
         send(chat_id, text, parse_mode="HTML", reply_markup=kb, thread_id=norm_tid)
         return
 
     if sub == "start":
-        body = {"bot": bot_hint, "source": "tg_cmd"}
+        body = {"bot": bot_hint, "source": "tg_cmd", "chat_scope": chat_scope}
         if owner_uid is not None:
             body["user_id"] = owner_uid
         if len(parts) > 1:
@@ -9300,19 +9322,35 @@ def cmd_browser(chat_id, arg, thread_id=None, scope_key=None, from_user=None):
             body["url"] = parts[2].strip()
         ok, res = _live_browser_request("POST", "/internal/start", json_body=body, timeout=(2.5, 25.0))
         if not ok:
-            send(chat_id, f"❌ 启动浏览器失败：{html_mod.escape(str(res))}", parse_mode="HTML", thread_id=norm_tid)
+            if not is_private:
+                send(
+                    chat_id,
+                    "❌ 启动浏览器未完成（群聊已脱敏隔离，不显示后端详情，请前往私聊执行与查看）",
+                    parse_mode="HTML",
+                    thread_id=norm_tid,
+                )
+            else:
+                send(chat_id, f"❌ 启动浏览器失败：{html_mod.escape(str(res))}", parse_mode="HTML", thread_id=norm_tid)
             return
         text, kb = build_browser_panel(chat_id, from_user=from_user)
         send(chat_id, text, parse_mode="HTML", reply_markup=kb, thread_id=norm_tid)
         return
 
     if sub == "stop":
-        body = {"bot": bot_hint, "source": "tg_cmd"}
+        body = {"bot": bot_hint, "source": "tg_cmd", "chat_scope": chat_scope}
         if owner_uid is not None:
             body["user_id"] = owner_uid
         ok, res = _live_browser_request("POST", "/internal/stop", json_body=body, timeout=(2.0, 10.0))
         if not ok:
-            send(chat_id, f"❌ 停止浏览器失败：{html_mod.escape(str(res))}", parse_mode="HTML", thread_id=norm_tid)
+            if not is_private:
+                send(
+                    chat_id,
+                    "❌ 停止浏览器未完成（群聊已脱敏隔离，不显示后端详情，请前往私聊执行与查看）",
+                    parse_mode="HTML",
+                    thread_id=norm_tid,
+                )
+            else:
+                send(chat_id, f"❌ 停止浏览器失败：{html_mod.escape(str(res))}", parse_mode="HTML", thread_id=norm_tid)
             return
         text, kb = build_browser_panel(chat_id, from_user=from_user)
         send(chat_id, text, parse_mode="HTML", reply_markup=kb, thread_id=norm_tid)
@@ -9981,11 +10019,16 @@ def _handle_browser_callback(cb_id, chat_id, thread_id, msg_id, data, from_user=
         tg("answerCallbackQuery", callback_query_id=cb_id, text="❌ 无法识别当前 Bot 身份，已拒绝操作", show_alert=True)
         return
     owner_uid = _live_browser_owner_uid(chat_id, from_user=from_user)
+    try:
+        cb_is_private = int(chat_id) > 0
+    except Exception:
+        cb_is_private = False
+    cb_chat_scope = "private" if cb_is_private else "group"
     if sub == "refresh":
         tg("answerCallbackQuery", callback_query_id=cb_id, text="浏览器状态已刷新")
     elif sub.startswith("switch:"):
         target = sub[7:].strip()
-        body = {"profile": target, "restart": True, "bot": bot_hint, "source": "tg_cmd"}
+        body = {"profile": target, "restart": True, "bot": bot_hint, "source": "tg_cmd", "chat_scope": cb_chat_scope}
         if owner_uid is not None:
             body["user_id"] = owner_uid
         ok, res = _live_browser_request(
@@ -9995,28 +10038,31 @@ def _handle_browser_callback(cb_id, chat_id, thread_id, msg_id, data, from_user=
             timeout=(2.5, 25.0),
         )
         if not ok:
-            tg("answerCallbackQuery", callback_query_id=cb_id, text=f"切换失败: {res}"[:180], show_alert=True)
+            err_alert = "切换未完成，请前往私聊查看详情" if not cb_is_private else f"切换失败: {res}"[:180]
+            tg("answerCallbackQuery", callback_query_id=cb_id, text=err_alert, show_alert=True)
             return
-        tg("answerCallbackQuery", callback_query_id=cb_id, text=f"已切换至指纹 {target}")
+        tg("answerCallbackQuery", callback_query_id=cb_id, text="已切换指纹" if not cb_is_private else f"已切换至指纹 {target}")
     elif sub.startswith("start:"):
         target = sub[6:].strip()
-        body = {"bot": bot_hint, "source": "tg_cmd"}
+        body = {"bot": bot_hint, "source": "tg_cmd", "chat_scope": cb_chat_scope}
         if owner_uid is not None:
             body["user_id"] = owner_uid
         if target:
             body["profile"] = target
         ok, res = _live_browser_request("POST", "/internal/start", json_body=body, timeout=(2.5, 25.0))
         if not ok:
-            tg("answerCallbackQuery", callback_query_id=cb_id, text=f"启动失败: {res}"[:180], show_alert=True)
+            err_alert = "启动未完成，请前往私聊查看详情" if not cb_is_private else f"启动失败: {res}"[:180]
+            tg("answerCallbackQuery", callback_query_id=cb_id, text=err_alert, show_alert=True)
             return
-        tg("answerCallbackQuery", callback_query_id=cb_id, text=f"已启动指纹 {target or 'default'}")
+        tg("answerCallbackQuery", callback_query_id=cb_id, text="浏览器已启动" if not cb_is_private else f"已启动指纹 {target or 'default'}")
     elif sub == "stop":
-        body = {"bot": bot_hint, "source": "tg_cmd"}
+        body = {"bot": bot_hint, "source": "tg_cmd", "chat_scope": cb_chat_scope}
         if owner_uid is not None:
             body["user_id"] = owner_uid
         ok, res = _live_browser_request("POST", "/internal/stop", json_body=body, timeout=(2.0, 10.0))
         if not ok:
-            tg("answerCallbackQuery", callback_query_id=cb_id, text=f"停止失败: {res}"[:180], show_alert=True)
+            err_alert = "停止未完成，请前往私聊查看详情" if not cb_is_private else f"停止失败: {res}"[:180]
+            tg("answerCallbackQuery", callback_query_id=cb_id, text=err_alert, show_alert=True)
             return
         tg("answerCallbackQuery", callback_query_id=cb_id, text="浏览器已安全停止")
     else:
