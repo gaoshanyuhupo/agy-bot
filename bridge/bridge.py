@@ -9219,6 +9219,9 @@ def cmd_browser(chat_id, arg, thread_id=None, scope_key=None, from_user=None):
         return
 
     bot_hint = _live_browser_bot_hint()
+    if not bot_hint:
+        send(chat_id, "❌ 无法识别当前 Bot 身份，已拒绝操作（fail-closed）", parse_mode="HTML", thread_id=norm_tid)
+        return
     owner_uid = _live_browser_owner_uid(chat_id, from_user=from_user)
 
     if sub == "switch":
@@ -9767,7 +9770,7 @@ def _live_browser_bot_hint():
     tok = os.environ.get("AGY_TG_BOT_TOKEN", "")
     if ":" in tok:
         return tok.split(":", 1)[0]
-    return "main"
+    return None
 
 
 def _handle_browser_callback(cb_id, chat_id, thread_id, msg_id, data, from_user=None):
@@ -9778,6 +9781,10 @@ def _handle_browser_callback(cb_id, chat_id, thread_id, msg_id, data, from_user=
             priv_cid = int(chat_id)
         except Exception:
             priv_cid = 0
+        try:
+            card_mid = int(msg_id) if msg_id is not None and not isinstance(msg_id, bool) else 0
+        except Exception:
+            card_mid = 0
         strict_role = _get_user_role(chat_id, from_user=from_user, allow_uid_fallback=False)
         if strict_role != "admin" or priv_cid <= 0 or (uid is not None and priv_cid != uid):
             tg(
@@ -9787,7 +9794,23 @@ def _handle_browser_callback(cb_id, chat_id, thread_id, msg_id, data, from_user=
                 show_alert=True,
             )
             return
+        if card_mid <= 0:
+            tg(
+                "answerCallbackQuery",
+                callback_query_id=cb_id,
+                text="🔒 缺少有效的实况卡片消息 ID，已拒绝操作",
+                show_alert=True,
+            )
+            return
         bot_hint = _live_browser_bot_hint()
+        if not bot_hint:
+            tg(
+                "answerCallbackQuery",
+                callback_query_id=cb_id,
+                text="❌ 无法识别当前 Bot 身份，已拒绝操作",
+                show_alert=True,
+            )
+            return
         if sub == "takeover_on":
             ok, res = _live_browser_request(
                 "POST",
@@ -9798,8 +9821,9 @@ def _handle_browser_callback(cb_id, chat_id, thread_id, msg_id, data, from_user=
                     "bot": bot_hint,
                     "user_id": priv_cid,
                     "chat_id": priv_cid,
-                    "message_id": msg_id,
+                    "message_id": card_mid,
                     "from_card": True,
+                    "source": "tg_card",
                 },
                 timeout=(1.5, 5.0),
             )
@@ -9817,8 +9841,9 @@ def _handle_browser_callback(cb_id, chat_id, thread_id, msg_id, data, from_user=
                     "bot": bot_hint,
                     "user_id": priv_cid,
                     "chat_id": priv_cid,
-                    "message_id": msg_id,
+                    "message_id": card_mid,
                     "from_card": True,
+                    "source": "tg_card",
                 },
                 timeout=(1.5, 5.0),
             )
@@ -9835,7 +9860,9 @@ def _handle_browser_callback(cb_id, chat_id, thread_id, msg_id, data, from_user=
                     "refresh_card": True,
                     "bot": bot_hint,
                     "chat_id": priv_cid,
-                    "message_id": msg_id,
+                    "message_id": card_mid,
+                    "from_card": True,
+                    "source": "tg_card",
                 },
                 timeout=(1.5, 8.0),
             )
@@ -9852,8 +9879,9 @@ def _handle_browser_callback(cb_id, chat_id, thread_id, msg_id, data, from_user=
                     "bot": bot_hint,
                     "user_id": priv_cid,
                     "chat_id": priv_cid,
-                    "message_id": msg_id,
+                    "message_id": card_mid,
                     "from_card": True,
+                    "source": "tg_card",
                 },
                 timeout=(2.0, 10.0),
             )
@@ -9901,6 +9929,9 @@ def _handle_browser_callback(cb_id, chat_id, thread_id, msg_id, data, from_user=
         return
 
     bot_hint = _live_browser_bot_hint()
+    if not bot_hint:
+        tg("answerCallbackQuery", callback_query_id=cb_id, text="❌ 无法识别当前 Bot 身份，已拒绝操作", show_alert=True)
+        return
     owner_uid = _live_browser_owner_uid(chat_id, from_user=from_user)
     if sub == "refresh":
         tg("answerCallbackQuery", callback_query_id=cb_id, text="浏览器状态已刷新")

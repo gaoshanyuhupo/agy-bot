@@ -127,6 +127,9 @@ class _FakeContext:
     def on(self, event: str, cb) -> None:
         self._callbacks.setdefault(event, []).append(cb)
 
+    async def route(self, pattern: str, handler) -> None:
+        self._callbacks.setdefault("route", []).append((pattern, handler))
+
     async def new_page(self) -> _FakePage:
         p = _FakePage()
         self.pages.append(p)
@@ -343,6 +346,7 @@ class TestLiveBrowserServerPanelWS(unittest.TestCase):
             hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "local-tok")
             hub.engine_mode = "async_hosted"
             hub.active_profile = "pinned_acct"
+            hub.session_owner = ("main", 111)
             hub.takeover = True
 
             incoming = [
@@ -925,6 +929,28 @@ class TestBridgeBrowserPanelAndRbac(unittest.TestCase):
                 self.assertEqual("100", payload.get("bot"), f"Missing bot hint on card callback {url}")
                 self.assertEqual(111, payload.get("chat_id"), f"Missing chat_id on card callback {url}")
                 self.assertEqual(909, payload.get("message_id"), f"Missing message_id on card callback {url}")
+                self.assertEqual("tg_card", payload.get("source"), f"Missing source='tg_card' on {url}")
+                self.assertTrue(payload.get("from_card"), f"Missing from_card=True on {url}")
+
+            # Fail-closed: missing bot identity MUST NOT fall back to "main", and missing msg_id on card callback MUST be rejected!
+            post_calls.clear()
+            bridge._env_file = ""
+            bridge.BOT_META.clear()
+            with (
+                mock.patch.dict(os.environ, {"AGY_TG_BOT_TOKEN": ""}, clear=False),
+                mock.patch.object(bridge.requests, "post", side_effect=_fake_post),
+                mock.patch.object(bridge, "send", return_value=1) as send_mock,
+                mock.patch.object(bridge, "tg", return_value=None) as tg_mock,
+            ):
+                self.assertIsNone(bridge._live_browser_bot_hint())
+                bridge.cmd_browser(111, "start default", from_user={"id": 111})
+                bridge._handle_browser_callback("cb-nobot", 111, None, 909, "browser:takeover_on", from_user={"id": 111})
+                bridge.BOT_META["bot_id"] = 100
+                bridge._handle_browser_callback("cb-nomid", 111, None, 0, "browser:card_refresh", from_user={"id": 111})
+                bridge._handle_browser_callback("cb-nonemid", 111, None, None, "browser:card_stop", from_user={"id": 111})
+                self.assertEqual([], post_calls)
+                self.assertTrue(send_mock.called)
+                self.assertGreaterEqual(tg_mock.call_count, 3)
 
 
 if __name__ == "__main__":

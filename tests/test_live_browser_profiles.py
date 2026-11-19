@@ -53,6 +53,9 @@ class _FakeContext:
     def on(self, event: str, cb) -> None:
         self._callbacks.setdefault(event, []).append(cb)
 
+    async def route(self, pattern: str, handler) -> None:
+        self._callbacks.setdefault("route", []).append((pattern, handler))
+
     async def new_page(self) -> _FakePage:
         p = _FakePage()
         self.pages.append(p)
@@ -422,7 +425,7 @@ class TestLiveBrowserProfiles(unittest.TestCase):
                 srv.discover_pinned_host_profile()
 
         # 5. Valid pinned host: non-pinned profile is blocked from Google/Gmail/YouTube destinations
-        self._install_mock_google_browser("pinned_acct")
+        pinned_dir = self._install_mock_google_browser("pinned_acct")
         srv.create_profile("nonpin", {"os": "linux"})
         for bad_url in (
             "https://www.google.com/search?q=test",
@@ -437,8 +440,11 @@ class TestLiveBrowserProfiles(unittest.TestCase):
                 self.assertTrue(srv.is_google_destination_url(bad_url))
                 with self.assertRaises(ValueError):
                     srv.enforce_google_profile_policy(bad_url, is_pinned=False)
-                # Pinned profile is permitted
-                srv.enforce_google_profile_policy(bad_url, is_pinned=True)
+                # Bare is_pinned=True without matching canonical profile_dir MUST ALSO fail closed!
+                with self.assertRaises(ValueError):
+                    srv.enforce_google_profile_policy(bad_url, is_pinned=True)
+                # Verified canonical pinned profile_dir is permitted
+                srv.enforce_google_profile_policy(bad_url, is_pinned=True, profile_dir=pinned_dir)
 
         # Non-Google URL is allowed on non-pinned profile
         self.assertFalse(srv.is_google_destination_url("https://example.com"))
@@ -600,6 +606,111 @@ class TestLiveBrowserProfiles(unittest.TestCase):
                 await asyncio.sleep(0.03)
                 self.assertEqual("about:blank", hub._current_page().url)
                 await hub.stop_hosted(notify_finished=False)
+
+        asyncio.run(_scenario())
+
+    def test_round4_p0_03_non_pinned_guard_fail_closed_and_sync_pinned_identity(self) -> None:
+        """Round 4 P0-03: non-pinned context fails closed if ctx.route missing/raises; sync never infers pinned."""
+        pinned_dir = self._install_mock_google_browser("pinned_acct")
+        srv.create_profile("unpinned-ephem", {"os": "linux", "persistent": False})
+
+        # 1. Policy refuses bare is_pinned=True without matching canonical profile_dir
+        with self.assertRaises(ValueError):
+            srv.enforce_google_profile_policy("https://mail.google.com", is_pinned=True, profile_dir=None)
+        with self.assertRaises(ValueError):
+            srv.enforce_google_profile_policy(
+                "https://mail.google.com", is_pinned=True, profile_dir=self.root / "other-dir"
+            )
+        srv.enforce_google_profile_policy("https://mail.google.com", is_pinned=True, profile_dir=pinned_dir)
+
+        # 2. Non-pinned startup MUST fail closed (closing CM & leaving hub idle) when ctx lacks route() OR route() raises!
+        exited_flags: list[bool] = []
+
+        class _NoRouteCtx:
+            pages = [_FakePage("https://example.com")]
+            def on(self, _ev, _cb): pass
+
+        class _BoomRouteCtx:
+            pages = [_FakePage("https://example.com")]
+            def on(self, _ev, _cb): pass
+            async def route(self, _pat, _cb):
+                raise RuntimeError("route hook unsupported")
+
+        def _make_cm_cls(ctx_cls):
+            class _CM:
+                def __init__(self, **_kw):
+                    self.ctx = ctx_cls()
+                async def __aenter__(self):
+                    return self.ctx
+                async def __aexit__(self, *_a):
+                    exited_flags.append(True)
+            return _CM
+
+        async def _scenario() -> None:
+            hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "sec-tok")
+            for ctx_cls in (_NoRouteCtx, _BoomRouteCtx):
+                exited_flags.clear()
+                fake_mod = types.ModuleType("camoufox.async_api")
+                fake_mod.AsyncCamoufox = _make_cm_cls(ctx_cls)  # type: ignore[attr-defined]
+                fake_pkg = types.ModuleType("camoufox")
+                fake_pkg.async_api = fake_mod  # type: ignore[attr-defined]
+                with mock.patch.dict(sys.modules, {"camoufox": fake_pkg, "camoufox.async_api": fake_mod}):
+                    with self.assertRaises(RuntimeError):
+                        await hub.start_hosted(initial_url="https://example.com", profile="unpinned-ephem", notify_tg=False)
+                self.assertEqual([True], exited_flags, "Failed guard install must close context immediately")
+                self.assertEqual("idle", hub.engine_mode)
+                self.assertIsNone(hub.ctx)
+                self.assertIsNone(hub.lock_fd)
+
+            # 3. internal_sync_start NEVER infers pinned=True from host files without explicit verified launch identity!
+            fake_web = types.SimpleNamespace(
+                json_response=lambda data, status=200: types.SimpleNamespace(data=data, status=status),
+                HTTPForbidden=RuntimeError,
+            )
+            with mock.patch.object(srv, "web", fake_web):
+                # Without profile_dir / pinned_launch -> active_pinned=False, active_pinned_verified=False
+                r_unverified = await srv.internal_sync_start(
+                    types.SimpleNamespace(
+                        headers={"X-Live-Token": "sec-tok"},
+                        remote="127.0.0.1",
+                        app={"hub": hub},
+                        json=mock.AsyncMock(return_value={"ai_status": "external sync"}),
+                    )  # type: ignore[arg-type]
+                )
+                self.assertEqual(200, r_unverified.status)
+                self.assertFalse(hub.active_pinned)
+                self.assertFalse(hub.active_pinned_verified)
+                self.assertFalse(r_unverified.data["pinned"])
+
+                # With forged profile_dir -> still False!
+                r_forged = await srv.internal_sync_start(
+                    types.SimpleNamespace(
+                        headers={"X-Live-Token": "sec-tok"},
+                        remote="127.0.0.1",
+                        app={"hub": hub},
+                        json=mock.AsyncMock(
+                            return_value={"profile_dir": str(self.root / "fake"), "pinned_launch": True}
+                        ),
+                    )  # type: ignore[arg-type]
+                )
+                self.assertEqual(200, r_forged.status)
+                self.assertFalse(hub.active_pinned)
+                self.assertFalse(hub.active_pinned_verified)
+
+                # With authentic host canonical pinned_dir + pinned_launch=True -> True!
+                r_verified = await srv.internal_sync_start(
+                    types.SimpleNamespace(
+                        headers={"X-Live-Token": "sec-tok"},
+                        remote="127.0.0.1",
+                        app={"hub": hub},
+                        json=mock.AsyncMock(
+                            return_value={"profile_dir": str(pinned_dir), "pinned_launch": True}
+                        ),
+                    )  # type: ignore[arg-type]
+                )
+                self.assertEqual(200, r_verified.status)
+                self.assertTrue(hub.active_pinned)
+                self.assertTrue(hub.active_pinned_verified)
 
         asyncio.run(_scenario())
 
