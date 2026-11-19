@@ -1161,6 +1161,213 @@ class TestLiveBrowserProfiles(unittest.TestCase):
 
         asyncio.run(_scenario())
 
+    def test_round8_input_loop_survives_stop_hosted_cancelling_cleanup_task(self) -> None:
+        """Round 8 Blocker 1: Cancelling a blocked new_tab cleanup task during concurrent stop_hosted() MUST NOT kill service-level _input_loop."""
+        pinned_dir = self.root / "pinned_r8"
+        pinned_dir.mkdir(parents=True, exist_ok=True)
+        pinned_lock = self.root / "pinned_r8.lock"
+        fake_pinned = {
+            "name": "pinned_r8",
+            "profile_dir": pinned_dir,
+            "lock_path": pinned_lock,
+            "fingerprint": {"os": "windows"},
+        }
+        srv.create_profile("nonpin-r8", {"os": "linux", "persistent": False})
+
+        class _MouseSpy:
+            def __init__(self, on_click: asyncio.Event | None = None) -> None:
+                self.clicks: list[tuple[float, float]] = []
+                self._on_click = on_click
+
+            async def click(self, x: float, y: float, **_kw) -> None:
+                self.clicks.append((x, y))
+                if self._on_click is not None:
+                    self._on_click.set()
+
+            async def up(self, button: str = "left") -> None:
+                pass
+
+        class _GoodPage:
+            def __init__(self, url: str = "https://ok.example", on_click: asyncio.Event | None = None) -> None:
+                self.url = url
+                self.viewport_size = {"width": 1280, "height": 800}
+                self.closed = False
+                self.listeners: dict[str, list] = {}
+                self.mouse = _MouseSpy(on_click=on_click)
+
+            def is_closed(self) -> bool:
+                return self.closed
+
+            async def close(self) -> None:
+                self.closed = True
+
+            async def goto(self, url: str, **_kw) -> None:
+                self.url = url
+
+            async def title(self) -> str:
+                return "Good"
+
+            async def screenshot(self, **_kw) -> bytes:
+                return b"JPEG"
+
+            async def evaluate(self, _script: str, _arg=None):
+                return None
+
+            def on(self, ev: str, cb) -> None:
+                self.listeners.setdefault(ev, []).append(cb)
+
+        class _BlockingBadPage(_GoodPage):
+            def __init__(self, entered: asyncio.Event, gate: asyncio.Event) -> None:
+                super().__init__("https://blocked-close.example")
+                self._entered = entered
+                self._gate = gate
+                self.close_cancelled = False
+
+            def on(self, ev: str, cb) -> None:
+                if ev == "framenavigated":
+                    raise RuntimeError("framenavigated registration failed")
+                super().on(ev, cb)
+
+            async def close(self) -> None:
+                self._entered.set()
+                try:
+                    await self._gate.wait()
+                except asyncio.CancelledError:
+                    self.close_cancelled = True
+                    raise
+                self.closed = True
+
+        class _RealEventCtx(_FakeContext):
+            def __init__(self, pages: list[object], next_new_page_factory=None) -> None:
+                super().__init__()
+                self.pages = list(pages)
+                self.ctx_listeners: dict[str, list] = {}
+                self._next_new_page_factory = next_new_page_factory
+
+            def on(self, ev: str, cb) -> None:
+                self.ctx_listeners.setdefault(ev, []).append(cb)
+
+            async def new_page(self):
+                p = self._next_new_page_factory()
+                self.pages.append(p)
+                for cb in list(self.ctx_listeners.get("page", [])):
+                    cb(p)
+                return p
+
+        async def _scenario() -> None:
+            close_entered = asyncio.Event()
+            close_gate = asyncio.Event()
+            bad_page = _BlockingBadPage(close_entered, close_gate)
+            click_done = asyncio.Event()
+            page_s2 = _GoodPage("https://session2.example", on_click=click_done)
+            cms: list[object] = []
+
+            class _CM:
+                def __init__(self, **_kw) -> None:
+                    self.exited = False
+                    if not cms:
+                        self.ctx = _RealEventCtx(
+                            [_GoodPage("https://session1.example")],
+                            next_new_page_factory=lambda: bad_page,
+                        )
+                    else:
+                        self.ctx = _RealEventCtx([page_s2])
+                    cms.append(self)
+
+                async def __aenter__(self):
+                    return self.ctx
+
+                async def __aexit__(self, *_a):
+                    self.exited = True
+
+            hub = srv.LiveBrowserHub({"public_url": ""}, "sec-tok")
+            input_task = asyncio.create_task(hub._input_loop())
+            try:
+                with (
+                    mock.patch.object(srv, "discover_pinned_host_profile", return_value=fake_pinned),
+                    mock.patch.object(srv, "resolve_camoufox_display", return_value=None),
+                    mock.patch.object(srv, "read_x11_clipboard_async", new=mock.AsyncMock(return_value="")),
+                    mock.patch.dict(
+                        sys.modules,
+                        {"camoufox": types.SimpleNamespace(), "camoufox.async_api": types.SimpleNamespace(AsyncCamoufox=_CM)},
+                    ),
+                ):
+                    # 1. Start hosted session #1 and enqueue explicit new_tab whose cleanup blocks on close_gate
+                    await hub.start_hosted(profile="nonpin-r8", notify_tg=False)
+                    self.assertEqual("async_hosted", hub.engine_mode)
+                    hub.takeover = True
+                    await hub.input_queue.put(
+                        {
+                            "action": "new_tab",
+                            "_session_gen": hub.session_gen,
+                            "_takeover_gen": hub.takeover_gen,
+                        }
+                    )
+                    await asyncio.wait_for(close_entered.wait(), timeout=2.0)
+                    await asyncio.sleep(0)
+
+                    # 2. Concurrent stop_hosted() cancels the blocked cleanup task via _cancel_and_await_bg_tasks()
+                    await asyncio.wait_for(hub.stop_hosted(notify_finished=False), timeout=3.0)
+                    await asyncio.sleep(0)
+                    self.assertEqual("idle", hub.engine_mode)
+                    self.assertIsNone(hub.ctx)
+                    self.assertTrue(cms[0].exited)  # type: ignore[attr-defined]
+                    self.assertTrue(bad_page.close_cancelled, "Blocked cleanup task should be cancelled by stop_hosted")
+                    self.assertFalse(
+                        input_task.done(),
+                        "Service-level _input_loop MUST stay alive after concurrent stop_hosted cancels child cleanup task!",
+                    )
+
+                    # 3. Start hosted session #2 and verify _input_loop still consumes & executes new human input!
+                    await hub.start_hosted(profile="nonpin-r8", notify_tg=False)
+                    self.assertEqual("async_hosted", hub.engine_mode)
+                    hub.takeover = True
+                    await hub.input_queue.put(
+                        {
+                            "action": "click",
+                            "x": 120,
+                            "y": 240,
+                            "_session_gen": hub.session_gen,
+                            "_takeover_gen": hub.takeover_gen,
+                        }
+                    )
+                    await asyncio.wait_for(click_done.wait(), timeout=2.0)
+                    self.assertEqual([(120.0, 240.0)], page_s2.mouse.clicks)
+                    self.assertFalse(input_task.done())
+
+                    await hub.stop_hosted(notify_finished=False)
+
+                    # 4. Also verify Sync mode forwarding still works through the same live _input_loop!
+                    hub.engine_mode = "sync_external"
+                    hub.takeover = True
+                    sync_gen = hub.session_gen
+                    sync_tgen = hub.takeover_gen
+                    await hub.input_queue.put(
+                        {
+                            "action": "click",
+                            "x": 55,
+                            "y": 66,
+                            "_session_gen": sync_gen,
+                            "_takeover_gen": sync_tgen,
+                        }
+                    )
+                    deadline = asyncio.get_running_loop().time() + 2.0
+                    while not hub.sync_cmd_queue and asyncio.get_running_loop().time() < deadline:
+                        await asyncio.sleep(0.01)
+                    self.assertEqual(1, len(hub.sync_cmd_queue))
+                    self.assertEqual("click", hub.sync_cmd_queue[0].get("action"))
+                    self.assertFalse(input_task.done())
+            finally:
+                # 5. Direct cancellation of _input_loop itself (shutdown path) MUST still exit cleanly!
+                input_task.cancel()
+                try:
+                    await asyncio.wait_for(input_task, timeout=1.0)
+                except asyncio.CancelledError:
+                    pass
+                self.assertTrue(input_task.done())
+
+        asyncio.run(_scenario())
+
 
 if __name__ == "__main__":
     unittest.main()

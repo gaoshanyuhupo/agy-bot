@@ -5252,6 +5252,179 @@ class TestRound6FinalClosureRegression(unittest.TestCase):
 
             asyncio.run(_scenario())
 
+    def test_round8_unified_card_retire_cross_path_and_media_retry(self) -> None:
+        """Round 8 Blocker 2: Explicit retire_cards() (caption & final-JPEG editMessageMedia) and periodic tick_updates() share response verification and the 3-attempt retry cap."""
+        tok_main = "100:MAIN_TOK_R8_RETIRE"
+        with tempfile.TemporaryDirectory() as tmp:
+            bdir = Path(tmp) / "bridge"
+            bdir.mkdir(parents=True, exist_ok=True)
+            (bdir / ".env").write_text(
+                f"AGY_TG_BOT_TOKEN={tok_main}\nAGY_TG_ALLOWED_CHATS=111\nAGY_TG_ADMIN_USERS=111\n",
+                encoding="utf-8",
+            )
+
+            class _FlakyHTTP:
+                def __init__(self, outcomes: list[object], *, hold_first_gate: asyncio.Event | None = None) -> None:
+                    self._outcomes = list(outcomes)
+                    self._hold_first_gate = hold_first_gate
+                    self.first_entered = asyncio.Event()
+                    self.calls: list[tuple[str, dict]] = []
+
+                def post(self, url: str, **kw):
+                    self.calls.append((url, kw))
+                    outcome = self._outcomes.pop(0) if self._outcomes else {"ok": True}
+                    idx = len(self.calls)
+                    outer = self
+
+                    class _Resp:
+                        status = outcome.get("http_status", 200) if isinstance(outcome, dict) else 200
+
+                        async def __aenter__(self_r):
+                            if idx == 1 and outer._hold_first_gate is not None:
+                                outer.first_entered.set()
+                                await outer._hold_first_gate.wait()
+                            if isinstance(outcome, Exception):
+                                raise outcome
+                            return self_r
+
+                        async def __aexit__(self_r, *_a):
+                            return False
+
+                        async def json(self_r):
+                            assert isinstance(outcome, dict)
+                            return outcome
+
+                    return _Resp()
+
+            def _make_card(mid: int, gen: int) -> dict:
+                return {
+                    "bot_key": "main",
+                    "chat_id": 111,
+                    "message_id": mid,
+                    "session_gen": gen,
+                    "owner": ("main", 111),
+                    "last_sha1": "s",
+                    "last_caption": "c",
+                    "last_markup": "m",
+                    "last_ts": 0.0,
+                }
+
+            async def _scenario() -> None:
+                hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "sec-tok")
+                with (
+                    mock.patch.object(srv, "_BRIDGE_DIR", bdir),
+                    mock.patch.object(srv, "FormData", _FakeFormData),
+                ):
+                    # 1. Cross-path concurrent transient failure:
+                    #    tick_updates() wins _lock -> 429 (attempt 1, retained)
+                    #    queued explicit retire_cards() takes _lock -> 503 (attempt 2, STILL retained!)
+                    #    next idle + latest_jpeg=None maintenance tick -> ok=True (attempt 3, succeeds & pops!)
+                    gate = asyncio.Event()
+                    http_cross = _FlakyHTTP(
+                        [
+                            {"http_status": 429, "ok": False, "description": "Too Many Requests"},
+                            {"http_status": 503, "ok": False, "description": "Service Unavailable"},
+                            {"ok": True, "result": {"message_id": 901}},
+                        ],
+                        hold_first_gate=gate,
+                    )
+                    hub.tg.http = http_cross
+                    hub.engine_mode = "idle"
+                    hub.session_gen = 15
+                    hub.latest_jpeg = None
+                    hub.tg.cards[("main", 111)] = _make_card(901, 14)
+
+                    t_tick = asyncio.create_task(hub.tg.tick_updates(force=True))
+                    await asyncio.wait_for(http_cross.first_entered.wait(), timeout=2.0)
+                    t_retire = asyncio.create_task(hub.tg.retire_cards(session_gen=14, mark_finished=True))
+                    await asyncio.sleep(0)
+                    self.assertFalse(t_retire.done(), "retire_cards() must wait behind tick_updates() on _lock")
+                    gate.set()
+                    _, retired_cnt = await asyncio.gather(t_tick, t_retire)
+
+                    self.assertEqual(0, retired_cnt, "Transient 503 in explicit retire_cards() MUST NOT claim retired")
+                    self.assertIn(("main", 111), hub.tg.cards, "Card MUST remain retained after 429 + 503 (< 3 cap)")
+                    self.assertEqual(2, hub.tg.cards[("main", 111)].get("retire_attempts"))
+                    self.assertEqual(2, len(http_cross.calls))
+
+                    # Next idle/no-frame periodic maintenance tick succeeds (attempt 3) and removes card
+                    await hub.tg.tick_updates(force=False)
+                    self.assertNotIn(("main", 111), hub.tg.cards)
+                    self.assertEqual(3, len(http_cross.calls))
+
+                    # 2. Explicit retire_cards() WITH final_jpeg (editMessageMedia path):
+                    #    transient 503 retains record (attempt 1) -> subsequent idle retry succeeds & removes card!
+                    http_media = _FlakyHTTP(
+                        [
+                            {"http_status": 503, "ok": False, "description": "Service Unavailable"},
+                            {"ok": True, "result": {"message_id": 902}},
+                        ]
+                    )
+                    hub.tg.http = http_media
+                    hub.engine_mode = "idle"
+                    hub.session_gen = 17
+                    hub.latest_jpeg = None
+                    hub.tg.cards[("main", 111)] = _make_card(902, 16)
+
+                    retired_m1 = await hub.tg.retire_cards(
+                        session_gen=16, mark_finished=True, final_jpeg=b"FINAL_JPEG_BYTES"
+                    )
+                    self.assertEqual(0, retired_m1)
+                    self.assertIn(("main", 111), hub.tg.cards, "editMessageMedia 503 MUST retain card for retry")
+                    self.assertEqual(1, hub.tg.cards[("main", 111)].get("retire_attempts"))
+                    self.assertTrue(http_media.calls[0][0].endswith("/editMessageMedia"))
+
+                    await hub.tg.tick_updates(force=False)
+                    self.assertNotIn(("main", 111), hub.tg.cards)
+                    self.assertTrue(http_media.calls[1][0].endswith("/editMessageCaption"))
+                    self.assertEqual(2, len(http_media.calls))
+
+                    # 3. Permanent terminal error on editMessageMedia (`message is not modified`) removes immediately
+                    http_perm = _FlakyHTTP(
+                        [
+                            {"http_status": 400, "ok": False, "error_code": 400, "description": "Bad Request: message is not modified"},
+                        ]
+                    )
+                    hub.tg.http = http_perm
+                    hub.tg.cards[("main", 111)] = _make_card(903, 16)
+                    retired_perm = await hub.tg.retire_cards(
+                        session_gen=16, mark_finished=True, final_jpeg=b"FINAL_JPEG_BYTES"
+                    )
+                    self.assertEqual(1, retired_perm)
+                    self.assertNotIn(("main", 111), hub.tg.cards)
+
+                    # 4. Shared 3-attempt cap across explicit (editMessageMedia + caption) & periodic paths
+                    http_cap = _FlakyHTTP(
+                        [
+                            {"http_status": 503, "ok": False, "description": "Service Unavailable"},
+                            {"http_status": 429, "ok": False, "description": "Too Many Requests"},
+                            RuntimeError("network timeout"),
+                        ]
+                    )
+                    hub.tg.http = http_cap
+                    hub.tg.cards[("main", 111)] = _make_card(904, 16)
+
+                    self.assertEqual(
+                        0,
+                        await hub.tg.retire_cards(session_gen=16, mark_finished=True, final_jpeg=b"FINAL_JPEG_BYTES"),
+                    )
+                    self.assertIn(("main", 111), hub.tg.cards)
+                    self.assertEqual(1, hub.tg.cards[("main", 111)].get("retire_attempts"))
+
+                    self.assertEqual(0, await hub.tg.retire_cards(session_gen=16, mark_finished=True))
+                    self.assertIn(("main", 111), hub.tg.cards)
+                    self.assertEqual(2, hub.tg.cards[("main", 111)].get("retire_attempts"))
+
+                    await hub.tg.tick_updates(force=False)
+                    self.assertNotIn(
+                        ("main", 111),
+                        hub.tg.cards,
+                        "Card MUST be dropped once shared retire_attempts reaches cap of 3",
+                    )
+                    self.assertEqual(3, len(http_cap.calls))
+
+            asyncio.run(_scenario())
+
 
 if __name__ == "__main__":
     unittest.main()

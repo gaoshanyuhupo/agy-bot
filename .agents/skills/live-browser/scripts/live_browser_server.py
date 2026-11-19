@@ -1630,6 +1630,29 @@ class TelegramLiveCardPublisher:
         "user is deactivated",
     )
 
+    @classmethod
+    def _is_tg_retire_terminal_response(cls, status: Any, data: Any) -> bool:
+        """Return True iff Telegram HTTP status + JSON body confirm retirement or a permanent terminal error.
+
+        Returns False on transient errors (HTTP 429/5xx, non-dict body, API error_code 429/5xx, or other
+        non-ok transient failures) so callers retain the card record for bounded retry.
+        """
+        if isinstance(status, int) and (status == 429 or status >= 500):
+            return False
+        if not isinstance(data, dict):
+            return False
+        if data.get("ok"):
+            return True
+        err_code = data.get("error_code")
+        desc = str(data.get("description") or "").lower()
+        if any(marker in desc for marker in cls._PERMANENT_TG_RETIRE_ERRORS):
+            return True
+        if err_code == 429 or (isinstance(err_code, int) and err_code >= 500):
+            return False
+        if err_code == 400 and ("not found" in desc or "not modified" in desc or "invalid" in desc):
+            return True
+        return False
+
     async def _retire_orphan_card_message(self, token: str, chat_id: int, message_id: int) -> bool:
         """Silently retire an orphaned Telegram card using strictly stateless fixed copy (zero hub reads).
 
@@ -1663,17 +1686,7 @@ class TelegramLiveCardPublisher:
                     )
                     return False
                 data = await resp.json()
-                if not isinstance(data, dict):
-                    return False
-                if data.get("ok"):
-                    return True
-                err_code = data.get("error_code")
-                desc = str(data.get("description") or "").lower()
-                if any(marker in desc for marker in self._PERMANENT_TG_RETIRE_ERRORS):
-                    return True
-                if err_code == 429 or (isinstance(err_code, int) and err_code >= 500):
-                    return False
-                if err_code == 400 and ("not found" in desc or "not modified" in desc or "invalid" in desc):
+                if self._is_tg_retire_terminal_response(status, data):
                     return True
                 log.debug("Orphan card retire non-ok response (chat_id=%s mid=%s): %s", chat_id, message_id, data)
                 return False
@@ -1682,15 +1695,35 @@ class TelegramLiveCardPublisher:
             return False
 
     async def _retire_card_record_locked(
-        self, card_key: tuple[str, int], card: dict[str, Any], token: str
+        self,
+        card_key: tuple[str, int],
+        card: dict[str, Any],
+        token: str,
+        *,
+        jpeg_override: bytes | None = None,
     ) -> bool:
-        """Retire a stale card record in Telegram; pop only on confirmed retire or bounded retry cap."""
+        """Retire a stale card record in Telegram; pop only on confirmed retire or bounded retry cap.
+
+        Shared by explicit `retire_cards()` (both caption-only and final-JPEG `editMessageMedia` paths)
+        and periodic `tick_updates()` / `_update_card_locked()` retirement paths so both observe the same
+        Telegram response verification and shared per-card `retire_attempts` counter (capped at 3).
+        """
         bot_key, chat_id = card_key
         mid = int(card.get("message_id") or 0)
         if mid <= 0:
             self.cards.pop(card_key, None)
             return True
-        retired_ok = await self._retire_orphan_card_message(token, chat_id, mid)
+        if jpeg_override:
+            retired_ok = await self._update_card_locked(
+                card_key,
+                token,
+                finished=True,
+                force=True,
+                allow_stale_gen=True,
+                jpeg_override=jpeg_override,
+            )
+        else:
+            retired_ok = await self._retire_orphan_card_message(token, chat_id, mid)
         if retired_ok:
             self.cards.pop(card_key, None)
             return True
@@ -1864,7 +1897,12 @@ class TelegramLiveCardPublisher:
         mark_finished: bool = True,
         final_jpeg: bytes | None = None,
     ) -> int:
-        """Retire active cards (optionally matching `session_gen`) using strictly stateless finished copy."""
+        """Retire active cards (optionally matching `session_gen`) using strictly stateless finished copy.
+
+        Shares the same Telegram confirmation/permanent-error verification and bounded 3-attempt
+        retry state machine (`_retire_card_record_locked`) as periodic `tick_updates()` across both
+        caption-only (`editMessageCaption`) and final-JPEG (`editMessageMedia`) paths.
+        """
         if not self.cards:
             return 0
         retired = 0
@@ -1875,33 +1913,29 @@ class TelegramLiveCardPublisher:
                     continue
                 if session_gen is not None and card.get("session_gen") != session_gen:
                     continue
+                if not mark_finished:
+                    self.cards.pop(card_key, None)
+                    retired += 1
+                    continue
                 bot_key, chat_id = card_key
                 bots, _, _, allowed_by_bot, bot_roles = _load_auth_context()
                 token = self._is_card_currently_authorized(
                     bot_key, chat_id, bots, allowed_by_bot, bot_roles
                 )
+                if not token or not self.http:
+                    self.cards.pop(card_key, None)
+                    retired += 1
+                    continue
                 same_gen_jpeg = (
                     self.hub.latest_jpeg
                     if card.get("session_gen") == self.hub.session_gen
                     else None
                 )
                 jpeg_for_finish = final_jpeg if final_jpeg is not None else same_gen_jpeg
-                if mark_finished and token and self.http:
-                    if jpeg_for_finish:
-                        await self._update_card_locked(
-                            card_key,
-                            token,
-                            finished=True,
-                            force=True,
-                            allow_stale_gen=True,
-                            jpeg_override=jpeg_for_finish,
-                        )
-                    else:
-                        mid = int(card.get("message_id") or 0)
-                        if mid > 0:
-                            await self._retire_orphan_card_message(token, chat_id, mid)
-                self.cards.pop(card_key, None)
-                retired += 1
+                if await self._retire_card_record_locked(
+                    card_key, card, token, jpeg_override=jpeg_for_finish
+                ):
+                    retired += 1
         return retired
 
     async def refresh_single_card(
@@ -1988,11 +2022,11 @@ class TelegramLiveCardPublisher:
         force: bool = False,
         allow_stale_gen: bool = False,
         jpeg_override: bytes | None = None,
-    ) -> None:
+    ) -> bool:
         card = self.cards.get(card_key)
         bot_key, chat_id = card_key
         if not card or not self.http:
-            return
+            return False
         if not finished and not allow_stale_gen:
             # Capture coherent same-generation snapshot and re-verify live RBAC, owner & session_gen
             # right before invoking Telegram API!
@@ -2004,7 +2038,7 @@ class TelegramLiveCardPublisher:
             )
             if not live_token:
                 self.cards.pop(card_key, None)
-                return
+                return False
             if (
                 self.hub.engine_mode == "idle"
                 or card.get("session_gen") != snap_gen
@@ -2013,16 +2047,16 @@ class TelegramLiveCardPublisher:
                 or not self._matches_session_owner(bot_key, chat_id)
             ):
                 await self._retire_card_record_locked(card_key, card, live_token)
-                return
+                return False
             token = live_token
             jpeg_bytes = jpeg_override if jpeg_override is not None else self.hub.latest_jpeg
         else:
             jpeg_bytes = jpeg_override
         if not jpeg_bytes:
-            return
+            return False
         now = time.monotonic()
         if not force and not finished and (now - card["last_ts"]) < 3.0:
-            return
+            return False
 
         sha = hashlib.sha1(jpeg_bytes).hexdigest()
         caption = self._build_finished_caption() if finished else self._build_caption(finished=False)
@@ -2035,7 +2069,7 @@ class TelegramLiveCardPublisher:
             and caption == card["last_caption"]
             and markup == card.get("last_markup")
         ):
-            return
+            return False
 
         media_obj = {
             "type": "photo",
@@ -2060,21 +2094,30 @@ class TelegramLiveCardPublisher:
             async with self.http.post(
                 f"https://api.telegram.org/bot{token}/editMessageMedia", data=form
             ) as resp:
+                status = getattr(resp, "status", 200)
+                if isinstance(status, int) and (status == 429 or status >= 500):
+                    log.debug("editMessageMedia transient HTTP %s (%s)", status, bot_key)
+                    return False
                 data = await resp.json()
-                if data.get("ok"):
+                if isinstance(data, dict) and data.get("ok"):
                     card["last_sha1"] = sha
                     card["last_caption"] = caption
                     card["last_markup"] = markup
                     card["last_ts"] = time.monotonic()
-                else:
+                    return True
+                if isinstance(data, dict):
                     desc = str(data.get("description", ""))
                     retry = (data.get("parameters") or {}).get("retry_after")
                     if retry:
                         card["last_ts"] = time.monotonic() + float(retry)
                     elif "message is not modified" not in desc.lower():
                         log.debug("editMessageMedia (%s): %s", bot_key, desc)
+                if finished:
+                    return self._is_tg_retire_terminal_response(status, data)
+                return False
         except Exception as exc:
             log.debug("editMessageMedia error (%s): %s", bot_key, exc)
+            return False
 
     async def send_clip_message(
         self, bot_key: str, text: str, preferred_user_id: int | None = None
@@ -5126,7 +5169,12 @@ class LiveBrowserHub:
 
                 await self._execute_human_cmd_async(cmd)
             except asyncio.CancelledError:
-                break
+                cur_task = asyncio.current_task()
+                cancelling_fn = getattr(cur_task, "cancelling", None)
+                if cur_task is None or (cancelling_fn() > 0 if callable(cancelling_fn) else True):
+                    break
+                log.debug("Swallowed non-self CancelledError inside _input_loop")
+                continue
             except Exception as exc:
                 log.warning("Human input execution error: %s", exc)
 
@@ -5389,8 +5437,20 @@ class LiveBrowserHub:
 
         # Await deduplicated fail-closed close/teardown strictly AFTER releasing `_exec_lock`
         # so `_stop_hosted_locked()` can acquire `_exec_lock` to release held mouse buttons with zero deadlock!
+        # Distinguish child-task cancellation (from concurrent `stop_hosted()` -> `_cancel_and_await_bg_tasks()`)
+        # from cancellation of the service-level `_input_loop` task itself so stopping one hosted session
+        # NEVER terminates `_input_loop`!
         if post_exec_cleanup_task is not None:
-            await post_exec_cleanup_task
+            try:
+                await post_exec_cleanup_task
+            except asyncio.CancelledError:
+                cur_task = asyncio.current_task()
+                cancelling_fn = getattr(cur_task, "cancelling", None)
+                if cur_task is not None and (cancelling_fn() > 0 if callable(cancelling_fn) else True):
+                    raise
+                log.debug(
+                    "Post-exec unguarded page cleanup task cancelled concurrently; keeping _input_loop alive"
+                )
 
     # ---------------- AI Agent Action RPC ----------------
 
