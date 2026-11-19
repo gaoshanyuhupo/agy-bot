@@ -709,6 +709,7 @@ def _record_auto_compact_failure(cid):
 
 PRIMARY_CHAT_ID = next((c for c in sorted(ALLOWED) if c > 0), next(iter(sorted(ALLOWED)), None))
 PRIMARY_SCOPE_KEY = str(PRIMARY_CHAT_ID) if PRIMARY_CHAT_ID is not None else "default"
+MODEL_FOLLOW_DM = "__follow_dm__"
 
 _SCOPE_PREF_KEYS = ("mode", "model", "fallback_models", "effort", "thinking", "auto_compact", "auto_compact_tokens")
 
@@ -847,13 +848,59 @@ def _sync_top_level_mirrors_locked():
     state["in_flight"] = active_inf
 
 
+def _is_group_scope_key(scope_key):
+    cid, _ = parse_scope_key(scope_key)
+    return bool(cid is not None and int(cid) < 0)
+
+
+def _is_group_main_scope_key(scope_key):
+    if not scope_key or ":ro:" in str(scope_key):
+        return False
+    cid, tid = parse_scope_key(scope_key)
+    return bool(cid is not None and int(cid) < 0 and tid is None)
+
+
+def _scope_model_from_bot_config(cfg=None):
+    """Map bot_bus team config (`default`/`follow`/`custom`) to a group scope `model` value without touching `state_lock`."""
+    try:
+        if isinstance(cfg, dict):
+            c = cfg
+        else:
+            handle = BOT_META.get("handle") or f"bot_{BOT_INSTANCE_ID}"
+            c = bot_bus.resolve_bot_config(
+                handle,
+                env_role=ENV_BOT_ROLE,
+                env_model=ENV_BOT_MODEL,
+            )
+    except Exception:
+        c = {}
+    mode = c.get("model_mode") or bot_bus.MODEL_MODE_DEFAULT
+    if mode == bot_bus.MODEL_MODE_FOLLOW:
+        return MODEL_FOLLOW_DM
+    if mode == bot_bus.MODEL_MODE_CUSTOM:
+        return (c.get("configured_model") or c.get("default_model") or "").strip() or None
+    return None
+
+
 def _ensure_scope_locked(scope_key=None):
     skey = scope_key or PRIMARY_SCOPE_KEY
     scopes = state.setdefault("scopes", {})
     sc = scopes.get(skey)
     if not isinstance(sc, dict):
         prim = scopes.get(state.get("primary_scope") or PRIMARY_SCOPE_KEY) or state
-        sc = _default_scope_state(prefs_source=prim)
+        cid, _tid = parse_scope_key(skey)
+        is_group = bool(cid is not None and int(cid) < 0)
+        if is_group:
+            parent_key = str(int(cid))
+            parent_sc = scopes.get(parent_key) if parent_key != skey else None
+            prefs_src = parent_sc if isinstance(parent_sc, dict) else prim
+            sc = _default_scope_state(prefs_source=prefs_src)
+            if isinstance(parent_sc, dict):
+                sc["model"] = parent_sc.get("model")
+            else:
+                sc["model"] = _scope_model_from_bot_config()
+        else:
+            sc = _default_scope_state(prefs_source=prim)
         scopes[skey] = sc
     else:
         defaults = _default_scope_state()
@@ -879,6 +926,161 @@ def update_scope_state(scope_key=None, **updates):
         sc = _ensure_scope_locked(scope_key)
         sc.update(updates)
         _sync_top_level_mirrors_locked()
+
+
+def _resolve_dm_raw_model():
+    """Return explicit DM primary-scope model override (None if default); never returns `MODEL_FOLLOW_DM`."""
+    dm_sc = get_scope_state(PRIMARY_SCOPE_KEY)
+    raw = dm_sc.get("model")
+    if isinstance(raw, str):
+        raw = raw.strip()
+    if not raw or raw == MODEL_FOLLOW_DM:
+        return None
+    return raw
+
+
+def _resolve_dm_effective_model():
+    """Return the active effective model of this bot's primary DM scope (`dm_model` or `ENV_BOT_MODEL` or `None`)."""
+    return _resolve_dm_raw_model() or (ENV_BOT_MODEL or None)
+
+
+def _resolve_scope_model_info(scope_key=None):
+    """Return `(mode, configured_model, effective_model)` for `scope_key`.
+
+    Guaranteed that `effective_model` is NEVER `MODEL_FOLLOW_DM`.
+    """
+    skey = scope_key or PRIMARY_SCOPE_KEY
+    sc = get_scope_state(skey)
+    raw = sc.get("model")
+    if isinstance(raw, str):
+        raw = raw.strip()
+    if raw == MODEL_FOLLOW_DM:
+        if _is_group_scope_key(skey):
+            return bot_bus.MODEL_MODE_FOLLOW, "", _resolve_dm_effective_model()
+        return bot_bus.MODEL_MODE_DEFAULT, "", (ENV_BOT_MODEL or None)
+    if not raw:
+        return bot_bus.MODEL_MODE_DEFAULT, "", (ENV_BOT_MODEL or None)
+    return bot_bus.MODEL_MODE_CUSTOM, raw, raw
+
+
+def _resolve_effective_model(scope_key=None):
+    """Resolve concrete effective model slug (or `None` for agy default) for `scope_key`."""
+    _, _, eff = _resolve_scope_model_info(scope_key)
+    return eff
+
+
+def _invalidate_following_group_sessions(reason="dm_model_follow_sync"):
+    """Evict warm AgySession instances for all group/topic scopes currently following DM model."""
+    with state_lock:
+        scopes = state.get("scopes") or {}
+        follow_skeys = [
+            k for k, v in scopes.items()
+            if isinstance(v, dict) and v.get("model") == MODEL_FOLLOW_DM and _is_group_scope_key(k)
+        ]
+    with session_lock:
+        extra_ro = [
+            pk for pk in list(_session_pool.keys())
+            if any(pk.startswith(f"{fk}:ro:") for fk in follow_skeys)
+        ]
+    targets = list(dict.fromkeys(follow_skeys + extra_ro))
+    for f_skey in targets:
+        invalidate_session(reason, scope_key=f_skey)
+    return targets
+
+
+def _apply_scope_model_change(skey, new_model, *, reason="model_change", sync_bus=True):
+    """Persist scope model change, evict warm sessions, and sync follow/bus state."""
+    is_group = _is_group_scope_key(skey)
+    if new_model == MODEL_FOLLOW_DM and not is_group:
+        new_model = None
+    update_scope_state(skey, model=new_model)
+    save_state()
+    invalidate_session(reason, scope_key=skey)
+    if is_group:
+        with session_lock:
+            ro_keys = [pk for pk in list(_session_pool.keys()) if pk.startswith(f"{skey}:ro:")]
+        for rk in ro_keys:
+            invalidate_session(reason, scope_key=rk)
+    if not is_group:
+        _invalidate_following_group_sessions("dm_model_follow_sync")
+        _publish_bot_heartbeat()
+    elif sync_bus and _is_group_main_scope_key(skey):
+        try:
+            if new_model == MODEL_FOLLOW_DM:
+                bot_bus.set_bot_model_config(_current_bot_handle(), bot_bus.MODEL_MODE_FOLLOW)
+            elif not new_model:
+                bot_bus.set_bot_model_config(_current_bot_handle(), bot_bus.MODEL_MODE_DEFAULT)
+            else:
+                bot_bus.set_bot_model_config(_current_bot_handle(), bot_bus.MODEL_MODE_CUSTOM, str(new_model))
+        except Exception as e:
+            log("sync group model to bot_bus failed: %r" % e)
+        _publish_bot_heartbeat()
+
+
+def _apply_local_group_model_sync(model_mode, model="", *, chat_id=0, thread_id=None):
+    """Apply a team-level group model update to this bot's group scope(s), evict warm sessions, and refresh heartbeat."""
+    norm_mode = str(model_mode or bot_bus.MODEL_MODE_DEFAULT).strip().lower()
+    clean_model = str(model or "").strip()
+    if norm_mode == bot_bus.MODEL_MODE_FOLLOW:
+        target_val = MODEL_FOLLOW_DM
+    elif norm_mode == bot_bus.MODEL_MODE_CUSTOM and clean_model and clean_model != MODEL_FOLLOW_DM:
+        target_val = clean_model
+    else:
+        target_val = None
+
+    target_skeys = []
+    for cid in sorted(ALLOWED):
+        try:
+            cid_int = int(cid)
+        except Exception:
+            continue
+        if cid_int < 0:
+            target_skeys.append(str(cid_int))
+    with state_lock:
+        for sk in list((state.get("scopes") or {}).keys()):
+            if _is_group_main_scope_key(sk):
+                target_skeys.append(sk)
+    if chat_id and int(chat_id) < 0:
+        norm_tid = _normalize_thread_id(thread_id)
+        target_skeys.append(scope_key_for(int(chat_id), norm_tid))
+    target_skeys = list(dict.fromkeys(target_skeys))
+
+    for g_skey in target_skeys:
+        update_scope_state(g_skey, model=target_val)
+    if target_skeys:
+        save_state()
+    with session_lock:
+        ro_keys = [
+            pk for pk in list(_session_pool.keys())
+            if any(pk.startswith(f"{gk}:ro:") for gk in target_skeys)
+        ]
+    for g_skey in list(dict.fromkeys(target_skeys + ro_keys)):
+        invalidate_session("team_model_sync", scope_key=g_skey)
+    _publish_bot_heartbeat()
+    return target_skeys
+
+
+def _set_team_bot_model(target_h, model_mode, model="", *, chat_id=0, thread_id=None):
+    """Persist a team bot's model config in Bot Bus and push immediate group sync."""
+    norm_h = bot_bus.normalize_handle(target_h)
+    norm_mode = str(model_mode or bot_bus.MODEL_MODE_DEFAULT).strip().lower()
+    clean_model = str(model or "").strip() if norm_mode == bot_bus.MODEL_MODE_CUSTOM else ""
+    bot_bus.set_bot_model_config(norm_h, norm_mode, clean_model)
+    me = _current_bot_handle()
+    if norm_h == me:
+        _apply_local_group_model_sync(norm_mode, clean_model, chat_id=chat_id, thread_id=thread_id)
+    else:
+        try:
+            bot_bus.notify_bot_model_sync(
+                norm_h,
+                model_mode=norm_mode,
+                model=clean_model,
+                from_bot=me,
+                chat_id=int(chat_id or 0),
+                thread_id=_normalize_thread_id(thread_id),
+            )
+        except Exception as e:
+            log("notify_bot_model_sync(%s) failed: %r" % (norm_h, e))
 
 
 def current_workdir(scope_key=None):
@@ -1329,12 +1531,16 @@ def _should_ignore_group_message(msg):
     my_id = int(BOT_META.get("bot_id") or 0)
     text = (msg.get("text") or msg.get("caption") or "").strip()
 
-    # 1. Explicit slash command targeted at another bot: /cmd@other_bot
+    # 1. Explicit slash command targeted at another bot: /cmd@other_bot (or `/ cmd@other_bot`)
     is_slash = text.startswith("/")
     if is_slash:
-        first_tok = text.split()[0]
-        if "@" in first_tok:
-            target = bot_bus.normalize_handle(first_tok.split("@", 1)[1])
+        slash_parts = text.split()
+        first_tok = slash_parts[0]
+        target_tok = first_tok
+        if first_tok == "/" and len(slash_parts) > 1:
+            target_tok = slash_parts[1]
+        if "@" in target_tok:
+            target = bot_bus.normalize_handle(target_tok.split("@", 1)[1])
             if target and target != my_handle:
                 return True
             if target == my_handle:
@@ -1409,6 +1615,7 @@ _PRIVATE_COMMANDS = [
 _GROUP_TEAM_COMMANDS = [
     {"command": "team", "description": "🤝 团队花名册、角色切换与派工单"},
     {"command": "delegate", "description": "📨 直派任务给队员 (/delegate @bot 任务)"},
+    {"command": "model", "description": "🤖 切换本群/Topic 模型 (默认/跟随私聊/全部模型)"},
     {"command": "project", "description": "📂 切换本群/Topic 协同的项目仓库"},
     {"command": "status", "description": "📊 查看团队主控状态与本群会话"},
     {"command": "new", "description": "🔄 开启本群/Topic 新会话 (隔离私聊)"},
@@ -1428,7 +1635,8 @@ def register_bot_commands(force=False):
         if not force and _LAST_REGISTERED_CMD_ROLE == role:
             return True
         try:
-            # Clear broad/legacy fallback scopes so workers & stale per-chat menus never pollute `/` in groups
+            # Clear broad/legacy fallback scopes & per-chat overrides (both group & private)
+            # so stale per-chat menus never shadow `all_private_chats` or `all_group_chats`.
             ok_def = _tg_ok(tg("deleteMyCommands", _timeout=15, scope={"type": "default"}))
             _tg_ok(tg("deleteMyCommands", _timeout=15, scope={"type": "all_chat_administrators"}))
             for cid in sorted(ALLOWED):
@@ -1436,7 +1644,7 @@ def register_bot_commands(force=False):
                     cid_int = int(cid)
                 except Exception:
                     continue
-                if cid_int < 0:
+                if cid_int != 0:
                     tg("deleteMyCommands", _timeout=15, scope={"type": "chat", "chat_id": cid_int})
                     tg("deleteMyCommands", _timeout=15, scope={"type": "chat_administrators", "chat_id": cid_int})
 
@@ -1485,6 +1693,7 @@ _gateway_adapter_srv = None
 _native_models_lock = threading.Lock()
 _native_models_cache = (0.0, [])  # (fetched_ts, [(slug, desc), ...])
 _MODEL_CB_MAP = {}  # "ms:<12hex>" -> model_id
+_TEAM_BOT_CB_MAP = {}  # "<8hex>" -> normalized bot handle
 
 
 def _strip_gateway_env(env):
@@ -1649,6 +1858,8 @@ def _resolve_native_model_and_effort(model, effort, native_models=None):
 
 def _describe_model_provider(model):
     """Resolve whether `model` targets Google native or a configured gateway without starting servers."""
+    if model == MODEL_FOLLOW_DM:
+        model = _resolve_dm_effective_model()
     gws = _get_gateways_map()
     return gateway_adapter.resolve_model_target(
         model,
@@ -1659,6 +1870,8 @@ def _describe_model_provider(model):
 
 
 def _compute_exec_signature(model, effort):
+    if model == MODEL_FOLLOW_DM:
+        model = _resolve_dm_effective_model()
     res = _describe_model_provider(model)
     if res.is_gateway:
         with _gateway_lock:
@@ -1671,6 +1884,8 @@ def _compute_exec_signature(model, effort):
 
 def _resolve_exec_target(model, effort):
     """Resolve effective CLI model/effort and subprocess gateway env for `model` + `effort`."""
+    if model == MODEL_FOLLOW_DM:
+        model = _resolve_dm_effective_model()
     res = _describe_model_provider(model)
     if res.is_gateway:
         srv = _get_gateway_adapter()
@@ -3841,7 +4056,7 @@ def run_compact(chat_id, instruction="", thread_id=None, scope_key=None):
     skey = scope_key or scope_key_for(chat_id, thread_id)
     sc = get_scope_state(skey)
     mode = sc.get("mode", "auto")
-    model = sc.get("model") or (ENV_BOT_MODEL or None)
+    model = _resolve_effective_model(skey)
     effort = sc.get("effort") or ENV_BOT_EFFORT
     conv = sc.get("conversation_id")
     project = current_project(skey)
@@ -4069,7 +4284,6 @@ def _run_fast_group_reply(
     try:
         with state_lock:
             sc = _ensure_scope_locked(skey)
-            model = sc.get("model")
             effort = sc.get("effort") or ENV_BOT_EFFORT
             project = sc.get("project") or None
             wdir_raw = sc.get("workdir")
@@ -4078,8 +4292,7 @@ def _run_fast_group_reply(
             rw = os.path.realpath(os.path.expanduser(wdir_raw))
             if os.path.isdir(rw):
                 fast_workdir = rw
-        cfg = _current_bot_cfg()
-        exec_model = model or cfg.get("default_model") or None
+        exec_model = _resolve_effective_model(skey)
         exec_plan = _resolve_exec_target(exec_model, effort)
         cli_model = exec_plan["cli_model"]
         cli_effort = exec_plan["cli_effort"]
@@ -4224,7 +4437,6 @@ def run_agy(
     with state_lock:
         sc = _ensure_scope_locked(skey)
         mode = "safe" if session_readonly else sc.get("mode", "auto")
-        model = sc.get("model")
         scope_fallback = sc.get("fallback_models")
         effort = sc.get("effort") or ENV_BOT_EFFORT
         show_thinking = sc.get("thinking", True)
@@ -4239,6 +4451,7 @@ def run_agy(
             undo_notice = sc.get("pending_undo_notice")
             sc["pending_undo_notice"] = None
 
+    model = _resolve_effective_model(skey)
     workdir = WORKDIR
     if wdir_raw:
         rw = os.path.realpath(os.path.expanduser(wdir_raw))
@@ -5655,7 +5868,17 @@ def _execute_bus_job(job_id):
 
     raw_proj = job.get("project") or cfg.get("default_project") or ""
     exec_project = _resolve_project_id_by_name_or_id(raw_proj)
-    exec_model = job.get("model") or cfg.get("default_model") or sc.get("model") or None
+    job_model_override = (job.get("model") or "").strip()
+    if job_model_override and job_model_override != MODEL_FOLLOW_DM:
+        exec_model = job_model_override
+    else:
+        cfg_mode = cfg.get("model_mode") or bot_bus.MODEL_MODE_DEFAULT
+        if cfg_mode == bot_bus.MODEL_MODE_CUSTOM:
+            exec_model = (cfg.get("configured_model") or cfg.get("default_model") or "").strip() or None
+        elif cfg_mode == bot_bus.MODEL_MODE_FOLLOW:
+            exec_model = _resolve_dm_effective_model()
+        else:
+            exec_model = ENV_BOT_MODEL or None
     exec_effort = job.get("effort") or sc.get("effort") or ENV_BOT_EFFORT or None
     exec_mode = job.get("mode") or sc.get("mode") or "auto"
     from_bot = job.get("from_bot") or "coordinator"
@@ -6096,6 +6319,8 @@ def _publish_bot_heartbeat():
     try:
         cfg = _current_bot_cfg()
         sc = get_scope_state(PRIMARY_SCOPE_KEY)
+        dm_raw = _resolve_dm_raw_model() or ""
+        dm_eff = _resolve_dm_effective_model() or ""
         with session_lock:
             busy = turn_running
             cur_job = _active_bus_job_id
@@ -6107,7 +6332,11 @@ def _publish_bot_heartbeat():
             "pid": os.getpid(),
             "role": cfg.get("role") or "peer",
             "specialty": cfg.get("specialty") or "",
-            "active_model": sc.get("model") or "",
+            "active_model": dm_eff,
+            "dm_model": dm_raw,
+            "env_default_model": ENV_BOT_MODEL or "",
+            "model_mode": cfg.get("model_mode") or bot_bus.MODEL_MODE_DEFAULT,
+            "configured_model": cfg.get("configured_model") or "",
             "workdir": sc.get("workdir") or WORKDIR,
             "project": current_project(PRIMARY_SCOPE_KEY) or "",
             "allowed_chats": sorted(ALLOWED),
@@ -6206,6 +6435,14 @@ def _handle_bot_bus_packet(pkt):
                 has_media=False,
                 raw_text="",
             )
+    elif ptype == "sync_group_model":
+        m_mode = str(pkt.get("model_mode") or bot_bus.MODEL_MODE_DEFAULT).strip().lower()
+        m_slug = str(pkt.get("model") or "").strip()
+        c_id = int(pkt.get("chat_id") or 0)
+        t_id = _normalize_thread_id(pkt.get("thread_id"))
+        log("Received sync_group_model from @%s: mode=%s model=%s"
+            % (pkt.get("from_bot") or "?", m_mode, m_slug or "(none)"))
+        _apply_local_group_model_sync(m_mode, m_slug, chat_id=c_id, thread_id=t_id)
     elif ptype == "job":
         jid = pkt.get("job_id")
         if jid and not bot_bus.is_job_cancelled(jid):
@@ -6347,8 +6584,8 @@ def agy_native_models(use_cache=True):
             return list(_native_models_cache[1])
 
 
-def _model_callback_data(model_id):
-    """Return a Telegram-safe callback token (<= 64 bytes) for arbitrary long model IDs."""
+def _model_cb_digest(model_id):
+    """Return deterministic 12-hex digest for `model_id` and register it in `_MODEL_CB_MAP`."""
     digest = hashlib.sha1(model_id.encode("utf-8")).hexdigest()[:12]
     tok = f"ms:{digest}"
     _MODEL_CB_MAP[tok] = model_id
@@ -6356,33 +6593,131 @@ def _model_callback_data(model_id):
         for old_k in list(_MODEL_CB_MAP.keys())[:500]:
             if old_k != tok:
                 _MODEL_CB_MAP.pop(old_k, None)
+    return digest
+
+
+def _model_callback_data(model_id):
+    """Return a Telegram-safe callback token (<= 64 bytes) for arbitrary long model IDs."""
+    return f"ms:{_model_cb_digest(model_id)}"
+
+
+def _resolve_model_cb_token(tok):
+    """Resolve `ms:<12hex>` or raw `<12hex>` callback token back to concrete model slug."""
+    key = tok if str(tok).startswith("ms:") else f"ms:{tok}"
+    resolved = _MODEL_CB_MAP.get(key)
+    if resolved is None:
+        try:
+            for slug, _desc in (agy_models() or ()):
+                _model_callback_data(slug)
+        except Exception as e:
+            log("_resolve_model_cb_token refresh failed: %r" % e)
+        resolved = _MODEL_CB_MAP.get(key)
+    return resolved
+
+
+def _team_bot_token(handle):
+    """Return deterministic 8-hex callback token for a bot handle and register it in `_TEAM_BOT_CB_MAP`."""
+    norm = bot_bus.normalize_handle(handle)
+    tok = hashlib.sha1(norm.encode("utf-8")).hexdigest()[:8]
+    _TEAM_BOT_CB_MAP[tok] = norm
+    if len(_TEAM_BOT_CB_MAP) > 500:
+        for old_k in list(_TEAM_BOT_CB_MAP.keys())[:100]:
+            if old_k != tok:
+                _TEAM_BOT_CB_MAP.pop(old_k, None)
     return tok
+
+
+def _resolve_team_bot_token(tok):
+    """Resolve a team bot callback token (or legacy handle) back to a normalized bot handle."""
+    raw = (tok or "").strip()
+    if not raw:
+        return ""
+    if raw in _TEAM_BOT_CB_MAP:
+        return _TEAM_BOT_CB_MAP[raw]
+    try:
+        roster = bot_bus.list_roster(include_offline=True)
+    except Exception:
+        roster = []
+    candidates = [b.get("handle") for b in roster if b.get("handle")]
+    me = _current_bot_handle()
+    if me:
+        candidates.append(me)
+    for h in candidates:
+        t = _team_bot_token(h)
+        if t == raw:
+            return bot_bus.normalize_handle(h)
+    norm_raw = bot_bus.normalize_handle(raw)
+    if norm_raw in {bot_bus.normalize_handle(h) for h in candidates}:
+        return norm_raw
+    return ""
 
 
 def agy_models(include_gateways=True, force_refresh=False):
     """Return combined `(model_id, display_desc)` list across Google native and enabled gateways."""
-    native = agy_native_models(use_cache=not force_refresh)
+    try:
+        native = agy_native_models(use_cache=not force_refresh)
+    except Exception as e:
+        log("agy_models native fetch failed: %r" % e)
+        native = []
     combined = list(native)
     if include_gateways:
-        gws = _get_gateways_map()
-        enabled_gws = {gid: gw for gid, gw in gws.items() if gw.enabled}
-        if enabled_gws:
-            catalogs = _get_gateway_catalogs(enabled_gws, force_refresh=force_refresh)
-            native_slugs = {slug for slug, _ in native}
-            counts = {}
-            for gid, mids in catalogs.items():
-                for mid in mids:
-                    counts[mid] = counts.get(mid, 0) + 1
-            for gid, gw in enabled_gws.items():
-                gw_label = gw.name or gw.id
-                for mid in catalogs.get(gid, ()):
-                    use_explicit = (mid in native_slugs) or (counts.get(mid, 0) > 1)
-                    slug = gateway_adapter.format_gateway_model_ref(gid, mid) if use_explicit else mid
-                    desc = f"[{gw_label}] {mid}"
-                    combined.append((slug, desc))
+        try:
+            gws = _get_gateways_map()
+            enabled_gws = {gid: gw for gid, gw in gws.items() if gw.enabled}
+            if enabled_gws:
+                catalogs = _get_gateway_catalogs(enabled_gws, force_refresh=force_refresh)
+                native_slugs = {slug for slug, _ in native}
+                counts = {}
+                for gid, mids in catalogs.items():
+                    for mid in mids:
+                        counts[mid] = counts.get(mid, 0) + 1
+                for gid, gw in enabled_gws.items():
+                    gw_label = gw.name or gw.id
+                    for mid in catalogs.get(gid, ()):
+                        use_explicit = (mid in native_slugs) or (counts.get(mid, 0) > 1)
+                        slug = gateway_adapter.format_gateway_model_ref(gid, mid) if use_explicit else mid
+                        desc = f"[{gw_label}] {mid}"
+                        combined.append((slug, desc))
+        except Exception as e:
+            log("agy_models gateway catalog fetch failed: %r" % e)
     for slug, _desc in combined:
         _model_callback_data(slug)
     return combined
+
+
+def _warmup_models_cache():
+    """Pre-warm native and gateway model catalogs in a daemon thread after startup."""
+    try:
+        models = agy_models(include_gateways=True, force_refresh=False)
+        log("Model catalog pre-warmed (%d model(s))" % len(models))
+    except Exception as e:
+        log("Model catalog pre-warm failed: %r" % e)
+
+
+def _resolve_model_slug_input(cand_raw, models=None):
+    """Resolve user-typed model slug with exact, case-insensitive, and suffix matching."""
+    raw = (cand_raw or "").strip()
+    if not raw:
+        return ""
+    try:
+        all_models = agy_models() if models is None else list(models)
+    except Exception as e:
+        log("_resolve_model_slug_input catalog lookup failed: %r" % e)
+        all_models = []
+    exact = [s for s, _ in all_models if s == raw]
+    if exact:
+        return exact[0]
+    low = raw.lower()
+    ci = [s for s, _ in all_models if s.lower() == low]
+    if len(ci) == 1:
+        return ci[0]
+    tail = [
+        s for s, _ in all_models
+        if s.lower().endswith("/" + low) or s.lower().endswith(":" + low)
+    ]
+    if len(tail) == 1:
+        return tail[0]
+    return raw
 
 
 def list_sessions(limit=8, scope_key=None):
@@ -6518,7 +6853,7 @@ def cancel_current_task(chat_id, clear_all=False, from_native_stop=False, thread
 
 # ---------------------------------------------------------------- keyboard builders
 def _is_active_model_entry(slug, cur_model):
-    if not cur_model:
+    if not cur_model or cur_model == MODEL_FOLLOW_DM:
         return False
     if slug == cur_model:
         return True
@@ -6535,8 +6870,15 @@ def _is_active_model_entry(slug, cur_model):
     return False
 
 
-def make_model_keyboard(cur_model, page=0, page_size=10, models=None):
-    all_models = agy_models() if models is None else list(models)
+def make_model_keyboard(cur_model, page=0, page_size=10, models=None, include_follow=False):
+    if models is None:
+        try:
+            all_models = agy_models()
+        except Exception as e:
+            log("make_model_keyboard agy_models failed: %r" % e)
+            all_models = []
+    else:
+        all_models = list(models)
     psize = max(1, int(page_size or 10))
     total_pages = max(1, math.ceil(len(all_models) / psize)) if all_models else 1
     cur_page = max(0, min(int(page or 0), total_pages - 1))
@@ -6557,7 +6899,17 @@ def make_model_keyboard(cur_model, page=0, page_size=10, models=None):
             nav_row.append({"text": "下一页 ➡️", "callback_data": f"mp:{cur_page + 1}"})
         buttons.append(nav_row)
 
-    buttons.append([{"text": "⚙️ Reset to Default (Clear)", "callback_data": "model:default"}])
+    if include_follow:
+        is_default = (cur_model is None or str(cur_model).strip() == "")
+        is_follow = (cur_model == MODEL_FOLLOW_DM)
+        buttons.append([
+            {"text": ("✓ " if is_default else "") + "⚙️ 默认", "callback_data": "model:default"},
+            {"text": ("✓ " if is_follow else "") + "🔗 跟随私聊", "callback_data": "model:follow"},
+        ])
+    else:
+        is_default = (cur_model is None or str(cur_model).strip() == "")
+        def_label = "✓ ⚙️ 默认 (Reset)" if is_default else "⚙️ Reset to Default (Clear)"
+        buttons.append([{"text": def_label, "callback_data": "model:default"}])
     return {"inline_keyboard": buttons}
 
 
@@ -6626,9 +6978,18 @@ def make_status_keyboard(scope_key=None):
 
 # ---------------------------------------------------------------- commands
 def _render_model_panel(skey, page=0, page_size=10, models=None):
-    all_models = agy_models() if models is None else list(models)
+    if models is None:
+        try:
+            all_models = agy_models()
+        except Exception as e:
+            log("_render_model_panel agy_models failed: %r" % e)
+            all_models = []
+    else:
+        all_models = list(models)
     sc = get_scope_state(skey)
-    cur = sc.get("model")
+    cur_raw = sc.get("model")
+    is_group = _is_group_scope_key(skey)
+    m_mode, m_cfg, eff_model = _resolve_scope_model_info(skey)
     fb_desc = model_failover.describe_fallback_config(sc.get("fallback_models"), FALLBACK_MODELS_RAW)
 
     psize = max(1, int(page_size or 10))
@@ -6638,20 +6999,36 @@ def _render_model_panel(skey, page=0, page_size=10, models=None):
 
     page_note = f" · Page {cur_page + 1}/{total_pages} ({len(all_models)} models)" if total_pages > 1 else ""
     lines = [f"<b>🤖 Models</b> (tap to switch{page_note}):"]
+    active_slug = m_cfg if m_mode == bot_bus.MODEL_MODE_CUSTOM else None
     for slug, desc in page_items:
-        mark = "✓" if _is_active_model_entry(slug, cur) else "·"
+        mark = "✓" if _is_active_model_entry(slug, active_slug) else "·"
         lines.append(f"{mark} <code>{html_mod.escape(slug)}</code> — {html_mod.escape(desc)}")
     if not page_items:
         lines.append("· <i>(no models available; you can type /model &lt;slug&gt;)</i>")
 
-    cur_res = _describe_model_provider(cur) if cur else None
-    cur_label = html_mod.escape(cur or "(agy default)")
-    if cur_res and cur_res.is_gateway:
-        cur_label += f" <code>[gw:{html_mod.escape(cur_res.gateway_id)}]</code>"
-    lines.append(f"\nCurrent: <b>{cur_label}</b>")
+    eff_res = _describe_model_provider(eff_model) if eff_model else None
+    eff_label = html_mod.escape(eff_model or "(agy default)")
+    if eff_res and eff_res.is_gateway:
+        eff_label += f" <code>[gw:{html_mod.escape(eff_res.gateway_id)}]</code>"
+
+    if m_mode == bot_bus.MODEL_MODE_FOLLOW:
+        lines.append(f"\nCurrent: <b>🔗 跟随私聊</b> → <b>{eff_label}</b>")
+    elif m_mode == bot_bus.MODEL_MODE_DEFAULT:
+        lines.append(f"\nCurrent: <b>⚙️ 默认</b> → <b>{eff_label}</b>")
+    else:
+        lines.append(f"\nCurrent: <b>{eff_label}</b>")
     lines.append(f"Fallback: <code>{html_mod.escape(fb_desc)}</code>")
-    lines.append("<i>Tip: <code>/model &lt;slug&gt;</code> · <code>/model fallback m1,m2</code></i>")
-    kb = make_model_keyboard(cur, page=cur_page, page_size=psize, models=all_models)
+    if is_group:
+        lines.append("<i>Tip: <code>/model default</code> · <code>/model follow</code> · <code>/model &lt;slug&gt;</code> · <code>/model fallback m1,m2</code></i>")
+    else:
+        lines.append("<i>Tip: <code>/model &lt;slug&gt;</code> · <code>/model fallback m1,m2</code></i>")
+    kb = make_model_keyboard(
+        cur_raw,
+        page=cur_page,
+        page_size=psize,
+        models=all_models,
+        include_follow=is_group,
+    )
     return "\n".join(lines), kb
 
 
@@ -6660,7 +7037,9 @@ def cmd_model(chat_id, arg, thread_id=None, scope_key=None):
     raw_arg = (arg or "").strip()
     if not raw_arg:
         text, kb = _render_model_panel(skey, page=0)
-        send(chat_id, text, parse_mode="HTML", reply_markup=kb, thread_id=thread_id)
+        mid = send(chat_id, text, parse_mode="HTML", reply_markup=kb, thread_id=thread_id)
+        if not mid:
+            log("cmd_model send failed for chat=%s scope=%s" % (chat_id, skey))
         return
 
     parts = raw_arg.split(None, 1)
@@ -6717,30 +7096,33 @@ def cmd_model(chat_id, arg, thread_id=None, scope_key=None):
         )
         return
 
-    if head in ("default", "reset", "clear", "none"):
+    if head in ("follow", "跟随", "追随", "跟随私聊", "follow_dm"):
+        if not _is_group_scope_key(skey):
+            send(
+                chat_id,
+                "ℹ️ 私聊本身即为主会话，无需设置「跟随私聊」；如需恢复默认请用 <code>/model default</code>。",
+                parse_mode="HTML",
+                thread_id=thread_id,
+            )
+            return
+        new_val = MODEL_FOLLOW_DM
+    elif head in ("default", "reset", "clear", "none", "默认"):
         new_val = None
     else:
-        cand_raw = parts[0]
-        new_val = cand_raw
-        if "/" not in cand_raw and ":" not in cand_raw and not gateway_adapter.is_native_google_slug(cand_raw):
-            all_models = agy_models()
-            exact = [s for s, _ in all_models if s == cand_raw]
-            if not exact:
-                ci = [s for s, _ in all_models if s.lower() == cand_raw.lower()]
-                if len(ci) == 1:
-                    new_val = ci[0]
-                else:
-                    tail = [
-                        s for s, _ in all_models
-                        if s.lower().endswith("/" + cand_raw.lower()) or s.lower().endswith(":" + cand_raw.lower())
-                    ]
-                    if len(tail) == 1:
-                        new_val = tail[0]
-    update_scope_state(skey, model=new_val)
-    save_state()
-    invalidate_session("model_change", scope_key=skey)
-    if new_val is None:
-        send(chat_id, "model → default (cleared)", thread_id=thread_id)
+        new_val = _resolve_model_slug_input(parts[0])
+
+    _apply_scope_model_change(skey, new_val, reason="model_change")
+    if new_val == MODEL_FOLLOW_DM:
+        eff = _resolve_effective_model(skey)
+        send(
+            chat_id,
+            f"model → 🔗 跟随私聊 (当前生效: {eff or '(agy default)'}，将随私聊切换自动同步)",
+            thread_id=thread_id,
+        )
+    elif new_val is None:
+        eff = _resolve_effective_model(skey)
+        extra = f" ({eff})" if eff else " (cleared)"
+        send(chat_id, f"model → default{extra}", thread_id=thread_id)
     else:
         res = _describe_model_provider(new_val)
         gw_note = f" [Gateway: {res.gateway_id}]" if res.is_gateway else ""
@@ -7890,6 +8272,115 @@ def _role_badge(role):
     }.get(role, str(role))
 
 
+def _format_bot_model_badge(bot_view):
+    """Format concise roster model display clearly distinguishing default / follow / custom."""
+    m_mode = (bot_view or {}).get("model_mode") or bot_bus.MODEL_MODE_DEFAULT
+    eff = (bot_view or {}).get("effective_model") or (bot_view or {}).get("default_model") or ""
+    eff_txt = eff or "(agy default)"
+    if m_mode == bot_bus.MODEL_MODE_FOLLOW:
+        return f"跟随私聊 → {eff_txt}"
+    if m_mode == bot_bus.MODEL_MODE_DEFAULT:
+        return f"默认 ({eff_txt})"
+    return eff_txt
+
+
+def _format_bot_model_button_label(bot_view):
+    m_mode = (bot_view or {}).get("model_mode") or bot_bus.MODEL_MODE_DEFAULT
+    eff = (bot_view or {}).get("effective_model") or (bot_view or {}).get("default_model") or ""
+    if m_mode == bot_bus.MODEL_MODE_FOLLOW:
+        return "🤖 模型:跟随私聊"
+    if m_mode == bot_bus.MODEL_MODE_DEFAULT:
+        return "🤖 模型:默认"
+    short = eff.rsplit("/", 1)[-1].rsplit(":", 1)[-1]
+    if len(short) > 16:
+        short = short[:15] + "…"
+    return f"🤖 模型:{short or '指定'}"
+
+
+def build_team_model_panel(target_handle, page=0, page_size=10, models=None):
+    """Build per-bot team model selector sub-panel with Default, Follow DM, and paginated full model catalog."""
+    norm_h = bot_bus.normalize_handle(target_handle)
+    btok = _team_bot_token(norm_h)
+    roster_map = {b["handle"]: b for b in bot_bus.list_roster(include_offline=True)}
+    bview = roster_map.get(norm_h)
+    if not bview:
+        cfg = bot_bus.resolve_bot_config(norm_h, env_model=ENV_BOT_MODEL if norm_h == _current_bot_handle() else "")
+        bview = {
+            "handle": norm_h,
+            "model_mode": cfg.get("model_mode") or bot_bus.MODEL_MODE_DEFAULT,
+            "configured_model": cfg.get("configured_model") or "",
+            "effective_model": cfg.get("default_model") or "",
+            "default_model": cfg.get("default_model") or "",
+            "dm_model": _resolve_dm_raw_model() or "" if norm_h == _current_bot_handle() else "",
+            "env_default_model": ENV_BOT_MODEL if norm_h == _current_bot_handle() else "",
+        }
+    m_mode = bview.get("model_mode") or bot_bus.MODEL_MODE_DEFAULT
+    configured_model = bview.get("configured_model") or ""
+    eff_model = bview.get("effective_model") or bview.get("default_model") or ""
+    eff_txt = eff_model or "(agy default)"
+
+    if models is None:
+        try:
+            all_models = agy_models()
+        except Exception as e:
+            log("build_team_model_panel agy_models failed: %r" % e)
+            all_models = []
+    else:
+        all_models = list(models)
+
+    psize = max(1, int(page_size or 10))
+    total_pages = max(1, math.ceil(len(all_models) / psize)) if all_models else 1
+    cur_page = max(0, min(int(page or 0), total_pages - 1))
+    page_items = all_models[cur_page * psize : (cur_page + 1) * psize]
+
+    page_note = f" · 第 {cur_page + 1}/{total_pages} 页 ({len(all_models)} 个模型)" if total_pages > 1 else ""
+    lines = [
+        f"<b>🤖 团队模型设置 — <code>@{html_mod.escape(norm_h)}</code></b>{page_note}",
+        "━━━━━━━━━━━━━━━━━━━━",
+    ]
+    if m_mode == bot_bus.MODEL_MODE_FOLLOW:
+        lines.append(f"• <b>当前模式：</b>🔗 跟随私聊 → <code>{html_mod.escape(eff_txt)}</code>")
+    elif m_mode == bot_bus.MODEL_MODE_DEFAULT:
+        lines.append(f"• <b>当前模式：</b>⚙️ 默认 → <code>{html_mod.escape(eff_txt)}</code>")
+    else:
+        lines.append(f"• <b>当前模式：</b>指定模型 → <code>{html_mod.escape(eff_txt)}</code>")
+    lines.append("")
+
+    active_custom = configured_model if m_mode == bot_bus.MODEL_MODE_CUSTOM else None
+    buttons = []
+    for slug, desc in page_items:
+        is_act = _is_active_model_entry(slug, active_custom)
+        mark = "✓" if is_act else "·"
+        lines.append(f"{mark} <code>{html_mod.escape(slug)}</code> — {html_mod.escape(desc)}")
+        mtok = _model_cb_digest(slug)
+        btn_mark = "✓ " if is_act else ""
+        buttons.append([{"text": f"{btn_mark}{desc}"[:64], "callback_data": f"team:tms:{btok}:{mtok}"}])
+    if not page_items:
+        lines.append("· <i>(当前无可选模型目录，可用 /team model @bot &lt;slug&gt; 手动设置)</i>")
+
+    if total_pages > 1:
+        nav_row = []
+        if cur_page > 0:
+            nav_row.append({"text": "⬅️ 上一页", "callback_data": f"team:tmp:{btok}:{cur_page - 1}"})
+        nav_row.append({"text": f"📄 {cur_page + 1}/{total_pages}", "callback_data": f"team:tmp:{btok}:{cur_page}"})
+        if cur_page + 1 < total_pages:
+            nav_row.append({"text": "下一页 ➡️", "callback_data": f"team:tmp:{btok}:{cur_page + 1}"})
+        buttons.append(nav_row)
+
+    buttons.append([
+        {
+            "text": ("✓ " if m_mode == bot_bus.MODEL_MODE_DEFAULT else "") + "⚙️ 默认",
+            "callback_data": f"team:tmd:{btok}",
+        },
+        {
+            "text": ("✓ " if m_mode == bot_bus.MODEL_MODE_FOLLOW else "") + "🔗 跟随私聊",
+            "callback_data": f"team:tmf:{btok}",
+        },
+    ])
+    buttons.append([{"text": "« 返回团队面板", "callback_data": "team:refresh"}])
+    return "\n".join(lines), {"inline_keyboard": buttons}
+
+
 def build_team_panel(scope_key=None):
     roster = bot_bus.list_roster(include_offline=True)
     jobs = bot_bus.list_jobs(limit=5)
@@ -7916,7 +8407,7 @@ def build_team_panel(scope_key=None):
         st_icon = "🔴 离线" if not b["online"] else ("🟡 忙碌" if b["busy"] else "🟢 空闲")
         r_tag = {"coordinator": "👑", "worker": "🛠", "peer": "🤝"}.get(b["role"], "🤖")
         self_tag = " <i>(我)</i>" if b["handle"] == me else ""
-        mdl = b.get("default_model") or "(跟随会话)"
+        mdl = _format_bot_model_badge(b)
         wdir = (b.get("default_workdir") or "").replace(HOME, "~") or "~"
         lines.append(
             f"{st_icon} {r_tag} <b><code>@{html_mod.escape(b['handle'])}</code></b>{self_tag} · {html_mod.escape(b.get('display_name') or '')}\n"
@@ -7952,11 +8443,11 @@ def build_team_panel(scope_key=None):
     ]
     for b in roster[:6]:
         h = b["handle"]
+        btok = _team_bot_token(h)
         next_r = {"coordinator": "worker", "worker": "peer", "peer": "coordinator"}.get(b["role"], "worker")
-        w_mdl = b.get("default_model") or "default"
         kb_rows.append([
             {"text": f"切换 @{h} ({b['role']}→{next_r})", "callback_data": f"team:cycle:{h[:40]}"},
-            {"text": f"⚡ 模型:{'flash-low' if 'flash-low' in w_mdl else '跟随'}", "callback_data": f"team:model:{h[:40]}"},
+            {"text": _format_bot_model_button_label(b), "callback_data": f"team:model:{btok}"},
         ])
     kb_rows.append([
         {"text": "📌 播报台设在此处", "callback_data": "team:mirror_here"},
@@ -7997,11 +8488,43 @@ def cmd_team(chat_id, raw_rest="", thread_id=None, scope_key=None, edit_msg_id=N
                 register_bot_commands_async(force=True)
             send(chat_id, f"✅ <code>@{html_mod.escape(target['handle'])}</code> 角色已设为 <code>{html_mod.escape(role)}</code>", parse_mode="HTML", thread_id=norm_tid)
             return
-        elif sub == "model" and len(parts) >= 3:
-            target = bot_bus.resolve_target_bot(parts[1])
-            mdl = "" if parts[2].lower() in ("default", "none", "auto") else parts[2]
-            bot_bus.update_bot_config(target["handle"], default_model=mdl)
-            send(chat_id, f"✅ <code>@{html_mod.escape(target['handle'])}</code> Worker 默认模型已设为 <code>{html_mod.escape(mdl or '跟随会话')}</code>", parse_mode="HTML", thread_id=norm_tid)
+        elif sub == "model" and len(parts) >= 2:
+            try:
+                target = bot_bus.resolve_target_bot(parts[1])
+            except ValueError as ve:
+                send(chat_id, f"⚠️ {html_mod.escape(str(ve))}", parse_mode="HTML", thread_id=norm_tid)
+                return
+            if len(parts) == 2:
+                text, kb = build_team_model_panel(target["handle"], page=0)
+                send(chat_id, text, parse_mode="HTML", reply_markup=kb, thread_id=norm_tid)
+                return
+            m_raw = parts[2].strip()
+            m_low = m_raw.lower()
+            if m_low in ("default", "默认", "reset", "clear", "none", "env"):
+                _set_team_bot_model(target["handle"], bot_bus.MODEL_MODE_DEFAULT, chat_id=chat_id, thread_id=norm_tid)
+                send(
+                    chat_id,
+                    f"✅ <code>@{html_mod.escape(target['handle'])}</code> 群聊模型已设为 <b>⚙️ 默认</b>（已同步生效）",
+                    parse_mode="HTML",
+                    thread_id=norm_tid,
+                )
+            elif m_low in ("follow", "跟随", "追随", "跟随私聊", "dm", "auto"):
+                _set_team_bot_model(target["handle"], bot_bus.MODEL_MODE_FOLLOW, chat_id=chat_id, thread_id=norm_tid)
+                send(
+                    chat_id,
+                    f"✅ <code>@{html_mod.escape(target['handle'])}</code> 群聊模型已设为 <b>🔗 跟随私聊</b>（将随其私聊模型自动同步）",
+                    parse_mode="HTML",
+                    thread_id=norm_tid,
+                )
+            else:
+                resolved_slug = _resolve_model_slug_input(m_raw)
+                _set_team_bot_model(target["handle"], bot_bus.MODEL_MODE_CUSTOM, resolved_slug, chat_id=chat_id, thread_id=norm_tid)
+                send(
+                    chat_id,
+                    f"✅ <code>@{html_mod.escape(target['handle'])}</code> 群聊模型已设为 <code>{html_mod.escape(resolved_slug)}</code>（已同步生效）",
+                    parse_mode="HTML",
+                    thread_id=norm_tid,
+                )
             return
         elif sub == "workdir" and len(parts) >= 3:
             target = bot_bus.resolve_target_bot(parts[1])
@@ -8113,7 +8636,7 @@ def cmd_status(chat_id, thread_id=None, scope_key=None):
     sc = get_scope_state(skey)
     conv = sc.get("conversation_id")
     mode = sc.get("mode", "auto")
-    model = sc.get("model") or (ENV_BOT_MODEL or None)
+    m_mode, _m_cfg, model = _resolve_scope_model_info(skey)
     effort = sc.get("effort") or ENV_BOT_EFFORT
     th_on = sc.get("thinking", True)
     ac_on = bool(sc.get("auto_compact", True))
@@ -8155,14 +8678,20 @@ def cmd_status(chat_id, thread_id=None, scope_key=None):
     fb_desc = model_failover.describe_fallback_config(sc.get("fallback_models"), FALLBACK_MODELS_RAW)
     model_res = _describe_model_provider(model) if model else None
     if model_res and model_res.is_gateway:
-        model_display = (
+        base_model_display = (
             f"<code>{html_mod.escape(model_res.upstream_model)}</code> "
             f"(Gateway: <code>{html_mod.escape(model_res.gateway_id)}</code>)"
         )
         effort_note = " (gateway reasoning_effort)" if effort else ""
     else:
-        model_display = f"<code>{html_mod.escape(model or '(default)')}</code>"
+        base_model_display = f"<code>{html_mod.escape(model or '(default)')}</code>"
         effort_note = ""
+    if _is_group_scope_key(skey) and m_mode == bot_bus.MODEL_MODE_FOLLOW:
+        model_display = f"🔗 跟随私聊 → {base_model_display}"
+    elif _is_group_scope_key(skey) and m_mode == bot_bus.MODEL_MODE_DEFAULT:
+        model_display = f"⚙️ 默认 ({base_model_display})"
+    else:
+        model_display = base_model_display
 
     text = (f"<b>🤖 Antigravity Bridge v3.2 (Scoped Topics &amp; Bot Bus)</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -8588,10 +9117,7 @@ def handle_callback(cb):
 
     if data.startswith("model:") or data.startswith("ms:"):
         if data.startswith("ms:"):
-            resolved_target = _MODEL_CB_MAP.get(data)
-            if resolved_target is None:
-                agy_models()
-                resolved_target = _MODEL_CB_MAP.get(data)
+            resolved_target = _resolve_model_cb_token(data)
             if resolved_target is None:
                 tg("answerCallbackQuery", callback_query_id=cb_id,
                    text="Model button expired; please re-run /model", show_alert=True)
@@ -8599,12 +9125,26 @@ def handle_callback(cb):
             new_model = resolved_target
         else:
             target = data[6:]
-            new_model = None if target == "default" else target
-        update_scope_state(skey, model=new_model)
-        save_state()
-        invalidate_session("callback_model", scope_key=skey)
-        tg("answerCallbackQuery", callback_query_id=cb_id,
-           text=f"Model set to: {new_model or 'default'}")
+            if target == "follow":
+                if not _is_group_scope_key(skey):
+                    tg("answerCallbackQuery", callback_query_id=cb_id,
+                       text="私聊本身为主会话，无需设置跟随私聊", show_alert=True)
+                    return
+                new_model = MODEL_FOLLOW_DM
+            elif target == "default":
+                new_model = None
+            else:
+                new_model = target
+        _apply_scope_model_change(skey, new_model, reason="callback_model")
+        if new_model == MODEL_FOLLOW_DM:
+            eff_toast = _resolve_effective_model(skey) or "default"
+            toast_txt = f"Model → 跟随私聊 ({eff_toast})"
+        elif new_model is None:
+            eff_toast = _resolve_effective_model(skey) or "default"
+            toast_txt = f"Model → 默认 ({eff_toast})"
+        else:
+            toast_txt = f"Model set to: {new_model}"
+        tg("answerCallbackQuery", callback_query_id=cb_id, text=toast_txt)
         if msg_id:
             text, kb = _render_model_panel(skey, page=0)
             r_ed = tg("editMessageText", chat_id=chat_id, message_id=msg_id,
@@ -8950,12 +9490,76 @@ def _handle_team_callback(cb_id, chat_id, thread_id, skey, msg_id, data):
             register_bot_commands_async(force=True)
         tg("answerCallbackQuery", callback_query_id=cb_id, text=f"@{target_h} → {next_role}")
     elif sub.startswith("model:"):
-        target_h = bot_bus.normalize_handle(sub[6:])
-        roster_map = {b["handle"]: b for b in bot_bus.list_roster(include_offline=True)}
-        cur_mdl = (roster_map.get(target_h) or {}).get("default_model") or ""
-        next_mdl = "" if "flash-low" in cur_mdl else "gemini-3.8-flash-low"
-        bot_bus.update_bot_config(target_h, default_model=next_mdl)
-        tg("answerCallbackQuery", callback_query_id=cb_id, text=f"@{target_h} 模型 → {next_mdl or '跟随会话'}")
+        target_h = _resolve_team_bot_token(sub[6:])
+        if not target_h:
+            tg("answerCallbackQuery", callback_query_id=cb_id, text="Bot 未在花名册中找到，请刷新 /team", show_alert=True)
+            return
+        tg("answerCallbackQuery", callback_query_id=cb_id, text=f"打开 @{target_h} 模型配置")
+        text, kb = build_team_model_panel(target_h, page=0)
+        if msg_id:
+            r_ed = tg("editMessageText", chat_id=chat_id, message_id=msg_id,
+                      text=text, parse_mode="HTML", reply_markup=kb)
+            if not _tg_ok(r_ed):
+                tg("editMessageReplyMarkup", chat_id=chat_id, message_id=msg_id, reply_markup=kb)
+        else:
+            send(chat_id, text, parse_mode="HTML", reply_markup=kb, thread_id=thread_id)
+        return
+    elif sub.startswith("tmp:"):
+        parts = sub.split(":")
+        btok = parts[1] if len(parts) > 1 else ""
+        try:
+            page_num = max(0, int(parts[2])) if len(parts) > 2 else 0
+        except ValueError:
+            page_num = 0
+        target_h = _resolve_team_bot_token(btok)
+        if not target_h:
+            tg("answerCallbackQuery", callback_query_id=cb_id, text="按钮已过期，请重新打开 /team", show_alert=True)
+            return
+        tg("answerCallbackQuery", callback_query_id=cb_id)
+        if msg_id:
+            text, kb = build_team_model_panel(target_h, page=page_num)
+            tg("editMessageText", chat_id=chat_id, message_id=msg_id,
+               text=text, parse_mode="HTML", reply_markup=kb)
+        return
+    elif sub.startswith("tmd:") or sub.startswith("tmf:") or sub.startswith("tms:"):
+        parts = sub.split(":")
+        action = parts[0]
+        btok = parts[1] if len(parts) > 1 else ""
+        target_h = _resolve_team_bot_token(btok)
+        if not target_h:
+            tg("answerCallbackQuery", callback_query_id=cb_id, text="Bot 按钮已过期，请重新打开 /team", show_alert=True)
+            return
+        sel_page = 0
+        if action == "tmd":
+            _set_team_bot_model(target_h, bot_bus.MODEL_MODE_DEFAULT, chat_id=chat_id, thread_id=thread_id)
+            toast_txt = f"@{target_h} 模型 → ⚙️ 默认"
+        elif action == "tmf":
+            _set_team_bot_model(target_h, bot_bus.MODEL_MODE_FOLLOW, chat_id=chat_id, thread_id=thread_id)
+            toast_txt = f"@{target_h} 模型 → 🔗 跟随私聊"
+        else:
+            mtok = parts[2] if len(parts) > 2 else ""
+            resolved_model = _resolve_model_cb_token(mtok)
+            if not resolved_model:
+                tg("answerCallbackQuery", callback_query_id=cb_id, text="模型按钮已过期，请重新打开 /team", show_alert=True)
+                return
+            _set_team_bot_model(target_h, bot_bus.MODEL_MODE_CUSTOM, resolved_model, chat_id=chat_id, thread_id=thread_id)
+            toast_txt = f"@{target_h} 模型 → {resolved_model}"
+            try:
+                all_m = agy_models()
+                for idx, (slug, _desc) in enumerate(all_m):
+                    if _is_active_model_entry(slug, resolved_model):
+                        sel_page = idx // 10
+                        break
+            except Exception:
+                sel_page = 0
+        tg("answerCallbackQuery", callback_query_id=cb_id, text=toast_txt[:180])
+        if msg_id:
+            text, kb = build_team_model_panel(target_h, page=sel_page)
+            r_ed = tg("editMessageText", chat_id=chat_id, message_id=msg_id,
+                      text=text, parse_mode="HTML", reply_markup=kb)
+            if not _tg_ok(r_ed):
+                tg("editMessageReplyMarkup", chat_id=chat_id, message_id=msg_id, reply_markup=kb)
+        return
     else:
         tg("answerCallbackQuery", callback_query_id=cb_id)
         return
@@ -9427,6 +10031,102 @@ def _handle_album_item(msg, chat_id, thread_id, skey, mg_id):
 
 
 # ---------------------------------------------------------------- message dispatch
+_KNOWN_BRIDGE_COMMANDS = frozenset({
+    "/new", "/reset",
+    "/retry",
+    "/undo", "/redo",
+    "/team", "/bots",
+    "/delegate", "/ask",
+    "/compact", "/context",
+    "/dream",
+    "/usage", "/quota",
+    "/cost", "/bill",
+    "/schedule", "/cron", "/timer", "/timers",
+    "/project", "/projects",
+    "/model",
+    "/browser", "/profile",
+    "/effort",
+    "/thinking",
+    "/sessions", "/resume",
+    "/files", "/get",
+    "/mode",
+    "/reload",
+    "/cancel", "/stop",
+    "/status",
+    "/start", "/help",
+})
+
+
+def _parse_slash_command(text, *, chat_id=None):
+    """Normalize slash commands, supporting `/ model`, `/Model`, and `@my_handle /model`.
+
+    Returns `(cmd_lower, first_arg, raw_rest)` if `text` should be dispatched as a bridge
+    command, or `None` if it should be treated as normal chat text.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None
+
+    stripped_mention = False
+    cmd_text = raw
+    my_handle = bot_bus.normalize_handle(_current_bot_handle())
+
+    if cmd_text.startswith("@"):
+        m_at = re.match(r"^@([A-Za-z0-9_]{3,32})[\s,:;]+(/.*)$", cmd_text, flags=re.DOTALL)
+        if not m_at:
+            return None
+        mention_h = bot_bus.normalize_handle(m_at.group(1))
+        if not my_handle or mention_h != my_handle:
+            return None
+        cmd_text = m_at.group(2).strip()
+        stripped_mention = True
+
+    if not cmd_text.startswith("/"):
+        return None
+
+    parts = cmd_text.split()
+    if not parts:
+        return None
+
+    is_group = bool(chat_id is not None and int(chat_id) < 0)
+
+    if parts[0] == "/":
+        if len(parts) < 2:
+            return None
+        tok = parts[1]
+        if "@" in tok:
+            base, target_raw = tok.split("@", 1)
+            target_h = bot_bus.normalize_handle(target_raw)
+            if is_group and my_handle and target_h and target_h != my_handle:
+                return None
+        else:
+            base = tok
+        cand_cmd = ("/" + base).lower()
+        if cand_cmd not in _KNOWN_BRIDGE_COMMANDS:
+            return None
+        arg = parts[2] if len(parts) > 2 else ""
+        m_rest = re.match(r"^/\s+\S+(?:\s+(.*))?$", cmd_text, flags=re.DOTALL)
+        raw_rest = (m_rest.group(1) or "").strip() if m_rest else ""
+        return cand_cmd, arg, raw_rest
+
+    head_tok = parts[0]
+    if "@" in head_tok:
+        base_cmd, target_raw = head_tok.split("@", 1)
+        target_h = bot_bus.normalize_handle(target_raw)
+        if is_group and my_handle and target_h and target_h != my_handle:
+            return None
+        cmd = base_cmd.lower()
+    else:
+        cmd = head_tok.lower()
+
+    if stripped_mention and cmd not in _KNOWN_BRIDGE_COMMANDS:
+        return None
+
+    arg = parts[1] if len(parts) > 1 else ""
+    raw_rest = cmd_text[len(head_tok):].strip()
+    return cmd, arg, raw_rest
+
+
 def handle_message(msg):
     chat_id = msg.get("chat", {}).get("id")
     from_user = msg.get("from")
@@ -9444,11 +10144,9 @@ def handle_message(msg):
     if not text:
         return
 
-    if text.startswith("/"):
-        parts = text.split()
-        cmd = parts[0].split("@")[0]
-        arg = parts[1] if len(parts) > 1 else ""
-        raw_rest = text[len(parts[0]):].strip()
+    parsed_cmd = _parse_slash_command(text, chat_id=chat_id)
+    if parsed_cmd is not None:
+        cmd, arg, raw_rest = parsed_cmd
         allowed_cmd, denied_label = access_control.is_command_allowed_for_role(role, cmd, raw_rest)
         if not allowed_cmd:
             send(
@@ -9550,6 +10248,7 @@ def handle_message(msg):
                      "<b>群聊快捷团队指令：</b>\n"
                      "/team — 查看/切换团队角色、模型、播报台与派工单\n"
                      "/delegate @bot 任务 — 绕过主控 LLM，直接向指定队员派单\n"
+                     "/model [default|follow|slug] — 切换本群/Topic 模型（默认 / 跟随私聊 / 全部模型）\n"
                      "/project [名称] — 切换本群/当前 Topic 协同的项目仓库\n"
                      "/browser — Live-Browser 浏览器多指纹控制面板\n"
                      "/status — 查看当前主控状态、Scope 与在线队员数\n"
@@ -9882,6 +10581,7 @@ def main():
         threading.Thread(target=idle_session_reaper, daemon=True).start()
         threading.Thread(target=scheduler_loop, daemon=True).start()
         threading.Thread(target=_bot_bus_loop, daemon=True).start()
+        threading.Thread(target=_warmup_models_cache, daemon=True).start()
         _mark_reload_healthy()
     except Exception as startup_exc:
         active_crumb = _read_reload_breadcrumb()

@@ -37,6 +37,10 @@ MENTION_CHAINS_FILE = os.path.join(BUS_DIR, "mention_chains.json")
 ORIGIN_CTX_FILE = os.path.join(BUS_DIR, "origin_context.json")
 
 VALID_ROLES = ("coordinator", "worker", "peer")
+MODEL_MODE_DEFAULT = "default"
+MODEL_MODE_FOLLOW = "follow"
+MODEL_MODE_CUSTOM = "custom"
+VALID_MODEL_MODES = (MODEL_MODE_DEFAULT, MODEL_MODE_FOLLOW, MODEL_MODE_CUSTOM)
 TERMINAL_STATUSES = frozenset({"done", "error", "cancelled"})
 FAN_OUT_MAX = 8
 DEFAULT_MAX_HOPS = 2
@@ -125,6 +129,34 @@ def load_team_config() -> Dict[str, Any]:
         return _load_team_config_unlocked()
 
 
+def _parse_entry_model_state(entry: Dict[str, Any]) -> Tuple[str, str]:
+    """Decode `(model_mode, configured_model)` from a `team_config.json` bot entry.
+
+    Explicit `model_mode` (`default` | `follow` | `custom`) takes precedence; legacy entries
+    without `model_mode` map missing/`None` -> `default`, `""` -> `follow`, non-empty -> `custom`.
+    """
+    raw_mode = str(entry.get("model_mode") or "").strip().lower()
+    raw_dm = entry.get("default_model")
+    clean_dm = str(raw_dm).strip() if isinstance(raw_dm, str) else (str(raw_dm).strip() if raw_dm is not None else "")
+    if clean_dm == "__follow_dm__":
+        clean_dm = ""
+
+    if raw_mode in VALID_MODEL_MODES:
+        if raw_mode == MODEL_MODE_DEFAULT:
+            return MODEL_MODE_DEFAULT, ""
+        if raw_mode == MODEL_MODE_FOLLOW:
+            return MODEL_MODE_FOLLOW, ""
+        if clean_dm:
+            return MODEL_MODE_CUSTOM, clean_dm
+        return MODEL_MODE_DEFAULT, ""
+
+    if "default_model" not in entry or raw_dm is None:
+        return MODEL_MODE_DEFAULT, ""
+    if clean_dm == "":
+        return MODEL_MODE_FOLLOW, ""
+    return MODEL_MODE_CUSTOM, clean_dm
+
+
 def resolve_bot_config(
     handle: str,
     *,
@@ -143,13 +175,26 @@ def resolve_bot_config(
     role = entry.get("role") or (env_role if env_role in VALID_ROLES else "") or "peer"
     if role not in VALID_ROLES:
         role = "peer"
+    model_mode, configured_model = _parse_entry_model_state(entry)
+    env_default_model = (env_model or "").strip()
+    if model_mode == MODEL_MODE_CUSTOM:
+        resolved_default_model = configured_model
+    elif model_mode == MODEL_MODE_FOLLOW:
+        resolved_default_model = ""
+    else:
+        resolved_default_model = env_default_model
+
     team_mirror = cfg.get("mirror") if isinstance(cfg.get("mirror"), dict) else {}
     m_chat = entry.get("mirror_chat_id") if entry.get("mirror_chat_id") is not None else team_mirror.get("chat_id")
     m_thread = entry.get("mirror_thread_id") if entry.get("mirror_chat_id") is not None else team_mirror.get("thread_id")
     return {
         "role": role,
         "specialty": (entry.get("specialty") if entry.get("specialty") is not None else env_specialty) or "",
-        "default_model": (entry.get("default_model") if entry.get("default_model") is not None else env_model) or "",
+        "model_mode": model_mode,
+        "configured_model": configured_model,
+        "env_default_model": env_default_model,
+        "default_model": resolved_default_model,
+        "model_updated_at": int(entry.get("model_updated_at") or 0),
         "default_workdir": (entry.get("default_workdir") if entry.get("default_workdir") is not None else fallback_workdir) or "",
         "default_project": (entry.get("default_project") if entry.get("default_project") is not None else env_project) or "",
         "mirror_chat_id": int(m_chat or 0),
@@ -179,14 +224,71 @@ def update_bot_config(handle: str, **updates: Any) -> Dict[str, Any]:
         cfg = _load_team_config_unlocked()
         bots = cfg.setdefault("bots", {})
         cur = dict(bots.get(norm) or {})
+        now = int(time.time())
+
+        has_mode = "model_mode" in updates
+        has_dm = "default_model" in updates
         for k, v in updates.items():
             if k == "role" and v not in VALID_ROLES:
                 raise ValueError(f"Invalid role: {v}")
-            cur[k] = v
-        cur["updated_at"] = int(time.time())
+            if k == "model_mode":
+                norm_mode = str(v or "").strip().lower()
+                if norm_mode not in VALID_MODEL_MODES:
+                    raise ValueError(f"Invalid model_mode: {v}")
+                cur["model_mode"] = norm_mode
+            else:
+                cur[k] = v
+
+        if has_mode:
+            mode_val = cur["model_mode"]
+            if mode_val == MODEL_MODE_DEFAULT:
+                cur["default_model"] = None
+            elif mode_val == MODEL_MODE_FOLLOW:
+                cur["default_model"] = ""
+            elif mode_val == MODEL_MODE_CUSTOM:
+                dm_clean = str(cur.get("default_model") or "").strip()
+                if not dm_clean or dm_clean == "__follow_dm__":
+                    raise ValueError("Custom model_mode requires a non-empty default_model")
+                cur["default_model"] = dm_clean
+        elif has_dm:
+            raw_dm = cur.get("default_model")
+            if raw_dm is None:
+                cur["model_mode"] = MODEL_MODE_DEFAULT
+                cur["default_model"] = None
+            else:
+                dm_clean = str(raw_dm).strip()
+                if not dm_clean or dm_clean == "__follow_dm__":
+                    cur["model_mode"] = MODEL_MODE_FOLLOW
+                    cur["default_model"] = ""
+                else:
+                    cur["model_mode"] = MODEL_MODE_CUSTOM
+                    cur["default_model"] = dm_clean
+
+        if has_mode or has_dm:
+            if "model_updated_at" not in updates or not updates.get("model_updated_at"):
+                cur["model_updated_at"] = now
+            else:
+                cur["model_updated_at"] = int(updates["model_updated_at"])
+
+        cur["updated_at"] = now
         bots[norm] = cur
         _atomic_write_json(CONFIG_FILE, cfg)
         return dict(cur)
+
+
+def set_bot_model_config(handle: str, mode: str, model: str = "") -> Dict[str, Any]:
+    """Explicitly configure a bot's group/team model mode (`default`, `follow`, or `custom`)."""
+    norm_mode = str(mode or MODEL_MODE_DEFAULT).strip().lower()
+    if norm_mode not in VALID_MODEL_MODES:
+        raise ValueError(f"Invalid model_mode: {mode}")
+    if norm_mode == MODEL_MODE_CUSTOM:
+        clean_model = str(model or "").strip()
+        if not clean_model or clean_model == "__follow_dm__":
+            raise ValueError("Custom model mode requires a concrete model slug")
+        return update_bot_config(handle, model_mode=MODEL_MODE_CUSTOM, default_model=clean_model)
+    if norm_mode == MODEL_MODE_FOLLOW:
+        return update_bot_config(handle, model_mode=MODEL_MODE_FOLLOW, default_model="")
+    return update_bot_config(handle, model_mode=MODEL_MODE_DEFAULT, default_model=None)
 
 
 def promote_sole_coordinator(coordinator_handle: str, *, worker_default_model: str = "gemini-3.8-flash-low") -> List[str]:
@@ -211,6 +313,8 @@ def promote_sole_coordinator(coordinator_handle: str, *, worker_default_model: s
                 cur["role"] = "worker"
                 if worker_default_model and not cur.get("default_model"):
                     cur["default_model"] = worker_default_model
+                    cur["model_mode"] = MODEL_MODE_CUSTOM
+                    cur["model_updated_at"] = now
                 cur["updated_at"] = now
             bots_cfg[h] = cur
             changed.append(f"{h}={cur['role']}")
@@ -280,6 +384,22 @@ def _merge_bot_view(handle: str, raw_roster: Dict[str, Any], raw_cfg: Dict[str, 
     m_chat = cfg.get("mirror_chat_id") if cfg.get("mirror_chat_id") is not None else tm.get("chat_id")
     m_thread = cfg.get("mirror_thread_id") if cfg.get("mirror_chat_id") is not None else tm.get("thread_id")
 
+    model_mode, configured_model = _parse_entry_model_state(cfg)
+    env_default_model = str(r.get("env_default_model") or "").strip()
+    if "dm_model" in r:
+        dm_model = str(r.get("dm_model") or "").strip()
+    else:
+        dm_model = str(r.get("active_model") or "").strip()
+    if dm_model == "__follow_dm__":
+        dm_model = ""
+
+    if model_mode == MODEL_MODE_CUSTOM:
+        effective_model = configured_model
+    elif model_mode == MODEL_MODE_FOLLOW:
+        effective_model = dm_model or env_default_model
+    else:
+        effective_model = env_default_model
+
     return {
         "handle": handle,
         "display_name": r.get("display_name") or handle,
@@ -291,8 +411,14 @@ def _merge_bot_view(handle: str, raw_roster: Dict[str, Any], raw_cfg: Dict[str, 
         "current_job": r.get("current_job") if online else None,
         "queue_depth": int(r.get("queue_depth") or 0) if online else 0,
         "specialty": cfg.get("specialty") if cfg.get("specialty") is not None else (r.get("specialty") or ""),
-        "default_model": cfg.get("default_model") or r.get("active_model") or "",
-        "active_model": r.get("active_model") or "",
+        "model_mode": model_mode,
+        "configured_model": configured_model,
+        "dm_model": dm_model,
+        "env_default_model": env_default_model,
+        "effective_model": effective_model,
+        "model_updated_at": int(cfg.get("model_updated_at") or 0),
+        "default_model": effective_model,
+        "active_model": str(r.get("active_model") or dm_model or "").strip(),
         "default_workdir": cfg.get("default_workdir") or r.get("workdir") or "",
         "default_project": cfg.get("default_project") if cfg.get("default_project") is not None else (r.get("project") or ""),
         "allowed_chats": list(r.get("allowed_chats") or []),
@@ -826,6 +952,41 @@ def enqueue_group_say(
                 "from_bot": sender,
                 "source_hop": max(0, int(source_hop or 0)),
                 "chain_id": str(chain_id or ""),
+                "created_at": time.time(),
+            },
+        )
+
+
+def notify_bot_model_sync(
+    target_bot: str,
+    *,
+    model_mode: str,
+    model: str = "",
+    from_bot: str = "",
+    chat_id: int = 0,
+    thread_id: Optional[int] = None,
+) -> str:
+    """Enqueue a `sync_group_model` packet so `target_bot` immediately syncs its group scope model."""
+    norm_target = normalize_handle(target_bot)
+    if not norm_target:
+        raise ValueError("Target bot handle is required")
+    norm_mode = str(model_mode or MODEL_MODE_DEFAULT).strip().lower()
+    if norm_mode not in VALID_MODEL_MODES:
+        raise ValueError(f"Invalid model_mode: {model_mode}")
+    clean_model = str(model or "").strip() if norm_mode == MODEL_MODE_CUSTOM else ""
+    if clean_model == "__follow_dm__":
+        clean_model = ""
+    with _bus_lock():
+        return _drop_inbox_packet_unlocked(
+            norm_target,
+            {
+                "type": "sync_group_model",
+                "target_bot": norm_target,
+                "from_bot": normalize_handle(from_bot) if from_bot else "",
+                "model_mode": norm_mode,
+                "model": clean_model,
+                "chat_id": int(chat_id or 0),
+                "thread_id": _norm_tid(thread_id),
                 "created_at": time.time(),
             },
         )

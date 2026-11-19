@@ -1221,5 +1221,509 @@ class TestGroupChatBus(unittest.TestCase):
                     bridge_coord.turn_running_scope = None
 
 
+class TestModelSelectionAndFollowSync(unittest.TestCase):
+    """Verify DM `/ model` normalization, group `/model` & `/team` full catalog UI, and live DM follow sync."""
+
+    def _load_bridge(self, tmp: str, extra_env: dict[str, str] | None = None):
+        env_patch = {
+            "AGY_BOT_BUS_DIR": tmp,
+            "AGY_TG_STATE_FILE": os.path.join(tmp, "state.json"),
+            "AGY_TG_WORKDIR": tmp,
+            "AGY_TG_ALLOWED_CHATS": "111,-1001234567890",
+            "AGY_TG_ALLOWED_USERS": "",
+            "AGY_TG_ADMIN_USERS": "",
+            "AGY_TG_READONLY_USERS": "",
+            "AGY_TG_BOT_TOKEN": "1234567890:EXAMPLE_TOKEN_FOR_TEST_ONLY",
+            "AGY_TG_ENV_FILE": os.path.join(tmp, "nonexistent.env"),
+            "AGY_TG_BOT_MODEL": "",
+            "AGY_TG_FALLBACK_MODELS": "",
+            "AGY_TG_GATEWAYS_FILE": os.path.join(tmp, "nonexistent_gw.json"),
+            "AGY_TG_GATEWAYS_JSON": "",
+            "AGY_BOT_CHAIN": "",
+            "AGY_BOT_ORIGIN_MSG_ID": "0",
+            "AGY_BOT_MENTION_HOP": "0",
+        }
+        if extra_env:
+            env_patch.update(extra_env)
+        with mock.patch.dict(os.environ, env_patch, clear=False):
+            import bot_bus  # noqa: E402
+            import bridge  # noqa: E402
+
+            importlib.reload(bot_bus)
+            importlib.reload(bridge)
+            return bridge
+
+    def test_dm_slash_normalization_resilient_panel_and_command_scope_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self._load_bridge(
+                tmp,
+                {
+                    "AGY_BOT_BUS_ROLE": "worker",
+                    "AGY_TG_BOT_MODEL": "team/gpt-6.1-sol",
+                },
+            )
+            bridge.BOT_META.update({"bot_id": 222, "handle": "bot_two", "resolved": True})
+            sample_models = [
+                ("gemini-4-neon-high", "Gemini 4 Neon (High)"),
+                ("claude-opus-5-5-high", "Claude Opus 5.5 (High)"),
+            ]
+
+            # 1. `/ model`, `/Model`, `@bot_two /model`, `@bot_two / model` all pop the model keyboard in DM
+            for raw_text in ("/ model", "/Model", "/  Model", "@bot_two /model", "@bot_two / model"):
+                sent = []
+                with (
+                    mock.patch.object(bridge, "agy_models", return_value=sample_models),
+                    mock.patch.object(bridge, "send", side_effect=lambda *a, **kw: sent.append((a, kw)) or 101),
+                ):
+                    bridge.handle_message(
+                        {
+                            "chat": {"id": 111, "type": "private"},
+                            "from": {"id": 111, "username": "username"},
+                            "message_id": 10,
+                            "text": raw_text,
+                        }
+                    )
+                self.assertEqual(1, len(sent), f"Failed for input {raw_text!r}")
+                self.assertIn("reply_markup", sent[0][1])
+                kb = sent[0][1]["reply_markup"]["inline_keyboard"]
+                self.assertTrue(len(kb) >= 3)
+                self.assertIn("Models", sent[0][0][1])
+
+            # 2. Non-command paths & other-bot mentions do NOT trigger cmd_model or unknown bridge command
+            for non_cmd in ("/ etc/hosts", "/", "@bot_two /etc/hosts", "@bot_one /model"):
+                sent = []
+                enqueued = []
+                with (
+                    mock.patch.object(bridge, "send", side_effect=lambda *a, **kw: sent.append(a[1]) or 102),
+                    mock.patch.object(bridge, "enqueue", side_effect=lambda *a, **kw: enqueued.append(a[1])),
+                ):
+                    bridge.handle_message(
+                        {
+                            "chat": {"id": 111, "type": "private"},
+                            "from": {"id": 111, "username": "username"},
+                            "message_id": 11,
+                            "text": non_cmd,
+                        }
+                    )
+                self.assertEqual([], sent, f"Unexpected bridge reply for {non_cmd!r}: {sent}")
+                self.assertEqual(1, len(enqueued), f"Expected normal chat enqueue for {non_cmd!r}")
+
+            # 3. Even when agy_models() throws during cold/network error, cmd_model still sends a valid keyboard
+            sent_err = []
+            with (
+                mock.patch.object(bridge, "agy_models", side_effect=RuntimeError("cli timeout")),
+                mock.patch.object(bridge, "send", side_effect=lambda *a, **kw: sent_err.append((a, kw)) or 103),
+            ):
+                bridge.cmd_model(111, "")
+            self.assertEqual(1, len(sent_err))
+            self.assertIn("inline_keyboard", sent_err[0][1]["reply_markup"])
+            self.assertEqual("model:default", sent_err[0][1]["reply_markup"]["inline_keyboard"][-1][0]["callback_data"])
+
+            # 4. register_bot_commands cleans positive DM chat_ids too (not only negative group chat_ids)
+            tg_calls = []
+            fake_ok = mock.MagicMock(status_code=200, json=lambda: {"ok": True})
+            with mock.patch.object(bridge, "tg", side_effect=lambda method, **kw: tg_calls.append((method, kw)) or fake_ok):
+                bridge.register_bot_commands(force=True)
+            deleted_scopes = [kw.get("scope") for m, kw in tg_calls if m == "deleteMyCommands"]
+            self.assertIn({"type": "chat", "chat_id": 111}, deleted_scopes)
+            self.assertIn({"type": "chat_administrators", "chat_id": 111}, deleted_scopes)
+            self.assertIn({"type": "chat", "chat_id": -1001234567890}, deleted_scopes)
+
+    def test_group_model_panel_has_default_follow_and_full_models_while_dm_stays_compat(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self._load_bridge(tmp, {"AGY_TG_BOT_MODEL": "team/gpt-6.1-sol"})
+            bridge.BOT_META.update({"bot_id": 111, "handle": "bot_one", "resolved": True})
+
+            # `model` must be present in _GROUP_TEAM_COMMANDS
+            grp_cmd_names = [c["command"] for c in bridge._GROUP_TEAM_COMMANDS]
+            self.assertIn("model", grp_cmd_names)
+
+            catalog = [
+                (f"vendor/very-long-model-slug-entry-number-{i:02d}", f"[GW] Model {i:02d}")
+                for i in range(15)
+            ]
+
+            # DM keyboard default preserves 12 rows (10 models + pagination + single reset row)
+            kb_dm = bridge.make_model_keyboard(catalog[0][0], page=0, page_size=10, models=catalog)
+            self.assertEqual(12, len(kb_dm["inline_keyboard"]))
+            self.assertEqual(1, len(kb_dm["inline_keyboard"][-1]))
+            self.assertEqual("model:default", kb_dm["inline_keyboard"][-1][0]["callback_data"])
+
+            # Group panel includes side-by-side [Default, Follow DM] + paginated models
+            bridge.update_scope_state("-1001234567890", model=bridge.MODEL_FOLLOW_DM)
+            bridge.update_scope_state("111", model="claude-opus-5-5-high")
+            text_grp, kb_grp = bridge._render_model_panel("-1001234567890", page=0, page_size=10, models=catalog)
+            self.assertIn("跟随私聊", text_grp)
+            self.assertIn("claude-opus-5-5-high", text_grp)
+            self.assertNotIn(bridge.MODEL_FOLLOW_DM, text_grp)
+
+            action_row = kb_grp["inline_keyboard"][-1]
+            self.assertEqual(2, len(action_row))
+            self.assertEqual("model:default", action_row[0]["callback_data"])
+            self.assertEqual("model:follow", action_row[1]["callback_data"])
+            self.assertTrue(action_row[1]["text"].startswith("✓ "))
+
+            # Group `/model 追随` and `model:default` callback update scope & bot_bus
+            with (
+                mock.patch.object(bridge, "agy_models", return_value=catalog),
+                mock.patch.object(bridge, "send", return_value=1),
+                mock.patch.object(bridge, "tg", return_value=mock.MagicMock(status_code=200, json=lambda: {"ok": True})),
+            ):
+                bridge.cmd_model(-1001234567890, "default")
+                self.assertIsNone(bridge.get_scope_value("-1001234567890", "model"))
+                self.assertEqual(
+                    bridge.bot_bus.MODEL_MODE_DEFAULT,
+                    bridge.bot_bus.resolve_bot_config("bot_one", env_model="team/gpt-6.1-sol")["model_mode"],
+                )
+
+                bridge.cmd_model(-1001234567890, "追随")
+                self.assertEqual(bridge.MODEL_FOLLOW_DM, bridge.get_scope_value("-1001234567890", "model"))
+                self.assertEqual(
+                    bridge.bot_bus.MODEL_MODE_FOLLOW,
+                    bridge.bot_bus.resolve_bot_config("bot_one", env_model="team/gpt-6.1-sol")["model_mode"],
+                )
+
+                # Topic scope /model change stays isolated to that Topic and does NOT overwrite bot_bus
+                bridge.cmd_model(-1001234567890, "gemini-4-neon-high", thread_id=42)
+                self.assertEqual("gemini-4-neon-high", bridge.get_scope_value("-1001234567890:42", "model"))
+                self.assertEqual(
+                    bridge.bot_bus.MODEL_MODE_FOLLOW,
+                    bridge.bot_bus.resolve_bot_config("bot_one", env_model="team/gpt-6.1-sol")["model_mode"],
+                )
+
+    def test_team_model_subpanel_pagination_64b_callbacks_and_cold_restart_recovery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self._load_bridge(tmp, {"AGY_BOT_BUS_ROLE": "coordinator"})
+            bridge.BOT_META.update({"bot_id": 111, "handle": "bot_one", "resolved": True})
+
+            long_handle = "very_long_worker_bot_handle_for_callback_length_test_bot"
+            bridge.bot_bus.heartbeat_bot(
+                {
+                    "handle": long_handle,
+                    "pid": os.getpid(),
+                    "role": "worker",
+                    "dm_model": "claude-opus-5-5-high",
+                    "env_default_model": "team/gpt-6.1-sol",
+                    "active_model": "claude-opus-5-5-high",
+                }
+            )
+            bridge.bot_bus.heartbeat_bot(
+                {
+                    "handle": "bot_one",
+                    "pid": os.getpid(),
+                    "role": "coordinator",
+                    "dm_model": "gemini-4-neon-high",
+                    "env_default_model": "",
+                    "active_model": "gemini-4-neon-high",
+                }
+            )
+
+            long_models = [
+                (f"gw:openrouter:very-long-org-prefix/model-identifier-variant-{i:02d}-thinking", f"[OR] Model {i:02d}")
+                for i in range(15)
+            ]
+
+            with mock.patch.object(bridge, "agy_models", return_value=long_models):
+                team_text, team_kb = bridge.build_team_panel()
+                self.assertIn("默认 (team/gpt-6.1-sol)", team_text)
+                for row in team_kb["inline_keyboard"]:
+                    for btn in row:
+                        self.assertLessEqual(len(btn["callback_data"].encode("utf-8")), 64)
+
+                # Find model button for long_handle
+                model_cbs = [
+                    btn["callback_data"]
+                    for row in team_kb["inline_keyboard"]
+                    for btn in row
+                    if btn["callback_data"].startswith("team:model:")
+                ]
+                self.assertTrue(len(model_cbs) >= 2)
+                btok = bridge._team_bot_token(long_handle)
+                open_cb = f"team:model:{btok}"
+                self.assertIn(open_cb, model_cbs)
+
+                # Open sub-panel page 0 & page 1 and verify ALL callback_data <= 64 bytes
+                sub_text, sub_kb = bridge.build_team_model_panel(long_handle, page=0, page_size=10, models=long_models)
+                self.assertIn("⚙️ 默认", sub_text)
+                for row in sub_kb["inline_keyboard"]:
+                    for btn in row:
+                        self.assertLessEqual(len(btn["callback_data"].encode("utf-8")), 64)
+
+                all_sub_cbs = [btn["callback_data"] for row in sub_kb["inline_keyboard"] for btn in row]
+                self.assertIn(f"team:tmp:{btok}:1", all_sub_cbs)
+                self.assertIn(f"team:tmd:{btok}", all_sub_cbs)
+                self.assertIn(f"team:tmf:{btok}", all_sub_cbs)
+                self.assertIn("team:refresh", all_sub_cbs)
+
+                # Simulate cold restart (clear in-memory callback token maps)
+                target_model_cb = sub_kb["inline_keyboard"][0][0]["callback_data"]
+                bridge._TEAM_BOT_CB_MAP.clear()
+                bridge._MODEL_CB_MAP.clear()
+
+                edited = []
+                fake_ok = mock.MagicMock(status_code=200, json=lambda: {"ok": True})
+                with mock.patch.object(bridge, "tg", side_effect=lambda m, **kw: edited.append((m, kw)) or fake_ok):
+                    # Select custom long gateway model after cold restart
+                    bridge.handle_callback(
+                        {
+                            "id": "cb-tm-1",
+                            "from": {"id": 111},
+                            "message": {"chat": {"id": -1001234567890}, "message_id": 88},
+                            "data": target_model_cb,
+                        }
+                    )
+                    cfg_after = bridge.bot_bus.resolve_bot_config(long_handle, env_model="team/gpt-6.1-sol")
+                    self.assertEqual(bridge.bot_bus.MODEL_MODE_CUSTOM, cfg_after["model_mode"])
+                    self.assertEqual(long_models[0][0], cfg_after["configured_model"])
+
+                    # Select follow via sub-panel callback -> dispatches sync_group_model packet
+                    bridge.handle_callback(
+                        {
+                            "id": "cb-tm-2",
+                            "from": {"id": 111},
+                            "message": {"chat": {"id": -1001234567890}, "message_id": 88},
+                            "data": f"team:tmf:{btok}",
+                        }
+                    )
+                    cfg_follow = bridge.bot_bus.resolve_bot_config(long_handle, env_model="team/gpt-6.1-sol")
+                    self.assertEqual(bridge.bot_bus.MODEL_MODE_FOLLOW, cfg_follow["model_mode"])
+                    pkts = bridge.bot_bus.pop_inbox_packets(long_handle)
+                    self.assertEqual(2, len(pkts))
+                    self.assertEqual("sync_group_model", pkts[-1]["type"])
+                    self.assertEqual(bridge.bot_bus.MODEL_MODE_FOLLOW, pkts[-1]["model_mode"])
+
+                    # Select default via sub-panel callback
+                    bridge.handle_callback(
+                        {
+                            "id": "cb-tm-3",
+                            "from": {"id": 111},
+                            "message": {"chat": {"id": -1001234567890}, "message_id": 88},
+                            "data": f"team:tmd:{btok}",
+                        }
+                    )
+                    cfg_def = bridge.bot_bus.resolve_bot_config(long_handle, env_model="team/gpt-6.1-sol")
+                    self.assertEqual(bridge.bot_bus.MODEL_MODE_DEFAULT, cfg_def["model_mode"])
+
+                # cmd_team model supports default/默认, follow/追随, and fuzzy suffix slug
+                with mock.patch.object(bridge, "send", return_value=1):
+                    bridge.cmd_team(-1001234567890, f"model @{long_handle} 追随")
+                    self.assertEqual(
+                        bridge.bot_bus.MODEL_MODE_FOLLOW,
+                        bridge.bot_bus.resolve_bot_config(long_handle)["model_mode"],
+                    )
+                    bridge.cmd_team(-1001234567890, f"model @{long_handle} model-identifier-variant-03-thinking")
+                    self.assertEqual(
+                        long_models[3][0],
+                        bridge.bot_bus.resolve_bot_config(long_handle)["configured_model"],
+                    )
+                    bridge.cmd_team(-1001234567890, f"model @{long_handle} 默认")
+                    self.assertEqual(
+                        bridge.bot_bus.MODEL_MODE_DEFAULT,
+                        bridge.bot_bus.resolve_bot_config(long_handle)["model_mode"],
+                    )
+
+    def test_follow_dm_live_sync_across_all_exec_paths_warm_sessions_and_bus_jobs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self._load_bridge(
+                tmp,
+                {
+                    "AGY_BOT_BUS_ROLE": "worker",
+                    "AGY_TG_BOT_MODEL": "team/gpt-6.1-sol",
+                },
+            )
+            bridge.BOT_META.update({"bot_id": 222, "handle": "bot_two", "resolved": True})
+
+            # Seed DM model first, then verify new group scope does NOT freeze DM model when config is default
+            bridge.update_scope_state("111", model="gemini-4-neon-high")
+            grp_sc = bridge.get_scope_state("-1001234567890")
+            self.assertIsNone(grp_sc["model"])
+            self.assertEqual("team/gpt-6.1-sol", bridge._resolve_effective_model("-1001234567890"))
+
+            # Pre-seed a warm AgySession on group scope to verify invalidation on sync & DM change
+            warm_grp_1 = mock.MagicMock()
+            warm_grp_1.is_alive.return_value = True
+            with bridge.session_lock:
+                bridge._session_pool["-1001234567890"] = warm_grp_1
+
+            # 1. Cross-bot sync_group_model(follow) updates group scope, evicts warm session, persists state & heartbeat
+            bridge.bot_bus.set_bot_model_config("bot_two", bridge.bot_bus.MODEL_MODE_FOLLOW)
+            bridge._handle_bot_bus_packet(
+                {
+                    "type": "sync_group_model",
+                    "from_bot": "bot_one",
+                    "target_bot": "bot_two",
+                    "model_mode": bridge.bot_bus.MODEL_MODE_FOLLOW,
+                    "model": "",
+                    "chat_id": -1001234567890,
+                    "thread_id": None,
+                }
+            )
+            self.assertEqual(bridge.MODEL_FOLLOW_DM, bridge.get_scope_value("-1001234567890", "model"))
+            self.assertNotIn("-1001234567890", bridge._session_pool)
+            self.assertEqual("gemini-4-neon-high", bridge._resolve_effective_model("-1001234567890"))
+
+            # New topic scope created under group inherits parent group's MODEL_FOLLOW_DM
+            self.assertEqual(bridge.MODEL_FOLLOW_DM, bridge.get_scope_value("-1001234567890:99", "model"))
+
+            # 2. Switch DM model to claude-opus-5-5-high -> evicts following group warm session & updates ALL paths!
+            warm_grp_2 = mock.MagicMock()
+            warm_grp_2.is_alive.return_value = True
+            with bridge.session_lock:
+                bridge._session_pool["-1001234567890"] = warm_grp_2
+
+            with mock.patch.object(bridge, "send", return_value=1):
+                bridge.cmd_model(111, "claude-opus-5-5-high")
+
+            self.assertNotIn("-1001234567890", bridge._session_pool)
+            self.assertEqual("claude-opus-5-5-high", bridge._resolve_effective_model("-1001234567890"))
+            self.assertEqual("claude-opus-5-5-high", bridge._resolve_effective_model("-1001234567890:99"))
+
+            # Heartbeat & roster view immediately reflect the new DM model
+            roster_map = {b["handle"]: b for b in bridge.bot_bus.list_roster(include_offline=True)}
+            self.assertEqual("claude-opus-5-5-high", roster_map["bot_two"]["dm_model"])
+            self.assertEqual("claude-opus-5-5-high", roster_map["bot_two"]["effective_model"])
+
+            # 2a. cmd_status shows Follow DM + claude-opus-5-5-high (never raw sentinel)
+            status_msgs = []
+            with mock.patch.object(bridge, "send", side_effect=lambda *a, **kw: status_msgs.append(a[1]) or 1):
+                bridge.cmd_status(-1001234567890)
+            self.assertTrue(status_msgs)
+            self.assertIn("跟随私聊", status_msgs[0])
+            self.assertIn("claude-opus-5-5-high", status_msgs[0])
+            self.assertNotIn(bridge.MODEL_FOLLOW_DM, status_msgs[0])
+
+            # 2b. run_compact receives claude-opus-5-5-high
+            bridge.update_scope_state("-1001234567890", conversation_id="conv-follow-1")
+            compact_models = []
+            with (
+                mock.patch.object(
+                    bridge,
+                    "_execute_compact_on_session",
+                    side_effect=lambda skey, conv, mode, mdl, *a, **kw: compact_models.append(mdl) or (True, 0.2, ""),
+                ),
+                mock.patch.object(bridge, "send", return_value=1),
+                mock.patch.object(bridge, "tg", return_value=None),
+            ):
+                bridge.run_compact(-1001234567890)
+            self.assertEqual(["claude-opus-5-5-high"], compact_models)
+
+            # 2c. _run_fast_group_reply passes --model claude-opus-5-5-high
+            fast_cmds = []
+            bridge._fast_chat_sem.acquire()
+            with (
+                mock.patch.object(
+                    bridge,
+                    "_run_subprocess_group",
+                    side_effect=lambda cmd, **kw: fast_cmds.append(list(cmd)) or (0, '{"response":"ok"}', ""),
+                ),
+                mock.patch.object(bridge, "send_rich", return_value=(55, "ok")),
+                mock.patch.object(bridge, "_record_and_relay_bot_group_msg"),
+            ):
+                bridge._run_fast_group_reply(-1001234567890, "进度如何？")
+            self.assertEqual(1, len(fast_cmds))
+            self.assertIn("--model", fast_cmds[0])
+            self.assertEqual("claude-opus-5-5-high", fast_cmds[0][fast_cmds[0].index("--model") + 1])
+
+            # 2d. run_agy passes --model claude-opus-5-5-high (never __follow_dm__)
+            run_agy_cmds = []
+
+            class _FakePopen:
+                def __init__(self, cmd, **kwargs):
+                    run_agy_cmds.append(list(cmd))
+                    self.pid = 7777
+                    self.returncode = 0
+                    self.stdin = mock.MagicMock()
+                    self.stdin.closed = False
+                    self.stdout = iter(
+                        [
+                            '{"event":"init","conversation_id":"conv-follow-1"}\n',
+                            '{"event":"result","result":{"status":"SUCCESS","response":"done","conversation_id":"conv-follow-1"}}\n',
+                        ]
+                    )
+                    self.stderr = iter([])
+
+                def poll(self):
+                    return 0
+
+                def wait(self, timeout=None):
+                    return 0
+
+            with (
+                mock.patch.object(bridge.subprocess, "Popen", side_effect=_FakePopen),
+                mock.patch.object(bridge, "send_rich", return_value=(56, "done")),
+                mock.patch.object(bridge, "send", return_value=1),
+                mock.patch.object(bridge, "tg", return_value=None),
+                mock.patch.object(bridge, "_record_and_relay_bot_group_msg"),
+            ):
+                bridge.run_agy(-1001234567890, "hello group")
+            self.assertEqual(1, len(run_agy_cmds))
+            self.assertIn("--model", run_agy_cmds[0])
+            self.assertEqual("claude-opus-5-5-high", run_agy_cmds[0][run_agy_cmds[0].index("--model") + 1])
+
+            # 2e. _execute_bus_job without job["model"] uses DM effective model when follow, and ENV_BOT_MODEL when default
+            def _run_one_bus_job(label: str):
+                res = bridge.bot_bus.dispatch_assignments(
+                    "bot_one",
+                    [{"bot": "bot_two", "prompt": "check", "label": label}],
+                    origin_chat_id=-1001234567890,
+                    origin_scope_key="-1001234567890",
+                )
+                jid = res["jobs"][0]["job_id"]
+                seen_models = []
+
+                def _fake_exec_target(mdl, eff):
+                    seen_models.append(mdl)
+                    return {
+                        "kind": "native",
+                        "cli_model": mdl,
+                        "cli_effort": eff,
+                        "env_set": {},
+                        "signature": ("native", mdl or "", eff or ""),
+                    }
+
+                class _JobPopen:
+                    def __init__(self, cmd, **kwargs):
+                        self.pid = 7778
+                        self.returncode = 0
+                        self.stdout = iter(
+                            [
+                                '{"event":"result","result":{"status":"SUCCESS","response":"job ok","conversation_id":"conv-job-1"}}\n'
+                            ]
+                        )
+                        self.stderr = iter([])
+
+                    def wait(self, timeout=None):
+                        return 0
+
+                with (
+                    mock.patch.object(bridge, "_resolve_exec_target", side_effect=_fake_exec_target),
+                    mock.patch.object(bridge.subprocess, "Popen", side_effect=_JobPopen),
+                    mock.patch.object(bridge, "tg_send_in_route", return_value=None),
+                    mock.patch.object(bridge, "send_rich", return_value=(57, "job ok")),
+                ):
+                    bridge._execute_bus_job(jid)
+                return seen_models
+
+            # While in follow mode -> job runs on DM model claude-opus-5-5-high
+            self.assertEqual(["claude-opus-5-5-high"], _run_one_bus_job("follow-check"))
+
+            # 3. Switch back to default via sync_group_model -> falls back to ENV_BOT_MODEL (team/gpt-6.1-sol)
+            bridge.bot_bus.set_bot_model_config("bot_two", bridge.bot_bus.MODEL_MODE_DEFAULT)
+            bridge._handle_bot_bus_packet(
+                {
+                    "type": "sync_group_model",
+                    "from_bot": "bot_one",
+                    "target_bot": "bot_two",
+                    "model_mode": bridge.bot_bus.MODEL_MODE_DEFAULT,
+                    "model": "",
+                    "chat_id": -1001234567890,
+                    "thread_id": None,
+                }
+            )
+            self.assertIsNone(bridge.get_scope_value("-1001234567890", "model"))
+            self.assertEqual("team/gpt-6.1-sol", bridge._resolve_effective_model("-1001234567890"))
+            self.assertEqual(["team/gpt-6.1-sol"], _run_one_bus_job("default-check"))
+
+
 if __name__ == "__main__":
     unittest.main()
