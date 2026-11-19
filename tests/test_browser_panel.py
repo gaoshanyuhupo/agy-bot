@@ -651,7 +651,8 @@ class TestBridgeBrowserPanelAndRbac(unittest.TestCase):
                 self.assertTrue(any(btn.get("callback_data") == "browser:switch:us-work" for row in priv_kb for btn in row))
                 self.assertTrue(any(btn.get("callback_data") == "browser:stop" for row in priv_kb for btn in row))
 
-                # Group chat (chat_id < 0) MUST NOT include any web_app button
+                # Group chat (chat_id < 0) MUST NOT include any web_app button,
+                # and SHOULD include deep-link URL button to private chat `/start browser`
                 sent.clear()
                 bridge.handle_message({
                     "chat": {"id": -1001234567890, "type": "supergroup"},
@@ -661,8 +662,47 @@ class TestBridgeBrowserPanelAndRbac(unittest.TestCase):
                 })
                 grp_kb = sent[0][2]["reply_markup"]["inline_keyboard"]
                 self.assertFalse(any("web_app" in btn for row in grp_kb for btn in row))
+                self.assertTrue(
+                    any(btn.get("url") == "https://t.me/example_bot?start=browser" for row in grp_kb for btn in row)
+                )
                 self.assertTrue(any(btn.get("callback_data") == "browser:refresh" for row in grp_kb for btn in row))
                 self.assertIn("群聊", sent[0][1])
+
+                # Private chat includes menu_set & menu_reset buttons
+                self.assertTrue(any(btn.get("callback_data") == "browser:menu_set" for row in priv_kb for btn in row))
+                self.assertTrue(any(btn.get("callback_data") == "browser:menu_reset" for row in priv_kb for btn in row))
+
+                # Group chat with AGY_LIVE_BROWSER_DIRECT_APP_URL prefers direct link URL
+                sent.clear()
+                with mock.patch.dict(
+                    os.environ,
+                    {"AGY_LIVE_BROWSER_DIRECT_APP_URL": "https://t.me/example_bot/liveapp"},
+                    clear=False,
+                ):
+                    bridge.handle_message({
+                        "chat": {"id": -1001234567890, "type": "supergroup"},
+                        "from": {"id": 111},
+                        "message_id": 13,
+                        "text": "/browser",
+                    })
+                direct_kb = sent[0][2]["reply_markup"]["inline_keyboard"]
+                self.assertFalse(any("web_app" in btn for row in direct_kb for btn in row))
+                self.assertTrue(
+                    any(btn.get("url") == "https://t.me/example_bot/liveapp" for row in direct_kb for btn in row)
+                )
+
+                # Private `/start browser` deep link opens Live-Browser panel directly
+                sent.clear()
+                bridge.handle_message({
+                    "chat": {"id": 111, "type": "private"},
+                    "from": {"id": 111},
+                    "message_id": 14,
+                    "text": "/start browser",
+                })
+                self.assertEqual(1, len(sent))
+                self.assertIn("Live-Browser", sent[0][1])
+                start_kb = sent[0][2]["reply_markup"]["inline_keyboard"]
+                self.assertTrue(any("web_app" in btn for row in start_kb for btn in row))
 
             # Test switch command and callback
             post_calls: list[tuple[str, dict]] = []
@@ -688,6 +728,7 @@ class TestBridgeBrowserPanelAndRbac(unittest.TestCase):
                 self.assertTrue(any(u.endswith("/internal/profiles/switch") and b.get("profile") == "us-work" for u, b in post_calls))
 
                 post_calls.clear()
+                tg_calls.clear()
                 bridge.handle_callback({
                     "id": "cb-sw",
                     "from": {"id": 111},
@@ -696,6 +737,47 @@ class TestBridgeBrowserPanelAndRbac(unittest.TestCase):
                 })
                 self.assertTrue(any(u.endswith("/internal/profiles/switch") for u, _ in post_calls))
                 self.assertTrue(any(m == "editMessageText" for m, _ in tg_calls))
+
+                # Live Card photo callbacks MUST NOT call editMessageText
+                for cb_data, expected_ep in (
+                    ("browser:takeover_on", "/internal/takeover"),
+                    ("browser:takeover_off", "/internal/takeover"),
+                    ("browser:card_refresh", "/internal/config"),
+                    ("browser:card_stop", "/internal/stop"),
+                ):
+                    post_calls.clear()
+                    tg_calls.clear()
+                    bridge.handle_callback({
+                        "id": f"cb-{cb_data}",
+                        "from": {"id": 111},
+                        "message": {"chat": {"id": 111}, "message_id": 99},
+                        "data": cb_data,
+                    })
+                    self.assertTrue(any(u.endswith(expected_ep) for u, _ in post_calls), f"Missing POST {expected_ep} for {cb_data}")
+                    self.assertFalse(any(m == "editMessageText" for m, _ in tg_calls), f"Should not editMessageText on photo card for {cb_data}")
+
+                # Private menu_set & menu_reset call setChatMenuButton
+                tg_calls.clear()
+                bridge.handle_callback({
+                    "id": "cb-mset",
+                    "from": {"id": 111},
+                    "message": {"chat": {"id": 111}, "message_id": 100},
+                    "data": "browser:menu_set",
+                })
+                self.assertTrue(
+                    any(m == "setChatMenuButton" and kw.get("menu_button", {}).get("type") == "web_app" for m, kw in tg_calls)
+                )
+
+                tg_calls.clear()
+                bridge.handle_callback({
+                    "id": "cb-mrst",
+                    "from": {"id": 111},
+                    "message": {"chat": {"id": 111}, "message_id": 100},
+                    "data": "browser:menu_reset",
+                })
+                self.assertTrue(
+                    any(m == "setChatMenuButton" and kw.get("menu_button", {}).get("type") == "default" for m, kw in tg_calls)
+                )
 
     def test_readonly_rbac_allows_browser_view_and_blocks_mutations(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -750,8 +832,17 @@ class TestBridgeBrowserPanelAndRbac(unittest.TestCase):
                 })
                 self.assertTrue(any(m == "editMessageText" for m, _ in tg_calls))
 
-                # Blocked callbacks: `browser:switch:*`, `browser:start:*`, `browser:stop`
-                for bad_cb in ("browser:switch:us-work", "browser:start:default", "browser:stop"):
+                # Blocked callbacks: mutating panel & card & menu callbacks
+                for bad_cb in (
+                    "browser:switch:us-work",
+                    "browser:start:default",
+                    "browser:stop",
+                    "browser:takeover_on",
+                    "browser:takeover_off",
+                    "browser:card_stop",
+                    "browser:menu_set",
+                    "browser:menu_reset",
+                ):
                     tg_calls.clear()
                     bridge.handle_callback({
                         "id": "cb-ro-no",

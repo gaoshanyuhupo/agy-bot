@@ -190,6 +190,8 @@ class TestLiveBrowserProfiles(unittest.TestCase):
             {"proxy": "socks5://proxy.example.com:1080"},
             {"proxy_bao_ref": "kv/proxies/us-west"},
             {"os": "macos"},
+            {"mobile": True},
+            {"window": "430x932"},
             {"headless": False},
             {"user_data_dir": str(self.root / "other")},
             {"ephemeral": True},
@@ -365,11 +367,20 @@ class TestLiveBrowserProfiles(unittest.TestCase):
         self.assertTrue(ns_create.ephemeral)
 
         ns_start = parser.parse_args(
-            ["start", "--profile", "cf-test", "--restart", "--proxy", "socks5://proxy.example.com:1080"]
+            ["start", "--profile", "cf-test", "--restart", "--mobile", "--proxy", "socks5://proxy.example.com:1080"]
         )
         self.assertEqual("start", ns_start.cmd)
         self.assertEqual("cf-test", ns_start.profile)
         self.assertTrue(ns_start.restart)
+        self.assertTrue(ns_start.mobile)
+
+        # Verify non-pinned mobile preset resolves to portrait viewport while pinned rejects it
+        srv.create_profile("mob-demo", {"os": "linux", "mobile": True})
+        mob_spec = srv.resolve_launch_spec("mob-demo")
+        self.assertTrue(mob_spec["mobile"])
+        self.assertEqual(srv.MOBILE_WINDOW_PRESET, mob_spec["window"])
+        mob_kwargs, _ = srv.build_camoufox_kwargs(mob_spec, mob_spec["profile_dir"])
+        self.assertEqual(tuple(srv.MOBILE_WINDOW_PRESET), mob_kwargs["window"])
 
         client = live_browser_ctl.LiveBrowserClient(bot="sg")
         with mock.patch.object(client, "is_alive", return_value=False):

@@ -171,6 +171,7 @@ _READONLY_CALLBACK_EXACT = frozenset({
     "action:files",
     "action:browser",
     "browser:refresh",
+    "browser:card_refresh",
     "sched:list",
     "team:refresh",
 })

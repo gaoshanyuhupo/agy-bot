@@ -9026,6 +9026,39 @@ def _live_browser_request(method, path, json_body=None, timeout=(1.5, 4.0)):
         return False, f"请求 Live-Browser 失败: {type(exc).__name__}"
 
 
+def _resolve_live_browser_direct_app_url(st_data=None):
+    env_url = (os.environ.get("AGY_LIVE_BROWSER_DIRECT_APP_URL") or "").strip()
+    if env_url.startswith("https://"):
+        return env_url
+    if isinstance(st_data, dict):
+        st_url = str(st_data.get("direct_app_url") or "").strip()
+        if st_url.startswith("https://"):
+            return st_url
+    cfg_dir = (
+        os.environ.get("AGY_LIVE_BROWSER_CONFIG_DIR")
+        or os.path.join(os.path.expanduser("~"), ".config", "agy-live-browser")
+    )
+    cfg_path = os.path.join(cfg_dir, "config.json")
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as fh:
+            cfg = json.load(fh)
+        if isinstance(cfg, dict):
+            cfg_url = str(cfg.get("direct_app_url") or "").strip()
+            if cfg_url.startswith("https://"):
+                return cfg_url
+    except Exception:
+        pass
+    return ""
+
+
+def _resolve_bot_username():
+    handle = str(BOT_META.get("handle") or "").strip().lstrip("@")
+    if handle:
+        return handle
+    env_uname = (os.environ.get("AGY_TG_BOT_USERNAME") or "").strip().lstrip("@")
+    return env_uname
+
+
 def build_browser_panel(chat_id):
     ok_st, st_data = _live_browser_request("GET", "/internal/status", timeout=(1.5, 3.0))
     if not ok_st:
@@ -9109,11 +9142,22 @@ def build_browser_panel(chat_id):
         is_private = False
 
     buttons = []
-    if pub_url.startswith("https://"):
-        if is_private:
+    direct_app_url = _resolve_live_browser_direct_app_url(st_data)
+    if is_private:
+        if pub_url.startswith("https://"):
             buttons.append([{"text": "🖥 打开 Live-Browser Mini App", "web_app": {"url": pub_url}}])
-        else:
-            lines.append("\n💡 <i>群聊受 Telegram 限制不显示 web_app 按钮，请私聊 Bot 打开实时画面。</i>")
+    else:
+        if direct_app_url.startswith("https://"):
+            buttons.append([{"text": "🖥 打开实时画面 (Direct App)", "url": direct_app_url}])
+            lines.append("\n💡 <i>群聊支持点击上方 Direct Link 入口直接打开实时画面。</i>")
+        elif pub_url.startswith("https://"):
+            bot_uname = _resolve_bot_username()
+            if bot_uname:
+                buttons.append([{
+                    "text": "🖥 去私聊一键打开实时画面",
+                    "url": f"https://t.me/{bot_uname}?start=browser",
+                }])
+            lines.append("\n💡 <i>群聊受 Telegram 限制不显示 web_app 按钮，点击上方按钮可一键跳转私聊打开实时画面。</i>")
 
     action_btns = []
     if running and engine_mode == "async_hosted":
@@ -9139,6 +9183,12 @@ def build_browser_panel(chat_id):
         buttons.append([{"text": "🔄 刷新状态", "callback_data": "browser:refresh"}])
     else:
         buttons.append([{"text": "🔄 刷新状态", "callback_data": "browser:refresh"}])
+
+    if is_private and pub_url.startswith("https://"):
+        buttons.append([
+            {"text": "📌 设为左下角菜单", "callback_data": "browser:menu_set"},
+            {"text": "↩️ 恢复默认菜单", "callback_data": "browser:menu_reset"},
+        ])
 
     return "\n".join(lines), {"inline_keyboard": buttons}
 
@@ -9683,6 +9733,87 @@ def _handle_team_callback(cb_id, chat_id, thread_id, skey, msg_id, data):
 
 def _handle_browser_callback(cb_id, chat_id, thread_id, msg_id, data):
     sub = data[8:]
+    if sub == "takeover_on":
+        ok, res = _live_browser_request(
+            "POST",
+            "/internal/takeover",
+            json_body={"active": True, "reason": "从 Telegram 实况卡片点击接管"},
+            timeout=(1.5, 5.0),
+        )
+        if not ok:
+            tg("answerCallbackQuery", callback_query_id=cb_id, text=f"接管失败: {res}"[:180], show_alert=True)
+            return
+        tg("answerCallbackQuery", callback_query_id=cb_id, text="🟠 已切换为人工接管模式")
+        return
+    elif sub == "takeover_off":
+        ok, res = _live_browser_request(
+            "POST",
+            "/internal/takeover",
+            json_body={"active": False},
+            timeout=(1.5, 5.0),
+        )
+        if not ok:
+            tg("answerCallbackQuery", callback_query_id=cb_id, text=f"交还失败: {res}"[:180], show_alert=True)
+            return
+        tg("answerCallbackQuery", callback_query_id=cb_id, text="▶️ 已交还给 AI 继续执行")
+        return
+    elif sub == "card_refresh":
+        ok, res = _live_browser_request(
+            "POST",
+            "/internal/config",
+            json_body={"refresh_card": True},
+            timeout=(1.5, 8.0),
+        )
+        if not ok:
+            tg("answerCallbackQuery", callback_query_id=cb_id, text=f"刷新失败: {res}"[:180], show_alert=True)
+            return
+        tg("answerCallbackQuery", callback_query_id=cb_id, text="📸 实况卡片已刷新")
+        return
+    elif sub == "card_stop":
+        ok, res = _live_browser_request("POST", "/internal/stop", json_body={}, timeout=(2.0, 10.0))
+        if not ok:
+            tg("answerCallbackQuery", callback_query_id=cb_id, text=f"关闭失败: {res}"[:180], show_alert=True)
+            return
+        tg("answerCallbackQuery", callback_query_id=cb_id, text="⏹ 浏览器已安全关闭")
+        return
+    elif sub == "menu_set":
+        try:
+            is_priv = int(chat_id) > 0
+        except Exception:
+            is_priv = False
+        if not is_priv:
+            tg("answerCallbackQuery", callback_query_id=cb_id, text="仅私聊支持设置左下角菜单按钮", show_alert=True)
+            return
+        ok_st, st_data = _live_browser_request("GET", "/internal/status", timeout=(1.5, 3.0))
+        pub_url = str(st_data.get("public_url") or "").strip().rstrip("/") if ok_st and isinstance(st_data, dict) else ""
+        if not pub_url.startswith("https://"):
+            tg("answerCallbackQuery", callback_query_id=cb_id, text="尚未配置有效的 HTTPS Mini App 地址", show_alert=True)
+            return
+        r_menu = tg(
+            "setChatMenuButton",
+            chat_id=chat_id,
+            menu_button={"type": "web_app", "text": "🖥 实时画面", "web_app": {"url": pub_url}},
+        )
+        if r_menu is not None and not _tg_ok(r_menu):
+            tg("answerCallbackQuery", callback_query_id=cb_id, text="设置左下角菜单失败", show_alert=True)
+            return
+        tg("answerCallbackQuery", callback_query_id=cb_id, text="📌 已将左下角菜单设为【🖥 实时画面】")
+        return
+    elif sub == "menu_reset":
+        try:
+            is_priv = int(chat_id) > 0
+        except Exception:
+            is_priv = False
+        if not is_priv:
+            tg("answerCallbackQuery", callback_query_id=cb_id, text="仅私聊支持恢复默认菜单按钮", show_alert=True)
+            return
+        r_menu = tg("setChatMenuButton", chat_id=chat_id, menu_button={"type": "default"})
+        if r_menu is not None and not _tg_ok(r_menu):
+            tg("answerCallbackQuery", callback_query_id=cb_id, text="恢复默认菜单失败", show_alert=True)
+            return
+        tg("answerCallbackQuery", callback_query_id=cb_id, text="↩️ 已恢复默认命令菜单")
+        return
+
     if sub == "refresh":
         tg("answerCallbackQuery", callback_query_id=cb_id, text="浏览器状态已刷新")
     elif sub.startswith("switch:"):
@@ -10351,6 +10482,11 @@ def handle_message(msg):
         elif cmd == "/status":
             cmd_status(chat_id, thread_id=thread_id, scope_key=skey)
         elif cmd in ("/start", "/help"):
+            if cmd == "/start" and int(chat_id) > 0:
+                start_payload = (arg or "").strip().lower()
+                if start_payload in ("browser", "live", "live_browser"):
+                    cmd_browser(chat_id, "", thread_id=thread_id, scope_key=skey)
+                    return
             if int(chat_id) < 0:
                 send(chat_id,
                      "<b>🤝 Antigravity 团队群协作指南 (Coordinator Bot Bus)</b>\n\n"

@@ -19,7 +19,8 @@
       --amber: #d29922;
       --amber-bg: rgba(210, 153, 34, 0.16);
       --danger: #f85149;
-      --safe-bottom: env(safe-area-inset-bottom, 0px);
+      --safe-top: calc(var(--tg-safe-area-inset-top, env(safe-area-inset-top, 0px)) + var(--tg-content-safe-area-inset-top, 0px));
+      --safe-bottom: var(--tg-safe-area-inset-bottom, env(safe-area-inset-bottom, 0px));
     }
     * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
     .hidden { display: none !important; }
@@ -34,7 +35,53 @@
       display: flex; flex-direction: column;
       width: 100%; height: 100%;
       overflow: hidden;
+      padding-top: var(--safe-top);
     }
+
+    /* Immersive Fullscreen Mode */
+    #app.immersive {
+      padding-top: 0;
+    }
+    #app.immersive .topbar,
+    #app.immersive .banner,
+    #app.immersive .nav-wrap,
+    #app.immersive .dock {
+      display: none !important;
+    }
+    #immersive-fab {
+      position: fixed;
+      top: calc(var(--safe-top) + 8px);
+      right: 10px;
+      z-index: 70;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 4px 6px;
+      border-radius: 999px;
+      background: rgba(22, 27, 34, 0.78);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      border: 1px solid rgba(139, 148, 158, 0.35);
+      box-shadow: 0 6px 22px rgba(0, 0, 0, 0.55);
+    }
+    .fab-btn {
+      border: 1px solid transparent;
+      background: rgba(31, 38, 48, 0.85);
+      color: var(--text);
+      border-radius: 999px;
+      height: 28px;
+      padding: 0 8px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 3px;
+      white-space: nowrap;
+    }
+    .fab-btn:active { transform: scale(0.95); }
+    .fab-btn.takeover { background: var(--green); color: #fff; border-color: var(--green-bright); }
+    .fab-btn.accent { background: rgba(47, 129, 247, 0.25); border-color: var(--accent); color: #79c0ff; }
 
     /* Auth / Error Overlay */
     #overlay {
@@ -48,9 +95,28 @@
     .overlay-title { font-size: 18px; font-weight: 600; }
     .overlay-desc { font-size: 13px; color: var(--muted); max-width: 340px; line-height: 1.5; }
 
+    /* Reconnect Banner */
+    #reconnect-bar {
+      position: fixed;
+      top: calc(var(--safe-top) + 6px);
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 95;
+      background: rgba(33, 20, 20, 0.96);
+      border: 1px solid var(--danger);
+      color: #ffdcd7;
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.65);
+    }
+
     /* Top Floating Smart Input Sheet (Never covered by iOS Keyboard!) */
     #kb-sheet {
-      position: fixed; top: 8px; left: 8px; right: 8px; z-index: 80;
+      position: fixed; top: calc(var(--safe-top) + 8px); left: 8px; right: 8px; z-index: 80;
       background: rgba(22, 27, 34, 0.98);
       border: 1.5px solid var(--accent);
       border-radius: 12px;
@@ -63,7 +129,7 @@
       display: flex; align-items: center; justify-content: space-between;
       font-size: 12px; font-weight: 600; color: #79c0ff;
     }
-    #kb-modal-input {
+    #kb-modal-input, #dialog-prompt-input {
       width: 100%; height: 38px;
       background: #0d1117; border: 1px solid #3d495a; border-radius: 8px;
       color: var(--text); padding: 0 10px; font-size: 15px;
@@ -73,9 +139,57 @@
       display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
     }
 
-    /* Top Floating Cross-System Clipboard Sheet (To Device Clipboard / Notes / Notepad / TG) */
+    /* Native Dialog Sheet (alert / confirm / prompt / beforeunload) */
+    #dialog-sheet {
+      position: fixed; top: calc(var(--safe-top) + 10px); left: 10px; right: 10px; z-index: 92;
+      background: rgba(22, 27, 34, 0.99);
+      border: 1.5px solid var(--amber);
+      border-radius: 12px;
+      padding: 12px;
+      box-shadow: 0 14px 40px rgba(0, 0, 0, 0.85);
+      display: flex; flex-direction: column; gap: 10px;
+      max-width: 440px; margin: 0 auto;
+    }
+    .dialog-title {
+      font-size: 13px; font-weight: 700; color: #f2cc60;
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    .dialog-msg {
+      font-size: 13px; line-height: 1.5; color: var(--text);
+      max-height: 32vh; overflow-y: auto; white-space: pre-wrap; word-break: break-word;
+      user-select: text; -webkit-user-select: text;
+    }
+
+    /* Native File Upload Sheet */
+    #upload-sheet {
+      position: fixed; top: calc(var(--safe-top) + 10px); left: 10px; right: 10px; z-index: 91;
+      background: rgba(22, 27, 34, 0.99);
+      border: 1.5px solid var(--accent);
+      border-radius: 12px;
+      padding: 12px;
+      box-shadow: 0 14px 40px rgba(0, 0, 0, 0.85);
+      display: flex; flex-direction: column; gap: 9px;
+      max-width: 420px; margin: 0 auto;
+    }
+
+    /* Download Ready Banner */
+    #download-banner {
+      position: absolute; bottom: 10px; left: 10px; right: 10px; z-index: 40;
+      background: rgba(22, 27, 34, 0.96);
+      border: 1.5px solid var(--green-bright);
+      border-radius: 10px;
+      padding: 8px 10px;
+      display: flex; align-items: center; justify-content: space-between; gap: 8px;
+      box-shadow: 0 8px 26px rgba(0, 0, 0, 0.7);
+      font-size: 12px;
+    }
+    .dl-info { min-width: 0; flex: 1; }
+    .dl-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .dl-meta { font-size: 11px; color: var(--muted); }
+
+    /* Top Floating Cross-System Clipboard Sheet */
     #clip-sheet {
-      position: fixed; top: 8px; left: 8px; right: 8px; z-index: 85;
+      position: fixed; top: calc(var(--safe-top) + 8px); left: 8px; right: 8px; z-index: 85;
       background: rgba(22, 27, 34, 0.99);
       border: 1.5px solid var(--green-bright);
       border-radius: 12px;
@@ -95,18 +209,10 @@
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       resize: none; user-select: text; -webkit-user-select: text;
     }
-    #clip-textarea.expanded {
-      height: 52vh; font-size: 16px; line-height: 1.6;
-    }
-    .clip-hint {
-      font-size: 11px; color: #8b949e; line-height: 1.35;
-    }
-    .btn-copy-primary {
-      background: var(--green); border-color: var(--green-bright); color: #fff;
-    }
-    .btn-copy-slice {
-      background: #1f6feb; border-color: #58a6ff; color: #fff;
-    }
+    #clip-textarea.expanded { height: 52vh; font-size: 16px; line-height: 1.6; }
+    .clip-hint { font-size: 11px; color: #8b949e; line-height: 1.35; }
+    .btn-copy-primary { background: var(--green); border-color: var(--green-bright); color: #fff; }
+    .btn-copy-slice { background: #1f6feb; border-color: #58a6ff; color: #fff; }
     #drag-sel-box {
       position: absolute; pointer-events: none; z-index: 25;
       background: rgba(47, 129, 247, 0.24);
@@ -124,7 +230,7 @@
     /* Top Control Header */
     .topbar {
       display: flex; align-items: center; justify-content: space-between;
-      padding: 6px 10px; gap: 6px;
+      padding: 6px 8px; gap: 5px;
       background: var(--panel); border-bottom: 1px solid var(--border);
       flex-shrink: 0;
     }
@@ -163,9 +269,9 @@
 
     /* AI / Takeover Status Banner */
     .banner {
-      padding: 5px 10px; font-size: 12px;
+      padding: 4px 8px; font-size: 11.5px;
       background: #121820; border-bottom: 1px solid var(--border);
-      display: flex; align-items: center; justify-content: space-between; gap: 8px;
+      display: flex; align-items: center; justify-content: space-between; gap: 6px;
       flex-shrink: 0;
     }
     .banner.takeover-active {
@@ -175,6 +281,12 @@
     .banner-text {
       overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1;
     }
+    .mini-badge {
+      border: 1px solid var(--border); background: var(--panel-2); color: var(--muted);
+      border-radius: 999px; padding: 2px 7px; font-size: 10.5px; font-weight: 600;
+      cursor: pointer; white-space: nowrap; flex-shrink: 0;
+    }
+    .mini-badge:active { opacity: 0.75; }
 
     /* Navigation & Tabs */
     .nav-wrap {
@@ -192,9 +304,7 @@
       background: #11161d; color: var(--muted); border: 1px solid var(--border);
       border-bottom: none; max-width: 140px; cursor: pointer; flex-shrink: 0;
     }
-    .tab-pill.active {
-      background: var(--panel-2); color: var(--text); font-weight: 600;
-    }
+    .tab-pill.active { background: var(--panel-2); color: var(--text); font-weight: 600; }
     .tab-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .tab-close { opacity: 0.65; font-size: 12px; padding: 0 2px; }
     .url-bar {
@@ -236,18 +346,45 @@
     }
     #idle-card.hidden { display: none; }
 
-    /* Cursor & Click Ripples */
-    .ripple {
-      position: absolute; width: 22px; height: 22px; border-radius: 50%;
-      transform: translate(-50%, -50%) scale(0.3);
-      pointer-events: none; animation: ripple-anim 0.55s ease-out forwards;
+    /* Sharp Precision Small Arrow Cursor (Tip strictly anchored at 0,0) */
+    #remote-cursor {
+      position: absolute;
+      left: 0; top: 0;
+      width: 17px; height: 21px;
+      pointer-events: none;
+      z-index: 28;
+      transform-origin: 0 0;
+      transition: opacity 0.25s ease;
+      filter: drop-shadow(0 1px 1.6px rgba(0, 0, 0, 0.72));
+      will-change: left, top, transform, opacity;
     }
-    .ripple.human { border: 2.5px solid var(--amber); background: rgba(210, 153, 34, 0.25); }
-    .ripple.ai { border: 2.5px solid #58a6ff; background: rgba(88, 166, 255, 0.25); }
-    .ripple.extract { border: 2.5px solid var(--green-bright); background: rgba(63, 185, 80, 0.30); }
-    @keyframes ripple-anim {
-      0% { opacity: 1; transform: translate(-50%, -50%) scale(0.35); }
-      100% { opacity: 0; transform: translate(-50%, -50%) scale(1.75); }
+    #remote-cursor svg {
+      display: block;
+      overflow: visible;
+    }
+    #remote-cursor.human .cursor-body { fill: #ffffff; stroke: #0d1117; }
+    #remote-cursor.ai .cursor-body { fill: #58a6ff; stroke: #0d1117; }
+    #remote-cursor.drag .cursor-body { fill: #f2cc60; stroke: #0d1117; }
+    #remote-cursor.faded { opacity: 0.28; }
+
+    /* Delicate Precision Click Ring at Arrow Tip (Replaces old blobby ripple) */
+    .click-ring {
+      position: absolute;
+      width: 12px; height: 12px;
+      border-radius: 50%;
+      background: transparent;
+      transform: translate(-50%, -50%) scale(0.45);
+      pointer-events: none;
+      z-index: 26;
+      animation: click-ring-anim 0.32s ease-out forwards;
+    }
+    .click-ring.human { border: 1.5px solid #ffffff; box-shadow: 0 0 0 0.75px rgba(13, 17, 23, 0.85); }
+    .click-ring.right { border: 1.5px solid var(--amber); }
+    .click-ring.ai { border: 1.5px solid #58a6ff; }
+    .click-ring.extract { border: 1.5px solid var(--green-bright); }
+    @keyframes click-ring-anim {
+      0% { opacity: 0.95; transform: translate(-50%, -50%) scale(0.45); }
+      100% { opacity: 0; transform: translate(-50%, -50%) scale(1.65); }
     }
 
     /* Floating Toast */
@@ -278,6 +415,7 @@
       cursor: pointer; flex-shrink: 0; white-space: nowrap;
     }
     .chip.active { border-color: var(--accent); color: #79c0ff; background: rgba(47, 129, 247, 0.16); }
+    .chip.hold-active { border-color: var(--amber); color: #f2cc60; background: var(--amber-bg); }
     .input-row {
       display: flex; align-items: center; gap: 5px;
     }
@@ -298,7 +436,7 @@
       font-size: 11px;
       font-weight: 500;
       cursor: pointer;
-      max-width: 52vw;
+      max-width: 44vw;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
@@ -376,6 +514,20 @@
     .btn-danger {
       background: rgba(248, 81, 73, 0.16); border-color: var(--danger); color: #ff7b72;
     }
+
+    /* Landscape Mobile Compact Mode */
+    @media (orientation: landscape) and (max-height: 520px) {
+      .topbar { padding: 3px 8px; gap: 4px; }
+      .btn { padding: 3px 7px; font-size: 11px; }
+      .banner { display: none; }
+      .tabs-bar { display: none; }
+      .url-bar { padding: 3px 8px; }
+      .icon-btn { width: 24px; height: 24px; font-size: 12px; }
+      #url-input { height: 24px; font-size: 12px; }
+      .dock { padding: 3px 8px calc(3px + var(--safe-bottom)) 8px; gap: 4px; }
+      .dock .input-row { display: none; }
+      .chip { padding: 3px 7px; font-size: 10.5px; }
+    }
   </style>
 </head>
 <body>
@@ -383,9 +535,53 @@
     <div class="overlay-icon" id="ov-icon">🔐</div>
     <div class="overlay-title" id="ov-title">正在验证 Telegram 安全签名...</div>
     <div class="overlay-desc" id="ov-desc">仅允许已授权的 Telegram 账号在 Mini App 内实时查看与接管浏览器。</div>
+    <button class="btn btn-takeover hidden" id="ov-reconnect-btn" onclick="manualReconnect()">🔄 立即重连</button>
   </div>
 
-  <!-- Top Floating Smart Input Sheet (Pops up automatically when tapping webpage inputs, never covered by mobile keyboard) -->
+  <!-- Disconnect / Backoff Reconnect Floating Bar -->
+  <div id="reconnect-bar" class="hidden">
+    <span id="reconnect-text">连接已断开，正在重连...</span>
+    <button class="chip active" id="reconnect-btn" onclick="manualReconnect()">🔄 立即重连</button>
+  </div>
+
+  <!-- Immersive Fullscreen Floating Capsule -->
+  <div id="immersive-fab" class="hidden">
+    <button class="fab-btn accent" id="fab-takeover-btn" onclick="toggleTakeover()">🖐 接管</button>
+    <button class="fab-btn" id="fab-mode-btn" onclick="cycleGestureMode()" title="切换手势模式">👆 点按</button>
+    <button class="fab-btn" onclick="openKbSheetManual()" title="输入法">⌨️</button>
+    <button class="fab-btn hidden" id="fab-tgfs-btn" onclick="toggleTgFullscreen()" title="切换 Telegram 全屏">⛶</button>
+    <button class="fab-btn" onclick="toggleImmersive(false)" title="退出沉浸模式">✕</button>
+  </div>
+
+  <!-- Native Webpage Dialog Sheet (alert / confirm / prompt / beforeunload) -->
+  <div id="dialog-sheet" class="hidden" role="alertdialog" aria-label="网页弹窗">
+    <div class="dialog-title">
+      <span id="dialog-type-label">💬 网页提示</span>
+      <button class="chip" onclick="submitDialog(false)">关闭 ×</button>
+    </div>
+    <div id="dialog-msg" class="dialog-msg"></div>
+    <input id="dialog-prompt-input" class="hidden" type="text" placeholder="请输入内容..." autocomplete="off" />
+    <div class="kb-actions">
+      <button class="btn btn-takeover" style="flex:1;justify-content:center;" onclick="submitDialog(true)">✅ 确定</button>
+      <button class="btn" id="dialog-cancel-btn" onclick="submitDialog(false)">取消</button>
+    </div>
+  </div>
+
+  <!-- Native File Chooser Upload Sheet -->
+  <div id="upload-sheet" class="hidden" role="dialog" aria-label="上传文件到网页">
+    <div class="kb-header">
+      <span id="upload-sheet-title">📤 网页请求选择文件上传</span>
+      <button class="chip" onclick="cancelFileChooser()">取消 ×</button>
+    </div>
+    <div class="clip-hint" id="upload-sheet-desc">点击下方按钮从手机相册或文件管理器选择文件（单次上限 25MB）：</div>
+    <input id="file-upload-input" type="file" class="hidden" />
+    <div class="kb-actions">
+      <button class="btn btn-takeover" id="upload-pick-btn" style="flex:1;justify-content:center;" onclick="triggerFilePick()">📁 选择文件 / 相册</button>
+      <button class="btn" onclick="cancelFileChooser()">取消</button>
+    </div>
+  </div>
+
+  <!-- Top Floating Smart Input Sheet -->
   <div id="kb-sheet" class="hidden">
     <div class="kb-header">
       <span id="kb-sheet-label">⌨️ 向网页输入框打字</span>
@@ -421,9 +617,9 @@
     <textarea id="clip-textarea" placeholder="点上方【🖊 去画面涂抹选字】用手指划过网页文字；或点【📄 载入整页自由划词】在这里用光标随意节选..."></textarea>
     <div class="kb-actions">
       <button class="btn btn-copy-primary" id="copy-local-btn" style="flex:1;justify-content:center;" onpointerdown="event.preventDefault()" onclick="copyToDeviceClipboard()">📋 复制框内全部</button>
-      <button class="btn" id="share-btn" onpointerdown="event.preventDefault()" onclick="shareToOtherApps()" title="调用系统原生分享直达备忘录/记事本/其他应用">📤 备忘录/分享</button>
+      <button class="btn" id="share-btn" onpointerdown="event.preventDefault()" onclick="shareToOtherApps()" title="调用系统原生分享直达备忘录/记事本/其他应用">📤 分享</button>
       <button class="btn" onpointerdown="event.preventDefault()" onclick="downloadAsTxt()" title="保存为 .txt 记事本文件">💾 .txt</button>
-      <button class="btn" onpointerdown="event.preventDefault()" onclick="sendClipToTg()" title="发送到当前 Telegram 聊天框">📨 发回TG</button>
+      <button class="btn" onpointerdown="event.preventDefault()" onclick="sendClipToTg()" title="发送到私聊 Telegram">📨 发回TG</button>
     </div>
   </div>
 
@@ -433,15 +629,17 @@
         <span class="dot" id="conn-dot"></span>
         <span class="metrics" id="metrics-text">连接中...</span>
       </div>
+      <button class="btn" id="immersive-btn" onclick="toggleImmersive()" title="沉浸全屏隐藏工具栏">⛶ 沉浸</button>
       <button class="btn" id="top-extract-btn" onclick="toggleExtractMode()" title="在网页上用手指涂抹/拖动选定任意文字复制">🖊 选字</button>
-      <button class="btn" onclick="openKbSheetManual()" title="弹出顶部输入法面板">⌨️ 打字</button>
-      <button class="btn btn-takeover" id="takeover-btn" onclick="toggleTakeover()">🖐 一键接管</button>
+      <button class="btn" onclick="openKbSheetManual()" title="弹出顶部输入法面板">⌨️</button>
+      <button class="btn btn-takeover" id="takeover-btn" onclick="toggleTakeover()">🖐 接管</button>
     </div>
 
     <div class="banner" id="mode-banner">
       <span class="banner-text" id="banner-text">👀 观看模式 · 触屏仅缩放浏览，不会打断 AI</span>
       <button class="profile-badge-btn" id="profile-badge" onclick="openProfileSheet()" title="查看或切换浏览器指纹与出口">🎭 默认指纹</button>
-      <span id="zoom-badge" style="font-size:11px;color:var(--muted);cursor:pointer;" onclick="resetZoom()">100%</span>
+      <button class="mini-badge" id="quality-badge" onclick="cycleQualityPreset()" title="点击切换流畅/均衡/高清画质">🎬 均衡</button>
+      <button class="mini-badge" id="zoom-badge" onclick="resetZoom()" title="点击或双击 1:1 复位">100%</button>
     </div>
 
     <div class="nav-wrap">
@@ -450,7 +648,7 @@
         <button class="icon-btn" title="后退" onclick="sendNav('back')">◀</button>
         <button class="icon-btn" title="前进" onclick="sendNav('forward')">▶</button>
         <button class="icon-btn" title="刷新" onclick="sendNav('reload')">↻</button>
-        <input id="url-input" type="text" placeholder="输入网址回车跳转（需先点接管）" enterkeyhint="go" />
+        <input id="url-input" type="text" placeholder="输入网址回车跳转（未接管时自动接管）" enterkeyhint="go" />
         <button class="icon-btn" title="前往" onclick="submitUrl()">↵</button>
       </div>
     </div>
@@ -458,9 +656,25 @@
     <div id="stage">
       <div id="canvas-wrap">
         <canvas id="screen" width="1280" height="800"></canvas>
+        <!-- Sharp Precision Small Arrow Cursor (Tip strictly at 0,0) -->
+        <div id="remote-cursor" class="hidden human" aria-hidden="true">
+          <svg width="17" height="21" viewBox="0 0 17 21" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <path d="M0.6 0.6L0.6 15.8L4.7 12.1L7.6 18.6L9.9 17.5L7.0 11.0L12.6 11.0L0.6 0.6Z"
+                  class="cursor-body" stroke-width="1.35" stroke-linejoin="round" />
+          </svg>
+        </div>
         <div id="drag-sel-box" class="hidden"></div>
       </div>
       <div id="live-sel-pill" class="hidden"></div>
+      <div id="download-banner" class="hidden">
+        <div class="dl-info">
+          <div class="dl-name" id="dl-name">download.bin</div>
+          <div class="dl-meta" id="dl-meta">准备就绪</div>
+        </div>
+        <button class="chip active" onclick="sendLatestDownloadToTg()">📨 发回TG</button>
+        <button class="chip" onclick="downloadLatestFile()">💾 下载</button>
+        <button class="chip" onclick="closeDownloadBanner()">×</button>
+      </div>
       <div id="idle-card" class="hidden">
         <div style="font-size:34px;">🖥</div>
         <div style="font-size:15px;font-weight:600;">当前没有正在运行的浏览器任务</div>
@@ -484,18 +698,24 @@
 
     <div class="dock">
       <div class="quick-row">
-        <button class="chip active" id="mode-touch-btn" onclick="setGestureMode('interact')">👆 点按+滑屏</button>
-        <button class="chip" id="mode-extract-btn" onclick="toggleExtractMode()">🖊 拖选文字</button>
-        <button class="chip" onclick="openClipSheetManual()">📋 复制面板</button>
-        <button class="chip" id="mode-pan-btn" onclick="setGestureMode('pan')">🔍 拖动画布</button>
-        <button class="chip" onclick="resetZoom()">1:1 复位</button>
+        <button class="chip active" id="mode-touch-btn" onclick="setGestureMode('interact')">👆 点按</button>
+        <button class="chip" id="mode-trackpad-btn" onclick="setGestureMode('trackpad')">🖱 触控板</button>
+        <button class="chip hidden" id="trackpad-hold-btn" onclick="toggleTrackpadHold()">✋ 按住拖曳</button>
+        <button class="chip" id="mode-drag-btn" onclick="setGestureMode('drag')">✋ 拖拽</button>
+        <button class="chip" id="mode-extract-btn" onclick="toggleExtractMode()">🖊 选字</button>
+        <button class="chip" onclick="openClipSheetManual()">📋 复制</button>
+        <button class="chip" onclick="sendHdScreenshot()">📸 截高清图</button>
+        <button class="chip" onclick="resetZoom()">1:1</button>
         <button class="chip" onclick="sendKey('Enter')">↵ Enter</button>
         <button class="chip" onclick="sendKey('Tab')">⇥ Tab</button>
         <button class="chip" onclick="sendKey('Backspace')">⌫ 退格</button>
         <button class="chip" onclick="sendKey('Escape')">Esc</button>
+        <button class="chip" onclick="sendKey('Control+v')">Ctrl+V</button>
+        <button class="chip" onclick="sendKey('Control+z')">Ctrl+Z</button>
+        <button class="chip" onclick="sendKey('Control+f')">Ctrl+F</button>
         <button class="chip" onclick="sendScroll(0, -360)">⬆ 上翻</button>
         <button class="chip" onclick="sendScroll(0, 360)">⬇ 下翻</button>
-        <button class="chip" onclick="clearField()">清空输入框</button>
+        <button class="chip" onclick="clearField()">清空框</button>
       </div>
       <div class="input-row">
         <input id="text-input" type="text" placeholder="点网页输入框会自动弹窗，或直接在此打字发送..." enterkeyhint="send" autocomplete="off" />
@@ -538,8 +758,8 @@
     const ctx = screenCanvas.getContext('2d', { alpha: false });
     const stage = document.getElementById('stage');
     const canvasWrap = document.getElementById('canvas-wrap');
+    const remoteCursorEl = document.getElementById('remote-cursor');
 
-    // Keep #app sized strictly above iOS / Android virtual keyboard!
     function syncViewportHeight() {
       const vv = window.visualViewport;
       if (vv) {
@@ -558,6 +778,11 @@
 
     let ws = null;
     let authed = false;
+    let authRejected = false;
+    let reconnectAttempt = 0;
+    let reconnectTimer = null;
+    const RECONNECT_DELAYS = [1000, 2000, 4000, 8000];
+
     let state = {
       running: false,
       engine_mode: 'idle',
@@ -574,18 +799,40 @@
       vw: 1280,
       vh: 800,
       tabs: [],
+      quality_preset: 'balanced',
       profiles: []
     };
+
+    let prevTakeoverState = false;
+    let immersiveMode = false;
+    let tgFullscreenActive = false;
 
     let frameCount = 0;
     let currentFps = 0;
     let rttMs = 0;
     let lastFpsTick = performance.now();
 
+    // Latest-frame single-slot decoder (zero frame backlog on mobile)
+    let pendingFrameBlob = null;
+    let decodingFrame = false;
+
+    // Zoom & Pan state
     let scale = 1.0;
     let panX = 0;
     let panY = 0;
+
+    // Gesture modes: 'interact' | 'trackpad' | 'drag' | 'extract'
     let gestureMode = 'interact';
+    let trackpadX = 640;
+    let trackpadY = 400;
+    let trackpadInitialized = false;
+    let trackpadHolding = false;
+    let cursorFadeTimer = null;
+
+    // Active P2 dialog / filechooser / download state
+    let activeDialogId = null;
+    let activeChooserId = null;
+    let latestDownload = null;
 
     function haptic(kind = 'light') {
       try { tg?.HapticFeedback?.impactOccurred(kind); } catch (_) {}
@@ -600,6 +847,77 @@
       toastTimer = setTimeout(() => el.classList.remove('show'), 2200);
     }
 
+    // ---------------- Sharp Small Arrow Cursor ----------------
+    function updateCursorInverseScale() {
+      const inv = 1 / Math.max(1, scale);
+      remoteCursorEl.style.transform = `scale(${inv.toFixed(4)})`;
+    }
+
+    function positionArrowCursor(remoteX, remoteY, actor = 'human', keepVisible = false) {
+      const vw = Math.max(1, state.vw || 1280);
+      const vh = Math.max(1, state.vh || 800);
+      const clampedX = Math.max(0, Math.min(vw, remoteX));
+      const clampedY = Math.max(0, Math.min(vh, remoteY));
+      const localX = (clampedX / vw) * (screenCanvas.clientWidth || 1);
+      const localY = (clampedY / vh) * (screenCanvas.clientHeight || 1);
+
+      remoteCursorEl.style.left = localX.toFixed(2) + 'px';
+      remoteCursorEl.style.top = localY.toFixed(2) + 'px';
+      remoteCursorEl.classList.remove('hidden', 'faded', 'human', 'ai', 'drag');
+      remoteCursorEl.classList.add(actor === 'ai' ? 'ai' : (actor === 'drag' ? 'drag' : 'human'));
+      updateCursorInverseScale();
+
+      clearTimeout(cursorFadeTimer);
+      if (!keepVisible && gestureMode !== 'trackpad') {
+        cursorFadeTimer = setTimeout(() => {
+          if (gestureMode !== 'trackpad') {
+            remoteCursorEl.classList.add('faded');
+          }
+        }, 3500);
+      }
+      return { localX, localY, x: clampedX, y: clampedY };
+    }
+
+    function spawnClickRing(localX, localY, cls = 'human') {
+      const r = document.createElement('div');
+      r.className = 'click-ring ' + cls;
+      r.style.left = localX + 'px';
+      r.style.top = localY + 'px';
+      canvasWrap.appendChild(r);
+      setTimeout(() => r.remove(), 350);
+    }
+
+    // ---------------- Viewport Layout, Zoom & Pan Clamping ----------------
+    function getStageBaseOffset() {
+      const sw = stage.clientWidth || 1;
+      const sh = stage.clientHeight || 1;
+      const dw = screenCanvas.clientWidth || 1;
+      const dh = screenCanvas.clientHeight || 1;
+      return { sw, sh, dw, dh, baseLeft: (sw - dw) / 2, baseTop: (sh - dh) / 2 };
+    }
+
+    function clampPan() {
+      const { sw, sh, dw, dh, baseLeft, baseTop } = getStageBaseOffset();
+      const scaledW = dw * scale;
+      const scaledH = dh * scale;
+
+      if (scaledW <= sw + 0.5) {
+        panX = (dw - scaledW) / 2;
+      } else {
+        const minPanX = sw - baseLeft - scaledW;
+        const maxPanX = -baseLeft;
+        panX = Math.max(minPanX, Math.min(maxPanX, panX));
+      }
+
+      if (scaledH <= sh + 0.5) {
+        panY = (dh - scaledH) / 2;
+      } else {
+        const minPanY = sh - baseTop - scaledH;
+        const maxPanY = -baseTop;
+        panY = Math.max(minPanY, Math.min(maxPanY, panY));
+      }
+    }
+
     function fitCanvasLayout() {
       const sw = stage.clientWidth;
       const sh = stage.clientHeight;
@@ -611,14 +929,20 @@
       screenCanvas.style.width = dispW + 'px';
       screenCanvas.style.height = dispH + 'px';
       applyTransform();
+      if (gestureMode === 'trackpad' && state.running) {
+        positionArrowCursor(trackpadX, trackpadY, trackpadHolding ? 'drag' : 'human', true);
+      }
     }
 
     function applyTransform() {
       if (scale <= 1.01) {
         scale = 1.0; panX = 0; panY = 0;
+      } else {
+        clampPan();
       }
-      canvasWrap.style.transform = `translate(${panX}px, ${panY}px) scale(${scale})`;
+      canvasWrap.style.transform = `translate(${panX.toFixed(2)}px, ${panY.toFixed(2)}px) scale(${scale.toFixed(4)})`;
       document.getElementById('zoom-badge').textContent = Math.round(scale * 100) + '%';
+      updateCursorInverseScale();
     }
 
     function resetZoom() {
@@ -626,11 +950,96 @@
       applyTransform();
     }
 
+    // ---------------- Immersive & TG WebApp 8.0+ Fullscreen ----------------
+    if (tg && typeof tg.requestFullscreen === 'function') {
+      document.getElementById('fab-tgfs-btn').classList.remove('hidden');
+    }
+
+    function toggleImmersive(forceVal) {
+      immersiveMode = (typeof forceVal === 'boolean') ? forceVal : !immersiveMode;
+      appEl.classList.toggle('immersive', immersiveMode);
+      document.getElementById('immersive-fab').classList.toggle('hidden', !immersiveMode);
+      haptic('light');
+      setTimeout(syncViewportHeight, 30);
+    }
+
+    function toggleTgFullscreen() {
+      if (!tg) return;
+      try {
+        if (!tgFullscreenActive && typeof tg.requestFullscreen === 'function') {
+          tg.requestFullscreen();
+          tgFullscreenActive = true;
+          document.getElementById('fab-tgfs-btn').textContent = '🗗';
+        } else if (typeof tg.exitFullscreen === 'function') {
+          tg.exitFullscreen();
+          tgFullscreenActive = false;
+          document.getElementById('fab-tgfs-btn').textContent = '⛶';
+        }
+      } catch (_) {}
+      setTimeout(syncViewportHeight, 120);
+    }
+
+    function updateFabUi() {
+      const fabTk = document.getElementById('fab-takeover-btn');
+      if (fabTk) {
+        if (state.takeover) {
+          fabTk.className = 'fab-btn takeover';
+          fabTk.textContent = '▶️ 交还';
+        } else {
+          fabTk.className = 'fab-btn accent';
+          fabTk.textContent = '🖐 接管';
+        }
+      }
+      const modeLabels = { interact: '👆 点按', trackpad: '🖱 触控板', drag: '✋ 拖拽', extract: '🖊 选字' };
+      const fabMode = document.getElementById('fab-mode-btn');
+      if (fabMode) fabMode.textContent = modeLabels[gestureMode] || '👆 点按';
+    }
+
+    // ---------------- Gesture Mode Switching ----------------
+    function releaseTrackpadHoldIfNeeded() {
+      if (!trackpadHolding) return;
+      trackpadHolding = false;
+      const btn = document.getElementById('trackpad-hold-btn');
+      if (btn) {
+        btn.classList.remove('hold-active');
+        btn.textContent = '✋ 按住拖曳';
+      }
+      if (state.running && state.takeover && ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'input', action: 'mouseup', x: trackpadX, y: trackpadY, button: 'left' }));
+      }
+      positionArrowCursor(trackpadX, trackpadY, 'human', gestureMode === 'trackpad');
+    }
+
+    function toggleTrackpadHold() {
+      if (!ensureTakeoverOrWarn()) return;
+      haptic('medium');
+      if (trackpadHolding) {
+        releaseTrackpadHoldIfNeeded();
+        showToast('已松开鼠标左键');
+      } else {
+        trackpadHolding = true;
+        const btn = document.getElementById('trackpad-hold-btn');
+        if (btn) {
+          btn.classList.add('hold-active');
+          btn.textContent = '🟡 拖曳中·点松开';
+        }
+        positionArrowCursor(trackpadX, trackpadY, 'drag', true);
+        ws.send(JSON.stringify({ type: 'input', action: 'mousedown', x: trackpadX, y: trackpadY, button: 'left' }));
+        showToast('🟡 已按住左键，单指滑动即可拖曳');
+      }
+    }
+
     function setGestureMode(mode) {
+      if (gestureMode === 'trackpad' && mode !== 'trackpad') {
+        releaseTrackpadHoldIfNeeded();
+      }
       gestureMode = mode;
       document.getElementById('mode-touch-btn').classList.toggle('active', mode === 'interact');
+      document.getElementById('mode-trackpad-btn').classList.toggle('active', mode === 'trackpad');
+      document.getElementById('mode-drag-btn').classList.toggle('active', mode === 'drag');
       document.getElementById('mode-extract-btn').classList.toggle('active', mode === 'extract');
-      document.getElementById('mode-pan-btn').classList.toggle('active', mode === 'pan');
+      document.getElementById('trackpad-hold-btn').classList.toggle('hidden', mode !== 'trackpad');
+
       const topBtn = document.getElementById('top-extract-btn');
       if (topBtn) {
         topBtn.classList.toggle('btn-takeover', mode === 'extract');
@@ -643,6 +1052,25 @@
         document.getElementById('drag-sel-box').classList.add('hidden');
         document.getElementById('live-sel-pill').classList.add('hidden');
       }
+      if (mode === 'trackpad') {
+        if (!trackpadInitialized) {
+          trackpadX = Math.round((state.vw || 1280) / 2);
+          trackpadY = Math.round((state.vh || 800) / 2);
+          trackpadInitialized = true;
+        }
+        positionArrowCursor(trackpadX, trackpadY, 'human', true);
+        showToast('🖱 触控板：单指移箭头/轻点左键 · 双指轻点右键/滑动滚轮');
+      } else if (mode === 'drag') {
+        showToast('✋ 拖拽模式：单指直接按住拖动滑块/列表');
+      }
+      updateFabUi();
+    }
+
+    function cycleGestureMode() {
+      const order = ['interact', 'trackpad', 'drag', 'extract'];
+      const next = order[(order.indexOf(gestureMode) + 1) % order.length];
+      haptic('light');
+      setGestureMode(next);
     }
 
     function toggleExtractMode() {
@@ -650,7 +1078,218 @@
       setGestureMode(gestureMode === 'extract' ? 'interact' : 'extract');
     }
 
-    // Cross-System Clipboard & Free Word-Selection Sheet
+    // ---------------- Quality Preset Switcher ----------------
+    const QUALITY_ORDER = ['smooth', 'balanced', 'hd'];
+    const QUALITY_LABELS = { smooth: '🎬 流畅', balanced: '🎬 均衡', hd: '🎬 高清' };
+
+    function renderQualityBadge() {
+      const badge = document.getElementById('quality-badge');
+      if (badge) {
+        badge.textContent = QUALITY_LABELS[state.quality_preset] || '🎬 均衡';
+      }
+    }
+
+    function cycleQualityPreset() {
+      if (!ws || ws.readyState !== WebSocket.OPEN || !authed) return;
+      haptic('light');
+      const cur = QUALITY_ORDER.indexOf(state.quality_preset || 'balanced');
+      const next = QUALITY_ORDER[(cur + 1) % QUALITY_ORDER.length];
+      state.quality_preset = next;
+      renderQualityBadge();
+      ws.send(JSON.stringify({ type: 'set_quality', preset: next }));
+    }
+
+    function sendHdScreenshot() {
+      if (!state.running) {
+        showToast('浏览器尚未运行');
+        return;
+      }
+      if (!ws || ws.readyState !== WebSocket.OPEN || !authed) return;
+      haptic('medium');
+      showToast('📸 正在采集高清截图并发送至私聊 TG...');
+      ws.send(JSON.stringify({ type: 'send_hd_screenshot' }));
+    }
+
+    // ---------------- P2 Native Dialogs (alert / confirm / prompt) ----------------
+    function openDialogSheet(msg) {
+      activeDialogId = msg.dialog_id;
+      const typeLabels = {
+        alert: '⚠️ 网页提示 (alert)',
+        confirm: '❓ 网页确认 (confirm)',
+        prompt: '✏️ 网页输入 (prompt)',
+        beforeunload: '🚪 离开页面确认'
+      };
+      document.getElementById('dialog-type-label').textContent = typeLabels[msg.dialog_type] || '💬 网页弹窗';
+      document.getElementById('dialog-msg').textContent = msg.message || '(无内容)';
+      const inp = document.getElementById('dialog-prompt-input');
+      const cancelBtn = document.getElementById('dialog-cancel-btn');
+      if (msg.dialog_type === 'prompt') {
+        inp.value = msg.default_value || '';
+        inp.classList.remove('hidden');
+        setTimeout(() => inp.focus(), 40);
+      } else {
+        inp.classList.add('hidden');
+      }
+      cancelBtn.classList.toggle('hidden', msg.dialog_type === 'alert');
+      document.getElementById('dialog-sheet').classList.remove('hidden');
+      haptic('medium');
+    }
+
+    function closeDialogSheet() {
+      activeDialogId = null;
+      document.getElementById('dialog-prompt-input').blur();
+      document.getElementById('dialog-sheet').classList.add('hidden');
+    }
+
+    function submitDialog(accept) {
+      if (!activeDialogId) return closeDialogSheet();
+      const did = activeDialogId;
+      const promptText = document.getElementById('dialog-prompt-input').value;
+      closeDialogSheet();
+      if (ws && ws.readyState === WebSocket.OPEN && authed) {
+        ws.send(JSON.stringify({
+          type: 'dialog_response',
+          dialog_id: did,
+          accept: !!accept,
+          prompt_text: promptText
+        }));
+      }
+    }
+
+    document.getElementById('dialog-prompt-input').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); submitDialog(true); }
+      if (e.key === 'Escape') { e.preventDefault(); submitDialog(false); }
+    });
+
+    // ---------------- P2 File Upload (`filechooser`) ----------------
+    const fileUploadInput = document.getElementById('file-upload-input');
+
+    function openUploadSheet(msg) {
+      activeChooserId = msg.chooser_id;
+      fileUploadInput.value = '';
+      fileUploadInput.multiple = !!msg.multiple;
+      document.getElementById('upload-sheet-title').textContent = msg.multiple
+        ? '📤 网页请求上传文件（支持多选）'
+        : '📤 网页请求上传文件';
+      document.getElementById('upload-sheet-desc').textContent =
+        '点击下方按钮从手机相册或文件管理器选择文件（单次上限 25MB）：';
+      document.getElementById('upload-pick-btn').disabled = false;
+      document.getElementById('upload-sheet').classList.remove('hidden');
+      haptic('medium');
+    }
+
+    function closeUploadSheet() {
+      activeChooserId = null;
+      fileUploadInput.value = '';
+      document.getElementById('upload-sheet').classList.add('hidden');
+    }
+
+    function cancelFileChooser() {
+      const cid = activeChooserId;
+      closeUploadSheet();
+      if (cid && ws && ws.readyState === WebSocket.OPEN && authed) {
+        ws.send(JSON.stringify({ type: 'filechooser_cancel', chooser_id: cid }));
+      }
+    }
+
+    function triggerFilePick() {
+      fileUploadInput.click();
+    }
+
+    fileUploadInput.addEventListener('change', async () => {
+      const files = Array.from(fileUploadInput.files || []);
+      if (!files.length || !activeChooserId) return;
+      const maxBytes = 25 * 1024 * 1024;
+      const total = files.reduce((acc, f) => acc + (f.size || 0), 0);
+      if (total > maxBytes) {
+        showToast('❌ 所选文件超过 25MB 限制');
+        return;
+      }
+      const pickBtn = document.getElementById('upload-pick-btn');
+      pickBtn.disabled = true;
+      document.getElementById('upload-sheet-desc').textContent =
+        `⏳ 正在上传 ${files.length} 个文件 (${(total / 1024).toFixed(1)} KB)...`;
+
+      const form = new FormData();
+      form.append('chooser_id', activeChooserId);
+      files.forEach((f) => form.append('files', f, f.name));
+
+      try {
+        const initData = (tg && tg.initData) ? tg.initData : '';
+        const resp = await fetch(`/api/upload?chooser_id=${encodeURIComponent(activeChooserId)}`, {
+          method: 'POST',
+          headers: { 'X-TG-Init-Data': initData },
+          body: form
+        });
+        const res = await resp.json().catch(() => ({}));
+        if (resp.ok && res.ok) {
+          showToast(`✅ 已上传 ${files.length} 个文件至网页`);
+          closeUploadSheet();
+        } else {
+          showToast(`❌ 上传失败: ${res.error || resp.status}`);
+          pickBtn.disabled = false;
+          document.getElementById('upload-sheet-desc').textContent = `❌ 上传失败：${res.error || resp.status}`;
+        }
+      } catch (err) {
+        showToast('❌ 上传网络异常');
+        pickBtn.disabled = false;
+      }
+    });
+
+    // ---------------- P2 File Download Banner ----------------
+    function formatBytes(n) {
+      if (!n || n < 1024) return `${n || 0} B`;
+      if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+      return `${(n / (1024 * 1024)).toFixed(2)} MB`;
+    }
+
+    function showDownloadBanner(msg) {
+      latestDownload = msg;
+      document.getElementById('dl-name').textContent = `📥 ${msg.filename || 'download.bin'}`;
+      document.getElementById('dl-meta').textContent = msg.auto_sent
+        ? `${formatBytes(msg.size)} · ✅ 已自动发往私聊 TG`
+        : `${formatBytes(msg.size)} · 点击右侧发回 TG 或直接下载`;
+      document.getElementById('download-banner').classList.remove('hidden');
+      haptic('light');
+    }
+
+    function closeDownloadBanner() {
+      document.getElementById('download-banner').classList.add('hidden');
+    }
+
+    function sendLatestDownloadToTg() {
+      if (!latestDownload || !latestDownload.download_id) return;
+      if (ws && ws.readyState === WebSocket.OPEN && authed) {
+        ws.send(JSON.stringify({ type: 'send_download_to_tg', download_id: latestDownload.download_id }));
+      }
+    }
+
+    async function downloadLatestFile() {
+      if (!latestDownload || !latestDownload.download_id) return;
+      try {
+        const initData = (tg && tg.initData) ? tg.initData : '';
+        const resp = await fetch(`/api/download/${encodeURIComponent(latestDownload.download_id)}`, {
+          headers: { 'X-TG-Init-Data': initData }
+        });
+        if (!resp.ok) {
+          showToast('❌ 文件下载失败或已过期');
+          return;
+        }
+        const blob = await resp.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = latestDownload.filename || 'download.bin';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(url), 4000);
+      } catch (_) {
+        showToast('❌ 文件下载失败');
+      }
+    }
+
+    // ---------------- Cross-System Clipboard & Free Word-Selection Sheet ----------------
     let lastClipVariants = { primary: '', block: '', href: '' };
     let lockedSelectionText = '';
 
@@ -674,11 +1313,9 @@
       const ta = document.getElementById('clip-textarea');
       if (!ta || document.getElementById('clip-sheet').classList.contains('hidden')) return;
       if (document.activeElement === ta) {
-        if (ta.selectionStart !== ta.selectionEnd) {
-          lockedSelectionText = ta.value.substring(ta.selectionStart, ta.selectionEnd);
-        } else {
-          lockedSelectionText = '';
-        }
+        lockedSelectionText = (ta.selectionStart !== ta.selectionEnd)
+          ? ta.value.substring(ta.selectionStart, ta.selectionEnd)
+          : '';
         refreshCopyButtonLabel();
       }
     }
@@ -810,36 +1447,26 @@
       try { tg?.HapticFeedback?.notificationOccurred?.('success'); } catch (_) { haptic('medium'); }
       const btn = document.getElementById('copy-local-btn');
       btn.textContent = isSlice
-        ? `✅ 已复制选中的 ${text.length} 字！去记事本粘贴`
-        : `✅ 已复制 (${text.length}字)！去记事本粘贴`;
-      showToast(`✅ 已写入本机剪贴板（${text.length}字），切去备忘录/记事本粘贴即可`);
+        ? `✅ 已复制选中的 ${text.length} 字！`
+        : `✅ 已复制 (${text.length}字)！`;
+      showToast(`✅ 已写入本机剪贴板（${text.length}字）`);
     }
 
     async function shareToOtherApps() {
       const text = getActiveClipText();
-      if (!text) {
-        showToast('当前没有可分享的内容');
-        return;
-      }
+      if (!text) { showToast('当前没有可分享的内容'); return; }
       haptic('light');
       if (navigator.share) {
-        try {
-          await navigator.share({ text });
-          return;
-        } catch (err) {
+        try { await navigator.share({ text }); return; } catch (err) {
           if (err && err.name === 'AbortError') return;
         }
       }
-      // Fallback on desktop WebViews without navigator.share: save as .txt for Notepad
       downloadAsTxt();
     }
 
     function downloadAsTxt() {
       const text = getActiveClipText();
-      if (!text) {
-        showToast('当前没有可保存的内容');
-        return;
-      }
+      if (!text) { showToast('当前没有可保存的内容'); return; }
       haptic('light');
       const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
       const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
@@ -856,17 +1483,14 @@
 
     function sendClipToTg() {
       const text = getActiveClipText();
-      if (!text) {
-        showToast('当前没有可发送的内容');
-        return;
-      }
+      if (!text) { showToast('当前没有可发送的内容'); return; }
       if (ws && ws.readyState === WebSocket.OPEN && authed) {
         haptic('light');
         ws.send(JSON.stringify({ type: 'send_to_tg', text }));
       }
     }
 
-    // Smart Top Input Sheet
+    // ---------------- Smart Top Input Sheet ----------------
     function openKbSheet(info) {
       closeClipSheet();
       const sheet = document.getElementById('kb-sheet');
@@ -912,55 +1536,115 @@
       if (e.key === 'Escape') { e.preventDefault(); closeKbSheet(); }
     });
 
-    function connectWs() {
-      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      ws = new WebSocket(`${proto}//${location.host}/ws`);
-      ws.binaryType = 'blob';
+    // ---------------- Latest-Frame Single-Slot Decoder ----------------
+    async function decodeAndDrawBlob(blob) {
+      try {
+        if (window.createImageBitmap) {
+          const bmp = await createImageBitmap(blob);
+          if (screenCanvas.width !== bmp.width || screenCanvas.height !== bmp.height) {
+            screenCanvas.width = bmp.width;
+            screenCanvas.height = bmp.height;
+            fitCanvasLayout();
+          }
+          ctx.drawImage(bmp, 0, 0);
+          bmp.close();
+        } else {
+          await new Promise((resolve) => {
+            const url = URL.createObjectURL(blob);
+            const img = new Image();
+            img.onload = () => {
+              if (screenCanvas.width !== img.naturalWidth || screenCanvas.height !== img.naturalHeight) {
+                screenCanvas.width = img.naturalWidth;
+                screenCanvas.height = img.naturalHeight;
+                fitCanvasLayout();
+              }
+              ctx.drawImage(img, 0, 0);
+              URL.revokeObjectURL(url);
+              resolve();
+            };
+            img.onerror = () => { URL.revokeObjectURL(url); resolve(); };
+            img.src = url;
+          });
+        }
+      } catch (_) {}
+    }
 
-      ws.onopen = () => {
+    async function pumpFrameDecoder() {
+      if (decodingFrame) return;
+      decodingFrame = true;
+      try {
+        while (pendingFrameBlob) {
+          const blob = pendingFrameBlob;
+          pendingFrameBlob = null;
+          await decodeAndDrawBlob(blob);
+        }
+      } finally {
+        decodingFrame = false;
+      }
+    }
+
+    // ---------------- Reliable Exponential Backoff WebSocket ----------------
+    function manualReconnect() {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+      authRejected = false;
+      reconnectAttempt = 0;
+      document.getElementById('reconnect-text').textContent = '正在重新连接...';
+      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+        try { ws.close(); } catch (_) {}
+      }
+      connectWs();
+    }
+
+    function scheduleReconnect() {
+      if (authRejected) return;
+      clearTimeout(reconnectTimer);
+      const delay = RECONNECT_DELAYS[Math.min(reconnectAttempt, RECONNECT_DELAYS.length - 1)];
+      reconnectAttempt++;
+      const sec = Math.round(delay / 1000);
+      document.getElementById('reconnect-text').textContent = `连接中断，${sec}s 后自动重连...`;
+      document.getElementById('reconnect-bar').classList.remove('hidden');
+      if (!authed) {
+        document.getElementById('ov-icon').textContent = '📡';
+        document.getElementById('ov-title').textContent = '连接暂时中断';
+        document.getElementById('ov-desc').textContent = `正在尝试自动重连（${sec}s 后第 ${reconnectAttempt} 次）...`;
+        document.getElementById('ov-reconnect-btn').classList.remove('hidden');
+      }
+      reconnectTimer = setTimeout(connectWs, delay);
+    }
+
+    function connectWs() {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const sock = new WebSocket(`${proto}//${location.host}/ws`);
+      ws = sock;
+      sock.binaryType = 'blob';
+
+      sock.onopen = () => {
+        if (sock !== ws) return;
         const initData = (tg && tg.initData) ? tg.initData : '';
-        ws.send(JSON.stringify({ type: 'auth', initData }));
+        sock.send(JSON.stringify({ type: 'auth', initData }));
       };
 
-      ws.onmessage = async (ev) => {
+      sock.onmessage = (ev) => {
+        if (sock !== ws) return;
         if (typeof ev.data === 'string') {
           const msg = JSON.parse(ev.data);
           handleJsonMessage(msg);
         } else if (ev.data instanceof Blob) {
           frameCount++;
-          try {
-            if (window.createImageBitmap) {
-              const bmp = await createImageBitmap(ev.data);
-              if (screenCanvas.width !== bmp.width || screenCanvas.height !== bmp.height) {
-                screenCanvas.width = bmp.width;
-                screenCanvas.height = bmp.height;
-                fitCanvasLayout();
-              }
-              ctx.drawImage(bmp, 0, 0);
-              bmp.close();
-            } else {
-              const url = URL.createObjectURL(ev.data);
-              const img = new Image();
-              img.onload = () => {
-                if (screenCanvas.width !== img.naturalWidth || screenCanvas.height !== img.naturalHeight) {
-                  screenCanvas.width = img.naturalWidth;
-                  screenCanvas.height = img.naturalHeight;
-                  fitCanvasLayout();
-                }
-                ctx.drawImage(img, 0, 0);
-                URL.revokeObjectURL(url);
-              };
-              img.src = url;
-            }
-          } catch (_) {}
+          pendingFrameBlob = ev.data;
+          pumpFrameDecoder();
         }
       };
 
-      ws.onclose = () => {
+      sock.onclose = () => {
+        if (sock !== ws) return;
         document.getElementById('conn-dot').className = 'dot offline';
         document.getElementById('metrics-text').textContent = '连接已断开，重连中...';
-        if (authed) {
-          setTimeout(connectWs, 1500);
+        if (!authRejected) {
+          scheduleReconnect();
         }
       };
     }
@@ -968,7 +1652,12 @@
     function handleJsonMessage(msg) {
       if (msg.type === 'auth_ok') {
         authed = true;
+        authRejected = false;
+        reconnectAttempt = 0;
+        clearTimeout(reconnectTimer);
         document.getElementById('overlay').classList.add('hidden');
+        document.getElementById('ov-reconnect-btn').classList.add('hidden');
+        document.getElementById('reconnect-bar').classList.add('hidden');
         syncViewportHeight();
         updateMetricsUi();
         refreshProfiles();
@@ -976,11 +1665,15 @@
       }
       if (msg.type === 'auth_error') {
         authed = false;
+        authRejected = true;
+        clearTimeout(reconnectTimer);
+        document.getElementById('reconnect-bar').classList.add('hidden');
         const ov = document.getElementById('overlay');
         ov.classList.remove('hidden');
         document.getElementById('ov-icon').textContent = '⛔';
         document.getElementById('ov-title').textContent = '403 Forbidden · 拒绝访问';
         document.getElementById('ov-desc').textContent = msg.error || '请从你本人的授权 Telegram 机器人对话内点击【实时画面 / 人工接管】按钮打开。';
+        document.getElementById('ov-reconnect-btn').classList.add('hidden');
         if (ws) ws.close();
         return;
       }
@@ -991,6 +1684,26 @@
       }
       if (msg.type === 'toast') {
         showToast(msg.message);
+        return;
+      }
+      if (msg.type === 'dialog_open') {
+        openDialogSheet(msg);
+        return;
+      }
+      if (msg.type === 'dialog_closed') {
+        if (!msg.dialog_id || msg.dialog_id === activeDialogId) closeDialogSheet();
+        return;
+      }
+      if (msg.type === 'filechooser_open') {
+        openUploadSheet(msg);
+        return;
+      }
+      if (msg.type === 'filechooser_closed') {
+        if (!msg.chooser_id || msg.chooser_id === activeChooserId) closeUploadSheet();
+        return;
+      }
+      if (msg.type === 'download_ready') {
+        showDownloadBanner(msg);
         return;
       }
       if (msg.type === 'profiles_list') {
@@ -1049,27 +1762,41 @@
 
       if (!state.running) {
         dot.className = 'dot';
+        remoteCursorEl.classList.add('hidden');
       } else if (state.takeover) {
         dot.className = 'dot takeover';
       } else {
         dot.className = 'dot live';
       }
 
+      // Sync Telegram Closing Confirmation during active human takeover
+      if (!!state.takeover !== prevTakeoverState) {
+        prevTakeoverState = !!state.takeover;
+        try {
+          if (state.takeover) {
+            if (typeof tg?.enableClosingConfirmation === 'function') tg.enableClosingConfirmation();
+          } else {
+            if (typeof tg?.disableClosingConfirmation === 'function') tg.disableClosingConfirmation();
+            releaseTrackpadHoldIfNeeded();
+          }
+        } catch (_) {}
+      }
+
       if (state.takeover) {
         btn.className = 'btn btn-resume';
-        btn.textContent = '▶️ 交还给 AI';
+        btn.textContent = '▶️ 交还';
         banner.classList.add('takeover-active');
         bannerText.textContent = state.takeover_reason
           ? `🖐 接管中：${state.takeover_reason}`
-          : '🖐 接管中 · 点网页输入框自动弹窗打字，或点右上角【⌨️ 打字】';
+          : '🖐 接管中 · 长按=右键，双指=缩放/平移，触控板=悬停精点';
       } else {
         btn.className = 'btn btn-takeover';
-        btn.textContent = '🖐 一键接管';
+        btn.textContent = '🖐 接管';
         banner.classList.remove('takeover-active');
         closeKbSheet();
         bannerText.textContent = state.ai_status
           ? `🤖 ${state.ai_status}`
-          : '👀 观看模式 · 点右上角【一键接管】即可暂停 AI 并手动操作';
+          : '👀 观看模式 · 点右上角【接管】暂停 AI 并手动操作';
       }
 
       const urlInput = document.getElementById('url-input');
@@ -1110,7 +1837,9 @@
       if (state.cursor && state.cursor.ts) {
         showRemoteCursor(state.cursor);
       }
+      renderQualityBadge();
       renderProfilesUi();
+      updateFabUi();
       updateMetricsUi();
     }
 
@@ -1181,7 +1910,7 @@
           warnEl.textContent = '⚠️ 当前由外部脚本控制浏览器，暂不支持切换指纹或从面板停止。';
           warnEl.classList.remove('hidden');
         } else if (state.takeover) {
-          warnEl.textContent = '⚠️ 当前处于人工接管中：切换指纹前请先点击【▶️ 交还给 AI】或先【⏹ 关闭浏览器】。';
+          warnEl.textContent = '⚠️ 当前处于人工接管中：切换指纹前请先点击【▶️ 交还】或先【⏹ 关闭浏览器】。';
           warnEl.classList.remove('hidden');
         } else if (state.ai_busy) {
           warnEl.textContent = '⏳ AI 正在执行浏览器操作，请等待当前步骤完成后再切换或关闭。';
@@ -1237,10 +1966,11 @@
           `💻 ${p.os || 'windows'}`,
           `🌐 ${p.egress_display || p.egress || 'direct'}`
         ];
+        if (p.mobile) tagTexts.push('📱 Mobile');
         if (p.locale) tagTexts.push(`🗣 ${p.locale}`);
         if (Array.isArray(p.window) && p.window.length === 2) tagTexts.push(`📐 ${p.window[0]}x${p.window[1]}`);
-        if (p.geoip) tagTexts.push(`📍 GeoIP`);
-        if (p.block_webrtc) tagTexts.push(`🛡 No-WebRTC`);
+        if (p.geoip) tagTexts.push('📍 GeoIP');
+        if (p.block_webrtc) tagTexts.push('🛡 No-WebRTC');
 
         tagTexts.forEach((txt) => {
           const sp = document.createElement('span');
@@ -1281,7 +2011,7 @@
         return;
       }
       if (state.takeover) {
-        showToast('请先点击右上角【▶️ 交还给 AI】或先【⏹ 关闭浏览器】再切换');
+        showToast('请先点击右上角【▶️ 交还】或先【⏹ 关闭浏览器】再切换');
         haptic('medium');
         return;
       }
@@ -1320,26 +2050,20 @@
     function showRemoteCursor(c) {
       if (!c || c.ts === lastCursorTs) return;
       lastCursorTs = c.ts;
-      const rx = (c.x || 0) / Math.max(1, state.vw || 1280);
-      const ry = (c.y || 0) / Math.max(1, state.vh || 800);
-      spawnRipple(rx * screenCanvas.clientWidth, ry * screenCanvas.clientHeight, c.actor === 'human' ? 'human' : 'ai');
-    }
-
-    function spawnRipple(localX, localY, cls) {
-      const r = document.createElement('div');
-      r.className = 'ripple ' + cls;
-      r.style.left = localX + 'px';
-      r.style.top = localY + 'px';
-      canvasWrap.appendChild(r);
-      setTimeout(() => r.remove(), 600);
+      if (c.actor === 'ai') {
+        const pos = positionArrowCursor(c.x || 0, c.y || 0, 'ai', false);
+        spawnClickRing(pos.localX, pos.localY, 'ai');
+      } else if (gestureMode !== 'trackpad' && c.kind !== 'move') {
+        positionArrowCursor(c.x || 0, c.y || 0, 'human', false);
+      }
     }
 
     function updateMetricsUi() {
-      const modeMap = { idle: '空闲', async_hosted: '实时守护', sync_external: '脚本联动' };
+      const modeMap = { idle: '空闲', async_hosted: '实时', sync_external: '联动' };
       const m = modeMap[state.engine_mode] || state.engine_mode;
       document.getElementById('metrics-text').textContent = state.running
-        ? `${m} · ${currentFps} FPS · ${rttMs || '--'}ms`
-        : `待机中 · ${rttMs || '--'}ms`;
+        ? `${m} · ${currentFps}fps · ${rttMs || '--'}ms`
+        : `待机 · ${rttMs || '--'}ms`;
     }
 
     setInterval(() => {
@@ -1360,7 +2084,7 @@
         return false;
       }
       if (!state.takeover) {
-        showToast('当前为观看模式，请先点右上角【🖐 一键接管】');
+        showToast('当前为观看模式，请先点右上角【🖐 接管】');
         haptic('medium');
         return false;
       }
@@ -1396,15 +2120,40 @@
 
     function sendNav(action) { sendInput({ action }); }
 
+    const urlInputEl = document.getElementById('url-input');
+    urlInputEl.addEventListener('focus', () => {
+      setTimeout(() => { try { urlInputEl.select(); } catch (_) {} }, 10);
+    });
+    urlInputEl.addEventListener('mouseup', (e) => {
+      if (document.activeElement === urlInputEl && urlInputEl.selectionStart === 0 && urlInputEl.selectionEnd === urlInputEl.value.length) {
+        e.preventDefault();
+      }
+    });
+
     function submitUrl() {
-      const raw = document.getElementById('url-input').value.trim();
+      const raw = urlInputEl.value.trim();
       if (!raw) return;
       const url = /^https?:\/\//i.test(raw) ? raw : 'https://' + raw;
+      if (!state.running) {
+        showToast('浏览器尚未运行');
+        return;
+      }
+      if (!state.takeover && !state.ai_busy && ws && ws.readyState === WebSocket.OPEN && authed) {
+        ws.send(JSON.stringify({ type: 'set_takeover', active: true, reason: '地址栏快速跳转' }));
+        state.takeover = true;
+        setTimeout(() => {
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'input', action: 'goto', url }));
+          }
+        }, 60);
+        urlInputEl.blur();
+        return;
+      }
       sendInput({ action: 'goto', url });
-      document.getElementById('url-input').blur();
+      urlInputEl.blur();
     }
 
-    document.getElementById('url-input').addEventListener('keydown', (e) => {
+    urlInputEl.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') { e.preventDefault(); submitUrl(); }
     });
 
@@ -1436,7 +2185,7 @@
       sendInput({ action: 'wheel', dx, dy });
     }
 
-    // Direct physical keyboard pass-through when no local <input> is focused (Desktop / iPad keyboard)
+    // Physical keyboard pass-through (Desktop / iPad)
     window.addEventListener('keydown', (e) => {
       const tag = (document.activeElement && document.activeElement.tagName || '').toUpperCase();
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
@@ -1448,9 +2197,9 @@
             e.preventDefault();
             ws.send(JSON.stringify({ type: 'input', action: 'press', key: 'Control+c' }));
             showToast('📋 正在从远程浏览器复制选中内容...');
-          } else if (k === 'a') {
+          } else if (['a', 'z', 'f', 'x'].includes(k)) {
             e.preventDefault();
-            ws.send(JSON.stringify({ type: 'input', action: 'press', key: 'Control+a' }));
+            ws.send(JSON.stringify({ type: 'input', action: 'press', key: `Control+${k}` }));
           }
         }
         return;
@@ -1481,7 +2230,7 @@
       }
     });
 
-    // Touch / Mouse Coordinate Mapping & Pinch-Zoom + Scroll Handling
+    // ---------------- Coordinate Mapping, Gestures, Trackpad & Desktop Mouse ----------------
     function clientToRemoteCoords(clientX, clientY) {
       const rect = screenCanvas.getBoundingClientRect();
       if (!rect.width || !rect.height) return null;
@@ -1500,16 +2249,48 @@
 
     let pointers = new Map();
     let gestureStart = null;
-    let pinchStartDist = 0;
-    let pinchStartScale = 1;
+    let pinchState = null;
+    let twoFingerTrackpad = null;
+    let longPressTimer = null;
     let lastWheelSent = 0;
+    let lastMoveSent = 0;
     let lastPreviewSent = 0;
-    let lastTapTime = 0;
+    let lastTapInfo = { t: 0, x: 0, y: 0 };
+
+    function clearLongPressTimer() {
+      if (longPressTimer) {
+        clearTimeout(longPressTimer);
+        longPressTimer = null;
+      }
+    }
+
+    function sendRemoteMoveThrottled(x, y, intervalMs = 40) {
+      const now = Date.now();
+      if (now - lastMoveSent < intervalMs) return;
+      lastMoveSent = now;
+      if (state.running && state.takeover && ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'input', action: 'move', x, y }));
+      }
+    }
+
+    // Desktop right-click -> remote rightclick
+    stage.addEventListener('contextmenu', (e) => {
+      if (e.target.closest('#idle-card') || e.target.closest('#download-banner')) return;
+      e.preventDefault();
+      const pt = clientToRemoteCoords(e.clientX, e.clientY);
+      if (!pt) return;
+      if (!ensureTakeoverOrWarn()) return;
+      haptic('medium');
+      positionArrowCursor(pt.x, pt.y, 'human', false);
+      spawnClickRing(pt.localX, pt.localY, 'right');
+      ws.send(JSON.stringify({ type: 'input', action: 'rightclick', x: pt.x, y: pt.y }));
+    });
 
     stage.addEventListener('pointerdown', (e) => {
-      if (e.target.closest('#idle-card')) return;
-      pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
-      stage.setPointerCapture(e.pointerId);
+      if (e.target.closest('#idle-card') || e.target.closest('#download-banner')) return;
+      if (e.pointerType === 'mouse' && e.button === 2) return; // handled by contextmenu
+      pointers.set(e.pointerId, { x: e.clientX, y: e.clientY, pointerType: e.pointerType });
+      try { stage.setPointerCapture(e.pointerId); } catch (_) {}
 
       if (pointers.size === 1) {
         const startRemote = clientToRemoteCoords(e.clientX, e.clientY);
@@ -1517,39 +2298,183 @@
           x: e.clientX, y: e.clientY,
           lastX: e.clientX, lastY: e.clientY,
           startRemote,
-          panX, panY, moved: false, t: Date.now()
+          panX, panY,
+          moved: false,
+          longPressed: false,
+          dragDownSent: false,
+          t: Date.now()
         };
+
+        // Direct Drag mode: send mousedown immediately on press
+        if (gestureMode === 'drag' && state.running && state.takeover && startRemote) {
+          positionArrowCursor(startRemote.x, startRemote.y, 'drag', true);
+          ws.send(JSON.stringify({ type: 'input', action: 'mousedown', x: startRemote.x, y: startRemote.y, button: 'left' }));
+          gestureStart.dragDownSent = true;
+          haptic('light');
+        }
+
+        // Interact mode: arm 480ms long-press right-click
+        clearLongPressTimer();
+        if (gestureMode === 'interact' && e.pointerType !== 'mouse' && startRemote) {
+          longPressTimer = setTimeout(() => {
+            if (!gestureStart || gestureStart.moved || pointers.size !== 1) return;
+            gestureStart.longPressed = true;
+            if (!ensureTakeoverOrWarn()) return;
+            haptic('heavy');
+            positionArrowCursor(startRemote.x, startRemote.y, 'human', false);
+            spawnClickRing(startRemote.localX, startRemote.localY, 'right');
+            ws.send(JSON.stringify({ type: 'input', action: 'rightclick', x: startRemote.x, y: startRemote.y }));
+            showToast('🖱 右键菜单');
+          }, 480);
+        }
       } else if (pointers.size === 2) {
-        const pts = Array.from(pointers.values());
-        pinchStartDist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
-        pinchStartScale = scale;
+        clearLongPressTimer();
+        if (gestureStart && gestureStart.dragDownSent) {
+          const cur = clientToRemoteCoords(gestureStart.lastX, gestureStart.lastY) || gestureStart.startRemote;
+          if (cur && ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'input', action: 'mouseup', x: cur.x, y: cur.y, button: 'left' }));
+          }
+          gestureStart.dragDownSent = false;
+        }
         if (gestureStart) gestureStart.moved = true;
         document.getElementById('drag-sel-box').classList.add('hidden');
         document.getElementById('live-sel-pill').classList.add('hidden');
+
+        const pts = Array.from(pointers.values());
+        const stageRect = stage.getBoundingClientRect();
+        const midX = (pts[0].x + pts[1].x) / 2 - stageRect.left;
+        const midY = (pts[0].y + pts[1].y) / 2 - stageRect.top;
+        const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+
+        if (gestureMode === 'trackpad') {
+          twoFingerTrackpad = {
+            startMidX: midX, startMidY: midY,
+            lastMidX: midX, lastMidY: midY,
+            moved: false,
+            t: Date.now()
+          };
+          pinchState = null;
+        } else {
+          const { baseLeft, baseTop } = getStageBaseOffset();
+          pinchState = {
+            startDist: dist,
+            startScale: scale,
+            anchorLx: (midX - baseLeft - panX) / scale,
+            anchorLy: (midY - baseTop - panY) / scale
+          };
+          twoFingerTrackpad = null;
+        }
       }
     });
 
     stage.addEventListener('pointermove', (e) => {
-      if (!pointers.has(e.pointerId)) return;
-      pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      // Desktop hover tracking (no button pressed)
+      if (!pointers.has(e.pointerId)) {
+        if (e.pointerType === 'mouse' && state.running && !e.target.closest('#idle-card')) {
+          const pt = clientToRemoteCoords(e.clientX, e.clientY);
+          if (pt) {
+            trackpadX = pt.x;
+            trackpadY = pt.y;
+            trackpadInitialized = true;
+            positionArrowCursor(pt.x, pt.y, 'human', true);
+            if (state.takeover) {
+              sendRemoteMoveThrottled(pt.x, pt.y, 45);
+            }
+          }
+        }
+        return;
+      }
 
+      pointers.set(e.pointerId, { x: e.clientX, y: e.clientY, pointerType: e.pointerType });
+
+      // Two-finger gestures
       if (pointers.size === 2) {
         const pts = Array.from(pointers.values());
-        const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
-        if (pinchStartDist > 10) {
-          scale = Math.min(3.5, Math.max(1.0, pinchStartScale * (dist / pinchStartDist)));
+        const stageRect = stage.getBoundingClientRect();
+        const curMidX = (pts[0].x + pts[1].x) / 2 - stageRect.left;
+        const curMidY = (pts[0].y + pts[1].y) / 2 - stageRect.top;
+
+        if (gestureMode === 'trackpad' && twoFingerTrackpad) {
+          if (Math.hypot(curMidX - twoFingerTrackpad.startMidX, curMidY - twoFingerTrackpad.startMidY) > 7) {
+            twoFingerTrackpad.moved = true;
+          }
+          if (twoFingerTrackpad.moved && state.running && state.takeover) {
+            const now = Date.now();
+            if (now - lastWheelSent >= 40) {
+              const stepX = twoFingerTrackpad.lastMidX - curMidX;
+              const stepY = twoFingerTrackpad.lastMidY - curMidY;
+              twoFingerTrackpad.lastMidX = curMidX;
+              twoFingerTrackpad.lastMidY = curMidY;
+              lastWheelSent = now;
+              if (Math.abs(stepX) > 1 || Math.abs(stepY) > 1) {
+                ws.send(JSON.stringify({
+                  type: 'input',
+                  action: 'wheel',
+                  dx: Math.round(stepX * 1.8),
+                  dy: Math.round(stepY * 1.8)
+                }));
+              }
+            }
+          }
+          return;
+        }
+
+        if (pinchState && pinchState.startDist > 10) {
+          const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+          const newScale = Math.min(3.5, Math.max(1.0, pinchState.startScale * (dist / pinchState.startDist)));
+          const { baseLeft, baseTop } = getStageBaseOffset();
+          scale = newScale;
+          panX = curMidX - baseLeft - pinchState.anchorLx * newScale;
+          panY = curMidY - baseTop - pinchState.anchorLy * newScale;
           applyTransform();
         }
         return;
       }
 
+      // Single-finger gestures
       if (pointers.size === 1 && gestureStart) {
         const dxTotal = e.clientX - gestureStart.x;
         const dyTotal = e.clientY - gestureStart.y;
-        if (Math.hypot(dxTotal, dyTotal) > 7) gestureStart.moved = true;
+        if (Math.hypot(dxTotal, dyTotal) > 7) {
+          gestureStart.moved = true;
+          clearLongPressTimer();
+        }
+
+        // Trackpad mode: relative cursor movement with sharp arrow + hover move
+        if (gestureMode === 'trackpad' && state.running) {
+          if (!gestureStart.moved) return;
+          const stepX = e.clientX - gestureStart.lastX;
+          const stepY = e.clientY - gestureStart.lastY;
+          gestureStart.lastX = e.clientX;
+          gestureStart.lastY = e.clientY;
+          const dispW = Math.max(1, screenCanvas.clientWidth * scale);
+          const dispH = Math.max(1, screenCanvas.clientHeight * scale);
+          const gain = 1.35;
+          trackpadX = Math.max(0, Math.min(state.vw || 1280, trackpadX + stepX * ((state.vw || 1280) / dispW) * gain));
+          trackpadY = Math.max(0, Math.min(state.vh || 800, trackpadY + stepY * ((state.vh || 800) / dispH) * gain));
+          trackpadInitialized = true;
+          positionArrowCursor(trackpadX, trackpadY, trackpadHolding ? 'drag' : 'human', true);
+          if (state.takeover) {
+            sendRemoteMoveThrottled(Math.round(trackpadX * 10) / 10, Math.round(trackpadY * 10) / 10, 38);
+          }
+          return;
+        }
+
+        // Drag mode: continuous remote mouse move while held down
+        if (gestureMode === 'drag' && gestureStart.dragDownSent) {
+          const curPt = clientToRemoteCoords(e.clientX, e.clientY);
+          if (curPt) {
+            gestureStart.lastX = e.clientX;
+            gestureStart.lastY = e.clientY;
+            positionArrowCursor(curPt.x, curPt.y, 'drag', true);
+            sendRemoteMoveThrottled(curPt.x, curPt.y, 35);
+          }
+          return;
+        }
+
         if (!gestureStart.moved) return;
 
-        // Drag-to-select characters directly on webpage when in 'extract' mode!
+        // Extract mode: drag-to-select characters
         if (gestureMode === 'extract' && state.running && gestureStart.startRemote) {
           const curPt = clientToRemoteCoords(e.clientX, e.clientY);
           if (curPt) {
@@ -1580,11 +2505,12 @@
           return;
         }
 
-        if (gestureMode === 'pan' || (!state.takeover && scale > 1.01)) {
+        // Interact mode: pan when zoomed in watching mode; wheel scroll in takeover
+        if (!state.takeover && scale > 1.01) {
           panX = gestureStart.panX + dxTotal;
           panY = gestureStart.panY + dyTotal;
           applyTransform();
-        } else if (state.takeover && state.running) {
+        } else if (state.takeover && state.running && !gestureStart.longPressed) {
           const now = Date.now();
           if (now - lastWheelSent >= 45) {
             const stepX = gestureStart.lastX - e.clientX;
@@ -1605,11 +2531,65 @@
       }
     });
 
+    function fireSmartClick(x, y, localX, localY) {
+      const now = Date.now();
+      const nearPrev = Math.hypot(x - lastTapInfo.x, y - lastTapInfo.y) <= 28;
+      const isSecondTap = (now - lastTapInfo.t) < 280 && nearPrev;
+      lastTapInfo = isSecondTap ? { t: 0, x: 0, y: 0 } : { t: now, x, y };
+      positionArrowCursor(x, y, 'human', gestureMode === 'trackpad');
+      spawnClickRing(localX, localY, 'human');
+      ws.send(JSON.stringify({
+        type: 'input',
+        action: 'click',
+        x,
+        y,
+        click_count: isSecondTap ? 2 : 1
+      }));
+    }
+
     function onPointerEnd(e) {
       if (!pointers.has(e.pointerId)) return;
       pointers.delete(e.pointerId);
+      clearLongPressTimer();
 
-      // Finish drag-to-select range in 'extract' mode!
+      // Trackpad two-finger tap -> right click at arrow tip!
+      if (gestureMode === 'trackpad' && twoFingerTrackpad && pointers.size < 2) {
+        const tf = twoFingerTrackpad;
+        if (pointers.size === 0) twoFingerTrackpad = null;
+        if (!tf.moved && (Date.now() - tf.t) < 280) {
+          twoFingerTrackpad = null;
+          if (ensureTakeoverOrWarn()) {
+            haptic('medium');
+            const pos = positionArrowCursor(trackpadX, trackpadY, 'human', true);
+            spawnClickRing(pos.localX, pos.localY, 'right');
+            ws.send(JSON.stringify({
+              type: 'input',
+              action: 'rightclick',
+              x: Math.round(trackpadX * 10) / 10,
+              y: Math.round(trackpadY * 10) / 10
+            }));
+          }
+        }
+        if (pointers.size === 0) gestureStart = null;
+        return;
+      }
+
+      if (pointers.size < 2) {
+        pinchState = null;
+      }
+
+      // Drag mode release
+      if (pointers.size === 0 && gestureStart && gestureStart.dragDownSent) {
+        const endPt = clientToRemoteCoords(e.clientX, e.clientY) || gestureStart.startRemote;
+        if (endPt && ws && ws.readyState === WebSocket.OPEN) {
+          positionArrowCursor(endPt.x, endPt.y, 'human', false);
+          ws.send(JSON.stringify({ type: 'input', action: 'mouseup', x: endPt.x, y: endPt.y, button: 'left' }));
+        }
+        gestureStart = null;
+        return;
+      }
+
+      // Extract mode finish
       if (pointers.size === 0 && gestureStart && gestureMode === 'extract') {
         document.getElementById('drag-sel-box').classList.add('hidden');
         document.getElementById('live-sel-pill').classList.add('hidden');
@@ -1626,7 +2606,7 @@
               y2: endPt.y
             }));
           } else {
-            spawnRipple(endPt.localX, endPt.localY, 'extract');
+            spawnClickRing(endPt.localX, endPt.localY, 'extract');
             ws.send(JSON.stringify({
               type: 'extract',
               mode: 'point',
@@ -1639,7 +2619,21 @@
         return;
       }
 
-      if (pointers.size === 0 && gestureStart && !gestureStart.moved && (Date.now() - gestureStart.t) < 500) {
+      // Trackpad single-finger tap -> click at arrow tip!
+      if (pointers.size === 0 && gestureStart && gestureMode === 'trackpad' && !gestureStart.moved && (Date.now() - gestureStart.t) < 280) {
+        if (ensureTakeoverOrWarn()) {
+          haptic('light');
+          const rx = Math.round(trackpadX * 10) / 10;
+          const ry = Math.round(trackpadY * 10) / 10;
+          const pos = positionArrowCursor(rx, ry, 'human', true);
+          fireSmartClick(rx, ry, pos.localX, pos.localY);
+        }
+        gestureStart = null;
+        return;
+      }
+
+      // Interact mode tap -> left click (unless long-press right-click already fired)
+      if (pointers.size === 0 && gestureStart && !gestureStart.moved && !gestureStart.longPressed && (Date.now() - gestureStart.t) < 470) {
         const pt = clientToRemoteCoords(e.clientX, e.clientY);
         if (pt) {
           if (!ensureTakeoverOrWarn()) {
@@ -1647,16 +2641,7 @@
             return;
           }
           haptic('light');
-          spawnRipple(pt.localX, pt.localY, 'human');
-          const now = Date.now();
-          const isDbl = (now - lastTapTime) < 280;
-          lastTapTime = now;
-          ws.send(JSON.stringify({
-            type: 'input',
-            action: isDbl ? 'dblclick' : 'click',
-            x: pt.x,
-            y: pt.y
-          }));
+          fireSmartClick(pt.x, pt.y, pt.localX, pt.localY);
         }
       }
       if (pointers.size === 0) gestureStart = null;

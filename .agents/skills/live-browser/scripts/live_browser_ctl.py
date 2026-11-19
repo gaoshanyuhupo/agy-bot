@@ -37,10 +37,12 @@ def _detect_current_bot_hint() -> str:
     if ":" in tok:
         return tok.split(":", 1)[0]
     env_file = os.environ.get("AGY_TG_ENV_FILE", "")
-    if env_file.endswith(".env.sg"):
-        return "sg"
-    if env_file.endswith(".env"):
-        return "main"
+    if env_file:
+        name = Path(env_file).name
+        if name == ".env":
+            return "main"
+        if name.startswith(".env.") and len(name) > 5:
+            return name[5:]
     return "sg"
 
 
@@ -106,6 +108,7 @@ class LiveBrowserClient:
         os_name: str | None = None,
         locale: str | None = None,
         window: list[int] | str | None = None,
+        mobile: bool = False,
         webgl_config: list[str] | str | None = None,
         block_webrtc: bool | None = None,
         geoip: bool | str | None = None,
@@ -123,6 +126,8 @@ class LiveBrowserClient:
             payload["locale"] = locale
         if window is not None:
             payload["window"] = window
+        if mobile:
+            payload["mobile"] = True
         if webgl_config is not None:
             payload["webgl_config"] = webgl_config
         if block_webrtc is not None:
@@ -387,13 +392,47 @@ class SyncLiveBridge:
         act = cmd.get("action")
         cursor_out: tuple[float, float, str] | None = None
         try:
-            if act in ("click", "dblclick"):
+            if act == "move":
+                x, y = float(cmd.get("x", 0)), float(cmd.get("y", 0))
+                cursor_out = (x, y, "human")
+                page.mouse.move(x, y)
+            elif act == "mousedown":
+                x, y = float(cmd.get("x", 0)), float(cmd.get("y", 0))
+                btn = str(cmd.get("button") or "left")
+                if btn not in ("left", "right", "middle"):
+                    btn = "left"
+                cursor_out = (x, y, "human")
+                page.mouse.move(x, y)
+                page.mouse.down(button=btn)
+            elif act == "mouseup":
+                x, y = float(cmd.get("x", 0)), float(cmd.get("y", 0))
+                btn = str(cmd.get("button") or "left")
+                if btn not in ("left", "right", "middle"):
+                    btn = "left"
+                cursor_out = (x, y, "human")
+                page.mouse.move(x, y)
+                page.mouse.up(button=btn)
+            elif act == "rightclick":
+                x, y = float(cmd.get("x", 0)), float(cmd.get("y", 0))
+                cursor_out = (x, y, "human")
+                page.mouse.click(x, y, button="right")
+            elif act in ("click", "dblclick"):
                 x, y = float(cmd.get("x", 0)), float(cmd.get("y", 0))
                 cursor_out = (x, y, "human")
                 if act == "dblclick":
                     page.mouse.dblclick(x, y)
                 else:
-                    page.mouse.click(x, y)
+                    try:
+                        click_count = max(1, min(3, int(cmd.get("click_count") or 1)))
+                    except (TypeError, ValueError):
+                        click_count = 1
+                    btn = str(cmd.get("button") or "left")
+                    if btn not in ("left", "right", "middle"):
+                        btn = "left"
+                    if click_count == 1 and btn == "left":
+                        page.mouse.click(x, y)
+                    else:
+                        page.mouse.click(x, y, button=btn, click_count=click_count)
             elif act == "wheel":
                 page.mouse.wheel(float(cmd.get("dx", 0)), float(cmd.get("dy", 0)))
             elif act == "type":
@@ -609,6 +648,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_start.add_argument("--os", dest="os_name", choices=["windows", "macos", "linux"], help="Override OS fingerprint.")
     p_start.add_argument("--locale", help="Override browser locale (e.g. en-US, zh-CN, ja-JP).")
     p_start.add_argument("--window", help="Override window size WxH (e.g. 1440x900).")
+    p_start.add_argument("--mobile", action="store_true", help="Use mobile portrait viewport preset (430x932, non-pinned profiles only).")
     p_start.add_argument("--webgl", dest="webgl_config", help="Override WebGL VENDOR,RENDERER.")
     p_start.add_argument("--block-webrtc", action="store_true", default=None, help="Block WebRTC leaks.")
     p_start.add_argument("--geoip", nargs="?", const="true", default=None, help="Enable Camoufox GeoIP (true or IP).")
@@ -627,6 +667,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_prof_create.add_argument("--os", dest="os_name", choices=["windows", "macos", "linux"], default="windows")
     p_prof_create.add_argument("--locale", help="Browser locale (e.g. en-US, ja-JP).")
     p_prof_create.add_argument("--window", help="Window size WxH (e.g. 1440x900).")
+    p_prof_create.add_argument("--mobile", action="store_true", help="Use mobile portrait viewport preset (430x932).")
     p_prof_create.add_argument("--webgl", dest="webgl_config", help="WebGL VENDOR,RENDERER.")
     p_prof_create.add_argument("--block-webrtc", action="store_true", default=None, help="Block WebRTC leaks.")
     p_prof_create.add_argument("--geoip", nargs="?", const="true", default=None, help="Enable Camoufox GeoIP (true or IP).")
@@ -702,6 +743,7 @@ def main() -> int:
                 os_name=args.os_name,
                 locale=args.locale,
                 window=args.window,
+                mobile=args.mobile,
                 webgl_config=args.webgl_config,
                 block_webrtc=args.block_webrtc,
                 geoip=_parse_geoip_arg(args.geoip),
@@ -720,6 +762,7 @@ def main() -> int:
                     os=args.os_name,
                     locale=args.locale,
                     window=args.window,
+                    mobile=True if args.mobile else None,
                     webgl_config=args.webgl_config,
                     block_webrtc=args.block_webrtc,
                     geoip=_parse_geoip_arg(args.geoip),
