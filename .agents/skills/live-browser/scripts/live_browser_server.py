@@ -2142,17 +2142,23 @@ class TelegramLiveCardPublisher:
                     retired += 1
         return retired
 
-    async def refresh_single_card(
+    async def _refresh_single_card_with_status(
         self,
         bot_key: str,
         chat_id: int,
         *,
         message_id: int | None = None,
         expected_session_gen: int | None = None,
-    ) -> tuple[bool, str]:
-        """Strictly refresh only the single card matching `(bot_key, chat_id, message_id, session_gen)`."""
+    ) -> tuple[bool, str, int]:
+        """Strictly refresh only the single card matching `(bot_key, chat_id, message_id, session_gen)`.
+
+        Returns `(ok, message, http_status)`:
+        - `403` when unauthorized, card missing/stale/retired, or session stopped/switched
+        - `502` when authorized and card remains active, but Telegram `editMessageMedia` was not confirmed
+        - `200` when Telegram confirmed the update (or confirmed `message is not modified`)
+        """
         if not self.hub.latest_jpeg or self.hub.engine_mode == "idle":
-            return False, "当前没有运行中的浏览器画面"
+            return False, "当前没有运行中的浏览器画面", 403
         ok_v, msg_v, token = self.verify_card_control(
             bot_key,
             chat_id,
@@ -2162,7 +2168,7 @@ class TelegramLiveCardPublisher:
             expected_session_gen=expected_session_gen,
         )
         if not ok_v or not token:
-            return False, msg_v
+            return False, msg_v, 403
         card_key = (bot_key, chat_id)
         async with self._lock:
             ok_v2, msg_v2, live_token = self.verify_card_control(
@@ -2174,11 +2180,32 @@ class TelegramLiveCardPublisher:
                 expected_session_gen=expected_session_gen,
             )
             if not ok_v2 or not live_token:
-                return False, msg_v2
-            await self._update_card_locked(card_key, live_token, finished=False, force=True)
+                return False, msg_v2, 403
+            updated = await self._update_card_locked(
+                card_key, live_token, finished=False, force=True
+            )
             if card_key not in self.cards:
-                return False, "当前私聊卡片未授权或权限已撤销"
-            return True, "ok"
+                return False, "当前私聊卡片未授权或权限已撤销", 403
+            if not updated:
+                return False, "Telegram 实况卡片刷新失败，请稍后重试", 502
+            return True, "ok", 200
+
+    async def refresh_single_card(
+        self,
+        bot_key: str,
+        chat_id: int,
+        *,
+        message_id: int | None = None,
+        expected_session_gen: int | None = None,
+    ) -> tuple[bool, str]:
+        """Strictly refresh only the single card matching `(bot_key, chat_id, message_id, session_gen)`."""
+        ok, msg, _status = await self._refresh_single_card_with_status(
+            bot_key,
+            chat_id,
+            message_id=message_id,
+            expected_session_gen=expected_session_gen,
+        )
+        return ok, msg
 
     async def tick_updates(
         self, finished: bool = False, force: bool = False, *, bot_filter: str | None = None
@@ -2359,6 +2386,15 @@ class TelegramLiveCardPublisher:
                             retry = (data.get("parameters") or {}).get("retry_after")
                             if retry:
                                 io_retry_after = float(retry)
+                            elif (
+                                not finished
+                                and not data.get("ok")
+                                and (not isinstance(status, int) or status in (200, 400))
+                                and data.get("error_code") in (None, 400)
+                                and "message is not modified" in desc.lower()
+                            ):
+                                io_media_ok = True
+                                io_result = True
                             elif "message is not modified" not in desc.lower():
                                 log.debug("editMessageMedia (%s): %s", bot_key, desc)
                         if finished:
@@ -7681,11 +7717,11 @@ async def internal_config(request: web.Request) -> web.Response:
                 return web.json_response({"ok": False, "error": msg_pre}, status=403)
             if hub.engine_mode == "async_hosted":
                 await hub._capture_once(force_broadcast=True, hd=True)
-            ok_rf, msg_rf = await hub.tg.refresh_single_card(
+            ok_rf, msg_rf, status_rf = await hub.tg._refresh_single_card_with_status(
                 target_bot, target_cid, message_id=mid_val, expected_session_gen=pre_gen
             )
             if not ok_rf:
-                return web.json_response({"ok": False, "error": msg_rf}, status=403)
+                return web.json_response({"ok": False, "error": msg_rf}, status=status_rf)
         else:
             bot_filter = hub.resolve_bot_key(str(raw_bot)) if raw_bot else None
             if raw_bot and bot_filter is None:

@@ -6795,5 +6795,587 @@ class TestRound6FinalClosureRegression(unittest.TestCase):
             asyncio.run(_scenario())
 
 
+class TestRound13RefreshStatusAndNotModifiedRegression(unittest.TestCase):
+    """Round 13: manual scoped card refresh must propagate _update_card_locked() result,
+    honor confirmed Telegram `message is not modified` (only on clean __aexit__), keep
+    active card & cache intact on HTTP 502 upstream failure, purge on in-flight revocation
+    (HTTP 403), and cleanly propagate CancelledError."""
+
+    @staticmethod
+    def _write_env_role(env_path: Path, tok_main: str, role: str) -> None:
+        if role == "admin":
+            env_path.write_text(
+                f"AGY_TG_BOT_TOKEN={tok_main}\n"
+                f"AGY_TG_ALLOWED_CHATS=111\n"
+                f"AGY_TG_ADMIN_USERS=111\n",
+                encoding="utf-8",
+            )
+        elif role == "readonly":
+            env_path.write_text(
+                f"AGY_TG_BOT_TOKEN={tok_main}\n"
+                f"AGY_TG_ALLOWED_CHATS=111\n"
+                f"AGY_TG_READONLY_USERS=111\n"
+                f"AGY_TG_USER_ROLES=111:readonly\n",
+                encoding="utf-8",
+            )
+        else:
+            raise ValueError(role)
+
+    @staticmethod
+    def _seed_refresh_hub(http_obj: Any) -> Any:
+        hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "sec-tok")
+        hub.tg.http = http_obj
+        hub.engine_mode = "hosted"
+        hub.session_gen = 8
+        hub.session_owner = ("main", 111)
+        hub.latest_jpeg = b"JPEG_R13_LIVE_FRAME"
+        hub.tg.cards[("main", 111)] = {
+            "bot_key": "main",
+            "chat_id": 111,
+            "message_id": 702,
+            "session_gen": 8,
+            "owner": ("main", 111),
+            "last_sha1": "prev_sha",
+            "last_caption": "prev_cap",
+            "last_markup": "prev_markup",
+            "last_ts": 12.5,
+        }
+        hub.tg.pending_retire_cards[("main", 111, 701)] = {
+            "bot_key": "main",
+            "chat_id": 111,
+            "message_id": 701,
+            "session_gen": 7,
+            "owner": ("main", 111),
+            "last_sha1": "old_sha",
+            "last_caption": "old_cap",
+            "last_markup": None,
+            "last_ts": 0.0,
+        }
+        return hub
+
+    @staticmethod
+    def _make_refresh_req(hub: Any, *, mid: int = 702) -> Any:
+        return types.SimpleNamespace(
+            headers={"X-Live-Token": "sec-tok"},
+            remote="127.0.0.1",
+            app={"hub": hub},
+            json=mock.AsyncMock(
+                return_value={
+                    "refresh_card": True,
+                    "bot": "main",
+                    "chat_id": 111,
+                    "message_id": mid,
+                    "from_card": True,
+                    "source": "tg_card",
+                }
+            ),
+        )
+
+    def test_authorized_refresh_aexit_connection_error_returns_502_and_bridge_alerts_failure(self) -> None:
+        """Authorized admin + editMessageMedia 200/ok=true followed by __aexit__ ConnectionError
+        MUST return HTTP 502 / ok=false, preserve active card 702 & cache, and cause bridge
+        card_refresh callback to show failure alert (NEVER '📸 实况卡片已刷新')."""
+        import importlib
+        import os
+
+        tok_main = "991301:TEST_ROUND13_REFRESH_AEXIT"
+        with tempfile.TemporaryDirectory() as tmp:
+            bdir = Path(tmp)
+            env_path = bdir / ".env"
+            self._write_env_role(env_path, tok_main, "admin")
+
+            class _AexitFailHTTP:
+                def __init__(self) -> None:
+                    self.calls: list[str] = []
+
+                def post(self, url: str, data=None, json=None):
+                    self.calls.append(url.rsplit("/", 1)[-1])
+
+                    class _Resp:
+                        status = 200
+
+                        async def __aenter__(self_r):
+                            return self_r
+
+                        async def __aexit__(self_r, *_a):
+                            raise ConnectionError("simulated close drop after 200 ok")
+
+                        async def json(self_r):
+                            return {"ok": True, "result": {"message_id": 702}}
+
+                    return _Resp()
+
+            http_obj = _AexitFailHTTP()
+            hub = self._seed_refresh_hub(http_obj)
+
+            async def _run_direct() -> None:
+                with (
+                    mock.patch.object(srv, "_BRIDGE_DIR", bdir),
+                    mock.patch.object(srv, "BRIDGE_ENV_FILES", {"main": env_path}),
+                    mock.patch.object(srv, "FormData", _FakeFormData),
+                    mock.patch.object(srv, "web", _FakeWeb),
+                ):
+                    resp = await srv.internal_config(self._make_refresh_req(hub))  # type: ignore[arg-type]
+                    self.assertEqual(502, resp.status)
+                    self.assertFalse(resp.data.get("ok"))
+                    self.assertIn("刷新失败", str(resp.data.get("error") or ""))
+                    # Active card 702 & its cache MUST remain intact; pending 701 untouched
+                    self.assertIn(("main", 111), hub.tg.cards)
+                    card = hub.tg.cards[("main", 111)]
+                    self.assertEqual(702, card["message_id"])
+                    self.assertEqual("prev_sha", card["last_sha1"])
+                    self.assertEqual("prev_cap", card["last_caption"])
+                    self.assertEqual("prev_markup", card["last_markup"])
+                    self.assertEqual(12.5, card["last_ts"])
+                    self.assertIn(("main", 111, 701), hub.tg.pending_retire_cards)
+
+                    # Thin wrapper refresh_single_card() preserves (bool, str) signature and propagates failure
+                    ok_wrap, msg_wrap = await hub.tg.refresh_single_card(
+                        "main", 111, message_id=702, expected_session_gen=8
+                    )
+                    self.assertFalse(ok_wrap)
+                    self.assertIn("刷新失败", msg_wrap)
+
+            asyncio.run(_run_direct())
+
+            # End-to-end verification through bridge `browser:card_refresh` -> `/internal/config`
+            cfg_dir = bdir / "live-cfg"
+            cfg_dir.mkdir(parents=True, exist_ok=True)
+            (cfg_dir / "local.token").write_text("sec-tok", encoding="utf-8")
+            bridge_dir = str(REPO_ROOT / "bridge")
+            added_path = bridge_dir not in sys.path
+            if added_path:
+                sys.path.insert(0, bridge_dir)
+            try:
+                env_patch = {
+                    "AGY_BOT_BUS_DIR": str(bdir / "bus"),
+                    "AGY_TG_STATE_FILE": str(bdir / "state.json"),
+                    "AGY_TG_WORKDIR": str(bdir / "workdir"),
+                    "AGY_TG_LOCK_DIR": str(bdir / "locks"),
+                    "AGY_TG_ALLOWED_CHATS": "111",
+                    "AGY_TG_ADMIN_USERS": "111",
+                    "AGY_TG_BOT_TOKEN": tok_main,
+                    "AGY_TG_ENV_FILE": str(env_path),
+                    "AGY_LIVE_BROWSER_URL": "http://127.0.0.1:18795",
+                    "AGY_LIVE_BROWSER_CONFIG_DIR": str(cfg_dir),
+                }
+                with mock.patch.dict(os.environ, env_patch, clear=False):
+                    import access_control  # noqa: E402
+                    import bot_bus  # noqa: E402
+                    import bridge  # noqa: E402
+
+                    importlib.reload(access_control)
+                    importlib.reload(bot_bus)
+                    importlib.reload(bridge)
+                    os.makedirs(bridge.WORKDIR, exist_ok=True)
+                    os.makedirs(bridge.UPLOADDIR, exist_ok=True)
+                    bridge.BOT_META.update({"bot_id": 991301, "handle": "test_r13_bot", "resolved": True})
+
+                    tg_calls: list[tuple[str, dict]] = []
+
+                    def _fake_tg(method: str, **kw):
+                        tg_calls.append((method, dict(kw)))
+                        return {"ok": True}
+
+                    def _fake_post(url: str, headers=None, json=None, timeout=None):
+                        self.assertTrue(url.endswith("/internal/config"))
+
+                        async def _call_server():
+                            with (
+                                mock.patch.object(srv, "_BRIDGE_DIR", bdir),
+                                mock.patch.object(srv, "BRIDGE_ENV_FILES", {"main": env_path}),
+                                mock.patch.object(srv, "FormData", _FakeFormData),
+                                mock.patch.object(srv, "web", _FakeWeb),
+                            ):
+                                req = types.SimpleNamespace(
+                                    headers=dict(headers or {}),
+                                    remote="127.0.0.1",
+                                    app={"hub": hub},
+                                    json=mock.AsyncMock(return_value=dict(json or {})),
+                                )
+                                return await srv.internal_config(req)  # type: ignore[arg-type]
+
+                        srv_resp = asyncio.run(_call_server())
+                        return types.SimpleNamespace(status_code=srv_resp.status, json=lambda: srv_resp.data)
+
+                    with (
+                        mock.patch.object(bridge, "tg", side_effect=_fake_tg),
+                        mock.patch.object(bridge.requests, "post", side_effect=_fake_post),
+                    ):
+                        bridge.handle_callback(
+                            {
+                                "id": "cb-r13-fail",
+                                "from": {"id": 111},
+                                "message": {"chat": {"id": 111}, "message_id": 702},
+                                "data": "browser:card_refresh",
+                            }
+                        )
+
+                    answers = [kw for m, kw in tg_calls if m == "answerCallbackQuery"]
+                    self.assertEqual(1, len(answers))
+                    self.assertTrue(answers[0].get("show_alert"))
+                    self.assertIn("刷新失败:", str(answers[0].get("text") or ""))
+                    self.assertNotIn("📸 实况卡片已刷新", str(answers[0].get("text") or ""))
+            finally:
+                if added_path and bridge_dir in sys.path:
+                    sys.path.remove(bridge_dir)
+
+    def test_authorized_refresh_http_503_returns_502_preserving_active_card_and_cache(self) -> None:
+        """Authorized admin + editMessageMedia HTTP 503 / ok=false (clean exit) MUST return
+        HTTP 502 / ok=false and preserve active card 702 & its cache untouched."""
+        tok_main = "991302:TEST_ROUND13_REFRESH_503"
+        with tempfile.TemporaryDirectory() as tmp:
+            bdir = Path(tmp)
+            env_path = bdir / ".env"
+            self._write_env_role(env_path, tok_main, "admin")
+
+            class _Http503:
+                def __init__(self) -> None:
+                    self.calls: list[str] = []
+
+                def post(self, url: str, data=None, json=None):
+                    self.calls.append(url.rsplit("/", 1)[-1])
+
+                    class _Resp:
+                        status = 503
+
+                        async def __aenter__(self_r):
+                            return self_r
+
+                        async def __aexit__(self_r, *_a):
+                            return False
+
+                        async def json(self_r):
+                            return {"ok": False, "error_code": 503, "description": "Service Unavailable"}
+
+                    return _Resp()
+
+            async def _scenario() -> None:
+                http_obj = _Http503()
+                hub = self._seed_refresh_hub(http_obj)
+                with (
+                    mock.patch.object(srv, "_BRIDGE_DIR", bdir),
+                    mock.patch.object(srv, "BRIDGE_ENV_FILES", {"main": env_path}),
+                    mock.patch.object(srv, "FormData", _FakeFormData),
+                    mock.patch.object(srv, "web", _FakeWeb),
+                ):
+                    resp = await srv.internal_config(self._make_refresh_req(hub))  # type: ignore[arg-type]
+                    self.assertEqual(502, resp.status)
+                    self.assertFalse(resp.data.get("ok"))
+                    self.assertEqual(["editMessageMedia"], http_obj.calls)
+                    self.assertIn(("main", 111), hub.tg.cards)
+                    card = hub.tg.cards[("main", 111)]
+                    self.assertEqual(702, card["message_id"])
+                    self.assertEqual("prev_sha", card["last_sha1"])
+                    self.assertEqual("prev_cap", card["last_caption"])
+                    self.assertEqual("prev_markup", card["last_markup"])
+                    self.assertEqual(12.5, card["last_ts"])
+                    self.assertIn(("main", 111, 701), hub.tg.pending_retire_cards)
+
+            asyncio.run(_scenario())
+
+    def test_authorized_refresh_400_not_modified_clean_returns_200_and_aexit_error_returns_502(self) -> None:
+        """Authorized admin + editMessageMedia 400 'Bad Request: message is not modified':
+        - clean __aexit__ -> HTTP 200 / ok=true and updates card cache
+        - __aexit__ ConnectionError -> HTTP 502 / ok=false and keeps original cache untouched."""
+        tok_main = "991303:TEST_ROUND13_NOT_MODIFIED"
+        with tempfile.TemporaryDirectory() as tmp:
+            bdir = Path(tmp)
+            env_path = bdir / ".env"
+            self._write_env_role(env_path, tok_main, "admin")
+
+            class _NotModifiedHTTP:
+                def __init__(self, aexit_exc: Exception | None) -> None:
+                    self._aexit_exc = aexit_exc
+                    self.calls: list[str] = []
+
+                def post(self, url: str, data=None, json=None):
+                    self.calls.append(url.rsplit("/", 1)[-1])
+                    aexit_exc = self._aexit_exc
+
+                    class _Resp:
+                        status = 400
+
+                        async def __aenter__(self_r):
+                            return self_r
+
+                        async def __aexit__(self_r, *_a):
+                            if aexit_exc is not None:
+                                raise aexit_exc
+                            return False
+
+                        async def json(self_r):
+                            return {
+                                "ok": False,
+                                "error_code": 400,
+                                "description": "Bad Request: message is not modified",
+                            }
+
+                    return _Resp()
+
+            async def _scenario() -> None:
+                with (
+                    mock.patch.object(srv, "_BRIDGE_DIR", bdir),
+                    mock.patch.object(srv, "BRIDGE_ENV_FILES", {"main": env_path}),
+                    mock.patch.object(srv, "FormData", _FakeFormData),
+                    mock.patch.object(srv, "web", _FakeWeb),
+                ):
+                    # 1. Clean exit -> HTTP 200 / ok=true & cache committed
+                    http_clean = _NotModifiedHTTP(aexit_exc=None)
+                    hub_clean = self._seed_refresh_hub(http_clean)
+                    resp_clean = await srv.internal_config(self._make_refresh_req(hub_clean))  # type: ignore[arg-type]
+                    self.assertEqual(200, resp_clean.status)
+                    self.assertTrue(resp_clean.data.get("ok"))
+                    self.assertEqual(["editMessageMedia"], http_clean.calls)
+                    self.assertIn(("main", 111), hub_clean.tg.cards)
+                    expected_sha = hashlib.sha1(b"JPEG_R13_LIVE_FRAME").hexdigest()
+                    self.assertEqual(expected_sha, hub_clean.tg.cards[("main", 111)]["last_sha1"])
+                    self.assertNotEqual("prev_cap", hub_clean.tg.cards[("main", 111)]["last_caption"])
+
+                    # 2. Same 400 not-modified payload, but __aexit__ raises ConnectionError -> HTTP 502 & cache untouched
+                    http_drop = _NotModifiedHTTP(aexit_exc=ConnectionError("close drop after 400 not modified"))
+                    hub_drop = self._seed_refresh_hub(http_drop)
+                    resp_drop = await srv.internal_config(self._make_refresh_req(hub_drop))  # type: ignore[arg-type]
+                    self.assertEqual(502, resp_drop.status)
+                    self.assertFalse(resp_drop.data.get("ok"))
+                    self.assertEqual(["editMessageMedia"], http_drop.calls)
+                    self.assertIn(("main", 111), hub_drop.tg.cards)
+                    card_drop = hub_drop.tg.cards[("main", 111)]
+                    self.assertEqual("prev_sha", card_drop["last_sha1"])
+                    self.assertEqual("prev_cap", card_drop["last_caption"])
+                    self.assertEqual("prev_markup", card_drop["last_markup"])
+                    self.assertEqual(12.5, card_drop["last_ts"])
+
+            asyncio.run(_scenario())
+
+    def test_inflight_rbac_downgrade_during_refresh_returns_403_and_purges_all_cards_immediately(self) -> None:
+        """Real temp .env RBAC downgrade admin -> readonly during editMessageMedia across:
+        1) 200 ok=true + __aexit__ ConnectionError
+        2) 400 message is not modified (clean exit)
+        3) 503 ok=false (clean exit)
+        MUST return HTTP 403 / ok=false, immediately purge BOTH active 702 & pending 701
+        before any tick_updates(), and emit ZERO follow-up Telegram requests."""
+        tok_main = "991304:TEST_ROUND13_REVOKE_REFRESH"
+        with tempfile.TemporaryDirectory() as tmp:
+            bdir = Path(tmp)
+            env_path = bdir / ".env"
+
+            class _GatedRefreshHTTP:
+                def __init__(
+                    self,
+                    status_code: int,
+                    payload: dict,
+                    gate: tuple[asyncio.Event, asyncio.Event],
+                    aexit_exc: Exception | None = None,
+                ) -> None:
+                    self._status = status_code
+                    self._payload = payload
+                    self._gate = gate
+                    self._aexit_exc = aexit_exc
+                    self.calls: list[str] = []
+
+                def post(self, url: str, data=None, json=None):
+                    self.calls.append(url.rsplit("/", 1)[-1])
+                    status_code = self._status
+                    payload = self._payload
+                    gate = self._gate
+                    aexit_exc = self._aexit_exc
+
+                    class _Resp:
+                        status = status_code
+
+                        async def __aenter__(self_r):
+                            entered, release = gate
+                            entered.set()
+                            await release.wait()
+                            return self_r
+
+                        async def __aexit__(self_r, *_a):
+                            if aexit_exc is not None:
+                                raise aexit_exc
+                            return False
+
+                        async def json(self_r):
+                            return payload
+
+                    return _Resp()
+
+            cases = [
+                (
+                    "200_ok_aexit_connection_error",
+                    200,
+                    {"ok": True, "result": {"message_id": 702}},
+                    ConnectionError("close drop on revoked refresh"),
+                ),
+                (
+                    "400_not_modified",
+                    400,
+                    {
+                        "ok": False,
+                        "error_code": 400,
+                        "description": "Bad Request: message is not modified",
+                    },
+                    None,
+                ),
+                (
+                    "503_ok_false",
+                    503,
+                    {"ok": False, "error_code": 503, "description": "Service Unavailable"},
+                    None,
+                ),
+            ]
+
+            async def _scenario() -> None:
+                with (
+                    mock.patch.object(srv, "_BRIDGE_DIR", bdir),
+                    mock.patch.object(srv, "BRIDGE_ENV_FILES", {"main": env_path}),
+                    mock.patch.object(srv, "FormData", _FakeFormData),
+                    mock.patch.object(srv, "web", _FakeWeb),
+                ):
+                    for label, status_code, payload, aexit_exc in cases:
+                        self._write_env_role(env_path, tok_main, "admin")
+                        entered, release = asyncio.Event(), asyncio.Event()
+                        http_obj = _GatedRefreshHTTP(status_code, payload, (entered, release), aexit_exc=aexit_exc)
+                        hub = self._seed_refresh_hub(http_obj)
+
+                        task = asyncio.create_task(srv.internal_config(self._make_refresh_req(hub)))  # type: ignore[arg-type]
+                        await asyncio.wait_for(entered.wait(), timeout=2.0)
+
+                        # Real temp .env downgrade admin -> readonly while editMessageMedia is in flight
+                        self._write_env_role(env_path, tok_main, "readonly")
+                        self.assertEqual(
+                            "readonly",
+                            srv.load_bot_credentials_with_rbac()[4]["main"][111],
+                            f"{label}: production RBAC parser must observe readonly",
+                        )
+                        release.set()
+                        resp = await asyncio.wait_for(task, timeout=2.0)
+
+                        self.assertEqual(403, resp.status, f"{label}: revoked refresh must return HTTP 403")
+                        self.assertFalse(resp.data.get("ok"), f"{label}: ok must be False")
+                        self.assertEqual(
+                            ["editMessageMedia"],
+                            http_obj.calls,
+                            f"{label}: must emit ONLY the in-flight editMessageMedia",
+                        )
+                        # IMMEDIATELY upon return (before any tick_updates()) BOTH 702 & 701 MUST be gone!
+                        self.assertNotIn(("main", 111), hub.tg.cards, f"{label}: 702 must be purged immediately")
+                        self.assertEqual({}, hub.tg.pending_retire_cards, f"{label}: 701 must be purged immediately")
+
+                        # Subsequent tick_updates() emits ZERO requests
+                        await hub.tg.tick_updates()
+                        self.assertEqual(
+                            ["editMessageMedia"],
+                            http_obj.calls,
+                            f"{label}: subsequent tick_updates() must emit zero requests",
+                        )
+
+            asyncio.run(_scenario())
+
+    def test_refresh_cancellation_in_aenter_json_aexit_propagates_and_purges_if_revoked(self) -> None:
+        """Real asyncio.CancelledError during refresh in __aenter__, json(), and __aexit__:
+        - MUST propagate CancelledError cleanly (never swallowed into HTTP 502/200)
+        - MUST release tg._lock
+        - MUST immediately purge BOTH 702 & 701 if RBAC was downgraded admin -> readonly in flight
+        - MUST preserve active card 702 & cache if RBAC stayed admin."""
+        tok_main = "991305:TEST_ROUND13_CANCEL_REFRESH"
+        with tempfile.TemporaryDirectory() as tmp:
+            bdir = Path(tmp)
+            env_path = bdir / ".env"
+
+            class _CancelPointHTTP:
+                def __init__(self, phase: str, reached: asyncio.Event, gate: asyncio.Event) -> None:
+                    self._phase = phase
+                    self._reached = reached
+                    self._gate = gate
+                    self.calls: list[str] = []
+
+                def post(self, url: str, data=None, json=None):
+                    self.calls.append(url.rsplit("/", 1)[-1])
+                    phase = self._phase
+                    reached = self._reached
+                    gate = self._gate
+
+                    class _Resp:
+                        status = 200
+
+                        async def __aenter__(self_r):
+                            if phase == "aenter":
+                                reached.set()
+                                await gate.wait()
+                            return self_r
+
+                        async def json(self_r):
+                            if phase == "json":
+                                reached.set()
+                                await gate.wait()
+                            return {"ok": True, "result": {"message_id": 702}}
+
+                        async def __aexit__(self_r, *_a):
+                            if phase == "aexit":
+                                reached.set()
+                                await gate.wait()
+                            return False
+
+                    return _Resp()
+
+            async def _scenario() -> None:
+                with (
+                    mock.patch.object(srv, "_BRIDGE_DIR", bdir),
+                    mock.patch.object(srv, "BRIDGE_ENV_FILES", {"main": env_path}),
+                    mock.patch.object(srv, "FormData", _FakeFormData),
+                    mock.patch.object(srv, "web", _FakeWeb),
+                ):
+                    for phase in ("aenter", "json", "aexit"):
+                        for revoke_in_flight in (False, True):
+                            self._write_env_role(env_path, tok_main, "admin")
+                            reached, gate = asyncio.Event(), asyncio.Event()
+                            http_obj = _CancelPointHTTP(phase, reached, gate)
+                            hub = self._seed_refresh_hub(http_obj)
+
+                            task = asyncio.create_task(srv.internal_config(self._make_refresh_req(hub)))  # type: ignore[arg-type]
+                            await asyncio.wait_for(reached.wait(), timeout=2.0)
+
+                            if revoke_in_flight:
+                                self._write_env_role(env_path, tok_main, "readonly")
+                                self.assertEqual(
+                                    "readonly",
+                                    srv.load_bot_credentials_with_rbac()[4]["main"][111],
+                                )
+
+                            task.cancel()
+                            with self.assertRaises(asyncio.CancelledError):
+                                await task
+
+                            self.assertFalse(
+                                hub.tg._lock.locked(),
+                                f"{phase} revoke={revoke_in_flight}: lock must be released on cancel",
+                            )
+                            self.assertEqual(["editMessageMedia"], http_obj.calls)
+                            if revoke_in_flight:
+                                self.assertNotIn(
+                                    ("main", 111),
+                                    hub.tg.cards,
+                                    f"{phase}: revoked cancel must purge active card 702 immediately",
+                                )
+                                self.assertEqual(
+                                    {},
+                                    hub.tg.pending_retire_cards,
+                                    f"{phase}: revoked cancel must purge pending card 701 immediately",
+                                )
+                            else:
+                                self.assertIn(
+                                    ("main", 111),
+                                    hub.tg.cards,
+                                    f"{phase}: authorized cancel must preserve active card 702",
+                                )
+                                self.assertEqual("prev_sha", hub.tg.cards[("main", 111)]["last_sha1"])
+                                self.assertEqual("prev_cap", hub.tg.cards[("main", 111)]["last_caption"])
+                                self.assertEqual("prev_markup", hub.tg.cards[("main", 111)]["last_markup"])
+                                self.assertEqual(12.5, hub.tg.cards[("main", 111)]["last_ts"])
+
+            asyncio.run(_scenario())
+
+
 if __name__ == "__main__":
     unittest.main()
