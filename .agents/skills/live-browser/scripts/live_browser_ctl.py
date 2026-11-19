@@ -221,7 +221,13 @@ class LiveBrowserClient:
 class SyncLiveBridge:
     """Wraps a sync Playwright BrowserContext to stream frames & honor human takeover."""
 
-    def __init__(self, raw_ctx: Any, bot_hint: str | None = None, notify: bool | None = None) -> None:
+    def __init__(
+        self,
+        raw_ctx: Any,
+        bot_hint: str | None = None,
+        notify: bool | None = None,
+        user_id: int | None = None,
+    ) -> None:
         self.raw_ctx = raw_ctx
         self.client = LiveBrowserClient(bot=bot_hint)
         self.notify = (os.environ.get("AGY_LIVE_NOTIFY", "1") != "0") if notify is None else notify
@@ -229,18 +235,38 @@ class SyncLiveBridge:
         self.active_idx = 0
         self._in_checkpoint = False
         self._held_buttons: set[str] = set()
+        self._sync_lease_id: str | None = None
+        self._sync_session_gen: int | None = None
         self._x11_display: str | None = self._resolve_display()
         self._last_clip: str = self._read_x11_clip()
         if self.enabled:
             try:
-                self.client.session.post(
+                start_body: dict[str, Any] = {
+                    "bot": self.client.bot,
+                    "ai_status": "已启动同步浏览器会话",
+                }
+                raw_uid = user_id if user_id is not None else os.environ.get("AGY_LIVE_USER_ID")
+                if raw_uid is not None and str(raw_uid).strip().isdigit() and int(str(raw_uid).strip()) > 0:
+                    start_body["user_id"] = int(str(raw_uid).strip())
+                resp = self.client.session.post(
                     f"{self.client.base_url}/internal/sync/start",
                     headers=self.client._headers(),
-                    json={"bot": self.client.bot, "ai_status": "已启动同步浏览器会话"},
+                    json=start_body,
                     timeout=3.0,
                 )
+                start_data = resp.json() if hasattr(resp, "json") else {}
+                if isinstance(start_data, dict):
+                    self._sync_lease_id = start_data.get("sync_lease_id")
+                    self._sync_session_gen = start_data.get("session_gen")
             except Exception:
                 self.enabled = False
+
+    def _sync_headers(self) -> dict[str, str]:
+        hdrs = dict(self.client._headers())
+        lease_id = getattr(self, "_sync_lease_id", None)
+        if lease_id:
+            hdrs["X-Sync-Lease-Id"] = str(lease_id)
+        return hdrs
 
     def close(self) -> None:
         if not self.enabled:
@@ -249,7 +275,7 @@ class SyncLiveBridge:
             self.sync_checkpoint(ai_status="会话即将完成", allow_takeover_loop=False)
             self.client.session.post(
                 f"{self.client.base_url}/internal/sync/stop",
-                headers=self.client._headers(),
+                headers=self._sync_headers(),
                 timeout=5.0,
             )
         except Exception:
@@ -298,10 +324,14 @@ class SyncLiveBridge:
         if not self.enabled or not payload.get("text"):
             return
         try:
+            body = dict(payload)
+            lease_id = getattr(self, "_sync_lease_id", None)
+            if lease_id:
+                body["lease_id"] = lease_id
             self.client.session.post(
                 f"{self.client.base_url}/internal/sync/clipboard",
-                headers=self.client._headers(),
-                json=payload,
+                headers=self._sync_headers(),
+                json=body,
                 timeout=2.5,
             )
         except Exception:
@@ -358,6 +388,12 @@ class SyncLiveBridge:
                     "ai_status": ai_status,
                     "tabs": json.dumps(tabs, ensure_ascii=False),
                 }
+                lease_id = getattr(self, "_sync_lease_id", None)
+                if lease_id:
+                    params["lease_id"] = str(lease_id)
+                sync_sgen = getattr(self, "_sync_session_gen", None)
+                if sync_sgen is not None:
+                    params["session_gen"] = str(sync_sgen)
                 if cursor:
                     params["cx"] = str(cursor[0])
                     params["cy"] = str(cursor[1])
@@ -366,23 +402,56 @@ class SyncLiveBridge:
                 qs = urllib.parse.urlencode(params)
                 resp = self.client.session.post(
                     f"{self.client.base_url}/internal/sync/push?{qs}",
-                    headers={**self.client._headers(), "Content-Type": "image/jpeg"},
+                    headers={**self._sync_headers(), "Content-Type": "image/jpeg"},
                     data=jpeg,
                     timeout=4.0,
                 )
+                status_code = getattr(resp, "status_code", 200)
+                if status_code in (409, 410):
+                    self.enabled = False
+                    break
                 data = resp.json()
+                if isinstance(data, dict) and data.get("ok") is False:
+                    self.enabled = False
+                    break
                 cur_clip = self._read_x11_clip()
                 if cur_clip and cur_clip != self._last_clip:
                     self._last_clip = cur_clip
                     self._push_clip({"text": cur_clip, "source": "网页复制按钮 / Ctrl+C"})
                 is_takeover = bool(data.get("takeover"))
+                resp_sgen = data.get("session_gen")
+                resp_tgen = data.get("takeover_gen")
                 cmds = data.get("commands") or []
                 for cmd in cmds:
                     act = cmd.get("action")
-                    # Strictly honor takeover barrier: once takeover is released, only run
-                    # cleanup `mouseup` or read-only `extract`; discard stale mutating commands.
-                    if not is_takeover and act not in ("mouseup", "extract"):
-                        continue
+                    cmd_sgen = cmd.get("session_gen")
+                    cmd_tgen = cmd.get("takeover_gen")
+                    if resp_sgen is not None and cmd_sgen is not None:
+                        try:
+                            if int(cmd_sgen) != int(resp_sgen):
+                                continue
+                        except (TypeError, ValueError):
+                            continue
+                    # Strictly honor takeover barrier & generation binding:
+                    # once takeover is released or takeover_gen changed, only run cleanup `mouseup`
+                    # or read-only `extract`; discard stale mutating commands.
+                    is_cleanup_up = act == "mouseup" and (bool(cmd.get("cleanup")) or not is_takeover)
+                    if act not in ("mouseup", "extract"):
+                        if not is_takeover:
+                            continue
+                        if resp_tgen is not None and cmd_tgen is not None:
+                            try:
+                                if int(cmd_tgen) != int(resp_tgen):
+                                    continue
+                            except (TypeError, ValueError):
+                                continue
+                    elif act == "mouseup" and not is_cleanup_up:
+                        if resp_tgen is not None and cmd_tgen is not None:
+                            try:
+                                if int(cmd_tgen) != int(resp_tgen):
+                                    continue
+                            except (TypeError, ValueError):
+                                continue
                     cursor = self._exec_human_sync(cmd)
                 if not is_takeover:
                     self._release_held_buttons_sync()
@@ -522,8 +591,16 @@ class SyncLiveBridge:
                         """({x, y}) => {
                             const el = document.elementFromPoint(x, y);
                             if (!el) return null;
+                            const tag = (el.tagName || '').toUpperCase();
+                            if (tag === 'INPUT' || tag === 'TEXTAREA') {
+                                const tp = (el.type || 'text').toLowerCase();
+                                const ac = (el.getAttribute && (el.getAttribute('autocomplete') || '') || '').toLowerCase();
+                                const isSensitive = tp === 'password' || ac.includes('password') || ac.includes('cc-');
+                                const val = isSensitive ? '' : String(el.value || el.placeholder || '').trim();
+                                return val ? { text: val.slice(0, 20000), href: '', source: '输入框内容' } : null;
+                            }
                             const link = el.closest('a[href]');
-                            const txt = (el.value || el.innerText || el.textContent || '').trim();
+                            const txt = (el.innerText || el.textContent || '').trim();
                             return txt ? { text: txt.slice(0, 20000), href: link ? link.href : '', source: '点字提取' } : null;
                         }""",
                         {"x": x, "y": y},

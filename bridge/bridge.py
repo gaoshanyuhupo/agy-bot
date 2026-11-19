@@ -9193,7 +9193,21 @@ def build_browser_panel(chat_id):
     return "\n".join(lines), {"inline_keyboard": buttons}
 
 
-def cmd_browser(chat_id, arg, thread_id=None, scope_key=None):
+def _live_browser_owner_uid(chat_id, from_user=None):
+    """Extract strictly positive owner Telegram user_id (DM chat_id in private chats, sender user_id in groups)."""
+    try:
+        cid = int(chat_id)
+    except Exception:
+        cid = 0
+    if cid > 0:
+        return cid
+    uid = access_control.extract_user_id(from_user)
+    if uid is not None and int(uid) > 0:
+        return int(uid)
+    return None
+
+
+def cmd_browser(chat_id, arg, thread_id=None, scope_key=None, from_user=None):
     norm_tid = _normalize_thread_id(thread_id)
     raw = (arg or "").strip()
     parts = raw.split()
@@ -9204,12 +9218,17 @@ def cmd_browser(chat_id, arg, thread_id=None, scope_key=None):
         send(chat_id, text, parse_mode="HTML", reply_markup=kb, thread_id=norm_tid)
         return
 
+    bot_hint = _live_browser_bot_hint()
+    owner_uid = _live_browser_owner_uid(chat_id, from_user=from_user)
+
     if sub == "switch":
         if len(parts) < 2:
             send(chat_id, "用法：<code>/browser switch &lt;profile&gt; [url]</code>", parse_mode="HTML", thread_id=norm_tid)
             return
         target = parts[1].strip()
-        body = {"profile": target, "restart": True}
+        body = {"profile": target, "restart": True, "bot": bot_hint}
+        if owner_uid is not None:
+            body["user_id"] = owner_uid
         if len(parts) > 2:
             body["url"] = parts[2].strip()
         ok, res = _live_browser_request("POST", "/internal/profiles/switch", json_body=body, timeout=(2.5, 25.0))
@@ -9221,7 +9240,9 @@ def cmd_browser(chat_id, arg, thread_id=None, scope_key=None):
         return
 
     if sub == "start":
-        body = {}
+        body = {"bot": bot_hint}
+        if owner_uid is not None:
+            body["user_id"] = owner_uid
         if len(parts) > 1:
             body["profile"] = parts[1].strip()
         if len(parts) > 2:
@@ -9235,7 +9256,10 @@ def cmd_browser(chat_id, arg, thread_id=None, scope_key=None):
         return
 
     if sub == "stop":
-        ok, res = _live_browser_request("POST", "/internal/stop", json_body={}, timeout=(2.0, 10.0))
+        body = {"bot": bot_hint}
+        if owner_uid is not None:
+            body["user_id"] = owner_uid
+        ok, res = _live_browser_request("POST", "/internal/stop", json_body=body, timeout=(2.0, 10.0))
         if not ok:
             send(chat_id, f"❌ 停止浏览器失败：{html_mod.escape(str(res))}", parse_mode="HTML", thread_id=norm_tid)
             return
@@ -9773,6 +9797,9 @@ def _handle_browser_callback(cb_id, chat_id, thread_id, msg_id, data, from_user=
                     "reason": "从 Telegram 实况卡片点击接管",
                     "bot": bot_hint,
                     "user_id": priv_cid,
+                    "chat_id": priv_cid,
+                    "message_id": msg_id,
+                    "from_card": True,
                 },
                 timeout=(1.5, 5.0),
             )
@@ -9785,7 +9812,14 @@ def _handle_browser_callback(cb_id, chat_id, thread_id, msg_id, data, from_user=
             ok, res = _live_browser_request(
                 "POST",
                 "/internal/takeover",
-                json_body={"active": False, "bot": bot_hint, "user_id": priv_cid},
+                json_body={
+                    "active": False,
+                    "bot": bot_hint,
+                    "user_id": priv_cid,
+                    "chat_id": priv_cid,
+                    "message_id": msg_id,
+                    "from_card": True,
+                },
                 timeout=(1.5, 5.0),
             )
             if not ok:
@@ -9814,7 +9848,13 @@ def _handle_browser_callback(cb_id, chat_id, thread_id, msg_id, data, from_user=
             ok, res = _live_browser_request(
                 "POST",
                 "/internal/stop",
-                json_body={"bot": bot_hint, "user_id": priv_cid},
+                json_body={
+                    "bot": bot_hint,
+                    "user_id": priv_cid,
+                    "chat_id": priv_cid,
+                    "message_id": msg_id,
+                    "from_card": True,
+                },
                 timeout=(2.0, 10.0),
             )
             if not ok:
@@ -9860,14 +9900,19 @@ def _handle_browser_callback(cb_id, chat_id, thread_id, msg_id, data, from_user=
         tg("answerCallbackQuery", callback_query_id=cb_id, text="↩️ 已恢复默认命令菜单")
         return
 
+    bot_hint = _live_browser_bot_hint()
+    owner_uid = _live_browser_owner_uid(chat_id, from_user=from_user)
     if sub == "refresh":
         tg("answerCallbackQuery", callback_query_id=cb_id, text="浏览器状态已刷新")
     elif sub.startswith("switch:"):
         target = sub[7:].strip()
+        body = {"profile": target, "restart": True, "bot": bot_hint}
+        if owner_uid is not None:
+            body["user_id"] = owner_uid
         ok, res = _live_browser_request(
             "POST",
             "/internal/profiles/switch",
-            json_body={"profile": target, "restart": True},
+            json_body=body,
             timeout=(2.5, 25.0),
         )
         if not ok:
@@ -9876,14 +9921,21 @@ def _handle_browser_callback(cb_id, chat_id, thread_id, msg_id, data, from_user=
         tg("answerCallbackQuery", callback_query_id=cb_id, text=f"已切换至指纹 {target}")
     elif sub.startswith("start:"):
         target = sub[6:].strip()
-        body = {"profile": target} if target else {}
+        body = {"bot": bot_hint}
+        if owner_uid is not None:
+            body["user_id"] = owner_uid
+        if target:
+            body["profile"] = target
         ok, res = _live_browser_request("POST", "/internal/start", json_body=body, timeout=(2.5, 25.0))
         if not ok:
             tg("answerCallbackQuery", callback_query_id=cb_id, text=f"启动失败: {res}"[:180], show_alert=True)
             return
         tg("answerCallbackQuery", callback_query_id=cb_id, text=f"已启动指纹 {target or 'default'}")
     elif sub == "stop":
-        ok, res = _live_browser_request("POST", "/internal/stop", json_body={}, timeout=(2.0, 10.0))
+        body = {"bot": bot_hint}
+        if owner_uid is not None:
+            body["user_id"] = owner_uid
+        ok, res = _live_browser_request("POST", "/internal/stop", json_body=body, timeout=(2.0, 10.0))
         if not ok:
             tg("answerCallbackQuery", callback_query_id=cb_id, text=f"停止失败: {res}"[:180], show_alert=True)
             return
@@ -10477,7 +10529,7 @@ def handle_message(msg):
         elif cmd == "/model":
             cmd_model(chat_id, raw_rest, thread_id=thread_id, scope_key=skey)
         elif cmd in ("/browser", "/profile"):
-            cmd_browser(chat_id, raw_rest, thread_id=thread_id, scope_key=skey)
+            cmd_browser(chat_id, raw_rest, thread_id=thread_id, scope_key=skey, from_user=from_user)
         elif cmd == "/effort":
             cmd_effort(chat_id, arg, thread_id=thread_id, scope_key=skey)
         elif cmd == "/thinking":

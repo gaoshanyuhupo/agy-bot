@@ -470,6 +470,139 @@ class TestLiveBrowserProfiles(unittest.TestCase):
 
         asyncio.run(_scenario())
 
+    def test_p0_03_forged_pinned_rejected_and_non_pinned_full_navigation_guard(self) -> None:
+        """P0-03: reject forged pinned=True, verify private unit env, and enforce ctx.route + framenavigated Google guard."""
+        # 1. Private repo systemd unit must explicitly enforce AGY_LIVE_BROWSER_REQUIRE_PINNED=1 (if present)
+        unit_path = REPO_ROOT / "systemd/agy-live-browser.service"
+        if unit_path.is_file():
+            self.assertIn("AGY_LIVE_BROWSER_REQUIRE_PINNED=1", unit_path.read_text(encoding="utf-8"))
+
+        pinned_dir = self._install_mock_google_browser("pinned_acct")
+
+        # 2. create_profile rejects forged pinned=True
+        with self.assertRaises(ValueError):
+            srv.create_profile("forged", {"os": "windows", "pinned": True})
+
+        # 3. Manually tampered profiles.json with pinned=True is stripped to unpinned & blocked from Google
+        srv.save_profiles({"forged": {"os": "windows", "persistent": True, "pinned": True}})
+        spec = srv.resolve_launch_spec("forged")
+        self.assertFalse(spec["pinned"])
+        self.assertFalse(spec["pinned_verified"])
+        with self.assertRaises(ValueError):
+            srv.enforce_google_profile_policy(
+                "https://mail.google.com",
+                is_pinned=True,
+                profile_dir=self.profiles_data / "forged",
+            )
+        # Authentic canonical pinned_dir is allowed
+        srv.enforce_google_profile_policy(
+            "https://mail.google.com",
+            is_pinned=True,
+            profile_dir=pinned_dir,
+        )
+
+        # 4. Non-pinned context installs ctx.route interceptor blocking redirects/links/popups/history + framenavigated fallback
+        routes_registered: list[tuple[str, object]] = []
+        nav_callbacks: list[object] = []
+
+        class _RouteAwarePage:
+            def __init__(self, url: str = "https://example.com") -> None:
+                self.url = url
+                self.viewport_size = {"width": 1280, "height": 800}
+                self.goto_history: list[str] = []
+
+            def on(self, event: str, cb) -> None:
+                if event == "framenavigated":
+                    nav_callbacks.append(cb)
+
+            async def title(self) -> str:
+                return "Page"
+
+            async def screenshot(self, **_kw) -> bytes:
+                return b"JPEG"
+
+            async def goto(self, url: str, **_kw) -> None:
+                self.url = url
+                self.goto_history.append(url)
+
+        class _RouteAwareCtx:
+            def __init__(self) -> None:
+                self.pages = [_RouteAwarePage()]
+                self._callbacks: dict[str, list] = {}
+                holder = types.SimpleNamespace(_display=11)
+                self.close = lambda: holder._display
+
+            async def route(self, pattern: str, handler) -> None:
+                routes_registered.append((pattern, handler))
+
+            def on(self, event: str, cb) -> None:
+                self._callbacks.setdefault(event, []).append(cb)
+
+            async def new_page(self):
+                p = _RouteAwarePage("about:blank")
+                self.pages.append(p)
+                return p
+
+        class _RouteCamoufoxCM:
+            def __init__(self, **_kw) -> None:
+                self.ctx = _RouteAwareCtx()
+
+            async def __aenter__(self):
+                return self.ctx
+
+            async def __aexit__(self, *_args) -> None:
+                return None
+
+        fake_mod = types.ModuleType("camoufox.async_api")
+        fake_mod.AsyncCamoufox = _RouteCamoufoxCM  # type: ignore[attr-defined]
+        fake_pkg = types.ModuleType("camoufox")
+        fake_pkg.async_api = fake_mod  # type: ignore[attr-defined]
+
+        async def _scenario() -> None:
+            hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "tok")
+            with mock.patch.dict(sys.modules, {"camoufox": fake_pkg, "camoufox.async_api": fake_mod}):
+                await hub.start_hosted(initial_url="https://example.com", profile="forged", notify_tg=False)
+                self.assertFalse(hub._is_active_pinned_verified())
+                self.assertEqual(1, len(routes_registered))
+                pattern, handler = routes_registered[0]
+                self.assertEqual("**/*", pattern)
+
+                # Simulated 3xx redirect / popup / history nav to Google MUST be aborted with blockedbyclient
+                aborted: list[str] = []
+                continued: list[str] = []
+
+                class _FakeRoute:
+                    def __init__(self, url: str, is_nav: bool = True, res_type: str = "document") -> None:
+                        self.request = types.SimpleNamespace(
+                            url=url,
+                            is_navigation_request=lambda: is_nav,
+                            resource_type=res_type,
+                        )
+
+                    async def abort(self, reason: str = "") -> None:
+                        aborted.append(reason)
+
+                    async def continue_(self) -> None:
+                        continued.append(self.request.url)
+
+                r_goog = _FakeRoute("https://accounts.google.com/ServiceLogin", is_nav=True)
+                await handler(r_goog, r_goog.request)
+                self.assertEqual(["blockedbyclient"], aborted)
+
+                r_ok = _FakeRoute("https://example.org/docs", is_nav=True)
+                await handler(r_ok, r_ok.request)
+                self.assertEqual(["https://example.org/docs"], continued)
+
+                # Fallback framenavigated to Google forces redirect to about:blank
+                self.assertTrue(nav_callbacks)
+                yt_url = "https://" + ".".join(("www", "youtube", "com")) + "/watch?v=123"
+                nav_callbacks[0](types.SimpleNamespace(url=yt_url))
+                await asyncio.sleep(0.03)
+                self.assertEqual("about:blank", hub._current_page().url)
+                await hub.stop_hosted(notify_finished=False)
+
+        asyncio.run(_scenario())
+
 
 if __name__ == "__main__":
     unittest.main()

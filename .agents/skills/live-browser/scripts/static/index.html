@@ -786,18 +786,25 @@
 
     let ws = null;
     let wsConnGen = 0;
+    let frameRenderGen = 0;
     let authed = false;
     let authRejected = false;
     let userRole = 'admin';
+    let currentBotKey = null;
+    let currentUserId = null;
     let reconnectAttempt = 0;
     let reconnectTimer = null;
     const RECONNECT_DELAYS = [1000, 2000, 4000, 8000];
     let pendingUrlGoto = null;
+    let takeoverReqSeq = 0;
+    let extractReqGen = 0;
+    let extractDragActive = false;
 
     let state = {
       running: false,
       engine_mode: 'idle',
       session_gen: 0,
+      takeover_gen: 0,
       profile: null,
       pinned: false,
       egress: 'direct',
@@ -827,7 +834,29 @@
     // Latest-frame single-slot decoder (zero frame backlog on mobile)
     let pendingFrameBlob = null;
     let pendingFrameConnGen = 0;
+    let pendingFrameGen = 0;
     let decodingFrame = false;
+
+    function sendWsInput(payload) {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+      ws.send(JSON.stringify({
+        type: 'input',
+        session_gen: state.session_gen,
+        takeover_gen: state.takeover_gen,
+        ...payload
+      }));
+      return true;
+    }
+
+    function sendWsExtract(payload) {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+      ws.send(JSON.stringify({
+        type: 'extract',
+        session_gen: state.session_gen,
+        ...payload
+      }));
+      return true;
+    }
 
     // Zoom & Pan state
     let scale = 1.0;
@@ -1076,7 +1105,7 @@
         btn.textContent = '✋ 按住拖曳';
       }
       if (state.running && state.takeover && ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'input', action: 'mouseup', x: trackpadX, y: trackpadY, button: 'left' }));
+        sendWsInput({ action: 'mouseup', x: trackpadX, y: trackpadY, button: 'left' });
       }
       positionArrowCursor(trackpadX, trackpadY, 'human', gestureMode === 'trackpad');
     }
@@ -1095,12 +1124,14 @@
           btn.textContent = '🟡 拖曳中·点松开';
         }
         positionArrowCursor(trackpadX, trackpadY, 'drag', true);
-        ws.send(JSON.stringify({ type: 'input', action: 'mousedown', x: trackpadX, y: trackpadY, button: 'left' }));
+        sendWsInput({ action: 'mousedown', x: trackpadX, y: trackpadY, button: 'left' });
         showToast('🟡 已按住左键，单指滑动即可拖曳');
       }
     }
 
     function setGestureMode(mode) {
+      extractReqGen++;
+      extractDragActive = false;
       if (gestureMode === 'trackpad' && mode !== 'trackpad') {
         releaseTrackpadHoldIfNeeded();
       }
@@ -1196,6 +1227,7 @@
         return;
       }
       const msg = pendingDialogs[0];
+      const isSameActive = activeDialogId !== null && activeDialogId === msg.dialog_id && !sheet.classList.contains('hidden');
       activeDialogId = msg.dialog_id;
       const typeLabels = {
         alert: '⚠️ 网页提示 (alert)',
@@ -1205,6 +1237,9 @@
       };
       const extra = pendingDialogs.length > 1 ? ` · 队列 +${pendingDialogs.length - 1}` : '';
       document.getElementById('dialog-type-label').textContent = (typeLabels[msg.dialog_type] || '💬 网页弹窗') + extra;
+      if (isSameActive) {
+        return;
+      }
       document.getElementById('dialog-msg').textContent = msg.message || '(无内容)';
       if (msg.dialog_type === 'prompt') {
         inp.value = msg.default_value || '';
@@ -1298,7 +1333,8 @@
 
     fileUploadInput.addEventListener('change', async () => {
       const files = Array.from(fileUploadInput.files || []);
-      if (!files.length || !activeChooserId) return;
+      const uploadedChooserId = activeChooserId;
+      if (!files.length || !uploadedChooserId) return;
       const maxBytes = 25 * 1024 * 1024;
       const total = files.reduce((acc, f) => acc + (f.size || 0), 0);
       if (total > maxBytes) {
@@ -1311,35 +1347,45 @@
         `⏳ 正在上传 ${files.length} 个文件 (${(total / 1024).toFixed(1)} KB)...`;
 
       const form = new FormData();
-      form.append('chooser_id', activeChooserId);
+      form.append('chooser_id', uploadedChooserId);
       files.forEach((f) => form.append('files', f, f.name));
 
       try {
         const initData = (tg && tg.initData) ? tg.initData : '';
-        const resp = await fetch(`/api/upload?chooser_id=${encodeURIComponent(activeChooserId)}`, {
+        const resp = await fetch(`/api/upload?chooser_id=${encodeURIComponent(uploadedChooserId)}`, {
           method: 'POST',
           headers: {
             'X-TG-Init-Data': initData,
-            'X-Chooser-Id': activeChooserId
+            'X-Chooser-Id': uploadedChooserId
           },
           body: form
         });
         const res = await resp.json().catch(() => ({}));
         if (resp.ok && res.ok) {
           showToast(`✅ 已上传 ${files.length} 个文件至网页`);
-          closeUploadSheet();
+          // Only close upload sheet if no newer chooser replaced the one we just uploaded!
+          if (activeChooserId === uploadedChooserId) {
+            closeUploadSheet();
+          }
         } else {
           showToast(`❌ 上传失败: ${res.error || resp.status}`);
-          pickBtn.disabled = false;
-          document.getElementById('upload-sheet-desc').textContent = `❌ 上传失败：${res.error || resp.status}`;
+          if (activeChooserId === uploadedChooserId) {
+            pickBtn.disabled = false;
+            document.getElementById('upload-sheet-desc').textContent = `❌ 上传失败：${res.error || resp.status}`;
+          }
         }
       } catch (err) {
         showToast('❌ 上传网络异常');
-        pickBtn.disabled = false;
+        if (activeChooserId === uploadedChooserId) {
+          pickBtn.disabled = false;
+        }
       }
     });
 
     // ---------------- P2 File Download Banner ----------------
+    const MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024;
+    const MAX_TG_DOWNLOAD_BYTES = 20 * 1024 * 1024;
+
     function formatBytes(n) {
       if (!n || n < 1024) return `${n || 0} B`;
       if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
@@ -1348,10 +1394,13 @@
 
     function showDownloadBanner(msg) {
       latestDownload = msg;
+      const sizeBytes = Number(msg.size || 0);
       document.getElementById('dl-name').textContent = `📥 ${msg.filename || 'download.bin'}`;
       document.getElementById('dl-meta').textContent = msg.auto_sent
-        ? `${formatBytes(msg.size)} · ✅ 已自动发往私聊 TG`
-        : `${formatBytes(msg.size)} · 点击右侧发回 TG 或直接下载`;
+        ? `${formatBytes(sizeBytes)} · ✅ 已自动发往私聊 TG`
+        : (sizeBytes > MAX_TG_DOWNLOAD_BYTES
+          ? `${formatBytes(sizeBytes)} · 超过 TG 20MB 限制，请点右侧【💾 下载】`
+          : `${formatBytes(sizeBytes)} · 点击右侧发回 TG 或直接下载`);
       document.getElementById('download-banner').classList.remove('hidden');
       haptic('light');
     }
@@ -1370,8 +1419,8 @@
     async function downloadLatestFile() {
       if (!latestDownload || !latestDownload.download_id) return;
       const sizeBytes = Number(latestDownload.size || 0);
-      if (sizeBytes > 25 * 1024 * 1024) {
-        showToast('⚠️ 文件超过 25MB，移动端面板内存有限，建议在桌面端下载');
+      if (sizeBytes > MAX_DOWNLOAD_BYTES) {
+        showToast('⚠️ 文件超过服务端 50MB 单文件下载上限');
         return;
       }
       const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
@@ -1509,7 +1558,7 @@
       }
       haptic('light');
       if (ws && ws.readyState === WebSocket.OPEN && authed) {
-        ws.send(JSON.stringify({ type: 'extract', mode }));
+        sendWsExtract({ mode });
       }
     }
 
@@ -1634,13 +1683,12 @@
       const inp = document.getElementById('kb-modal-input');
       const text = inp.value;
       haptic('light');
-      ws.send(JSON.stringify({
-        type: 'input',
+      sendWsInput({
         action: 'type',
         text,
         submit: !!submitEnter,
         replace: !!replaceExisting
-      }));
+      });
       inp.value = '';
       if (submitEnter) closeKbSheet();
     }
@@ -1650,15 +1698,26 @@
       if (e.key === 'Escape') { e.preventDefault(); closeKbSheet(); }
     });
 
-    // ---------------- Latest-Frame Single-Slot Decoder (Safe Resource Cleanup & Connection Gen) ----------------
-    async function decodeAndDrawBlob(blob, connGen) {
-      if (connGen !== wsConnGen) return false;
+    // ---------------- Latest-Frame Single-Slot Decoder (Safe Resource Cleanup & Frame Render Gen) ----------------
+    function invalidateFrameSurface(clearCanvas = true) {
+      frameRenderGen++;
+      pendingFrameBlob = null;
+      pendingFrameGen = frameRenderGen;
+      if (clearCanvas && ctx && screenCanvas) {
+        try {
+          ctx.clearRect(0, 0, screenCanvas.width || 1280, screenCanvas.height || 800);
+        } catch (_) {}
+      }
+    }
+
+    async function decodeAndDrawBlob(blob, connGen, renderGen = frameRenderGen) {
+      if (connGen !== wsConnGen || renderGen !== frameRenderGen || authRejected || !authed) return false;
       let drew = false;
       if (window.createImageBitmap) {
         let bmp = null;
         try {
           bmp = await createImageBitmap(blob);
-          if (connGen !== wsConnGen) return false;
+          if (connGen !== wsConnGen || renderGen !== frameRenderGen || authRejected || !authed) return false;
           if (screenCanvas.width !== bmp.width || screenCanvas.height !== bmp.height) {
             screenCanvas.width = bmp.width;
             screenCanvas.height = bmp.height;
@@ -1675,7 +1734,7 @@
         }
       }
 
-      if (!drew && connGen === wsConnGen) {
+      if (!drew && connGen === wsConnGen && renderGen === frameRenderGen && !authRejected && authed) {
         await new Promise((resolve) => {
           const url = URL.createObjectURL(blob);
           const img = new Image();
@@ -1688,7 +1747,7 @@
           };
           img.onload = () => {
             try {
-              if (connGen === wsConnGen) {
+              if (connGen === wsConnGen && renderGen === frameRenderGen && !authRejected && authed) {
                 if (screenCanvas.width !== img.naturalWidth || screenCanvas.height !== img.naturalHeight) {
                   screenCanvas.width = img.naturalWidth;
                   screenCanvas.height = img.naturalHeight;
@@ -1712,7 +1771,7 @@
         });
       }
 
-      if (drew && connGen === wsConnGen) {
+      if (drew && connGen === wsConnGen && renderGen === frameRenderGen && !authRejected && authed) {
         renderedFrameCount++;
       }
       return drew;
@@ -1725,8 +1784,9 @@
         while (pendingFrameBlob) {
           const blob = pendingFrameBlob;
           const connGen = pendingFrameConnGen;
+          const renderGen = pendingFrameGen;
           pendingFrameBlob = null;
-          await decodeAndDrawBlob(blob, connGen);
+          await decodeAndDrawBlob(blob, connGen, renderGen);
         }
       } finally {
         decodingFrame = false;
@@ -1743,8 +1803,10 @@
 
     function resetConnectionControlState() {
       authed = false;
-      pendingFrameBlob = null;
+      invalidateFrameSurface(true);
       pendingFrameConnGen = wsConnGen;
+      extractReqGen++;
+      extractDragActive = false;
       clearPendingUrlGoto();
       state.takeover = false;
       prevTakeoverState = false;
@@ -1767,6 +1829,7 @@
     function showAuthRejectedUi(errMsg) {
       authed = false;
       authRejected = true;
+      invalidateFrameSurface(true);
       clearTimeout(reconnectTimer);
       reconnectTimer = null;
       clearPendingUrlGoto();
@@ -1835,14 +1898,19 @@
           const msg = JSON.parse(ev.data);
           handleJsonMessage(msg);
         } else if (ev.data instanceof Blob) {
+          if (!authed || authRejected) return;
           pendingFrameBlob = ev.data;
           pendingFrameConnGen = myGen;
+          pendingFrameGen = frameRenderGen;
           pumpFrameDecoder();
         }
       };
 
       sock.onclose = (ev) => {
         if (sock !== ws || myGen !== wsConnGen) return;
+        authed = false;
+        invalidateFrameSurface(true);
+        clearPendingUrlGoto();
         if (ev && ev.code === 4003) {
           showAuthRejectedUi('Telegram 身份鉴权未通过或权限已被撤销。');
           return;
@@ -1862,6 +1930,8 @@
         authed = true;
         authRejected = false;
         userRole = msg.role || 'admin';
+        currentBotKey = msg.bot !== undefined ? msg.bot : null;
+        currentUserId = msg.user_id !== undefined ? msg.user_id : null;
         reconnectAttempt = 0;
         clearTimeout(reconnectTimer);
         document.getElementById('overlay').classList.add('hidden');
@@ -1875,6 +1945,27 @@
       if (msg.type === 'auth_error') {
         showAuthRejectedUi(msg.error);
         if (ws && ws.readyState === WebSocket.OPEN) ws.close();
+        return;
+      }
+      if (msg.type === 'takeover_ack') {
+        if (!pendingUrlGoto || !msg.req_id || msg.req_id !== pendingUrlGoto.reqId) {
+          return;
+        }
+        const reqCtx = pendingUrlGoto;
+        clearPendingUrlGoto();
+        const ownerBotOk = currentBotKey === null || msg.owner_bot === undefined || msg.owner_bot === currentBotKey;
+        const ownerUidOk = currentUserId === null || msg.owner_uid === undefined || msg.owner_uid === currentUserId;
+        const genOk = msg.session_gen === undefined || reqCtx.sessionGen === undefined || msg.session_gen === reqCtx.sessionGen;
+        if (msg.ok === true && msg.takeover === true && ownerBotOk && ownerUidOk && genOk) {
+          state.takeover = true;
+          if (msg.session_gen !== undefined) state.session_gen = msg.session_gen;
+          if (msg.takeover_gen !== undefined) state.takeover_gen = msg.takeover_gen;
+          if (ws && ws.readyState === WebSocket.OPEN && authed) {
+            sendWsInput({ action: 'goto', url: reqCtx.url });
+          }
+        } else if (msg.error) {
+          showToast(msg.error);
+        }
         return;
       }
       if (msg.type === 'pong') {
@@ -1927,14 +2018,18 @@
         return;
       }
       if (msg.type === 'selection_preview') {
+        if (gestureMode !== 'extract' || !extractDragActive) return;
+        if (msg.extract_gen !== undefined && msg.extract_gen !== extractReqGen) return;
         const pill = document.getElementById('live-sel-pill');
-        if (gestureMode === 'extract' && msg.text) {
+        if (msg.text) {
           pill.textContent = `🖊 已涂抹选中 (${msg.text.length}字)：${msg.text.slice(0, 90)}`;
           pill.classList.remove('hidden');
         }
         return;
       }
       if (msg.type === 'clipboard') {
+        extractReqGen++;
+        extractDragActive = false;
         document.getElementById('drag-sel-box').classList.add('hidden');
         document.getElementById('live-sel-pill').classList.add('hidden');
         try { tg?.HapticFeedback?.notificationOccurred?.('success'); } catch (_) { haptic('medium'); }
@@ -1946,6 +2041,16 @@
       }
       if (msg.type === 'state') {
         const prevUrl = state.url;
+        const prevSessionGen = state.session_gen;
+        const prevRunning = !!state.running;
+        const sessionGenChanged = msg.session_gen !== undefined && prevSessionGen !== undefined && msg.session_gen !== prevSessionGen;
+        const stoppedOrRestricted = (msg.running === false && prevRunning) || !!msg.session_restricted;
+        if (sessionGenChanged || stoppedOrRestricted) {
+          invalidateFrameSurface(true);
+          if (sessionGenChanged) {
+            clearPendingUrlGoto();
+          }
+        }
         state = { ...state, ...msg };
         renderState(prevUrl !== state.url);
       }
@@ -1971,15 +2076,6 @@
         dot.className = 'dot takeover';
       } else {
         dot.className = 'dot live';
-      }
-
-      // Execute pending URL auto-takeover goto ONLY after server confirms takeover=true ACK
-      if (state.running && state.takeover && pendingUrlGoto) {
-        const targetUrl = pendingUrlGoto.url;
-        clearPendingUrlGoto();
-        if (ws && ws.readyState === WebSocket.OPEN && authed) {
-          ws.send(JSON.stringify({ type: 'input', action: 'goto', url: targetUrl }));
-        }
       }
 
       // Sync Telegram Closing Confirmation during active human takeover
@@ -2300,6 +2396,10 @@
         document.getElementById('metrics-text').textContent = '未授权 (403)';
         return;
       }
+      if (!ws || ws.readyState !== WebSocket.OPEN || !authed) {
+        document.getElementById('conn-dot').className = 'dot offline';
+        return;
+      }
       const modeMap = { idle: '空闲', async_hosted: '实时', sync_external: '联动' };
       const m = modeMap[state.engine_mode] || state.engine_mode;
       document.getElementById('metrics-text').textContent = state.running
@@ -2316,8 +2416,8 @@
       if (authRejected) return;
       if (ws && ws.readyState === WebSocket.OPEN && authed) {
         ws.send(JSON.stringify({ type: 'ping', t: Date.now() }));
+        updateMetricsUi();
       }
-      updateMetricsUi();
     }, 1500);
 
     function ensureTakeoverOrWarn() {
@@ -2343,7 +2443,7 @@
         const pt = gestureStart.lastValidRemote || gestureStart.startRemote;
         gestureStart.dragDownSent = false;
         if (pt && state.running && state.takeover && ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: 'input', action: 'mouseup', x: pt.x, y: pt.y, button: 'left' }));
+          sendWsInput({ action: 'mouseup', x: pt.x, y: pt.y, button: 'left' });
         }
       }
     }
@@ -2385,9 +2485,7 @@
 
     function sendInput(payload) {
       if (!ensureTakeoverOrWarn()) return;
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'input', ...payload }));
-      }
+      sendWsInput(payload);
     }
 
     function sendNav(action) { sendInput({ action }); }
@@ -2415,19 +2513,23 @@
         return;
       }
       if (!state.takeover) {
-        if (state.ai_busy) {
-          showToast('AI 正在执行操作，请等待完成后再跳转');
-          return;
-        }
         if (ws && ws.readyState === WebSocket.OPEN && authed) {
           clearPendingUrlGoto();
+          const reqId = `url-${++takeoverReqSeq}-${Date.now()}`;
+          if (state.ai_busy) {
+            showToast('⏳ 等待 AI 当前动作完成后接管并跳转...');
+          }
           pendingUrlGoto = {
             url,
+            reqId,
+            sessionGen: state.session_gen,
             timer: setTimeout(() => {
-              pendingUrlGoto = null;
-            }, 4000)
+              if (pendingUrlGoto && pendingUrlGoto.reqId === reqId) {
+                pendingUrlGoto = null;
+              }
+            }, state.ai_busy ? 15000 : 6000)
           };
-          ws.send(JSON.stringify({ type: 'set_takeover', active: true, reason: '地址栏快速跳转' }));
+          ws.send(JSON.stringify({ type: 'set_takeover', active: true, reason: '地址栏快速跳转', req_id: reqId }));
         }
         urlInputEl.blur();
         return;
@@ -2446,7 +2548,7 @@
       if (!text && !submitEnter) return;
       if (!ensureTakeoverOrWarn()) return;
       haptic('light');
-      ws.send(JSON.stringify({ type: 'input', action: 'type', text, submit: !!submitEnter }));
+      sendWsInput({ action: 'type', text, submit: !!submitEnter });
       el.value = '';
     }
 
@@ -2478,11 +2580,11 @@
           const k = (e.key || '').toLowerCase();
           if (k === 'c') {
             e.preventDefault();
-            ws.send(JSON.stringify({ type: 'input', action: 'press', key: 'Control+c' }));
+            sendWsInput({ action: 'press', key: 'Control+c' });
             showToast('📋 正在从远程浏览器复制选中内容...');
           } else if (['a', 'z', 'f', 'x'].includes(k)) {
             e.preventDefault();
-            ws.send(JSON.stringify({ type: 'input', action: 'press', key: `Control+${k}` }));
+            sendWsInput({ action: 'press', key: `Control+${k}` });
           }
         }
         return;
@@ -2494,10 +2596,10 @@
       ];
       if (specialKeys.includes(e.key)) {
         e.preventDefault();
-        ws.send(JSON.stringify({ type: 'input', action: 'press', key: e.key }));
+        sendWsInput({ action: 'press', key: e.key });
       } else if (e.key.length === 1) {
         e.preventDefault();
-        ws.send(JSON.stringify({ type: 'input', action: 'type', text: e.key, submit: false }));
+        sendWsInput({ action: 'type', text: e.key, submit: false });
       }
     });
 
@@ -2508,7 +2610,7 @@
       const pasted = (e.clipboardData || window.clipboardData)?.getData('text');
       if (pasted) {
         e.preventDefault();
-        ws.send(JSON.stringify({ type: 'input', action: 'type', text: pasted, submit: false }));
+        sendWsInput({ action: 'type', text: pasted, submit: false });
         showToast('已粘贴文字到网页焦点框');
       }
     });
@@ -2552,7 +2654,7 @@
       if (now - lastMoveSent < intervalMs) return;
       lastMoveSent = now;
       if (state.running && state.takeover && ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'input', action: 'move', x, y }));
+        sendWsInput({ action: 'move', x, y });
       }
     }
 
@@ -2566,7 +2668,7 @@
       haptic('medium');
       positionArrowCursor(pt.x, pt.y, 'human', false);
       spawnClickRing(pt.localX, pt.localY, 'right');
-      ws.send(JSON.stringify({ type: 'input', action: 'rightclick', x: pt.x, y: pt.y }));
+      sendWsInput({ action: 'rightclick', x: pt.x, y: pt.y });
     });
 
     stage.addEventListener('pointerdown', (e) => {
@@ -2576,6 +2678,8 @@
       try { stage.setPointerCapture(e.pointerId); } catch (_) {}
 
       if (pointers.size === 1) {
+        extractReqGen++;
+        extractDragActive = false;
         const startRemote = clientToRemoteCoords(e.clientX, e.clientY);
         gestureStart = {
           x: e.clientX, y: e.clientY,
@@ -2593,7 +2697,7 @@
         // Direct Drag mode: send mousedown immediately on press
         if (gestureMode === 'drag' && state.running && state.takeover && startRemote) {
           positionArrowCursor(startRemote.x, startRemote.y, 'drag', true);
-          ws.send(JSON.stringify({ type: 'input', action: 'mousedown', x: startRemote.x, y: startRemote.y, button: 'left' }));
+          sendWsInput({ action: 'mousedown', x: startRemote.x, y: startRemote.y, button: 'left' });
           gestureStart.dragDownSent = true;
           haptic('light');
         }
@@ -2608,18 +2712,20 @@
             haptic('heavy');
             positionArrowCursor(startRemote.x, startRemote.y, 'human', false);
             spawnClickRing(startRemote.localX, startRemote.localY, 'right');
-            ws.send(JSON.stringify({ type: 'input', action: 'rightclick', x: startRemote.x, y: startRemote.y }));
+            sendWsInput({ action: 'rightclick', x: startRemote.x, y: startRemote.y });
             showToast('🖱 右键菜单');
           }, 480);
         }
       } else if (pointers.size === 2) {
         clearLongPressTimer();
+        extractReqGen++;
+        extractDragActive = false;
         if (gestureStart && gestureStart.dragDownSent) {
           const cur = clientToRemoteCoords(gestureStart.lastX, gestureStart.lastY)
             || gestureStart.lastValidRemote
             || gestureStart.startRemote;
           if (cur && ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'input', action: 'mouseup', x: cur.x, y: cur.y, button: 'left' }));
+            sendWsInput({ action: 'mouseup', x: cur.x, y: cur.y, button: 'left' });
           }
           gestureStart.dragDownSent = false;
         }
@@ -2630,7 +2736,8 @@
         document.getElementById('drag-sel-box').classList.add('hidden');
         document.getElementById('live-sel-pill').classList.add('hidden');
 
-        const pts = Array.from(pointers.values());
+        const entries = Array.from(pointers.entries());
+        const pts = entries.map(([, p]) => p);
         const stageRect = stage.getBoundingClientRect();
         const midX = (pts[0].x + pts[1].x) / 2 - stageRect.left;
         const midY = (pts[0].y + pts[1].y) / 2 - stageRect.top;
@@ -2638,7 +2745,12 @@
         const { baseLeft, baseTop } = getStageBaseOffset();
 
         if (gestureMode === 'trackpad') {
+          const startPts = {};
+          entries.forEach(([pid, p]) => { startPts[pid] = { x: p.x, y: p.y }; });
           twoFingerTrackpad = {
+            ids: entries.map(([pid]) => pid),
+            startPts,
+            movedIds: new Set(),
             startMidX: midX, startMidY: midY,
             lastMidX: midX, lastMidY: midY,
             startDist: dist,
@@ -2647,6 +2759,7 @@
             anchorLy: (midY - baseTop - panY) / scale,
             mode: null, // 'pinch' | 'scroll' | null
             moved: false,
+            canceled: false,
             t: Date.now()
           };
           pinchState = null;
@@ -2691,15 +2804,42 @@
         const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
 
         if (gestureMode === 'trackpad' && twoFingerTrackpad) {
+          const spCur = twoFingerTrackpad.startPts && twoFingerTrackpad.startPts[e.pointerId];
+          if (spCur && Math.hypot(e.clientX - spCur.x, e.clientY - spCur.y) > 2) {
+            twoFingerTrackpad.movedIds.add(e.pointerId);
+          }
           const midDelta = Math.hypot(curMidX - twoFingerTrackpad.startMidX, curMidY - twoFingerTrackpad.startMidY);
           const distDelta = Math.abs(dist - twoFingerTrackpad.startDist);
           if (!twoFingerTrackpad.mode) {
-            if (twoFingerTrackpad.startDist > 10 && distDelta > 14 && distDelta > midDelta * 1.15) {
-              twoFingerTrackpad.mode = 'pinch';
-              twoFingerTrackpad.moved = true;
-            } else if (midDelta > 8) {
-              twoFingerTrackpad.mode = 'scroll';
-              twoFingerTrackpad.moved = true;
+            // Compute per-pointer displacement dot product so symmetric pinch with alternating
+            // single-pointer updates NEVER prematurely locks into scroll!
+            const [id0, id1] = twoFingerTrackpad.ids || [];
+            const p0 = pointers.get(id0);
+            const p1 = pointers.get(id1);
+            const s0 = twoFingerTrackpad.startPts && twoFingerTrackpad.startPts[id0];
+            const s1 = twoFingerTrackpad.startPts && twoFingerTrackpad.startPts[id1];
+            let dot = 0;
+            if (p0 && p1 && s0 && s1) {
+              dot = (p0.x - s0.x) * (p1.x - s1.x) + (p0.y - s0.y) * (p1.y - s1.y);
+            }
+            if (twoFingerTrackpad.movedIds.size >= 2) {
+              if (twoFingerTrackpad.startDist > 10 && distDelta > 12 && (dot <= 0 || distDelta > midDelta * 1.1)) {
+                twoFingerTrackpad.mode = 'pinch';
+                twoFingerTrackpad.moved = true;
+              } else if (midDelta > 12 && dot > 0 && distDelta < midDelta * 0.75) {
+                twoFingerTrackpad.mode = 'scroll';
+                twoFingerTrackpad.moved = true;
+              }
+            } else {
+              // Single pointer moved so far: hold classification until paired update arrives,
+              // unless a single finger dragged well beyond the pairing deadzone.
+              if (twoFingerTrackpad.startDist > 10 && distDelta > 24 && distDelta > midDelta * 1.3) {
+                twoFingerTrackpad.mode = 'pinch';
+                twoFingerTrackpad.moved = true;
+              } else if (midDelta > 28 && distDelta < midDelta * 0.5) {
+                twoFingerTrackpad.mode = 'scroll';
+                twoFingerTrackpad.moved = true;
+              }
             }
           }
           if (twoFingerTrackpad.mode === 'pinch' && twoFingerTrackpad.startDist > 10) {
@@ -2720,12 +2860,11 @@
               twoFingerTrackpad.lastMidY = curMidY;
               lastWheelSent = now;
               if (Math.abs(stepX) > 1 || Math.abs(stepY) > 1) {
-                ws.send(JSON.stringify({
-                  type: 'input',
+                sendWsInput({
                   action: 'wheel',
                   dx: Math.round(stepX * 1.8),
                   dy: Math.round(stepY * 1.8)
-                }));
+                });
               }
             }
           }
@@ -2806,14 +2945,15 @@
             const now = Date.now();
             if (now - lastPreviewSent >= 95 && ws && ws.readyState === WebSocket.OPEN) {
               lastPreviewSent = now;
-              ws.send(JSON.stringify({
-                type: 'extract',
+              extractDragActive = true;
+              sendWsExtract({
                 mode: 'range_preview',
+                extract_gen: extractReqGen,
                 x1: gestureStart.startRemote.x,
                 y1: gestureStart.startRemote.y,
                 x2: curPt.x,
                 y2: curPt.y
-              }));
+              });
             }
           }
           return;
@@ -2833,12 +2973,11 @@
             gestureStart.lastY = e.clientY;
             lastWheelSent = now;
             if (Math.abs(stepX) > 1 || Math.abs(stepY) > 1) {
-              ws.send(JSON.stringify({
-                type: 'input',
+              sendWsInput({
                 action: 'wheel',
                 dx: Math.round(stepX * 1.6),
                 dy: Math.round(stepY * 1.6)
-              }));
+              });
             }
           }
         }
@@ -2852,19 +2991,20 @@
       lastTapInfo = isSecondTap ? { t: 0, x: 0, y: 0 } : { t: now, x, y };
       positionArrowCursor(x, y, 'human', gestureMode === 'trackpad');
       spawnClickRing(localX, localY, 'human');
-      ws.send(JSON.stringify({
-        type: 'input',
+      sendWsInput({
         action: 'click',
         x,
         y,
         click_count: isSecondTap ? 2 : 1
-      }));
+      });
     }
 
     function onPointerCancel(e) {
       if (!pointers.has(e.pointerId)) return;
       pointers.delete(e.pointerId);
       clearLongPressTimer();
+      extractReqGen++;
+      extractDragActive = false;
       document.getElementById('drag-sel-box').classList.add('hidden');
       document.getElementById('live-sel-pill').classList.add('hidden');
 
@@ -2873,14 +3013,19 @@
         gestureStart.dragDownSent = false;
         if (endPt && state.running && state.takeover && ws && ws.readyState === WebSocket.OPEN) {
           positionArrowCursor(endPt.x, endPt.y, 'human', false);
-          ws.send(JSON.stringify({ type: 'input', action: 'mouseup', x: endPt.x, y: endPt.y, button: 'left' }));
+          sendWsInput({ action: 'mouseup', x: endPt.x, y: endPt.y, button: 'left' });
         }
+      }
+      if (twoFingerTrackpad) {
+        // Invalidate two-finger tap candidate so lifting one finger + canceling the other NEVER fires rightclick!
+        twoFingerTrackpad.canceled = true;
+        twoFingerTrackpad.moved = true;
       }
       if (pointers.size < 2) {
         pinchState = null;
-        twoFingerTrackpad = null;
       }
       if (pointers.size === 0) {
+        twoFingerTrackpad = null;
         gestureStart = null;
       }
     }
@@ -2890,25 +3035,27 @@
       pointers.delete(e.pointerId);
       clearLongPressTimer();
 
-      // Trackpad two-finger tap -> right click at arrow tip!
-      if (gestureMode === 'trackpad' && twoFingerTrackpad && pointers.size < 2) {
+      // Trackpad two-finger tap -> fire right click ONLY after ALL fingers lift cleanly without any cancel!
+      if (gestureMode === 'trackpad' && twoFingerTrackpad) {
+        if (pointers.size > 0) {
+          // Wait for the remaining finger to finish cleanly (or cancel) before deciding
+          return;
+        }
         const tf = twoFingerTrackpad;
-        if (pointers.size === 0) twoFingerTrackpad = null;
-        if (!tf.moved && !tf.mode && (Date.now() - tf.t) < 280) {
-          twoFingerTrackpad = null;
+        twoFingerTrackpad = null;
+        gestureStart = null;
+        if (!tf.canceled && !tf.moved && !tf.mode && (Date.now() - tf.t) < 280) {
           if (ensureTakeoverOrWarn()) {
             haptic('medium');
             const pos = positionArrowCursor(trackpadX, trackpadY, 'human', true);
             spawnClickRing(pos.localX, pos.localY, 'right');
-            ws.send(JSON.stringify({
-              type: 'input',
+            sendWsInput({
               action: 'rightclick',
               x: Math.round(trackpadX * 10) / 10,
               y: Math.round(trackpadY * 10) / 10
-            }));
+            });
           }
         }
-        if (pointers.size === 0) gestureStart = null;
         return;
       }
 
@@ -2924,7 +3071,7 @@
         gestureStart.dragDownSent = false;
         if (endPt && ws && ws.readyState === WebSocket.OPEN) {
           positionArrowCursor(endPt.x, endPt.y, 'human', false);
-          ws.send(JSON.stringify({ type: 'input', action: 'mouseup', x: endPt.x, y: endPt.y, button: 'left' }));
+          sendWsInput({ action: 'mouseup', x: endPt.x, y: endPt.y, button: 'left' });
         }
         gestureStart = null;
         return;
@@ -2932,6 +3079,8 @@
 
       // Extract mode finish (never trigger extract after a 2-finger pinch!)
       if (pointers.size === 0 && gestureStart && gestureMode === 'extract') {
+        extractReqGen++;
+        extractDragActive = false;
         document.getElementById('drag-sel-box').classList.add('hidden');
         document.getElementById('live-sel-pill').classList.add('hidden');
         if (gestureStart.wasPinch) {
@@ -2942,22 +3091,20 @@
         if (state.running && endPt) {
           haptic('light');
           if (gestureStart.moved && gestureStart.startRemote) {
-            ws.send(JSON.stringify({
-              type: 'extract',
+            sendWsExtract({
               mode: 'range',
               x1: gestureStart.startRemote.x,
               y1: gestureStart.startRemote.y,
               x2: endPt.x,
               y2: endPt.y
-            }));
+            });
           } else {
             spawnClickRing(endPt.localX, endPt.localY, 'extract');
-            ws.send(JSON.stringify({
-              type: 'extract',
+            sendWsExtract({
               mode: 'point',
               x: endPt.x,
               y: endPt.y
-            }));
+            });
           }
         }
         gestureStart = null;
@@ -3004,12 +3151,11 @@
       const now = Date.now();
       if (now - lastWheelSent >= 40) {
         lastWheelSent = now;
-        ws.send(JSON.stringify({
-          type: 'input',
+        sendWsInput({
           action: 'wheel',
           dx: Math.round(e.deltaX),
           dy: Math.round(e.deltaY)
-        }));
+        });
       }
     }, { passive: false });
 

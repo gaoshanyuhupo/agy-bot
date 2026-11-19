@@ -301,6 +301,7 @@ class TestMultiBotCredentialsAndPrivateRouting(unittest.TestCase):
                 {"host": "127.0.0.1", "port": 18795, "public_url": "https://live.example.com"},
                 "local-tok",
             )
+            hub.engine_mode = "async_hosted"
             hub.latest_jpeg = b"FAKEJPEG"
             hub.title = "Test Page"
             hub.url = "https://example.com"
@@ -1146,7 +1147,14 @@ class TestP1BarriersDialogsAndTransferBoundaries(unittest.TestCase):
                         task_cancelled = True
                         raise
 
-            with mock.patch.object(srv, "DIALOG_TIMEOUT_SECONDS", 0.02):
+            with (
+                mock.patch.object(srv, "DIALOG_TIMEOUT_SECONDS", 0.02),
+                mock.patch.object(
+                    srv,
+                    "load_bot_credentials",
+                    return_value=({"main": "100001:EXAMPLE_TOK_1234567"}, {}, {111}),
+                ),
+            ):
                 await hub._handle_page_dialog(_HangingDialog())
                 self.assertEqual(1, len(hub.pending_dialogs))
                 tt = next(iter(hub.pending_dialogs.values()))["timeout_task"]
@@ -1171,13 +1179,18 @@ class TestP1BarriersDialogsAndTransferBoundaries(unittest.TestCase):
             hub.viewer_meta[ws_owner] = {"bot_key": "main", "user_id": 111, "role": "admin"}
 
             dlg = _FakeDialog("confirm", "Orphan me")
-            await hub._handle_page_dialog(dlg)
-            self.assertEqual(1, len(hub.pending_dialogs))
+            with mock.patch.object(
+                srv,
+                "load_bot_credentials",
+                return_value=({"main": "100001:EXAMPLE_TOK_1234567"}, {}, {111}),
+            ):
+                await hub._handle_page_dialog(dlg)
+                self.assertEqual(1, len(hub.pending_dialogs))
 
-            # Simulate last eligible admin disconnecting
-            hub.viewers.discard(ws_owner)  # type: ignore[arg-type]
-            hub.viewer_meta.pop(ws_owner, None)
-            await hub._dismiss_orphaned_dialogs_on_disconnect()
+                # Simulate last eligible admin disconnecting
+                hub.viewers.discard(ws_owner)  # type: ignore[arg-type]
+                hub.viewer_meta.pop(ws_owner, None)
+                await hub._dismiss_orphaned_dialogs_on_disconnect()
             self.assertEqual(1, dlg.dismissed)
             self.assertEqual(0, len(hub.pending_dialogs))
 
@@ -1361,7 +1374,12 @@ class TestP2StreamingDedupSyncAndScopedRefresh(unittest.TestCase):
             p.title = _shrinking_title  # type: ignore[method-assign]
             hub._tabs_dirty = True
             await hub._refresh_tabs_metadata(force=True)
-            self.assertEqual("Tab 2", hub.title)
+            # P2-01: Closed tab p2 MUST be evicted, active_tab_index clamped to 0, title updated to surviving tab, dirty preserved!
+            self.assertEqual("Shrunk", hub.title)
+            self.assertEqual(1, len(hub.tabs))
+            self.assertEqual(0, hub.active_tab_index)
+            self.assertTrue(hub.tabs[0]["active"])
+            self.assertTrue(hub._tabs_dirty)
 
         asyncio.run(_scenario())
 
@@ -1401,7 +1419,8 @@ class TestP2StreamingDedupSyncAndScopedRefresh(unittest.TestCase):
                 ws_live = _FakeWSViewer()
                 hub.viewers.add(ws_live)  # type: ignore[arg-type]
                 hub.viewer_meta[ws_live] = {"bot_key": "main", "user_id": 111, "role": "admin"}
-                await hub._cleanup_pending_filechoosers_async(page_id=id(page))
+                with mock.patch.object(srv, "_BRIDGE_DIR", bdir):
+                    await hub._cleanup_pending_filechoosers_async(page_id=id(page))
                 self.assertEqual(0, len(hub.pending_filechoosers))
                 self.assertTrue(
                     any(m.get("type") == "filechooser_closed" and m.get("chooser_id") == cid for m in ws_live.sent_json)
@@ -1580,6 +1599,10 @@ class FakeEl {
   closest() { return null; }
   getContext() {
     return {
+      clearRect: (...args) => {
+        sandbox.__clearCount++;
+        sandbox.__lastClearArgs = args;
+      },
       drawImage: (...args) => {
         if (sandbox.__throwDrawOnce) { sandbox.__throwDrawOnce = false; throw new Error('draw failed'); }
         sandbox.__drawCount++;
@@ -1623,9 +1646,18 @@ const sandbox = {
   location: { protocol: 'https:', host: 'live.example.com' },
   __throwDrawOnce: false,
   __drawCount: 0,
+  __clearCount: 0,
+  __lastClearArgs: null,
   __lastDrawArgs: null,
   __revokedUrls: [],
   __bmpClosed: 0,
+  __fetchCalls: [],
+  FormData: class FakeFormData { constructor() { this.fields = []; } append(k, v, n) { this.fields.push([k, v, n]); } },
+  fetch: async (url, opts) => {
+    sandbox.__fetchCalls.push({ url, opts });
+    if (sandbox.__fetchHook) return sandbox.__fetchHook(url, opts);
+    return { ok: true, status: 200, json: async () => ({ ok: true }), blob: async () => new FakeBlob('dl') };
+  },
   setTimeout: (fn, ms) => { const id = timers.length + 1; timers.push({ id, fn, ms, cleared: false }); return id; },
   clearTimeout: (id) => { const t = timers.find((x) => x.id === id); if (t) t.cleared = true; },
   setInterval: (fn, ms) => { intervals.push({ fn, ms }); return intervals.length; },
@@ -1757,21 +1789,108 @@ vm.runInContext(jsCode, sandbox);
   stageEl.dispatch('pointerup', { pointerId: 21, clientX: 450, clientY: 200, pointerType: 'touch', target: screenEl });
   stageEl.dispatch('pointerup', { pointerId: 20, clientX: 200, clientY: 200, pointerType: 'touch', target: screenEl });
 
-  // 8. P2-03: URL auto-takeover waits for server state.takeover===true ACK (no optimistic flip!)
-  sock1.onmessage({ data: JSON.stringify({ type: 'state', running: true, takeover: false, ai_busy: false, vw: 1280, vh: 800 }) });
+  // 8. P2-03: URL auto-takeover requires matching request-level takeover_ack (NOT global state!) and waits for barrier during ai_busy
+  sock1.onmessage({ data: JSON.stringify({ type: 'state', running: true, session_gen: 7, takeover_gen: 1, takeover: false, ai_busy: true, vw: 1280, vh: 800 }) });
   sock1.sent.length = 0;
   getEl('url-input').value = 'example.org';
   vm.runInContext("submitUrl();", sandbox);
   assert.strictEqual(vm.runInContext("state.takeover", sandbox), false, 'Must not optimistically mutate state.takeover');
-  assert.strictEqual(sock1.sent.length, 1);
+  assert.strictEqual(sock1.sent.length, 1, 'ai_busy must still send set_takeover to wait behind server barrier');
   assert.strictEqual(sock1.sent[0].type, 'set_takeover');
-  // Now server ACKs takeover=true -> goto fires immediately!
-  sock1.onmessage({ data: JSON.stringify({ type: 'state', running: true, takeover: true, ai_busy: false, vw: 1280, vh: 800 }) });
-  assert.strictEqual(sock1.sent.length, 2);
-  assert.strictEqual(sock1.sent[1].action, 'goto');
-  assert.strictEqual(sock1.sent[1].url, 'https://example.org');
+  const reqId1 = sock1.sent[0].req_id;
+  assert(reqId1, 'set_takeover must carry req_id');
+  // Unrelated global state takeover=true or mismatched req_id / wrong owner MUST NOT send goto!
+  sock1.onmessage({ data: JSON.stringify({ type: 'state', running: true, session_gen: 7, takeover_gen: 2, takeover: true, ai_busy: false, vw: 1280, vh: 800 }) });
+  sock1.onmessage({ data: JSON.stringify({ type: 'takeover_ack', req_id: 'other-req', ok: true, takeover: true, session_gen: 7, takeover_gen: 2, owner_bot: 'main', owner_uid: 111 }) });
+  assert.strictEqual(sock1.sent.filter((m) => m.action === 'goto').length, 0, 'Global state or wrong req_id must never fire goto');
+  // Matching req_id with ok:true & matching owner & gen fires goto with session_gen/takeover_gen!
+  sock1.onmessage({ data: JSON.stringify({ type: 'takeover_ack', req_id: reqId1, ok: true, takeover: true, session_gen: 7, takeover_gen: 3, owner_bot: 'main', owner_uid: 111 }) });
+  const gotoSent = sock1.sent.find((m) => m.action === 'goto');
+  assert(gotoSent, 'Matching takeover_ack must fire goto');
+  assert.strictEqual(gotoSent.url, 'https://example.org');
+  assert.strictEqual(gotoSent.session_gen, 7);
+  assert.strictEqual(gotoSent.takeover_gen, 3);
 
-  // 9. P2-03 & P3: bmp.close() always runs on draw exception + Image fallback revokes URL + stale connGen dropped + FPS counts drawImage
+  // 8b. P1-02: Two-finger lift first finger + cancel second finger MUST NOT fire rightclick; clean 2-finger tap DOES
+  vm.runInContext("setGestureMode('trackpad'); resetZoom();", sandbox);
+  sock1.sent.length = 0;
+  stageEl.dispatch('pointerdown', { pointerId: 30, clientX: 150, clientY: 150, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointerdown', { pointerId: 31, clientX: 250, clientY: 150, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointerup', { pointerId: 30, clientX: 150, clientY: 150, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointercancel', { pointerId: 31, clientX: 250, clientY: 150, pointerType: 'touch', target: screenEl });
+  assert.strictEqual(sock1.sent.filter((m) => m.action === 'rightclick').length, 0, 'Lift 1st + cancel 2nd must never fire rightclick');
+  // Clean two-finger tap fires rightclick only when BOTH lift cleanly
+  stageEl.dispatch('pointerdown', { pointerId: 32, clientX: 150, clientY: 150, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointerdown', { pointerId: 33, clientX: 250, clientY: 150, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointerup', { pointerId: 32, clientX: 150, clientY: 150, pointerType: 'touch', target: screenEl });
+  assert.strictEqual(sock1.sent.filter((m) => m.action === 'rightclick').length, 0, 'Must wait until second finger lifts');
+  stageEl.dispatch('pointerup', { pointerId: 33, clientX: 250, clientY: 150, pointerType: 'touch', target: screenEl });
+  assert.strictEqual(sock1.sent.filter((m) => m.action === 'rightclick').length, 1, 'Clean two-finger tap must fire rightclick');
+
+  // 8c. P1-02: Late range_preview after pointercancel MUST be ignored (pill stays hidden)
+  vm.runInContext("setGestureMode('extract'); lastPreviewSent = 0;", sandbox);
+  sock1.sent.length = 0;
+  stageEl.dispatch('pointerdown', { pointerId: 35, clientX: 100, clientY: 100, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointermove', { pointerId: 35, clientX: 180, clientY: 110, pointerType: 'touch', target: screenEl });
+  const prevReq = sock1.sent.find((m) => m.type === 'extract' && m.mode === 'range_preview');
+  assert(prevReq, 'Expected range_preview request');
+  stageEl.dispatch('pointercancel', { pointerId: 35, clientX: 180, clientY: 110, pointerType: 'touch', target: screenEl });
+  sock1.onmessage({ data: JSON.stringify({ type: 'selection_preview', text: 'stale text', extract_gen: prevReq.extract_gen }) });
+  assert(getEl('live-sel-pill').classList.contains('hidden'), 'Stale range_preview after cancel must stay hidden');
+
+  // 8d. P1-03: Dialog B arriving while editing Prompt A preserves user's prompt draft!
+  sock1.onmessage({ data: JSON.stringify({ type: 'dialog_open', dialog_id: 'pa', dialog_type: 'prompt', message: 'Enter A', default_value: 'defaultA' }) });
+  assert.strictEqual(getEl('dialog-prompt-input').value, 'defaultA');
+  getEl('dialog-prompt-input').value = 'user-edited-draft';
+  sock1.onmessage({ data: JSON.stringify({ type: 'dialog_open', dialog_id: 'pb', dialog_type: 'alert', message: 'Alert B' }) });
+  assert.strictEqual(getEl('dialog-prompt-input').value, 'user-edited-draft', 'Dialog B must not clobber Prompt A draft');
+  assert(getEl('dialog-type-label').textContent.includes('队列 +1'), 'Queue badge must update');
+  vm.runInContext("closeDialogSheet();", sandbox);
+
+  // 8e. P1-04: Download limit aligned to 50 MiB (26 MiB fetches, 51 MiB blocked without fetch)
+  sandbox.__fetchCalls.length = 0;
+  sock1.onmessage({ data: JSON.stringify({ type: 'download_ready', download_id: 'dl26', filename: 'big.bin', size: 26 * 1024 * 1024, auto_sent: false }) });
+  await vm.runInContext("downloadLatestFile();", sandbox);
+  assert.strictEqual(sandbox.__fetchCalls.length, 1, '26 MiB file must proceed to authenticated /api/download fetch');
+  assert(sandbox.__fetchCalls[0].url.includes('/api/download/dl26'));
+  sandbox.__fetchCalls.length = 0;
+  sock1.onmessage({ data: JSON.stringify({ type: 'download_ready', download_id: 'dl51', filename: 'too_big.bin', size: 51 * 1024 * 1024, auto_sent: false }) });
+  await vm.runInContext("downloadLatestFile();", sandbox);
+  assert.strictEqual(sandbox.__fetchCalls.length, 0, '51 MiB file must be blocked before fetch');
+
+  // 8f. P2-02: Symmetric pinch with alternating single-pointer updates MUST lock pinch (NOT scroll/wheel)!
+  vm.runInContext("setGestureMode('trackpad'); resetZoom();", sandbox);
+  sock1.sent.length = 0;
+  stageEl.dispatch('pointerdown', { pointerId: 40, clientX: 150, clientY: 150, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointerdown', { pointerId: 41, clientX: 250, clientY: 150, pointerType: 'touch', target: screenEl });
+  // Alternate single-pointer diagonal outward steps that previously triggered midDelta > 8 before distDelta > 14
+  stageEl.dispatch('pointermove', { pointerId: 40, clientX: 137, clientY: 140, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointermove', { pointerId: 41, clientX: 263, clientY: 160, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointermove', { pointerId: 40, clientX: 110, clientY: 130, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointermove', { pointerId: 41, clientX: 290, clientY: 170, pointerType: 'touch', target: screenEl });
+  assert(vm.runInContext("scale", sandbox) > 1.3, 'Symmetric alternating pinch must zoom');
+  assert.strictEqual(sock1.sent.filter((m) => m.action === 'wheel').length, 0, 'Symmetric pinch must emit zero wheel events');
+  stageEl.dispatch('pointerup', { pointerId: 40, clientX: 110, clientY: 130, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointerup', { pointerId: 41, clientX: 290, clientY: 170, pointerType: 'touch', target: screenEl });
+
+  // 8g. P2-04: Upload A completing after Chooser B opens MUST NOT hide Chooser B!
+  let resolveUploadA;
+  sandbox.__fetchHook = () => new Promise((res) => { resolveUploadA = res; });
+  sock1.onmessage({ data: JSON.stringify({ type: 'filechooser_open', chooser_id: 'chA', multiple: false }) });
+  getEl('file-upload-input').files = [{ name: 'a.txt', size: 10 }];
+  const uploadAPromise = (async () => {
+    const cbs = getEl('file-upload-input')._listeners['change'] || [];
+    for (const fn of cbs) await fn();
+  })();
+  // Chooser B opens while Upload A is in flight
+  sock1.onmessage({ data: JSON.stringify({ type: 'filechooser_open', chooser_id: 'chB', multiple: true }) });
+  resolveUploadA({ ok: true, status: 200, json: async () => ({ ok: true }) });
+  await uploadAPromise;
+  sandbox.__fetchHook = null;
+  assert.strictEqual(vm.runInContext("activeChooserId", sandbox), 'chB');
+  assert(!getEl('upload-sheet').classList.contains('hidden'), 'Upload A completion must not hide Chooser B');
+
+  // 9. P2-03 & P3: bmp.close() always runs on draw exception + Image fallback revokes URL + stale connGen/frameRenderGen dropped + FPS counts drawImage
   sandbox.__bmpClosed = 0;
   sandbox.__drawCount = 0;
   sandbox.__throwDrawOnce = true;
@@ -1788,9 +1907,39 @@ vm.runInContext(jsCode, sandbox);
   await vm.runInContext(`decodeAndDrawBlob(new Blob('stale'), ${curGen - 1})`, sandbox);
   assert.strictEqual(sandbox.__drawCount, prevDraws, 'Stale connection generation frame must not draw');
 
-  // 10. P2-03 & P3: WS close 4003 stops reconnect and keeps '未授权 (403)' across interval ticks
+  // In-flight bitmap blocked & canvas cleared when same socket changes session_gen!
+  let resolveSlowBmp;
+  sandbox.createImageBitmap = () => new Promise((res) => { resolveSlowBmp = res; });
+  const clearBeforeGen = sandbox.__clearCount;
+  const drawsBeforeGen = sandbox.__drawCount;
+  const bmpClosedBefore = sandbox.__bmpClosed;
+  const inflightP = vm.runInContext(`decodeAndDrawBlob(new Blob('old-gen'), wsConnGen, frameRenderGen)`, sandbox);
+  sock1.onmessage({ data: JSON.stringify({ type: 'state', running: true, session_gen: 8, takeover: false, vw: 1280, vh: 800 }) });
+  assert(sandbox.__clearCount > clearBeforeGen, 'Same-socket session_gen change must clear canvas');
+  resolveSlowBmp({ width: 1280, height: 800, close() { sandbox.__bmpClosed++; } });
+  await inflightP;
+  assert.strictEqual(sandbox.__drawCount, drawsBeforeGen, 'In-flight bitmap from prior session_gen must not draw');
+  assert.strictEqual(sandbox.__bmpClosed, bmpClosedBefore + 1, 'Dropped in-flight bitmap must still close()');
+
+  // 10. P2-03 & P3: Ordinary disconnect clears canvas, drops in-flight bitmap, and periodic interval MUST NOT overwrite disconnected text!
+  sandbox.createImageBitmap = () => new Promise((res) => { resolveSlowBmp = res; });
+  const drawsBeforeClose = sandbox.__drawCount;
+  const closeInflightP = vm.runInContext(`decodeAndDrawBlob(new Blob('pre-close'), wsConnGen, frameRenderGen)`, sandbox);
+  sock1.readyState = FakeWS.CLOSED;
+  sock1.onclose({ code: 1006 });
+  resolveSlowBmp({ width: 1280, height: 800, close() { sandbox.__bmpClosed++; } });
+  await closeInflightP;
+  assert.strictEqual(sandbox.__drawCount, drawsBeforeClose, 'In-flight bitmap after onclose must not draw');
+  assert.strictEqual(getEl('metrics-text').textContent, '连接已断开，重连中...');
+  intervals[0].fn();
+  assert.strictEqual(getEl('metrics-text').textContent, '连接已断开，重连中...', 'Periodic interval must NOT overwrite disconnected metrics with 实时');
+
+  // 11. P2-03 & P3: WS close 4003 stops reconnect and keeps '未授权 (403)' across interval ticks
+  vm.runInContext("connectWs();", sandbox);
+  const sock2 = wsInstances[wsInstances.length - 1];
+  sock2.onopen();
   const timersBefore = timers.length;
-  sock1.onclose({ code: 4003 });
+  sock2.onclose({ code: 4003 });
   assert.strictEqual(getEl('metrics-text').textContent, '未授权 (403)');
   assert.strictEqual(timers.length, timersBefore, '4003 must not schedule reconnect');
   intervals[0].fn();
@@ -1822,6 +1971,644 @@ vm.runInContext(jsCode, sandbox);
                 f"Node VM behavioral test failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
             )
             self.assertIn("NODE_VM_ALL_PASS", proc.stdout)
+
+
+class TestRound2QABlockersAdversarialRegression(unittest.TestCase):
+    """Deterministic adversarial regressions covering every Round 2 QA blocker (P0-01..P2-06)."""
+
+    def test_p0_01_ws_read_isolation_live_revocation_client_gen_and_sync_extract_hardening(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bdir = Path(tmp)
+            tok_main = "100001:EXAMPLE_MAIN_TOK_ABCDEF12345"
+            tok_sg = "100002:EXAMPLE_SG_TOK_ABCDEF1234567"
+            env_main = bdir / ".env"
+            env_main.write_text(
+                f"AGY_TG_BOT_TOKEN={tok_main}\n"
+                "AGY_TG_ALLOWED_CHATS=111,112\n"
+                "AGY_TG_ADMIN_USERS=111\n"
+                "AGY_TG_READONLY_USERS=112\n",
+                encoding="utf-8",
+            )
+            (bdir / ".env.sg").write_text(
+                f"AGY_TG_BOT_TOKEN={tok_sg}\n"
+                "AGY_TG_ALLOWED_CHATS=222\n",
+                encoding="utf-8",
+            )
+
+            async def _scenario() -> None:
+                hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "tok")
+                hub.engine_mode = "async_hosted"
+                hub.ctx = _FakeCtx([_FakePage("https://secret.example.com/inbox", "Private Inbox")])
+                hub.session_gen = 4
+                hub.takeover_gen = 2
+                hub.takeover = True
+                hub.session_owner = ("main", 111)
+                hub.takeover_owner = ("main", 111)
+                hub.url = "https://secret.example.com/inbox"
+                hub.title = "Private Inbox"
+                hub.tabs = [{"index": 0, "title": "Private Inbox", "url": hub.url, "active": True}]
+                hub.latest_jpeg = b"SECRET_SESSION_JPEG"
+                hub.latest_clip = {"text": "secret-clip-content"}
+
+                fake_ws_type = types.SimpleNamespace(TEXT="TEXT", CLOSE="CLOSE")
+                req = types.SimpleNamespace(app={"hub": hub}, remote="127.0.0.1")
+
+                with (
+                    mock.patch.object(srv, "_BRIDGE_DIR", bdir),
+                    mock.patch.object(srv, "WSMsgType", fake_ws_type),
+                    mock.patch.object(srv, "web", _FakeWeb),
+                ):
+                    # 1. Cross-bot admin (sg:222) and same-bot non-owner readonly (main:112) receive redacted state & ZERO frames/clips!
+                    for bad_init in (_signed_init_data(tok_sg, 222), _signed_init_data(tok_main, 112)):
+                        ws_iso = _FakeWSViewer(
+                            [
+                                {"type": "auth", "initData": bad_init},
+                                {"type": "extract", "mode": "url"},
+                                {"type": "read_clipboard"},
+                            ]
+                        )
+                        with mock.patch.object(srv, "web", types.SimpleNamespace(WebSocketResponse=lambda **_kw: ws_iso)):
+                            await srv.handle_ws(req)  # type: ignore[arg-type]
+                        self.assertEqual([], ws_iso.sent_bytes, "Isolated viewer must NEVER receive session JPEG")
+                        st_msgs = [m for m in ws_iso.sent_json if m.get("type") == "state"]
+                        self.assertTrue(st_msgs)
+                        self.assertFalse(st_msgs[0]["running"])
+                        self.assertTrue(st_msgs[0].get("session_restricted"))
+                        self.assertEqual("", st_msgs[0]["url"])
+                        self.assertEqual("", st_msgs[0]["title"])
+                        self.assertEqual([], st_msgs[0]["tabs"])
+                        self.assertFalse(any(m.get("type") == "clipboard" for m in ws_iso.sent_json))
+
+                    # 2. Connected owner receives frames, then revocation immediately evicts with auth_error + 4003!
+                    ws_owner = _FakeWSViewer()
+                    hub.viewers.add(ws_owner)  # type: ignore[arg-type]
+                    hub.viewer_meta[ws_owner] = {"bot_key": "main", "user_id": 111, "role": "admin"}
+                    await hub.broadcast_frame(b"FRAME_BEFORE_REVOKE")
+                    self.assertEqual([b"FRAME_BEFORE_REVOKE"], ws_owner.sent_bytes)
+
+                    # Revoke user 111 in .env live
+                    env_main.write_text(
+                        f"AGY_TG_BOT_TOKEN={tok_main}\n"
+                        "AGY_TG_ALLOWED_CHATS=112\n"
+                        "AGY_TG_READONLY_USERS=112\n",
+                        encoding="utf-8",
+                    )
+                    await hub.broadcast_frame(b"FRAME_AFTER_REVOKE")
+                    self.assertEqual([b"FRAME_BEFORE_REVOKE"], ws_owner.sent_bytes)
+                    self.assertTrue(ws_owner.closed)
+                    self.assertEqual(srv.WS_CLOSE_AUTH_FORBIDDEN, ws_owner.close_code)
+                    self.assertTrue(any(m.get("type") == "auth_error" for m in ws_owner.sent_json))
+                    self.assertNotIn(ws_owner, hub.viewers)
+
+                    # Restore user 111 as admin for client-gen & sync-extract checks
+                    env_main.write_text(
+                        f"AGY_TG_BOT_TOKEN={tok_main}\n"
+                        "AGY_TG_ALLOWED_CHATS=111,112\n"
+                        "AGY_TG_ADMIN_USERS=111\n"
+                        "AGY_TG_READONLY_USERS=112\n",
+                        encoding="utf-8",
+                    )
+
+                    # 3. Stale client-supplied session_gen / takeover_gen inputs are dropped (NOT overwritten with server gen!)
+                    enqueued_inputs: list[dict] = []
+                    orig_put = hub.input_queue.put
+
+                    async def _spy_put(item: dict) -> None:
+                        enqueued_inputs.append(dict(item))
+                        await orig_put(item)
+
+                    ws_stale_in = _FakeWSViewer(
+                        [
+                            {"type": "auth", "initData": _signed_init_data(tok_main, 111)},
+                            {"type": "input", "action": "click", "x": 10, "y": 10, "session_gen": 3, "takeover_gen": 2},
+                            {"type": "input", "action": "click", "x": 20, "y": 20, "session_gen": 4, "takeover_gen": 1},
+                            {"type": "input", "action": "click", "x": 30, "y": 30, "session_gen": 4, "takeover_gen": 2},
+                        ]
+                    )
+                    with (
+                        mock.patch.object(srv, "web", types.SimpleNamespace(WebSocketResponse=lambda **_kw: ws_stale_in)),
+                        mock.patch.object(hub.input_queue, "put", side_effect=_spy_put),
+                    ):
+                        await srv.handle_ws(req)  # type: ignore[arg-type]
+                    self.assertEqual(1, len(enqueued_inputs))
+                    self.assertEqual(30, enqueued_inputs[0]["x"])
+                    self.assertEqual(4, enqueued_inputs[0]["_session_gen"])
+                    self.assertEqual(2, enqueued_inputs[0]["_takeover_gen"])
+                    # Also verify disconnect drained input_queue & bumped takeover_gen!
+                    self.assertTrue(hub.input_queue.empty())
+                    self.assertEqual(3, hub.takeover_gen)
+
+                    # 4. Sync extract forwarding applies strict field whitelist (strips rogue fields & blocks unknown modes)
+                    hub.engine_mode = "sync_external"
+                    hub.sync_cmd_queue.clear()
+                    ws_sync_ext = _FakeWSViewer(
+                        [
+                            {"type": "auth", "initData": _signed_init_data(tok_main, 111)},
+                            {"type": "extract", "mode": "point", "x": 12, "y": 34, "evil": "rm -rf /", "action": "goto"},
+                            {"type": "extract", "mode": "evil_mode", "x": 1, "y": 2},
+                        ]
+                    )
+                    with mock.patch.object(srv, "web", types.SimpleNamespace(WebSocketResponse=lambda **_kw: ws_sync_ext)):
+                        await srv.handle_ws(req)  # type: ignore[arg-type]
+                    self.assertEqual(1, len(hub.sync_cmd_queue))
+                    self.assertEqual(
+                        {"action": "extract", "mode": "point", "session_gen": 4, "x": 12.0, "y": 34.0},
+                        hub.sync_cmd_queue[0],
+                    )
+
+                    # 5. Live browser ctl Sync extract masks password inputs
+                    ctl_src = (REPO_ROOT / ".agents/skills/live-browser/scripts/live_browser_ctl.py").read_text(encoding="utf-8")
+                    self.assertIn("tp === 'password'", ctl_src)
+                    self.assertIn("isSensitive", ctl_src)
+
+                    # 6. Upload commit second check re-verifies live role (mid-upload downgrade to readonly -> 403!)
+                    hub.engine_mode = "async_hosted"
+                    chooser = _FakeFileChooser(multiple=False)
+                    await hub._handle_page_filechooser(chooser)
+                    cid = next(iter(hub.pending_filechoosers.keys()))
+
+                    class _DowngradingReader:
+                        def __init__(self) -> None:
+                            self._parts = [_FakeMultipartPart("files", b"abc", "a.txt")]
+
+                        async def next(self):
+                            if self._parts:
+                                p = self._parts.pop(0)
+                                # Downgrade user 111 -> readonly BEFORE commit!
+                                env_main.write_text(
+                                    f"AGY_TG_BOT_TOKEN={tok_main}\n"
+                                    "AGY_TG_ALLOWED_CHATS=111,112\n"
+                                    "AGY_TG_READONLY_USERS=111,112\n",
+                                    encoding="utf-8",
+                                )
+                                return p
+                            return None
+
+                    r_down = await srv.handle_api_upload(
+                        types.SimpleNamespace(
+                            headers={"X-TG-Init-Data": _signed_init_data(tok_main, 111), "X-Chooser-Id": cid},
+                            query={},
+                            app={"hub": hub},
+                            multipart=mock.AsyncMock(return_value=_DowngradingReader()),
+                        )  # type: ignore[arg-type]
+                    )
+                    self.assertEqual(403, r_down.status)
+                    self.assertIsNone(chooser.received_files)
+                    hub._cleanup_transfer_dir(force_all=True)
+
+            asyncio.run(_scenario())
+
+    def test_p0_02_card_owner_binding_fail_closed_bot_resolve_and_late_screenshot_drop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bdir = Path(tmp)
+            tok_main = "100001:EXAMPLE_MAIN_TOK_ABCDEF12345"
+            tok_sg = "100002:EXAMPLE_SG_TOK_ABCDEF1234567"
+            (bdir / ".env").write_text(f"AGY_TG_BOT_TOKEN={tok_main}\nAGY_TG_ALLOWED_CHATS=111,113\n", encoding="utf-8")
+            (bdir / ".env.sg").write_text(f"AGY_TG_BOT_TOKEN={tok_sg}\nAGY_TG_ALLOWED_CHATS=222\n", encoding="utf-8")
+
+            async def _scenario() -> None:
+                hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "tok")
+                hub.engine_mode = "async_hosted"
+                hub.session_gen = 2
+                hub.session_owner = ("main", 111)
+                hub.latest_jpeg = b"MAIN_OWNER_FRAME"
+                posts: list[str] = []
+
+                class _FakeHttp:
+                    def post(self, url: str, **_kw):
+                        posts.append(url)
+                        return _FakeHTTPResp({"ok": True, "result": {"message_id": 501}})
+
+                hub.tg.http = _FakeHttp()
+
+                with (
+                    mock.patch.object(srv, "_BRIDGE_DIR", bdir),
+                    mock.patch.object(srv, "FormData", _FakeFormData),
+                ):
+                    # 1. Fail-closed resolve_bot_key in multi-bot environment
+                    self.assertIsNone(hub.resolve_bot_key(None))
+                    self.assertIsNone(hub.resolve_bot_key("unknown_bot"))
+                    self.assertEqual("main", hub.resolve_bot_key("main"))
+
+                    # 2. ensure_card blocks cross-bot (sg:222) and same-bot non-owner (main:113)
+                    self.assertIsNone(await hub.tg.ensure_card("sg", preferred_user_id=222))
+                    self.assertIsNone(await hub.tg.ensure_card("main", preferred_user_id=113))
+                    self.assertEqual([], posts)
+
+                    # Owner (main:111) succeeds
+                    card = await hub.tg.ensure_card("main", preferred_user_id=111)
+                    self.assertIsNotNone(card)
+                    self.assertEqual(1, len(posts))
+
+                    # 3. Late screenshot returning after stop_hosted() MUST NOT backfill idle cache!
+                    shot_started = asyncio.Event()
+                    release_shot = asyncio.Event()
+
+                    class _SlowShotPage(_FakePage):
+                        async def screenshot(self, **_kw) -> bytes:
+                            shot_started.set()
+                            await release_shot.wait()
+                            return b"STALE_LATE_JPEG"
+
+                    hub.ctx = _FakeCtx([_SlowShotPage()])
+                    cap_task = asyncio.create_task(hub._capture_once(force_broadcast=True))
+                    await asyncio.wait_for(shot_started.wait(), timeout=1.0)
+                    await hub.stop_hosted(notify_finished=False)
+                    self.assertEqual("idle", hub.engine_mode)
+                    self.assertIsNone(hub.latest_jpeg)
+                    release_shot.set()
+                    cap_ok = await cap_task
+                    self.assertFalse(cap_ok)
+                    self.assertIsNone(hub.latest_jpeg, "Late screenshot must never backfill idle latest_jpeg!")
+
+            asyncio.run(_scenario())
+
+    def test_p1_01_concurrent_takeover_handoff_disconnect_inflight_mousedown_and_sync_gen(self) -> None:
+        async def _scenario() -> None:
+            hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "tok")
+            hub.engine_mode = "async_hosted"
+            hub.session_gen = 1
+            hub.session_owner = ("main", 111)
+
+            up_entered = asyncio.Event()
+            release_up = asyncio.Event()
+            move_entered = asyncio.Event()
+            release_move = asyncio.Event()
+
+            class _SlowMouse:
+                def __init__(self) -> None:
+                    self.events: list[tuple] = []
+
+                async def move(self, x: float, y: float) -> None:
+                    self.events.append(("move", x, y))
+                    if x == 77.0:
+                        move_entered.set()
+                        await release_move.wait()
+
+                async def down(self, button: str = "left") -> None:
+                    self.events.append(("down", button))
+
+                async def up(self, button: str = "left") -> None:
+                    self.events.append(("up", button))
+                    up_entered.set()
+                    await release_up.wait()
+
+            page = _FakePage()
+            page.mouse = _SlowMouse()  # type: ignore[assignment]
+            hub.ctx = _FakeCtx([page])
+
+            # 1. Overlapping set_takeover(False) (suspended in mouse.up) + set_takeover(True) stays atomic!
+            await hub.set_takeover(True, "start", owner=("main", 111))
+            hub._mouse_buttons_down.add("left")
+            t_off = asyncio.create_task(hub.set_takeover(False))
+            await asyncio.wait_for(up_entered.wait(), timeout=1.0)
+            t_on = asyncio.create_task(hub.set_takeover(True, "reacquire", owner=("main", 111)))
+            await asyncio.sleep(0.02)
+            release_up.set()
+            await asyncio.gather(t_off, t_on)
+            self.assertTrue(hub.takeover)
+            self.assertFalse(hub.ai_allowed_event.is_set(), "takeover=True must NEVER coexist with ai_allowed_event=True")
+
+            # 2. Suspended mouse.move during mousedown + takeover_gen bump (disconnect) skips mouse.down!
+            page.mouse.events.clear()
+            tgen_before = hub.takeover_gen
+            md_task = asyncio.create_task(
+                hub._execute_human_cmd_async(
+                    {
+                        "action": "mousedown",
+                        "x": 77.0,
+                        "y": 88.0,
+                        "button": "left",
+                        "_session_gen": hub.session_gen,
+                        "_takeover_gen": tgen_before,
+                    }
+                )
+            )
+            await asyncio.wait_for(move_entered.wait(), timeout=1.0)
+            # Simulate disconnect invalidating takeover_gen BEFORE mouse.move finishes
+            hub.takeover_gen += 1
+            release_move.set()
+            await md_task
+            self.assertEqual([("move", 77.0, 88.0)], page.mouse.events, "mouse.down MUST NOT run after takeover_gen bumped")
+            self.assertEqual(set(), hub._mouse_buttons_down)
+
+            # 3. Sync pop_sync_cmds & SyncLiveBridge enforce takeover_gen end-to-end
+            hub.engine_mode = "sync_external"
+            hub.session_gen = 5
+            hub.takeover = True
+            hub.takeover_gen = 10
+            hub.sync_cmd_queue = [
+                {"action": "click", "x": 1, "y": 1, "session_gen": 5, "takeover_gen": 9},
+                {"action": "click", "x": 2, "y": 2, "session_gen": 5, "takeover_gen": 10},
+            ]
+            popped = hub.pop_sync_cmds()
+            self.assertEqual(1, len(popped))
+            self.assertEqual(2, popped[0]["x"])
+            self.assertEqual(10, popped[0]["takeover_gen"])
+
+            # Client-side SyncLiveBridge also rejects mismatched takeover_gen commands
+            import live_browser_ctl as ctl
+
+            class _FakeSyncPage:
+                url = "https://example.com"
+                viewport_size = {"width": 1280, "height": 800}
+                def __init__(self) -> None:
+                    self.mouse = types.SimpleNamespace(click=mock.Mock(), up=mock.Mock(), move=mock.Mock(), down=mock.Mock())
+                def screenshot(self, **_kw) -> bytes: return b"JPEG"
+                def title(self) -> str: return "T"
+
+            sp = _FakeSyncPage()
+            bridge = ctl.SyncLiveBridge.__new__(ctl.SyncLiveBridge)
+            bridge.raw_ctx = types.SimpleNamespace(pages=[sp])
+            bridge.enabled = True
+            bridge.notify = False
+            bridge.active_idx = 0
+            bridge._in_checkpoint = False
+            bridge._held_buttons = set()
+            bridge._sync_lease_id = "lease-1"
+            bridge._sync_session_gen = 5
+            bridge._x11_display = None
+            bridge._last_clip = ""
+            bridge.client = types.SimpleNamespace(
+                bot="main",
+                base_url="http://127.0.0.1:18795",
+                _headers=lambda: {"X-Live-Token": "tok"},
+                session=types.SimpleNamespace(
+                    post=lambda *_a, **_kw: types.SimpleNamespace(
+                        status_code=200,
+                        json=lambda: {
+                            "ok": True,
+                            "session_gen": 5,
+                            "takeover": True,
+                            "takeover_gen": 11,
+                            "commands": [
+                                {"action": "click", "x": 10, "y": 10, "session_gen": 5, "takeover_gen": 10},
+                            ],
+                        },
+                    )
+                ),
+            )
+            bridge.sync_checkpoint(ai_status="chk", allow_takeover_loop=False)
+            sp.mouse.click.assert_not_called()
+
+        asyncio.run(_scenario())
+
+    def test_p1_04_upload_nonfile_budget_framing_sem_release_and_download_write_cap(self) -> None:
+        async def _scenario() -> None:
+            hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "tok")
+            hub.session_gen = 1
+            hub.session_owner = ("main", 111)
+            bot_tok = "100001:EXAMPLE_UPLOAD_TOKEN_1234567"
+            valid_init = _signed_init_data(bot_tok, user_id=111)
+
+            with (
+                mock.patch.object(srv, "web", _FakeWeb),
+                mock.patch.object(srv, "load_bot_credentials", return_value=({"main": bot_tok}, {}, {111})),
+            ):
+                chooser = _FakeFileChooser(multiple=False)
+                await hub._handle_page_filechooser(chooser)
+                cid = next(iter(hub.pending_filechoosers.keys()))
+
+                # 1. Combined non-file total budget (4 B cap): two 3 B non-file fields -> 413!
+                with mock.patch.object(srv, "MAX_UPLOAD_NONFILE_TOTAL_BYTES", 4):
+                    r_nf = await srv.handle_api_upload(
+                        types.SimpleNamespace(
+                            headers={"X-TG-Init-Data": valid_init, "X-Chooser-Id": cid},
+                            query={},
+                            app={"hub": hub},
+                            multipart=mock.AsyncMock(
+                                return_value=_FakeMultipartReader(
+                                    [
+                                        _FakeMultipartPart("f1", b"aaa"),
+                                        _FakeMultipartPart("f2", b"bbb"),
+                                        _FakeMultipartPart("files", b"ok", "x.txt"),
+                                    ]
+                                )
+                            ),
+                        )  # type: ignore[arg-type]
+                    )
+                self.assertEqual(413, r_nf.status)
+
+                # 2. Unknown Content-Length framing overhead counts toward MAX_UPLOAD_TOTAL_BYTES -> 413!
+                with mock.patch.object(srv, "MAX_UPLOAD_TOTAL_BYTES", 50):
+                    r_fr = await srv.handle_api_upload(
+                        types.SimpleNamespace(
+                            headers={"X-TG-Init-Data": valid_init, "X-Chooser-Id": cid},
+                            query={},
+                            app={"hub": hub},
+                            multipart=mock.AsyncMock(
+                                return_value=_FakeMultipartReader(
+                                    [_FakeMultipartPart("files", b"x", "a.txt")]
+                                )
+                            ),
+                        )  # type: ignore[arg-type]
+                    )
+                self.assertEqual(413, r_fr.status)
+
+                # 3. I/O failure during staging setup STILL releases _upload_sem (no permit leak!)
+                before_permits = hub._upload_sem._value
+                with mock.patch.object(hub, "_ensure_transfer_dir", side_effect=OSError("disk full")):
+                    r_io = await srv.handle_api_upload(
+                        types.SimpleNamespace(
+                            headers={"X-TG-Init-Data": valid_init, "X-Chooser-Id": cid},
+                            query={},
+                            app={"hub": hub},
+                            multipart=mock.AsyncMock(),
+                        )  # type: ignore[arg-type]
+                    )
+                self.assertEqual(400, r_io.status)
+                self.assertEqual(before_permits, hub._upload_sem._value, "Semaphore permit leaked on staging OSError!")
+
+                # 4. Hanging oversized download (> MAX_DOWNLOAD_BYTES) is cancelled live & purged with zero leftovers
+                cancel_called = False
+
+                class _HangingOversizedDownload:
+                    suggested_filename = "overflow.bin"
+
+                    async def cancel(self) -> None:
+                        nonlocal cancel_called
+                        cancel_called = True
+
+                    async def save_as(self, path: str) -> None:
+                        Path(path).write_bytes(b"ABCDEFGHIJ")  # 10 B > 8 B
+                        await asyncio.sleep(5.0)
+
+                with mock.patch.object(srv, "MAX_DOWNLOAD_BYTES", 8):
+                    await asyncio.wait_for(
+                        hub._handle_page_download(_HangingOversizedDownload(), session_gen=1, owner_bot="main", owner_uid=111),
+                        timeout=1.5,
+                    )
+                self.assertTrue(cancel_called, "Live download watcher must cancel oversized in-flight save_as")
+                self.assertEqual(0, len(hub.downloads))
+                if hub._transfer_dir and hub._transfer_dir.is_dir():
+                    self.assertEqual([], list(hub._transfer_dir.iterdir()))
+
+                hub._cleanup_transfer_dir(force_all=True)
+
+        asyncio.run(_scenario())
+
+    def test_p2_04_p2_05_p2_06_chooser_closed_sync_lease_and_card_precheck(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bdir = Path(tmp)
+            tok_main = "100001:EXAMPLE_MAIN_TOK_ABCDEF12345"
+            tok_sg = "100002:EXAMPLE_SG_TOK_ABCDEF1234567"
+            (bdir / ".env").write_text(f"AGY_TG_BOT_TOKEN={tok_main}\nAGY_TG_ALLOWED_CHATS=111\n", encoding="utf-8")
+            (bdir / ".env.sg").write_text(f"AGY_TG_BOT_TOKEN={tok_sg}\nAGY_TG_ALLOWED_CHATS=222\n", encoding="utf-8")
+
+            async def _scenario() -> None:
+                hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "sec-tok")
+                hub.engine_mode = "async_hosted"
+                hub.ctx = _FakeCtx([_FakePage()])
+                hub.session_gen = 3
+                hub.session_owner = ("main", 111)
+                hub.latest_jpeg = b"FRAME"
+
+                ws_owner = _FakeWSViewer()
+                hub.viewers.add(ws_owner)  # type: ignore[arg-type]
+                hub.viewer_meta[ws_owner] = {"bot_key": "main", "user_id": 111, "role": "admin"}
+
+                with (
+                    mock.patch.object(srv, "_BRIDGE_DIR", bdir),
+                    mock.patch.object(srv, "web", _FakeWeb),
+                    mock.patch.object(srv, "FormData", _FakeFormData),
+                ):
+                    # P2-04: Expired chooser hit in handle_api_upload returns 404 AND broadcasts filechooser_closed
+                    chooser = _FakeFileChooser(multiple=False)
+                    await hub._handle_page_filechooser(chooser)
+                    cid = next(iter(hub.pending_filechoosers.keys()))
+                    hub.pending_filechoosers[cid]["created_ts"] = time.monotonic() - (srv.TRANSFER_TTL_SECONDS + 10.0)
+                    ws_owner.sent_json.clear()
+                    r_exp = await srv.handle_api_upload(
+                        types.SimpleNamespace(
+                            headers={"X-TG-Init-Data": _signed_init_data(tok_main, 111), "X-Chooser-Id": cid},
+                            query={},
+                            app={"hub": hub},
+                            multipart=mock.AsyncMock(),
+                        )  # type: ignore[arg-type]
+                    )
+                    self.assertEqual(404, r_exp.status)
+                    self.assertTrue(
+                        any(m.get("type") == "filechooser_closed" and m.get("chooser_id") == cid for m in ws_owner.sent_json)
+                    )
+
+                    # P2-06: Stale message_id / wrong owner card_refresh MUST return 403 BEFORE _capture_once runs!
+                    hub.tg.http = types.SimpleNamespace(
+                        post=lambda *_a, **_kw: _FakeHTTPResp({"ok": True, "result": {"message_id": 900}})
+                    )
+                    await hub.tg.ensure_card("main", preferred_user_id=111)
+                    cap_spy = mock.AsyncMock(return_value=True)
+                    with mock.patch.object(hub, "_capture_once", cap_spy):
+                        r_old_mid = await srv.internal_config(
+                            types.SimpleNamespace(
+                                headers={"X-Live-Token": "sec-tok"},
+                                remote="127.0.0.1",
+                                app={"hub": hub},
+                                json=mock.AsyncMock(
+                                    return_value={"refresh_card": True, "bot": "main", "chat_id": 111, "message_id": 899}
+                                ),
+                            )  # type: ignore[arg-type]
+                        )
+                        self.assertEqual(403, r_old_mid.status)
+                        cap_spy.assert_not_called()
+
+                    # P2-06: Cross-owner card takeover / stop rejected with 403 without mutating session!
+                    r_bad_tk = await srv.internal_takeover(
+                        types.SimpleNamespace(
+                            headers={"X-Live-Token": "sec-tok"},
+                            remote="127.0.0.1",
+                            app={"hub": hub},
+                            json=mock.AsyncMock(
+                                return_value={
+                                    "active": True,
+                                    "bot": "sg",
+                                    "user_id": 222,
+                                    "chat_id": 222,
+                                    "message_id": 900,
+                                    "from_card": True,
+                                }
+                            ),
+                        )  # type: ignore[arg-type]
+                    )
+                    self.assertEqual(403, r_bad_tk.status)
+                    self.assertFalse(hub.takeover)
+
+                    r_bad_stop = await srv.internal_stop(
+                        types.SimpleNamespace(
+                            headers={"X-Live-Token": "sec-tok"},
+                            remote="127.0.0.1",
+                            app={"hub": hub},
+                            read=mock.AsyncMock(
+                                return_value=json.dumps(
+                                    {"bot": "sg", "user_id": 222, "chat_id": 222, "message_id": 900, "from_card": True}
+                                ).encode("utf-8")
+                            ),
+                            query={},
+                        )  # type: ignore[arg-type]
+                    )
+                    self.assertEqual(403, r_bad_stop.status)
+                    self.assertEqual("async_hosted", hub.engine_mode)
+
+                    # P2-05: Sync push while async_hosted returns 409 and MUST NOT overwrite engine_mode or ctx!
+                    r_over = await srv.internal_sync_push(
+                        types.SimpleNamespace(
+                            headers={"X-Live-Token": "sec-tok"},
+                            remote="127.0.0.1",
+                            app={"hub": hub},
+                            query={"lease_id": "fake"},
+                            read=mock.AsyncMock(return_value=b"ROGUE_SYNC_JPEG"),
+                        )  # type: ignore[arg-type]
+                    )
+                    self.assertEqual(409, r_over.status)
+                    self.assertEqual("async_hosted", hub.engine_mode)
+                    self.assertIsNotNone(hub.ctx)
+
+                    # P2-05: Sync start issues lease_id; after lease expiry -> idle, late push returns 410 and NEVER revives!
+                    r_start = await srv.internal_sync_start(
+                        types.SimpleNamespace(
+                            headers={"X-Live-Token": "sec-tok"},
+                            remote="127.0.0.1",
+                            app={"hub": hub},
+                            json=mock.AsyncMock(return_value={"bot": "main", "user_id": 111}),
+                        )  # type: ignore[arg-type]
+                    )
+                    self.assertEqual(200, r_start.status)
+                    lease_id = r_start.data["sync_lease_id"]
+                    sgen = r_start.data["session_gen"]
+                    self.assertTrue(lease_id)
+
+                    # Valid push succeeds
+                    r_push_ok = await srv.internal_sync_push(
+                        types.SimpleNamespace(
+                            headers={"X-Live-Token": "sec-tok"},
+                            remote="127.0.0.1",
+                            app={"hub": hub},
+                            query={"lease_id": lease_id, "session_gen": str(sgen), "url": "https://sync.example.com"},
+                            read=mock.AsyncMock(return_value=b"SYNC_OK_JPEG"),
+                        )  # type: ignore[arg-type]
+                    )
+                    self.assertEqual(200, r_push_ok.status)
+                    self.assertEqual(b"SYNC_OK_JPEG", hub.latest_jpeg)
+
+                    # Expire lease -> idle; late push with old lease_id rejected with 410 and latest_jpeg stays None!
+                    hub._sync_last_push_ts = time.monotonic() - (srv.SYNC_LEASE_TIMEOUT_SECONDS + 5.0)
+                    self.assertTrue(await hub._expire_sync_session_if_stale())
+                    self.assertEqual("idle", hub.engine_mode)
+                    self.assertIsNone(hub.latest_jpeg)
+
+                    r_push_late = await srv.internal_sync_push(
+                        types.SimpleNamespace(
+                            headers={"X-Live-Token": "sec-tok"},
+                            remote="127.0.0.1",
+                            app={"hub": hub},
+                            query={"lease_id": lease_id, "session_gen": str(sgen)},
+                            read=mock.AsyncMock(return_value=b"ZOMBIE_JPEG"),
+                        )  # type: ignore[arg-type]
+                    )
+                    self.assertEqual(410, r_push_late.status)
+                    self.assertEqual("idle", hub.engine_mode)
+                    self.assertIsNone(hub.latest_jpeg)
+
+            asyncio.run(_scenario())
 
 
 if __name__ == "__main__":

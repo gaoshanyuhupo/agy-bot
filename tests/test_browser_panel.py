@@ -874,6 +874,58 @@ class TestBridgeBrowserPanelAndRbac(unittest.TestCase):
                     )
                 post_mock.assert_not_called()
 
+    def test_p0_02_and_p2_06_bridge_passes_bot_uid_and_card_binding_metadata(self) -> None:
+        """All Telegram /browser commands & card callbacks must explicitly propagate bot, positive user_id, chat_id, message_id."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_dir = Path(tmp) / "live-cfg"
+            cfg_dir.mkdir(parents=True, exist_ok=True)
+            (cfg_dir / "local.token").write_text("tok-local", encoding="utf-8")
+            bridge, _ac = _load_isolated_bridge(tmp, extra_env={"AGY_LIVE_BROWSER_CONFIG_DIR": str(cfg_dir)})
+            bridge.BOT_META.update({"bot_id": 100, "handle": "example_bot", "resolved": True})
+
+            post_calls: list[tuple[str, dict]] = []
+
+            def _fake_post(url: str, json=None, **_kw):
+                post_calls.append((url, dict(json or {})))
+                return _FakeResp(200, {"ok": True})
+
+            def _fake_get(url: str, **_kw):
+                if url.endswith("/internal/status"):
+                    return _FakeResp(200, {"ok": True, "running": True, "engine_mode": "async_hosted", "public_url": ""})
+                return _FakeResp(200, {"ok": True, "profiles": []})
+
+            with (
+                mock.patch.dict(os.environ, {"AGY_LIVE_BROWSER_CONFIG_DIR": str(cfg_dir)}, clear=False),
+                mock.patch.object(bridge.requests, "get", side_effect=_fake_get),
+                mock.patch.object(bridge.requests, "post", side_effect=_fake_post),
+                mock.patch.object(bridge, "send", return_value=1),
+                mock.patch.object(bridge, "tg", return_value=None),
+            ):
+                # Private DM `/browser start`, `/browser switch`, `/browser stop` pass bot & user_id=111
+                for cmd_txt in ("/browser start default", "/browser switch us-work", "/browser stop"):
+                    bridge.cmd_browser(111, cmd_txt.split(" ", 1)[1], from_user={"id": 111})
+                # Group `/browser start` passes positive triggering user_id=111 (never negative chat_id!)
+                bridge.cmd_browser(-1001234567890, "start default", from_user={"id": 111})
+                # All 4 private live-card callbacks pass bot, user_id, chat_id, message_id
+                for cb_data in (
+                    "browser:takeover_on",
+                    "browser:takeover_off",
+                    "browser:card_refresh",
+                    "browser:card_stop",
+                ):
+                    bridge._handle_browser_callback(
+                        "cb-1", 111, None, 909, cb_data, from_user={"id": 111}
+                    )
+
+            self.assertEqual(8, len(post_calls))
+            for url, payload in post_calls[:4]:
+                self.assertEqual("100", payload.get("bot"), f"Missing bot hint on {url}")
+                self.assertEqual(111, payload.get("user_id"), f"Missing positive user_id on {url}")
+            for url, payload in post_calls[4:]:
+                self.assertEqual("100", payload.get("bot"), f"Missing bot hint on card callback {url}")
+                self.assertEqual(111, payload.get("chat_id"), f"Missing chat_id on card callback {url}")
+                self.assertEqual(909, payload.get("message_id"), f"Missing message_id on card callback {url}")
+
 
 if __name__ == "__main__":
     unittest.main()
