@@ -417,6 +417,73 @@ class TestBotBusTeamWorkflow(unittest.TestCase):
             self.assertEqual(pkts[-1]["model_mode"], final_cfg["model_mode"])
             self.assertEqual(pkts[-1]["model"], final_cfg["configured_model"])
 
+    def test_watermark_cold_start_backlog_bootstrap_and_fail_closed_persistence(self):
+        """Missing/corrupted watermark bootstraps from existing inbox backlog under clock rollback; unwritable watermark fails closed."""
+        # 1. Missing `.last_pkt_ns` + pre-existing inbox backlog + wall-clock rollback
+        with tempfile.TemporaryDirectory() as tmp:
+            proc_new = self._load_fresh_bus_instance(tmp, "bot_bus_bootstrap_missing")
+            bot_inbox = os.path.join(proc_new.INBOX_DIR, "bot_two")
+            os.makedirs(bot_inbox, mode=0o700, exist_ok=True)
+            backlog_ns = 1_795_074_421_000_000_000
+            proc_new._atomic_write_json(
+                os.path.join(bot_inbox, f"{backlog_ns:020d}_000001_ffffffff.json"),
+                {"tag": "FIRST_EXISTING_PREUPGRADE"},
+            )
+            wm_path = os.path.join(proc_new.INBOX_DIR, ".last_pkt_ns")
+            self.assertFalse(os.path.exists(wm_path))
+
+            with (
+                mock.patch.object(proc_new.time, "time_ns", return_value=backlog_ns - 1),
+                mock.patch.object(proc_new.uuid, "uuid4", return_value=mock.Mock(hex="0000000011111111")),
+            ):
+                with proc_new._bus_lock():
+                    proc_new._drop_inbox_packet_unlocked("bot_two", {"tag": "SECOND"})
+
+            with open(wm_path, "r", encoding="utf-8") as f:
+                self.assertEqual(str(backlog_ns + 1), f.read().strip())
+            pkts = proc_new.pop_inbox_packets("bot_two")
+            self.assertEqual(["FIRST_EXISTING_PREUPGRADE", "SECOND"], [p["tag"] for p in pkts])
+
+        # 2. Corrupted `.last_pkt_ns` + legacy 13-digit ms backlog + clock rollback
+        with tempfile.TemporaryDirectory() as tmp_corrupt:
+            proc_corrupt = self._load_fresh_bus_instance(tmp_corrupt, "bot_bus_bootstrap_corrupt")
+            bot_inbox = os.path.join(proc_corrupt.INBOX_DIR, "bot_two")
+            os.makedirs(bot_inbox, mode=0o700, exist_ok=True)
+            legacy_ms = 1_795_074_422_500
+            proc_corrupt._atomic_write_json(
+                os.path.join(bot_inbox, f"{legacy_ms}_deadbeef.json"),
+                {"tag": "FIRST_LEGACY_MS"},
+            )
+            wm_path = os.path.join(proc_corrupt.INBOX_DIR, ".last_pkt_ns")
+            with open(wm_path, "w", encoding="utf-8") as f:
+                f.write("corrupted-watermark\n")
+
+            with mock.patch.object(proc_corrupt.time, "time_ns", return_value=(legacy_ms * 1_000_000) - 500):
+                with proc_corrupt._bus_lock():
+                    proc_corrupt._drop_inbox_packet_unlocked("bot_two", {"tag": "SECOND_AFTER_CORRUPT"})
+
+            pkts_corrupt = proc_corrupt.pop_inbox_packets("bot_two")
+            self.assertEqual(["FIRST_LEGACY_MS", "SECOND_AFTER_CORRUPT"], [p["tag"] for p in pkts_corrupt])
+
+        # 3. Fail-closed persistence: `.last_pkt_ns` replaced by a directory raises OSError & writes no packet/tmp
+        with tempfile.TemporaryDirectory() as tmp_fail:
+            proc_fail = self._load_fresh_bus_instance(tmp_fail, "bot_bus_fail_closed")
+            wm_dir = os.path.join(proc_fail.INBOX_DIR, ".last_pkt_ns")
+            os.makedirs(wm_dir, mode=0o700, exist_ok=True)
+
+            with self.assertRaises(OSError):
+                proc_fail.notify_bot_model_sync(
+                    "bot_two",
+                    model_mode=proc_fail.MODEL_MODE_CUSTOM,
+                    model="model-should-not-enqueue",
+                    from_bot="bot_one",
+                    chat_id=-1001234567890,
+                )
+
+            self.assertEqual([], proc_fail.pop_inbox_packets("bot_two"))
+            leftover_tmps = [fn for fn in os.listdir(proc_fail.INBOX_DIR) if fn.endswith(".tmp")]
+            self.assertEqual([], leftover_tmps)
+
 
 if __name__ == "__main__":
     unittest.main()

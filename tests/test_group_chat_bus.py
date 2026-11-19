@@ -1934,6 +1934,173 @@ class TestModelSelectionAndFollowSync(unittest.TestCase):
                 self.assertFalse(bridge.register_bot_commands(force=True))
                 self.assertIsNone(bridge._LAST_REGISTERED_CMD_ROLE)
 
+    def test_receiver_vs_local_setter_toctou_race_and_equal_rev_mismatch(self):
+        """Full-module Event-driven receiver-vs-setter TOCTOU tests + equal-rev stale notify rejection (QA-02)."""
+        chat_id = -1001234567890
+        sk = str(chat_id)
+        topic_sk = f"{sk}:42"
+
+        for kind in ("local_scope_setter", "self_team_setter"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                bridge = self._load_bridge(
+                    tmp,
+                    {
+                        "AGY_TG_BOT_ROLE": "worker",
+                        "AGY_TG_BOT_MODEL": "team/gpt-6.1-sol",
+                    },
+                )
+                bridge.BOT_META.update({"bot_id": 222, "handle": "bot_two", "resolved": True})
+                bus = bridge.bot_bus
+
+                # Remote setter queues STALE at rev=1
+                rec1 = bus.set_bot_model_and_notify(
+                    "bot_two",
+                    bus.MODEL_MODE_CUSTOM,
+                    "STALE",
+                    from_bot="bot_one",
+                    chat_id=chat_id,
+                    notify_target=True,
+                )
+                self.assertEqual(1, rec1["model_rev"])
+                (packet,) = bus.pop_inbox_packets("bot_two")
+                bridge.update_scope_state(sk, model="STALE")
+                bridge.update_scope_state(topic_sk, model="TOPIC")
+
+                original_cfg = bridge._current_bot_cfg
+                captured = threading.Event()
+                resume = threading.Event()
+                errors = []
+
+                def paused_cfg():
+                    val = original_cfg()
+                    if threading.current_thread().name == "bus-receiver" and not captured.is_set():
+                        captured.set()
+                        if not resume.wait(5):
+                            raise TimeoutError("receiver pause timed out")
+                    return val
+
+                def run_receiver():
+                    try:
+                        bridge._handle_bot_bus_packet(packet)
+                    except BaseException as exc:  # pragma: no cover - surfaced via assertEqual
+                        errors.append(repr(exc))
+
+                with mock.patch.object(bridge, "_current_bot_cfg", side_effect=paused_cfg):
+                    rx_thread = threading.Thread(target=run_receiver, name="bus-receiver")
+                    rx_thread.start()
+                    self.assertTrue(captured.wait(5), "receiver did not reach _current_bot_cfg pause")
+
+                    # Concurrently update model on main thread; MUST NOT deadlock `_current_bot_cfg`
+                    if kind == "local_scope_setter":
+                        bridge._apply_scope_model_change(sk, "NEW")
+                    else:
+                        bridge._set_team_bot_model("bot_two", bus.MODEL_MODE_CUSTOM, "NEW", chat_id=chat_id)
+
+                    mid_cfg = original_cfg()
+                    self.assertEqual("NEW", mid_cfg["configured_model"])
+                    self.assertEqual(2, mid_cfg["model_rev"])
+                    self.assertEqual("NEW", bridge.get_scope_value(sk, "model"))
+
+                    resume.set()
+                    rx_thread.join(5)
+                    self.assertFalse(rx_thread.is_alive(), "receiver thread deadlocked")
+                    self.assertEqual([], errors)
+
+                final_cfg = original_cfg()
+                roster = {b["handle"]: b for b in bus.list_roster(include_offline=True)}
+                pending = bus.pop_inbox_packets("bot_two")
+                self.assertEqual("NEW", final_cfg["configured_model"])
+                self.assertEqual(2, final_cfg["model_rev"])
+                self.assertEqual("NEW", bridge.get_scope_value(sk, "model"))
+                self.assertEqual("NEW", bridge._resolve_effective_model(sk))
+                self.assertEqual("TOPIC", bridge.get_scope_value(topic_sk, "model"))
+                self.assertEqual("NEW", roster["bot_two"]["effective_model"])
+                self.assertEqual(2, roster["bot_two"]["model_rev"])
+                self.assertEqual(0, len(pending))
+
+                # Equal-rev mismatched `notify_bot_model_sync(model="STALE")` while config already holds NEW (rev=2)
+                warm_new = mock.MagicMock()
+                warm_new.is_alive.return_value = True
+                with bridge.session_lock:
+                    bridge._session_pool[sk] = warm_new
+
+                bus.notify_bot_model_sync(
+                    "bot_two",
+                    model_mode=bus.MODEL_MODE_CUSTOM,
+                    model="STALE",
+                    from_bot="bot_one",
+                    chat_id=chat_id,
+                )
+                (eq_rev_pkt,) = bus.pop_inbox_packets("bot_two")
+                self.assertEqual(2, eq_rev_pkt["model_rev"])
+                self.assertEqual("STALE", eq_rev_pkt["model"])
+
+                bridge._handle_bot_bus_packet(eq_rev_pkt)
+                self.assertEqual("NEW", bridge.get_scope_value(sk, "model"))
+                self.assertEqual("NEW", bridge._resolve_effective_model(sk))
+                self.assertEqual("TOPIC", bridge.get_scope_value(topic_sk, "model"))
+                self.assertIs(warm_new, bridge._session_pool.get(sk))
+
+    def test_register_bot_commands_forced_refresh_failure_invalidates_cached_role(self):
+        """A failed forced refresh clears prior cached role so the next non-forced call retries and recovers (QA-03)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self._load_bridge(tmp, {"AGY_TG_BOT_ROLE": "worker"})
+            bridge.BOT_META.update({"bot_id": 222, "handle": "bot_two", "resolved": True})
+            bridge._LAST_REGISTERED_CMD_ROLE = None
+
+            resp_ok = mock.MagicMock(status_code=200, json=lambda: {"ok": True})
+            resp_400 = mock.MagicMock(status_code=400, json=lambda: {"ok": False, "error_code": 400})
+
+            # 1. Initial forced registration succeeds and caches `worker`
+            with mock.patch.object(bridge, "tg", return_value=resp_ok):
+                self.assertTrue(bridge.register_bot_commands(force=True))
+            self.assertEqual("worker", bridge._LAST_REGISTERED_CMD_ROLE)
+
+            # 2. Subsequent forced refresh fails on DM chat deleteMyCommands HTTP 400 -> returns False & clears cache
+            calls_fail = []
+
+            def _tg_dm_400(method, **kw):
+                calls_fail.append((method, kw.get("scope")))
+                if method == "deleteMyCommands" and kw.get("scope") == {"type": "chat", "chat_id": 111}:
+                    return resp_400
+                return resp_ok
+
+            with mock.patch.object(bridge, "tg", side_effect=_tg_dm_400):
+                self.assertFalse(bridge.register_bot_commands(force=True))
+                self.assertIsNone(bridge._LAST_REGISTERED_CMD_ROLE)
+                after_forced = len(calls_fail)
+                # Next non-forced call MUST actually retry Telegram APIs
+                self.assertFalse(bridge.register_bot_commands(force=False))
+                self.assertGreater(len(calls_fail), after_forced)
+                self.assertIsNone(bridge._LAST_REGISTERED_CMD_ROLE)
+
+            # 3. Once DM chat succeeds (even if private chat_administrators returns HTTP 400), force=False recovers
+            calls_recover = []
+
+            def _tg_recover_private_admin_400(method, **kw):
+                calls_recover.append((method, kw.get("scope")))
+                if method == "deleteMyCommands" and kw.get("scope") == {"type": "chat_administrators", "chat_id": 111}:
+                    return resp_400
+                return resp_ok
+
+            with mock.patch.object(bridge, "tg", side_effect=_tg_recover_private_admin_400):
+                self.assertTrue(bridge.register_bot_commands(force=False))
+                self.assertGreater(len(calls_recover), 0)
+                self.assertEqual("worker", bridge._LAST_REGISTERED_CMD_ROLE)
+
+            # 4. Exception during forced refresh also clears cached role so next non-forced call retries
+            with mock.patch.object(bridge, "tg", side_effect=RuntimeError("transient network drop")):
+                self.assertFalse(bridge.register_bot_commands(force=True))
+                self.assertIsNone(bridge._LAST_REGISTERED_CMD_ROLE)
+
+            calls_after_exc = []
+            with mock.patch.object(
+                bridge, "tg", side_effect=lambda method, **kw: calls_after_exc.append(method) or resp_ok
+            ):
+                self.assertTrue(bridge.register_bot_commands(force=False))
+                self.assertGreater(len(calls_after_exc), 0)
+                self.assertEqual("worker", bridge._LAST_REGISTERED_CMD_ROLE)
+
 
 if __name__ == "__main__":
     unittest.main()

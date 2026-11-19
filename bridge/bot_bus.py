@@ -546,32 +546,74 @@ _PKT_SEQ = 0
 _LAST_PKT_NS_BY_DIR: Dict[str, int] = {}
 
 
+def _scan_inbox_max_ns_unlocked() -> int:
+    """Scan existing `INBOX_DIR/*/*.json` filenames under `_bus_lock()` to bootstrap watermark."""
+    max_ns = 0
+    try:
+        if not os.path.isdir(INBOX_DIR):
+            return 0
+        for bot_entry in os.scandir(INBOX_DIR):
+            if not bot_entry.is_dir(follow_symlinks=False):
+                continue
+            try:
+                for pkt_entry in os.scandir(bot_entry.path):
+                    fn = pkt_entry.name
+                    if fn.endswith(".json") and not fn.endswith(".tmp"):
+                        ts_ns = _inbox_sort_key(fn)[0]
+                        if ts_ns > max_ns:
+                            max_ns = ts_ns
+            except OSError:
+                continue
+    except OSError:
+        return max_ns
+    return max_ns
+
+
 def _next_monotonic_pkt_ns_unlocked() -> int:
-    """Return a strictly increasing nanosecond timestamp shared across processes under `_bus_lock()`."""
+    """Return a strictly increasing nanosecond timestamp shared across processes under `_bus_lock()`.
+
+    When `.last_pkt_ns` is missing, empty, or corrupted, bootstraps from existing
+    `INBOX_DIR/*/*.json` backlog. Fails closed (raises `OSError`) if watermark
+    persistence cannot be committed atomically.
+    """
     now_ns = time.time_ns()
     inbox_key = os.path.realpath(INBOX_DIR)
     wm_path = os.path.join(INBOX_DIR, ".last_pkt_ns")
     prev_ns = _LAST_PKT_NS_BY_DIR.get(inbox_key, 0)
+    wm_valid = False
     try:
         with open(wm_path, "r", encoding="utf-8") as f:
             raw = f.read().strip()
         if raw.isdigit():
             file_ns = int(raw)
-            if file_ns > prev_ns:
-                prev_ns = file_ns
-    except Exception:
-        pass
+            if file_ns > 0:
+                wm_valid = True
+                if file_ns > prev_ns:
+                    prev_ns = file_ns
+    except (OSError, UnicodeError, ValueError):
+        wm_valid = False
+
+    if not wm_valid:
+        backlog_ns = _scan_inbox_max_ns_unlocked()
+        if backlog_ns > prev_ns:
+            prev_ns = backlog_ns
+
     mono_ns = now_ns if now_ns > prev_ns else (prev_ns + 1)
-    _LAST_PKT_NS_BY_DIR[inbox_key] = mono_ns
+    os.makedirs(INBOX_DIR, mode=0o700, exist_ok=True)
+    tmp = f"{wm_path}.{os.getpid()}.{uuid.uuid4().hex[:6]}.tmp"
     try:
-        os.makedirs(INBOX_DIR, mode=0o700, exist_ok=True)
-        tmp = f"{wm_path}.{os.getpid()}.{uuid.uuid4().hex[:6]}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(str(mono_ns))
         os.chmod(tmp, 0o600)
         os.replace(tmp, wm_path)
-    except Exception:
-        pass
+    except OSError:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    _LAST_PKT_NS_BY_DIR[inbox_key] = mono_ns
     return mono_ns
 
 
