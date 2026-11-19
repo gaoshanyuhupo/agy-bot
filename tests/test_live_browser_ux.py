@@ -6483,6 +6483,317 @@ class TestRound6FinalClosureRegression(unittest.TestCase):
 
             asyncio.run(_scenario())
 
+    def test_retire_cards_final_jpeg_aexit_connection_error_keeps_retry_when_authorized(self) -> None:
+        """Round 12: when editMessageMedia returns 200/ok=true and __aexit__ raises ConnectionError
+        while RBAC stays admin, retire_cards(session_gen=7, final_jpeg=...) MUST treat it as a
+        transient failure (retired=0, keep 701 with retire_attempts=1, keep active 702 intact),
+        and subsequent tick_updates() MUST retry and retire 701 cleanly; ensure_card() sendPhoto
+        with 200/ok=true + __aexit__ ConnectionError MUST likewise return None without overwriting 702."""
+        tok_main = "991234:TEST_ROUND12_AUTH_AEXIT"
+        with tempfile.TemporaryDirectory() as tmp:
+            bdir = Path(tmp)
+            env_path = bdir / ".env"
+            env_path.write_text(
+                f"AGY_TG_BOT_TOKEN={tok_main}\n"
+                f"AGY_TG_ALLOWED_CHATS=111\n"
+                f"AGY_TG_ADMIN_USERS=111\n",
+                encoding="utf-8",
+            )
+
+            class _FakeFormData:
+                def __init__(self) -> None:
+                    self.fields: dict[str, object] = {}
+
+                def add_field(self, name: str, value, **_kw) -> None:
+                    self.fields[name] = value
+
+            class _ScriptedAexitHTTP:
+                def __init__(self, script: list[tuple[dict, Exception | None]]) -> None:
+                    self._script = list(script)
+                    self.calls: list[tuple[str, dict]] = []
+
+                def post(self, url: str, data=None, json=None):
+                    endpoint = url.rsplit("/", 1)[-1]
+                    rec = {
+                        "endpoint": endpoint,
+                        "fields": dict(getattr(data, "fields", {})) if data is not None else None,
+                        "json": dict(json) if isinstance(json, dict) else json,
+                    }
+                    self.calls.append((endpoint, rec))
+                    payload, aexit_exc = self._script.pop(0)
+
+                    class _Resp:
+                        status = payload.get("http_status", 200)
+
+                        async def __aenter__(self_r):
+                            return self_r
+
+                        async def __aexit__(self_r, *_a):
+                            if aexit_exc is not None:
+                                raise aexit_exc
+                            return False
+
+                        async def json(self_r):
+                            return payload
+
+                    return _Resp()
+
+            async def _scenario() -> None:
+                with (
+                    mock.patch.object(srv, "_BRIDGE_DIR", bdir),
+                    mock.patch.object(srv, "BRIDGE_ENV_FILES", {"main": env_path}),
+                    mock.patch.object(srv, "FormData", _FakeFormData),
+                ):
+                    http_obj = _ScriptedAexitHTTP(
+                        [
+                            # 1. retire_cards final-JPEG editMessageMedia: 200 ok then __aexit__ ConnectionError
+                            (
+                                {"http_status": 200, "ok": True, "result": {"message_id": 701}},
+                                ConnectionError("simulated close error on editMessageMedia"),
+                            ),
+                            # 2. tick_updates live update on active 702 (editMessageMedia): clean 200 ok
+                            (
+                                {"http_status": 200, "ok": True, "result": {"message_id": 702}},
+                                None,
+                            ),
+                            # 3. tick_updates shared retry on 701 (editMessageCaption): clean 200 ok
+                            (
+                                {"http_status": 200, "ok": True, "result": {"message_id": 701}},
+                                None,
+                            ),
+                            # 4. ensure_card(force_new=True) sendPhoto: 200 ok then __aexit__ ConnectionError
+                            (
+                                {"http_status": 200, "ok": True, "result": {"message_id": 703}},
+                                ConnectionError("simulated close error on sendPhoto"),
+                            ),
+                        ]
+                    )
+                    hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "sec-tok")
+                    hub.tg.http = http_obj
+                    hub.engine_mode = "hosted"
+                    hub.session_gen = 8
+                    hub.session_owner = ("main", 111)
+                    hub.latest_jpeg = b"JPEG_R12_LIVE_FRAME"
+                    hub.tg.cards[("main", 111)] = {
+                        "bot_key": "main",
+                        "chat_id": 111,
+                        "message_id": 702,
+                        "session_gen": 8,
+                        "owner": ("main", 111),
+                        "last_sha1": "prev_sha",
+                        "last_caption": "prev_cap",
+                        "last_markup": None,
+                        "last_ts": 0.0,
+                    }
+                    hub.tg.pending_retire_cards[("main", 111, 701)] = {
+                        "bot_key": "main",
+                        "chat_id": 111,
+                        "message_id": 701,
+                        "session_gen": 7,
+                        "owner": ("main", 111),
+                        "last_sha1": "old_sha",
+                        "last_caption": "old_cap",
+                        "last_markup": None,
+                        "last_ts": 0.0,
+                    }
+
+                    retired = await hub.tg.retire_cards(session_gen=7, final_jpeg=b"JPEG_R12_FINAL")
+                    self.assertEqual(0, retired)
+                    self.assertEqual(["editMessageMedia"], [c[0] for c in http_obj.calls])
+                    self.assertIn(("main", 111, 701), hub.tg.pending_retire_cards)
+                    self.assertEqual(
+                        1,
+                        hub.tg.pending_retire_cards[("main", 111, 701)].get("retire_attempts"),
+                    )
+                    # Active card 702 remains intact
+                    self.assertIn(("main", 111), hub.tg.cards)
+                    self.assertEqual(702, hub.tg.cards[("main", 111)]["message_id"])
+
+                    # Subsequent tick_updates() shares the retry record and cleanly retires 701
+                    await hub.tg.tick_updates()
+                    self.assertNotIn(("main", 111, 701), hub.tg.pending_retire_cards)
+                    self.assertIn(("main", 111), hub.tg.cards)
+                    self.assertEqual(702, hub.tg.cards[("main", 111)]["message_id"])
+                    self.assertEqual(
+                        ["editMessageMedia", "editMessageMedia", "editMessageCaption"],
+                        [c[0] for c in http_obj.calls],
+                    )
+                    self.assertEqual(701, http_obj.calls[2][1]["json"]["message_id"])
+
+                    # Companion check: ensure_card(force_new=True) sendPhoto 200 ok + __aexit__ ConnectionError
+                    # MUST NOT treat sendPhoto as succeeded or overwrite active card 702 with 703
+                    res = await hub.tg.ensure_card("main", force_new=True, preferred_user_id=111)
+                    self.assertIsNone(res)
+                    self.assertEqual(702, hub.tg.cards[("main", 111)]["message_id"])
+                    self.assertEqual({}, hub.tg.pending_retire_cards)
+
+            asyncio.run(_scenario())
+
+    def test_retire_cards_final_jpeg_aexit_connection_error_purges_when_revoked_in_flight(self) -> None:
+        """Round 12: when editMessageMedia (or sendPhoto) returns 200/ok=true, RBAC downgrades
+        admin -> readonly in flight, and __aexit__ raises ConnectionError, BOTH active card 702
+        and pending-retire card 701 MUST be purged immediately upon return (before any tick_updates())
+        with ZERO follow-up Telegram requests."""
+        tok_main = "991235:TEST_ROUND12_REVOKE_AEXIT"
+        with tempfile.TemporaryDirectory() as tmp:
+            bdir = Path(tmp)
+            env_path = bdir / ".env"
+
+            def _set_role(role: str) -> None:
+                if role == "admin":
+                    env_path.write_text(
+                        f"AGY_TG_BOT_TOKEN={tok_main}\n"
+                        f"AGY_TG_ALLOWED_CHATS=111\n"
+                        f"AGY_TG_ADMIN_USERS=111\n",
+                        encoding="utf-8",
+                    )
+                elif role == "readonly":
+                    env_path.write_text(
+                        f"AGY_TG_BOT_TOKEN={tok_main}\n"
+                        f"AGY_TG_ALLOWED_CHATS=111\n"
+                        f"AGY_TG_READONLY_USERS=111\n"
+                        f"AGY_TG_USER_ROLES=111:readonly\n",
+                        encoding="utf-8",
+                    )
+                else:
+                    raise ValueError(role)
+
+            class _FakeFormData:
+                def __init__(self) -> None:
+                    self.fields: dict[str, object] = {}
+
+                def add_field(self, name: str, value, **_kw) -> None:
+                    self.fields[name] = value
+
+            class _GatedAexitHTTP:
+                def __init__(
+                    self,
+                    payload: dict,
+                    gate: tuple[asyncio.Event, asyncio.Event],
+                    aexit_exc: Exception,
+                ) -> None:
+                    self._payload = payload
+                    self._gate = gate
+                    self._aexit_exc = aexit_exc
+                    self.calls: list[tuple[str, dict]] = []
+
+                def post(self, url: str, data=None, json=None):
+                    endpoint = url.rsplit("/", 1)[-1]
+                    rec = {
+                        "endpoint": endpoint,
+                        "fields": dict(getattr(data, "fields", {})) if data is not None else None,
+                        "json": dict(json) if isinstance(json, dict) else json,
+                    }
+                    self.calls.append((endpoint, rec))
+                    payload = self._payload
+                    gate = self._gate
+                    aexit_exc = self._aexit_exc
+
+                    class _Resp:
+                        status = payload.get("http_status", 200)
+
+                        async def __aenter__(self_r):
+                            entered, release = gate
+                            entered.set()
+                            await release.wait()
+                            return self_r
+
+                        async def __aexit__(self_r, *_a):
+                            raise aexit_exc
+
+                        async def json(self_r):
+                            return payload
+
+                    return _Resp()
+
+            def _seed_hub(http_obj) -> object:
+                hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "sec-tok")
+                hub.tg.http = http_obj
+                hub.engine_mode = "hosted"
+                hub.session_gen = 8
+                hub.session_owner = ("main", 111)
+                hub.latest_jpeg = b"JPEG_R12_LIVE_FRAME"
+                hub.tg.cards[("main", 111)] = {
+                    "bot_key": "main",
+                    "chat_id": 111,
+                    "message_id": 702,
+                    "session_gen": 8,
+                    "owner": ("main", 111),
+                    "last_sha1": "prev_sha",
+                    "last_caption": "prev_cap",
+                    "last_markup": None,
+                    "last_ts": 0.0,
+                }
+                hub.tg.pending_retire_cards[("main", 111, 701)] = {
+                    "bot_key": "main",
+                    "chat_id": 111,
+                    "message_id": 701,
+                    "session_gen": 7,
+                    "owner": ("main", 111),
+                    "last_sha1": "old_sha",
+                    "last_caption": "old_cap",
+                    "last_markup": None,
+                    "last_ts": 0.0,
+                }
+                return hub
+
+            async def _scenario() -> None:
+                with (
+                    mock.patch.object(srv, "_BRIDGE_DIR", bdir),
+                    mock.patch.object(srv, "BRIDGE_ENV_FILES", {"main": env_path}),
+                    mock.patch.object(srv, "FormData", _FakeFormData),
+                ):
+                    # 1. retire_cards(session_gen=7, final_jpeg=...) with in-flight downgrade + __aexit__ ConnectionError
+                    _set_role("admin")
+                    entered, release = asyncio.Event(), asyncio.Event()
+                    http_retire = _GatedAexitHTTP(
+                        {"http_status": 200, "ok": True, "result": {"message_id": 701}},
+                        (entered, release),
+                        ConnectionError("simulated close drop on retire editMessageMedia"),
+                    )
+                    hub = _seed_hub(http_retire)
+
+                    task = asyncio.create_task(
+                        hub.tg.retire_cards(session_gen=7, final_jpeg=b"JPEG_R12_FINAL")
+                    )
+                    await asyncio.wait_for(entered.wait(), timeout=2.0)
+                    _set_role("readonly")
+                    self.assertEqual(
+                        "readonly", srv.load_bot_credentials_with_rbac()[4]["main"][111]
+                    )
+                    release.set()
+                    retired = await asyncio.wait_for(task, timeout=2.0)
+
+                    self.assertEqual(0, retired)
+                    self.assertEqual(["editMessageMedia"], [c[0] for c in http_retire.calls])
+                    self.assertNotIn(("main", 111), hub.tg.cards)
+                    self.assertEqual({}, hub.tg.pending_retire_cards)
+
+                    # 2. Companion check: ensure_card(force_new=True) sendPhoto 200 ok + in-flight downgrade + __aexit__ ConnectionError
+                    _set_role("admin")
+                    entered2, release2 = asyncio.Event(), asyncio.Event()
+                    http_send = _GatedAexitHTTP(
+                        {"http_status": 200, "ok": True, "result": {"message_id": 703}},
+                        (entered2, release2),
+                        ConnectionError("simulated close drop on sendPhoto"),
+                    )
+                    hub2 = _seed_hub(http_send)
+
+                    task2 = asyncio.create_task(
+                        hub2.tg.ensure_card("main", force_new=True, preferred_user_id=111)
+                    )
+                    await asyncio.wait_for(entered2.wait(), timeout=2.0)
+                    _set_role("readonly")
+                    release2.set()
+                    res2 = await asyncio.wait_for(task2, timeout=2.0)
+
+                    self.assertIsNone(res2)
+                    self.assertEqual(["sendPhoto"], [c[0] for c in http_send.calls])
+                    self.assertNotIn(("main", 111), hub2.tg.cards)
+                    self.assertEqual({}, hub2.tg.pending_retire_cards)
+
+            asyncio.run(_scenario())
+
 
 if __name__ == "__main__":
     unittest.main()

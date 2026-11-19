@@ -1949,6 +1949,8 @@ class TelegramLiveCardPublisher:
             send_ok = False
             mid = 0
             try:
+                parsed_mid = 0
+                io_send_ok = False
                 async with self.http.post(
                     f"https://api.telegram.org/bot{live_token}/sendPhoto", data=form
                 ) as resp:
@@ -1977,12 +1979,17 @@ class TelegramLiveCardPublisher:
                             parsed_mid = int(raw_mid)
                             if parsed_mid <= 0:
                                 raise ValueError(f"non-positive message_id: {parsed_mid}")
-                            mid = parsed_mid
-                            send_ok = True
+                            io_send_ok = True
                         else:
                             desc = data.get("description") if isinstance(data, dict) else data
                             log.warning("sendPhoto failed (%s): %s", bot_key, desc)
+                # Commit success only after async with __aexit__ exits cleanly
+                if io_send_ok:
+                    mid = parsed_mid
+                    send_ok = True
             except Exception as exc:
+                send_ok = False
+                mid = 0
                 log.warning("sendPhoto error (%s): %s", bot_key, exc)
             except BaseException:
                 self._recheck_auth_or_drop_locked(bot_key, chat_id)
@@ -2328,6 +2335,9 @@ class TelegramLiveCardPublisher:
 
         result = False
         try:
+            io_result = False
+            io_media_ok = False
+            io_retry_after: float | None = None
             async with self.http.post(
                 f"https://api.telegram.org/bot{token}/editMessageMedia", data=form
             ) as resp:
@@ -2341,22 +2351,29 @@ class TelegramLiveCardPublisher:
                         and data.get("ok")
                         and not (isinstance(status, int) and status >= 400)
                     ):
-                        card["last_sha1"] = sha
-                        card["last_caption"] = caption
-                        card["last_markup"] = markup
-                        card["last_ts"] = time.monotonic()
-                        result = True
+                        io_media_ok = True
+                        io_result = True
                     else:
                         if isinstance(data, dict):
                             desc = str(data.get("description", ""))
                             retry = (data.get("parameters") or {}).get("retry_after")
                             if retry:
-                                card["last_ts"] = time.monotonic() + float(retry)
+                                io_retry_after = float(retry)
                             elif "message is not modified" not in desc.lower():
                                 log.debug("editMessageMedia (%s): %s", bot_key, desc)
                         if finished:
-                            result = self._is_tg_retire_terminal_response(status, data)
+                            io_result = self._is_tg_retire_terminal_response(status, data)
+            # Commit card state & success only after async with __aexit__ exits cleanly
+            if io_media_ok:
+                card["last_sha1"] = sha
+                card["last_caption"] = caption
+                card["last_markup"] = markup
+                card["last_ts"] = time.monotonic()
+            elif io_retry_after is not None:
+                card["last_ts"] = time.monotonic() + io_retry_after
+            result = io_result
         except Exception as exc:
+            result = False
             log.debug("editMessageMedia error (%s): %s", bot_key, exc)
         except BaseException:
             self._recheck_auth_or_drop_locked(bot_key, chat_id)
