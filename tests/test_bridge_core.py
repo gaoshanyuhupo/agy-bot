@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import sys
 import tempfile
@@ -468,6 +469,326 @@ class TestAutoCompactAndUsageQuietSelfHeal(unittest.TestCase):
                 err_text, _kb2 = bridge.build_usage_panel(force_live=True)
             self.assertIn("⚠️", err_text)
             self.assertIn("暂无法获取云端总套餐实时配额", err_text)
+
+
+class TestRecoveredAttemptErrorHandling(unittest.TestCase):
+    """Verify strict detection of recovered `API error (attempt N):` turns in Bus & interactive modes."""
+
+    @staticmethod
+    def _write_transcript(brain_root: Path, cid: str, entries: list[dict]) -> Path:
+        tpath = brain_root / cid / ".system_generated" / "logs" / "transcript.jsonl"
+        tpath.parent.mkdir(parents=True, exist_ok=True)
+        tpath.write_text(
+            "\n".join(json.dumps(item, ensure_ascii=False) for item in entries) + "\n",
+            encoding="utf-8",
+        )
+        return tpath
+
+    def test_is_recovered_attempt_error_strict_matrix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = _load_isolated_bridge(tmp)
+            brain_root = Path(tmp) / "brain"
+            bridge.BRAIN_ROOT = str(brain_root)
+            err_msg = "API error (attempt 1): request failed: net/http: timeout awaiting response headers"
+
+            # (a) Valid recovery: ERROR_MESSAGE followed by tool cycle + terminal PLANNER_RESPONSE
+            self._write_transcript(
+                brain_root,
+                "cid-ok",
+                [
+                    {"type": "USER_INPUT", "status": "DONE", "content": "check"},
+                    {"type": "ERROR_MESSAGE", "status": "DONE"},
+                    {"type": "PLANNER_RESPONSE", "status": "DONE", "tool_calls": [{"name": "read_file"}]},
+                    {"type": "GENERIC", "status": "DONE", "content": "file body"},
+                    {"type": "PLANNER_RESPONSE", "status": "DONE", "content": "All checks passed."},
+                ],
+            )
+            self.assertTrue(bridge._is_recovered_attempt_error("cid-ok", 0, err_msg))
+
+            # (b1) ERROR_MESSAGE is the last step -> False
+            self._write_transcript(
+                brain_root,
+                "cid-last-err",
+                [
+                    {"type": "USER_INPUT", "status": "DONE", "content": "check"},
+                    {"type": "ERROR_MESSAGE", "status": "DONE"},
+                ],
+            )
+            self.assertFalse(bridge._is_recovered_attempt_error("cid-last-err", 0, err_msg))
+
+            # (b2) PLANNER_RESPONSE followed by another ERROR_MESSAGE -> False
+            self._write_transcript(
+                brain_root,
+                "cid-trailing-err",
+                [
+                    {"type": "ERROR_MESSAGE", "status": "DONE"},
+                    {"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Partial reply"},
+                    {"type": "ERROR_MESSAGE", "status": "DONE"},
+                ],
+            )
+            self.assertFalse(bridge._is_recovered_attempt_error("cid-trailing-err", 0, err_msg))
+
+            # (b3) Terminal PLANNER_RESPONSE with empty/whitespace content -> False
+            self._write_transcript(
+                brain_root,
+                "cid-empty-content",
+                [
+                    {"type": "ERROR_MESSAGE", "status": "DONE"},
+                    {"type": "PLANNER_RESPONSE", "status": "DONE", "content": "   \n"},
+                ],
+            )
+            self.assertFalse(bridge._is_recovered_attempt_error("cid-empty-content", 0, err_msg))
+
+            # (b4) Terminal PLANNER_RESPONSE still has pending tool_calls -> False
+            self._write_transcript(
+                brain_root,
+                "cid-has-tools",
+                [
+                    {"type": "ERROR_MESSAGE", "status": "DONE"},
+                    {
+                        "type": "PLANNER_RESPONSE",
+                        "status": "DONE",
+                        "content": "Calling tool...",
+                        "tool_calls": [{"name": "run_command"}],
+                    },
+                ],
+            )
+            self.assertFalse(bridge._is_recovered_attempt_error("cid-has-tools", 0, err_msg))
+
+            # (b5) Non-attempt error message -> False
+            self.assertFalse(bridge._is_recovered_attempt_error("cid-ok", 0, "HTTP 500 Internal Server Error"))
+            self.assertFalse(bridge._is_recovered_attempt_error("cid-ok", 0, "status=ERROR"))
+
+            # (b6) ERROR_MESSAGE only existed BEFORE start_line -> False
+            self._write_transcript(
+                brain_root,
+                "cid-prior-err",
+                [
+                    {"type": "ERROR_MESSAGE", "status": "DONE"},
+                    {"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Previous turn done"},
+                    {"type": "USER_INPUT", "status": "DONE", "content": "Next turn"},
+                    {"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Next turn done"},
+                ],
+            )
+            self.assertFalse(bridge._is_recovered_attempt_error("cid-prior-err", 2, err_msg))
+
+            # (b7) Non-DONE terminal PLANNER_RESPONSE -> False
+            self._write_transcript(
+                brain_root,
+                "cid-running",
+                [
+                    {"type": "ERROR_MESSAGE", "status": "DONE"},
+                    {"type": "PLANNER_RESPONSE", "status": "RUNNING", "content": "Still streaming"},
+                ],
+            )
+            self.assertFalse(bridge._is_recovered_attempt_error("cid-running", 0, err_msg))
+
+    def test_execute_bus_job_recovers_false_error_and_preserves_true_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = _load_isolated_bridge(tmp, extra_env={"HOME": tmp})
+            brain_root = Path(tmp) / "brain"
+            bridge.BRAIN_ROOT = str(brain_root)
+            cid = "conv-bus-recover-001"
+            # Pre-existing turn (2 lines) before agy runs
+            prior_entries = [
+                {"type": "USER_INPUT", "status": "DONE", "content": "old turn"},
+                {"type": "PLANNER_RESPONSE", "status": "DONE", "content": "old answer"},
+            ]
+            self._write_transcript(brain_root, cid, prior_entries)
+
+            job_payload = {
+                "job_id": "job-recover-1",
+                "from_bot": "sgaeget_bot",
+                "to_bot": "jeff_ha_bot",
+                "prompt": "verify gateway",
+                "label": "Recover check",
+                "resume_cid": cid,
+                "notify_group": False,
+            }
+            stream_events = [
+                json.dumps({"event": "init", "conversation_id": cid}) + "\n",
+                json.dumps({"event": "step_update", "step_update": {"step_type": "agent_response", "step_index": 1, "state": "DONE", "text_delta": "Final verified report."}}) + "\n",
+                json.dumps({
+                    "event": "result",
+                    "result": {
+                        "conversation_id": cid,
+                        "status": "ERROR",
+                        "error": "API error (attempt 1): request failed: net/http: timeout awaiting response headers",
+                        "response": "Final verified report.",
+                    },
+                }) + "\n",
+            ]
+
+            class _FakeProc:
+                def __init__(self, lines, turn_entries, rc=0):
+                    self.pid = 99999
+                    self.stdout = iter(lines)
+                    self.stderr = iter([])
+                    self.returncode = rc
+                    TestRecoveredAttemptErrorHandling._write_transcript(
+                        brain_root, cid, prior_entries + turn_entries
+                    )
+
+                def wait(self, timeout=None):
+                    return self.returncode
+
+            recovered_turn = [
+                {"type": "USER_INPUT", "status": "DONE", "content": "new turn"},
+                {"type": "ERROR_MESSAGE", "status": "DONE"},
+                {"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Final verified report."},
+            ]
+            finished: list[tuple] = []
+            with (
+                mock.patch.object(bridge.bot_bus, "claim_job", return_value=job_payload),
+                mock.patch.object(bridge.bot_bus, "is_job_cancelled", return_value=False),
+                mock.patch.object(
+                    bridge.bot_bus,
+                    "finish_job",
+                    side_effect=lambda jid, **kw: finished.append((jid, kw)),
+                ),
+                mock.patch.object(bridge, "_publish_bot_heartbeat"),
+                mock.patch.object(
+                    bridge.subprocess,
+                    "Popen",
+                    side_effect=lambda *a, **kw: _FakeProc(stream_events, recovered_turn, rc=0),
+                ),
+            ):
+                bridge._execute_bus_job("job-recover-1")
+
+            self.assertEqual(1, len(finished))
+            self.assertEqual("done", finished[0][1]["status"])
+            self.assertEqual("", finished[0][1]["error"])
+            self.assertEqual("Final verified report.", finished[0][1]["result_text"])
+
+            # Negative case: transcript ends with ERROR_MESSAGE -> stays status="error"
+            self._write_transcript(brain_root, cid, prior_entries)
+            unrecovered_turn = [
+                {"type": "USER_INPUT", "status": "DONE", "content": "new turn"},
+                {"type": "ERROR_MESSAGE", "status": "DONE"},
+            ]
+            finished.clear()
+            with (
+                mock.patch.object(bridge.bot_bus, "claim_job", return_value=job_payload),
+                mock.patch.object(bridge.bot_bus, "is_job_cancelled", return_value=False),
+                mock.patch.object(
+                    bridge.bot_bus,
+                    "finish_job",
+                    side_effect=lambda jid, **kw: finished.append((jid, kw)),
+                ),
+                mock.patch.object(bridge, "_publish_bot_heartbeat"),
+                mock.patch.object(
+                    bridge.subprocess,
+                    "Popen",
+                    side_effect=lambda *a, **kw: _FakeProc(stream_events, unrecovered_turn, rc=0),
+                ),
+            ):
+                bridge._execute_bus_job("job-recover-1")
+
+            self.assertEqual(1, len(finished))
+            self.assertEqual("error", finished[0][1]["status"])
+            self.assertIn("API error (attempt 1)", finished[0][1]["error"])
+
+    def test_interactive_run_agy_coalesces_recovered_attempt_error_without_warning(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = _load_isolated_bridge(tmp, extra_env={"HOME": tmp})
+            brain_root = Path(tmp) / "brain"
+            bridge.BRAIN_ROOT = str(brain_root)
+            cid = "conv-interactive-recover-001"
+            self._write_transcript(
+                brain_root,
+                cid,
+                [
+                    {"type": "USER_INPUT", "status": "DONE", "content": "hello"},
+                    {"type": "ERROR_MESSAGE", "status": "DONE"},
+                    {"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Recovered interactive answer."},
+                ],
+            )
+
+            events = iter(
+                [
+                    {"event": "init", "conversation_id": cid},
+                    {
+                        "event": "step_update",
+                        "step_update": {
+                            "step_type": "agent_response",
+                            "step_index": 1,
+                            "state": "DONE",
+                            "text_delta": "Recovered interactive answer.",
+                        },
+                    },
+                ]
+            )
+
+            class _FakeSession:
+                cid = None
+                proc = type("P", (), {"returncode": 0})()
+
+                def send_user_prompt(self, _prompt):
+                    return None
+
+                def next_event(self, timeout=0.25):
+                    return next(events, {"event": "__eof__"})
+
+                def peek_immediate_result(self, timeout=0.065):
+                    return (
+                        {
+                            "conversation_id": cid,
+                            "status": "ERROR",
+                            "error": "API error (attempt 1): request failed: net/http: timeout awaiting response headers",
+                            "response": "",
+                        },
+                        [],
+                    )
+
+                def get_stderr_text(self):
+                    return ""
+
+            finalized: list[tuple] = []
+            sent_plain: list[str] = []
+
+            class _FakeStreamer:
+                status_override = None
+
+                def __init__(self, *args, **kwargs):
+                    self.start_line = 0
+
+                def start(self):
+                    pass
+
+                def stop(self):
+                    pass
+
+                def set_cid(self, _c):
+                    pass
+
+                def set_status_override(self, _v):
+                    pass
+
+                def on_thinking(self, _t):
+                    pass
+
+                def on_text_delta(self, _t):
+                    pass
+
+                def finalize_step(self, text, **kwargs):
+                    finalized.append((text, kwargs))
+                    return (101, f"<p>{text}</p>")
+
+            chat_id = -1001234567890
+            with (
+                mock.patch.object(bridge, "_acquire_session", return_value=(_FakeSession(), False)),
+                mock.patch.object(bridge, "LiveDraftStreamer", _FakeStreamer),
+                mock.patch.object(bridge, "send", side_effect=lambda _c, txt, **_kw: sent_plain.append(txt)),
+                mock.patch.object(bridge, "push_step_images"),
+                mock.patch.object(bridge, "_record_and_relay_bot_group_msg"),
+                mock.patch.object(bridge, "_maybe_post_turn_auto_compact"),
+            ):
+                bridge.run_agy(chat_id, "hello", scope_key=bridge.scope_key_for(chat_id, None))
+
+            self.assertEqual(1, len(finalized))
+            self.assertEqual("Recovered interactive answer.", finalized[0][0])
+            self.assertIsNotNone(finalized[0][1].get("footer_str"))
+            self.assertEqual([], [m for m in sent_plain if "⚠️ agy" in m])
 
 
 if __name__ == "__main__":

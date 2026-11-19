@@ -2350,6 +2350,70 @@ def get_transcript_line_count(cid):
         return 0
 
 
+_API_ATTEMPT_ERROR_RE = re.compile(r"^\s*API error \(attempt \d+\):")
+
+
+def _is_recovered_attempt_error(cid, start_line, raw_err):
+    """Return True only when an `API error (attempt N):` was fully recovered in transcript.jsonl."""
+    if not cid or not raw_err:
+        return False
+    if not _API_ATTEMPT_ERROR_RE.match(str(raw_err)):
+        return False
+    tpath = os.path.join(BRAIN_ROOT, str(cid), ".system_generated/logs/transcript.jsonl")
+    if not os.path.isfile(tpath):
+        return False
+    try:
+        with open(tpath, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+    except Exception:
+        return False
+
+    objs = []
+    for raw in lines[max(0, int(start_line or 0)):]:
+        s = raw.strip()
+        if not s:
+            continue
+        try:
+            obj = json.loads(s)
+        except Exception:
+            return False
+        if not isinstance(obj, dict):
+            return False
+        objs.append(obj)
+    if not objs:
+        return False
+
+    last_err_idx = -1
+    for idx, obj in enumerate(objs):
+        if obj.get("type") == "ERROR_MESSAGE":
+            last_err_idx = idx
+    if last_err_idx < 0:
+        return False
+
+    tail = objs[last_err_idx + 1:]
+    if not tail:
+        return False
+
+    for obj in tail:
+        if obj.get("type") == "ERROR_MESSAGE":
+            return False
+        st = obj.get("status")
+        if st not in (None, "DONE") and not (obj.get("type") == "GENERIC" and st == "ERROR"):
+            return False
+
+    last_obj = tail[-1]
+    if last_obj.get("type") != "PLANNER_RESPONSE":
+        return False
+    if last_obj.get("status") != "DONE":
+        return False
+    content = last_obj.get("content")
+    if not isinstance(content, str) or not content.strip():
+        return False
+    if last_obj.get("tool_calls"):
+        return False
+    return True
+
+
 def get_turn_details(cid, start_line=0):
     """Extract thinking chains and tool calls from transcript.jsonl starting at start_line."""
     if not cid:
@@ -4330,6 +4394,15 @@ def run_agy(
 
                             # Peek up to 65ms: if `result` is right behind DONE, coalesce into ONE single sendMessage!
                             imm_res, _ = sess.peek_immediate_result(timeout=0.065)
+                            if imm_res is not None and imm_res.get("status") == "ERROR":
+                                imm_cid = imm_res.get("conversation_id") or cur_cid
+                                imm_err = str(imm_res.get("error") or imm_res.get("response") or "")
+                                if _is_recovered_attempt_error(imm_cid, turn_start_line, imm_err):
+                                    log("Interactive turn recovered after transient attempt error (%s); coalescing as SUCCESS" % imm_err[:160])
+                                    imm_res = dict(imm_res)
+                                    imm_res["status"] = "SUCCESS"
+                                    if not (imm_res.get("response") or "").strip():
+                                        imm_res["response"] = final_step_text
                             if imm_res is not None and imm_res.get("status") == "SUCCESS":
                                 result = imm_res
                                 fb_from = (primary_model_label or "default") if candidate_idx > 0 else None
@@ -4395,6 +4468,15 @@ def run_agy(
 
             if cancel_requested or shutting_down:
                 break
+            if result is not None and result.get("status") == "ERROR":
+                chk_cid = result.get("conversation_id") or conv or get_scope_value(exec_skey, "conversation_id")
+                chk_err = str(result.get("error") or result.get("response") or "")
+                if _is_recovered_attempt_error(chk_cid, turn_start_line, chk_err):
+                    log("Interactive turn recovered after transient attempt error (%s); normalizing result to SUCCESS" % chk_err[:160])
+                    result = dict(result)
+                    result["status"] = "SUCCESS"
+                    if not (result.get("response") or "").strip() and step_buffers:
+                        result["response"] = step_buffers[max(step_buffers.keys())].strip()
             if result is not None and result.get("status") != "ERROR":
                 break
             if result is None and reused_warm and not got_turn_event and same_model_retries == 0 and candidate_idx == 0:
@@ -4542,6 +4624,13 @@ def run_agy(
         status = result.get("status")
         finished_reason = result.get("finished_reason")
         resp = (result.get("response") or "").strip()
+        if not resp and step_buffers:
+            resp = step_buffers[max(step_buffers.keys())].strip()
+        if status == "ERROR" and _is_recovered_attempt_error(
+            conv, turn_start_line, str(result.get("error") or resp or "")
+        ):
+            log("Interactive turn post-loop recovered after transient attempt error; normalizing status to SUCCESS")
+            status = "SUCCESS"
         with state_lock:
             sc_w = _ensure_scope_locked(exec_skey)
             if isinstance(sc_w.get("last_turn"), dict):
@@ -5422,6 +5511,7 @@ def _execute_bus_job(job_id):
     if resume_cid and not os.path.isdir(os.path.join(BRAIN_ROOT, resume_cid)):
         resume_cid = ""
 
+    pre_turn_tline = get_transcript_line_count(resume_cid) if resume_cid else 0
     skip_steps = 0
     if resume_cid:
         pre_tp = os.path.join(BRAIN_ROOT, resume_cid, ".system_generated", "logs", "transcript.jsonl")
@@ -5695,9 +5785,25 @@ def _execute_bus_job(job_id):
                 final_status = "done"
                 final_text = resp or "(completed with empty text)"
             else:
-                final_status = "error"
-                err_msg = str(result_ev.get("error") or resp or f"status={st}")
-                final_text = resp
+                raw_err = str(result_ev.get("error") or resp or f"status={st}")
+                rc = proc.returncode if proc else -1
+                err_start_line = pre_turn_tline if (resume_cid and new_cid == resume_cid) else 0
+                if (
+                    st == "ERROR"
+                    and rc == 0
+                    and resp
+                    and _is_recovered_attempt_error(new_cid, err_start_line, raw_err)
+                ):
+                    log("Bus job %s recovered after transient attempt error (%s); marking as done" % (
+                        job_id, raw_err[:160]
+                    ))
+                    final_status = "done"
+                    err_msg = ""
+                    final_text = resp
+                else:
+                    final_status = "error"
+                    err_msg = raw_err
+                    final_text = resp
         else:
             rc = proc.returncode if proc else -1
             err_msg = f"agy exited ({rc}): {''.join(stderr_tail)[-600:]}"

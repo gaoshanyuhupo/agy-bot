@@ -8,9 +8,11 @@ import importlib
 import json
 import os
 from pathlib import Path
+import socket
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -1057,6 +1059,285 @@ class TestBridgeHybridRoutingAndCompanionModules(unittest.TestCase):
                 self.assertEqual("high", compact_calls[0][4])
             finally:
                 bridge._stop_gateway_adapter()
+
+
+class TestPreheaderKeepaliveAndDisconnectSafety(unittest.TestCase):
+    """Integration tests for Stage 4.5 pre-header SSE keepalive and disconnect cleanup."""
+
+    def test_slow_stream_emits_keepalive_then_complete_sse(self):
+        class _SlowStreamHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format, *args):  # noqa: A002
+                return
+
+            def do_POST(self):  # noqa: N802
+                clen = int(self.headers.get("Content-Length") or "0")
+                _ = self.rfile.read(clen)
+                time.sleep(0.22)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                c1 = {
+                    "id": "cmpl-slow",
+                    "object": "chat.completion.chunk",
+                    "choices": [{"index": 0, "delta": {"content": "hello after thinking"}, "finish_reason": None}],
+                }
+                c2 = {
+                    "id": "cmpl-slow",
+                    "object": "chat.completion.chunk",
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                }
+                self.wfile.write(f"data: {json.dumps(c1)}\n\n".encode("utf-8"))
+                self.wfile.write(f"data: {json.dumps(c2)}\n\n".encode("utf-8"))
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+
+        up = ThreadingHTTPServer(("127.0.0.1", 0), _SlowStreamHandler)
+        threading.Thread(target=up.serve_forever, daemon=True).start()
+        gws = gateway_adapter.parse_gateways_payload(
+            [{"id": "cpa", "base_url": f"http://127.0.0.1:{up.server_address[1]}/v1", "dialect": "cpa"}]
+        )
+        adapter = gateway_adapter.GatewayAdapterServer(
+            gws,
+            port=0,
+            preheader_keepalive_after_s=0.08,
+            preheader_keepalive_interval_s=0.03,
+        )
+        adapter.start()
+        try:
+            rt = adapter.register_route("cpa", "team/gpt-6.1-sol", effort="high")
+            t0 = time.monotonic()
+            resp = requests.post(
+                f"{rt.url}/chat/completions",
+                json={"model": "team/gpt-6.1-sol", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+                stream=True,
+                timeout=5,
+            )
+            header_elapsed = time.monotonic() - t0
+            self.assertEqual(200, resp.status_code)
+            self.assertLess(header_elapsed, 0.20)
+            self.assertEqual("no", resp.headers.get("X-Accel-Buffering"))
+            self.assertIn("text/event-stream", resp.headers.get("Content-Type", ""))
+            body = resp.content.decode("utf-8")
+            self.assertIn(": keepalive\n\n", body)
+            self.assertIn("hello after thinking", body)
+            self.assertIn("data: [DONE]\n\n", body)
+        finally:
+            adapter.stop()
+            up.shutdown()
+            up.server_close()
+
+    def test_fast_429_and_503_preserve_original_http_status(self):
+        next_code = {"status": 429}
+
+        class _FastErrHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format, *args):  # noqa: A002
+                return
+
+            def do_POST(self):  # noqa: N802
+                clen = int(self.headers.get("Content-Length") or "0")
+                _ = self.rfile.read(clen)
+                code = next_code["status"]
+                raw = json.dumps({"error": {"message": f"upstream_{code}", "code": code}}).encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(raw)
+
+        up = ThreadingHTTPServer(("127.0.0.1", 0), _FastErrHandler)
+        threading.Thread(target=up.serve_forever, daemon=True).start()
+        gws = gateway_adapter.parse_gateways_payload(
+            [{"id": "cpa", "base_url": f"http://127.0.0.1:{up.server_address[1]}/v1", "dialect": "cpa"}]
+        )
+        adapter = gateway_adapter.GatewayAdapterServer(
+            gws,
+            port=0,
+            preheader_keepalive_after_s=0.12,
+            preheader_keepalive_interval_s=0.04,
+        )
+        adapter.start()
+        try:
+            rt = adapter.register_route("cpa", "team/gpt-6.1-sol", effort="high")
+            for code in (429, 503):
+                next_code["status"] = code
+                r = requests.post(
+                    f"{rt.url}/chat/completions",
+                    json={"model": "team/gpt-6.1-sol", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+                    timeout=5,
+                )
+                self.assertEqual(code, r.status_code)
+                self.assertIn(f"upstream_{code}", r.text)
+                self.assertNotIn(": keepalive", r.text)
+        finally:
+            adapter.stop()
+            up.shutdown()
+            up.server_close()
+
+    def test_slow_non_200_and_slow_json_after_keepalive_headers(self):
+        mode = {"kind": "slow_503"}
+
+        class _SlowMixedHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format, *args):  # noqa: A002
+                return
+
+            def do_POST(self):  # noqa: N802
+                clen = int(self.headers.get("Content-Length") or "0")
+                _ = self.rfile.read(clen)
+                time.sleep(0.18)
+                if mode["kind"] == "slow_503":
+                    raw = json.dumps({"error": {"message": "capacity exhausted"}}).encode("utf-8")
+                    self.send_response(503)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.write(raw)
+                    return
+                raw = json.dumps(
+                    {
+                        "id": "cmpl-json-slow",
+                        "model": "team/gpt-6.1-sol",
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": "json ok"}, "finish_reason": "stop"}],
+                    }
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(raw)
+
+        up = ThreadingHTTPServer(("127.0.0.1", 0), _SlowMixedHandler)
+        threading.Thread(target=up.serve_forever, daemon=True).start()
+        gws = gateway_adapter.parse_gateways_payload(
+            [{"id": "cpa", "base_url": f"http://127.0.0.1:{up.server_address[1]}/v1", "dialect": "cpa"}]
+        )
+        adapter = gateway_adapter.GatewayAdapterServer(
+            gws,
+            port=0,
+            preheader_keepalive_after_s=0.06,
+            preheader_keepalive_interval_s=0.03,
+        )
+        adapter.start()
+        try:
+            rt = adapter.register_route("cpa", "team/gpt-6.1-sol", effort="high")
+            mode["kind"] = "slow_503"
+            r_err = requests.post(
+                f"{rt.url}/chat/completions",
+                json={"model": "team/gpt-6.1-sol", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+                timeout=5,
+            )
+            self.assertEqual(200, r_err.status_code)
+            txt_err = r_err.content.decode("utf-8")
+            self.assertIn(": keepalive\n\n", txt_err)
+            self.assertIn('"type": "upstream_error"', txt_err)
+            self.assertIn('"code": 503', txt_err)
+            self.assertIn("capacity exhausted", txt_err)
+            self.assertIn("data: [DONE]\n\n", txt_err)
+
+            mode["kind"] = "slow_json"
+            r_json = requests.post(
+                f"{rt.url}/chat/completions",
+                json={"model": "team/gpt-6.1-sol", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+                timeout=5,
+            )
+            self.assertEqual(200, r_json.status_code)
+            txt_json = r_json.content.decode("utf-8")
+            self.assertIn(": keepalive\n\n", txt_json)
+            self.assertIn("json ok", txt_json)
+            self.assertIn("data: [DONE]\n\n", txt_json)
+        finally:
+            adapter.stop()
+            up.shutdown()
+            up.server_close()
+
+    def test_client_midwait_disconnect_closes_upstream_without_crash(self):
+        upstream_release = threading.Event()
+        closed_responses: list[bool] = []
+
+        class _BlockingHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format, *args):  # noqa: A002
+                return
+
+            def do_POST(self):  # noqa: N802
+                clen = int(self.headers.get("Content-Length") or "0")
+                _ = self.rfile.read(clen)
+                upstream_release.wait(timeout=3.0)
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                except OSError:
+                    pass
+
+        up = ThreadingHTTPServer(("127.0.0.1", 0), _BlockingHandler)
+        threading.Thread(target=up.serve_forever, daemon=True).start()
+        gws = gateway_adapter.parse_gateways_payload(
+            [{"id": "cpa", "base_url": f"http://127.0.0.1:{up.server_address[1]}/v1", "dialect": "cpa"}]
+        )
+        adapter = gateway_adapter.GatewayAdapterServer(
+            gws,
+            port=0,
+            preheader_keepalive_after_s=0.06,
+            preheader_keepalive_interval_s=0.03,
+        )
+        adapter.start()
+        real_post = requests.post
+
+        def _wrapped_post(*args, **kwargs):
+            resp = real_post(*args, **kwargs)
+            orig_close = resp.close
+
+            def _tracked_close():
+                closed_responses.append(True)
+                return orig_close()
+
+            resp.close = _tracked_close
+            return resp
+
+        try:
+            rt = adapter.register_route("cpa", "team/gpt-6.1-sol", effort="high")
+            with mock.patch.object(gateway_adapter.requests, "post", side_effect=_wrapped_post):
+                sock = socket.create_connection(("127.0.0.1", adapter.port), timeout=3.0)
+                body = json.dumps({"model": "team/gpt-6.1-sol", "stream": True, "messages": [{"role": "user", "content": "hi"}]}).encode("utf-8")
+                req = (
+                    f"POST /g/{rt.token}/v1/chat/completions HTTP/1.1\r\n"
+                    f"Host: 127.0.0.1:{adapter.port}\r\n"
+                    f"Content-Type: application/json\r\n"
+                    f"Content-Length: {len(body)}\r\n"
+                    f"Connection: close\r\n\r\n"
+                ).encode("utf-8") + body
+                sock.sendall(req)
+                # Wait long enough for keepalive headers + first heartbeat, then disconnect mid-stream
+                time.sleep(0.11)
+                sock.close()
+                # Let keepalive loop observe client disconnect, then release upstream response
+                time.sleep(0.08)
+                upstream_release.set()
+                deadline = time.monotonic() + 2.0
+                while not closed_responses and time.monotonic() < deadline:
+                    time.sleep(0.02)
+            self.assertTrue(closed_responses, "Expected late-resolving upstream response to be closed after client disconnect")
+            self.assertTrue(adapter.is_running())
+        finally:
+            upstream_release.set()
+            adapter.stop()
+            up.shutdown()
+            up.server_close()
 
 
 if __name__ == "__main__":

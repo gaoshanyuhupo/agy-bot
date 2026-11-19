@@ -1230,6 +1230,12 @@ class _AdapterHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
 
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+            return
+        super().handle_error(request, client_address)
+
 
 class GatewayAdapterServer:
     """In-process or standalone OpenAI-compatible multi-gateway loopback adapter."""
@@ -1244,6 +1250,8 @@ class GatewayAdapterServer:
         default_gateway_id: Optional[str] = None,
         default_effort: Optional[str] = None,
         max_routes: int = 512,
+        preheader_keepalive_after_s: float = 30.0,
+        preheader_keepalive_interval_s: float = 15.0,
     ) -> None:
         self.host = host
         self.requested_port = int(port)
@@ -1251,6 +1259,21 @@ class GatewayAdapterServer:
         self.default_gateway_id = default_gateway_id
         self.default_effort = default_effort
         self.max_routes = max(1, int(max_routes))
+
+        env_after = os.environ.get("AGY_GATEWAY_PREHEADER_KEEPALIVE_AFTER_S", "").strip()
+        env_interval = os.environ.get("AGY_GATEWAY_PREHEADER_KEEPALIVE_INTERVAL_S", "").strip()
+        if env_after and preheader_keepalive_after_s == 30.0:
+            try:
+                preheader_keepalive_after_s = float(env_after)
+            except ValueError:
+                pass
+        if env_interval and preheader_keepalive_interval_s == 15.0:
+            try:
+                preheader_keepalive_interval_s = float(env_interval)
+            except ValueError:
+                pass
+        self.preheader_keepalive_after_s = max(0.0, float(preheader_keepalive_after_s))
+        self.preheader_keepalive_interval_s = max(0.01, float(preheader_keepalive_interval_s))
 
         self._lock = threading.Lock()
         self._gateways: Dict[str, GatewayConfig] = dict(gateways or {})
@@ -1343,14 +1366,63 @@ class GatewayAdapterServer:
                 def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
                     return
 
+                def _safe_write(self, data: bytes, *, flush: bool = True) -> bool:
+                    try:
+                        self.wfile.write(data)
+                        if flush:
+                            self.wfile.flush()
+                        return True
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        return False
+
+                def _safe_flush(self) -> bool:
+                    try:
+                        self.wfile.flush()
+                        return True
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        return False
+
+                def _send_raw(self, code: int, content_type: str, raw: bytes) -> bool:
+                    try:
+                        self.send_response(code)
+                        self.send_header("Content-Type", content_type)
+                        self.send_header("Content-Length", str(len(raw)))
+                        self.send_header("Connection", "close")
+                        self.end_headers()
+                        self.wfile.write(raw)
+                        self.wfile.flush()
+                        return True
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        return False
+
                 def _send_json(self, code: int, obj: Any) -> None:
                     raw = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-                    self.send_response(code)
-                    self.send_header("Content-Type", "application/json; charset=utf-8")
-                    self.send_header("Content-Length", str(len(raw)))
-                    self.send_header("Connection", "close")
-                    self.end_headers()
-                    self.wfile.write(raw)
+                    self._send_raw(code, "application/json; charset=utf-8", raw)
+
+                def _send_sse_headers(self) -> bool:
+                    try:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                        self.send_header("Cache-Control", "no-cache")
+                        self.send_header("X-Accel-Buffering", "no")
+                        self.send_header("Connection", "close")
+                        self.end_headers()
+                        return True
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        return False
+
+                def _send_sse_error(self, message: str, code: Any = 502) -> bool:
+                    err_obj = {
+                        "error": {
+                            "message": message,
+                            "type": "upstream_error",
+                            "code": code,
+                        }
+                    }
+                    frame = f"data: {json.dumps(err_obj, ensure_ascii=False)}\n\n".encode("utf-8")
+                    if not self._safe_write(frame, flush=False):
+                        return False
+                    return self._safe_write(b"data: [DONE]\n\n", flush=True)
 
                 def _read_body(self) -> bytes:
                     try:
@@ -1428,14 +1500,230 @@ class GatewayAdapterServer:
                         resp = requests.get(target_url, headers=headers, timeout=min(30.0, gw.timeout_s))
                         raw = resp.content
                         ctype = resp.headers.get("Content-Type", "application/json")
-                        self.send_response(resp.status_code)
-                        self.send_header("Content-Type", ctype)
-                        self.send_header("Content-Length", str(len(raw)))
-                        self.send_header("Connection", "close")
-                        self.end_headers()
-                        self.wfile.write(raw)
+                        self._send_raw(resp.status_code, ctype, raw)
                     except Exception as exc:
                         self._send_json(502, {"error": {"message": f"upstream GET error: {type(exc).__name__}"}})
+
+                @staticmethod
+                def _close_resp_quiet(r: Any) -> None:
+                    if r is not None:
+                        try:
+                            r.close()
+                        except Exception:
+                            pass
+
+                @staticmethod
+                def _extract_error_message(raw_bytes: bytes, status_code: int) -> str:
+                    err_text = raw_bytes.decode("utf-8", errors="replace").strip()
+                    if err_text:
+                        try:
+                            parsed = json.loads(err_text)
+                            if isinstance(parsed, dict):
+                                err_obj = parsed.get("error")
+                                if isinstance(err_obj, dict) and err_obj.get("message"):
+                                    return str(err_obj["message"])
+                                if parsed.get("message"):
+                                    return str(parsed["message"])
+                        except Exception:
+                            pass
+                        return err_text[:500]
+                    return f"upstream returned HTTP {status_code}"
+
+                def _perform_chat_attempts(
+                    self,
+                    gw: GatewayConfig,
+                    target_url: str,
+                    req_json: Dict[str, Any],
+                    headers: Dict[str, str],
+                    route_model: Optional[str],
+                    route_effort: Optional[str],
+                    cancel_ev: Optional[threading.Event] = None,
+                ) -> Dict[str, Any]:
+                    quirks = adapter.runtime.get_quirks(gw)
+                    resp = None
+                    last_err_text = ""
+                    try:
+                        for attempt in range(3):
+                            if cancel_ev is not None and cancel_ev.is_set():
+                                return {"kind": "cancelled", "resp": None, "exc": None, "status": 0, "ctype": "", "body": b""}
+                            fwd_json = transform_chat_request(
+                                req_json,
+                                gw,
+                                upstream_model=route_model,
+                                effort=route_effort,
+                                quirks=quirks,
+                            )
+                            try:
+                                resp = requests.post(
+                                    target_url,
+                                    json=fwd_json,
+                                    headers=headers,
+                                    stream=True,
+                                    timeout=gw.timeout_s,
+                                )
+                            except Exception as exc:
+                                return {"kind": "conn_error", "resp": None, "exc": exc, "status": 502, "ctype": "", "body": b""}
+
+                            if cancel_ev is not None and cancel_ev.is_set():
+                                self._close_resp_quiet(resp)
+                                resp = None
+                                return {"kind": "cancelled", "resp": None, "exc": None, "status": 0, "ctype": "", "body": b""}
+
+                            if resp.status_code == 400 and gw.adaptive_400_fallback and attempt < 2:
+                                err_ctype = resp.headers.get("Content-Type", "application/json")
+                                try:
+                                    err_bytes = resp.raw.read(65536) if hasattr(resp, "raw") and resp.raw else resp.content[:65536]
+                                    last_err_text = (
+                                        err_bytes.decode("utf-8", errors="replace")
+                                        if isinstance(err_bytes, bytes)
+                                        else str(err_bytes)
+                                    )
+                                except Exception:
+                                    last_err_text = ""
+                                finally:
+                                    self._close_resp_quiet(resp)
+                                    resp = None
+                                new_quirks = infer_quirk_from_400(last_err_text, fwd_json, quirks, gw)
+                                if new_quirks is not None:
+                                    adapter.runtime.update_quirks(gw, new_quirks)
+                                    quirks = new_quirks
+                                    logger.info("Gateway %s adapted quirk on 400 retry %d", gw.id, attempt + 1)
+                                    continue
+                                return {
+                                    "kind": "buffered_400",
+                                    "resp": None,
+                                    "exc": None,
+                                    "status": 400,
+                                    "ctype": err_ctype,
+                                    "body": last_err_text.encode("utf-8"),
+                                }
+                            break
+
+                        if resp is None:
+                            return {"kind": "no_response", "resp": None, "exc": None, "status": 502, "ctype": "", "body": b""}
+                        res = {"kind": "response", "resp": resp, "exc": None, "status": resp.status_code, "ctype": "", "body": b""}
+                        resp = None
+                        return res
+                    finally:
+                        self._close_resp_quiet(resp)
+
+                def _write_chat_outcome(
+                    self,
+                    outcome: Dict[str, Any],
+                    client_wants_stream: bool,
+                    sse_headers_sent: bool,
+                    cancel_ev: Optional[threading.Event] = None,
+                ) -> None:
+                    kind = outcome.get("kind")
+                    resp = outcome.get("resp")
+                    try:
+                        if kind == "cancelled":
+                            return
+                        if kind == "conn_error":
+                            msg = f"upstream connection failed: {type(outcome.get('exc')).__name__}"
+                            if sse_headers_sent:
+                                self._send_sse_error(msg, code=502)
+                            else:
+                                self._send_json(502, {"error": {"message": msg}})
+                            return
+                        if kind == "buffered_400":
+                            buf_body = outcome.get("body") or b""
+                            if sse_headers_sent:
+                                msg = self._extract_error_message(buf_body, 400)
+                                self._send_sse_error(msg, code=400)
+                            else:
+                                self._send_raw(400, outcome.get("ctype") or "application/json", buf_body)
+                            return
+                        if kind == "no_response" or resp is None:
+                            msg = "upstream returned no response"
+                            if sse_headers_sent:
+                                self._send_sse_error(msg, code=502)
+                            else:
+                                self._send_json(502, {"error": {"message": msg}})
+                            return
+
+                        if resp.status_code != 200:
+                            err_raw = resp.content[:262144]
+                            if sse_headers_sent:
+                                msg = self._extract_error_message(err_raw, resp.status_code)
+                                self._send_sse_error(msg, code=resp.status_code)
+                            else:
+                                self._send_raw(
+                                    resp.status_code,
+                                    resp.headers.get("Content-Type", "application/json"),
+                                    err_raw,
+                                )
+                            return
+
+                        ctype = (resp.headers.get("Content-Type") or "").lower()
+                        if "text/event-stream" in ctype:
+                            if not sse_headers_sent:
+                                if not self._send_sse_headers():
+                                    if cancel_ev is not None:
+                                        cancel_ev.set()
+                                    return
+                            norm = SSEStreamNormalizer()
+                            for raw_line in resp.iter_lines(chunk_size=None, decode_unicode=False):
+                                if cancel_ev is not None and cancel_ev.is_set():
+                                    return
+                                if raw_line is None:
+                                    continue
+                                line_str = (
+                                    bytes(raw_line).decode("utf-8", errors="replace")
+                                    if isinstance(raw_line, (bytes, bytearray))
+                                    else str(raw_line)
+                                )
+                                frame = norm.process_line(line_str)
+                                if frame:
+                                    if not self._safe_write(frame, flush=True):
+                                        if cancel_ev is not None:
+                                            cancel_ev.set()
+                                        return
+                            tail = norm.finalize()
+                            if tail:
+                                if not self._safe_write(tail, flush=True) and cancel_ev is not None:
+                                    cancel_ev.set()
+                            return
+
+                        # Non-streaming JSON response
+                        body_bytes = resp.content
+                        try:
+                            parsed_resp = json.loads(body_bytes.decode("utf-8"))
+                        except Exception:
+                            if sse_headers_sent:
+                                self._send_sse_error("upstream returned non-JSON response", code=502)
+                            else:
+                                self._send_raw(
+                                    200,
+                                    resp.headers.get("Content-Type", "application/json"),
+                                    body_bytes,
+                                )
+                            return
+
+                        if (client_wants_stream or sse_headers_sent) and isinstance(parsed_resp, dict):
+                            frames = json_completion_to_sse_chunks(parsed_resp)
+                            if not sse_headers_sent:
+                                if not self._send_sse_headers():
+                                    if cancel_ev is not None:
+                                        cancel_ev.set()
+                                    return
+                            for frame in frames:
+                                if not self._safe_write(frame, flush=False):
+                                    if cancel_ev is not None:
+                                        cancel_ev.set()
+                                    return
+                            if not self._safe_flush() and cancel_ev is not None:
+                                cancel_ev.set()
+                            return
+
+                        norm_json = normalize_completion_json(parsed_resp) if isinstance(parsed_resp, dict) else parsed_resp
+                        out_raw = json.dumps(norm_json, ensure_ascii=False).encode("utf-8")
+                        self._send_raw(200, "application/json; charset=utf-8", out_raw)
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        if cancel_ev is not None:
+                            cancel_ev.set()
+                    finally:
+                        self._close_resp_quiet(resp)
 
                 def do_POST(self) -> None:  # noqa: N802
                     gw, route, sub, err = self._resolve_request_target()
@@ -1456,12 +1744,11 @@ class GatewayAdapterServer:
                         try:
                             resp = requests.post(target_url, data=raw_body, headers=headers, timeout=gw.timeout_s)
                             out_bytes = resp.content
-                            self.send_response(resp.status_code)
-                            self.send_header("Content-Type", resp.headers.get("Content-Type", "application/json"))
-                            self.send_header("Content-Length", str(len(out_bytes)))
-                            self.send_header("Connection", "close")
-                            self.end_headers()
-                            self.wfile.write(out_bytes)
+                            self._send_raw(
+                                resp.status_code,
+                                resp.headers.get("Content-Type", "application/json"),
+                                out_bytes,
+                            )
                         except Exception as exc:
                             self._send_json(502, {"error": {"message": f"upstream POST error: {type(exc).__name__}"}})
                         return
@@ -1486,141 +1773,76 @@ class GatewayAdapterServer:
                     if api_key:
                         headers["Authorization"] = f"Bearer {api_key}"
 
-                    quirks = adapter.runtime.get_quirks(gw)
-                    resp = None
-                    last_err_text = ""
-
-                    for attempt in range(3):
-                        fwd_json = transform_chat_request(
-                            req_json,
-                            gw,
-                            upstream_model=route_model,
-                            effort=route_effort,
-                            quirks=quirks,
+                    if not client_wants_stream or adapter.preheader_keepalive_after_s <= 0:
+                        outcome = self._perform_chat_attempts(
+                            gw, target_url, req_json, headers, route_model, route_effort
                         )
-                        try:
-                            resp = requests.post(
-                                target_url,
-                                json=fwd_json,
-                                headers=headers,
-                                stream=True,
-                                timeout=gw.timeout_s,
-                            )
-                        except Exception as exc:
-                            self._send_json(502, {"error": {"message": f"upstream connection failed: {type(exc).__name__}"}})
-                            return
-
-                        if resp.status_code == 400 and gw.adaptive_400_fallback and attempt < 2:
-                            try:
-                                err_bytes = resp.raw.read(65536) if hasattr(resp, "raw") and resp.raw else resp.content[:65536]
-                                last_err_text = (
-                                    err_bytes.decode("utf-8", errors="replace")
-                                    if isinstance(err_bytes, bytes)
-                                    else str(err_bytes)
-                                )
-                            except Exception:
-                                last_err_text = ""
-                            finally:
-                                try:
-                                    resp.close()
-                                except Exception:
-                                    pass
-                            new_quirks = infer_quirk_from_400(last_err_text, fwd_json, quirks, gw)
-                            if new_quirks is not None:
-                                adapter.runtime.update_quirks(gw, new_quirks)
-                                quirks = new_quirks
-                                logger.info("Gateway %s adapted quirk on 400 retry %d", gw.id, attempt + 1)
-                                continue
-                            # Non-recoverable 400: forward buffered error body cleanly
-                            err_raw = last_err_text.encode("utf-8")
-                            self.send_response(400)
-                            self.send_header("Content-Type", resp.headers.get("Content-Type", "application/json"))
-                            self.send_header("Content-Length", str(len(err_raw)))
-                            self.send_header("Connection", "close")
-                            self.end_headers()
-                            self.wfile.write(err_raw)
-                            return
-                        break
-
-                    if resp is None:
-                        self._send_json(502, {"error": {"message": "upstream returned no response"}})
+                        self._write_chat_outcome(outcome, client_wants_stream, sse_headers_sent=False)
                         return
 
+                    done_ev = threading.Event()
+                    cancel_ev = threading.Event()
+                    outcome_lock = threading.Lock()
+                    shared_outcome: Dict[str, Any] = {
+                        "kind": None,
+                        "resp": None,
+                        "exc": None,
+                        "status": 0,
+                        "ctype": "",
+                        "body": b"",
+                    }
+
+                    def _worker() -> None:
+                        res = self._perform_chat_attempts(
+                            gw,
+                            target_url,
+                            req_json,
+                            headers,
+                            route_model,
+                            route_effort,
+                            cancel_ev=cancel_ev,
+                        )
+                        with outcome_lock:
+                            if cancel_ev.is_set():
+                                self._close_resp_quiet(res.get("resp"))
+                                res["resp"] = None
+                                shared_outcome["kind"] = "cancelled"
+                            else:
+                                shared_outcome.update(res)
+                        done_ev.set()
+
+                    threading.Thread(target=_worker, daemon=True, name="agy-gw-upstream").start()
+
+                    sse_headers_sent = False
                     try:
-                        if resp.status_code != 200:
-                            err_raw = resp.content[:262144]
-                            self.send_response(resp.status_code)
-                            self.send_header("Content-Type", resp.headers.get("Content-Type", "application/json"))
-                            self.send_header("Content-Length", str(len(err_raw)))
-                            self.send_header("Connection", "close")
-                            self.end_headers()
-                            self.wfile.write(err_raw)
-                            return
+                        if not done_ev.wait(timeout=adapter.preheader_keepalive_after_s):
+                            if not self._send_sse_headers():
+                                cancel_ev.set()
+                                return
+                            sse_headers_sent = True
+                            if not self._safe_write(b": keepalive\n\n", flush=True):
+                                cancel_ev.set()
+                                return
+                            while not done_ev.wait(timeout=adapter.preheader_keepalive_interval_s):
+                                if not self._safe_write(b": keepalive\n\n", flush=True):
+                                    cancel_ev.set()
+                                    return
 
-                        ctype = (resp.headers.get("Content-Type") or "").lower()
-                        if "text/event-stream" in ctype:
-                            self.send_response(200)
-                            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-                            self.send_header("Cache-Control", "no-cache")
-                            self.send_header("Connection", "close")
-                            self.end_headers()
-                            norm = SSEStreamNormalizer()
-                            for raw_line in resp.iter_lines(chunk_size=None, decode_unicode=False):
-                                if raw_line is None:
-                                    continue
-                                line_str = (
-                                    bytes(raw_line).decode("utf-8", errors="replace")
-                                    if isinstance(raw_line, (bytes, bytearray))
-                                    else str(raw_line)
-                                )
-                                frame = norm.process_line(line_str)
-                                if frame:
-                                    self.wfile.write(frame)
-                                    self.wfile.flush()
-                            tail = norm.finalize()
-                            if tail:
-                                self.wfile.write(tail)
-                                self.wfile.flush()
-                            return
-
-                        # Non-streaming JSON response
-                        body_bytes = resp.content
-                        try:
-                            parsed_resp = json.loads(body_bytes.decode("utf-8"))
-                        except Exception:
-                            self.send_response(200)
-                            self.send_header("Content-Type", resp.headers.get("Content-Type", "application/json"))
-                            self.send_header("Content-Length", str(len(body_bytes)))
-                            self.send_header("Connection", "close")
-                            self.end_headers()
-                            self.wfile.write(body_bytes)
-                            return
-
-                        if client_wants_stream and isinstance(parsed_resp, dict):
-                            frames = json_completion_to_sse_chunks(parsed_resp)
-                            self.send_response(200)
-                            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-                            self.send_header("Cache-Control", "no-cache")
-                            self.send_header("Connection", "close")
-                            self.end_headers()
-                            for frame in frames:
-                                self.wfile.write(frame)
-                            self.wfile.flush()
-                            return
-
-                        norm_json = normalize_completion_json(parsed_resp) if isinstance(parsed_resp, dict) else parsed_resp
-                        out_raw = json.dumps(norm_json, ensure_ascii=False).encode("utf-8")
-                        self.send_response(200)
-                        self.send_header("Content-Type", "application/json; charset=utf-8")
-                        self.send_header("Content-Length", str(len(out_raw)))
-                        self.send_header("Connection", "close")
-                        self.end_headers()
-                        self.wfile.write(out_raw)
+                        with outcome_lock:
+                            outcome = dict(shared_outcome)
+                            shared_outcome["resp"] = None
+                        self._write_chat_outcome(
+                            outcome,
+                            client_wants_stream,
+                            sse_headers_sent=sse_headers_sent,
+                            cancel_ev=cancel_ev,
+                        )
                     finally:
-                        try:
-                            resp.close()
-                        except Exception:
-                            pass
+                        cancel_ev.set()
+                        with outcome_lock:
+                            leftover_resp = shared_outcome.get("resp")
+                            shared_outcome["resp"] = None
+                        self._close_resp_quiet(leftover_resp)
 
             self._httpd = _AdapterHTTPServer((self.host, self.requested_port), _Handler)
             self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True, name="agy-gateway-adapter")
