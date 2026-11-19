@@ -1368,6 +1368,559 @@ class TestRecoveredAttemptErrorHandling(unittest.TestCase):
             self.assertEqual("error", finished[0][1]["status"])
             self.assertIn("different bus error", finished[0][1]["error"])
 
+    def test_sanitize_recovered_response_and_response_only_stale_error_matrix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = _load_isolated_bridge(tmp, extra_env={"HOME": tmp})
+            brain_root = Path(tmp) / "brain"
+            bridge.BRAIN_ROOT = str(brain_root)
+            err_503 = (
+                "API error (attempt 1): UNAVAILABLE (code 503): "
+                "No capacity available for model gemini-4-hydrogen-xhigh on the server"
+            )
+            err_other = "API error (attempt 1): INTERNAL (code 500): brand new response-only error"
+
+            # (0) Direct unit tests for _sanitize_recovered_response
+            self.assertEqual(
+                "Step text",
+                bridge._sanitize_recovered_response("", err_503, "Step text", "Terminal text"),
+            )
+            self.assertEqual(
+                "Terminal text",
+                bridge._sanitize_recovered_response(f"  {err_503} \n", err_503, "", "  Terminal text  "),
+            )
+            self.assertEqual(
+                "Terminal text",
+                bridge._sanitize_recovered_response(err_503, "", "", "Terminal text"),
+            )
+            self.assertEqual(
+                "Legitimate new response",
+                bridge._sanitize_recovered_response("  Legitimate new response  ", err_503, "Fallback"),
+            )
+            self.assertEqual(
+                "",
+                bridge._sanitize_recovered_response(err_503, err_503, "", "   "),
+            )
+
+            chat_id = -1001234567890
+            skey = bridge.scope_key_for(chat_id, None)
+            prior_entries = [
+                {"type": "USER_INPUT", "status": "DONE", "content": "earlier turn"},
+                {"type": "ERROR_MESSAGE", "status": "DONE", "error": err_503},
+                {"type": "PLANNER_RESPONSE", "status": "DONE", "content": "earlier answer"},
+            ]
+
+            finalized: list[tuple] = []
+            sent_rich: list[tuple] = []
+            sent_plain: list[tuple] = []
+            footer_results: list[dict] = []
+
+            class _FakeStreamer:
+                status_override = None
+
+                def __init__(self, *args, **kwargs):
+                    self.start_line = kwargs.get("start_line", 0)
+
+                def start(self):
+                    pass
+
+                def stop(self):
+                    pass
+
+                def set_cid(self, _c):
+                    pass
+
+                def set_status_override(self, _v):
+                    pass
+
+                def on_thinking(self, _t):
+                    pass
+
+                def on_tool_start(self, *_a, **_kw):
+                    pass
+
+                def on_tool_done(self, *_a, **_kw):
+                    pass
+
+                def on_text_delta(self, _t):
+                    pass
+
+                def start_next_segment(self, sl):
+                    self.start_line = sl
+
+                def finalize_step(self, text, **kwargs):
+                    finalized.append((text, kwargs))
+                    return (202, f"<p>{text}</p>")
+
+            orig_compute_footer = bridge._compute_workspace_diff_and_footer
+
+            def _spy_footer(res, *args, **kwargs):
+                footer_results.append(dict(res))
+                return orig_compute_footer(res, *args, **kwargs)
+
+            # (1) run_agy 65ms imm_res coalescing: response-only stale error A & error+response both A
+            for case_idx, imm_payload_extra in enumerate(
+                [
+                    {"response": err_503},
+                    {"error": err_503, "response": err_503},
+                ]
+            ):
+                cid_imm = f"conv-resp-only-imm-{case_idx}"
+                self._write_transcript(brain_root, cid_imm, prior_entries)
+                bridge.update_scope_state(skey, conversation_id=cid_imm)
+                expected_ans = f"Clean coalesced answer #{case_idx}."
+
+                class _ImmRespOnlySession:
+                    cid = cid_imm
+                    proc = type("P", (), {"returncode": 0})()
+
+                    def __init__(self, _cid=cid_imm, _ans=expected_ans, _extra=imm_payload_extra):
+                        self._cid = _cid
+                        self._ans = _ans
+                        self._extra = dict(_extra)
+                        self._events = iter(
+                            [
+                                {"event": "init", "conversation_id": _cid},
+                                {
+                                    "event": "step_update",
+                                    "step_update": {
+                                        "step_type": "agent_response",
+                                        "step_index": 2,
+                                        "state": "DONE",
+                                        "text_delta": _ans,
+                                    },
+                                },
+                            ]
+                        )
+
+                    def send_user_prompt(self, _prompt):
+                        TestRecoveredAttemptErrorHandling._write_transcript(
+                            brain_root,
+                            self._cid,
+                            prior_entries
+                            + [
+                                {"type": "USER_INPUT", "status": "DONE", "content": "follow up imm"},
+                                {"type": "PLANNER_RESPONSE", "status": "DONE", "content": self._ans},
+                            ],
+                        )
+
+                    def next_event(self, timeout=0.25):
+                        return next(self._events, {"event": "__eof__"})
+
+                    def peek_immediate_result(self, timeout=0.065):
+                        payload = {"conversation_id": self._cid, "status": "ERROR"}
+                        payload.update(self._extra)
+                        return payload, []
+
+                    def get_stderr_text(self):
+                        return ""
+
+                finalized.clear()
+                sent_rich.clear()
+                sent_plain.clear()
+                footer_results.clear()
+                with (
+                    mock.patch.object(bridge, "_acquire_session", return_value=(_ImmRespOnlySession(), True)),
+                    mock.patch.object(bridge, "LiveDraftStreamer", _FakeStreamer),
+                    mock.patch.object(bridge, "_compute_workspace_diff_and_footer", side_effect=_spy_footer),
+                    mock.patch.object(bridge, "send", side_effect=lambda _c, txt, **kw: sent_plain.append((txt, kw))),
+                    mock.patch.object(
+                        bridge,
+                        "send_rich",
+                        side_effect=lambda _c, txt, **kw: (sent_rich.append((txt, kw)) or (303, f"<p>{txt}</p>")),
+                    ),
+                    mock.patch.object(bridge, "push_step_images"),
+                    mock.patch.object(bridge, "_record_and_relay_bot_group_msg"),
+                    mock.patch.object(bridge, "_maybe_post_turn_auto_compact"),
+                ):
+                    bridge.run_agy(chat_id, "follow up imm", scope_key=skey)
+
+                self.assertEqual(1, len(finalized))
+                self.assertEqual(expected_ans, finalized[0][0])
+                self.assertNotIn("API error (attempt 1)", finalized[0][0])
+                self.assertEqual(1, len(footer_results))
+                self.assertEqual(expected_ans, footer_results[0].get("response"))
+                self.assertEqual("SUCCESS", footer_results[0].get("status"))
+                self.assertEqual([], sent_plain)
+                self.assertEqual("SUCCESS", bridge.get_scope_state(skey)["last_turn"]["status"])
+
+            # (2) run_agy main-loop recovery (no step_update, only init + result):
+            #     response-only stale error A & error+response both A -> send_rich gets terminal_text + footer
+            for case_idx, res_extra in enumerate(
+                [
+                    {"response": err_503},
+                    {"error": err_503, "response": err_503},
+                ]
+            ):
+                cid_main = f"conv-resp-only-main-{case_idx}"
+                self._write_transcript(brain_root, cid_main, prior_entries)
+                bridge.update_scope_state(skey, conversation_id=cid_main)
+                expected_ans = f"Main-loop sanitized terminal answer #{case_idx}."
+
+                class _MainLoopRespOnlySession:
+                    cid = cid_main
+                    proc = type("P", (), {"returncode": 0})()
+
+                    def __init__(self, _cid=cid_main, _ans=expected_ans, _extra=res_extra):
+                        self._cid = _cid
+                        self._ans = _ans
+                        payload = {"conversation_id": _cid, "status": "ERROR"}
+                        payload.update(_extra)
+                        self._events = iter(
+                            [
+                                {"event": "init", "conversation_id": _cid},
+                                {"event": "result", "result": payload},
+                            ]
+                        )
+
+                    def send_user_prompt(self, _prompt):
+                        TestRecoveredAttemptErrorHandling._write_transcript(
+                            brain_root,
+                            self._cid,
+                            prior_entries
+                            + [
+                                {"type": "USER_INPUT", "status": "DONE", "content": "follow up main"},
+                                {"type": "PLANNER_RESPONSE", "status": "DONE", "content": self._ans},
+                            ],
+                        )
+
+                    def next_event(self, timeout=0.25):
+                        return next(self._events, {"event": "__eof__"})
+
+                    def peek_immediate_result(self, timeout=0.065):
+                        return None, "timeout"
+
+                    def get_stderr_text(self):
+                        return ""
+
+                finalized.clear()
+                sent_rich.clear()
+                sent_plain.clear()
+                with (
+                    mock.patch.object(bridge, "_acquire_session", return_value=(_MainLoopRespOnlySession(), True)),
+                    mock.patch.object(bridge, "LiveDraftStreamer", _FakeStreamer),
+                    mock.patch.object(bridge, "send", side_effect=lambda _c, txt, **kw: sent_plain.append((txt, kw))),
+                    mock.patch.object(
+                        bridge,
+                        "send_rich",
+                        side_effect=lambda _c, txt, **kw: (sent_rich.append((txt, kw)) or (303, f"<p>{txt}</p>")),
+                    ),
+                    mock.patch.object(bridge, "push_step_images"),
+                    mock.patch.object(bridge, "_record_and_relay_bot_group_msg"),
+                    mock.patch.object(bridge, "_maybe_post_turn_auto_compact"),
+                ):
+                    bridge.run_agy(chat_id, "follow up main", scope_key=skey)
+
+                self.assertEqual([], finalized)
+                self.assertEqual(1, len(sent_rich))
+                self.assertEqual(expected_ans, sent_rich[0][0])
+                self.assertNotIn("API error (attempt 1)", sent_rich[0][0])
+                self.assertTrue(bool(sent_rich[0][1].get("footer_str")))
+                self.assertEqual([], [m for m, _kw in sent_plain if "⚠️ agy ERROR" in m])
+                self.assertEqual("SUCCESS", bridge.get_scope_state(skey)["last_turn"]["status"])
+
+            # (2b) Negative: main-loop response-only different error B must NOT be swallowed
+            cid_mis_resp = "conv-resp-only-mismatch-001"
+            self._write_transcript(brain_root, cid_mis_resp, prior_entries)
+            bridge.update_scope_state(skey, conversation_id=cid_mis_resp)
+
+            class _MainLoopMismatchRespOnlySession:
+                cid = cid_mis_resp
+                proc = type("P", (), {"returncode": 0})()
+
+                def __init__(self):
+                    self._events = iter(
+                        [
+                            {"event": "init", "conversation_id": cid_mis_resp},
+                            {
+                                "event": "step_update",
+                                "step_update": {
+                                    "step_type": "tool",
+                                    "step_index": 1,
+                                    "state": "ACTIVE",
+                                    "tool_name": "read_file",
+                                },
+                            },
+                            {
+                                "event": "result",
+                                "result": {
+                                    "conversation_id": cid_mis_resp,
+                                    "status": "ERROR",
+                                    "response": err_other,
+                                },
+                            },
+                        ]
+                    )
+
+                def send_user_prompt(self, _prompt):
+                    TestRecoveredAttemptErrorHandling._write_transcript(
+                        brain_root,
+                        cid_mis_resp,
+                        prior_entries
+                        + [
+                            {"type": "USER_INPUT", "status": "DONE", "content": "follow up mismatch"},
+                            {"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Unrelated"},
+                        ],
+                    )
+
+                def next_event(self, timeout=0.25):
+                    return next(self._events, {"event": "__eof__"})
+
+                def peek_immediate_result(self, timeout=0.065):
+                    return None, "timeout"
+
+                def get_stderr_text(self):
+                    return ""
+
+            sent_rich.clear()
+            sent_plain.clear()
+            with (
+                mock.patch.object(bridge, "_acquire_session", return_value=(_MainLoopMismatchRespOnlySession(), True)),
+                mock.patch.object(bridge, "LiveDraftStreamer", _FakeStreamer),
+                mock.patch.object(bridge, "send", side_effect=lambda _c, txt, **kw: sent_plain.append((txt, kw))),
+                mock.patch.object(
+                    bridge,
+                    "send_rich",
+                    side_effect=lambda _c, txt, **kw: (sent_rich.append((txt, kw)) or (303, f"<p>{txt}</p>")),
+                ),
+                mock.patch.object(bridge, "push_step_images"),
+                mock.patch.object(bridge, "_record_and_relay_bot_group_msg"),
+                mock.patch.object(bridge, "_maybe_post_turn_auto_compact"),
+            ):
+                bridge.run_agy(chat_id, "follow up mismatch", scope_key=skey)
+
+            self.assertEqual([], sent_rich)
+            self.assertTrue(any("⚠️ agy ERROR" in txt and err_other in txt for txt, _kw in sent_plain))
+            self.assertEqual("ERROR", bridge.get_scope_state(skey)["last_turn"]["status"])
+
+            # (3) run_agy TRUE post-loop recovery branch:
+            #     1st _inspect_recovered_attempt_error (in main loop) sees unflushed transcript -> (False, "");
+            #     tool step prevents retry -> exits loop -> transcript flushes ->
+            #     2nd _inspect_recovered_attempt_error (post-loop) recovers and sanitizes response-only err A!
+            cid_true_post = "conv-resp-only-true-postloop"
+            self._write_transcript(brain_root, cid_true_post, prior_entries)
+            bridge.update_scope_state(skey, conversation_id=cid_true_post)
+
+            class _TruePostLoopSession:
+                cid = cid_true_post
+                proc = type("P", (), {"returncode": 0})()
+
+                def __init__(self):
+                    self._events = iter(
+                        [
+                            {"event": "init", "conversation_id": cid_true_post},
+                            {
+                                "event": "step_update",
+                                "step_update": {
+                                    "step_type": "tool",
+                                    "step_index": 1,
+                                    "state": "ACTIVE",
+                                    "tool_name": "read_file",
+                                },
+                            },
+                            {
+                                "event": "step_update",
+                                "step_update": {
+                                    "step_type": "tool",
+                                    "step_index": 1,
+                                    "state": "DONE",
+                                    "tool_name": "read_file",
+                                },
+                            },
+                            {
+                                "event": "result",
+                                "result": {
+                                    "conversation_id": cid_true_post,
+                                    "status": "ERROR",
+                                    "response": err_503,
+                                },
+                            },
+                        ]
+                    )
+
+                def send_user_prompt(self, _prompt):
+                    # Deliberately do NOT flush transcript yet so main-loop check returns (False, "")
+                    pass
+
+                def next_event(self, timeout=0.25):
+                    return next(self._events, {"event": "__eof__"})
+
+                def peek_immediate_result(self, timeout=0.065):
+                    return None, "timeout"
+
+                def get_stderr_text(self):
+                    return ""
+
+            orig_inspect = bridge._inspect_recovered_attempt_error
+            inspect_calls = [0]
+
+            def _delayed_flush_inspect(cid_arg, start_line_arg, raw_err_arg, **kw):
+                inspect_calls[0] += 1
+                res = orig_inspect(cid_arg, start_line_arg, raw_err_arg, **kw)
+                if inspect_calls[0] == 1:
+                    # Flush transcript right after the main-loop check fails so post-loop check succeeds
+                    TestRecoveredAttemptErrorHandling._write_transcript(
+                        brain_root,
+                        cid_true_post,
+                        prior_entries
+                        + [
+                            {"type": "USER_INPUT", "status": "DONE", "content": "post-loop prompt"},
+                            {"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Post-loop sanitized answer."},
+                        ],
+                    )
+                return res
+
+            sent_rich.clear()
+            sent_plain.clear()
+            with (
+                mock.patch.object(bridge, "_acquire_session", return_value=(_TruePostLoopSession(), True)),
+                mock.patch.object(bridge, "LiveDraftStreamer", _FakeStreamer),
+                mock.patch.object(bridge, "_inspect_recovered_attempt_error", side_effect=_delayed_flush_inspect),
+                mock.patch.object(bridge, "send", side_effect=lambda _c, txt, **kw: sent_plain.append((txt, kw))),
+                mock.patch.object(
+                    bridge,
+                    "send_rich",
+                    side_effect=lambda _c, txt, **kw: (sent_rich.append((txt, kw)) or (303, f"<p>{txt}</p>")),
+                ),
+                mock.patch.object(bridge, "push_step_images"),
+                mock.patch.object(bridge, "_record_and_relay_bot_group_msg"),
+                mock.patch.object(bridge, "_maybe_post_turn_auto_compact"),
+            ):
+                bridge.run_agy(chat_id, "post-loop prompt", scope_key=skey)
+
+            self.assertEqual(2, inspect_calls[0])
+            self.assertEqual(1, len(sent_rich))
+            self.assertEqual("Post-loop sanitized answer.", sent_rich[0][0])
+            self.assertNotIn("API error (attempt 1)", sent_rich[0][0])
+            self.assertTrue(bool(sent_rich[0][1].get("footer_str")))
+            self.assertEqual([], [m for m, _kw in sent_plain if "⚠️ agy ERROR" in m])
+            self.assertEqual("SUCCESS", bridge.get_scope_state(skey)["last_turn"]["status"])
+
+            # (4) _execute_bus_job: response-only stale error A, error+response both A,
+            #     response-only mismatched error B (negative), and fail-closed empty sanitized_text
+            cid_bus = "conv-bus-resp-only-001"
+            clean_bus_turn = [
+                {"type": "USER_INPUT", "status": "DONE", "content": "bus prompt"},
+                {"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Bus sanitized answer."},
+            ]
+            job_payload = {
+                "job_id": "job-resp-only-1",
+                "from_bot": "sgaeget_bot",
+                "to_bot": "agycli_main_bot",
+                "prompt": "continue",
+                "label": "Response-only bus check",
+                "resume_cid": cid_bus,
+                "notify_group": False,
+            }
+
+            class _BusFakeProc:
+                def __init__(self, lines, turn_entries, rc=0):
+                    self.pid = 99997
+                    self.stdout = iter(lines)
+                    self.stderr = iter([])
+                    self.returncode = rc
+                    TestRecoveredAttemptErrorHandling._write_transcript(
+                        brain_root, cid_bus, prior_entries + turn_entries
+                    )
+
+                def wait(self, timeout=None):
+                    return self.returncode
+
+            for result_payload in (
+                {"conversation_id": cid_bus, "status": "ERROR", "response": err_503},
+                {"conversation_id": cid_bus, "status": "ERROR", "error": err_503, "response": err_503},
+            ):
+                self._write_transcript(brain_root, cid_bus, prior_entries)
+                stream_evs = [
+                    json.dumps({"event": "init", "conversation_id": cid_bus}) + "\n",
+                    json.dumps({"event": "result", "result": result_payload}) + "\n",
+                ]
+                finished_bus: list[tuple] = []
+                with (
+                    mock.patch.object(bridge.bot_bus, "claim_job", return_value=job_payload),
+                    mock.patch.object(bridge.bot_bus, "is_job_cancelled", return_value=False),
+                    mock.patch.object(
+                        bridge.bot_bus,
+                        "finish_job",
+                        side_effect=lambda jid, **kw: finished_bus.append((jid, kw)),
+                    ),
+                    mock.patch.object(bridge, "_publish_bot_heartbeat"),
+                    mock.patch.object(
+                        bridge.subprocess,
+                        "Popen",
+                        side_effect=lambda *a, _ev=stream_evs, **kw: _BusFakeProc(_ev, clean_bus_turn, rc=0),
+                    ),
+                ):
+                    bridge._execute_bus_job("job-resp-only-1")
+
+                self.assertEqual(1, len(finished_bus))
+                self.assertEqual("done", finished_bus[0][1]["status"])
+                self.assertEqual("", finished_bus[0][1]["error"])
+                self.assertEqual("Bus sanitized answer.", finished_bus[0][1]["result_text"])
+                self.assertNotIn("API error (attempt 1)", finished_bus[0][1]["result_text"])
+
+            # Negative: response-only mismatched error B stays status="error"
+            self._write_transcript(brain_root, cid_bus, prior_entries)
+            stream_mis_bus = [
+                json.dumps({"event": "init", "conversation_id": cid_bus}) + "\n",
+                json.dumps({
+                    "event": "result",
+                    "result": {"conversation_id": cid_bus, "status": "ERROR", "response": err_other},
+                }) + "\n",
+            ]
+            finished_bus = []
+            with (
+                mock.patch.object(bridge.bot_bus, "claim_job", return_value=job_payload),
+                mock.patch.object(bridge.bot_bus, "is_job_cancelled", return_value=False),
+                mock.patch.object(
+                    bridge.bot_bus,
+                    "finish_job",
+                    side_effect=lambda jid, **kw: finished_bus.append((jid, kw)),
+                ),
+                mock.patch.object(bridge, "_publish_bot_heartbeat"),
+                mock.patch.object(
+                    bridge.subprocess,
+                    "Popen",
+                    side_effect=lambda *a, **kw: _BusFakeProc(stream_mis_bus, clean_bus_turn, rc=0),
+                ),
+            ):
+                bridge._execute_bus_job("job-resp-only-1")
+
+            self.assertEqual(1, len(finished_bus))
+            self.assertEqual("error", finished_bus[0][1]["status"])
+            self.assertIn("brand new response-only error", finished_bus[0][1]["error"])
+
+            # Negative fail-closed: recovered=True with empty fallback text must NOT promote stale error to done
+            self._write_transcript(brain_root, cid_bus, prior_entries)
+            stream_fc_bus = [
+                json.dumps({"event": "init", "conversation_id": cid_bus}) + "\n",
+                json.dumps({
+                    "event": "result",
+                    "result": {"conversation_id": cid_bus, "status": "ERROR", "response": err_503},
+                }) + "\n",
+            ]
+            finished_bus = []
+            with (
+                mock.patch.object(bridge.bot_bus, "claim_job", return_value=job_payload),
+                mock.patch.object(bridge.bot_bus, "is_job_cancelled", return_value=False),
+                mock.patch.object(
+                    bridge.bot_bus,
+                    "finish_job",
+                    side_effect=lambda jid, **kw: finished_bus.append((jid, kw)),
+                ),
+                mock.patch.object(bridge, "_publish_bot_heartbeat"),
+                mock.patch.object(bridge, "_inspect_recovered_attempt_error", return_value=(True, "")),
+                mock.patch.object(
+                    bridge.subprocess,
+                    "Popen",
+                    side_effect=lambda *a, **kw: _BusFakeProc(stream_fc_bus, clean_bus_turn, rc=0),
+                ),
+            ):
+                bridge._execute_bus_job("job-resp-only-1")
+
+            self.assertEqual(1, len(finished_bus))
+            self.assertEqual("error", finished_bus[0][1]["status"])
+            self.assertIn("code 503", finished_bus[0][1]["error"])
+
     def test_execute_compact_on_session_recovery_retry_and_fail_closed_matrix(self):
         with tempfile.TemporaryDirectory() as tmp:
             bridge = _load_isolated_bridge(tmp, extra_env={"HOME": tmp})

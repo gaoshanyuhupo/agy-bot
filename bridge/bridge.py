@@ -2502,6 +2502,26 @@ def _latest_step_buffer_text(step_buffers):
     return ""
 
 
+def _sanitize_recovered_response(raw_resp, raw_err, *fallbacks):
+    """Return clean response text for a recovered attempt-error turn.
+
+    If `raw_resp` is empty, equals `raw_err` (ignoring surrounding whitespace),
+    or matches `_API_ATTEMPT_ERROR_RE`, fall back to the first non-empty
+    stripped entry in `fallbacks` (e.g. streamed step text or transcript
+    `PLANNER_RESPONSE.content`). Otherwise preserve legitimate non-empty
+    `raw_resp` unchanged.
+    """
+    resp_s = str(raw_resp or "").strip()
+    err_s = str(raw_err or "").strip()
+    if resp_s and resp_s != err_s and not _API_ATTEMPT_ERROR_RE.match(resp_s):
+        return resp_s
+    for cand in fallbacks:
+        cand_s = str(cand or "").strip()
+        if cand_s:
+            return cand_s
+    return ""
+
+
 def get_turn_details(cid, start_line=0):
     """Extract thinking chains and tool calls from transcript.jsonl starting at start_line."""
     if not cid:
@@ -4510,8 +4530,12 @@ def run_agy(
                                     imm_res = dict(imm_res)
                                     imm_res["status"] = "SUCCESS"
                                     imm_res.pop("error", None)
-                                    if not (imm_res.get("response") or "").strip():
-                                        imm_res["response"] = final_step_text or imm_rec_text
+                                    imm_res["response"] = _sanitize_recovered_response(
+                                        imm_res.get("response"),
+                                        imm_err,
+                                        final_step_text,
+                                        imm_rec_text,
+                                    )
                             if imm_res is not None and imm_res.get("status") == "SUCCESS":
                                 result = imm_res
                                 fb_from = (primary_model_label or "default") if candidate_idx > 0 else None
@@ -4591,8 +4615,12 @@ def run_agy(
                     result = dict(result)
                     result["status"] = "SUCCESS"
                     result.pop("error", None)
-                    if not (result.get("response") or "").strip():
-                        result["response"] = _latest_step_buffer_text(step_buffers) or chk_rec_text
+                    result["response"] = _sanitize_recovered_response(
+                        result.get("response"),
+                        chk_err,
+                        _latest_step_buffer_text(step_buffers),
+                        chk_rec_text,
+                    )
             if result is not None and result.get("status") != "ERROR":
                 break
             if result is None and reused_warm and not got_turn_event and same_model_retries == 0 and candidate_idx == 0:
@@ -4743,16 +4771,21 @@ def run_agy(
         if not resp and step_buffers:
             resp = _latest_step_buffer_text(step_buffers)
         if status == "ERROR":
+            post_err = str(result.get("error") or resp or "")
             post_recovered, post_rec_text = _inspect_recovered_attempt_error(
-                conv, turn_start_line, str(result.get("error") or resp or "")
+                conv, turn_start_line, post_err
             )
             if post_recovered:
                 log(
                     "Interactive turn post-loop recovered after historical/transient attempt error; normalizing status to SUCCESS"
                 )
                 status = "SUCCESS"
-                if not resp:
-                    resp = post_rec_text
+                resp = _sanitize_recovered_response(
+                    resp,
+                    post_err,
+                    _latest_step_buffer_text(step_buffers),
+                    post_rec_text,
+                )
         with state_lock:
             sc_w = _ensure_scope_locked(exec_skey)
             if isinstance(sc_w.get("last_turn"), dict):
@@ -5916,13 +5949,23 @@ def _execute_bus_job(job_id):
                     recovered, recovered_text = _inspect_recovered_attempt_error(
                         new_cid, err_start_line, raw_err
                     )
-                if recovered and (resp or recovered_text):
+                sanitized_text = (
+                    _sanitize_recovered_response(
+                        resp,
+                        raw_err,
+                        _latest_step_buffer_text(step_buffers),
+                        recovered_text,
+                    )
+                    if recovered
+                    else ""
+                )
+                if recovered and sanitized_text:
                     log("Bus job %s recovered after historical/transient attempt error (%s); marking as done" % (
                         job_id, raw_err[:160]
                     ))
                     final_status = "done"
                     err_msg = ""
-                    final_text = resp or recovered_text
+                    final_text = sanitized_text
                 else:
                     final_status = "error"
                     err_msg = raw_err
