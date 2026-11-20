@@ -1524,6 +1524,272 @@ class TestPAC2C3C4StudioChatEndToEnd(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.05)
         self.assertEqual(len(chat_svc._active_streams), 0)
 
+    async def test_pa_c4_sse_revocation_race_finally_before_step3(self) -> None:
+        """Deterministic race (a): handle_chat_stream finally runs before _on_auth_revoked Step 3."""
+        sid_a, csrf_a = await self._login("AdminA", "EXAMPLE_ADMIN_A_PW_01")
+        r_send = await self.client.post(
+            "/api/chat/send",
+            headers={"Origin": self.origin, "Content-Type": "application/json", "X-Studio-CSRF": csrf_a},
+            cookies={SESSION_COOKIE_NAME: sid_a},
+            json={"prompt": "race finally before step3"},
+        )
+        self.assertEqual(r_send.status, 202)
+        tid = (await r_send.json())["turn_id"]
+        self.ipc_buffer.append(tid, "turn_start", {"turn_id": tid})
+        self.ipc_buffer.append(tid, "text_delta", {"delta": "a" * 300, "step_index": 0})
+
+        chat_svc = self.app[CHAT_SERVICE_KEY]
+        received_chunks: list[str] = []
+        stream_started = asyncio.Event()
+
+        async def _reader() -> None:
+            async with self.client.get(
+                f"/api/chat/stream?turn_id={tid}",
+                cookies={SESSION_COOKIE_NAME: sid_a},
+            ) as resp:
+                self.assertEqual(resp.status, 200)
+                first = await resp.content.readany()
+                received_chunks.append(first.decode("utf-8", errors="replace"))
+                stream_started.set()
+                while True:
+                    chunk = await resp.content.readany()
+                    if not chunk:
+                        break
+                    received_chunks.append(chunk.decode("utf-8", errors="replace"))
+
+        reader_task = asyncio.create_task(_reader())
+        await asyncio.wait_for(stream_started.wait(), timeout=3.0)
+        self.assertEqual(len(chat_svc._active_streams), 1)
+        entry = next(iter(chat_svc._active_streams.values()))
+        sse_resp = entry["stream_resp"]
+        self.assertIsNotNone(sse_resp)
+
+        finally_closed_downstream = asyncio.Event()
+        orig_close_upstream = chat_svc._close_upstream_stream
+        orig_close_downstream = chat_svc._close_downstream_sse_bounded
+        orig_write_eof = sse_resp.write_eof
+
+        upstream_pause_triggered = False
+        observed_before_step3: dict[str, object] = {}
+        downstream_close_executions = 0
+        write_eof_calls = 0
+
+        async def _gated_close_upstream(ent: dict) -> None:
+            nonlocal upstream_pause_triggered
+            await orig_close_upstream(ent)
+            if ent is entry and not upstream_pause_triggered:
+                upstream_pause_triggered = True
+                observed_before_step3["closing"] = ent.get("closing")
+                observed_before_step3["close_reason"] = ent.get("close_reason")
+                observed_before_step3["downstream_close_task"] = ent.get("downstream_close_task")
+                # Hold _on_auth_revoked between Step 2 and Step 3 until handle_chat_stream's
+                # finally block has closed the downstream response.
+                await asyncio.wait_for(finally_closed_downstream.wait(), timeout=3.0)
+
+        async def _tracked_close_downstream(ent: dict, **kwargs) -> None:
+            nonlocal downstream_close_executions
+            if ent is entry and not ent.get("downstream_closing"):
+                downstream_close_executions += 1
+                observed_before_step3["finally_error_reason"] = kwargs.get("error_reason")
+                observed_before_step3["finally_saw_close_task"] = ent.get("downstream_close_task")
+            await orig_close_downstream(ent, **kwargs)
+            if ent is entry:
+                finally_closed_downstream.set()
+
+        async def _counted_write_eof(*args, **kwargs):
+            nonlocal write_eof_calls
+            if not sse_resp._eof_sent:
+                write_eof_calls += 1
+            return await orig_write_eof(*args, **kwargs)
+
+        t_rev = time.monotonic()
+        with (
+            mock.patch.object(chat_svc, "_close_upstream_stream", side_effect=_gated_close_upstream),
+            mock.patch.object(chat_svc, "_close_downstream_sse_bounded", side_effect=_tracked_close_downstream),
+            mock.patch.object(sse_resp, "write_eof", side_effect=_counted_write_eof),
+        ):
+            r_out = await self.client.post(
+                "/api/auth/logout",
+                headers={"Origin": self.origin, "X-Studio-CSRF": csrf_a},
+                cookies={SESSION_COOKIE_NAME: sid_a},
+            )
+            self.assertEqual(r_out.status, 200)
+            self.ipc_buffer.append(tid, "text_delta", {"delta": "RACE_A_LEAK_" + ("Z" * 300), "step_index": 0})
+            await asyncio.wait_for(reader_task, timeout=2.0)
+
+        elapsed = time.monotonic() - t_rev
+        full_out = "".join(received_chunks)
+        self.assertLessEqual(elapsed, 0.85)
+        self.assertTrue(upstream_pause_triggered)
+        self.assertTrue(observed_before_step3.get("closing"))
+        self.assertEqual(observed_before_step3.get("close_reason"), "访问权限已被撤销")
+        self.assertIsNone(observed_before_step3.get("downstream_close_task"))
+        self.assertIsNone(observed_before_step3.get("finally_saw_close_task"))
+        self.assertEqual(observed_before_step3.get("finally_error_reason"), "访问权限已被撤销")
+        # Step 3 must not create a duplicate task once finally has already closed downstream
+        self.assertIsNone(entry.get("downstream_close_task"))
+        self.assertEqual(downstream_close_executions, 1)
+        self.assertEqual(write_eof_calls, 1)
+        self.assertEqual(full_out.count("event: auth_error"), 1)
+        self.assertNotIn("RACE_A_LEAK_", full_out)
+        self.assertEqual(len(chat_svc._active_streams), 0)
+
+    async def test_pa_c4_sse_revocation_race_finally_waits_pending_close_task(self) -> None:
+        """Deterministic race (b): _on_auth_revoked Step 3 creates downstream_close_task; finally awaits it."""
+        sid_a, csrf_a = await self._login("AdminA", "EXAMPLE_ADMIN_A_PW_01")
+        r_send = await self.client.post(
+            "/api/chat/send",
+            headers={"Origin": self.origin, "Content-Type": "application/json", "X-Studio-CSRF": csrf_a},
+            cookies={SESSION_COOKIE_NAME: sid_a},
+            json={"prompt": "race finally waits close task"},
+        )
+        self.assertEqual(r_send.status, 202)
+        tid = (await r_send.json())["turn_id"]
+        self.ipc_buffer.append(tid, "turn_start", {"turn_id": tid})
+        self.ipc_buffer.append(tid, "text_delta", {"delta": "b" * 300, "step_index": 0})
+
+        chat_svc = self.app[CHAT_SERVICE_KEY]
+        received_chunks: list[str] = []
+        stream_started = asyncio.Event()
+
+        async def _reader() -> None:
+            async with self.client.get(
+                f"/api/chat/stream?turn_id={tid}",
+                cookies={SESSION_COOKIE_NAME: sid_a},
+            ) as resp:
+                self.assertEqual(resp.status, 200)
+                first = await resp.content.readany()
+                received_chunks.append(first.decode("utf-8", errors="replace"))
+                stream_started.set()
+                while True:
+                    chunk = await resp.content.readany()
+                    if not chunk:
+                        break
+                    received_chunks.append(chunk.decode("utf-8", errors="replace"))
+
+        reader_task = asyncio.create_task(_reader())
+        await asyncio.wait_for(stream_started.wait(), timeout=3.0)
+        self.assertEqual(len(chat_svc._active_streams), 1)
+        entry = next(iter(chat_svc._active_streams.values()))
+        sse_resp = entry["stream_resp"]
+        self.assertIsNotNone(sse_resp)
+
+        auth_write_started = asyncio.Event()
+        allow_auth_write_finish = asyncio.Event()
+        events_order: list[str] = []
+        write_eof_calls = 0
+        downstream_close_executions = 0
+        upstream_calls = 0
+        finally_saw_pending_task = False
+
+        orig_close_upstream = chat_svc._close_upstream_stream
+        orig_close_downstream = chat_svc._close_downstream_sse_bounded
+        orig_write = sse_resp.write
+        orig_write_eof = sse_resp.write_eof
+
+        async def _counted_close_downstream(ent: dict, **kwargs) -> None:
+            nonlocal downstream_close_executions
+            if ent is entry and not ent.get("downstream_closing"):
+                downstream_close_executions += 1
+            await orig_close_downstream(ent, **kwargs)
+
+        async def _delayed_auth_write(data: bytes, *args, **kwargs):
+            if b"event: auth_error" in data:
+                auth_write_started.set()
+                await asyncio.wait_for(allow_auth_write_finish.wait(), timeout=3.0)
+                res = await orig_write(data, *args, **kwargs)
+                events_order.append("auth_error_written")
+                return res
+            return await orig_write(data, *args, **kwargs)
+
+        async def _ordered_write_eof(*args, **kwargs):
+            nonlocal write_eof_calls
+            first_eof = not sse_resp._eof_sent
+            res = await orig_write_eof(*args, **kwargs)
+            if first_eof:
+                write_eof_calls += 1
+                events_order.append("write_eof_sent")
+            return res
+
+        async def _staged_close_upstream(ent: dict) -> None:
+            nonlocal upstream_calls, finally_saw_pending_task
+            upstream_calls += 1
+            call_idx = upstream_calls
+            await orig_close_upstream(ent)
+            if ent is entry and call_idx >= 2:
+                # Hold handle_chat_stream's finally until Step 3 has launched downstream_close_task
+                # and it is mid-write on `event: auth_error`, then release after yielding so finally
+                # must actively await `downstream_close_task`.
+                await asyncio.wait_for(auth_write_started.wait(), timeout=3.0)
+                ct = ent.get("downstream_close_task")
+                finally_saw_pending_task = ct is not None and not ct.done()
+                asyncio.get_running_loop().call_later(0.05, allow_auth_write_finish.set)
+
+        t_rev = time.monotonic()
+        with (
+            mock.patch.object(chat_svc, "_close_upstream_stream", side_effect=_staged_close_upstream),
+            mock.patch.object(chat_svc, "_close_downstream_sse_bounded", side_effect=_counted_close_downstream),
+            mock.patch.object(sse_resp, "write", side_effect=_delayed_auth_write),
+            mock.patch.object(sse_resp, "write_eof", side_effect=_ordered_write_eof),
+        ):
+            r_out = await self.client.post(
+                "/api/auth/logout",
+                headers={"Origin": self.origin, "X-Studio-CSRF": csrf_a},
+                cookies={SESSION_COOKIE_NAME: sid_a},
+            )
+            self.assertEqual(r_out.status, 200)
+            self.ipc_buffer.append(tid, "text_delta", {"delta": "RACE_B_LEAK_" + ("Z" * 300), "step_index": 0})
+            await asyncio.wait_for(reader_task, timeout=2.0)
+
+        elapsed = time.monotonic() - t_rev
+        full_out = "".join(received_chunks)
+        self.assertLessEqual(elapsed, 0.85)
+        self.assertTrue(finally_saw_pending_task)
+        self.assertIsNotNone(entry.get("downstream_close_task"))
+        self.assertTrue(entry["downstream_close_task"].done())
+        self.assertEqual(downstream_close_executions, 1)
+        self.assertEqual(events_order, ["auth_error_written", "write_eof_sent"])
+        self.assertEqual(write_eof_calls, 1)
+        self.assertEqual(full_out.count("event: auth_error"), 1)
+        self.assertNotIn("RACE_B_LEAK_", full_out)
+        self.assertEqual(len(chat_svc._active_streams), 0)
+
+    async def test_pa_c4_sse_normal_completion_emits_no_auth_error(self) -> None:
+        """Deterministic case (c): normal stream completion leaves close_reason=None and never emits auth_error."""
+        sid_a, csrf_a = await self._login("AdminA", "EXAMPLE_ADMIN_A_PW_01")
+        r_send = await self.client.post(
+            "/api/chat/send",
+            headers={"Origin": self.origin, "Content-Type": "application/json", "X-Studio-CSRF": csrf_a},
+            cookies={SESSION_COOKIE_NAME: sid_a},
+            json={"prompt": "normal stream finish"},
+        )
+        self.assertEqual(r_send.status, 202)
+        tid = (await r_send.json())["turn_id"]
+        self.ipc_buffer.append(tid, "turn_start", {"turn_id": tid})
+        self.ipc_buffer.append(tid, "text_delta", {"delta": "normal response body", "step_index": 0})
+        self.ipc_buffer.append(tid, "done", {"response": "normal response body", "status": "SUCCESS"})
+
+        chat_svc = self.app[CHAT_SERVICE_KEY]
+        observed_close: list[tuple[object, object]] = []
+        orig_close_downstream = chat_svc._close_downstream_sse_bounded
+
+        async def _capture_close(ent: dict, **kwargs) -> None:
+            observed_close.append((ent.get("close_reason"), kwargs.get("error_reason")))
+            await orig_close_downstream(ent, **kwargs)
+
+        with mock.patch.object(chat_svc, "_close_downstream_sse_bounded", side_effect=_capture_close):
+            async with self.client.get(
+                f"/api/chat/stream?turn_id={tid}",
+                cookies={SESSION_COOKIE_NAME: sid_a},
+            ) as resp:
+                self.assertEqual(resp.status, 200)
+                text = (await resp.read()).decode("utf-8")
+
+        self.assertIn("event: done", text)
+        self.assertNotIn("event: auth_error", text)
+        self.assertEqual(observed_close, [(None, None)])
+        self.assertEqual(len(chat_svc._active_streams), 0)
+
 
 class TestPAC5AndC7FrontendSafetyAndPublicHygiene(unittest.TestCase):
     """PA-C5 & PA-C7: SafeMarkdown XSS guard, zero new npm deps, UI structure & export hygiene."""

@@ -777,16 +777,22 @@ class StudioChatService:
     ) -> None:
         if entry.get("closing"):
             return
-        # 1. Synchronously block all further data frame writes
+        # 1. Synchronously block all further data frame writes & record close_reason before any await
         entry["closing"] = True
+        entry["close_reason"] = error_reason
         # 2. Sever upstream UDS connection FIRST before touching downstream
         await self._close_upstream_stream(entry)
         # 3. Emit terminal auth_error and close downstream within <= 0.8s
-        coro = self._close_downstream_sse_bounded(entry, error_reason=error_reason, timeout_sec=0.8)
         if await_downstream:
-            await coro
-        else:
-            asyncio.create_task(coro)
+            await self._close_downstream_sse_bounded(
+                entry, error_reason=error_reason, timeout_sec=0.8
+            )
+        elif not entry.get("downstream_closing") and entry.get("downstream_close_task") is None:
+            entry["downstream_close_task"] = asyncio.create_task(
+                self._close_downstream_sse_bounded(
+                    entry, error_reason=error_reason, timeout_sec=0.8
+                )
+            )
 
     async def _on_auth_revoked(
         self,
@@ -820,9 +826,10 @@ class StudioChatService:
         if not targets:
             return
 
-        # 1. Synchronously mark closing
+        # 1. Synchronously mark closing & close_reason before any await
         for e in targets:
             e["closing"] = True
+            e["close_reason"] = "访问权限已被撤销"
 
         # 2. Sever all upstream UDS connections first in parallel
         await asyncio.gather(
@@ -832,15 +839,20 @@ class StudioChatService:
 
         # 3. Close downstream SSE responses with bounded <= 0.8s timeout
         for e in targets:
-            if not e.get("downstream_closing"):
-                asyncio.create_task(
-                    self._close_downstream_sse_bounded(e, error_reason="访问权限已被撤销", timeout_sec=0.8)
+            if not e.get("downstream_closing") and e.get("downstream_close_task") is None:
+                e["downstream_close_task"] = asyncio.create_task(
+                    self._close_downstream_sse_bounded(
+                        e,
+                        error_reason=e.get("close_reason") or "访问权限已被撤销",
+                        timeout_sec=0.8,
+                    )
                 )
 
     async def close_all(self) -> None:
         entries = list(self._active_streams.values())
         for e in entries:
             e["closing"] = True
+            e["close_reason"] = "服务正在关闭"
         await asyncio.gather(*(self._close_upstream_stream(e) for e in entries), return_exceptions=True)
         await asyncio.gather(
             *(self._close_downstream_sse_bounded(e, error_reason="服务正在关闭", timeout_sec=0.8) for e in entries),
@@ -921,7 +933,9 @@ class StudioChatService:
             "user_id": int(sess["user_id"]),
             "turn_id": turn_id,
             "closing": False,
+            "close_reason": None,
             "downstream_closing": False,
+            "downstream_close_task": None,
             "reader_task": None,
         }
         entry_key = id(entry)
@@ -1024,7 +1038,9 @@ class StudioChatService:
 
             if entry.get("closing"):
                 await self._close_downstream_sse_bounded(
-                    entry, error_reason="访问权限已被撤销", timeout_sec=0.8
+                    entry,
+                    error_reason=entry.get("close_reason") or "访问权限已被撤销",
+                    timeout_sec=0.8,
                 )
                 return sse_resp
 
@@ -1180,8 +1196,18 @@ class StudioChatService:
             self._active_streams.pop(entry_key, None)
             entry["closing"] = True
             await self._close_upstream_stream(entry)
+            close_task = entry.get("downstream_close_task")
+            if close_task is not None and not close_task.done():
+                try:
+                    await asyncio.wait_for(close_task, timeout=0.9)
+                except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                    pass
             if entry.get("stream_resp") is not None and not entry.get("downstream_closing"):
-                await self._close_downstream_sse_bounded(entry, error_reason=None, timeout_sec=0.8)
+                await self._close_downstream_sse_bounded(
+                    entry,
+                    error_reason=entry.get("close_reason"),
+                    timeout_sec=0.8,
+                )
 
     @staticmethod
     def _sanitize_event_payload(ev_name: str, data: dict[str, Any]) -> dict[str, Any]:
