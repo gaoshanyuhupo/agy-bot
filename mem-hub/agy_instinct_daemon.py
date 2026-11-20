@@ -73,19 +73,56 @@ MEMORY_TAINT_FILE = Path(
     )
 )
 
-WORKSPACE_AGENTS_DIR = Path(os.environ.get("AGY_WORKSPACE_DIR", str(Path.home() / "agy-workspace"))) / ".agents"
+WORKSPACE_DIR = Path(os.environ.get("AGY_WORKSPACE_DIR", str(Path.home() / "agy-workspace")))
+WORKSPACE_AGENTS_DIR = WORKSPACE_DIR / ".agents"
 ACTIVE_RULE_FILE = WORKSPACE_AGENTS_DIR / "rules" / "ecc-active-instincts.md"
 CLAUDE_MEM_RECENT_RULE_FILE = WORKSPACE_AGENTS_DIR / "rules" / "claude-mem-recent.md"
 WORKSPACE_SKILLS_DIR = WORKSPACE_AGENTS_DIR / "skills"
 INSTINCT_CLI = WORKSPACE_SKILLS_DIR / "continuous-learning-v2" / "scripts" / "instinct-cli.py"
 CLAUDE_MEM_CONTEXT_URL = "http://127.0.0.1:37701/api/context/inject?projects=agy-workspace"
-BRIDGE_RELOAD_FILES = [Path("/tmp/agy_bridge_reload"), Path("/tmp/agy_bridge_sg_reload")]
+BRIDGE_RELOAD_FILES = [
+    Path("/tmp/agy_bridge_reload"),
+    Path("/tmp/agy_bridge_sg_reload"),
+    Path("/tmp/agy_bridge_jeff_reload"),
+]
+
+
+def _resolve_global_plugin_dir() -> Path | None:
+    explicit = os.environ.get("AGY_GLOBAL_PLUGIN_DIR", "").strip()
+    if explicit:
+        if explicit.lower() in ("none", "off", "false", "0"):
+            return None
+        return Path(explicit).expanduser()
+    env_ws = os.environ.get("AGY_WORKSPACE_DIR", "").strip()
+    default_ws = Path.home() / "agy-workspace"
+    if env_ws:
+        try:
+            if Path(env_ws).expanduser().resolve() != default_ws.resolve():
+                return Path(env_ws).expanduser() / ".gemini-plugin-ecc-instincts"
+        except OSError:
+            return Path(env_ws).expanduser() / ".gemini-plugin-ecc-instincts"
+    return Path.home() / ".gemini" / "config" / "plugins" / "ecc-instincts"
+
+
+GLOBAL_PLUGIN_DIR: Path | None = _resolve_global_plugin_dir()
+GLOBAL_PLUGIN_MANIFEST: Path | None = (GLOBAL_PLUGIN_DIR / "plugin.json") if GLOBAL_PLUGIN_DIR is not None else None
+GLOBAL_PLUGIN_RULE_FILE: Path | None = (
+    (GLOBAL_PLUGIN_DIR / "rules" / "AGENTS.md") if GLOBAL_PLUGIN_DIR is not None else None
+)
+GLOBAL_PLUGIN_SKILLS_DIR: Path | None = (GLOBAL_PLUGIN_DIR / "skills") if GLOBAL_PLUGIN_DIR is not None else None
 
 POLL_INTERVAL_SEC = 180
 MIN_OBS_FOR_BATCH = 40
 MIN_OBS_ON_CORRECTION = 6
-ANALYSIS_COOLDOWN_SEC = 1800
-MAX_EVOLVED_SKILLS = 8
+ANALYSIS_COOLDOWN_SEC = int(os.environ.get("AGY_ANALYSIS_COOLDOWN_SEC", "1800") or "1800")
+CORRECTION_COOLDOWN_SEC = int(os.environ.get("AGY_CORRECTION_COOLDOWN_SEC", "300") or "300")
+MAX_EVOLVED_SKILLS = int(os.environ.get("AGY_MAX_EVOLVED_SKILLS", "16") or "16")
+EVOLVE_DELTA_MIN = int(os.environ.get("AGY_EVOLVE_DELTA_MIN", "3") or "3")
+EVOLVE_COOLDOWN_SEC = int(os.environ.get("AGY_EVOLVE_COOLDOWN_SEC", "21600") or "21600")
+ACTIVE_RULE_CORE_SLOTS = int(os.environ.get("AGY_ACTIVE_RULE_CORE_SLOTS", "15") or "15")
+ACTIVE_RULE_RECENT_SLOTS = int(os.environ.get("AGY_ACTIVE_RULE_RECENT_SLOTS", "5") or "5")
+ACTIVE_RULE_RECENT_DAYS = int(os.environ.get("AGY_ACTIVE_RULE_RECENT_DAYS", "7") or "7")
+ACTIVE_RULE_RECENT_MIN_CONF = float(os.environ.get("AGY_ACTIVE_RULE_RECENT_MIN_CONF", "0.70") or "0.70")
 
 DREAM_INTERVAL_SEC = int(os.environ.get("AGY_DREAM_INTERVAL_SEC", "86400") or "86400")
 DREAM_MAX_OBS_LINES = int(os.environ.get("AGY_DREAM_MAX_OBS_LINES", "2000") or "2000")
@@ -258,6 +295,9 @@ def _default_daemon_state() -> dict[str, Any]:
         "poison_blocked_count": 0,
         "last_dream_ts": 0.0,
         "obs_compaction_gen": 0,
+        "pending_correction": False,
+        "evolved_domain_counts": {},
+        "last_evolve_ts": 0.0,
     }
 
 
@@ -272,6 +312,9 @@ def _read_daemon_state_unlocked() -> dict[str, Any]:
                 data.setdefault("poison_blocked_count", 0)
                 data.setdefault("last_dream_ts", 0.0)
                 data.setdefault("obs_compaction_gen", 0)
+                data.setdefault("pending_correction", False)
+                data.setdefault("evolved_domain_counts", {})
+                data.setdefault("last_evolve_ts", 0.0)
                 return data
     except Exception:
         pass
@@ -642,37 +685,113 @@ def sync_claude_mem_recent_rule() -> bool:
     return False
 
 
-def sync_active_instincts_rule() -> tuple[int, bool]:
-    """Render high-confidence (>=0.80) instincts into .agents/rules/ecc-active-instincts.md
-    using deterministic ordering and omitting volatile confidence percentages to preserve prompt cache.
+def _write_text_if_changed(path: Path, content: str) -> bool:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    old = path.read_text(encoding="utf-8") if path.is_file() else ""
+    if old == content:
+        return False
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(content, encoding="utf-8")
+    tmp.replace(path)
+    return True
+
+
+def _ensure_global_plugin_manifest() -> bool:
+    if GLOBAL_PLUGIN_DIR is None or GLOBAL_PLUGIN_MANIFEST is None:
+        return False
+    manifest = json.dumps(
+        {
+            "name": "ecc-instincts",
+            "displayName": "ECC Learned Instincts",
+            "version": "1.0.0",
+            "description": (
+                "Auto-synced high-confidence ECC learned instincts and evolved skills "
+                "available globally across all Antigravity workspaces."
+            ),
+        },
+        indent=2,
+        ensure_ascii=False,
+    ) + "\n"
+    return _write_text_if_changed(GLOBAL_PLUGIN_MANIFEST, manifest)
+
+
+def _select_active_instincts(
+    existing: dict[str, dict[str, Any]],
+    *,
+    today: date | None = None,
+) -> list[dict[str, Any]]:
+    """Select active instincts via two-pool allocation (core >=0.80 + reserved recent >=0.70),
+    breaking confidence ties by recency and outputting deterministic (domain, id) order.
     """
-    existing = load_existing_instincts()
-    active = []
+    ref_today = today or datetime.now(timezone.utc).date()
+    valid: list[dict[str, Any]] = []
     for v in existing.values():
-        if float(v.get("confidence", 0)) < 0.80:
-            continue
         ok, _reason = _validate_instinct_candidate(v, is_existing=True)
         if not ok:
             continue
-        active.append(v)
+        valid.append(v)
 
-    active.sort(key=lambda x: (-float(x.get("confidence", 0)), str(x.get("id", ""))))
-    active = active[:15]
+    # Pool 1: Core high-confidence instincts (>= 0.80), tie-broken by recency before id
+    core_candidates = [v for v in valid if float(v.get("confidence", 0)) >= 0.80]
+    core_candidates.sort(
+        key=lambda x: (
+            -float(x.get("confidence", 0)),
+            -_extract_last_observed_date(x).toordinal(),
+            str(x.get("id", "")),
+        )
+    )
+    core_selected = core_candidates[: max(0, ACTIVE_RULE_CORE_SLOTS)]
+    selected_ids = {str(x.get("id", "")) for x in core_selected}
+
+    # Pool 2: Reserved recent slots so freshly learned/confirmed instincts take effect immediately
+    recent_selected: list[dict[str, Any]] = []
+    if ACTIVE_RULE_RECENT_SLOTS > 0:
+        recent_candidates: list[dict[str, Any]] = []
+        for v in valid:
+            vid = str(v.get("id", ""))
+            if vid in selected_ids:
+                continue
+            conf = float(v.get("confidence", 0))
+            if conf < ACTIVE_RULE_RECENT_MIN_CONF:
+                continue
+            last_obs = _extract_last_observed_date(v)
+            age_days = (ref_today - last_obs).days
+            if age_days <= ACTIVE_RULE_RECENT_DAYS:
+                recent_candidates.append(v)
+        recent_candidates.sort(
+            key=lambda x: (
+                -_extract_last_observed_date(x).toordinal(),
+                -float(x.get("confidence", 0)),
+                str(x.get("id", "")),
+            )
+        )
+        recent_selected = recent_candidates[:ACTIVE_RULE_RECENT_SLOTS]
+
+    selected = core_selected + recent_selected
     # Sort deterministically by (domain, id) so minor confidence updates do not reorder or mutate <user_rules>
-    active.sort(key=lambda x: (str(x.get("domain", "general")), str(x.get("id", ""))))
+    selected.sort(key=lambda x: (str(x.get("domain", "general")), str(x.get("id", ""))))
+    return selected
+
+
+def sync_active_instincts_rule(*, today: date | None = None) -> tuple[int, bool]:
+    """Render selected instincts into workspace `.agents/rules/ecc-active-instincts.md`
+    AND global Antigravity plugin `~/.gemini/config/plugins/ecc-instincts/rules/AGENTS.md`
+    using deterministic ordering and omitting volatile confidence percentages to preserve prompt cache.
+    """
+    existing = load_existing_instincts()
+    active = _select_active_instincts(existing, today=today)
 
     if not active:
+        changed = False
         if ACTIVE_RULE_FILE.exists():
             ACTIVE_RULE_FILE.unlink()
-            return 0, True
-        return 0, False
+            changed = True
+        if GLOBAL_PLUGIN_RULE_FILE is not None and GLOBAL_PLUGIN_RULE_FILE.exists():
+            GLOBAL_PLUGIN_RULE_FILE.unlink()
+            changed = True
+        return 0, changed
 
-    lines = [
-        "---",
-        "trigger: always_on",
-        "description: Auto-synced high-confidence learned instincts from ECC continuous-learning-v2",
-        "---",
-        "",
+    body_lines = [
         "# Learned Workspace Instincts (ECC Auto-Synced)",
         "",
         "Apply these verified user & workflow preferences when their trigger matches:",
@@ -683,16 +802,25 @@ def sync_active_instincts_rule() -> tuple[int, bool]:
         body = inst.get("body", "")
         act_m = re.search(r"## Action\s*\n\s*(.+?)(?:\n\n|\n##|$)", body, re.DOTALL)
         act_txt = act_m.group(1).strip().replace("\n", " ") if act_m else body.splitlines()[0]
-        lines.append(f"- **[{inst.get('domain', 'general')}]** When {trig}: {act_txt}")
+        body_lines.append(f"- **[{inst.get('domain', 'general')}]** When {trig}: {act_txt}")
 
-    rendered = "\n".join(lines) + "\n"
-    ACTIVE_RULE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    old = ACTIVE_RULE_FILE.read_text(encoding="utf-8") if ACTIVE_RULE_FILE.is_file() else ""
-    changed = old != rendered
-    if changed:
-        tmp = ACTIVE_RULE_FILE.with_suffix(".md.tmp")
-        tmp.write_text(rendered, encoding="utf-8")
-        tmp.replace(ACTIVE_RULE_FILE)
+    frontmatter_lines = [
+        "---",
+        "trigger: always_on",
+        "description: Auto-synced high-confidence learned instincts from ECC continuous-learning-v2",
+        "---",
+        "",
+    ]
+    ws_rendered = "\n".join(frontmatter_lines + body_lines) + "\n"
+    changed = _write_text_if_changed(ACTIVE_RULE_FILE, ws_rendered)
+
+    if GLOBAL_PLUGIN_DIR is not None and GLOBAL_PLUGIN_RULE_FILE is not None:
+        _ensure_global_plugin_manifest()
+        # Antigravity plugin rules/AGENTS.md uses plain markdown without frontmatter
+        plugin_rendered = "\n".join(body_lines) + "\n"
+        plugin_changed = _write_text_if_changed(GLOBAL_PLUGIN_RULE_FILE, plugin_rendered)
+        changed = changed or plugin_changed
+
     return len(active), changed
 
 
@@ -765,16 +893,32 @@ def sync_evolved_skills() -> tuple[list[str], bool]:
                 by_slug[clean_slug] = (rank, normalized)
 
     chosen = sorted(by_slug.items(), key=lambda kv: (-kv[1][0][0], -kv[1][0][1], kv[0]))[:MAX_EVOLVED_SKILLS]
+    chosen_dest_names = {f"evolved-{clean_slug}" for clean_slug, _ in chosen}
+
+    if GLOBAL_PLUGIN_DIR is not None and GLOBAL_PLUGIN_SKILLS_DIR is not None:
+        if chosen:
+            _ensure_global_plugin_manifest()
+            GLOBAL_PLUGIN_SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+        if GLOBAL_PLUGIN_SKILLS_DIR.is_dir():
+            for existing_dir in list(GLOBAL_PLUGIN_SKILLS_DIR.iterdir()):
+                if (
+                    existing_dir.is_dir()
+                    and existing_dir.name.startswith("evolved-")
+                    and existing_dir.name not in chosen_dest_names
+                ):
+                    shutil.rmtree(existing_dir, ignore_errors=True)
+                    any_changed = True
 
     for clean_slug, (_rank, normalized) in sorted(chosen, key=lambda kv: kv[0]):
         dest_name = f"evolved-{clean_slug}"
         dest_dir = WORKSPACE_SKILLS_DIR / dest_name
-        dest_dir.mkdir(parents=True, exist_ok=True)
         dest_file = dest_dir / "SKILL.md"
-        old = dest_file.read_text(encoding="utf-8") if dest_file.is_file() else ""
-        if old != normalized:
-            dest_file.write_text(normalized, encoding="utf-8")
+        if _write_text_if_changed(dest_file, normalized):
             any_changed = True
+        if GLOBAL_PLUGIN_SKILLS_DIR is not None:
+            plugin_skill_file = GLOBAL_PLUGIN_SKILLS_DIR / dest_name / "SKILL.md"
+            if _write_text_if_changed(plugin_skill_file, normalized):
+                any_changed = True
         synced.append(str(dest_file))
     return synced, any_changed
 
@@ -817,10 +961,13 @@ def analyze_observations_batch(force: bool = False) -> dict[str, Any]:
         offsets = latest.setdefault("transcript_offsets", {})
         for cid, off in harvested_offsets.items():
             offsets[cid] = max(int(offsets.get(cid) or 0), int(off))
+        if saw_corr:
+            latest["pending_correction"] = True
         if harvest_poison_delta:
             latest["poison_blocked_count"] = int(latest.get("poison_blocked_count") or 0) + harvest_poison_delta
 
     state = _update_daemon_state(_save_harvest)
+    effective_corr = saw_corr or bool(state.get("pending_correction"))
 
     if not OBSERVATIONS_FILE.is_file():
         return {"status": "no_observations", "harvested": harvested}
@@ -853,7 +1000,8 @@ def analyze_observations_batch(force: bool = False) -> dict[str, Any]:
             continue
         pending.append(ln)
 
-    min_needed = MIN_OBS_ON_CORRECTION if saw_corr else MIN_OBS_FOR_BATCH
+    min_needed = MIN_OBS_ON_CORRECTION if effective_corr else MIN_OBS_FOR_BATCH
+    effective_cooldown = CORRECTION_COOLDOWN_SEC if effective_corr else ANALYSIS_COOLDOWN_SEC
     if not force:
         if len(pending) < min_needed:
             if obs_poison_delta:
@@ -863,19 +1011,20 @@ def analyze_observations_batch(force: bool = False) -> dict[str, Any]:
                     )
                 )
             return {"status": "waiting_for_more", "pending": len(pending), "needed": min_needed}
-        if (time.time() - float(state.get("last_analysis_ts") or 0)) < ANALYSIS_COOLDOWN_SEC:
+        if (time.time() - float(state.get("last_analysis_ts") or 0)) < effective_cooldown:
             if obs_poison_delta:
                 _update_daemon_state(
                     lambda st: st.__setitem__(
                         "poison_blocked_count", int(st.get("poison_blocked_count") or 0) + obs_poison_delta
                     )
                 )
-            return {"status": "cooldown", "pending": len(pending)}
+            return {"status": "cooldown", "pending": len(pending), "cooldown_sec": effective_cooldown}
 
     if not pending:
         def _commit_empty(latest: dict[str, Any]) -> None:
             if int(latest.get("obs_compaction_gen") or 0) == start_compaction_gen:
                 latest["last_analyzed_obs_line"] = max(int(latest.get("last_analyzed_obs_line") or 0), batch_end_idx)
+            latest["pending_correction"] = False
             if obs_poison_delta:
                 latest["poison_blocked_count"] = int(latest.get("poison_blocked_count") or 0) + obs_poison_delta
 
@@ -974,6 +1123,7 @@ def analyze_observations_batch(force: bool = False) -> dict[str, Any]:
             else:
                 latest["last_analyzed_obs_line"] = min(len(cur_lines), cur_idx)
         latest["last_analysis_ts"] = now_ts
+        latest["pending_correction"] = False
         if total_poison_delta:
             latest["poison_blocked_count"] = int(latest.get("poison_blocked_count") or 0) + total_poison_delta
 
@@ -988,19 +1138,39 @@ def analyze_observations_batch(force: bool = False) -> dict[str, Any]:
         if float(v.get("confidence", 0)) >= 0.80:
             dom = str(v.get("domain") or "general")
             by_domain.setdefault(dom, []).append(v)
-    evolved_domains: list[str] = list(state.get("evolved_domains") or [])
-    new_ready_domains = [d for d, items_d in by_domain.items() if len(items_d) >= 3 and d not in evolved_domains]
-    current_synced, _ = sync_evolved_skills()
-    if new_ready_domains and len(current_synced) < MAX_EVOLVED_SKILLS:
+
+    dom_counts: dict[str, int] = {}
+    raw_counts = state.get("evolved_domain_counts")
+    if isinstance(raw_counts, dict):
+        for k, val in raw_counts.items():
+            try:
+                dom_counts[str(k)] = int(val)
+            except (TypeError, ValueError):
+                pass
+    for legacy_dom in list(state.get("evolved_domains") or []):
+        dom_counts.setdefault(str(legacy_dom), 3)
+
+    ready_domains = [
+        d
+        for d, items_d in by_domain.items()
+        if len(items_d) >= 3 and (d not in dom_counts or len(items_d) >= dom_counts[d] + EVOLVE_DELTA_MIN)
+    ]
+    last_evolve_ts = float(state.get("last_evolve_ts") or 0.0)
+    evolve_due = (not last_evolve_ts) or ((now_ts - last_evolve_ts) >= EVOLVE_COOLDOWN_SEC)
+    sync_evolved_skills()
+    if ready_domains and evolve_due:
         try:
             evolve_with_llm_and_cli(quiet=True)
             sync_evolved_skills()
 
             def _record_evolved(latest: dict[str, Any]) -> None:
                 ev_doms = latest.setdefault("evolved_domains", [])
-                for d in new_ready_domains:
+                ev_counts = latest.setdefault("evolved_domain_counts", {})
+                for d in ready_domains:
                     if d not in ev_doms:
                         ev_doms.append(d)
+                    ev_counts[d] = len(by_domain.get(d) or [])
+                latest["last_evolve_ts"] = now_ts
 
             _update_daemon_state(_record_evolved)
         except Exception as e:
@@ -1467,7 +1637,7 @@ def run_dream(
     active_rules = 0
     rules_changed = False
     if not dry_run:
-        active_rules, rules_changed = sync_active_instincts_rule()
+        active_rules, rules_changed = sync_active_instincts_rule(today=ref_today)
         sync_claude_mem_recent_rule()
         summary = {
             "ts": now_ts,
@@ -1489,7 +1659,8 @@ def run_dream(
 
         state = _update_daemon_state(_commit_dream)
     else:
-        active_rules = sum(1 for s in survivors if float(s.get("confidence") or 0) >= 0.80)
+        survivor_map = {str(s.get("id", "")): s for s in survivors}
+        active_rules = len(_select_active_instincts(survivor_map, today=ref_today))
 
     result = {
         "status": "dry_run" if dry_run else "dreamed",
@@ -1521,9 +1692,28 @@ def get_dream_status() -> dict[str, Any]:
         except OSError:
             obs_lines = 0
     guard_stats = _MEMORY_GUARD.get_guard_stats(taint_file=MEMORY_TAINT_FILE) if _MEMORY_GUARD is not None else {}
+    selected_active = _select_active_instincts(existing)
+    evolved_cnt = (
+        len([d for d in WORKSPACE_SKILLS_DIR.iterdir() if d.is_dir() and d.name.startswith("evolved-")])
+        if WORKSPACE_SKILLS_DIR.is_dir()
+        else 0
+    )
+    plugin_synced = bool(
+        GLOBAL_PLUGIN_MANIFEST is not None
+        and GLOBAL_PLUGIN_MANIFEST.is_file()
+        and GLOBAL_PLUGIN_RULE_FILE is not None
+        and GLOBAL_PLUGIN_RULE_FILE.is_file()
+    )
     return {
         "personal_instincts": len(existing),
-        "active_rules_count": sum(1 for v in existing.values() if float(v.get("confidence") or 0) >= 0.80),
+        "active_rules_count": len(selected_active),
+        "high_conf_instincts_count": sum(1 for v in existing.values() if float(v.get("confidence") or 0) >= 0.80),
+        "core_active_slots": ACTIVE_RULE_CORE_SLOTS,
+        "recent_active_slots": ACTIVE_RULE_RECENT_SLOTS,
+        "evolved_skills_count": evolved_cnt,
+        "max_evolved_skills": MAX_EVOLVED_SKILLS,
+        "global_plugin_dir": str(GLOBAL_PLUGIN_DIR) if GLOBAL_PLUGIN_DIR is not None else None,
+        "global_plugin_synced": plugin_synced,
         "archived_instincts": archived_cnt,
         "observations_lines": obs_lines,
         "last_analyzed_obs_line": int(state.get("last_analyzed_obs_line") or 0),
@@ -1535,7 +1725,9 @@ def get_dream_status() -> dict[str, Any]:
 
 
 def evolve_with_llm_and_cli(quiet: bool = False) -> int:
-    """Run ECC's native `instinct-cli.py evolve --generate`, plus LLM synthesis when >=2 related instincts exist."""
+    """Run ECC's native `instinct-cli.py evolve --generate`, plus LLM synthesis or incremental refresh
+    when >=3 strong instincts exist (even when already at MAX_EVOLVED_SKILLS cap, by refreshing an existing skill).
+    """
     subprocess.run(
         [sys.executable, str(INSTINCT_CLI), "evolve", "--generate"],
         check=False,
@@ -1546,32 +1738,57 @@ def evolve_with_llm_and_cli(quiet: bool = False) -> int:
 
     existing = load_existing_instincts()
     strong = [v for v in existing.values() if float(v.get("confidence", 0)) >= 0.70]
+    strong.sort(
+        key=lambda x: (
+            -_extract_last_observed_date(x).toordinal(),
+            -float(x.get("confidence", 0)),
+            str(x.get("id", "")),
+        )
+    )
     existing_skill_names = sorted(
         ({d.name for d in WORKSPACE_SKILLS_DIR.iterdir() if d.is_dir()} if WORKSPACE_SKILLS_DIR.is_dir() else set())
         | {Path(p).parent.name for p in synced}
     )
-    if len(synced) < MAX_EVOLVED_SKILLS and len(strong) >= 3:
+    existing_evolved_slugs = sorted(
+        {_clean_evolved_slug(Path(p).parent.name) for p in synced if _clean_evolved_slug(Path(p).parent.name)}
+    )
+    at_skill_cap = len(synced) >= MAX_EVOLVED_SKILLS
+    if len(strong) >= 3:
+        cap_instruction = (
+            "Skill count is at cap: you MUST refresh one existing `evolved-*` slug from `existing_evolved_slugs` "
+            "(returning that exact slug without the `evolved-` prefix) by merging new strong instincts into it, "
+            "or output `{}` if none needs updating."
+            if at_skill_cap
+            else (
+                "If 3 or more instincts form a coherent reusable workflow/domain NOT already covered by existing "
+                "workspace skills, synthesize ONE new Antigravity SKILL.md bundle; OR if an existing `evolved-*` "
+                "skill in `existing_evolved_slugs` is missing recent strong instincts, refresh it by returning its "
+                "existing slug."
+            )
+        )
         sys_p = (
             "You are the ECC Skill Evolution Engine for Antigravity CLI (`agy`).\n"
-            "Given high-confidence learned instincts and ALL already existing workspace skill names, if 3 or more instincts "
-            "form a coherent reusable workflow/domain NOT already covered by existing workspace or evolved skills, "
-            "synthesize ONE Antigravity SKILL.md bundle as JSON: "
+            f"{cap_instruction}\n"
+            "Output strict JSON: "
             '{"slug":"short-kebab-name","description":"When to activate this skill","markdown":"Full markdown body (without frontmatter)"}. '
             "Do NOT include an `evolved-` prefix in `slug`. "
-            "If already covered by any existing skill or only unrelated single-line preferences remain, output `{}`."
+            "If nothing new or worth refreshing remains, output `{}`."
         )
         usr_p = json.dumps(
             {
                 "already_existing_skills": existing_skill_names,
+                "existing_evolved_slugs": existing_evolved_slugs,
+                "at_skill_cap": at_skill_cap,
                 "strong_instincts": [
                     {
                         "id": v.get("id"),
                         "trigger": v.get("trigger"),
                         "confidence": v.get("confidence"),
                         "domain": v.get("domain"),
+                        "last_observed": _extract_last_observed_date(v).strftime("%Y-%m-%d"),
                         "body": v.get("body"),
                     }
-                    for v in strong
+                    for v in strong[:40]
                 ],
             },
             ensure_ascii=False,
@@ -1585,7 +1802,8 @@ def evolve_with_llm_and_cli(quiet: bool = False) -> int:
                 md = str(data.get("markdown") or "").strip()
                 desc = str(data.get("description") or "").strip()
                 bad_md, _ = _inspect_text(f"{slug}\n{desc}\n{md}")
-                if slug and md and desc and not bad_md:
+                allowed_slug = (not at_skill_cap) or (slug in existing_evolved_slugs)
+                if slug and md and desc and not bad_md and allowed_slug:
                     skill_file = EVOLVED_SKILLS_DIR / slug / "SKILL.md"
                     skill_file.parent.mkdir(parents=True, exist_ok=True)
                     full_md = (
@@ -1603,7 +1821,7 @@ def evolve_with_llm_and_cli(quiet: bool = False) -> int:
 
     if not quiet:
         if synced:
-            print(f"\nSynced {len(synced)} evolved skill(s) into Antigravity workspace (.agents/skills/):")
+            print(f"\nSynced {len(synced)} evolved skill(s) into Antigravity workspace (.agents/skills/) and global plugin:")
             for s in synced:
                 print(f"  - {s}")
         else:
@@ -1615,6 +1833,7 @@ def run_daemon_loop() -> None:
     ensure_dirs()
     sync_claude_mem_recent_rule()
     sync_active_instincts_rule()
+    sync_evolved_skills()
     log.info("Starting agy-instinct-daemon (poll=%ds, dream=%ds, shim=%s, model=%s)", POLL_INTERVAL_SEC, DREAM_INTERVAL_SEC, SHIM_URL, SHIM_MODEL)
     while True:
         try:
@@ -1679,6 +1898,8 @@ def main() -> int:
                     "active_rules_synced": n_rules,
                     "claude_mem_recent_removed": m_ch,
                     "evolved_skills_synced": skills,
+                    "global_plugin_dir": str(GLOBAL_PLUGIN_DIR) if GLOBAL_PLUGIN_DIR is not None else None,
+                    "global_plugin_rule_synced": bool(GLOBAL_PLUGIN_RULE_FILE and GLOBAL_PLUGIN_RULE_FILE.is_file()),
                 },
                 indent=2,
                 ensure_ascii=False,

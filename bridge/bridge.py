@@ -2334,7 +2334,7 @@ def _format_tg_err(resp):
     return f"HTTP {resp.status_code}: {(resp.text or '')[:300]}"
 
 
-def send(chat_id, text, parse_mode=None, reply_markup=None, thread_id=None, _max_429_wait=45, reply_to_message_id=None):
+def send(chat_id, text, parse_mode=None, reply_markup=None, thread_id=None, _max_429_wait=45, reply_to_message_id=None, disable_web_page_preview=False):
     """Send text with chunking and HTML parse fallback if needed. Returns last message_id."""
     text = (text or "(empty response)").strip() or "(empty response)"
     last_mid = None
@@ -2349,6 +2349,9 @@ def send(chat_id, text, parse_mode=None, reply_markup=None, thread_id=None, _max
             kw["reply_markup"] = reply_markup
         if reply_to_message_id and is_first:
             kw["reply_to_message_id"] = reply_to_message_id
+        if disable_web_page_preview:
+            kw["disable_web_page_preview"] = True
+            kw["link_preview_options"] = {"is_disabled": True}
         r = tg_send_in_route("sendMessage", chat_id, thread_id=thread_id, _max_429_wait=_max_429_wait, **kw)
         mid = _extract_msg_id(r)
         if not mid and parse_mode == "HTML":
@@ -2360,6 +2363,9 @@ def send(chat_id, text, parse_mode=None, reply_markup=None, thread_id=None, _max
                     plain_kw["reply_markup"] = reply_markup
                 if reply_to_message_id and is_first:
                     plain_kw["reply_to_message_id"] = reply_to_message_id
+                if disable_web_page_preview:
+                    plain_kw["disable_web_page_preview"] = True
+                    plain_kw["link_preview_options"] = {"is_disabled": True}
                 r = tg_send_in_route("sendMessage", chat_id, thread_id=thread_id, _max_429_wait=_max_429_wait, **plain_kw)
                 mid = _extract_msg_id(r)
         if mid:
@@ -9368,6 +9374,60 @@ def cmd_browser(chat_id, arg, thread_id=None, scope_key=None, from_user=None):
     )
 
 
+# ---------------------------------------------------------------- AGY Studio WebUI (/webui)
+def cmd_webui(chat_id, arg="", thread_id=None, scope_key=None, from_user=None):
+    norm_tid = _normalize_thread_id(thread_id)
+    try:
+        cid_int = int(chat_id)
+    except Exception:
+        cid_int = 0
+    if cid_int <= 0:
+        send(chat_id, "🔒 请私聊我发送 <code>/webui</code> 获取专属一次性登录链接。", parse_mode="HTML", thread_id=norm_tid)
+        return
+    bot_hint, owner_uid = _live_browser_bot_hint(), _live_browser_owner_uid(chat_id, from_user=from_user)
+    if not bot_hint or not owner_uid:
+        send(chat_id, "❌ 无法识别当前 Bot 或用户身份，已拒绝签发。", parse_mode="HTML", thread_id=norm_tid)
+        return
+    base_url = (os.environ.get("AGY_STUDIO_URL") or "http://127.0.0.1:18796").strip().rstrip("/")
+    cfg_dir = os.environ.get("AGY_STUDIO_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".config", "agy-studio")
+    try:
+        with open(os.path.join(cfg_dir, "local.token"), "r", encoding="utf-8") as fh:
+            token = fh.read().strip()
+    except OSError:
+        token = ""
+    if not token:
+        send(chat_id, "❌ AGY Studio 服务未初始化或本地令牌不可读。", parse_mode="HTML", thread_id=norm_tid)
+        return
+    try:
+        resp = requests.post(
+            f"{base_url}/internal/magic-link",
+            headers={"X-Studio-Internal-Token": token},
+            json={"bot": bot_hint, "user_id": int(owner_uid)},
+            timeout=(1.5, 4.0),
+        )
+        payload = resp.json() if resp.content else {}
+    except Exception:
+        send(chat_id, "❌ AGY Studio 服务暂不可达，请确认本机 sidecar 已启动。", parse_mode="HTML", thread_id=norm_tid)
+        return
+    if resp.status_code >= 400 or not isinstance(payload, dict) or not payload.get("ok"):
+        err = (payload.get("error") if isinstance(payload, dict) else "") or f"HTTP {resp.status_code}"
+        send(chat_id, f"❌ 签发 WebUI 登录链接失败：{html_mod.escape(str(err))}", parse_mode="HTML", thread_id=norm_tid)
+        return
+    role_lbl = "管理员 (admin)" if payload.get("role") == "admin" else "只读访客 (readonly)"
+    ttl_sec = int(payload.get("ttl_seconds") or 60)
+    send(
+        chat_id,
+        f"<b>🌐 AGY Studio 专属一次性登录链接</b>\n"
+        f"• <b>授权角色：</b><code>{html_mod.escape(role_lbl)}</code>\n"
+        f"• <b>有效期：</b><code>{ttl_sec} 秒 · 单次有效（用后即毁）</code>\n\n"
+        f"🔗 {html_mod.escape(str(payload.get('url') or '').strip())}\n\n"
+        "<i>⚠️ 请勿转发给他人；打开后将自动写入安全会话并清除地址栏令牌。</i>",
+        parse_mode="HTML",
+        thread_id=norm_tid,
+        disable_web_page_preview=True,
+    )
+
+
 # ---------------------------------------------------------------- callback handling
 def handle_callback(cb):
     cb_id = cb.get("id")
@@ -10511,6 +10571,7 @@ _KNOWN_BRIDGE_COMMANDS = frozenset({
     "/project", "/projects",
     "/model",
     "/browser", "/profile",
+    "/webui", "/studio",
     "/effort",
     "/thinking",
     "/sessions", "/resume",
@@ -10655,6 +10716,8 @@ def handle_message(msg):
             cmd_model(chat_id, raw_rest, thread_id=thread_id, scope_key=skey)
         elif cmd in ("/browser", "/profile"):
             cmd_browser(chat_id, raw_rest, thread_id=thread_id, scope_key=skey, from_user=from_user)
+        elif cmd in ("/webui", "/studio"):
+            cmd_webui(chat_id, raw_rest, thread_id=thread_id, scope_key=skey, from_user=from_user)
         elif cmd == "/effort":
             cmd_effort(chat_id, arg, thread_id=thread_id, scope_key=skey)
         elif cmd == "/thinking":
@@ -10752,6 +10815,7 @@ def handle_message(msg):
                  "/project [name] — switch Antigravity CLI project &amp; repo\n"
                  "/model [fallback m1,m2|off] — switch AI models &amp; auto-failover\n"
                  "/browser [switch|start|stop] — Live-Browser multi-fingerprint panel &amp; Mini App\n"
+                 "/webui — issue 60s single-use AGY Studio desktop login link (DM only)\n"
                  "/effort — configure reasoning effort\n"
                  "/thinking [on|off] — toggle live &amp; expandable thinking chain\n"
                  "/sessions — browse &amp; resume recent sessions\n"

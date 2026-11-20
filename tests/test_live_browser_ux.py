@@ -673,6 +673,55 @@ class TestFrontendIndexHtmlRegression(unittest.TestCase):
         self.assertIn("lostpointercapture", html_src)
         self.assertIn("X-Chooser-Id", html_src)
 
+    def test_chrome_minimal_shell_virtual_camera_and_minimap_structure(self) -> None:
+        html_src = INDEX_HTML_PATH.read_text(encoding="utf-8")
+
+        # Chrome-style minimal portrait top capsule + bottom bar + landscape right narrow rail
+        self.assertIn('id="chrome-topbar"', html_src)
+        self.assertIn('id="chrome-url-pill"', html_src)
+        self.assertIn('id="chrome-url-host"', html_src)
+        self.assertIn('id="chrome-more-btn"', html_src)
+        self.assertIn('id="chrome-bottombar"', html_src)
+        self.assertIn('id="chrome-takeover-btn"', html_src)
+        self.assertIn('id="chrome-view-btn"', html_src)
+        self.assertIn('id="chrome-newtab-btn"', html_src)
+        self.assertIn('id="chrome-tabs-btn"', html_src)
+        self.assertIn('id="chrome-side-rail"', html_src)
+        self.assertIn('id="more-sheet"', html_src)
+        self.assertIn('id="tabs-sheet"', html_src)
+        self.assertIn("@media (max-width: 680px)", html_src)
+        self.assertIn("@media (orientation: landscape) and (max-height: 540px) and (max-width: 960px)", html_src)
+        self.assertIn("function canDispatchRemoteInput()", html_src)
+        self.assertIn("function cancelInFlightInteraction(", html_src)
+        self.assertIn('id="chrome-profile-badge"', html_src)
+        self.assertIn('id="more-profile-strip"', html_src)
+        self.assertIn('id="immersive-exit"', html_src)
+        self.assertIn("预设视口", html_src)
+
+        # Virtual camera + DPR direct-draw + single-source mapping + minimap + pan mode
+        self.assertIn("function stageToRemote(", html_src)
+        self.assertIn("function remoteToStage(", html_src)
+        self.assertIn("function drawSourceToCanvas(", html_src)
+        self.assertIn("function getMaxScale(", html_src)
+        self.assertIn("function setViewMode(", html_src)
+        self.assertIn("window.devicePixelRatio", html_src)
+        self.assertIn('id="minimap-box"', html_src)
+        self.assertIn('id="minimap-viewport"', html_src)
+        self.assertIn('id="more-pan-btn"', html_src)
+        self.assertIn('id="more-takeover-btn"', html_src)
+        self.assertIn("function syncMoreTakeoverBtn(", html_src)
+        # Inside #more-sheet drawer, the former "前进" button is replaced by Human/AI takeover toggle,
+        # while the outside desktop url-bar "前进" button remains intact.
+        more_sheet_start = html_src.index('id="more-sheet"')
+        more_sheet_end = html_src.index('id="tabs-backdrop"', more_sheet_start)
+        more_sheet_html = html_src[more_sheet_start:more_sheet_end]
+        self.assertIn('id="more-takeover-btn"', more_sheet_html)
+        self.assertIn("toggleTakeover(); closeMoreSheet();", more_sheet_html)
+        self.assertNotIn("sendNav('forward')", more_sheet_html)
+        self.assertIn('title="前进" onclick="sendNav(\'forward\')"', html_src)
+        # CSS transform scale on #canvas-wrap must be completely gone
+        self.assertNotIn("canvasWrap.style.transform = `translate(", html_src)
+
 
 class _FakeWSViewer:
     """Minimal WebSocket fake for verifying scoped broadcasts, close codes, and RBAC."""
@@ -1713,7 +1762,8 @@ vm.createContext(sandbox);
 vm.runInContext(jsCode, sandbox);
 
 (async () => {
-  // Authenticate initial WS
+  // Authenticate initial WS & decode first frame (mirrors real auth_ok -> state -> snap_jpeg)
+  sandbox.createImageBitmap = async () => ({ width: 1280, height: 800, close() { sandbox.__bmpClosed++; } });
   const sock1 = wsInstances[0];
   sock1.onopen();
   sock1.onmessage({ data: JSON.stringify({ type: 'auth_ok', bot: 'main', user_id: 111, role: 'admin' }) });
@@ -1721,6 +1771,7 @@ vm.runInContext(jsCode, sandbox);
     type: 'state', running: true, engine_mode: 'async_hosted', takeover: true,
     vw: 1280, vh: 800, url: 'https://example.com', tabs: [], profiles: [{ name: 'nonpin', pinned: false }]
   }) });
+  await vm.runInContext("decodeAndDrawBlob(new Blob('init1'), wsConnGen, frameRenderGen)", sandbox);
   sock1.sent.length = 0;
 
   // 1. P1-01: Handback sends mouseup BEFORE set_takeover(false) when trackpad hold is active
@@ -1757,6 +1808,8 @@ vm.runInContext(jsCode, sandbox);
   vm.runInContext("setGestureMode('drag');", sandbox);
   sock1.sent.length = 0;
   stageEl.dispatch('pointerdown', { pointerId: 3, clientX: 50, clientY: 50, pointerType: 'touch', target: screenEl });
+  // Advance past 80ms two-finger join grace window so single-finger touch drag commits mousedown
+  vm.runInContext("gestureStart.t -= 100;", sandbox);
   stageEl.dispatch('pointermove', { pointerId: 3, clientX: 200, clientY: 125, pointerType: 'touch', target: screenEl });
   // Release outside canvas (-50, -50) -> MUST send mouseup at lastValidRemote (640, 400), NOT startRemote (160, 160)!
   stageEl.dispatch('pointerup', { pointerId: 3, clientX: -50, clientY: -50, pointerType: 'touch', target: screenEl });
@@ -1832,6 +1885,7 @@ vm.runInContext(jsCode, sandbox);
   assert.strictEqual(gotoSent.takeover_gen, 3);
 
   // 8b. P1-02: Two-finger lift first finger + cancel second finger MUST NOT fire rightclick; clean 2-finger tap DOES
+  await vm.runInContext("decodeAndDrawBlob(new Blob('gen7'), wsConnGen, frameRenderGen)", sandbox);
   vm.runInContext("setGestureMode('trackpad'); resetZoom();", sandbox);
   sock1.sent.length = 0;
   stageEl.dispatch('pointerdown', { pointerId: 30, clientX: 150, clientY: 150, pointerType: 'touch', target: screenEl });
@@ -1991,6 +2045,7 @@ vm.runInContext(jsCode, sandbox);
   // 8j. Round 5 P2-02: Staggered same-direction two-finger pan MUST lock 'scroll' & emit wheel (NEVER pinch!)
   vm.runInContext("scale = 1.0; panX = 0; panY = 0; setGestureMode('trackpad');", sandbox);
   sock1.onmessage({ data: JSON.stringify({ type: 'state', running: true, session_gen: 8, takeover_gen: 10, takeover: true, ai_busy: false, vw: 1280, vh: 800 }) });
+  await vm.runInContext("decodeAndDrawBlob(new Blob('gen8'), wsConnGen, frameRenderGen)", sandbox);
   sock1.sent.length = 0;
   // Two vertically stacked fingers; finger 50 moves 30px down first, then finger 51 moves 5px down (staggered same-direction pan)
   stageEl.dispatch('pointerdown', { pointerId: 50, clientX: 200, clientY: 160, pointerType: 'touch', target: screenEl });
@@ -2036,6 +2091,7 @@ vm.runInContext(jsCode, sandbox);
   sock1.onmessage({ data: JSON.stringify({ type: 'state', running: true, session_gen: 7, takeover_gen: 4, takeover: true, ai_busy: false, vw: 1280, vh: 800 }) });
 
   // 9. P2-03 & P3: bmp.close() always runs on draw exception + Image fallback revokes URL + stale connGen/frameRenderGen dropped + FPS counts drawImage
+  vm.runInContext("renderedFrameCount = 0;", sandbox);
   sandbox.__bmpClosed = 0;
   sandbox.__drawCount = 0;
   sandbox.__throwDrawOnce = true;
@@ -2116,6 +2172,927 @@ vm.runInContext(jsCode, sandbox);
                 f"Node VM behavioral test failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
             )
             self.assertIn("NODE_VM_ALL_PASS", proc.stdout)
+
+    def test_p0_virtual_camera_dpr_two_finger_pan_pinch_view_modes_and_shell(self) -> None:
+        html_src = INDEX_HTML_PATH.read_text(encoding="utf-8")
+        blocks = re.findall(r"<script>(.*?)</script>", html_src, re.S)
+        self.assertEqual(1, len(blocks))
+        js_src = blocks[0]
+
+        harness = r"""
+const vm = require('vm');
+const fs = require('fs');
+const assert = require('assert');
+const jsCode = fs.readFileSync(process.argv[2], 'utf8');
+
+class FakeClassList {
+  constructor(initial = []) { this._set = new Set(initial); }
+  add(...xs) { xs.forEach((x) => this._set.add(x)); }
+  remove(...xs) { xs.forEach((x) => this._set.delete(x)); }
+  toggle(x, force) {
+    if (typeof force === 'boolean') { force ? this._set.add(x) : this._set.delete(x); return force; }
+    if (this._set.has(x)) { this._set.delete(x); return false; }
+    this._set.add(x); return true;
+  }
+  contains(x) { return this._set.has(x); }
+}
+
+class FakeEl {
+  constructor(id = '', tag = 'DIV') {
+    this.id = id;
+    this.tagName = tag;
+    this.style = {};
+    this.classList = new FakeClassList();
+    this.className = '';
+    this.textContent = '';
+    this._innerHTML = '';
+    this.value = '';
+    this.disabled = false;
+    this.width = 1280;
+    this.height = 800;
+    this.clientWidth = 390;
+    this.clientHeight = 700;
+    this.children = [];
+    this._listeners = {};
+    this._rect = { left: 0, top: 0, width: 390, height: 700 };
+  }
+  get innerHTML() { return this._innerHTML; }
+  set innerHTML(v) { this._innerHTML = v; if (v === '') this.children = []; }
+  addEventListener(ev, fn) { (this._listeners[ev] ||= []).push(fn); }
+  dispatch(ev, obj) {
+    const evt = { stopPropagation() {}, preventDefault() {}, target: this, ...obj };
+    (this._listeners[ev] || []).forEach((fn) => fn(evt));
+  }
+  getBoundingClientRect() { return this._rect; }
+  appendChild(c) { this.children.push(c); return c; }
+  removeChild(c) { this.children = this.children.filter((x) => x !== c); }
+  remove() {}
+  focus() {}
+  blur() {}
+  select() {}
+  setSelectionRange() {}
+  setPointerCapture() {}
+  setAttribute() {}
+  closest() { return null; }
+  getContext() {
+    const id = this.id;
+    return {
+      clearRect: (...args) => {
+        if (id === 'screen') { sandbox.__screenClears++; sandbox.__lastClearArgs = args; }
+      },
+      drawImage: (...args) => {
+        if (id === 'screen') { sandbox.__screenDraws++; sandbox.__lastDrawArgs = args; }
+        else if (id === 'minimap-canvas') { sandbox.__minimapDraws++; }
+      }
+    };
+  }
+}
+
+const elements = new Map();
+function getEl(id) {
+  if (!elements.has(id)) elements.set(id, new FakeEl(id));
+  return elements.get(id);
+}
+
+// Portrait iPhone viewport: 390x700 stage at DPR=3
+const stageEl = getEl('stage');
+stageEl.clientWidth = 390; stageEl.clientHeight = 700;
+stageEl._rect = { left: 0, top: 44, width: 390, height: 700 };
+const screenEl = getEl('screen');
+screenEl.clientWidth = 390; screenEl.clientHeight = 700;
+screenEl._rect = { left: 0, top: 44, width: 390, height: 700 };
+const mmSurf = getEl('minimap-surface');
+mmSurf._rect = { left: 272, top: 674, width: 108, height: 55 };
+
+class FakeBlob { constructor(id) { this.id = id; } }
+const wsInstances = [];
+class FakeWS {
+  static OPEN = 1; static CONNECTING = 0; static CLOSED = 3;
+  constructor(url) { this.url = url; this.readyState = FakeWS.OPEN; this.sent = []; wsInstances.push(this); }
+  send(s) { this.sent.push(JSON.parse(s)); }
+  close() { this.readyState = FakeWS.CLOSED; }
+}
+
+const timers = [];
+const sandbox = {
+  console, Math, Date, JSON, Map, Set, Array, Number, String, Boolean, Promise, Object, Error, URL: class extends URL {},
+  performance: { now: () => 1000 },
+  devicePixelRatio: 3,
+  Blob: FakeBlob,
+  WebSocket: FakeWS,
+  location: { protocol: 'https:', host: 'live.example.com' },
+  __screenDraws: 0,
+  __screenClears: 0,
+  __minimapDraws: 0,
+  __lastDrawArgs: null,
+  __lastClearArgs: null,
+  __bmpClosed: 0,
+  FormData: class { append() {} },
+  fetch: async () => ({ ok: true, status: 200, json: async () => ({ ok: true }) }),
+  setTimeout: (fn, ms) => { const id = timers.length + 1; timers.push({ id, fn, ms, cleared: false }); return id; },
+  clearTimeout: (id) => { const t = timers.find((x) => x.id === id); if (t) t.cleared = true; },
+  setInterval: () => 1,
+  clearInterval: () => {},
+  document: {
+    getElementById: (id) => getEl(id),
+    createElement: (tag) => new FakeEl('', tag.toUpperCase()),
+    addEventListener: () => {},
+    activeElement: null,
+    body: new FakeEl('body', 'BODY'),
+  },
+  navigator: {},
+  window: null,
+};
+sandbox.window = sandbox;
+sandbox.addEventListener = () => {};
+sandbox.scrollTo = () => {};
+sandbox.innerHeight = 844;
+sandbox.visualViewport = { height: 844, addEventListener: () => {} };
+sandbox.Telegram = { WebApp: { initData: 'mock_init', ready() {}, expand() {}, disableVerticalSwipes() {} } };
+
+vm.createContext(sandbox);
+vm.runInContext(jsCode, sandbox);
+
+function assertRoundTrip(sx, sy, label) {
+  const res = vm.runInContext(`(() => {
+    const r = stageToRemote(${sx}, ${sy});
+    if (!r) return null;
+    const back = remoteToStage(r.x, r.y);
+    const r2 = stageToRemote(back.stageX, back.stageY);
+    return { r, back, r2 };
+  })()`, sandbox);
+  assert(res && res.r && res.r2, `${label}: expected valid mapping at stage (${sx},${sy})`);
+  const errX = Math.abs(res.r.x - res.r2.x);
+  const errY = Math.abs(res.r.y - res.r2.y);
+  assert(errX <= 1.0 && errY <= 1.0, `${label}: remote round-trip error (${errX}, ${errY}) > 1px`);
+  const stageErrX = Math.abs(res.back.stageX - sx);
+  const stageErrY = Math.abs(res.back.stageY - sy);
+  assert(stageErrX <= 1.0 && stageErrY <= 1.0, `${label}: stage round-trip error (${stageErrX}, ${stageErrY}) > 1px`);
+}
+
+(async () => {
+  const sock = wsInstances[0];
+  sock.onopen();
+  sock.onmessage({ data: JSON.stringify({ type: 'auth_ok', bot: 'main', user_id: 111, role: 'admin' }) });
+
+  // 1. Portrait stage (390x700) + desktop landscape remote (2560x1307) -> auto enters 'fit_height' + DPR=3 canvas buffer + zero CSS scale
+  sock.onmessage({ data: JSON.stringify({
+    type: 'state', running: true, engine_mode: 'async_hosted', session_gen: 1, takeover_gen: 1, takeover: true,
+    vw: 2560, vh: 1307, url: 'https://mail.google.com/mail/u/0/#inbox',
+    tabs: [{ index: 0, title: 'Gmail', url: 'https://mail.google.com/mail/u/0/#inbox', active: true }],
+    profiles: [
+      { name: 'fisherwseven', pinned: true, os: 'windows', egress: 'direct' },
+      { name: 'mobile-sg', pinned: false, mobile: true, window: [430, 932], os: 'android', egress: 'direct' }
+    ]
+  }) });
+  assert.strictEqual(vm.runInContext("camera.viewMode", sandbox), 'fit_height', 'Portrait stage + wide desktop remote must auto-enter fit_height');
+  assert(vm.runInContext("scale", sandbox) > 3.0, 'fit_height scale on 2560x1307 in 390x700 should be > 3.0x');
+  assert.strictEqual(screenEl.width, 1170, 'Canvas width must match stageW * DPR (390 * 3 = 1170)');
+  assert.strictEqual(screenEl.height, 2100, 'Canvas height must match stageH * DPR (700 * 3 = 2100)');
+  assert.strictEqual(getEl('canvas-wrap').style.transform || '', '', '#canvas-wrap must NOT use CSS transform scale');
+  assert.strictEqual(getEl('chrome-url-host').textContent, 'mail.google.com', 'Chrome capsule must show clean domain');
+
+  // 2. Dynamic maxScale allows zooming to 1.25x source CSS pixels (> 8x on 2560px in 390px)
+  const maxScale = vm.runInContext("getMaxScale()", sandbox);
+  const baseFit = vm.runInContext("getBaseFitScale(390, 700, 2560, 1307)", sandbox);
+  assert(maxScale > 8.0, `Expected dynamic maxScale > 8.0, got ${maxScale}`);
+  assert(baseFit * maxScale >= 1.249, `Expected effScale >= 1.25x source CSS px, got ${baseFit * maxScale}`);
+
+  // 3. Single-pass DPR drawImage verification + round-trip coordinate accuracy across fit / fit_height / 1:1 (>6x) / maxScale (>8x) + edge clamping
+  sandbox.createImageBitmap = async () => ({ width: 2560, height: 1307, close() { sandbox.__bmpClosed++; } });
+  await vm.runInContext("decodeAndDrawBlob(new Blob('desktop1'), wsConnGen, frameRenderGen)", sandbox);
+  assert.strictEqual(sandbox.__screenDraws, 1);
+  assert.strictEqual(sandbox.__lastDrawArgs.length, 9, 'Virtual camera must use 9-arg drawImage(src, sx, sy, sW, sH, dx, dy, dW, dH)');
+  const [, sx0, sy0, sw0, sh0, dx0, dy0, dw0, dh0] = sandbox.__lastDrawArgs;
+  assert(Math.abs(dw0 - 1170) < 2 && Math.abs(dh0 - 2100) < 2, `Expected full DPR dst (1170x2100), got ${dw0}x${dh0}`);
+  assert(sw0 < 800 && Math.abs(sh0 - 1307) < 2, `Expected fit_height src crop (~728x1307), got ${sw0}x${sh0}`);
+
+  assertRoundTrip(195, 350, 'fit_height center');
+  assertRoundTrip(10, 12, 'fit_height top-left');
+  assertRoundTrip(380, 690, 'fit_height bottom-right');
+
+  // Switch to 1:1 focus (>6.5x) & pan to extreme bottom-right edge (clamped)
+  vm.runInContext("setViewMode('focus_1x', true);", sandbox);
+  assert(vm.runInContext("scale", sandbox) > 6.0, '1:1 focus on 2560px in 390px must exceed 6x');
+  assert(Math.abs(vm.runInContext("camera.effScale", sandbox) - 1.0) < 1e-4, '1:1 focus must have effScale === 1.0');
+  vm.runInContext("camera.cx = 99999; camera.cy = 99999; applyCamera(true);", sandbox);
+  assert(vm.runInContext("camera.cx", sandbox) <= 2560 - 195 + 0.01, 'clampPan must clamp cx inside right boundary');
+  assert(vm.runInContext("camera.cy", sandbox) <= 1307 - 350 + 0.01, 'clampPan must clamp cy inside bottom boundary');
+  assertRoundTrip(50, 100, 'focus_1x clamped edge');
+  assertRoundTrip(340, 620, 'focus_1x clamped edge 2');
+
+  // High zoom > 8x (1.25x source CSS px)
+  vm.runInContext("scale = getMaxScale(); camera.cx = 500; camera.cy = 300; applyCamera(true);", sandbox);
+  assertRoundTrip(123, 456, 'maxScale 1.25x source px');
+  // Verify cursor projection matches remoteToStage identically
+  vm.runInContext("positionHumanCursor(500, 300, 'human', true);", sandbox);
+  assert.strictEqual(getEl('remote-cursor').style.left, '195.00px', 'Cursor at camera center must project to stage center X (195.00px)');
+  assert.strictEqual(getEl('remote-cursor').style.top, '350.00px', 'Cursor at camera center must project to stage center Y (350.00px)');
+  assert(!getEl('minimap-box').classList.contains('hidden'), 'Minimap must be visible when zoomed in');
+
+  // Fit mode round-trip
+  vm.runInContext("setViewMode('fit', true);", sandbox);
+  assert.strictEqual(vm.runInContext("scale", sandbox), 1.0);
+  assert(getEl('minimap-box').classList.contains('hidden'), 'Minimap must hide at 1x full view');
+  assertRoundTrip(195, 350, 'fit center');
+  // Click in black letterbox margin above/below remote frame returns null
+  assert.strictEqual(vm.runInContext("stageToRemote(195, 5)", sandbox), null, 'Letterbox bar must map to null');
+
+  // 4. Two-finger simultaneous pan + pinch-zoom in takeover interact mode -> ZERO remote wheel, ZERO clicks; single-finger still clicks & scrolls!
+  vm.runInContext("setViewMode('fit_height', true); setGestureMode('interact');", sandbox);
+  const cxBeforePan = vm.runInContext("camera.cx", sandbox);
+  sock.sent.length = 0;
+  // Two-finger parallel pan left by 80px (fingers start at y=300+44)
+  stageEl.dispatch('pointerdown', { pointerId: 101, clientX: 160, clientY: 344, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointerdown', { pointerId: 102, clientX: 240, clientY: 344, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointermove', { pointerId: 101, clientX: 80, clientY: 344, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointermove', { pointerId: 102, clientX: 160, clientY: 344, pointerType: 'touch', target: screenEl });
+  const cxAfterPan = vm.runInContext("camera.cx", sandbox);
+  assert(cxAfterPan > cxBeforePan + 100, `Two-finger left drag must pan camera right (cx ${cxBeforePan} -> ${cxAfterPan})`);
+  assert.strictEqual(sock.sent.filter((m) => m.action === 'wheel').length, 0, 'Two-finger pan must emit 0 remote wheel events');
+
+  // Simultaneous spread (dist 80 -> 160 = 2x zoom) + shift midpoint down by 50px in SAME two-finger gesture!
+  const scaleBeforeSpread = vm.runInContext("scale", sandbox);
+  stageEl.dispatch('pointermove', { pointerId: 101, clientX: 40, clientY: 394, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointermove', { pointerId: 102, clientX: 200, clientY: 394, pointerType: 'touch', target: screenEl });
+  assert(vm.runInContext("scale", sandbox) > scaleBeforeSpread * 1.5, 'Simultaneous spread must zoom smoothly');
+  assert.strictEqual(sock.sent.filter((m) => m.action === 'wheel').length, 0, 'Simultaneous pinch+pan must emit 0 remote wheel');
+  // Lift 1 finger, move remaining finger -> MUST still emit 0 wheel (wasPinch guard)
+  stageEl.dispatch('pointerup', { pointerId: 102, clientX: 200, clientY: 394, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointermove', { pointerId: 101, clientX: 40, clientY: 500, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointerup', { pointerId: 101, clientX: 40, clientY: 500, pointerType: 'touch', target: screenEl });
+  assert.strictEqual(sock.sent.length, 0, 'Two-finger pan+pinch and leftover finger lift must emit 0 remote inputs');
+
+  // Single-finger click in takeover still maps through stageToRemote accurately
+  sock.sent.length = 0;
+  const expectedClick = vm.runInContext("stageToRemote(195, 350)", sandbox);
+  stageEl.dispatch('pointerdown', { pointerId: 105, clientX: 195, clientY: 394, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointerup', { pointerId: 105, clientX: 195, clientY: 394, pointerType: 'touch', target: screenEl });
+  assert.strictEqual(sock.sent.length, 1);
+  assert.strictEqual(sock.sent[0].action, 'click');
+  assert(Math.abs(sock.sent[0].x - expectedClick.x) <= 1.0 && Math.abs(sock.sent[0].y - expectedClick.y) <= 1.0, 'Single-finger click must match stageToRemote within 1px');
+
+  // Single-finger drag in takeover still emits remote wheel scroll
+  sock.sent.length = 0;
+  vm.runInContext("lastWheelSent = 0;", sandbox);
+  stageEl.dispatch('pointerdown', { pointerId: 106, clientX: 195, clientY: 444, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointermove', { pointerId: 106, clientX: 195, clientY: 364, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointerup', { pointerId: 106, clientX: 195, clientY: 364, pointerType: 'touch', target: screenEl });
+  assert(sock.sent.some((m) => m.action === 'wheel' && m.dy > 0), 'Single-finger vertical drag in takeover must still emit remote wheel');
+
+  // 4b. Single-hand Pan mode ('pan') pans camera on single-finger drag even in takeover without emitting remote click/wheel
+  vm.runInContext("camera.cx = 1280; applyCamera(true); togglePanMode();", sandbox);
+  assert.strictEqual(vm.runInContext("gestureMode", sandbox), 'pan');
+  const cxBeforeHandPan = vm.runInContext("camera.cx", sandbox);
+  const effBeforeHandPan = vm.runInContext("camera.effScale", sandbox);
+  sock.sent.length = 0;
+  stageEl.dispatch('pointerdown', { pointerId: 107, clientX: 220, clientY: 344, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointermove', { pointerId: 107, clientX: 120, clientY: 344, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointerup', { pointerId: 107, clientX: 120, clientY: 344, pointerType: 'touch', target: screenEl });
+  const expectedCxAfterPan = cxBeforeHandPan + 100 / effBeforeHandPan;
+  assert(Math.abs(vm.runInContext("camera.cx", sandbox) - expectedCxAfterPan) <= 1.0, 'Pan mode single-finger drag must pan camera 1:1 with finger');
+  assert.strictEqual(sock.sent.length, 0, 'Pan mode must emit 0 remote clicks/wheels');
+  vm.runInContext("togglePanMode();", sandbox);
+  assert.strictEqual(vm.runInContext("gestureMode", sandbox), 'interact');
+
+  // 4c. Minimap drag navigates camera center directly without sending remote events
+  sock.sent.length = 0;
+  mmSurf.dispatch('pointerdown', { pointerId: 108, clientX: 272 + 10.8, clientY: 674 + 5.5, pointerType: 'touch' });
+  mmSurf.dispatch('pointerup', { pointerId: 108, clientX: 272 + 10.8, clientY: 674 + 5.5, pointerType: 'touch' });
+  assert(vm.runInContext("camera.cx", sandbox) < 500, 'Minimap top-left tap must pan camera near left edge');
+  assert.strictEqual(sock.sent.length, 0, 'Minimap drag must not leak remote inputs');
+
+  // 5. Portrait viewing portrait mobile remote (430x932) -> auto stays 'fit' (1.0x full screen)
+  sock.onmessage({ data: JSON.stringify({
+    type: 'state', running: true, session_gen: 2, takeover_gen: 1, takeover: true,
+    vw: 430, vh: 932, url: 'https://example.com/m',
+    tabs: [{ index: 0, title: 'Mobile', url: 'https://example.com/m', active: true }]
+  }) });
+  assert.strictEqual(vm.runInContext("camera.viewMode", sandbox), 'fit', 'Portrait viewing 430x932 mobile remote must default to fit');
+  assert.strictEqual(vm.runInContext("scale", sandbox), 1.0);
+  assert(sandbox.__bmpClosed >= 1, 'session_gen change must close retained ImageBitmap');
+  assert.strictEqual(vm.runInContext("latestFrameBitmap", sandbox), null, 'session_gen change must invalidate retained bitmap');
+
+  // 6. Same-session tab switch follows JPEG(B) -> state(B) and preserves B's frame without closing it; Rotation (portrait -> landscape) re-aligns camera & DPR buffer
+  sock.onmessage({ data: JSON.stringify({
+    type: 'state', running: true, session_gen: 3, takeover_gen: 1, takeover: true,
+    vw: 2560, vh: 1307, url: 'https://mail.google.com',
+    tabs: [
+      { index: 0, title: 'Tab0', url: 'https://mail.google.com', active: true },
+      { index: 1, title: 'Tab1', url: 'https://example.org/tab2', active: false }
+    ]
+  }) });
+  assert.strictEqual(getEl('chrome-tabs-count').textContent, '2');
+  assert.strictEqual(getEl('rail-tabs-count').textContent, '2');
+  await vm.runInContext("decodeAndDrawBlob(new Blob('tab0'), wsConnGen, frameRenderGen)", sandbox);
+  assert(vm.runInContext("latestFrameBitmap !== null", sandbox));
+  // Real server order on tab switch: JPEG(B) arrives before state(B)
+  let bmpBClosed = 0;
+  sandbox.createImageBitmap = async () => ({ width: 2560, height: 1307, tag: 'tabB', close() { bmpBClosed++; sandbox.__bmpClosed++; } });
+  await vm.runInContext("decodeAndDrawBlob(new Blob('tab1'), wsConnGen, frameRenderGen)", sandbox);
+  const clearsBeforeTab = sandbox.__screenClears;
+  sock.onmessage({ data: JSON.stringify({
+    type: 'state', running: true, session_gen: 3, takeover_gen: 1, takeover: true,
+    vw: 2560, vh: 1307, url: 'https://example.org/tab2',
+    tabs: [
+      { index: 0, title: 'Tab0', url: 'https://mail.google.com', active: false },
+      { index: 1, title: 'Tab1', url: 'https://example.org/tab2', active: true }
+    ]
+  }) });
+  assert.strictEqual(bmpBClosed, 0, 'state(B) after JPEG(B) must NOT close B bitmap');
+  assert.strictEqual(sandbox.__screenClears, clearsBeforeTab, 'state(B) after JPEG(B) must NOT clear canvas');
+  assert.strictEqual(vm.runInContext("latestFrameBitmap && latestFrameBitmap.tag", sandbox), 'tabB', 'B bitmap must stay retained');
+  assert.strictEqual(vm.runInContext("canDispatchRemoteInput()", sandbox), true, 'Tab B must remain interactive immediately');
+
+  // Rotate phone to landscape (760x340): auto switches from portrait fit_height to landscape fit + updates DPR canvas + reprojects cursor
+  vm.runInContext("positionHumanCursor(1280, 653.5, 'human', true);", sandbox);
+  stageEl.clientWidth = 760; stageEl.clientHeight = 340;
+  stageEl._rect = { left: 0, top: 36, width: 760, height: 340 };
+  vm.runInContext("syncViewportHeight();", sandbox);
+  assert.strictEqual(screenEl.width, 760 * 3, 'Landscape rotation must update DPR canvas width');
+  assert.strictEqual(screenEl.height, 340 * 3, 'Landscape rotation must update DPR canvas height');
+  assert.strictEqual(vm.runInContext("camera.viewMode", sandbox), 'fit', 'Landscape stage must auto-reset to fit');
+  assert.strictEqual(getEl('remote-cursor').style.left, '380.00px', 'Cursor must re-project to landscape center X');
+  assert.strictEqual(getEl('remote-cursor').style.top, '170.00px', 'Cursor must re-project to landscape center Y');
+
+  // 7. Profile sheet distinguishes preset viewport ('预设视口 📱 430×932') and pinned lock note for fisherwseven
+  vm.runInContext("openProfileSheet();", sandbox);
+  const cards = getEl('profile-list').children;
+  assert.strictEqual(cards.length, 2);
+  const cardTexts = cards.map((c) => JSON.stringify(c));
+  assert(cardTexts[0].includes('fisherwseven') && cardTexts[0].includes('锁定指纹/视口'), 'Pinned profile must show locked fingerprint/viewport tag');
+  assert(cardTexts[1].includes('预设视口') && cardTexts[1].includes('📱 430×932'), 'Non-pinned mobile profile must distinguish preset viewport badge');
+
+  console.log('NODE_VM_P0_CAMERA_PASS');
+})().catch((err) => { console.error(err); process.exit(1); });
+"""
+
+        node_bin = shutil.which("node")
+        if not node_bin:
+            self.skipTest("node binary not available in PATH")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            js_file = Path(tmp) / "inline.js"
+            harness_file = Path(tmp) / "harness_p0.js"
+            js_file.write_text(js_src, encoding="utf-8")
+            harness_file.write_text(harness, encoding="utf-8")
+            proc = subprocess.run(
+                [node_bin, str(harness_file), str(js_file)],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertEqual(
+                0,
+                proc.returncode,
+                f"Node VM P0 camera behavioral test failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
+            )
+            self.assertIn("NODE_VM_P0_CAMERA_PASS", proc.stdout)
+
+    def test_p0_qa_adversarial_regression_suite(self) -> None:
+        """Adversarial Node VM regressions for all 6 QA P0 blockers + mobile address bar & P1 checks."""
+        html_src = INDEX_HTML_PATH.read_text(encoding="utf-8")
+        blocks = re.findall(r"<script>(.*?)</script>", html_src, re.S)
+        self.assertEqual(1, len(blocks))
+        js_src = blocks[0]
+
+        harness = r"""
+const vm = require('vm');
+const fs = require('fs');
+const assert = require('assert');
+const jsCode = fs.readFileSync(process.argv[2], 'utf8');
+
+class FakeClassList {
+  constructor(initial = []) { this._set = new Set(initial); }
+  add(...xs) { xs.forEach((x) => this._set.add(x)); }
+  remove(...xs) { xs.forEach((x) => this._set.delete(x)); }
+  toggle(x, force) {
+    if (typeof force === 'boolean') { force ? this._set.add(x) : this._set.delete(x); return force; }
+    if (this._set.has(x)) { this._set.delete(x); return false; }
+    this._set.add(x); return true;
+  }
+  contains(x) { return this._set.has(x); }
+}
+
+const windowListeners = {};
+const elements = new Map();
+
+class FakeEl {
+  constructor(id = '', tag = 'DIV') {
+    this.id = id;
+    this.tagName = tag;
+    this.style = {};
+    this.classList = new FakeClassList();
+    this.className = '';
+    this.textContent = '';
+    this._innerHTML = '';
+    this.value = '';
+    this.disabled = false;
+    this.width = 1280;
+    this.height = 800;
+    this.clientWidth = 390;
+    this.clientHeight = 700;
+    this.children = [];
+    this.parent = null;
+    this._listeners = {};
+    this._rect = { left: 17, top: 44, width: 390, height: 700 };
+    this._focusCount = 0;
+    this._blurCount = 0;
+  }
+  get innerHTML() { return this._innerHTML; }
+  set innerHTML(v) { this._innerHTML = v; if (v === '') this.children = []; }
+  addEventListener(ev, fn) { (this._listeners[ev] ||= []).push(fn); }
+  dispatch(ev, obj = {}, { bubbleToWindow = false } = {}) {
+    let stopped = false;
+    const evt = {
+      defaultPrevented: false,
+      preventDefault() { this.defaultPrevented = true; },
+      stopPropagation() { stopped = true; },
+      target: this,
+      ...obj,
+    };
+    let cur = this;
+    while (cur && !stopped) {
+      (cur._listeners[ev] || []).forEach((fn) => fn(evt));
+      cur = cur.parent;
+    }
+    if (bubbleToWindow && !stopped) {
+      (windowListeners[ev] || []).forEach((fn) => fn(evt));
+    }
+    return evt;
+  }
+  getBoundingClientRect() { return this._rect; }
+  appendChild(c) { c.parent = this; this.children.push(c); return c; }
+  removeChild(c) { this.children = this.children.filter((x) => x !== c); c.parent = null; }
+  remove() {}
+  focus() { this._focusCount++; sandbox.document.activeElement = this; }
+  blur() { this._blurCount++; if (sandbox.document.activeElement === this) sandbox.document.activeElement = null; }
+  select() {}
+  setSelectionRange() {}
+  setPointerCapture() {}
+  setAttribute() {}
+  closest(sel) {
+    let cur = this;
+    while (cur) {
+      if (sel.startsWith('#') && cur.id === sel.slice(1)) return cur;
+      cur = cur.parent;
+    }
+    return null;
+  }
+  getContext() {
+    const id = this.id;
+    return {
+      clearRect: (...args) => {
+        if (id === 'screen') { sandbox.__screenClears++; sandbox.__lastScreenClear = args; }
+        else if (id === 'minimap-canvas') { sandbox.__minimapClears++; sandbox.__lastMinimapClear = args; }
+      },
+      drawImage: (...args) => {
+        if (id === 'screen') { sandbox.__screenDraws++; sandbox.__lastScreenDraw = args; }
+        else if (id === 'minimap-canvas') { sandbox.__minimapDraws++; sandbox.__lastMinimapDraw = args; }
+      }
+    };
+  }
+}
+
+function getEl(id) {
+  if (!elements.has(id)) {
+    let tag = 'DIV';
+    if (id.includes('input')) tag = 'INPUT';
+    else if (id.includes('textarea')) tag = 'TEXTAREA';
+    else if (id.includes('select')) tag = 'SELECT';
+    else if (id === 'screen' || id === 'minimap-canvas') tag = 'CANVAS';
+    elements.set(id, new FakeEl(id, tag));
+  }
+  return elements.get(id);
+}
+
+// Build realistic parent-child hierarchy for event bubbling checks
+const stageEl = getEl('stage');
+stageEl.clientWidth = 390; stageEl.clientHeight = 700;
+stageEl._rect = { left: 17, top: 44, width: 390, height: 700 };
+
+const canvasWrapEl = getEl('canvas-wrap');
+stageEl.appendChild(canvasWrapEl);
+const screenEl = getEl('screen');
+screenEl.clientWidth = 390; screenEl.clientHeight = 700;
+screenEl._rect = { left: 17, top: 44, width: 390, height: 700 };
+canvasWrapEl.appendChild(screenEl);
+
+const minimapBoxEl = getEl('minimap-box');
+minimapBoxEl.classList.add('hidden');
+stageEl.appendChild(minimapBoxEl);
+const minimapSurfEl = getEl('minimap-surface');
+minimapSurfEl._rect = { left: 289, top: 674, width: 108, height: 55 };
+minimapBoxEl.appendChild(minimapSurfEl);
+const minimapCanvasEl = getEl('minimap-canvas');
+minimapCanvasEl.width = 108; minimapCanvasEl.height = 55;
+minimapSurfEl.appendChild(minimapCanvasEl);
+
+getEl('kb-sheet').classList.add('hidden');
+getEl('clip-sheet').classList.add('hidden');
+getEl('more-sheet').classList.add('hidden');
+getEl('tabs-sheet').classList.add('hidden');
+getEl('profile-sheet').classList.add('hidden');
+
+class FakeBlob { constructor(id) { this.id = id; } }
+const wsInstances = [];
+class FakeWS {
+  static OPEN = 1; static CONNECTING = 0; static CLOSED = 3;
+  constructor(url) { this.url = url; this.readyState = FakeWS.OPEN; this.sent = []; wsInstances.push(this); }
+  send(s) { this.sent.push(JSON.parse(s)); }
+  close() { this.readyState = FakeWS.CLOSED; }
+}
+
+const timers = [];
+const vvListeners = {};
+const sandbox = {
+  console, Math, Date, JSON, Map, Set, Array, Number, String, Boolean, Promise, Object, Error, URL: class extends URL {},
+  performance: { now: () => 1000 },
+  devicePixelRatio: 2.75,
+  Blob: FakeBlob,
+  WebSocket: FakeWS,
+  location: { protocol: 'https:', host: 'live.example.com' },
+  __screenDraws: 0,
+  __screenClears: 0,
+  __lastScreenDraw: null,
+  __lastScreenClear: null,
+  __minimapDraws: 0,
+  __minimapClears: 0,
+  __lastMinimapDraw: null,
+  __lastMinimapClear: null,
+  FormData: class { append() {} },
+  fetch: async () => ({ ok: true, status: 200, json: async () => ({ ok: true }) }),
+  setTimeout: (fn, ms) => { const id = timers.length + 1; timers.push({ id, fn, ms, cleared: false }); return id; },
+  clearTimeout: (id) => { const t = timers.find((x) => x.id === id); if (t) t.cleared = true; },
+  setInterval: () => 1,
+  clearInterval: () => {},
+  document: {
+    getElementById: (id) => getEl(id),
+    createElement: (tag) => new FakeEl('', tag.toUpperCase()),
+    addEventListener: () => {},
+    activeElement: null,
+    body: new FakeEl('body', 'BODY'),
+  },
+  navigator: {},
+  window: null,
+};
+sandbox.window = sandbox;
+sandbox.addEventListener = (ev, fn) => { (windowListeners[ev] ||= []).push(fn); };
+sandbox.scrollTo = () => {};
+sandbox.innerHeight = 844;
+sandbox.visualViewport = {
+  height: 844,
+  addEventListener: (ev, fn) => { (vvListeners[ev] ||= []).push(fn); },
+  dispatch: (ev) => { (vvListeners[ev] || []).forEach((fn) => fn()); },
+};
+sandbox.Telegram = { WebApp: { initData: 'mock_init', ready() {}, expand() {}, disableVerticalSwipes() {} } };
+
+vm.createContext(sandbox);
+vm.runInContext(jsCode, sandbox);
+
+(async () => {
+  const sock = wsInstances[0];
+  sock.onopen();
+  sock.onmessage({ data: JSON.stringify({ type: 'auth_ok', bot: 'main', user_id: 111, role: 'admin' }) });
+
+  // =========================================================================
+  // 1. P0-1: No bitmap / pre-first-frame / session_gen change / cross-session press->release => 0 remote clicks
+  // =========================================================================
+  sock.onmessage({ data: JSON.stringify({
+    type: 'state', running: true, engine_mode: 'async_hosted', session_gen: 1, takeover_gen: 1, takeover: true,
+    vw: 2560, vh: 1307, url: 'https://page-a.example',
+    tabs: [
+      { index: 0, title: 'A', url: 'https://page-a.example', active: true },
+      { index: 1, title: 'B', url: 'https://page-b.example', active: false }
+    ]
+  }) });
+  sock.sent.length = 0;
+  // Before any JPEG arrives -> 0 click, 0 wheel, 0 press
+  assert.strictEqual(vm.runInContext("canDispatchRemoteInput()", sandbox), false, 'Must block input before first frame');
+  stageEl.dispatch('pointerdown', { pointerId: 1, clientX: 200, clientY: 394, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointerup', { pointerId: 1, clientX: 200, clientY: 394, pointerType: 'touch', target: screenEl });
+  vm.runInContext("sendKey('Enter');", sandbox);
+  assert.strictEqual(sock.sent.filter((m) => m.type === 'input').length, 0, 'Pre-first-frame must emit 0 remote inputs');
+
+  // Decode first frame for session_gen=1
+  let bmpAClosed = 0;
+  sandbox.createImageBitmap = async () => ({ width: 2560, height: 1307, tag: 'A', close() { bmpAClosed++; } });
+  await vm.runInContext("decodeAndDrawBlob(new Blob('frameA'), wsConnGen, frameRenderGen)", sandbox);
+  assert.strictEqual(vm.runInContext("canDispatchRemoteInput()", sandbox), true, 'After first frame must allow input');
+
+  // Press in session_gen=1, then session_gen changes to 2 BEFORE pointerup -> 0 clicks!
+  sock.sent.length = 0;
+  stageEl.dispatch('pointerdown', { pointerId: 2, clientX: 200, clientY: 394, pointerType: 'touch', target: screenEl });
+  sock.onmessage({ data: JSON.stringify({
+    type: 'state', running: true, session_gen: 2, takeover_gen: 1, takeover: true,
+    vw: 2560, vh: 1307, url: 'https://new-session.example',
+    tabs: [{ index: 0, title: 'New', url: 'https://new-session.example', active: true }]
+  }) });
+  stageEl.dispatch('pointerup', { pointerId: 2, clientX: 200, clientY: 394, pointerType: 'touch', target: screenEl });
+  // Also attempt fresh tap in session_gen=2 BEFORE JPEG(gen=2) arrives -> 0 clicks!
+  stageEl.dispatch('pointerdown', { pointerId: 3, clientX: 200, clientY: 394, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointerup', { pointerId: 3, clientX: 200, clientY: 394, pointerType: 'touch', target: screenEl });
+  assert.strictEqual(sock.sent.filter((m) => m.action === 'click').length, 0, 'Cross-session press->release & pre-frame gen=2 must emit 0 clicks');
+
+  // Disconnect & reconnect: before snap_jpeg arrives -> 0 clicks!
+  sock.readyState = FakeWS.CLOSED;
+  sock.onclose({ code: 1006 });
+  vm.runInContext("connectWs();", sandbox);
+  const sock2 = wsInstances[wsInstances.length - 1];
+  sock2.onopen();
+  sock2.onmessage({ data: JSON.stringify({ type: 'auth_ok', bot: 'main', user_id: 111, role: 'admin' }) });
+  sock2.onmessage({ data: JSON.stringify({
+    type: 'state', running: true, session_gen: 2, takeover_gen: 1, takeover: true,
+    vw: 2560, vh: 1307, url: 'https://tab-a.example',
+    tabs: [
+      { index: 0, title: 'TabA', url: 'https://tab-a.example', active: true },
+      { index: 1, title: 'TabB', url: 'https://tab-b.example', active: false }
+    ]
+  }) });
+  sock2.sent.length = 0;
+  stageEl.dispatch('pointerdown', { pointerId: 4, clientX: 200, clientY: 394, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointerup', { pointerId: 4, clientX: 200, clientY: 394, pointerType: 'touch', target: screenEl });
+  assert.strictEqual(sock2.sent.filter((m) => m.action === 'click').length, 0, 'Reconnect before first frame must emit 0 clicks');
+
+  // =========================================================================
+  // 2 & 3. P0-2: Real JPEG(B)->state(B) preservation + static tab switch + same-index close_tab + kb-sheet invalidation + remote DPR != 1
+  // =========================================================================
+  sandbox.createImageBitmap = async () => ({ width: 2560, height: 1307, tag: 'tabA', close() {} });
+  await vm.runInContext("decodeAndDrawBlob(new Blob('tabA'), wsConnGen, frameRenderGen)", sandbox);
+
+  // Open kb-sheet on Tab A with sensitive draft text
+  vm.runInContext("openKbSheet({ label: 'TabA Login', value: 'secret-tab-a', isPassword: false });", sandbox);
+  assert(!getEl('kb-sheet').classList.contains('hidden'));
+  assert.strictEqual(getEl('kb-modal-input').value, 'secret-tab-a');
+
+  // Client initiates switch_tab -> kb-sheet closes immediately, clicks blocked until cmd_id confirmed!
+  sock2.sent.length = 0;
+  vm.runInContext("sendInput({ action: 'switch_tab', index: 1 });", sandbox);
+  const sw1Cmd = sock2.sent.find((m) => m.action === 'switch_tab');
+  assert(sw1Cmd && typeof sw1Cmd.cmd_id === 'string' && sw1Cmd.cmd_id.startsWith('tc-'), 'switch_tab must attach cmd_id');
+  assert(getEl('kb-sheet').classList.contains('hidden'), 'switch_tab must immediately close old kb-sheet');
+  assert.strictEqual(getEl('kb-modal-input').value, '', 'switch_tab must clear old kb-sheet text');
+  stageEl.dispatch('pointerdown', { pointerId: 5, clientX: 200, clientY: 394, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointerup', { pointerId: 5, clientX: 200, clientY: 394, pointerType: 'touch', target: screenEl });
+  assert.strictEqual(sock2.sent.filter((m) => m.action === 'click').length, 0, 'Click during pending switch_tab before JPEG(B) must be blocked');
+
+  // Server sends JPEG(B) BEFORE state(B) with rendered_tab_cmds=[sw1Cmd.cmd_id]!
+  let bmpBClosed = 0;
+  sandbox.createImageBitmap = async () => ({ width: 2560, height: 1307, tag: 'tabB', close() { bmpBClosed++; } });
+  await vm.runInContext("decodeAndDrawBlob(new Blob('tabB'), wsConnGen, frameRenderGen)", sandbox);
+  const clearsBeforeStateB = sandbox.__screenClears;
+  sock2.onmessage({ data: JSON.stringify({
+    type: 'state', running: true, session_gen: 2, takeover_gen: 1, takeover: true,
+    vw: 2560, vh: 1307, url: 'https://tab-b.example',
+    rendered_tab_cmds: [sw1Cmd.cmd_id],
+    tabs: [
+      { index: 0, title: 'TabA', url: 'https://tab-a.example', active: false },
+      { index: 1, title: 'TabB', url: 'https://tab-b.example', active: true }
+    ]
+  }) });
+  assert.strictEqual(bmpBClosed, 0, 'JPEG(B) -> state(B) MUST NOT close B bitmap');
+  assert.strictEqual(sandbox.__screenClears, clearsBeforeStateB, 'JPEG(B) -> state(B) MUST NOT clear canvas');
+  assert.strictEqual(vm.runInContext("latestFrameBitmap && latestFrameBitmap.tag", sandbox), 'tabB');
+  // Clicking on Tab B now works immediately!
+  sock2.sent.length = 0;
+  stageEl.dispatch('pointerdown', { pointerId: 6, clientX: 200, clientY: 394, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointerup', { pointerId: 6, clientX: 200, clientY: 394, pointerType: 'touch', target: screenEl });
+  assert.strictEqual(sock2.sent.filter((m) => m.action === 'click').length, 1, 'Tab B must be clickable after JPEG(B) -> state(B)');
+
+  // Static identical-pixel tab switch: switch_tab -> NO JPEG pushed -> state confirms rendered_tab_cmds -> unlocks without deadlock!
+  sock2.sent.length = 0;
+  vm.runInContext("sendInput({ action: 'switch_tab', index: 0 });", sandbox);
+  const sw2Cmd = sock2.sent.find((m) => m.action === 'switch_tab');
+  assert(sw2Cmd && sw2Cmd.cmd_id, 'Second switch_tab must attach cmd_id');
+  assert.strictEqual(vm.runInContext("canDispatchRemoteInput()", sandbox), false, 'Pending switch_tab blocks before state(A) arrives');
+  sock2.onmessage({ data: JSON.stringify({
+    type: 'state', running: true, session_gen: 2, takeover_gen: 1, takeover: true,
+    vw: 2560, vh: 1307, url: 'https://tab-a.example',
+    rendered_tab_cmds: [sw1Cmd.cmd_id, sw2Cmd.cmd_id],
+    tabs: [
+      { index: 0, title: 'TabA', url: 'https://tab-a.example', active: true },
+      { index: 1, title: 'TabB', url: 'https://tab-b.example', active: false }
+    ]
+  }) });
+  assert.strictEqual(vm.runInContext("canDispatchRemoteInput()", sandbox), true, 'Static identical-pixel tab switch must unlock on rendered_tab_cmds confirmation');
+
+  // Same-index tab replacement (close index 0 -> new index 0 is TabB): cancels in-flight tap AND closes old kb-sheet!
+  vm.runInContext("openKbSheet({ label: 'Old Tab0 Form', value: 'old-form-secret', isPassword: false });", sandbox);
+  stageEl.dispatch('pointerdown', { pointerId: 7, clientX: 200, clientY: 394, pointerType: 'touch', target: screenEl });
+  sock2.sent.length = 0;
+  sock2.onmessage({ data: JSON.stringify({
+    type: 'state', running: true, session_gen: 2, takeover_gen: 1, takeover: true,
+    vw: 2560, vh: 1307, url: 'https://tab-b.example',
+    tabs: [
+      { index: 0, title: 'TabB', url: 'https://tab-b.example', active: true }
+    ]
+  }) });
+  stageEl.dispatch('pointerup', { pointerId: 7, clientX: 200, clientY: 394, pointerType: 'touch', target: screenEl });
+  vm.runInContext("submitKbSheet(true, false);", sandbox);
+  assert(getEl('kb-sheet').classList.contains('hidden'), 'Same-index tab replacement must close old kb-sheet');
+  assert.strictEqual(getEl('kb-modal-input').value, '', 'Same-index tab replacement must wipe old kb-sheet draft');
+  assert.strictEqual(sock2.sent.filter((m) => m.action === 'click').length, 0, 'Same-index tab replacement must cancel in-flight tap');
+  assert.strictEqual(sock2.sent.filter((m) => m.action === 'type').length, 0, 'Old kb-sheet must NOT submit text into new tab');
+
+  // Remote DPR != 1 (bitmap 2560x1600 vs CSS viewport 1280x800): frame stays valid & interactive!
+  sock2.onmessage({ data: JSON.stringify({
+    type: 'state', running: true, session_gen: 3, takeover_gen: 1, takeover: true,
+    vw: 1280, vh: 800, url: 'https://hidpi.example',
+    tabs: [{ index: 0, title: 'HiDPI', url: 'https://hidpi.example', active: true }]
+  }) });
+  sandbox.createImageBitmap = async () => ({ width: 2560, height: 1600, tag: 'hidpi2x', close() {} });
+  await vm.runInContext("decodeAndDrawBlob(new Blob('hidpi'), wsConnGen, frameRenderGen)", sandbox);
+  assert.strictEqual(vm.runInContext("canDispatchRemoteInput()", sandbox), true, 'Remote DPR!=1 bitmap must stay interactive');
+  sock2.sent.length = 0;
+  stageEl.dispatch('pointerdown', { pointerId: 8, clientX: 212, clientY: 394, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointerup', { pointerId: 8, clientX: 212, clientY: 394, pointerType: 'touch', target: screenEl });
+  assert.strictEqual(sock2.sent.filter((m) => m.action === 'click').length, 1, 'Click on remote DPR!=1 frame must dispatch');
+
+  // =========================================================================
+  // 4. Minimap invalidation clears backing store & visualViewport resize NEVER re-shows old thumbnail
+  // =========================================================================
+  vm.runInContext("setViewMode('fit_height', true);", sandbox);
+  assert(!minimapBoxEl.classList.contains('hidden'), 'Minimap must show when zoomed in with valid frame');
+  const mmClearsBefore = sandbox.__minimapClears;
+  const mmDrawsBefore = sandbox.__minimapDraws;
+  sock2.onmessage({ data: JSON.stringify({
+    type: 'state', running: true, session_gen: 4, takeover_gen: 1, takeover: true,
+    vw: 2560, vh: 1307, url: 'https://next.example',
+    tabs: [{ index: 0, title: 'Next', url: 'https://next.example', active: true }]
+  }) });
+  assert(sandbox.__minimapClears > mmClearsBefore, 'Invalidation must clearRect minimap backing store');
+  assert(minimapBoxEl.classList.contains('hidden'), 'Minimap must hide on invalidation');
+  assert.strictEqual(vm.runInContext("hasMinimapFrame", sandbox), false, 'hasMinimapFrame must be false after invalidation');
+  // Trigger visualViewport resize while awaiting fresh frame
+  sandbox.visualViewport.height = 620;
+  sandbox.visualViewport.dispatch('resize');
+  assert(minimapBoxEl.classList.contains('hidden'), 'visualViewport resize must NEVER re-show stale minimap');
+  assert.strictEqual(sandbox.__minimapDraws, mmDrawsBefore, 'visualViewport resize must emit 0 minimap drawImage calls before fresh frame');
+
+  // Decode fresh frame for session_gen=4 (2560x1307)
+  sandbox.createImageBitmap = async () => ({ width: 2560, height: 1307, tag: 'gen4', close() {} });
+  await vm.runInContext("decodeAndDrawBlob(new Blob('gen4'), wsConnGen, frameRenderGen)", sandbox);
+  assert(!minimapBoxEl.classList.contains('hidden'), 'Minimap should reappear once fresh zoomed frame is drawn');
+
+  // =========================================================================
+  // 5. P0-3: Two-finger gestures zero leakage (interact / drag / trackpad)
+  // =========================================================================
+  // 5a. Default interact mode: finger 1 moves 9px, then finger 2 joins => 0 wheel!
+  vm.runInContext("setGestureMode('interact'); lastWheelSent = 0;", sandbox);
+  sock2.sent.length = 0;
+  stageEl.dispatch('pointerdown', { pointerId: 50, clientX: 200, clientY: 394, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointermove', { pointerId: 50, clientX: 200, clientY: 385, pointerType: 'touch', target: screenEl }); // 9px drift
+  stageEl.dispatch('pointerdown', { pointerId: 51, clientX: 260, clientY: 394, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointermove', { pointerId: 50, clientX: 160, clientY: 385, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointermove', { pointerId: 51, clientX: 300, clientY: 394, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointerup', { pointerId: 51, clientX: 300, clientY: 394, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointermove', { pointerId: 50, clientX: 160, clientY: 460, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointerup', { pointerId: 50, clientX: 160, clientY: 460, pointerType: 'touch', target: screenEl });
+  assert.strictEqual(sock2.sent.filter((m) => m.action === 'wheel').length, 0, 'Interact: 9px 1st-finger drift + 2nd finger must emit 0 wheel');
+  assert.strictEqual(sock2.sent.filter((m) => m.action === 'click').length, 0, 'Interact: pinch must emit 0 click');
+
+  // 5b. Drag mode: finger 1 presses, then finger 2 joins => 0 mousedown, 0 mouseup!
+  vm.runInContext("setGestureMode('drag');", sandbox);
+  sock2.sent.length = 0;
+  stageEl.dispatch('pointerdown', { pointerId: 52, clientX: 180, clientY: 394, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointermove', { pointerId: 52, clientX: 185, clientY: 394, pointerType: 'touch', target: screenEl }); // 5px drift
+  stageEl.dispatch('pointerdown', { pointerId: 53, clientX: 260, clientY: 394, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointermove', { pointerId: 52, clientX: 150, clientY: 394, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointermove', { pointerId: 53, clientX: 290, clientY: 394, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointerup', { pointerId: 53, clientX: 290, clientY: 394, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointerup', { pointerId: 52, clientX: 150, clientY: 394, pointerType: 'touch', target: screenEl });
+  assert.strictEqual(sock2.sent.filter((m) => m.action === 'mousedown').length, 0, 'Drag mode two-finger join must emit 0 mousedown');
+  assert.strictEqual(sock2.sent.filter((m) => m.action === 'mouseup').length, 0, 'Drag mode two-finger join must emit 0 mouseup');
+
+  // 5c. Trackpad mode: 2->1 lift + remaining finger micro-move + lift within 280ms => 0 rightclick!
+  vm.runInContext("setGestureMode('trackpad');", sandbox);
+  sock2.sent.length = 0;
+  stageEl.dispatch('pointerdown', { pointerId: 54, clientX: 180, clientY: 394, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointerdown', { pointerId: 55, clientX: 260, clientY: 394, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointerup', { pointerId: 55, clientX: 260, clientY: 394, pointerType: 'touch', target: screenEl }); // 2 -> 1
+  stageEl.dispatch('pointermove', { pointerId: 54, clientX: 183, clientY: 394, pointerType: 'touch', target: screenEl }); // 3px micro-move
+  stageEl.dispatch('pointerup', { pointerId: 54, clientX: 183, clientY: 394, pointerType: 'touch', target: screenEl }); // within 280ms
+  assert.strictEqual(sock2.sent.filter((m) => m.action === 'rightclick').length, 0, 'Trackpad 2->1 micro-move must emit 0 rightclick');
+
+  // =========================================================================
+  // 6. P0-4: Outside-stage pointer-captured release, letterbox & minimap wheel isolation, fractional DPR (2.75 & 2.625) <= 1 CSS px
+  // =========================================================================
+  vm.runInContext("setGestureMode('interact'); setViewMode('fit_height', true);", sandbox);
+  sock2.sent.length = 0;
+  // Stage rect left=17 -> press 2px inside left edge (clientX=19), release 2px outside left edge (clientX=15)
+  stageEl.dispatch('pointerdown', { pointerId: 60, clientX: 19, clientY: 394, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointerup', { pointerId: 60, clientX: 15, clientY: 394, pointerType: 'touch', target: screenEl });
+  assert.strictEqual(sock2.sent.filter((m) => m.action === 'click').length, 0, 'Pointer-captured release 2px outside stage must emit 0 click');
+
+  // Wheel & pointer on #minimap-box must NOT bubble to #stage or emit remote wheel
+  vm.runInContext("lastWheelSent = 0;", sandbox);
+  sock2.sent.length = 0;
+  minimapSurfEl.dispatch('wheel', { clientX: 310, clientY: 690, deltaX: 0, deltaY: 120 });
+  minimapBoxEl.dispatch('wheel', { clientX: 310, clientY: 690, deltaX: 0, deltaY: 120 });
+  assert.strictEqual(sock2.sent.filter((m) => m.action === 'wheel').length, 0, 'Minimap wheel must emit 0 remote wheel');
+
+  // Letterbox wheel & single-finger drag in fit mode -> 0 remote wheel!
+  vm.runInContext("setViewMode('fit', true); lastWheelSent = 0;", sandbox);
+  sock2.sent.length = 0;
+  // Top black letterbox bar: stageY=10 -> clientY = 44 + 10 = 54
+  stageEl.dispatch('wheel', { clientX: 212, clientY: 54, deltaX: 0, deltaY: 120, target: screenEl });
+  stageEl.dispatch('pointerdown', { pointerId: 61, clientX: 212, clientY: 54, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointermove', { pointerId: 61, clientX: 212, clientY: 110, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointerup', { pointerId: 61, clientX: 212, clientY: 110, pointerType: 'touch', target: screenEl });
+  assert.strictEqual(sock2.sent.filter((m) => m.action === 'wheel').length, 0, 'Letterbox wheel & drag must emit 0 remote wheel');
+
+  // Fractional & integer DPR precision check: 390x700 stage (offset left=17, top=44) + 2560x1307 remote across DPR 1 / 1.5 / 2 / 2.625 / 2.75 / 3
+  for (const testDpr of [1, 1.5, 2, 2.625, 2.75, 3]) {
+    sandbox.devicePixelRatio = testDpr;
+    for (const mode of ['fit', 'fit_height', 'focus_1x']) {
+      vm.runInContext(`setViewMode('${mode}', true);`, sandbox);
+      const drawArgs = sandbox.__lastScreenDraw;
+      assert(drawArgs && drawArgs.length === 9, `Expected 9-arg drawImage at DPR ${testDpr} ${mode}`);
+      const [, sx, sy, sW, sH, dx, dy, dW, dH] = drawArgs;
+      const canvasW = screenEl.width;
+      const canvasH = screenEl.height;
+      // Map drawn canvas backing-store rect back to CSS stage coords via actual browser CSS scaling (canvasW / 390, canvasH / 700)
+      const cssLeft = dx * (390 / canvasW);
+      const cssTop = dy * (700 / canvasH);
+      const cssW = dW * (390 / canvasW);
+      const cssH = dH * (700 / canvasH);
+      const testPoints = [
+        [cssLeft + 0.5, cssTop + 0.5],
+        [cssLeft + cssW - 0.5, cssTop + 0.5],
+        [cssLeft + 0.5, cssTop + cssH - 0.5],
+        [cssLeft + cssW - 0.5, cssTop + cssH - 0.5],
+        [cssLeft + cssW / 2, cssTop + cssH / 2],
+      ];
+      for (const [stageX, stageY] of testPoints) {
+        // What remote pixel is ACTUALLY painted under CSS point (stageX, stageY)?
+        const paintedRx = sx + ((stageX - cssLeft) / cssW) * sW;
+        const paintedRy = sy + ((stageY - cssTop) / cssH) * sH;
+        // What remote pixel does clientToRemoteCoords(left + stageX, top + stageY) click?
+        const clicked = vm.runInContext(`clientToRemoteCoords(${17 + stageX}, ${44 + stageY})`, sandbox);
+        assert(clicked, `Expected valid click at DPR ${testDpr} ${mode} (${stageX},${stageY})`);
+        const errX = Math.abs(clicked.x - paintedRx);
+        const errY = Math.abs(clicked.y - paintedRy);
+        assert(
+          errX <= 0.5 && errY <= 0.5,
+          `DPR ${testDpr} ${mode} drift too high at (${stageX.toFixed(1)},${stageY.toFixed(1)}): err=(${errX.toFixed(3)}, ${errY.toFixed(3)})`
+        );
+      }
+    }
+  }
+
+  // =========================================================================
+  // 7. P0-5 + P1: Mobile address bar synchronous focus + Enter/Escape zero key leakage to remote
+  // =========================================================================
+  const chromeUrlInp = getEl('chrome-url-input');
+  const focusBefore = chromeUrlInp._focusCount;
+  vm.runInContext("openChromeUrlEdit();", sandbox);
+  assert.strictEqual(chromeUrlInp._focusCount, focusBefore + 1, 'openChromeUrlEdit must focus() synchronously for iOS Safari');
+  assert.strictEqual(sandbox.document.activeElement, chromeUrlInp);
+
+  // Enter inside #chrome-url-input: must send ONLY goto and 0 remote press Enter (even with bubbling to window after blur!)
+  chromeUrlInp.value = 'https://target.example';
+  sock2.sent.length = 0;
+  chromeUrlInp.dispatch('keydown', { key: 'Enter' }, { bubbleToWindow: true });
+  const gotos = sock2.sent.filter((m) => m.action === 'goto');
+  const pressesAfterEnter = sock2.sent.filter((m) => m.action === 'press');
+  assert.strictEqual(gotos.length, 1, 'Mobile address bar Enter must send goto');
+  assert.strictEqual(gotos[0].url, 'https://target.example');
+  assert.strictEqual(pressesAfterEnter.length, 0, 'Mobile address bar Enter must emit 0 remote press events');
+
+  // Escape inside #chrome-url-input: must close edit and emit 0 remote press Escape!
+  vm.runInContext("openChromeUrlEdit();", sandbox);
+  sock2.sent.length = 0;
+  chromeUrlInp.dispatch('keydown', { key: 'Escape' }, { bubbleToWindow: true });
+  assert(!getEl('chrome-url-pill').classList.contains('editing'), 'Escape must exit address bar editing');
+  assert.strictEqual(sock2.sent.filter((m) => m.action === 'press').length, 0, 'Mobile address bar Escape must emit 0 remote press events');
+
+  console.log('NODE_VM_QA_ADVERSARIAL_PASS');
+})().catch((err) => { console.error(err); process.exit(1); });
+"""
+
+        node_bin = shutil.which("node")
+        if not node_bin:
+            self.skipTest("node binary not available in PATH")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            js_file = Path(tmp) / "inline.js"
+            harness_file = Path(tmp) / "harness_qa_adv.js"
+            js_file.write_text(js_src, encoding="utf-8")
+            harness_file.write_text(harness, encoding="utf-8")
+            proc = subprocess.run(
+                [node_bin, str(harness_file), str(js_file)],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertEqual(
+                0,
+                proc.returncode,
+                f"Node VM QA adversarial regression test failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
+            )
+            self.assertIn("NODE_VM_QA_ADVERSARIAL_PASS", proc.stdout)
 
 
 class TestRound2QABlockersAdversarialRegression(unittest.TestCase):
@@ -7931,6 +8908,2446 @@ class TestRound14InFlightSessionInvalidation(unittest.TestCase):
                             http_ens.calls,
                             label,
                         )
+
+            asyncio.run(_scenario())
+
+
+class TestRound2QAFourBlockersClosure(unittest.TestCase):
+    """Targeted adversarial regressions for all 4 Round-2 QA blockers (job-3dfbf39b0e)."""
+
+    def test_frontend_four_blockers_cmd_id_preframe_drag_release_grace_and_blackbar(self) -> None:
+        """Node VM adversarial verification of all 4 frontend blockers:
+        1. cmd_id -> rendered_tab_cmds authoritative unlock (no 2.5s timer, no old-frame unlock,
+           no early metadata state(B) unlock, deferred unlock until B JPEG finishes decoding,
+           static identical-pixel page B unlocks without deadlock, rejected tab_cmd_ack unlocks).
+        2. Pre-first-frame pointerdown -> first JPEG draws -> pointerup emits strictly 0 click.
+        3. Committed drag on Tab A -> switch_tab emits mouseup on Tab A BEFORE switch_tab,
+           and lifting finger after switching to Tab B emits 0 mouseup to Tab B.
+        4. Touch drag +16px at 40ms + 2nd finger emits 0 mousedown/move/mouseup; trackpad
+           two-finger swipe inside top black letterbox bar emits 0 wheel (while inside frame works).
+        """
+        html_src = INDEX_HTML_PATH.read_text(encoding="utf-8")
+        blocks = re.findall(r"<script>(.*?)</script>", html_src, re.S)
+        self.assertEqual(1, len(blocks))
+        js_src = blocks[0]
+
+        harness = r"""
+const vm = require('vm');
+const fs = require('fs');
+const assert = require('assert');
+const jsCode = fs.readFileSync(process.argv[2], 'utf8');
+
+class FakeClassList {
+  constructor(initial = []) { this._set = new Set(initial); }
+  add(...xs) { xs.forEach((x) => this._set.add(x)); }
+  remove(...xs) { xs.forEach((x) => this._set.delete(x)); }
+  toggle(x, force) {
+    if (typeof force === 'boolean') { force ? this._set.add(x) : this._set.delete(x); return force; }
+    if (this._set.has(x)) { this._set.delete(x); return false; }
+    this._set.add(x); return true;
+  }
+  contains(x) { return this._set.has(x); }
+}
+
+const elements = new Map();
+class FakeEl {
+  constructor(id = '', tag = 'DIV') {
+    this.id = id;
+    this.tagName = tag;
+    this.style = {};
+    this.classList = new FakeClassList();
+    this.className = '';
+    this.textContent = '';
+    this._innerHTML = '';
+    this.value = '';
+    this.width = 1280;
+    this.height = 800;
+    this.clientWidth = 440;
+    this.clientHeight = 700;
+    this.children = [];
+    this.parent = null;
+    this._listeners = {};
+    this._rect = { left: 0, top: 0, width: 440, height: 700 };
+  }
+  get innerHTML() { return this._innerHTML; }
+  set innerHTML(v) { this._innerHTML = v; if (v === '') this.children = []; }
+  addEventListener(ev, fn) { (this._listeners[ev] ||= []).push(fn); }
+  dispatch(ev, obj = {}) {
+    let stopped = false;
+    const evt = {
+      defaultPrevented: false,
+      preventDefault() { this.defaultPrevented = true; },
+      stopPropagation() { stopped = true; },
+      target: this,
+      ...obj,
+    };
+    let cur = this;
+    while (cur && !stopped) {
+      (cur._listeners[ev] || []).forEach((fn) => fn(evt));
+      cur = cur.parent;
+    }
+    return evt;
+  }
+  getBoundingClientRect() { return this._rect; }
+  appendChild(c) { c.parent = this; this.children.push(c); return c; }
+  removeChild(c) { this.children = this.children.filter((x) => x !== c); c.parent = null; }
+  remove() {}
+  focus() {}
+  blur() {}
+  select() {}
+  setSelectionRange() {}
+  setPointerCapture() {}
+  setAttribute() {}
+  closest(sel) {
+    let cur = this;
+    while (cur) {
+      if (sel.startsWith('#') && cur.id === sel.slice(1)) return cur;
+      cur = cur.parent;
+    }
+    return null;
+  }
+  getContext() {
+    return { clearRect() {}, drawImage() {} };
+  }
+}
+
+function getEl(id) {
+  if (!elements.has(id)) {
+    let tag = 'DIV';
+    if (id.includes('input')) tag = 'INPUT';
+    else if (id === 'screen' || id === 'minimap-canvas') tag = 'CANVAS';
+    elements.set(id, new FakeEl(id, tag));
+  }
+  return elements.get(id);
+}
+
+const stageEl = getEl('stage');
+stageEl.clientWidth = 440; stageEl.clientHeight = 700;
+stageEl._rect = { left: 0, top: 0, width: 440, height: 700 };
+const canvasWrapEl = getEl('canvas-wrap');
+stageEl.appendChild(canvasWrapEl);
+const screenEl = getEl('screen');
+screenEl.clientWidth = 440; screenEl.clientHeight = 700;
+screenEl._rect = { left: 0, top: 0, width: 440, height: 700 };
+canvasWrapEl.appendChild(screenEl);
+getEl('kb-sheet').classList.add('hidden');
+getEl('clip-sheet').classList.add('hidden');
+getEl('more-sheet').classList.add('hidden');
+getEl('tabs-sheet').classList.add('hidden');
+getEl('profile-sheet').classList.add('hidden');
+getEl('minimap-box').classList.add('hidden');
+
+class FakeBlob { constructor(id) { this.id = id; } }
+const wsInstances = [];
+class FakeWS {
+  static OPEN = 1; static CONNECTING = 0; static CLOSED = 3;
+  constructor(url) { this.url = url; this.readyState = FakeWS.OPEN; this.sent = []; wsInstances.push(this); }
+  send(s) { this.sent.push(JSON.parse(s)); }
+  close() { this.readyState = FakeWS.CLOSED; }
+}
+
+let fakeNow = 10000;
+const RealDate = Date;
+class FakeDate extends RealDate {
+  static now() { return fakeNow; }
+}
+
+const timers = [];
+const sandbox = {
+  console, Math, Date: FakeDate, JSON, Map, Set, Array, Number, String, Boolean, Promise, Object, Error, URL: class extends URL {},
+  performance: { now: () => fakeNow },
+  devicePixelRatio: 2,
+  Blob: FakeBlob,
+  WebSocket: FakeWS,
+  location: { protocol: 'https:', host: 'live.example.com' },
+  FormData: class { append() {} },
+  fetch: async () => ({ ok: true, status: 200, json: async () => ({ ok: true }) }),
+  setTimeout: (fn, ms) => { const id = timers.length + 1; timers.push({ id, fn, ms, cleared: false }); return id; },
+  clearTimeout: (id) => { const t = timers.find((x) => x.id === id); if (t) t.cleared = true; },
+  setInterval: () => 1,
+  clearInterval: () => {},
+  document: {
+    getElementById: (id) => getEl(id),
+    createElement: (tag) => new FakeEl('', tag.toUpperCase()),
+    addEventListener: () => {},
+    activeElement: null,
+    body: new FakeEl('body', 'BODY'),
+  },
+  navigator: {},
+  window: null,
+};
+sandbox.window = sandbox;
+sandbox.addEventListener = () => {};
+sandbox.scrollTo = () => {};
+sandbox.innerHeight = 700;
+sandbox.Telegram = { WebApp: { initData: 'mock_init', ready() {}, expand() {}, disableVerticalSwipes() {} } };
+
+vm.createContext(sandbox);
+vm.runInContext(jsCode, sandbox);
+
+(async () => {
+  const sock = wsInstances[0];
+  sock.onopen();
+  sock.onmessage({ data: JSON.stringify({ type: 'auth_ok', bot: 'main', user_id: 111, role: 'admin' }) });
+  sock.onmessage({ data: JSON.stringify({
+    type: 'state', running: true, engine_mode: 'async_hosted', session_gen: 1, takeover_gen: 1, takeover: true,
+    vw: 1280, vh: 800, url: 'https://tab-a.example',
+    rendered_tab_cmds: [],
+    tabs: [
+      { index: 0, title: 'A', url: 'https://tab-a.example', active: true },
+      { index: 1, title: 'B', url: 'https://tab-b.example', active: false }
+    ]
+  }) });
+
+  // =========================================================================
+  // Blocker #2: Pre-first-frame pointerdown -> first JPEG draws -> pointerup => 0 clicks!
+  // =========================================================================
+  sock.sent.length = 0;
+  stageEl.dispatch('pointerdown', { pointerId: 10, clientX: 220, clientY: 350, pointerType: 'touch', target: screenEl });
+  sandbox.createImageBitmap = async (blob) => ({ width: 1280, height: 800, tag: blob.id, close() {} });
+  sock.onmessage({ data: new FakeBlob('firstA') });
+  await new Promise((r) => setImmediate(r));
+  assert.strictEqual(vm.runInContext('canDispatchRemoteInput()', sandbox), true, 'First frame drawn');
+  stageEl.dispatch('pointerup', { pointerId: 10, clientX: 220, clientY: 350, pointerType: 'touch', target: screenEl });
+  assert.strictEqual(sock.sent.filter((m) => m.action === 'click').length, 0, 'Blocker #2: pre-first-frame press + post-first-frame release MUST emit 0 click');
+
+  // Fresh tap AFTER first frame works normally
+  stageEl.dispatch('pointerdown', { pointerId: 11, clientX: 220, clientY: 350, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointerup', { pointerId: 11, clientX: 220, clientY: 350, pointerType: 'touch', target: screenEl });
+  assert.strictEqual(sock.sent.filter((m) => m.action === 'click').length, 1, 'Post-first-frame normal tap must emit 1 click');
+
+  // =========================================================================
+  // Blocker #1: Authoritative cmd_id -> rendered_tab_cmds confirmation
+  // =========================================================================
+  // Case 1a: In-flight old JPEG(A) starts decoding BEFORE switch_tab, finishes AFTER switch_tab => MUST STAY LOCKED!
+  let resolveOldA;
+  sandbox.createImageBitmap = (blob) => new Promise((res) => {
+    if (blob.id === 'oldA_inflight') {
+      resolveOldA = () => res({ width: 1280, height: 800, tag: 'oldA_inflight', close() {} });
+    } else {
+      res({ width: 1280, height: 800, tag: blob.id, close() {} });
+    }
+  });
+  sock.onmessage({ data: new FakeBlob('oldA_inflight') }); // starts decoding BEFORE switch_tab
+
+  const timersBeforeSwitch = timers.length;
+  sock.sent.length = 0;
+  vm.runInContext("sendInput({ action: 'switch_tab', index: 1 });", sandbox);
+  const swCmd = sock.sent.find((m) => m.action === 'switch_tab');
+  assert(swCmd && /^tc-[A-Za-z0-9]{12}-\d+-\d+$/.test(swCmd.cmd_id), 'switch_tab must send valid cmd_id');
+  const added2500Timers = timers.slice(timersBeforeSwitch).filter((t) => t.ms === 2500);
+  assert.strictEqual(added2500Timers.length, 0, 'Blocker #1: MUST NOT arm any 2.5s timeout unlock timer');
+
+  // Old JPEG(A) that entered decoder BEFORE switch_tab finishes decoding AFTER switch_tab
+  resolveOldA();
+  await new Promise((r) => setImmediate(r));
+  assert.strictEqual(vm.runInContext('canDispatchRemoteInput()', sandbox), false, 'Old in-flight A decode MUST NOT unlock switch_tab');
+  stageEl.dispatch('pointerdown', { pointerId: 12, clientX: 220, clientY: 350, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointerup', { pointerId: 12, clientX: 220, clientY: 350, pointerType: 'touch', target: screenEl });
+  assert.strictEqual(sock.sent.filter((m) => m.action === 'click').length, 0, 'Click after old A decode MUST be 0');
+
+  // Case 1b: Another old A JPEG arrives AFTER switch_tab + Sync old A state -> MUST STAY LOCKED!
+  sock.onmessage({ data: new FakeBlob('oldA_late') });
+  await new Promise((r) => setImmediate(r));
+  sock.onmessage({ data: JSON.stringify({
+    type: 'state', running: true, session_gen: 1, takeover_gen: 1, takeover: true,
+    vw: 1280, vh: 800, url: 'https://tab-a.example', rendered_tab_cmds: [],
+    tabs: [
+      { index: 0, title: 'A', url: 'https://tab-a.example', active: true },
+      { index: 1, title: 'B', url: 'https://tab-b.example', active: false }
+    ]
+  }) });
+  assert.strictEqual(vm.runInContext('canDispatchRemoteInput()', sandbox), false, 'Late A frame + A state MUST NOT unlock');
+
+  // Case 1c: Hosted background _schedule_metadata_refresh sends early state(B) WITHOUT rendered_tab_cmds -> MUST STAY LOCKED!
+  sock.onmessage({ data: JSON.stringify({
+    type: 'state', running: true, session_gen: 1, takeover_gen: 1, takeover: true,
+    vw: 1280, vh: 800, url: 'https://tab-b.example', rendered_tab_cmds: [],
+    tabs: [
+      { index: 0, title: 'A', url: 'https://tab-a.example', active: false },
+      { index: 1, title: 'B', url: 'https://tab-b.example', active: true }
+    ]
+  }) });
+  assert.strictEqual(vm.runInContext('canDispatchRemoteInput()', sandbox), false, 'Early Hosted state(B) without rendered_tab_cmds MUST NOT unlock');
+  stageEl.dispatch('pointerdown', { pointerId: 13, clientX: 220, clientY: 350, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointerup', { pointerId: 13, clientX: 220, clientY: 350, pointerType: 'touch', target: screenEl });
+  assert.strictEqual(sock.sent.filter((m) => m.action === 'click').length, 0, 'Click on early state(B) while A pixels still on canvas MUST be 0');
+
+  // Case 1d: Server sends JPEG(B) (slow decode) THEN state(B) WITH rendered_tab_cmds=[swCmd.cmd_id] ->
+  // MUST STAY LOCKED while JPEG(B) is still decoding, then UNLOCK the instant JPEG(B) finishes drawing!
+  let resolveB;
+  sandbox.createImageBitmap = (blob) => new Promise((res) => {
+    if (blob.id === 'realB') {
+      resolveB = () => res({ width: 1280, height: 800, tag: 'realB', close() {} });
+    } else {
+      res({ width: 1280, height: 800, tag: blob.id, close() {} });
+    }
+  });
+  sock.onmessage({ data: new FakeBlob('realB') });
+  sock.onmessage({ data: JSON.stringify({
+    type: 'state', running: true, session_gen: 1, takeover_gen: 1, takeover: true,
+    vw: 1280, vh: 800, url: 'https://tab-b.example', rendered_tab_cmds: [swCmd.cmd_id],
+    tabs: [
+      { index: 0, title: 'A', url: 'https://tab-a.example', active: false },
+      { index: 1, title: 'B', url: 'https://tab-b.example', active: true }
+    ]
+  }) });
+  assert.strictEqual(vm.runInContext('canDispatchRemoteInput()', sandbox), false, 'MUST stay locked while target JPEG(B) is still decoding');
+  resolveB();
+  await new Promise((r) => setImmediate(r));
+  assert.strictEqual(vm.runInContext('canDispatchRemoteInput()', sandbox), true, 'MUST unlock immediately once target JPEG(B) finishes drawing');
+  sock.sent.length = 0;
+  stageEl.dispatch('pointerdown', { pointerId: 14, clientX: 220, clientY: 350, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointerup', { pointerId: 14, clientX: 220, clientY: 350, pointerType: 'touch', target: screenEl });
+  assert.strictEqual(sock.sent.filter((m) => m.action === 'click').length, 1, 'Click on Tab B must succeed after JPEG(B) drawn');
+
+  // Case 1e: Static identical-pixel page switch (0 new JPEG, only state with rendered_tab_cmds) -> unlocks immediately!
+  sock.sent.length = 0;
+  vm.runInContext("sendInput({ action: 'switch_tab', index: 0 });", sandbox);
+  const swStatic = sock.sent.find((m) => m.action === 'switch_tab');
+  assert.strictEqual(vm.runInContext('canDispatchRemoteInput()', sandbox), false);
+  sock.onmessage({ data: JSON.stringify({
+    type: 'state', running: true, session_gen: 1, takeover_gen: 1, takeover: true,
+    vw: 1280, vh: 800, url: 'https://tab-a.example', rendered_tab_cmds: [swCmd.cmd_id, swStatic.cmd_id],
+    tabs: [
+      { index: 0, title: 'A', url: 'https://tab-a.example', active: true },
+      { index: 1, title: 'B', url: 'https://tab-b.example', active: false }
+    ]
+  }) });
+  assert.strictEqual(vm.runInContext('canDispatchRemoteInput()', sandbox), true, 'Static identical-pixel tab switch MUST unlock without deadlock');
+
+  // Case 1f: Rejected tab_cmd_ack unlocks cleanly
+  sock.sent.length = 0;
+  vm.runInContext("sendInput({ action: 'new_tab' });", sandbox);
+  const newTabCmd = sock.sent.find((m) => m.action === 'new_tab');
+  assert.strictEqual(vm.runInContext('canDispatchRemoteInput()', sandbox), false);
+  sock.onmessage({ data: JSON.stringify({ type: 'tab_cmd_ack', cmd_id: newTabCmd.cmd_id, status: 'rejected' }) });
+  assert.strictEqual(vm.runInContext('canDispatchRemoteInput()', sandbox), true, 'Rejected tab_cmd_ack must unlock client');
+
+  // =========================================================================
+  // Blocker #3 (Frontend): Committed drag on Tab A -> switch_tab releases mouseup BEFORE switch_tab, 0 mouseup on Tab B!
+  // =========================================================================
+  vm.runInContext("setGestureMode('drag');", sandbox);
+  sock.sent.length = 0;
+  stageEl.dispatch('pointerdown', { pointerId: 20, clientX: 220, clientY: 350, pointerType: 'mouse', button: 0, target: screenEl });
+  assert.strictEqual(sock.sent.filter((m) => m.action === 'mousedown').length, 1, 'Desktop mouse drag commits mousedown immediately');
+  sock.sent.length = 0;
+  vm.runInContext("sendInput({ action: 'switch_tab', index: 1 });", sandbox);
+  const actionsSent = sock.sent.map((m) => m.action);
+  assert.deepStrictEqual(actionsSent, ['mouseup', 'switch_tab'], 'Blocker #3: switch_tab MUST emit mouseup on OLD tab strictly BEFORE switch_tab');
+  const sw3 = sock.sent[1];
+  // Confirm Tab B arrived, then lift original pointer 20 -> MUST emit 0 mouseup on Tab B!
+  sock.onmessage({ data: JSON.stringify({
+    type: 'state', running: true, session_gen: 1, takeover_gen: 1, takeover: true,
+    vw: 1280, vh: 800, url: 'https://tab-b.example', rendered_tab_cmds: [sw3.cmd_id],
+    tabs: [
+      { index: 0, title: 'A', url: 'https://tab-a.example', active: false },
+      { index: 1, title: 'B', url: 'https://tab-b.example', active: true }
+    ]
+  }) });
+  sock.sent.length = 0;
+  stageEl.dispatch('pointerup', { pointerId: 20, clientX: 220, clientY: 350, pointerType: 'mouse', button: 0, target: screenEl });
+  assert.strictEqual(sock.sent.filter((m) => m.action === 'mouseup').length, 0, 'Lifting old pointer on Tab B MUST emit 0 mouseup');
+
+  // =========================================================================
+  // Blocker #4a: Drag mode touch +16px at 40ms + 2nd finger joins -> 0 mousedown / 0 move / 0 mouseup!
+  // =========================================================================
+  vm.runInContext("setGestureMode('drag');", sandbox);
+  sock.sent.length = 0;
+  fakeNow = 20000;
+  stageEl.dispatch('pointerdown', { pointerId: 30, clientX: 200, clientY: 350, pointerType: 'touch', target: screenEl });
+  fakeNow = 20040; // 40ms < 80ms grace
+  stageEl.dispatch('pointermove', { pointerId: 30, clientX: 216, clientY: 350, pointerType: 'touch', target: screenEl }); // +16px (>14px)
+  assert.strictEqual(sock.sent.length, 0, 'Blocker #4a: +16px within 40ms (<80ms) MUST NOT commit mousedown early');
+  fakeNow = 20041;
+  stageEl.dispatch('pointerdown', { pointerId: 31, clientX: 280, clientY: 350, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointermove', { pointerId: 30, clientX: 180, clientY: 350, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointermove', { pointerId: 31, clientX: 310, clientY: 350, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointerup', { pointerId: 31, clientX: 310, clientY: 350, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointerup', { pointerId: 30, clientX: 180, clientY: 350, pointerType: 'touch', target: screenEl });
+  assert.strictEqual(sock.sent.filter((m) => ['mousedown', 'move', 'mouseup'].includes(m.action)).length, 0, 'Blocker #4a: 40ms/+16px + 2nd finger MUST emit 0 mousedown/move/mouseup');
+
+  // Positive control: single-finger touch drag past 80ms commits mousedown(startPt) + move(curPt) + mouseup!
+  sock.sent.length = 0;
+  fakeNow = 21000;
+  stageEl.dispatch('pointerdown', { pointerId: 32, clientX: 200, clientY: 350, pointerType: 'touch', target: screenEl });
+  fakeNow = 21040;
+  stageEl.dispatch('pointermove', { pointerId: 32, clientX: 220, clientY: 350, pointerType: 'touch', target: screenEl });
+  assert.strictEqual(sock.sent.length, 0, 'Still inside 80ms grace');
+  fakeNow = 21085;
+  const dragTimer = timers.slice().reverse().find((t) => !t.cleared && t.ms === 80);
+  assert(dragTimer, 'Expected active 80ms drag grace timer');
+  dragTimer.fn();
+  assert.deepStrictEqual(sock.sent.map((m) => m.action), ['mousedown', 'move'], 'After 80ms grace timer single-finger drag emits mousedown + move');
+  stageEl.dispatch('pointerup', { pointerId: 32, clientX: 220, clientY: 350, pointerType: 'touch', target: screenEl });
+  assert.deepStrictEqual(sock.sent.map((m) => m.action), ['mousedown', 'move', 'mouseup']);
+
+  // =========================================================================
+  // Blocker #4b: Trackpad two-finger swipe inside top black letterbox bar -> 0 wheel!
+  // Stage 440x700, remote 1280x800 in 'fit' mode => rendered height = 440*(800/1280) = 275px => top bar y=[0, 212.5)
+  // =========================================================================
+  vm.runInContext("setViewMode('fit', true); setGestureMode('trackpad'); lastWheelSent = 0;", sandbox);
+  sock.sent.length = 0;
+  fakeNow = 30000;
+  stageEl.dispatch('pointerdown', { pointerId: 40, clientX: 180, clientY: 75, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointerdown', { pointerId: 41, clientX: 260, clientY: 75, pointerType: 'touch', target: screenEl });
+  fakeNow = 30060;
+  stageEl.dispatch('pointermove', { pointerId: 40, clientX: 180, clientY: 120, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointermove', { pointerId: 41, clientX: 260, clientY: 120, pointerType: 'touch', target: screenEl });
+  fakeNow = 30120;
+  stageEl.dispatch('pointermove', { pointerId: 40, clientX: 180, clientY: 160, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointermove', { pointerId: 41, clientX: 260, clientY: 160, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointerup', { pointerId: 41, clientX: 260, clientY: 160, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointerup', { pointerId: 40, clientX: 180, clientY: 160, pointerType: 'touch', target: screenEl });
+  assert.strictEqual(sock.sent.filter((m) => m.action === 'wheel').length, 0, 'Blocker #4b: Trackpad two-finger swipe in black letterbox bar MUST emit 0 wheel');
+
+  // Positive control: Trackpad two-finger swipe INSIDE rendered frame (y=320 -> y=380) emits wheel!
+  sock.sent.length = 0;
+  fakeNow = 31000;
+  stageEl.dispatch('pointerdown', { pointerId: 42, clientX: 180, clientY: 320, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointerdown', { pointerId: 43, clientX: 260, clientY: 320, pointerType: 'touch', target: screenEl });
+  fakeNow = 31060;
+  stageEl.dispatch('pointermove', { pointerId: 42, clientX: 180, clientY: 380, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointermove', { pointerId: 43, clientX: 260, clientY: 380, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointerup', { pointerId: 43, clientX: 260, clientY: 380, pointerType: 'touch', target: screenEl });
+  stageEl.dispatch('pointerup', { pointerId: 42, clientX: 180, clientY: 380, pointerType: 'touch', target: screenEl });
+  assert(sock.sent.filter((m) => m.action === 'wheel').length >= 1, 'Trackpad two-finger swipe inside rendered frame must emit wheel');
+
+  console.log('NODE_VM_FOUR_BLOCKERS_PASS');
+})().catch((err) => { console.error(err); process.exit(1); });
+"""
+
+        node_bin = shutil.which("node")
+        if not node_bin:
+            self.skipTest("node binary not available in PATH")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            js_file = Path(tmp) / "inline.js"
+            harness_file = Path(tmp) / "harness_four_blockers.js"
+            js_file.write_text(js_src, encoding="utf-8")
+            harness_file.write_text(harness, encoding="utf-8")
+            proc = subprocess.run(
+                [node_bin, str(harness_file), str(js_file)],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertEqual(
+                0,
+                proc.returncode,
+                f"Node VM 4-blockers test failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
+            )
+            self.assertIn("NODE_VM_FOUR_BLOCKERS_PASS", proc.stdout)
+
+    def test_backend_hosted_cmd_id_confirmation_stale_frame_drop_static_dedup_and_old_page_button_release(self) -> None:
+        """Hosted backend verification of Blockers #1 & #3:
+        - `_sanitize_tab_cmd_id` validates tokens; `rendered_tab_cmds` present in `state_dict()`,
+          strictly ABSENT in `_redacted_state_dict()`.
+        - In-flight Tab A `_capture_once()` completing after `switch_tab` is discarded (returns False)
+          and NEVER promotes cmd_id or broadcasts stale A frame.
+        - `switch_tab` releases held `_mouse_buttons_down` strictly on OLD page A BEFORE switching,
+          and NEVER sends `mouse.up` to page B.
+        - Target Tab B `_capture_once()` broadcasts JPEG(B) BEFORE `state(B)` containing `cmd_id`.
+        - Static pixel-identical Tab B (dedup hit) STILL promotes `cmd_id` and broadcasts `state(B)`
+          so client never deadlocks.
+        """
+        self.assertEqual("tc-1-42", srv._sanitize_tab_cmd_id("tc-1-42"))
+        self.assertIsNone(srv._sanitize_tab_cmd_id(""))
+        self.assertIsNone(srv._sanitize_tab_cmd_id("bad space"))
+        self.assertIsNone(srv._sanitize_tab_cmd_id("a" * 49))
+        self.assertIsNone(srv._sanitize_tab_cmd_id("bad,comma"))
+
+        async def _scenario() -> None:
+            hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "sec-tok")
+            hub.engine_mode = "async_hosted"
+            hub.session_gen = 5
+            hub.takeover = True
+            hub.takeover_gen = 2
+            hub.session_owner = ("main", 111)
+            hub.takeover_owner = ("main", 111)
+
+            self.assertIn("rendered_tab_cmds", hub.state_dict())
+            self.assertNotIn("rendered_tab_cmds", hub._redacted_state_dict())
+
+            events: list[tuple[str, Any]] = []
+            shot_a_started = asyncio.Event()
+            release_shot_a = asyncio.Event()
+
+            class _FakeMouse:
+                def __init__(self, tag: str) -> None:
+                    self.tag = tag
+                    self.downs: list[str] = []
+                    self.ups: list[str] = []
+
+                async def move(self, _x: float, _y: float) -> None:
+                    pass
+
+                async def down(self, button: str = "left") -> None:
+                    self.downs.append(button)
+
+                async def up(self, button: str = "left") -> None:
+                    self.ups.append(button)
+                    events.append(("mouse_up", self.tag, button))
+
+            class _FakePage:
+                def __init__(self, tag: str, url: str, jpeg_bytes: bytes, *, gate: bool = False) -> None:
+                    self.tag = tag
+                    self.url = url
+                    self._jpeg = jpeg_bytes
+                    self._gate = gate
+                    self.mouse = _FakeMouse(tag)
+                    self.viewport_size = {"width": 1280, "height": 800}
+
+                def on(self, _ev: str, _fn: Any) -> None:
+                    pass
+
+                def is_closed(self) -> bool:
+                    return False
+
+                async def title(self) -> str:
+                    return f"Title {self.tag}"
+
+                async def bring_to_front(self) -> None:
+                    events.append(("bring_to_front", self.tag))
+
+                async def screenshot(self, **_kw: Any) -> bytes:
+                    if self._gate:
+                        self._gate = False
+                        shot_a_started.set()
+                        await release_shot_a.wait()
+                    return self._jpeg
+
+            page_a = _FakePage("A", "https://a.example", b"JPEG_PAGE_A", gate=False)
+            page_b = _FakePage("B", "https://b.example", b"JPEG_PAGE_B")
+            page_c_static = _FakePage("C", "https://c.example", b"JPEG_PAGE_B")  # Identical bytes to B!
+            hub.ctx = types.SimpleNamespace(pages=[page_a, page_b, page_c_static])
+            hub.active_tab_index = 0
+
+            async def _rec_frame(jpeg: bytes) -> None:
+                hub.latest_jpeg = jpeg
+                events.append(("frame", jpeg))
+
+            async def _rec_state() -> None:
+                st = hub.state_dict()
+                events.append(("state", st["url"], list(st["rendered_tab_cmds"])))
+
+            hub.broadcast_frame = _rec_frame  # type: ignore[assignment]
+            hub.broadcast_state = _rec_state  # type: ignore[assignment]
+
+            # 1. Hold left mouse button on page A
+            with mock.patch.object(srv, "_check_live_user_role", return_value="admin"):
+                await hub._execute_human_cmd_async(
+                    {
+                        "action": "mousedown",
+                        "x": 100,
+                        "y": 100,
+                        "button": "left",
+                        "_session_gen": 5,
+                        "_takeover_gen": 2,
+                        "_bot_key": "main",
+                        "_user_id": 111,
+                    }
+                )
+            self.assertEqual(["left"], page_a.mouse.downs)
+            self.assertIn("left", hub._mouse_buttons_down)
+            events.clear()
+
+            # 2. Start stale _capture_once on page A (blocks inside screenshot)
+            page_a._gate = True
+            stale_cap_task = asyncio.create_task(hub._capture_once(nonblocking_meta=True))
+            await asyncio.wait_for(shot_a_started.wait(), timeout=2.0)
+
+            # 3. Execute switch_tab -> page B with cmd_id="tc-1-7"; also verify early metadata refresh
+            #    (running before B screenshot finishes) NEVER promotes tc-1-7!
+            orig_b_shot = page_b.screenshot
+
+            async def _b_shot_with_early_meta(**kw: Any) -> bytes:
+                # Simulate background _schedule_metadata_refresh finishing while B screenshot is in flight
+                await hub._refresh_tabs_metadata(force=True)
+                await hub.broadcast_state()
+                return await orig_b_shot(**kw)
+
+            page_b.screenshot = _b_shot_with_early_meta  # type: ignore[assignment]
+            with mock.patch.object(srv, "_check_live_user_role", return_value="admin"):
+                await hub._execute_human_cmd_async(
+                    {
+                        "action": "switch_tab",
+                        "index": 1,
+                        "cmd_id": "tc-1-7",
+                        "_session_gen": 5,
+                        "_takeover_gen": 2,
+                        "_bot_key": "main",
+                        "_user_id": 111,
+                    }
+                )
+
+            # Release stale A screenshot AFTER switch_tab completed -> MUST be discarded!
+            release_shot_a.set()
+            stale_res = await asyncio.wait_for(stale_cap_task, timeout=2.0)
+            self.assertFalse(stale_res, "Stale page A screenshot finishing after tab switch must be discarded")
+
+            # Verify Blocker #3: old page A released left BEFORE bring_to_front(B), page B got 0 ups!
+            self.assertEqual(["left"], page_a.mouse.ups)
+            self.assertEqual([], page_b.mouse.ups)
+            self.assertEqual(set(), hub._mouse_buttons_down)
+            up_idx = events.index(("mouse_up", "A", "left"))
+            btf_idx = events.index(("bring_to_front", "B"))
+            self.assertLess(up_idx, btf_idx, "Old page A mouse.up must happen BEFORE bring_to_front(B)")
+
+            # Verify early state(B) emitted mid-screenshot did NOT contain tc-1-7, and JPEG(B) came BEFORE confirmed state(B)
+            early_state_b_idx = events.index(("state", "https://b.example", []))
+            frame_b_idx = events.index(("frame", b"JPEG_PAGE_B"))
+            state_b_idx = next(
+                i for i, ev in enumerate(events) if ev[0] == "state" and "tc-1-7" in ev[2]
+            )
+            self.assertLess(early_state_b_idx, frame_b_idx, "Early metadata state(B) had empty rendered_tab_cmds")
+            self.assertLess(frame_b_idx, state_b_idx, "Target JPEG(B) must be broadcast BEFORE state(B) with cmd_id")
+            self.assertNotIn(("frame", b"JPEG_PAGE_A"), events, "Stale A JPEG must never be broadcast")
+
+            # 4. Switch to static pixel-identical page C (same bytes as B -> dedup hit!) with cmd_id="tc-1-8"
+            events.clear()
+            with mock.patch.object(srv, "_check_live_user_role", return_value="admin"):
+                await hub._execute_human_cmd_async(
+                    {
+                        "action": "switch_tab",
+                        "index": 2,
+                        "cmd_id": "tc-1-8",
+                        "_session_gen": 5,
+                        "_takeover_gen": 2,
+                        "_bot_key": "main",
+                        "_user_id": 111,
+                    }
+                )
+            # Even with 0 duplicate JPEG broadcasts, state(C) MUST carry 'tc-1-8' so client never deadlocks!
+            self.assertEqual([], [ev for ev in events if ev[0] == "frame"])
+            state_c_evs = [ev for ev in events if ev[0] == "state" and "tc-1-8" in ev[2]]
+            self.assertTrue(state_c_evs, "Static identical-pixel tab switch MUST still emit state with cmd_id")
+            self.assertEqual("https://c.example", state_c_evs[0][1])
+
+            # 5. Clearing session caches clears both pending & rendered tab cmd ids
+            hub._clear_session_caches()
+            self.assertEqual([], hub.state_dict()["rendered_tab_cmds"])
+            self.assertEqual([], hub._pending_tab_cmd_ids)
+
+        asyncio.run(_scenario())
+
+    def test_backend_sync_ack_tab_cmds_ordering_and_old_page_button_release(self) -> None:
+        """Sync backend verification of Blockers #1 & #3:
+        - Round 1 push sends Tab A JPEG without ack_tab_cmds (hub rendered_tab_cmds stays empty),
+          receives switch_tab(1, cmd_id='tc-2-9'), releases held mouse button on OLD page A,
+          switches to Tab B, and records 'tc-2-9' in _acked_tab_cmds.
+        - Round 2 push sends Tab B JPEG with query param ack_tab_cmds=tc-2-9; internal_sync_push
+          broadcasts JPEG(B) FIRST and state(B) WITH rendered_tab_cmds=['tc-2-9'] SECOND,
+          and SyncLiveBridge clears _acked_tab_cmds after 200 OK.
+        """
+        import urllib.parse as _up
+
+        async def _scenario() -> None:
+            hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "sec-tok")
+            hub.engine_mode = "sync_external"
+            hub.session_gen = 9
+            hub.takeover = True
+            hub.takeover_gen = 3
+            hub.session_owner = ("main", 111)
+            hub.takeover_owner = ("main", 111)
+            hub._sync_lease_id = "lease-sync-9"
+            hub._sync_last_push_ts = srv.time.monotonic()
+
+            events: list[tuple[str, Any]] = []
+
+            async def _rec_frame(jpeg: bytes) -> None:
+                hub.latest_jpeg = jpeg
+                events.append(("frame", jpeg))
+
+            async def _rec_state() -> None:
+                st = hub.state_dict()
+                events.append(("state", st["url"], list(st["rendered_tab_cmds"])))
+
+            hub.broadcast_frame = _rec_frame  # type: ignore[assignment]
+            hub.broadcast_state = _rec_state  # type: ignore[assignment]
+
+            # Queue switch_tab command with cmd_id into hub.sync_cmd_queue
+            hub._enqueue_sync_cmd(
+                {
+                    "action": "switch_tab",
+                    "index": 1,
+                    "cmd_id": "tc-2-9",
+                    "session_gen": 9,
+                    "takeover_gen": 3,
+                    "_bot_key": "main",
+                    "_user_id": 111,
+                }
+            )
+
+            class _SyncMouse:
+                def __init__(self, ups: list[str]) -> None:
+                    self._ups = ups
+
+                def move(self, _x: float, _y: float) -> None:
+                    pass
+
+                def down(self, button: str = "left") -> None:
+                    pass
+
+                def up(self, button: str = "left") -> None:
+                    self._ups.append(button)
+
+            ups_a: list[str] = []
+            ups_b: list[str] = []
+
+            class _SyncPage:
+                def __init__(self, url: str, title: str, jpeg: bytes, ups: list[str]) -> None:
+                    self.url = url
+                    self._title = title
+                    self._jpeg = jpeg
+                    self.mouse = _SyncMouse(ups)
+                    self.viewport_size = {"width": 1280, "height": 800}
+
+                def on(self, _ev: str, _fn: Any) -> None:
+                    pass
+
+                def is_closed(self) -> bool:
+                    return False
+
+                def title(self) -> str:
+                    return self._title
+
+                def bring_to_front(self) -> None:
+                    pass
+
+                def screenshot(self, **_kw: Any) -> bytes:
+                    return self._jpeg
+
+            page_a = _SyncPage("https://sync-a.example", "SyncA", b"SYNC_JPEG_A", ups_a)
+            page_b = _SyncPage("https://sync-b.example", "SyncB", b"SYNC_JPEG_B", ups_b)
+
+            posted_queries: list[dict[str, str]] = []
+
+            # We drive SyncLiveBridge synchronously against real internal_sync_push in-process via a helper
+            async def _dispatch_push(url: str, headers: dict[str, str], data: bytes) -> dict[str, Any]:
+                parsed = _up.urlparse(url)
+                q = {k: v[-1] for k, v in _up.parse_qs(parsed.query, keep_blank_values=True).items()}
+                posted_queries.append(q)
+                req = types.SimpleNamespace(
+                    headers=headers,
+                    query=q,
+                    remote="127.0.0.1",
+                    app={"hub": hub},
+                    read=mock.AsyncMock(return_value=data),
+                )
+                with (
+                    mock.patch.object(srv, "web", _FakeWeb),
+                    mock.patch.object(srv, "_check_live_user_role", return_value="admin"),
+                ):
+                    resp = await srv.internal_sync_push(req)  # type: ignore[arg-type]
+                return resp.data
+
+            # Run round 1 and round 2 manually using SyncLiveBridge + real internal_sync_push
+            bridge = live_browser_ctl.SyncLiveBridge.__new__(live_browser_ctl.SyncLiveBridge)
+            bridge.raw_ctx = types.SimpleNamespace(pages=[page_a, page_b])
+            bridge.client = types.SimpleNamespace(base_url="http://127.0.0.1:18795", token="sec-tok", bot="main", _headers=lambda: {"X-Live-Token": "sec-tok"})
+            bridge.notify = False
+            bridge.enabled = True
+            bridge.active_idx = 0
+            bridge._in_checkpoint = False
+            bridge._held_buttons = {}
+            bridge._acked_tab_cmds = []
+            bridge._pinned_verified = False
+            bridge._profile_dir = None
+            bridge._sync_lease_id = "lease-sync-9"
+            bridge._sync_session_gen = 9
+            bridge._x11_display = None
+            bridge._last_clip = ""
+
+            # Hold left button on Page A
+            bridge._exec_human_sync({"action": "mousedown", "x": 20, "y": 20, "button": "left"})
+            self.assertEqual({"left": page_a}, bridge._held_buttons)
+
+            # Round 1: push Page A frame -> hub broadcasts A without tc-2-9 and returns switch_tab command
+            r1 = await _dispatch_push(
+                "http://127.0.0.1:18795/internal/sync/push?url=https%3A%2F%2Fsync-a.example&lease_id=lease-sync-9&session_gen=9",
+                {"X-Live-Token": "sec-tok", "X-Sync-Lease-Id": "lease-sync-9"},
+                page_a.screenshot(),
+            )
+            self.assertEqual([], hub.state_dict()["rendered_tab_cmds"])
+            self.assertEqual(1, len(r1["commands"]))
+            self.assertEqual("tc-2-9", r1["commands"][0]["cmd_id"])
+
+            # Execute switch_tab on SyncLiveBridge -> releases held button on page_a, switches to page_b, queues ack
+            bridge._exec_human_sync(r1["commands"][0])
+            self.assertEqual(["left"], ups_a, "Sync switch_tab must release held button on OLD page A")
+            self.assertEqual([], ups_b, "Sync switch_tab must NOT send mouse.up to new page B")
+            self.assertEqual(1, bridge.active_idx)
+            self.assertEqual(["tc-2-9"], bridge._acked_tab_cmds)
+
+            # Round 2: push Page B frame via real SyncLiveBridge.sync_checkpoint() using fake session wired to internal_sync_push
+            events.clear()
+            r2_capture: dict[str, Any] = {}
+
+            def _sync_post(url: str, headers=None, data=b"", timeout=None):
+                r2_capture["url"] = url
+                r2_capture["headers"] = dict(headers or {})
+                r2_capture["data"] = data
+                return types.SimpleNamespace(
+                    status_code=200,
+                    json=lambda: {
+                        "ok": True,
+                        "session_gen": 9,
+                        "sync_lease_id": "lease-sync-9",
+                        "takeover": True,
+                        "takeover_gen": 3,
+                        "commands": [],
+                    },
+                )
+
+            bridge.client.session = types.SimpleNamespace(post=_sync_post)
+            bridge.sync_checkpoint(allow_takeover_loop=False)
+            self.assertEqual([], bridge._acked_tab_cmds, "SyncLiveBridge must clear _acked_tab_cmds after 200 OK")
+            self.assertIn("ack_tab_cmds=tc-2-9", r2_capture["url"])
+
+            # Feed the exact URL & JPEG emitted by SyncLiveBridge into real internal_sync_push!
+            await _dispatch_push(r2_capture["url"], r2_capture["headers"], r2_capture["data"])
+            self.assertEqual(
+                [("frame", b"SYNC_JPEG_B"), ("state", "https://sync-b.example", ["tc-2-9"])],
+                events,
+                "internal_sync_push must broadcast JPEG(B) FIRST and state(B) with rendered_tab_cmds SECOND",
+            )
+
+        asyncio.run(_scenario())
+
+
+class TestRound3QAThreeMicroFixes(unittest.TestCase):
+    """Targeted adversarial regressions for the 3 Round-3 QA micro-fixes (job-c8586cdb92)."""
+
+    def test_frontend_two_independent_webviews_unique_cmd_id_no_cross_unlock_and_rejection_unlock(self) -> None:
+        """Micro-fix A & C (Frontend):
+        - Two independent simulated WebView instances issue their first switch_tab command.
+        - Both cmd_ids strictly match `^tc-[A-Za-z0-9]{12}-\\d+-\\d+$` (and `^[A-Za-z0-9_:-]{1,48}$`)
+          and are strictly distinct (no `tc-1-1` collision across WebView reopen or concurrent tabs).
+        - Server state echoing WebView #1's old `cmd_id` in `rendered_tab_cmds` MUST NOT unlock WebView #2
+          (0 clicks dispatched on WebView #2 until its own `cmd_id` is confirmed or rejected).
+        - Terminal `tab_cmd_ack(status="rejected", reason="execution_error")` cleanly unlocks WebView #2
+          so subsequent click succeeds.
+        """
+        html_src = INDEX_HTML_PATH.read_text(encoding="utf-8")
+        blocks = re.findall(r"<script>(.*?)</script>", html_src, re.S)
+        self.assertEqual(1, len(blocks))
+        js_src = blocks[0]
+
+        harness = r"""
+const vm = require('vm');
+const fs = require('fs');
+const assert = require('assert');
+const nodeCrypto = require('crypto');
+const jsCode = fs.readFileSync(process.argv[2], 'utf8');
+
+function createWebViewInstance(useWebCrypto) {
+  class FakeClassList {
+    constructor(initial = []) { this._set = new Set(initial); }
+    add(...xs) { xs.forEach((x) => this._set.add(x)); }
+    remove(...xs) { xs.forEach((x) => this._set.delete(x)); }
+    toggle(x, force) {
+      if (typeof force === 'boolean') { force ? this._set.add(x) : this._set.delete(x); return force; }
+      if (this._set.has(x)) { this._set.delete(x); return false; }
+      this._set.add(x); return true;
+    }
+    contains(x) { return this._set.has(x); }
+  }
+  const elements = new Map();
+  class FakeEl {
+    constructor(id = '', tag = 'DIV') {
+      this.id = id; this.tagName = tag; this.style = {}; this.classList = new FakeClassList();
+      this.className = ''; this.textContent = ''; this._innerHTML = ''; this.value = '';
+      this.width = 1280; this.height = 800; this.clientWidth = 440; this.clientHeight = 700;
+      this.children = []; this.parent = null; this._listeners = {};
+      this._rect = { left: 0, top: 0, width: 440, height: 700 };
+    }
+    get innerHTML() { return this._innerHTML; }
+    set innerHTML(v) { this._innerHTML = v; if (v === '') this.children = []; }
+    addEventListener(ev, fn) { (this._listeners[ev] ||= []).push(fn); }
+    dispatch(ev, obj = {}) {
+      let stopped = false;
+      const evt = { defaultPrevented: false, preventDefault() { this.defaultPrevented = true; }, stopPropagation() { stopped = true; }, target: this, ...obj };
+      let cur = this;
+      while (cur && !stopped) { (cur._listeners[ev] || []).forEach((fn) => fn(evt)); cur = cur.parent; }
+      return evt;
+    }
+    getBoundingClientRect() { return this._rect; }
+    appendChild(c) { c.parent = this; this.children.push(c); return c; }
+    removeChild(c) { this.children = this.children.filter((x) => x !== c); c.parent = null; }
+    remove() {} focus() {} blur() {} select() {} setSelectionRange() {} setPointerCapture() {} setAttribute() {}
+    closest(sel) { let cur = this; while (cur) { if (sel.startsWith('#') && cur.id === sel.slice(1)) return cur; cur = cur.parent; } return null; }
+    getContext() { return { clearRect() {}, drawImage() {} }; }
+  }
+  function getEl(id) {
+    if (!elements.has(id)) {
+      let tag = 'DIV';
+      if (id.includes('input')) tag = 'INPUT';
+      else if (id === 'screen' || id === 'minimap-canvas') tag = 'CANVAS';
+      elements.set(id, new FakeEl(id, tag));
+    }
+    return elements.get(id);
+  }
+  const stageEl = getEl('stage');
+  const canvasWrapEl = getEl('canvas-wrap');
+  stageEl.appendChild(canvasWrapEl);
+  const screenEl = getEl('screen');
+  canvasWrapEl.appendChild(screenEl);
+  ['kb-sheet', 'clip-sheet', 'more-sheet', 'tabs-sheet', 'profile-sheet', 'minimap-box'].forEach((id) => getEl(id).classList.add('hidden'));
+
+  class FakeBlob { constructor(id) { this.id = id; } }
+  const wsInstances = [];
+  class FakeWS {
+    static OPEN = 1; static CONNECTING = 0; static CLOSED = 3;
+    constructor(url) { this.url = url; this.readyState = FakeWS.OPEN; this.sent = []; wsInstances.push(this); }
+    send(s) { this.sent.push(JSON.parse(s)); }
+    close() { this.readyState = FakeWS.CLOSED; }
+  }
+  const sandbox = {
+    console, Math, Date, JSON, Map, Set, Array, Number, String, Boolean, Promise, Object, Error, Uint8Array, URL: class extends URL {},
+    performance: { now: () => 10000 },
+    devicePixelRatio: 2,
+    Blob: FakeBlob,
+    WebSocket: FakeWS,
+    location: { protocol: 'https:', host: 'live.example.com' },
+    FormData: class { append() {} },
+    fetch: async () => ({ ok: true, status: 200, json: async () => ({ ok: true }) }),
+    setTimeout: () => 1, clearTimeout: () => {}, setInterval: () => 1, clearInterval: () => {},
+    document: {
+      getElementById: (id) => getEl(id),
+      createElement: (tag) => new FakeEl('', tag.toUpperCase()),
+      querySelectorAll: () => [],
+      addEventListener: () => {},
+      documentElement: new FakeEl('html', 'HTML'),
+      body: new FakeEl('body', 'BODY'),
+      activeElement: null,
+    },
+    navigator: { clipboard: { writeText: async () => {} } },
+    visualViewport: null,
+    createImageBitmap: async () => ({ width: 1280, height: 800, close() {} }),
+    Telegram: { WebApp: { initData: 'user=111', ready() {}, expand() {}, disableVerticalSwipes() {}, HapticFeedback: { impactOccurred() {} } } },
+  };
+  if (useWebCrypto && nodeCrypto.webcrypto) {
+    sandbox.crypto = nodeCrypto.webcrypto;
+  }
+  sandbox.window = sandbox;
+  sandbox.globalThis = sandbox;
+  sandbox.addEventListener = () => {};
+  sandbox.scrollTo = () => {};
+  sandbox.innerHeight = 700;
+  vm.createContext(sandbox);
+  vm.runInContext(jsCode, sandbox);
+
+  const sock = wsInstances[0];
+  sock.onopen();
+  sock.onmessage({ data: JSON.stringify({ type: 'auth_ok', user_id: 111, bot: 'main', role: 'admin' }) });
+  return { sandbox, sock, FakeBlob };
+}
+
+(async () => {
+  // Instance 1 (WebCrypto randomUUID) and Instance 2 (fallback / reopened WebView)
+  const wv1 = createWebViewInstance(true);
+  const wv2 = createWebViewInstance(false);
+  const wv3 = createWebViewInstance(true);
+
+  const initState = {
+    type: 'state', running: true, session_gen: 1, takeover_gen: 1, takeover: true,
+    vw: 1280, vh: 800, url: 'https://tab-a.example', rendered_tab_cmds: [],
+    tabs: [
+      { index: 0, title: 'A', url: 'https://tab-a.example', active: true },
+      { index: 1, title: 'B', url: 'https://tab-b.example', active: false },
+    ],
+  };
+
+  for (const wv of [wv1, wv2, wv3]) {
+    wv.sock.onmessage({ data: JSON.stringify(initState) });
+    wv.sock.onmessage({ data: new wv.FakeBlob('frame-A') });
+    await new Promise((r) => setImmediate(r));
+    assert.strictEqual(vm.runInContext('canDispatchRemoteInput()', wv.sandbox), true);
+    wv.sock.sent.length = 0;
+  }
+
+  // First switch_tab command from each independent WebView
+  vm.runInContext("sendInput({ action: 'switch_tab', index: 1 });", wv1.sandbox);
+  vm.runInContext("sendInput({ action: 'switch_tab', index: 1 });", wv2.sandbox);
+  vm.runInContext("sendInput({ action: 'switch_tab', index: 1 });", wv3.sandbox);
+
+  const cmd1 = wv1.sock.sent.find((m) => m.action === 'switch_tab').cmd_id;
+  const cmd2 = wv2.sock.sent.find((m) => m.action === 'switch_tab').cmd_id;
+  const cmd3 = wv3.sock.sent.find((m) => m.action === 'switch_tab').cmd_id;
+
+  const strictPattern = /^tc-[A-Za-z0-9]{12}-\d+-\d+$/;
+  const serverPattern = /^[A-Za-z0-9_:-]{1,48}$/;
+  for (const cid of [cmd1, cmd2, cmd3]) {
+    assert(strictPattern.test(cid), `Unexpected cmd_id format: ${cid}`);
+    assert(serverPattern.test(cid), `cmd_id violates server allowlist: ${cid}`);
+  }
+  assert.notStrictEqual(cmd1, cmd2, 'Reopened WebView #2 must not collide with WebView #1 cmd_id');
+  assert.notStrictEqual(cmd1, cmd3, 'Concurrent WebView #3 must not collide with WebView #1 cmd_id');
+  assert.notStrictEqual(cmd2, cmd3, 'WebView #2 and #3 must not collide');
+
+  // Server still holds old cmd1 in rendered_tab_cmds and pushes state to WebView #2 BEFORE cmd2's frame arrives!
+  wv2.sock.sent.length = 0;
+  wv2.sock.onmessage({ data: JSON.stringify({
+    ...initState,
+    rendered_tab_cmds: [cmd1],
+  }) });
+  assert.strictEqual(
+    vm.runInContext('canDispatchRemoteInput()', wv2.sandbox),
+    false,
+    'Old WebView #1 confirmation in rendered_tab_cmds MUST NOT unlock WebView #2'
+  );
+  assert.strictEqual(vm.runInContext("sendWsInput({ action: 'click', x: 50, y: 50 })", wv2.sandbox), false);
+  assert.strictEqual(wv2.sock.sent.filter((m) => m.action === 'click').length, 0);
+
+  // Terminal rejection receipt unlocks WebView #2 safely!
+  wv2.sock.onmessage({ data: JSON.stringify({
+    type: 'tab_cmd_ack',
+    cmd_id: cmd2,
+    status: 'rejected',
+    reason: 'execution_error',
+  }) });
+  assert.strictEqual(
+    vm.runInContext('canDispatchRemoteInput()', wv2.sandbox),
+    true,
+    'Terminal execution_error rejection receipt must unlock WebView #2'
+  );
+  assert.strictEqual(vm.runInContext("sendWsInput({ action: 'click', x: 50, y: 50 })", wv2.sandbox), true);
+  assert.strictEqual(wv2.sock.sent.filter((m) => m.action === 'click').length, 1);
+
+  console.log('NODE_VM_UNIQUE_CMD_ID_PASS');
+})().catch((err) => { console.error(err); process.exit(1); });
+"""
+
+        node_bin = shutil.which("node")
+        if not node_bin:
+            self.skipTest("node binary not available in PATH")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            js_file = Path(tmp) / "inline.js"
+            harness_file = Path(tmp) / "harness_unique_cmd_id.js"
+            js_file.write_text(js_src, encoding="utf-8")
+            harness_file.write_text(harness, encoding="utf-8")
+            proc = subprocess.run(
+                [node_bin, str(harness_file), str(js_file)],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertEqual(
+                0,
+                proc.returncode,
+                f"Node VM unique cmd_id test failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
+            )
+            self.assertIn("NODE_VM_UNIQUE_CMD_ID_PASS", proc.stdout)
+
+    def test_hosted_slow_client_frame_drop_defers_confirmation_and_recovers_on_dedup_catchup(self) -> None:
+        """Micro-fix B (Hosted slow client >512 KiB drop + dedup catch-up recovery):
+        - When slow viewer write buffer > 512 KiB causes `broadcast_frame` to skip Tab B JPEG,
+          slow viewer's `last_frame_seq` stays behind and its `state` omits `cmd_id` (stays locked),
+          while fast viewer gets JPEG(B) + confirmed `cmd_id` and unauthorized viewer stays redacted.
+        - Once slow viewer write buffer drains (< 512 KiB), the next static dedup `_capture_once()`
+          pushes JPEG(B) ONLY to the lagging slow viewer, updates `last_frame_seq`, and sends `state`
+          with `cmd_id` (fast viewer receives 0 redundant frames/states!).
+        """
+        async def _scenario() -> None:
+            hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "sec-tok")
+            hub.engine_mode = "async_hosted"
+            hub.session_gen = 3
+            hub.takeover = True
+            hub.takeover_gen = 1
+            hub.session_owner = ("main", 111)
+            hub.takeover_owner = ("main", 111)
+
+            class _BufferedWS:
+                def __init__(self, buf_size: int = 0) -> None:
+                    self.closed = False
+                    self.buf_size = buf_size
+                    self.events: list[tuple[str, Any]] = []
+                    self._writer = types.SimpleNamespace(
+                        transport=types.SimpleNamespace(get_write_buffer_size=lambda: self.buf_size)
+                    )
+
+                async def send_bytes(self, data: bytes) -> None:
+                    self.events.append(("frame", data))
+
+                async def send_str(self, text: str) -> None:
+                    self.events.append(("json", json.loads(text)))
+
+                async def close(self, **_kw: Any) -> None:
+                    self.closed = True
+
+            class _FakePage:
+                def __init__(self, url: str, title: str, jpeg: bytes) -> None:
+                    self.url = url
+                    self._title = title
+                    self._jpeg = jpeg
+                    self.viewport_size = {"width": 1280, "height": 800}
+
+                def on(self, _ev: str, _fn: Any) -> None:
+                    pass
+
+                def is_closed(self) -> bool:
+                    return False
+
+                async def title(self) -> str:
+                    return self._title
+
+                async def bring_to_front(self) -> None:
+                    pass
+
+                async def screenshot(self, **_kw: Any) -> bytes:
+                    return self._jpeg
+
+            page_a = _FakePage("https://a.example", "Tab A", b"HOSTED_JPEG_A")
+            page_b = _FakePage("https://b.example", "Tab B", b"HOSTED_JPEG_B")
+            hub.ctx = types.SimpleNamespace(pages=[page_a, page_b])
+            hub.active_tab_index = 0
+
+            ws_fast = _BufferedWS(buf_size=0)
+            ws_slow = _BufferedWS(buf_size=0)
+            ws_unauth = _BufferedWS(buf_size=0)
+            for ws, meta in (
+                (ws_fast, {"bot_key": "main", "user_id": 111, "role": "admin", "last_frame_seq": 0}),
+                (ws_slow, {"bot_key": "main", "user_id": 111, "role": "admin", "last_frame_seq": 0}),
+                (ws_unauth, {"bot_key": "sg", "user_id": 222, "role": "admin", "last_frame_seq": 0}),
+            ):
+                hub.viewers.add(ws)  # type: ignore[arg-type]
+                hub.viewer_meta[ws] = meta
+
+            with mock.patch.object(srv, "_check_live_user_role", return_value="admin"):
+                # 1. Initial Tab A capture: both authorized viewers receive JPEG_A (seq 1)
+                await hub._capture_once(force_broadcast=True)
+                self.assertEqual(1, hub._frame_broadcast_seq)
+                self.assertEqual(1, hub.viewer_meta[ws_fast]["last_frame_seq"])
+                self.assertEqual(1, hub.viewer_meta[ws_slow]["last_frame_seq"])
+                self.assertEqual(0, hub.viewer_meta[ws_unauth]["last_frame_seq"])
+                ws_fast.events.clear()
+                ws_slow.events.clear()
+                ws_unauth.events.clear()
+
+                # 2. Slow viewer becomes congested (> 512 KiB write buffer); execute switch_tab -> B
+                ws_slow.buf_size = 600_000
+                cmd_id = "tc-slowclient01-1-1"
+                await hub._execute_human_cmd_async(
+                    {
+                        "action": "switch_tab",
+                        "index": 1,
+                        "cmd_id": cmd_id,
+                        "_session_gen": 3,
+                        "_takeover_gen": 1,
+                        "_bot_key": "main",
+                        "_user_id": 111,
+                        "_ws": ws_slow,
+                    }
+                )
+                self.assertEqual(2, hub._frame_broadcast_seq)
+                self.assertEqual(2, hub.viewer_meta[ws_fast]["last_frame_seq"])
+                self.assertEqual(1, hub.viewer_meta[ws_slow]["last_frame_seq"])
+
+                # Fast viewer got JPEG_B then state with cmd_id
+                self.assertIn(("frame", b"HOSTED_JPEG_B"), ws_fast.events)
+                fast_states = [ev[1] for ev in ws_fast.events if ev[0] == "json" and ev[1].get("type") == "state"]
+                self.assertTrue(any(cmd_id in st.get("rendered_tab_cmds", []) for st in fast_states))
+
+                # Slow viewer dropped JPEG_B -> MUST NOT receive cmd_id in any state (stays locked!)
+                self.assertEqual([], [ev for ev in ws_slow.events if ev[0] == "frame"])
+                slow_states = [ev[1] for ev in ws_slow.events if ev[0] == "json" and ev[1].get("type") == "state"]
+                self.assertTrue(slow_states)
+                self.assertTrue(all(cmd_id not in st.get("rendered_tab_cmds", []) for st in slow_states))
+
+                # Unauthorized viewer stays strictly redacted (no frames, no rendered_tab_cmds key)
+                self.assertEqual([], [ev for ev in ws_unauth.events if ev[0] == "frame"])
+                unauth_states = [ev[1] for ev in ws_unauth.events if ev[0] == "json" and ev[1].get("type") == "state"]
+                self.assertTrue(all("rendered_tab_cmds" not in st for st in unauth_states))
+
+                # 3. Dedup cycle while slow viewer is STILL congested -> 0 catchup frames, still locked
+                ws_fast.events.clear()
+                ws_slow.events.clear()
+                ws_unauth.events.clear()
+                changed_still_slow = await hub._capture_once(hd=False)
+                self.assertFalse(changed_still_slow)
+                self.assertEqual([], ws_fast.events)
+                self.assertEqual([], ws_slow.events)
+                self.assertEqual(1, hub.viewer_meta[ws_slow]["last_frame_seq"])
+
+                # 4. Slow viewer write buffer drains (< 512 KiB) -> dedup cycle catches up ONLY slow viewer:
+                #    JPEG_B FIRST, state WITH cmd_id SECOND, fast viewer gets 0 redundant frames/states!
+                ws_slow.buf_size = 0
+                changed_recovered = await hub._capture_once(hd=False)
+                self.assertFalse(changed_recovered)
+                self.assertEqual([], ws_fast.events, "Fast viewer must receive 0 redundant frames/states on catch-up")
+                self.assertEqual([], ws_unauth.events, "Unauthorized viewer must receive 0 catch-up frames/states")
+                self.assertEqual(2, hub.viewer_meta[ws_slow]["last_frame_seq"])
+                self.assertEqual(2, len(ws_slow.events))
+                self.assertEqual(("frame", b"HOSTED_JPEG_B"), ws_slow.events[0])
+                self.assertEqual("json", ws_slow.events[1][0])
+                self.assertEqual("state", ws_slow.events[1][1]["type"])
+                self.assertIn(cmd_id, ws_slow.events[1][1]["rendered_tab_cmds"])
+
+        asyncio.run(_scenario())
+
+    def test_sync_empty_jpeg_blocks_ack_on_both_producer_and_hub_until_real_frame(self) -> None:
+        """Micro-fix B (Sync empty JPEG guard):
+        - When Sync `page.screenshot()` raises (empty `jpeg = b""`), SyncLiveBridge does NOT attach
+          `ack_tab_cmds` and does NOT clear `_acked_tab_cmds` after HTTP 200 OK.
+        - Even if Hub receives empty `jpeg = b""` with `ack_tab_cmds` in query, `internal_sync_push`
+          refuses to promote `ack_tab_cmds` into `_rendered_tab_cmd_ids`.
+        - On the next push with non-empty JPEG(B), SyncLiveBridge sends `ack_tab_cmds`, clears it on 200 OK,
+          and Hub broadcasts JPEG(B) followed by `state` containing the confirmed `cmd_id`.
+        """
+        import urllib.parse as _up
+
+        async def _scenario() -> None:
+            hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "sec-tok")
+            hub.engine_mode = "sync_external"
+            hub.session_gen = 11
+            hub.takeover = True
+            hub.takeover_gen = 4
+            hub.session_owner = ("main", 111)
+            hub.takeover_owner = ("main", 111)
+            hub._sync_lease_id = "lease-sync-11"
+            hub._sync_last_push_ts = srv.time.monotonic()
+
+            ws_owner = _FakeWSViewer()
+            hub.viewers.add(ws_owner)  # type: ignore[arg-type]
+            hub.viewer_meta[ws_owner] = {"bot_key": "main", "user_id": 111, "role": "admin", "last_frame_seq": 0}
+
+            async def _dispatch_push(url: str, headers: dict[str, str], data: bytes) -> dict[str, Any]:
+                parsed = _up.urlparse(url)
+                q = {k: v[-1] for k, v in _up.parse_qs(parsed.query, keep_blank_values=True).items()}
+                req = types.SimpleNamespace(
+                    headers=headers,
+                    query=q,
+                    remote="127.0.0.1",
+                    app={"hub": hub},
+                    read=mock.AsyncMock(return_value=data),
+                )
+                with (
+                    mock.patch.object(srv, "web", _FakeWeb),
+                    mock.patch.object(srv, "_check_live_user_role", return_value="admin"),
+                ):
+                    resp = await srv.internal_sync_push(req)  # type: ignore[arg-type]
+                return resp.data
+
+            # 1. Producer side: screenshot raises -> empty jpeg -> MUST NOT send or clear _acked_tab_cmds!
+            fail_shot = True
+
+            class _FlakySyncPage:
+                url = "https://sync-b.example"
+                viewport_size = {"width": 1280, "height": 800}
+
+                def on(self, _ev: str, _fn: Any) -> None:
+                    pass
+
+                def is_closed(self) -> bool:
+                    return False
+
+                def title(self) -> str:
+                    return "Sync B"
+
+                def bring_to_front(self) -> None:
+                    pass
+
+                def screenshot(self, **_kw: Any) -> bytes:
+                    if fail_shot:
+                        raise RuntimeError("transient screenshot error")
+                    return b"REAL_SYNC_JPEG_B"
+
+            page_b = _FlakySyncPage()
+            bridge = live_browser_ctl.SyncLiveBridge.__new__(live_browser_ctl.SyncLiveBridge)
+            bridge.raw_ctx = types.SimpleNamespace(pages=[page_b])
+            bridge.notify = False
+            bridge.enabled = True
+            bridge.active_idx = 0
+            bridge._in_checkpoint = False
+            bridge._held_buttons = {}
+            bridge._acked_tab_cmds = ["tc-syncempty01-1-1"]
+            bridge._rejected_tab_cmds = []
+            bridge._pinned_verified = False
+            bridge._profile_dir = None
+            bridge._sync_lease_id = "lease-sync-11"
+            bridge._sync_session_gen = 11
+            bridge._x11_display = None
+            bridge._last_clip = ""
+
+            posted: list[tuple[str, dict[str, str], bytes]] = []
+
+            def _post_ok(url: str, headers=None, data=b"", timeout=None):
+                posted.append((url, dict(headers or {}), data))
+                return types.SimpleNamespace(
+                    status_code=200,
+                    json=lambda: {
+                        "ok": True,
+                        "session_gen": 11,
+                        "sync_lease_id": "lease-sync-11",
+                        "takeover": True,
+                        "takeover_gen": 4,
+                        "commands": [],
+                    },
+                )
+
+            bridge.client = types.SimpleNamespace(
+                base_url="http://127.0.0.1:18795",
+                token="sec-tok",
+                bot="main",
+                _headers=lambda: {"X-Live-Token": "sec-tok"},
+                session=types.SimpleNamespace(post=_post_ok),
+            )
+
+            bridge.sync_checkpoint(allow_takeover_loop=False)
+            self.assertEqual(1, len(posted))
+            self.assertEqual(b"", posted[0][2])
+            self.assertNotIn("ack_tab_cmds=", posted[0][0], "Producer must not send ack_tab_cmds when JPEG is empty")
+            self.assertEqual(
+                ["tc-syncempty01-1-1"],
+                bridge._acked_tab_cmds,
+                "Producer must retain _acked_tab_cmds when JPEG is empty",
+            )
+
+            # 2. Hub side: even if empty JPEG arrives WITH ack_tab_cmds, Hub MUST refuse to promote it!
+            await _dispatch_push(
+                "http://127.0.0.1:18795/internal/sync/push?url=https%3A%2F%2Fsync-b.example"
+                "&lease_id=lease-sync-11&session_gen=11&ack_tab_cmds=tc-forgedempty1-1-1",
+                {"X-Live-Token": "sec-tok", "X-Sync-Lease-Id": "lease-sync-11"},
+                b"",
+            )
+            self.assertEqual([], hub.state_dict()["rendered_tab_cmds"])
+            self.assertEqual([], ws_owner.sent_bytes)
+            self.assertTrue(
+                all("tc-forgedempty1-1-1" not in m.get("rendered_tab_cmds", []) for m in ws_owner.sent_json)
+            )
+
+            # 3. Recovery: screenshot succeeds -> producer sends ack_tab_cmds & clears it; Hub promotes after JPEG!
+            ws_owner.sent_bytes.clear()
+            ws_owner.sent_json.clear()
+            fail_shot = False
+            bridge.sync_checkpoint(allow_takeover_loop=False)
+            self.assertEqual(2, len(posted))
+            self.assertEqual(b"REAL_SYNC_JPEG_B", posted[1][2])
+            self.assertIn("ack_tab_cmds=tc-syncempty01-1-1", posted[1][0])
+            self.assertEqual([], bridge._acked_tab_cmds)
+
+            await _dispatch_push(posted[1][0], posted[1][1], posted[1][2])
+            self.assertEqual([b"REAL_SYNC_JPEG_B"], ws_owner.sent_bytes)
+            self.assertTrue(
+                any("tc-syncempty01-1-1" in m.get("rendered_tab_cmds", []) for m in ws_owner.sent_json)
+            )
+
+        asyncio.run(_scenario())
+
+    def test_hosted_and_sync_tab_cmd_execution_errors_emit_authorized_only_rejection_ack(self) -> None:
+        """Micro-fix C (Hosted & Sync execution error terminal rejection receipt):
+        - Hosted: `bring_to_front()` raising emits `tab_cmd_ack(status="rejected", reason="execution_error")`
+          strictly to authorized session readers (0 leaks to unauthorized viewers).
+        - Sync: `new_page()` raising records `cmd_id` in `_rejected_tab_cmds` (NOT `_acked_tab_cmds`),
+          reports `reject_tab_cmds` on next push even when `jpeg` is empty, clears `_rejected_tab_cmds` on 200 OK,
+          and Hub broadcasts `tab_cmd_ack(status="rejected", reason="execution_error")` strictly to authorized viewers.
+        """
+        import urllib.parse as _up
+
+        async def _scenario() -> None:
+            # --- Part 1: Hosted bring_to_front() raises ---
+            hub_h = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "sec-tok")
+            hub_h.engine_mode = "async_hosted"
+            hub_h.session_gen = 7
+            hub_h.takeover = True
+            hub_h.takeover_gen = 2
+            hub_h.session_owner = ("main", 111)
+            hub_h.takeover_owner = ("main", 111)
+
+            ws_owner_h = _FakeWSViewer()
+            ws_unauth_h = _FakeWSViewer()
+            hub_h.viewers.add(ws_owner_h)  # type: ignore[arg-type]
+            hub_h.viewers.add(ws_unauth_h)  # type: ignore[arg-type]
+            hub_h.viewer_meta[ws_owner_h] = {"bot_key": "main", "user_id": 111, "role": "admin", "last_frame_seq": 1}
+            hub_h.viewer_meta[ws_unauth_h] = {"bot_key": "sg", "user_id": 222, "role": "admin", "last_frame_seq": 0}
+
+            class _BoomPage:
+                def __init__(self, boom: bool = False) -> None:
+                    self._boom = boom
+                    self.url = "https://boom.example"
+                    self.viewport_size = {"width": 1280, "height": 800}
+
+                def on(self, _ev: str, _fn: Any) -> None:
+                    pass
+
+                def is_closed(self) -> bool:
+                    return False
+
+                async def bring_to_front(self) -> None:
+                    if self._boom:
+                        raise RuntimeError("bring_to_front failed")
+
+            hub_h.ctx = types.SimpleNamespace(pages=[_BoomPage(False), _BoomPage(True)])
+            hub_h.active_tab_index = 0
+
+            with mock.patch.object(srv, "_check_live_user_role", return_value="admin"):
+                await hub_h._execute_human_cmd_async(
+                    {
+                        "action": "switch_tab",
+                        "index": 1,
+                        "cmd_id": "tc-hosterr00001-1-1",
+                        "_session_gen": 7,
+                        "_takeover_gen": 2,
+                        "_bot_key": "main",
+                        "_user_id": 111,
+                        "_ws": ws_owner_h,
+                    }
+                )
+
+            self.assertEqual(
+                [
+                    {
+                        "type": "tab_cmd_ack",
+                        "cmd_id": "tc-hosterr00001-1-1",
+                        "status": "rejected",
+                        "reason": "execution_error",
+                    }
+                ],
+                [m for m in ws_owner_h.sent_json if m.get("type") == "tab_cmd_ack"],
+            )
+            self.assertEqual(
+                [],
+                [m for m in ws_unauth_h.sent_json if m.get("type") == "tab_cmd_ack"],
+                "Unauthorized viewer MUST NOT receive hosted tab_cmd_ack",
+            )
+            self.assertNotIn("tc-hosterr00001-1-1", hub_h._pending_tab_cmd_ids)
+            self.assertNotIn("tc-hosterr00001-1-1", hub_h._rendered_tab_cmd_ids)
+
+            # --- Part 2: Sync new_page() raises + empty JPEG still delivers reject_tab_cmds ---
+            hub_s = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "sec-tok")
+            hub_s.engine_mode = "sync_external"
+            hub_s.session_gen = 12
+            hub_s.takeover = True
+            hub_s.takeover_gen = 5
+            hub_s.session_owner = ("main", 111)
+            hub_s.takeover_owner = ("main", 111)
+            hub_s._sync_lease_id = "lease-sync-12"
+            hub_s._sync_last_push_ts = srv.time.monotonic()
+
+            ws_owner_s = _FakeWSViewer()
+            ws_unauth_s = _FakeWSViewer()
+            hub_s.viewers.add(ws_owner_s)  # type: ignore[arg-type]
+            hub_s.viewers.add(ws_unauth_s)  # type: ignore[arg-type]
+            hub_s.viewer_meta[ws_owner_s] = {"bot_key": "main", "user_id": 111, "role": "admin", "last_frame_seq": 1}
+            hub_s.viewer_meta[ws_unauth_s] = {"bot_key": "sg", "user_id": 222, "role": "admin", "last_frame_seq": 0}
+
+            class _SyncPageFailShot:
+                url = "https://sync-err.example"
+                viewport_size = {"width": 1280, "height": 800}
+
+                def on(self, _ev: str, _fn: Any) -> None:
+                    pass
+
+                def is_closed(self) -> bool:
+                    return False
+
+                def title(self) -> str:
+                    return "Sync Err"
+
+                def screenshot(self, **_kw: Any) -> bytes:
+                    raise RuntimeError("shot failed too")
+
+            class _SyncCtxFailNewPage:
+                def __init__(self) -> None:
+                    self.pages = [_SyncPageFailShot()]
+
+                def new_page(self) -> Any:
+                    raise RuntimeError("new_page exploded")
+
+            bridge = live_browser_ctl.SyncLiveBridge.__new__(live_browser_ctl.SyncLiveBridge)
+            bridge.raw_ctx = _SyncCtxFailNewPage()
+            bridge.notify = False
+            bridge.enabled = True
+            bridge.active_idx = 0
+            bridge._in_checkpoint = False
+            bridge._held_buttons = {}
+            bridge._acked_tab_cmds = []
+            bridge._rejected_tab_cmds = []
+            bridge._pinned_verified = False
+            bridge._profile_dir = None
+            bridge._sync_lease_id = "lease-sync-12"
+            bridge._sync_session_gen = 12
+            bridge._x11_display = None
+            bridge._last_clip = ""
+
+            bridge._exec_human_sync({"action": "new_tab", "cmd_id": "tc-syncerr00001-1-1"})
+            self.assertEqual([], bridge._acked_tab_cmds)
+            self.assertEqual(["tc-syncerr00001-1-1"], bridge._rejected_tab_cmds)
+
+            captured_push: dict[str, Any] = {}
+
+            def _post_sync(url: str, headers=None, data=b"", timeout=None):
+                captured_push["url"] = url
+                captured_push["headers"] = dict(headers or {})
+                captured_push["data"] = data
+                return types.SimpleNamespace(
+                    status_code=200,
+                    json=lambda: {
+                        "ok": True,
+                        "session_gen": 12,
+                        "sync_lease_id": "lease-sync-12",
+                        "takeover": True,
+                        "takeover_gen": 5,
+                        "commands": [],
+                    },
+                )
+
+            bridge.client = types.SimpleNamespace(
+                base_url="http://127.0.0.1:18795",
+                token="sec-tok",
+                bot="main",
+                _headers=lambda: {"X-Live-Token": "sec-tok"},
+                session=types.SimpleNamespace(post=_post_sync),
+            )
+            bridge.sync_checkpoint(allow_takeover_loop=False)
+            self.assertEqual(b"", captured_push["data"])
+            self.assertIn("reject_tab_cmds=tc-syncerr00001-1-1", captured_push["url"])
+            self.assertEqual([], bridge._rejected_tab_cmds, "SyncLiveBridge must clear _rejected_tab_cmds after 200 OK")
+
+            parsed = _up.urlparse(captured_push["url"])
+            q = {k: v[-1] for k, v in _up.parse_qs(parsed.query, keep_blank_values=True).items()}
+            req = types.SimpleNamespace(
+                headers=captured_push["headers"],
+                query=q,
+                remote="127.0.0.1",
+                app={"hub": hub_s},
+                read=mock.AsyncMock(return_value=captured_push["data"]),
+            )
+            with (
+                mock.patch.object(srv, "web", _FakeWeb),
+                mock.patch.object(srv, "_check_live_user_role", return_value="admin"),
+            ):
+                resp = await srv.internal_sync_push(req)  # type: ignore[arg-type]
+            self.assertEqual(200, resp.status)
+            self.assertEqual(
+                [
+                    {
+                        "type": "tab_cmd_ack",
+                        "cmd_id": "tc-syncerr00001-1-1",
+                        "status": "rejected",
+                        "reason": "execution_error",
+                    }
+                ],
+                [m for m in ws_owner_s.sent_json if m.get("type") == "tab_cmd_ack"],
+            )
+            self.assertEqual(
+                [],
+                [m for m in ws_unauth_s.sent_json if m.get("type") == "tab_cmd_ack"],
+                "Unauthorized viewer MUST NOT receive sync tab_cmd_ack",
+            )
+
+        asyncio.run(_scenario())
+
+    def test_c1_hosted_tab_switch_and_new_tab_error_preserves_active_page_for_click(self) -> None:
+        """C1-Hosted:
+        - `switch_tab` whose `bring_to_front()` raises MUST keep `active_tab_index` on A,
+          emit `rejected/execution_error`, and route subsequent `click` to A (A=1, B=0).
+        - `new_tab` whose `goto()` raises MUST keep `active_tab_index` on A,
+          emit `rejected/execution_error`, and route subsequent `click` to A (A=2, B=0, new_page=0).
+        - `close_tab` where `orig_page` IS closed and a post-close error occurs MUST NOT emit
+          `rejected/execution_error`; instead queues `tab_cmd_id` and captures fresh frame of remaining page B.
+        """
+        async def _scenario() -> None:
+            hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "sec-tok")
+            hub.engine_mode = "async_hosted"
+            hub.session_gen = 21
+            hub.takeover = True
+            hub.takeover_gen = 3
+            hub.session_owner = ("main", 111)
+            hub.takeover_owner = ("main", 111)
+
+            ws_owner = _FakeWSViewer()
+            hub.viewers.add(ws_owner)  # type: ignore[arg-type]
+            hub.viewer_meta[ws_owner] = {"bot_key": "main", "user_id": 111, "role": "admin", "last_frame_seq": 1}
+
+            class _TrackedPage:
+                def __init__(
+                    self,
+                    name: str,
+                    *,
+                    fail_bring: bool = False,
+                    fail_goto: bool = False,
+                    jpeg: bytes = b"JPEG",
+                ) -> None:
+                    self.name = name
+                    self.url = f"https://{name}.example"
+                    self.viewport_size = {"width": 1280, "height": 800}
+                    self._fail_bring = fail_bring
+                    self._fail_goto = fail_goto
+                    self._jpeg = jpeg
+                    self._closed = False
+                    self.clicks: list[tuple[float, float]] = []
+                    self.mouse = types.SimpleNamespace(
+                        click=self._click,
+                        move=self._noop,
+                        up=self._noop,
+                    )
+
+                async def _click(self, x: float, y: float, **_kw: Any) -> None:
+                    self.clicks.append((x, y))
+
+                async def _noop(self, *_a: Any, **_kw: Any) -> None:
+                    pass
+
+                def on(self, _ev: str, _fn: Any) -> None:
+                    pass
+
+                def is_closed(self) -> bool:
+                    return self._closed
+
+                async def title(self) -> str:
+                    return f"Title {self.name}"
+
+                async def evaluate(self, *_a: Any, **_kw: Any) -> Any:
+                    return None
+
+                async def bring_to_front(self) -> None:
+                    if self._fail_bring:
+                        raise RuntimeError("bring_to_front boom")
+
+                async def goto(self, url: str, **_kw: Any) -> None:
+                    if self._fail_goto:
+                        raise RuntimeError("new_tab goto boom")
+                    self.url = url
+
+                async def close(self) -> None:
+                    self._closed = True
+
+                async def screenshot(self, **_kw: Any) -> bytes:
+                    return self._jpeg
+
+            page_a = _TrackedPage("page-a", jpeg=b"JPEG_A")
+            page_b = _TrackedPage("page-b", fail_bring=True, jpeg=b"JPEG_B")
+            created_pages: list[_TrackedPage] = []
+
+            class _FakeHostedCtx:
+                def __init__(self, pages: list[_TrackedPage]) -> None:
+                    self.pages = pages
+
+                async def new_page(self) -> _TrackedPage:
+                    np = _TrackedPage("page-new", fail_goto=True, jpeg=b"JPEG_NEW")
+                    self.pages.append(np)
+                    created_pages.append(np)
+                    return np
+
+            hub.ctx = _FakeHostedCtx([page_a, page_b])
+            hub.active_tab_index = 0
+            rev_before = hub._tab_select_rev
+
+            with mock.patch.object(srv, "_check_live_user_role", return_value="admin"):
+                # 1. switch_tab -> B raises in bring_to_front()
+                await hub._execute_human_cmd_async(
+                    {
+                        "action": "switch_tab",
+                        "index": 1,
+                        "cmd_id": "tc-c1host-sw-1",
+                        "_session_gen": 21,
+                        "_takeover_gen": 3,
+                        "_bot_key": "main",
+                        "_user_id": 111,
+                        "_ws": ws_owner,
+                    }
+                )
+                self.assertEqual(0, hub.active_tab_index, "active_tab_index must remain on A after bring_to_front error")
+                self.assertIs(page_a, hub._current_page())
+                self.assertEqual(rev_before, hub._tab_select_rev)
+                acks_1 = [m for m in ws_owner.sent_json if m.get("type") == "tab_cmd_ack"]
+                self.assertEqual(
+                    [{"type": "tab_cmd_ack", "cmd_id": "tc-c1host-sw-1", "status": "rejected", "reason": "execution_error"}],
+                    acks_1,
+                )
+
+                # Subsequent click MUST hit A (A=1, B=0)
+                await hub._execute_human_cmd_async(
+                    {
+                        "action": "click",
+                        "x": 100,
+                        "y": 120,
+                        "_session_gen": 21,
+                        "_takeover_gen": 3,
+                        "_bot_key": "main",
+                        "_user_id": 111,
+                        "_ws": ws_owner,
+                    }
+                )
+                self.assertEqual(1, len(page_a.clicks), "Click after failed switch_tab must land on A")
+                self.assertEqual(0, len(page_b.clicks), "Click after failed switch_tab must NEVER land on B")
+
+                # 2. new_tab raises in np.goto()
+                ws_owner.sent_json.clear()
+                await hub._execute_human_cmd_async(
+                    {
+                        "action": "new_tab",
+                        "cmd_id": "tc-c1host-nt-1",
+                        "_session_gen": 21,
+                        "_takeover_gen": 3,
+                        "_bot_key": "main",
+                        "_user_id": 111,
+                        "_ws": ws_owner,
+                    }
+                )
+                self.assertEqual(1, len(created_pages))
+                self.assertEqual(0, hub.active_tab_index, "active_tab_index must remain on A after new_tab goto error")
+                self.assertIs(page_a, hub._current_page())
+                acks_2 = [m for m in ws_owner.sent_json if m.get("type") == "tab_cmd_ack"]
+                self.assertEqual(
+                    [{"type": "tab_cmd_ack", "cmd_id": "tc-c1host-nt-1", "status": "rejected", "reason": "execution_error"}],
+                    acks_2,
+                )
+
+                # Subsequent click MUST hit A (A=2, B=0, new_page=0)
+                await hub._execute_human_cmd_async(
+                    {
+                        "action": "click",
+                        "x": 200,
+                        "y": 240,
+                        "_session_gen": 21,
+                        "_takeover_gen": 3,
+                        "_bot_key": "main",
+                        "_user_id": 111,
+                        "_ws": ws_owner,
+                    }
+                )
+                self.assertEqual(2, len(page_a.clicks))
+                self.assertEqual(0, len(page_b.clicks))
+                self.assertEqual(0, len(created_pages[0].clicks))
+
+                # 3. close_tab closes orig_page A, then a post-close error occurs -> MUST NOT emit rejected,
+                #    instead captures fresh frame of remaining page B and confirms cmd_id via rendered_tab_cmds!
+                ws_owner.sent_json.clear()
+                ws_owner.sent_bytes.clear()
+                hub.ctx.pages = [page_a, page_b]
+                hub.active_tab_index = 0
+                orig_capture = hub._capture_once
+                fail_once = True
+
+                async def _capture_fail_first(**kw: Any) -> bool:
+                    nonlocal fail_once
+                    if fail_once:
+                        fail_once = False
+                        raise RuntimeError("transient post-close capture boom")
+                    return await orig_capture(**kw)
+
+                with mock.patch.object(hub, "_capture_once", side_effect=_capture_fail_first):
+                    await hub._execute_human_cmd_async(
+                        {
+                            "action": "close_tab",
+                            "index": 0,
+                            "cmd_id": "tc-c1host-cl-1",
+                            "_session_gen": 21,
+                            "_takeover_gen": 3,
+                            "_bot_key": "main",
+                            "_user_id": 111,
+                            "_ws": ws_owner,
+                        }
+                    )
+                self.assertEqual(
+                    [],
+                    [m for m in ws_owner.sent_json if m.get("type") == "tab_cmd_ack"],
+                    "Must NOT emit rejected when orig_page was closed",
+                )
+                self.assertIn(b"JPEG_B", ws_owner.sent_bytes)
+                self.assertIn("tc-c1host-cl-1", hub._rendered_tab_cmd_ids)
+
+        asyncio.run(_scenario())
+
+    def test_c1_sync_tab_switch_and_new_tab_error_preserves_active_page_for_click(self) -> None:
+        """C1-Sync:
+        - Sync `switch_tab` whose `bring_to_front()` raises keeps `active_idx` on A,
+          records ONLY `_rejected_tab_cmds` (not `_acked_tab_cmds`), and subsequent `click` hits A (A=1, B=0).
+        - Sync `new_tab` whose `goto()` raises keeps `active_idx` on A,
+          records ONLY `_rejected_tab_cmds`, and subsequent `click` hits A (A=2, B=0, np=0).
+        - Sync `close_tab` where `orig_page` is closed before an exception records `_acked_tab_cmds` (not rejected).
+        """
+        class _SyncTrackedPage:
+            def __init__(self, name: str, *, fail_bring: bool = False, fail_goto: bool = False) -> None:
+                self.name = name
+                self.url = f"https://{name}.example"
+                self._fail_bring = fail_bring
+                self._fail_goto = fail_goto
+                self._closed = False
+                self.clicks: list[tuple[float, float]] = []
+                self.mouse = types.SimpleNamespace(
+                    click=lambda x, y, **_kw: self.clicks.append((x, y)),
+                    move=lambda *_a, **_kw: None,
+                    up=lambda *_a, **_kw: None,
+                )
+
+            def is_closed(self) -> bool:
+                return self._closed
+
+            def bring_to_front(self) -> None:
+                if self._fail_bring:
+                    raise RuntimeError("sync bring_to_front boom")
+
+            def goto(self, url: str, **_kw: Any) -> None:
+                if self._fail_goto:
+                    raise RuntimeError("sync new_tab goto boom")
+                self.url = url
+
+            def close(self) -> None:
+                self._closed = True
+
+        page_a = _SyncTrackedPage("sync-a")
+        page_b = _SyncTrackedPage("sync-b", fail_bring=True)
+        created_np: list[_SyncTrackedPage] = []
+
+        class _SyncFakeCtx:
+            def __init__(self, pages: list[_SyncTrackedPage]) -> None:
+                self.pages = pages
+
+            def new_page(self) -> _SyncTrackedPage:
+                np = _SyncTrackedPage("sync-new", fail_goto=True)
+                self.pages.append(np)
+                created_np.append(np)
+                return np
+
+        bridge = live_browser_ctl.SyncLiveBridge.__new__(live_browser_ctl.SyncLiveBridge)
+        bridge.raw_ctx = _SyncFakeCtx([page_a, page_b])
+        bridge.active_idx = 0
+        bridge._held_buttons = {}
+        bridge._acked_tab_cmds = []
+        bridge._rejected_tab_cmds = []
+
+        # 1. switch_tab raises in bring_to_front()
+        bridge._exec_human_sync({"action": "switch_tab", "index": 1, "cmd_id": "tc-c1sync-sw-1"})
+        self.assertEqual(0, bridge.active_idx)
+        self.assertIs(page_a, bridge._active_raw_page())
+        self.assertEqual([], bridge._acked_tab_cmds)
+        self.assertEqual(["tc-c1sync-sw-1"], bridge._rejected_tab_cmds)
+
+        # Click lands on A (A=1, B=0)
+        bridge._exec_human_sync({"action": "click", "x": 40, "y": 50})
+        self.assertEqual(1, len(page_a.clicks))
+        self.assertEqual(0, len(page_b.clicks))
+
+        # 2. new_tab raises in goto()
+        bridge._rejected_tab_cmds.clear()
+        bridge._exec_human_sync({"action": "new_tab", "cmd_id": "tc-c1sync-nt-1"})
+        self.assertEqual(1, len(created_np))
+        self.assertEqual(0, bridge.active_idx)
+        self.assertIs(page_a, bridge._active_raw_page())
+        self.assertEqual([], bridge._acked_tab_cmds)
+        self.assertEqual(["tc-c1sync-nt-1"], bridge._rejected_tab_cmds)
+
+        # Click lands on A (A=2, B=0, np=0)
+        bridge._exec_human_sync({"action": "click", "x": 60, "y": 70})
+        self.assertEqual(2, len(page_a.clicks))
+        self.assertEqual(0, len(page_b.clicks))
+        self.assertEqual(0, len(created_np[0].clicks))
+
+        # 3. close_tab closes orig_page A and throws inside close() -> active page changed, so MUST record ack (not reject)!
+        bridge._acked_tab_cmds.clear()
+        bridge._rejected_tab_cmds.clear()
+
+        class _CloseAndBoomPage(_SyncTrackedPage):
+            def close(self) -> None:
+                self._closed = True
+                bridge.raw_ctx.pages.remove(self)
+                raise RuntimeError("post-close error")
+
+        page_c = _CloseAndBoomPage("sync-c")
+        bridge.raw_ctx.pages = [page_c, page_b]
+        bridge.active_idx = 0
+        bridge._exec_human_sync({"action": "close_tab", "index": 0, "cmd_id": "tc-c1sync-cl-1"})
+        self.assertEqual(["tc-c1sync-cl-1"], bridge._acked_tab_cmds)
+        self.assertEqual([], bridge._rejected_tab_cmds)
+
+    def test_c2_sync_reject_tab_cmds_rechecks_lease_per_item_and_per_viewer(self) -> None:
+        """C2-Sync-Lease:
+        - `reject_tab_cmds="cid-1,cid-2"`: when sync lease expires during the `await` of `cid-1`,
+          batch immediately aborts, NEVER sends `cid-2`, NEVER calls `broadcast_state`, and returns 410.
+        - Single `cid` across 2 owner WS connections: when lease expires during WS #1 `send_str`,
+          WS #2 receives 0 `tab_cmd_ack`, `broadcast_state` is skipped, and endpoint returns 410.
+        """
+        async def _scenario() -> None:
+            # --- Case A: Multi-cid batch aborts before cid-2 on lease expiry ---
+            hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "sec-tok")
+            hub.engine_mode = "sync_external"
+            hub.session_gen = 30
+            hub.takeover = True
+            hub.takeover_gen = 2
+            hub.session_owner = ("main", 111)
+            hub.takeover_owner = ("main", 111)
+            hub._sync_lease_id = "lease-c2-a"
+            hub._sync_last_push_ts = srv.time.monotonic()
+
+            class _ExpireOnFirstAckWS(_FakeWSViewer):
+                async def send_str(self, data: str) -> None:
+                    await super().send_str(data)
+                    parsed = json.loads(data)
+                    if parsed.get("type") == "tab_cmd_ack" and parsed.get("cmd_id") == "cid-1":
+                        # Expire lease during the first receipt await!
+                        hub._sync_last_push_ts = srv.time.monotonic() - (srv.SYNC_LEASE_TIMEOUT_SECONDS + 5.0)
+
+            ws_owner = _ExpireOnFirstAckWS()
+            hub.viewers.add(ws_owner)  # type: ignore[arg-type]
+            hub.viewer_meta[ws_owner] = {"bot_key": "main", "user_id": 111, "role": "admin", "last_frame_seq": 1}
+
+            req = types.SimpleNamespace(
+                headers={"X-Live-Token": "sec-tok", "X-Sync-Lease-Id": "lease-c2-a"},
+                query={
+                    "lease_id": "lease-c2-a",
+                    "session_gen": "30",
+                    "reject_tab_cmds": "cid-1,cid-2",
+                },
+                remote="127.0.0.1",
+                app={"hub": hub},
+                read=mock.AsyncMock(return_value=b""),
+            )
+            with (
+                mock.patch.object(srv, "web", _FakeWeb),
+                mock.patch.object(srv, "_check_live_user_role", return_value="admin"),
+                mock.patch.object(hub, "broadcast_state", new_callable=mock.AsyncMock) as mock_bcast_state,
+            ):
+                resp = await srv.internal_sync_push(req)  # type: ignore[arg-type]
+
+            self.assertEqual(410, resp.status, "Expired lease mid-reject_tab_cmds batch must return 410")
+            acks = [m for m in ws_owner.sent_json if m.get("type") == "tab_cmd_ack"]
+            self.assertEqual(["cid-1"], [m["cmd_id"] for m in acks], "cid-2 MUST NEVER be sent after lease expiry")
+            mock_bcast_state.assert_not_awaited()
+
+            # --- Case B: Single cid across 2 owner WS connections aborts before WS #2 ---
+            hub2 = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "sec-tok")
+            hub2.engine_mode = "sync_external"
+            hub2.session_gen = 31
+            hub2.takeover = True
+            hub2.takeover_gen = 1
+            hub2.session_owner = ("main", 111)
+            hub2.takeover_owner = ("main", 111)
+            hub2._sync_lease_id = "lease-c2-b"
+            hub2._sync_last_push_ts = srv.time.monotonic()
+
+            class _ExpireAnyAckWS(_FakeWSViewer):
+                async def send_str(self, data: str) -> None:
+                    await super().send_str(data)
+                    parsed = json.loads(data)
+                    if parsed.get("type") == "tab_cmd_ack":
+                        hub2._sync_last_push_ts = srv.time.monotonic() - (srv.SYNC_LEASE_TIMEOUT_SECONDS + 5.0)
+
+            ws_1 = _ExpireAnyAckWS()
+            ws_2 = _ExpireAnyAckWS()
+            hub2.viewers.add(ws_1)  # type: ignore[arg-type]
+            hub2.viewers.add(ws_2)  # type: ignore[arg-type]
+            hub2.viewer_meta[ws_1] = {"bot_key": "main", "user_id": 111, "role": "admin", "last_frame_seq": 1}
+            hub2.viewer_meta[ws_2] = {"bot_key": "main", "user_id": 111, "role": "admin", "last_frame_seq": 1}
+
+            req2 = types.SimpleNamespace(
+                headers={"X-Live-Token": "sec-tok", "X-Sync-Lease-Id": "lease-c2-b"},
+                query={
+                    "lease_id": "lease-c2-b",
+                    "session_gen": "31",
+                    "reject_tab_cmds": "cid-multi-1",
+                },
+                remote="127.0.0.1",
+                app={"hub": hub2},
+                read=mock.AsyncMock(return_value=b""),
+            )
+            with (
+                mock.patch.object(srv, "web", _FakeWeb),
+                mock.patch.object(srv, "_check_live_user_role", return_value="admin"),
+                mock.patch.object(hub2, "broadcast_state", new_callable=mock.AsyncMock) as mock_bcast_state2,
+            ):
+                resp2 = await srv.internal_sync_push(req2)  # type: ignore[arg-type]
+
+            self.assertEqual(410, resp2.status)
+            total_acks = len([m for m in ws_1.sent_json if m.get("type") == "tab_cmd_ack"]) + len(
+                [m for m in ws_2.sent_json if m.get("type") == "tab_cmd_ack"]
+            )
+            self.assertEqual(1, total_acks, "Second WS connection must NOT receive tab_cmd_ack after lease expiry")
+            mock_bcast_state2.assert_not_awaited()
+
+        asyncio.run(_scenario())
+
+    def test_c3_tab_cmd_ack_strict_auth_and_owner_isolation(self) -> None:
+        """C3-Auth-Isolation:
+        - Non-owner readonly viewer, non-owner admin, and revoked/downgraded former owner sending `switch_tab`
+          with `cmd_id` under BOTH `takeover=True` and `takeover=False` via `handle_ws` MUST receive 0 `tab_cmd_ack`.
+        - Hosted & Sync `execution_error` broadcasts and `_send_tab_cmd_rejected` MUST send 0 `tab_cmd_ack` to
+          readonly viewers, non-owner admins, and revoked/downgraded former owners, while authorized live admin
+          owner receives its own `tab_cmd_ack` normally.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            bdir = Path(tmp)
+            tok_main = "100001:EXAMPLE_MAIN_TOK_C3_AUTH_12345"
+            tok_sg = "200002:EXAMPLE_SG_TOK_C3_AUTH_67890"
+            (bdir / ".env").write_text(
+                f"AGY_TG_BOT_TOKEN={tok_main}\n"
+                "AGY_TG_ALLOWED_CHATS=111,112\n"
+                "AGY_TG_ADMIN_USERS=111\n"
+                "AGY_TG_READONLY_USERS=112\n",
+                encoding="utf-8",
+            )
+            (bdir / ".env.sg").write_text(
+                f"AGY_TG_BOT_TOKEN={tok_sg}\n"
+                "AGY_TG_ALLOWED_CHATS=222,223\n"
+                "AGY_TG_ADMIN_USERS=222\n"
+                "AGY_TG_READONLY_USERS=223\n",
+                encoding="utf-8",
+            )
+
+            async def _scenario() -> None:
+                hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "sec-tok")
+                hub.engine_mode = "async_hosted"
+                hub.ctx = _FakeCtx([_FakePage(), _FakePage()])
+                hub.session_gen = 5
+                hub.takeover_gen = 2
+                hub.session_owner = ("main", 111)
+                hub.takeover_owner = ("main", 111)
+                fake_ws_type = types.SimpleNamespace(TEXT="TEXT", CLOSE="CLOSE")
+                req = types.SimpleNamespace(app={"hub": hub}, remote="127.0.0.1")
+
+                # 1. WS `input` rejection branches under BOTH takeover=True and takeover=False
+                for tk in (True, False):
+                    hub.takeover = tk
+                    hub.takeover_owner = ("main", 111) if tk else None
+
+                    # 1a. Non-owner readonly viewer (sg, 223)
+                    ws_ro = _FakeWSViewer(
+                        [
+                            {"type": "auth", "initData": _signed_init_data(tok_sg, 223)},
+                            {
+                                "type": "input",
+                                "action": "switch_tab",
+                                "index": 1,
+                                "cmd_id": f"tc-ro-{int(tk)}",
+                                "session_gen": 5,
+                                "takeover_gen": 2,
+                            },
+                        ]
+                    )
+                    # 1b. Same-bot readonly viewer (main, 112)
+                    ws_same_ro = _FakeWSViewer(
+                        [
+                            {"type": "auth", "initData": _signed_init_data(tok_main, 112)},
+                            {
+                                "type": "input",
+                                "action": "switch_tab",
+                                "index": 1,
+                                "cmd_id": f"tc-samero-{int(tk)}",
+                                "session_gen": 5,
+                                "takeover_gen": 2,
+                            },
+                        ]
+                    )
+                    # 1c. Non-owner admin (sg, 222)
+                    ws_other_adm = _FakeWSViewer(
+                        [
+                            {"type": "auth", "initData": _signed_init_data(tok_sg, 222)},
+                            {
+                                "type": "input",
+                                "action": "switch_tab",
+                                "index": 1,
+                                "cmd_id": f"tc-otheradm-{int(tk)}",
+                                "session_gen": 5,
+                                "takeover_gen": 2,
+                            },
+                        ]
+                    )
+                    for target_ws, label in (
+                        (ws_ro, "non-owner readonly"),
+                        (ws_same_ro, "same-bot readonly"),
+                        (ws_other_adm, "non-owner admin"),
+                    ):
+                        with (
+                            mock.patch.object(srv, "_BRIDGE_DIR", bdir),
+                            mock.patch.object(srv, "WSMsgType", fake_ws_type),
+                            mock.patch.object(srv, "web", types.SimpleNamespace(WebSocketResponse=lambda **_kw: target_ws)),
+                        ):
+                            await srv.handle_ws(req)  # type: ignore[arg-type]
+                        self.assertEqual(
+                            [],
+                            [m for m in target_ws.sent_json if m.get("type") == "tab_cmd_ack"],
+                            f"{label} under takeover={tk} MUST receive 0 tab_cmd_ack",
+                        )
+
+                # 1d. Authorized owner admin (main, 111) DOES receive tab_cmd_ack when takeover=False or stale_session
+                hub.takeover = False
+                hub.takeover_owner = None
+                ws_owner_no_tk = _FakeWSViewer(
+                    [
+                        {"type": "auth", "initData": _signed_init_data(tok_main, 111)},
+                        {
+                            "type": "input",
+                            "action": "switch_tab",
+                            "index": 1,
+                            "cmd_id": "tc-owner-notk-1",
+                            "session_gen": 5,
+                            "takeover_gen": 2,
+                        },
+                    ]
+                )
+                with (
+                    mock.patch.object(srv, "_BRIDGE_DIR", bdir),
+                    mock.patch.object(srv, "WSMsgType", fake_ws_type),
+                    mock.patch.object(srv, "web", types.SimpleNamespace(WebSocketResponse=lambda **_kw: ws_owner_no_tk)),
+                ):
+                    await srv.handle_ws(req)  # type: ignore[arg-type]
+                self.assertEqual(
+                    [{"type": "tab_cmd_ack", "cmd_id": "tc-owner-notk-1", "status": "rejected", "reason": "no_takeover"}],
+                    [m for m in ws_owner_no_tk.sent_json if m.get("type") == "tab_cmd_ack"],
+                )
+
+                # 1e. Revoked/downgraded former owner sending switch_tab receives 0 tab_cmd_ack
+                hub.takeover = True
+                hub.takeover_owner = ("main", 111)
+                ws_revoked_in = _FakeWSViewer(
+                    [
+                        {"type": "auth", "initData": _signed_init_data(tok_main, 111)},
+                        {
+                            "type": "input",
+                            "action": "switch_tab",
+                            "index": 1,
+                            "cmd_id": "tc-revoked-in-1",
+                            "session_gen": 5,
+                            "takeover_gen": 2,
+                        },
+                    ]
+                )
+                orig_role_fn = srv._check_live_user_role
+                call_idx = 0
+
+                def _downgrade_on_input(bk: str, uid: int) -> str:
+                    nonlocal call_idx
+                    if bk == "main" and uid == 111:
+                        call_idx += 1
+                        # Allow initial auth/state, then downgrade to readonly before input check
+                        return "readonly" if call_idx >= 3 else "admin"
+                    return orig_role_fn(bk, uid)
+
+                with (
+                    mock.patch.object(srv, "_BRIDGE_DIR", bdir),
+                    mock.patch.object(srv, "WSMsgType", fake_ws_type),
+                    mock.patch.object(srv, "web", types.SimpleNamespace(WebSocketResponse=lambda **_kw: ws_revoked_in)),
+                    mock.patch.object(srv, "_check_live_user_role", side_effect=_downgrade_on_input),
+                ):
+                    await srv.handle_ws(req)  # type: ignore[arg-type]
+                self.assertEqual(
+                    [],
+                    [m for m in ws_revoked_in.sent_json if m.get("type") == "tab_cmd_ack"],
+                    "Downgraded former owner MUST receive 0 tab_cmd_ack",
+                )
+
+                # 2. Broadcast isolation (Hosted & Sync execution_error) + _send_tab_cmd_rejected isolation
+                hub.engine_mode = "async_hosted"
+                hub.session_gen = 9
+                hub.takeover = True
+                hub.takeover_gen = 4
+                hub.session_owner = ("main", 111)
+                hub.takeover_owner = ("main", 111)
+
+                ws_auth_owner = _FakeWSViewer()
+                ws_ro_owner = _FakeWSViewer()
+                ws_non_owner_adm = _FakeWSViewer()
+                ws_non_owner_ro = _FakeWSViewer()
+                ws_revoked_former = _FakeWSViewer()
+                hub.viewers.clear()
+                hub.viewer_meta.clear()
+                for v, meta in (
+                    (ws_auth_owner, {"bot_key": "main", "user_id": 111, "role": "admin"}),
+                    (ws_ro_owner, {"bot_key": "main", "user_id": 112, "role": "readonly"}),
+                    (ws_non_owner_adm, {"bot_key": "sg", "user_id": 222, "role": "admin"}),
+                    (ws_non_owner_ro, {"bot_key": "sg", "user_id": 223, "role": "readonly"}),
+                    (ws_revoked_former, {"bot_key": "main", "user_id": 113, "role": "admin"}),
+                ):
+                    hub.viewers.add(v)  # type: ignore[arg-type]
+                    hub.viewer_meta[v] = meta
+
+                roles_map = {
+                    ("main", 111): "admin",
+                    ("main", 112): "readonly",
+                    ("sg", 222): "admin",
+                    ("sg", 223): "readonly",
+                    ("main", 113): "denied",
+                }
+                with mock.patch.object(
+                    srv, "_check_live_user_role", side_effect=lambda bk, uid: roles_map.get((bk, uid), "denied")
+                ):
+                    # Hosted execution_error broadcast
+                    await hub._broadcast_tab_cmd_rejected("tc-bcast-host-1", "execution_error", expected_session_gen=9)
+
+                    # Direct _send_tab_cmd_rejected with unauthorized MUST be silent even for owner;
+                    # and non-owner / readonly MUST be silent for any reason!
+                    await hub._send_tab_cmd_rejected(
+                        {"action": "switch_tab", "cmd_id": "tc-unauth-drop", "_ws": ws_auth_owner, "_session_gen": 9},
+                        "unauthorized",
+                    )
+                    await hub._send_tab_cmd_rejected(
+                        {"action": "switch_tab", "cmd_id": "tc-other-drop", "_ws": ws_non_owner_adm, "_session_gen": 9},
+                        "no_page",
+                    )
+                    await hub._send_tab_cmd_rejected(
+                        {"action": "switch_tab", "cmd_id": "tc-ro-drop", "_ws": ws_ro_owner, "_session_gen": 9},
+                        "no_page",
+                    )
+
+                    # Sync execution_error broadcast via internal_sync_push
+                    hub.ctx = None
+                    hub.engine_mode = "sync_external"
+                    hub._sync_lease_id = "lease-c3-sync"
+                    hub._sync_last_push_ts = srv.time.monotonic()
+                    req_sync = types.SimpleNamespace(
+                        headers={"X-Live-Token": "sec-tok", "X-Sync-Lease-Id": "lease-c3-sync"},
+                        query={"lease_id": "lease-c3-sync", "session_gen": "9", "reject_tab_cmds": "tc-bcast-sync-1"},
+                        remote="127.0.0.1",
+                        app={"hub": hub},
+                        read=mock.AsyncMock(return_value=b""),
+                    )
+                    with mock.patch.object(srv, "web", _FakeWeb):
+                        resp_sync = await srv.internal_sync_push(req_sync)  # type: ignore[arg-type]
+                    self.assertEqual(200, resp_sync.status)
+
+                    # Same owner downgraded to readonly MUST receive 0 tab_cmd_ack
+                    roles_map[("main", 111)] = "readonly"
+                    await hub._broadcast_tab_cmd_rejected("tc-bcast-downgraded-1", "execution_error", expected_session_gen=9)
+
+                self.assertEqual(
+                    ["tc-bcast-host-1", "tc-bcast-sync-1"],
+                    [m["cmd_id"] for m in ws_auth_owner.sent_json if m.get("type") == "tab_cmd_ack"],
+                    "Authorized live admin owner must receive ONLY its authorized host+sync execution_error acks",
+                )
+                for bad_ws, name in (
+                    (ws_ro_owner, "readonly viewer"),
+                    (ws_non_owner_adm, "non-owner admin"),
+                    (ws_non_owner_ro, "non-owner readonly"),
+                    (ws_revoked_former, "revoked former owner"),
+                ):
+                    self.assertEqual(
+                        [],
+                        [m for m in bad_ws.sent_json if m.get("type") == "tab_cmd_ack"],
+                        f"{name} MUST receive 0 tab_cmd_ack across all paths",
+                    )
+
+            asyncio.run(_scenario())
+
+    def test_c3_idle_and_ownerless_zero_tab_cmd_ack(self) -> None:
+        """C3-Idle-Fail-Closed:
+        - Once a Hosted or Sync session ends and enters ownerless `idle`, both non-owner admin and former owner
+          sending `switch_tab` with `cmd_id` using either current `session_gen` or stale `session_gen` MUST receive
+          0 `tab_cmd_ack` (across WS input, `_send_tab_cmd_rejected`, and `_broadcast_tab_cmd_rejected`).
+        - Active Hosted and Sync sessions with an explicit verified owner still deliver `tab_cmd_ack`
+          (`stale_takeover`, `no_takeover`, `execution_error`) normally to the authorized owner admin.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            bdir = Path(tmp)
+            tok_main = "100001:EXAMPLE_MAIN_TOK_C3_IDLE_12345"
+            tok_sg = "200002:EXAMPLE_SG_TOK_C3_IDLE_67890"
+            (bdir / ".env").write_text(
+                f"AGY_TG_BOT_TOKEN={tok_main}\n"
+                "AGY_TG_ALLOWED_CHATS=111\n"
+                "AGY_TG_ADMIN_USERS=111\n",
+                encoding="utf-8",
+            )
+            (bdir / ".env.sg").write_text(
+                f"AGY_TG_BOT_TOKEN={tok_sg}\n"
+                "AGY_TG_ALLOWED_CHATS=222\n"
+                "AGY_TG_ADMIN_USERS=222\n",
+                encoding="utf-8",
+            )
+
+            async def _run_ws_switch(
+                hub: Any,
+                token: str,
+                uid: int,
+                *,
+                cmd_id: str,
+                sgen: int,
+                tgen: int,
+            ) -> list[dict[str, Any]]:
+                fake_ws_type = types.SimpleNamespace(TEXT="TEXT", CLOSE="CLOSE")
+                req = types.SimpleNamespace(app={"hub": hub}, remote="127.0.0.1")
+                ws = _FakeWSViewer(
+                    [
+                        {"type": "auth", "initData": _signed_init_data(token, uid)},
+                        {
+                            "type": "input",
+                            "action": "switch_tab",
+                            "index": 1,
+                            "cmd_id": cmd_id,
+                            "session_gen": sgen,
+                            "takeover_gen": tgen,
+                        },
+                    ]
+                )
+                with (
+                    mock.patch.object(srv, "_BRIDGE_DIR", bdir),
+                    mock.patch.object(srv, "WSMsgType", fake_ws_type),
+                    mock.patch.object(srv, "web", types.SimpleNamespace(WebSocketResponse=lambda **_kw: ws)),
+                ):
+                    await srv.handle_ws(req)  # type: ignore[arg-type]
+                return [m for m in ws.sent_json if m.get("type") == "tab_cmd_ack"]
+
+            async def _scenario() -> None:
+                hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18796, "public_url": ""}, "sec-tok")
+                hub.tg.retire_cards = mock.AsyncMock()  # type: ignore[method-assign]
+
+                # 1. Active Hosted session with explicit owner ("main", 111):
+                #    authorized owner receives stale_takeover, no_takeover, and execution_error acks.
+                hub.engine_mode = "async_hosted"
+                hub.ctx = _FakeCtx([_FakePage(), _FakePage()])
+                hub.session_gen = 12
+                hub.takeover_gen = 3
+                hub.session_owner = ("main", 111)
+                hub.takeover = True
+                hub.takeover_owner = ("main", 111)
+
+                acks_host_stale_tk = await _run_ws_switch(
+                    hub, tok_main, 111, cmd_id="tc-host-stale-tk", sgen=12, tgen=1
+                )
+                self.assertEqual(
+                    [{"type": "tab_cmd_ack", "cmd_id": "tc-host-stale-tk", "status": "rejected", "reason": "stale_takeover"}],
+                    acks_host_stale_tk,
+                )
+
+                hub.takeover = False
+                hub.takeover_owner = None
+                acks_host_no_tk = await _run_ws_switch(
+                    hub, tok_main, 111, cmd_id="tc-host-no-tk", sgen=12, tgen=3
+                )
+                self.assertEqual(
+                    [{"type": "tab_cmd_ack", "cmd_id": "tc-host-no-tk", "status": "rejected", "reason": "no_takeover"}],
+                    acks_host_no_tk,
+                )
+
+                ws_owner_bcast = _FakeWSViewer()
+                hub.viewers.add(ws_owner_bcast)  # type: ignore[arg-type]
+                hub.viewer_meta[ws_owner_bcast] = {"bot_key": "main", "user_id": 111, "role": "admin"}
+                with mock.patch.object(srv, "_BRIDGE_DIR", bdir):
+                    await hub._broadcast_tab_cmd_rejected("tc-host-exec-err", "execution_error", expected_session_gen=12)
+                self.assertEqual(
+                    [{"type": "tab_cmd_ack", "cmd_id": "tc-host-exec-err", "status": "rejected", "reason": "execution_error"}],
+                    [m for m in ws_owner_bcast.sent_json if m.get("type") == "tab_cmd_ack"],
+                )
+                hub.viewers.clear()
+                hub.viewer_meta.clear()
+
+                # 2. Hosted session stops -> enters ownerless `idle`:
+                #    non-owner admin & former owner with BOTH current and stale session_gen get 0 tab_cmd_ack.
+                old_hosted_gen = hub.session_gen
+                await hub._stop_hosted_locked(notify_finished=False)
+                self.assertEqual("idle", hub.engine_mode)
+                self.assertIsNone(hub.session_owner)
+                self.assertEqual((None, None), hub._effective_resource_owner())
+                cur_idle_gen = hub.session_gen
+                cur_idle_tgen = hub.takeover_gen
+
+                for label, tok, uid, sgen, cid in (
+                    ("hosted-idle non-owner current gen", tok_sg, 222, cur_idle_gen, "tc-hidle-other-cur"),
+                    ("hosted-idle non-owner stale gen", tok_sg, 222, old_hosted_gen, "tc-hidle-other-old"),
+                    ("hosted-idle former-owner current gen", tok_main, 111, cur_idle_gen, "tc-hidle-own-cur"),
+                    ("hosted-idle former-owner stale gen", tok_main, 111, old_hosted_gen, "tc-hidle-own-old"),
+                ):
+                    acks = await _run_ws_switch(hub, tok, uid, cmd_id=cid, sgen=sgen, tgen=cur_idle_tgen)
+                    self.assertEqual([], acks, f"{label} MUST receive 0 tab_cmd_ack")
+
+                # Direct `_send_tab_cmd_rejected` and `_broadcast_tab_cmd_rejected` in ownerless idle MUST also emit 0 acks
+                ws_idle_adm = _FakeWSViewer()
+                ws_idle_other = _FakeWSViewer()
+                hub.viewers.update({ws_idle_adm, ws_idle_other})  # type: ignore[arg-type]
+                hub.viewer_meta[ws_idle_adm] = {"bot_key": "main", "user_id": 111, "role": "admin"}
+                hub.viewer_meta[ws_idle_other] = {"bot_key": "sg", "user_id": 222, "role": "admin"}
+                with mock.patch.object(srv, "_BRIDGE_DIR", bdir):
+                    await hub._send_tab_cmd_rejected(
+                        {"action": "switch_tab", "cmd_id": "tc-idle-direct-own", "_ws": ws_idle_adm, "_session_gen": cur_idle_gen},
+                        "idle",
+                    )
+                    await hub._send_tab_cmd_rejected(
+                        {"action": "switch_tab", "cmd_id": "tc-idle-direct-other", "_ws": ws_idle_other, "_session_gen": cur_idle_gen},
+                        "idle",
+                    )
+                    await hub._broadcast_tab_cmd_rejected("tc-idle-bcast", "execution_error", expected_session_gen=cur_idle_gen)
+                self.assertEqual([], [m for m in ws_idle_adm.sent_json if m.get("type") == "tab_cmd_ack"])
+                self.assertEqual([], [m for m in ws_idle_other.sent_json if m.get("type") == "tab_cmd_ack"])
+                hub.viewers.clear()
+                hub.viewer_meta.clear()
+
+                # 3. Active Sync session with explicit owner ("main", 111):
+                #    authorized owner still receives stale_takeover, no_takeover, and execution_error acks.
+                hub.engine_mode = "sync_external"
+                hub._sync_lease_id = "lease-c3-idle-test"
+                hub._sync_last_push_ts = srv.time.monotonic()
+                hub.session_gen = 20
+                hub.takeover_gen = 5
+                hub.session_owner = ("main", 111)
+                hub.takeover = True
+                hub.takeover_owner = ("main", 111)
+
+                acks_sync_stale_tk = await _run_ws_switch(
+                    hub, tok_main, 111, cmd_id="tc-sync-stale-tk", sgen=20, tgen=2
+                )
+                self.assertEqual(
+                    [{"type": "tab_cmd_ack", "cmd_id": "tc-sync-stale-tk", "status": "rejected", "reason": "stale_takeover"}],
+                    acks_sync_stale_tk,
+                )
+
+                hub.takeover = False
+                hub.takeover_owner = None
+                acks_sync_no_tk = await _run_ws_switch(
+                    hub, tok_main, 111, cmd_id="tc-sync-no-tk", sgen=20, tgen=5
+                )
+                self.assertEqual(
+                    [{"type": "tab_cmd_ack", "cmd_id": "tc-sync-no-tk", "status": "rejected", "reason": "no_takeover"}],
+                    acks_sync_no_tk,
+                )
+
+                ws_sync_owner = _FakeWSViewer()
+                hub.viewers.add(ws_sync_owner)  # type: ignore[arg-type]
+                hub.viewer_meta[ws_sync_owner] = {"bot_key": "main", "user_id": 111, "role": "admin"}
+                req_sync = types.SimpleNamespace(
+                    headers={"X-Live-Token": "sec-tok", "X-Sync-Lease-Id": "lease-c3-idle-test"},
+                    query={"lease_id": "lease-c3-idle-test", "session_gen": "20", "reject_tab_cmds": "tc-sync-exec-err"},
+                    remote="127.0.0.1",
+                    app={"hub": hub},
+                    read=mock.AsyncMock(return_value=b""),
+                )
+                with (
+                    mock.patch.object(srv, "_BRIDGE_DIR", bdir),
+                    mock.patch.object(srv, "web", _FakeWeb),
+                ):
+                    resp_sync = await srv.internal_sync_push(req_sync)  # type: ignore[arg-type]
+                self.assertEqual(200, resp_sync.status)
+                self.assertEqual(
+                    [{"type": "tab_cmd_ack", "cmd_id": "tc-sync-exec-err", "status": "rejected", "reason": "execution_error"}],
+                    [m for m in ws_sync_owner.sent_json if m.get("type") == "tab_cmd_ack"],
+                )
+                hub.viewers.clear()
+                hub.viewer_meta.clear()
+
+                # 4. Sync session ends -> enters ownerless `idle`:
+                #    non-owner admin & former owner with BOTH current and stale session_gen get 0 tab_cmd_ack.
+                old_sync_gen, _ = hub._invalidate_sync_session_sync()
+                self.assertEqual("idle", hub.engine_mode)
+                self.assertIsNone(hub.session_owner)
+                self.assertEqual((None, None), hub._effective_resource_owner())
+                cur_sync_idle_gen = hub.session_gen
+                cur_sync_idle_tgen = hub.takeover_gen
+
+                for label, tok, uid, sgen, cid in (
+                    ("sync-idle non-owner current gen", tok_sg, 222, cur_sync_idle_gen, "tc-sidle-other-cur"),
+                    ("sync-idle non-owner stale gen", tok_sg, 222, old_sync_gen, "tc-sidle-other-old"),
+                    ("sync-idle former-owner current gen", tok_main, 111, cur_sync_idle_gen, "tc-sidle-own-cur"),
+                    ("sync-idle former-owner stale gen", tok_main, 111, old_sync_gen, "tc-sidle-own-old"),
+                ):
+                    acks = await _run_ws_switch(hub, tok, uid, cmd_id=cid, sgen=sgen, tgen=cur_sync_idle_tgen)
+                    self.assertEqual([], acks, f"{label} MUST receive 0 tab_cmd_ack")
+
+                # 5. Active ownerless session (localhost CLI only, session_owner=None) MUST also emit 0 tab_cmd_ack
+                hub.engine_mode = "async_hosted"
+                hub.session_owner = None
+                hub.takeover = False
+                hub.takeover_owner = None
+                hub.session_gen = 30
+                hub.takeover_gen = 1
+                self.assertFalse(hub._viewer_can_receive_tab_cmd_ack("main", 111, "admin"))
+                self.assertFalse(hub._viewer_can_receive_tab_cmd_ack("sg", 222, "admin"))
+                self.assertEqual(
+                    [],
+                    await _run_ws_switch(hub, tok_main, 111, cmd_id="tc-ownerless-active", sgen=30, tgen=1),
+                )
 
             asyncio.run(_scenario())
 

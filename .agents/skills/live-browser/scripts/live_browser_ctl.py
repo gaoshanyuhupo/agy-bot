@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -29,6 +30,16 @@ CONFIG_DIR = Path(os.environ.get("AGY_LIVE_BROWSER_CONFIG_DIR", str(Path.home() 
 CONFIG_FILE = CONFIG_DIR / "config.json"
 LOCAL_TOKEN_FILE = CONFIG_DIR / "local.token"
 DEFAULT_BASE_URL = "http://127.0.0.1:18795"
+_TAB_CMD_ID_RE = re.compile(r"^[A-Za-z0-9_:-]{1,48}$")
+
+
+def _sanitize_tab_cmd_id(raw: Any) -> str | None:
+    if not isinstance(raw, str):
+        return None
+    val = raw.strip()
+    if not val or not _TAB_CMD_ID_RE.match(val):
+        return None
+    return val
 
 
 def _detect_current_bot_hint() -> str:
@@ -237,6 +248,8 @@ class SyncLiveBridge:
         self.active_idx = 0
         self._in_checkpoint = False
         self._held_buttons: dict[str, Any] = {}
+        self._acked_tab_cmds: list[str] = []
+        self._rejected_tab_cmds: list[str] = []
         self._pinned_verified: bool = False
         self._profile_dir: Path | None = Path(profile_dir) if profile_dir is not None else None
         self._sync_lease_id: str | None = None
@@ -299,7 +312,48 @@ class SyncLiveBridge:
             pass
         finally:
             self._release_held_buttons_sync()
+            self._clear_acked_tab_cmds()
             self.enabled = False
+
+    def _record_acked_tab_cmd(self, raw_cmd_id: Any) -> None:
+        clean = _sanitize_tab_cmd_id(raw_cmd_id)
+        if not clean:
+            return
+        acked = getattr(self, "_acked_tab_cmds", None)
+        if acked is None:
+            acked = []
+            self._acked_tab_cmds = acked
+        if clean not in acked:
+            acked.append(clean)
+            if len(acked) > 32:
+                del acked[:-32]
+
+    def _record_rejected_tab_cmd(self, raw_cmd_id: Any) -> None:
+        clean = _sanitize_tab_cmd_id(raw_cmd_id)
+        if not clean:
+            return
+        acked = getattr(self, "_acked_tab_cmds", None)
+        if isinstance(acked, list):
+            try:
+                acked.remove(clean)
+            except ValueError:
+                pass
+        rejected = getattr(self, "_rejected_tab_cmds", None)
+        if rejected is None:
+            rejected = []
+            self._rejected_tab_cmds = rejected
+        if clean not in rejected:
+            rejected.append(clean)
+            if len(rejected) > 32:
+                del rejected[:-32]
+
+    def _clear_acked_tab_cmds(self) -> None:
+        acked = getattr(self, "_acked_tab_cmds", None)
+        if isinstance(acked, list):
+            acked.clear()
+        rejected = getattr(self, "_rejected_tab_cmds", None)
+        if isinstance(rejected, list):
+            rejected.clear()
 
     def _active_raw_page(self) -> Any | None:
         pages = list(self.raw_ctx.pages)
@@ -424,6 +478,12 @@ class SyncLiveBridge:
                     params["cx"] = str(cursor[0])
                     params["cy"] = str(cursor[1])
                     params["actor"] = cursor[2]
+                acked_snap = list(getattr(self, "_acked_tab_cmds", None) or []) if jpeg else []
+                if acked_snap:
+                    params["ack_tab_cmds"] = ",".join(acked_snap)
+                rejected_snap = list(getattr(self, "_rejected_tab_cmds", None) or [])
+                if rejected_snap:
+                    params["reject_tab_cmds"] = ",".join(rejected_snap)
 
                 qs = urllib.parse.urlencode(params)
                 resp = self.client.session.post(
@@ -435,13 +495,31 @@ class SyncLiveBridge:
                 status_code = getattr(resp, "status_code", 200)
                 if status_code in (409, 410):
                     self._release_held_buttons_sync()
+                    self._clear_acked_tab_cmds()
                     self.enabled = False
                     break
                 data = resp.json()
                 if isinstance(data, dict) and data.get("ok") is False:
                     self._release_held_buttons_sync()
+                    self._clear_acked_tab_cmds()
                     self.enabled = False
                     break
+                if acked_snap:
+                    cur_acked = getattr(self, "_acked_tab_cmds", None)
+                    if isinstance(cur_acked, list):
+                        for cid in acked_snap:
+                            try:
+                                cur_acked.remove(cid)
+                            except ValueError:
+                                pass
+                if rejected_snap:
+                    cur_rejected = getattr(self, "_rejected_tab_cmds", None)
+                    if isinstance(cur_rejected, list):
+                        for cid in rejected_snap:
+                            try:
+                                cur_rejected.remove(cid)
+                            except ValueError:
+                                pass
                 cur_clip = self._read_x11_clip()
                 if cur_clip and cur_clip != self._last_clip:
                     self._last_clip = cur_clip
@@ -590,12 +668,15 @@ class SyncLiveBridge:
     def _exec_human_sync(self, cmd: dict[str, Any]) -> tuple[float, float, str] | None:
         page = self._active_raw_page()
         if not page:
+            if cmd.get("action") in ("switch_tab", "new_tab", "close_tab"):
+                self._record_rejected_tab_cmd(cmd.get("cmd_id"))
             return None
         held = getattr(self, "_held_buttons", None)
         if held is None:
             held = {}
             self._held_buttons = held
         act = cmd.get("action")
+        orig_page = page
         cursor_out: tuple[float, float, str] | None = None
         try:
             if act == "move":
@@ -700,18 +781,54 @@ class SyncLiveBridge:
                 page.reload(wait_until="domcontentloaded", timeout=30000)
             elif act == "switch_tab":
                 idx = int(cmd.get("index", 0))
-                if 0 <= idx < len(self.raw_ctx.pages):
-                    self.active_idx = idx
-                    self.raw_ctx.pages[idx].bring_to_front()
+                pages_now = list(self.raw_ctx.pages)
+                if 0 <= idx < len(pages_now):
+                    target_page = pages_now[idx]
+                    if target_page is not page:
+                        self._release_held_buttons_sync()
+                    try:
+                        target_page.bring_to_front()
+                    except Exception:
+                        pages_fb = list(self.raw_ctx.pages)
+                        if orig_page in pages_fb:
+                            self.active_idx = pages_fb.index(orig_page)
+                        raise
+                    pages_after = list(self.raw_ctx.pages)
+                    if target_page in pages_after:
+                        self.active_idx = pages_after.index(target_page)
+                        self._record_acked_tab_cmd(cmd.get("cmd_id"))
+                    else:
+                        if orig_page in pages_after:
+                            self.active_idx = pages_after.index(orig_page)
+                        self._record_rejected_tab_cmd(cmd.get("cmd_id"))
+                else:
+                    self._record_acked_tab_cmd(cmd.get("cmd_id"))
             elif act == "new_tab":
+                self._release_held_buttons_sync()
                 np = self.raw_ctx.new_page()
-                self.active_idx = list(self.raw_ctx.pages).index(np)
-                np.goto("about:blank", wait_until="domcontentloaded", timeout=30000)
+                try:
+                    np.goto("about:blank", wait_until="domcontentloaded", timeout=30000)
+                except Exception:
+                    pages_fb = list(self.raw_ctx.pages)
+                    if orig_page in pages_fb:
+                        self.active_idx = pages_fb.index(orig_page)
+                    raise
+                pages_after = list(self.raw_ctx.pages)
+                if np in pages_after:
+                    self.active_idx = pages_after.index(np)
+                    self._record_acked_tab_cmd(cmd.get("cmd_id"))
+                else:
+                    if orig_page in pages_after:
+                        self.active_idx = pages_after.index(orig_page)
+                    self._record_rejected_tab_cmd(cmd.get("cmd_id"))
             elif act == "close_tab":
                 idx = int(cmd.get("index", -1))
-                if len(self.raw_ctx.pages) > 1 and 0 <= idx < len(self.raw_ctx.pages):
-                    self.raw_ctx.pages[idx].close()
+                pages_now = list(self.raw_ctx.pages)
+                if len(pages_now) > 1 and 0 <= idx < len(pages_now):
+                    self._release_held_buttons_sync()
+                    pages_now[idx].close()
                     self.active_idx = max(0, min(self.active_idx, len(self.raw_ctx.pages) - 1))
+                self._record_acked_tab_cmd(cmd.get("cmd_id"))
             elif act == "extract":
                 mode = str(cmd.get("mode") or "point")
                 req_id = cmd.get("req_id")
@@ -908,7 +1025,12 @@ class SyncLiveBridge:
                     if ext:
                         _emit_extract(ext)
         except Exception:
-            pass
+            if act in ("switch_tab", "new_tab", "close_tab"):
+                cur_page = self._active_raw_page()
+                if cur_page is orig_page and not self._is_raw_page_closed(orig_page):
+                    self._record_rejected_tab_cmd(cmd.get("cmd_id"))
+                elif cur_page is not None:
+                    self._record_acked_tab_cmd(cmd.get("cmd_id"))
         return cursor_out
 
 

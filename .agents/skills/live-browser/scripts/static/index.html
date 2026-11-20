@@ -10,6 +10,7 @@
       --bg: #0d1117;
       --panel: #161b22;
       --panel-2: #1f2630;
+      --pill-bg: #222934;
       --border: #2d3643;
       --text: #e6edf3;
       --muted: #8b949e;
@@ -21,6 +22,8 @@
       --danger: #f85149;
       --safe-top: calc(var(--tg-safe-area-inset-top, env(safe-area-inset-top, 0px)) + var(--tg-content-safe-area-inset-top, 0px));
       --safe-bottom: var(--tg-safe-area-inset-bottom, env(safe-area-inset-bottom, 0px));
+      --safe-left: var(--tg-safe-area-inset-left, env(safe-area-inset-left, 0px));
+      --safe-right: var(--tg-safe-area-inset-right, env(safe-area-inset-right, 0px));
     }
     * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
     .hidden { display: none !important; }
@@ -45,13 +48,17 @@
     #app.immersive .topbar,
     #app.immersive .banner,
     #app.immersive .nav-wrap,
-    #app.immersive .dock {
+    #app.immersive .dock,
+    #app.immersive .chrome-topbar,
+    #app.immersive .chrome-bottombar,
+    #app.immersive .chrome-side-rail {
       display: none !important;
     }
     #immersive-fab {
       position: fixed;
       top: calc(var(--safe-top) + 8px);
-      right: 10px;
+      right: calc(10px + var(--safe-right, env(safe-area-inset-right, 0px)));
+      max-width: calc(100vw - 20px - var(--safe-left, env(safe-area-inset-left, 0px)) - var(--safe-right, env(safe-area-inset-right, 0px)));
       z-index: 70;
       display: inline-flex;
       align-items: center;
@@ -63,6 +70,9 @@
       -webkit-backdrop-filter: blur(10px);
       border: 1px solid rgba(139, 148, 158, 0.35);
       box-shadow: 0 6px 22px rgba(0, 0, 0, 0.55);
+    }
+    #immersive-exit {
+      margin-right: max(0px, calc(env(safe-area-inset-right, 0px) * 0));
     }
     .fab-btn {
       border: 1px solid transparent;
@@ -116,7 +126,11 @@
 
     /* Top Floating Smart Input Sheet (Never covered by iOS Keyboard!) */
     #kb-sheet {
-      position: fixed; top: calc(var(--safe-top) + 8px); left: 8px; right: 8px; z-index: 80;
+      position: fixed;
+      top: calc(var(--safe-top) + 8px);
+      left: calc(8px + var(--safe-left, env(safe-area-inset-left, 0px)));
+      right: calc(8px + var(--safe-right, env(safe-area-inset-right, 0px)));
+      z-index: 80;
       background: rgba(22, 27, 34, 0.98);
       border: 1.5px solid var(--accent);
       border-radius: 12px;
@@ -227,7 +241,7 @@
       max-height: 76px; overflow: hidden;
     }
 
-    /* Top Control Header */
+    /* Desktop Top Control Header */
     .topbar {
       display: flex; align-items: center; justify-content: space-between;
       padding: 6px 8px; gap: 5px;
@@ -287,8 +301,9 @@
       cursor: pointer; white-space: nowrap; flex-shrink: 0;
     }
     .mini-badge:active { opacity: 0.75; }
+    .mini-badge.active { border-color: var(--accent); color: #79c0ff; background: rgba(47, 129, 247, 0.16); }
 
-    /* Navigation & Tabs */
+    /* Navigation & Tabs (Desktop) */
     .nav-wrap {
       background: var(--panel); border-bottom: 1px solid var(--border);
       flex-shrink: 0;
@@ -324,27 +339,223 @@
       user-select: text; -webkit-user-select: text;
     }
 
+    /* Chrome-Style Minimal Mobile Top Capsule */
+    .chrome-topbar {
+      display: none;
+      align-items: center;
+      gap: 6px;
+      padding: 5px calc(8px + var(--safe-right)) 5px calc(8px + var(--safe-left));
+      background: var(--panel);
+      border-bottom: 1px solid rgba(45, 54, 67, 0.72);
+      flex-shrink: 0;
+      min-height: 44px;
+    }
+    .chrome-icon-btn {
+      border: none;
+      background: transparent;
+      color: var(--text);
+      width: 34px; height: 34px;
+      border-radius: 999px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 18px;
+      cursor: pointer;
+      flex-shrink: 0;
+      transition: background 0.12s ease, transform 0.08s ease;
+    }
+    .chrome-icon-btn:active { background: rgba(255, 255, 255, 0.1); transform: scale(0.93); }
+    .chrome-url-pill {
+      flex: 1;
+      min-width: 0;
+      height: 34px;
+      border-radius: 999px;
+      background: var(--pill-bg);
+      border: 1px solid rgba(139, 148, 158, 0.22);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      padding: 0 12px;
+      cursor: pointer;
+      transition: border-color 0.15s ease, background 0.15s ease;
+    }
+    .chrome-url-pill.takeover {
+      border-color: rgba(210, 153, 34, 0.6);
+      background: rgba(210, 153, 34, 0.12);
+    }
+    .chrome-url-pill.editing {
+      justify-content: flex-start;
+      border-color: var(--accent);
+      background: #0d1117;
+      padding: 0 10px;
+    }
+    .chrome-url-display {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      min-width: 0;
+      max-width: 100%;
+      font-size: 13.5px;
+      font-weight: 500;
+      color: var(--text);
+    }
+    .chrome-url-pill.editing .chrome-url-display { display: none; }
+    #chrome-url-host {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    #chrome-url-input {
+      display: none;
+      width: 100%;
+      height: 100%;
+      border: none;
+      outline: none;
+      background: transparent;
+      color: var(--text);
+      font-size: 13.5px;
+      user-select: text; -webkit-user-select: text;
+    }
+    .chrome-url-pill.editing #chrome-url-input { display: block; }
+    #chrome-reload-btn { display: none; }
+    .chrome-profile-chip {
+      border: 1px solid rgba(139, 148, 158, 0.28);
+      background: rgba(47, 129, 247, 0.14);
+      color: #c9d1d9;
+      border-radius: 999px;
+      height: 26px;
+      max-width: 104px;
+      padding: 0 8px;
+      font-size: 11px;
+      font-weight: 600;
+      display: inline-flex;
+      align-items: center;
+      gap: 3px;
+      cursor: pointer;
+      flex-shrink: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .chrome-profile-chip.pinned {
+      border-color: rgba(210, 153, 34, 0.55);
+      background: rgba(210, 153, 34, 0.16);
+      color: #f2cc60;
+    }
+    .chrome-profile-chip:active { transform: scale(0.95); }
+
+    /* Main Workspace Row (Stage + Landscape Right Rail) */
+    #stage-row {
+      display: flex;
+      flex-direction: row;
+      flex: 1;
+      min-height: 0;
+      width: 100%;
+      overflow: hidden;
+    }
+
     /* Main Interactive Viewport Stage */
     #stage {
-      position: relative; flex: 1; min-height: 0;
+      position: relative; flex: 1; min-width: 0; min-height: 0;
       background: #07090c; overflow: hidden;
-      display: flex; align-items: center; justify-content: center;
+      display: block;
       touch-action: none;
     }
     #canvas-wrap {
-      position: relative; transform-origin: 0 0;
-      box-shadow: 0 6px 28px rgba(0, 0, 0, 0.65);
+      position: relative;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
     }
     #screen {
-      display: block; background: #0f141a;
-      max-width: 100%; max-height: 100%;
+      display: block;
+      width: 100%;
+      height: 100%;
+      background: #0f141a;
     }
     #idle-card {
-      position: absolute; inset: 0;
+      position: absolute; inset: 0; z-index: 32;
       display: flex; flex-direction: column; align-items: center; justify-content: center;
       gap: 12px; padding: 20px; text-align: center; background: rgba(13, 17, 23, 0.92);
     }
     #idle-card.hidden { display: none; }
+
+    /* Draggable Semi-Transparent Minimap */
+    #minimap-box {
+      position: absolute;
+      right: 10px;
+      bottom: 10px;
+      z-index: 29;
+      background: rgba(13, 17, 23, 0.82);
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+      border: 1px solid rgba(139, 148, 158, 0.4);
+      border-radius: 9px;
+      padding: 4px;
+      box-shadow: 0 6px 20px rgba(0, 0, 0, 0.65);
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      touch-action: none;
+    }
+    #minimap-box.collapsed {
+      padding: 3px 7px;
+      border-radius: 999px;
+    }
+    .minimap-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      font-size: 10px;
+      color: var(--muted);
+      line-height: 1;
+    }
+    #minimap-toggle {
+      border: none;
+      background: transparent;
+      color: var(--text);
+      font-size: 11px;
+      font-weight: 700;
+      padding: 0 2px;
+      cursor: pointer;
+    }
+    #minimap-surface {
+      position: relative;
+      width: 108px;
+      height: 60px;
+      border-radius: 5px;
+      overflow: hidden;
+      background: #161b22;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      cursor: grab;
+      touch-action: none;
+    }
+    #minimap-box.collapsed #minimap-surface { display: none; }
+    #minimap-canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+    }
+    #minimap-viewport {
+      position: absolute;
+      left: 0; top: 0; width: 100%; height: 100%;
+      border: 1.5px solid #58a6ff;
+      background: rgba(47, 129, 247, 0.22);
+      border-radius: 2px;
+      pointer-events: none;
+    }
+    #minimap-ai-dot {
+      position: absolute;
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: #58a6ff;
+      border: 1px solid #fff;
+      transform: translate(-50%, -50%);
+      pointer-events: none;
+    }
 
     /* Sharp Precision Small Arrow Cursors (Tip strictly anchored at 0,0; Human & AI separated) */
     #remote-cursor, #ai-cursor {
@@ -399,7 +610,114 @@
     }
     #toast.show { opacity: 1; }
 
-    /* Bottom Touch & Keyboard Dock */
+    /* Chrome-Style Minimal Portrait Bottom Bar (4 compact items) */
+    .chrome-bottombar {
+      display: none;
+      align-items: center;
+      justify-content: space-around;
+      padding: 4px 6px calc(5px + var(--safe-bottom)) 6px;
+      background: var(--panel);
+      border-top: 1px solid rgba(45, 54, 67, 0.78);
+      flex-shrink: 0;
+      min-height: 48px;
+    }
+    .chrome-bar-btn {
+      border: none;
+      background: transparent;
+      color: var(--text);
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 2px;
+      padding: 4px 2px;
+      border-radius: 10px;
+      cursor: pointer;
+      transition: background 0.12s ease, transform 0.08s ease;
+    }
+    .chrome-bar-btn:active { background: rgba(255, 255, 255, 0.08); transform: scale(0.95); }
+    .chrome-bar-btn .cb-ico {
+      font-size: 17px;
+      line-height: 1.1;
+      height: 22px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .chrome-bar-btn .cb-lbl {
+      font-size: 10px;
+      color: var(--muted);
+      line-height: 1.1;
+      white-space: nowrap;
+    }
+    .chrome-bar-btn.takeover-on .cb-ico,
+    .chrome-bar-btn.takeover-on .cb-lbl {
+      color: var(--green-bright);
+      font-weight: 600;
+    }
+    .chrome-bar-btn.accent-on .cb-ico,
+    .chrome-bar-btn.accent-on .cb-lbl {
+      color: #79c0ff;
+      font-weight: 600;
+    }
+    .tab-count-box {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 21px;
+      height: 21px;
+      padding: 0 4px;
+      border: 1.8px solid currentColor;
+      border-radius: 5px;
+      font-size: 11px;
+      font-weight: 700;
+      line-height: 1;
+    }
+    .plus-circle-box {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 22px;
+      height: 22px;
+      border: 1.8px solid currentColor;
+      border-radius: 50%;
+      font-size: 15px;
+      font-weight: 600;
+      line-height: 1;
+    }
+
+    /* Chrome-Style Ultra-Narrow Right Vertical Rail (Mobile Landscape) */
+    .chrome-side-rail {
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      justify-content: space-between;
+      width: calc(46px + var(--safe-right));
+      padding: 10px var(--safe-right) 10px 0;
+      background: var(--panel);
+      border-left: 1px solid rgba(45, 54, 67, 0.78);
+      flex-shrink: 0;
+    }
+    .rail-btn {
+      border: none;
+      background: transparent;
+      color: var(--text);
+      width: 38px;
+      height: 38px;
+      border-radius: 10px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 17px;
+      cursor: pointer;
+      transition: background 0.12s ease, transform 0.08s ease;
+    }
+    .rail-btn:active { background: rgba(255, 255, 255, 0.1); transform: scale(0.93); }
+    .rail-btn.takeover-on { color: var(--green-bright); background: rgba(35, 134, 54, 0.18); }
+    .rail-btn.accent-on { color: #79c0ff; background: rgba(47, 129, 247, 0.18); }
+
+    /* Bottom Touch & Keyboard Dock (Desktop) */
     .dock {
       background: var(--panel); border-top: 1px solid var(--border);
       padding: 6px 8px calc(6px + var(--safe-bottom)) 8px;
@@ -427,7 +745,7 @@
       user-select: text; -webkit-user-select: text;
     }
 
-    /* Multi-Fingerprint Profile Indicator & Bottom Drawer */
+    /* Multi-Fingerprint Profile Indicator & Drawers (`•••` More / Tabs / Profiles) */
     .profile-badge-btn {
       border: 1px solid var(--border);
       background: rgba(47, 129, 247, 0.12);
@@ -458,6 +776,98 @@
       border: 1px solid var(--border); border-radius: 8px;
       padding: 0 10px; font-size: 13px;
     }
+    .sheet-backdrop {
+      position: fixed; inset: 0; z-index: 86;
+      background: rgba(0, 0, 0, 0.62);
+    }
+    .bottom-sheet {
+      position: fixed; left: 0; right: 0; bottom: 0; z-index: 90;
+      background: var(--panel);
+      border-top: 1.5px solid var(--accent);
+      border-radius: 16px 16px 0 0;
+      padding: 12px calc(12px + var(--safe-right, env(safe-area-inset-right, 0px))) calc(14px + var(--safe-bottom)) calc(12px + var(--safe-left, env(safe-area-inset-left, 0px)));
+      max-height: 82vh;
+      display: flex; flex-direction: column; gap: 10px;
+      box-shadow: 0 -10px 36px rgba(0, 0, 0, 0.78);
+      overflow-y: auto;
+    }
+    .more-profile-strip {
+      width: 100%;
+      display: flex; align-items: center; justify-content: space-between; gap: 8px;
+      padding: 7px 10px; border-radius: 9px;
+      background: rgba(47, 129, 247, 0.12);
+      border: 1px solid rgba(47, 129, 247, 0.35);
+      color: #c9d1d9;
+      font-size: 12px; font-weight: 600;
+      cursor: pointer; text-align: left;
+    }
+    .more-profile-strip.pinned {
+      background: rgba(210, 153, 34, 0.14);
+      border-color: rgba(210, 153, 34, 0.55);
+      color: #f2cc60;
+    }
+    .more-profile-strip-text {
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1;
+    }
+    .sheet-header {
+      display: flex; align-items: center; justify-content: space-between; gap: 8px;
+      font-size: 14px; font-weight: 600;
+    }
+    .more-status-strip {
+      display: flex; align-items: center; justify-content: space-between; gap: 8px;
+      padding: 7px 10px; border-radius: 9px;
+      background: #10151c; border: 1px solid var(--border);
+      font-size: 11.5px; color: var(--muted);
+    }
+    .more-section-title {
+      font-size: 11px; color: var(--muted); font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.03em;
+      margin-bottom: 4px;
+    }
+    .more-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 6px;
+    }
+    .more-btn {
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+      color: var(--text);
+      border-radius: 9px;
+      padding: 8px 4px;
+      font-size: 11.5px;
+      font-weight: 500;
+      cursor: pointer;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 3px;
+      text-align: center;
+    }
+    .more-btn:active { transform: scale(0.96); }
+    .more-btn.active { border-color: var(--accent); color: #79c0ff; background: rgba(47, 129, 247, 0.16); }
+    .more-btn.hold-active { border-color: var(--amber); color: #f2cc60; background: var(--amber-bg); }
+    .more-btn.takeover-on { border-color: var(--green-bright); color: var(--green-bright); background: rgba(35, 134, 54, 0.18); font-weight: 600; }
+    .more-btn-ico { font-size: 16px; line-height: 1.1; }
+    .tab-drawer-list {
+      display: flex; flex-direction: column; gap: 6px;
+      max-height: 52vh; overflow-y: auto;
+    }
+    .tab-drawer-item {
+      display: flex; align-items: center; justify-content: space-between; gap: 8px;
+      padding: 9px 10px; border-radius: 10px;
+      background: var(--panel-2); border: 1px solid var(--border);
+      cursor: pointer;
+    }
+    .tab-drawer-item.active {
+      border-color: var(--accent);
+      background: rgba(47, 129, 247, 0.14);
+    }
+    .tab-drawer-meta { min-width: 0; flex: 1; }
+    .tab-drawer-title { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .tab-drawer-url { font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
     #profile-backdrop {
       position: fixed; inset: 0; z-index: 88;
       background: rgba(0, 0, 0, 0.62);
@@ -467,7 +877,7 @@
       background: var(--panel);
       border-top: 1.5px solid var(--accent);
       border-radius: 16px 16px 0 0;
-      padding: 12px 12px calc(14px + var(--safe-bottom)) 12px;
+      padding: 12px calc(12px + var(--safe-right, env(safe-area-inset-right, 0px))) calc(14px + var(--safe-bottom)) calc(12px + var(--safe-left, env(safe-area-inset-left, 0px)));
       max-height: 78vh;
       display: flex; flex-direction: column; gap: 10px;
       box-shadow: 0 -10px 36px rgba(0, 0, 0, 0.78);
@@ -508,6 +918,16 @@
       background: #0d1117; border: 1px solid var(--border);
       border-radius: 5px; padding: 2px 6px;
     }
+    .profile-tag.pinned-lock {
+      border-color: rgba(210, 153, 34, 0.55);
+      background: rgba(210, 153, 34, 0.14);
+      color: #f2cc60;
+    }
+    .profile-tag.mobile-vp {
+      border-color: rgba(47, 129, 247, 0.55);
+      background: rgba(47, 129, 247, 0.16);
+      color: #79c0ff;
+    }
     .profile-sheet-footer {
       display: flex; align-items: center; justify-content: space-between; gap: 8px;
       padding-top: 4px; border-top: 1px solid var(--border);
@@ -516,18 +936,27 @@
       background: rgba(248, 81, 73, 0.16); border-color: var(--danger); color: #ff7b72;
     }
 
-    /* Landscape Mobile Compact Mode */
-    @media (orientation: landscape) and (max-height: 520px) {
-      .topbar { padding: 3px 8px; gap: 4px; }
-      .btn { padding: 3px 7px; font-size: 11px; }
-      .banner { display: none; }
-      .tabs-bar { display: none; }
-      .url-bar { padding: 3px 8px; }
-      .icon-btn { width: 24px; height: 24px; font-size: 12px; }
-      #url-input { height: 24px; font-size: 12px; }
-      .dock { padding: 3px 8px calc(3px + var(--safe-bottom)) 8px; gap: 4px; }
-      .dock .input-row { display: none; }
-      .chip { padding: 3px 7px; font-size: 10.5px; }
+    /* Chrome Minimal Portrait Shell (Mobile Portrait <= 680px) */
+    @media (max-width: 680px) {
+      .topbar, .banner, .nav-wrap, .dock { display: none; }
+      .chrome-topbar { display: flex; }
+      .chrome-bottombar { display: flex; }
+      .chrome-side-rail { display: none; }
+    }
+
+    /* Chrome Minimal Landscape Shell (Mobile Landscape: top capsule + right narrow rail; exclude desktop short windows) */
+    @media (orientation: landscape) and (max-height: 540px) and (max-width: 960px) {
+      .topbar, .banner, .nav-wrap, .dock { display: none; }
+      .chrome-topbar {
+        display: flex;
+        min-height: 36px;
+        padding: 3px calc(8px + var(--safe-right)) 3px calc(8px + var(--safe-left));
+      }
+      .chrome-url-pill { height: 28px; }
+      .chrome-icon-btn { width: 30px; height: 30px; font-size: 16px; }
+      #chrome-reload-btn { display: inline-flex; }
+      .chrome-bottombar { display: none; }
+      .chrome-side-rail { display: flex; }
     }
   </style>
 </head>
@@ -548,10 +977,11 @@
   <!-- Immersive Fullscreen Floating Capsule -->
   <div id="immersive-fab" class="hidden">
     <button class="fab-btn accent" id="fab-takeover-btn" onclick="toggleTakeover()">🖐 接管</button>
+    <button class="fab-btn" id="fab-view-btn" onclick="cycleViewMode()" title="切换视图聚焦">⊡ 全图</button>
     <button class="fab-btn" id="fab-mode-btn" onclick="cycleGestureMode()" title="切换手势模式">👆 点按</button>
     <button class="fab-btn" onclick="openKbSheetManual()" title="输入法">⌨️</button>
     <button class="fab-btn hidden" id="fab-tgfs-btn" onclick="toggleTgFullscreen()" title="切换 Telegram 全屏">⛶</button>
-    <button class="fab-btn" onclick="toggleImmersive(false)" title="退出沉浸模式">✕</button>
+    <button class="fab-btn" id="immersive-exit" onclick="toggleImmersive(false)" title="退出沉浸模式">✕</button>
   </div>
 
   <!-- Native Webpage Dialog Sheet (alert / confirm / prompt / beforeunload) -->
@@ -625,6 +1055,7 @@
   </div>
 
   <div id="app">
+    <!-- Desktop Control Header -->
     <div class="topbar">
       <div class="status-group">
         <span class="dot" id="conn-dot"></span>
@@ -637,10 +1068,11 @@
     </div>
 
     <div class="banner" id="mode-banner">
-      <span class="banner-text" id="banner-text">👀 观看模式 · 触屏仅缩放浏览，不会打断 AI</span>
+      <span class="banner-text" id="banner-text">👀 观看模式 · 双指拖动/捏合调节视野，不会打断 AI</span>
       <button class="profile-badge-btn" id="profile-badge" onclick="openProfileSheet()" title="查看或切换浏览器指纹与出口">🎭 默认指纹</button>
+      <button class="mini-badge" id="view-mode-badge" onclick="cycleViewMode()" title="一键切换 全图 / 适高 / 1:1 聚焦">⊡ 全图</button>
       <button class="mini-badge" id="quality-badge" onclick="cycleQualityPreset()" title="点击切换流畅/均衡/高清画质">🎬 均衡</button>
-      <button class="mini-badge" id="zoom-badge" onclick="resetZoom()" title="点击或双击 1:1 复位">100%</button>
+      <button class="mini-badge" id="zoom-badge" onclick="resetZoom()" title="点击 1:1 全图复位">100%</button>
     </div>
 
     <div class="nav-wrap">
@@ -654,58 +1086,124 @@
       </div>
     </div>
 
-    <div id="stage">
-      <div id="canvas-wrap">
-        <canvas id="screen" width="1280" height="800"></canvas>
-        <!-- Sharp Precision Small Arrow Cursors (Geometric tip strictly at 0,0; Human & AI separated) -->
-        <div id="remote-cursor" class="hidden human" aria-hidden="true">
-          <svg width="18" height="22" viewBox="0 0 18 22" fill="none" xmlns="http://www.w3.org/2000/svg">
-            <path d="M0 0L0 15.6L4.2 11.8L7.2 18.4L9.5 17.3L6.5 10.7L12.2 10.7L0 0Z"
-                  class="cursor-body" stroke-width="1.35" stroke-linejoin="miter" stroke-miterlimit="3" />
-          </svg>
+    <!-- Chrome-Style Minimal Single-Row Top Capsule (Mobile Portrait & Landscape) -->
+    <div class="chrome-topbar" id="chrome-topbar">
+      <button class="chrome-icon-btn" id="chrome-back-btn" title="后退" onclick="sendNav('back')">←</button>
+      <button class="chrome-icon-btn" id="chrome-reload-btn" title="刷新" onclick="sendNav('reload')">↻</button>
+      <div class="chrome-url-pill" id="chrome-url-pill" onclick="openChromeUrlEdit()">
+        <div class="chrome-url-display" id="chrome-url-display">
+          <span class="dot" id="chrome-conn-dot"></span>
+          <span id="chrome-url-icon">🔒</span>
+          <span id="chrome-url-host">AGY Live Browser</span>
         </div>
-        <div id="ai-cursor" class="hidden ai" aria-hidden="true">
-          <svg width="18" height="22" viewBox="0 0 18 22" fill="none" xmlns="http://www.w3.org/2000/svg">
-            <path d="M0 0L0 15.6L4.2 11.8L7.2 18.4L9.5 17.3L6.5 10.7L12.2 10.7L0 0Z"
-                  class="cursor-body" stroke-width="1.35" stroke-linejoin="miter" stroke-miterlimit="3" />
-          </svg>
-        </div>
-        <div id="drag-sel-box" class="hidden"></div>
+        <input id="chrome-url-input" type="text" placeholder="搜索或输入网址" enterkeyhint="go" autocomplete="off" />
       </div>
-      <div id="live-sel-pill" class="hidden"></div>
-      <div id="download-banner" class="hidden">
-        <div class="dl-info">
-          <div class="dl-name" id="dl-name">download.bin</div>
-          <div class="dl-meta" id="dl-meta">准备就绪</div>
-        </div>
-        <button class="chip active" onclick="sendLatestDownloadToTg()">📨 发回TG</button>
-        <button class="chip" onclick="downloadLatestFile()">💾 下载</button>
-        <button class="chip" onclick="closeDownloadBanner()">×</button>
-      </div>
-      <div id="idle-card" class="hidden">
-        <div style="font-size:34px;">🖥</div>
-        <div style="font-size:15px;font-weight:600;">当前没有正在运行的浏览器任务</div>
-        <div style="font-size:12px;color:var(--muted);max-width:290px;">
-          当 AI 启动浏览器时画面会自动出现；你也可以选择指纹环境后手动拉起浏览器直接操作。
-        </div>
-        <div class="idle-profile-wrap">
-          <select id="idle-profile-select" aria-label="选择浏览器指纹"></select>
-          <div style="display:flex;gap:8px;width:100%;justify-content:center;flex-wrap:wrap;">
-            <button class="btn btn-takeover" onclick="startBrowserManual()" style="padding:8px 16px;font-size:13px;">
-              🚀 立即启动安全浏览器
-            </button>
-            <button class="btn" onclick="openProfileSheet()" style="padding:8px 12px;font-size:12px;">
-              🎭 指纹详情
-            </button>
-          </div>
-        </div>
-      </div>
-      <div id="toast"></div>
+      <button class="chrome-profile-chip" id="chrome-profile-badge" title="当前运行指纹环境" onclick="openProfileSheet()">🎭 默认</button>
+      <button class="chrome-icon-btn" id="chrome-more-btn" title="更多菜单" onclick="openMoreSheet()">•••</button>
     </div>
 
+    <div id="stage-row">
+      <div id="stage">
+        <div id="canvas-wrap">
+          <canvas id="screen" width="1280" height="800"></canvas>
+          <!-- Sharp Precision Small Arrow Cursors (Geometric tip strictly at 0,0; Human & AI separated) -->
+          <div id="remote-cursor" class="hidden human" aria-hidden="true">
+            <svg width="18" height="22" viewBox="0 0 18 22" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M0 0L0 15.6L4.2 11.8L7.2 18.4L9.5 17.3L6.5 10.7L12.2 10.7L0 0Z"
+                    class="cursor-body" stroke-width="1.35" stroke-linejoin="miter" stroke-miterlimit="3" />
+            </svg>
+          </div>
+          <div id="ai-cursor" class="hidden ai" aria-hidden="true">
+            <svg width="18" height="22" viewBox="0 0 18 22" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M0 0L0 15.6L4.2 11.8L7.2 18.4L9.5 17.3L6.5 10.7L12.2 10.7L0 0Z"
+                    class="cursor-body" stroke-width="1.35" stroke-linejoin="miter" stroke-miterlimit="3" />
+            </svg>
+          </div>
+          <div id="drag-sel-box" class="hidden"></div>
+        </div>
+
+        <!-- Semi-Transparent Collapsible Draggable Minimap -->
+        <div id="minimap-box" class="hidden">
+          <div class="minimap-head">
+            <span id="minimap-zoom-label">100%</span>
+            <button id="minimap-toggle" onclick="toggleMinimapCollapse()" title="折叠或展开小地图">−</button>
+          </div>
+          <div id="minimap-surface">
+            <canvas id="minimap-canvas" width="108" height="60"></canvas>
+            <div id="minimap-viewport"></div>
+            <div id="minimap-ai-dot" class="hidden"></div>
+          </div>
+        </div>
+
+        <div id="live-sel-pill" class="hidden"></div>
+        <div id="download-banner" class="hidden">
+          <div class="dl-info">
+            <div class="dl-name" id="dl-name">download.bin</div>
+            <div class="dl-meta" id="dl-meta">准备就绪</div>
+          </div>
+          <button class="chip active" onclick="sendLatestDownloadToTg()">📨 发回TG</button>
+          <button class="chip" onclick="downloadLatestFile()">💾 下载</button>
+          <button class="chip" onclick="closeDownloadBanner()">×</button>
+        </div>
+        <div id="idle-card" class="hidden">
+          <div style="font-size:34px;">🖥</div>
+          <div style="font-size:15px;font-weight:600;">当前没有正在运行的浏览器任务</div>
+          <div style="font-size:12px;color:var(--muted);max-width:290px;">
+            当 AI 启动浏览器时画面会自动出现；你也可以选择指纹环境后手动拉起浏览器直接操作。
+          </div>
+          <div class="idle-profile-wrap">
+            <select id="idle-profile-select" aria-label="选择浏览器指纹"></select>
+            <div style="display:flex;gap:8px;width:100%;justify-content:center;flex-wrap:wrap;">
+              <button class="btn btn-takeover" onclick="startBrowserManual()" style="padding:8px 16px;font-size:13px;">
+                🚀 立即启动安全浏览器
+              </button>
+              <button class="btn" onclick="openProfileSheet()" style="padding:8px 12px;font-size:12px;">
+                🎭 指纹详情
+              </button>
+            </div>
+          </div>
+        </div>
+        <div id="toast"></div>
+      </div>
+
+      <!-- Chrome-Style Ultra-Narrow Right Vertical Rail (Mobile Landscape Only) -->
+      <div class="chrome-side-rail" id="chrome-side-rail" aria-label="横屏快捷侧栏">
+        <button class="rail-btn" id="rail-tabs-btn" onclick="openTabsSheet()" title="标签页">
+          <span class="tab-count-box" id="rail-tabs-count">1</span>
+        </button>
+        <button class="rail-btn" id="rail-newtab-btn" onclick="sendInput({ action: 'new_tab' })" title="新建标签页">
+          <span class="plus-circle-box">+</span>
+        </button>
+        <button class="rail-btn" id="rail-view-btn" onclick="cycleViewMode()" title="切换全图/适高/1:1聚焦">⊞</button>
+        <button class="rail-btn" id="rail-takeover-btn" onclick="toggleTakeover()" title="接管 / 交还 AI">✦</button>
+      </div>
+    </div>
+
+    <!-- Chrome-Style Minimal Single-Row Bottom Bar (Mobile Portrait Only) -->
+    <div class="chrome-bottombar" id="chrome-bottombar" aria-label="底部快捷栏">
+      <button class="chrome-bar-btn" id="chrome-takeover-btn" onclick="toggleTakeover()">
+        <span class="cb-ico" id="chrome-takeover-ico">✦</span>
+        <span class="cb-lbl" id="chrome-takeover-lbl">接管</span>
+      </button>
+      <button class="chrome-bar-btn" id="chrome-view-btn" onclick="cycleViewMode()">
+        <span class="cb-ico" id="chrome-view-ico">⊞</span>
+        <span class="cb-lbl" id="chrome-view-lbl">适高</span>
+      </button>
+      <button class="chrome-bar-btn" id="chrome-newtab-btn" onclick="sendInput({ action: 'new_tab' })">
+        <span class="cb-ico"><span class="plus-circle-box">+</span></span>
+        <span class="cb-lbl">新标签</span>
+      </button>
+      <button class="chrome-bar-btn" id="chrome-tabs-btn" onclick="openTabsSheet()">
+        <span class="cb-ico"><span class="tab-count-box" id="chrome-tabs-count">1</span></span>
+        <span class="cb-lbl">标签页</span>
+      </button>
+    </div>
+
+    <!-- Desktop Dock -->
     <div class="dock">
       <div class="quick-row">
         <button class="chip active" id="mode-touch-btn" onclick="setGestureMode('interact')">👆 点按</button>
+        <button class="chip" id="mode-pan-btn" onclick="togglePanMode()">✋ 漫游</button>
         <button class="chip" id="mode-trackpad-btn" onclick="setGestureMode('trackpad')">🖱 触控板</button>
         <button class="chip hidden" id="trackpad-hold-btn" onclick="toggleTrackpadHold()">✋ 按住拖曳</button>
         <button class="chip" id="mode-drag-btn" onclick="setGestureMode('drag')">✋ 拖拽</button>
@@ -732,6 +1230,87 @@
     </div>
   </div>
 
+  <!-- Chrome `•••` More Actions Drawer -->
+  <div id="more-backdrop" class="sheet-backdrop hidden" onclick="closeMoreSheet()"></div>
+  <div id="more-sheet" class="bottom-sheet hidden" role="dialog" aria-label="更多操作菜单">
+    <div class="sheet-header">
+      <span>⚙️ 浏览器工具与快捷控制</span>
+      <button class="chip" onclick="closeMoreSheet()">关闭 ×</button>
+    </div>
+    <div class="more-status-strip">
+      <div style="display:flex;align-items:center;gap:6px;min-width:0;flex:1;">
+        <span class="dot" id="more-conn-dot"></span>
+        <span id="more-metrics-text" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">连接中...</span>
+      </div>
+      <button class="mini-badge" id="more-zoom-badge" onclick="resetZoom(); closeMoreSheet();">100%</button>
+    </div>
+    <button class="more-profile-strip" id="more-profile-strip" onclick="closeMoreSheet(); openProfileSheet();">
+      <span class="more-profile-strip-text" id="more-profile-text">🎭 当前指纹：默认指纹</span>
+      <span style="font-size:11px;opacity:0.8;flex-shrink:0;">切换 ›</span>
+    </button>
+    <div id="more-banner-text" style="font-size:11.5px;color:var(--muted);padding:0 2px;">👀 观看模式 · 双指拖动平移视野，双指捏合缩放</div>
+
+    <div>
+      <div class="more-section-title">页面与视野</div>
+      <div class="more-grid">
+        <button class="more-btn" id="more-takeover-btn" onclick="toggleTakeover(); closeMoreSheet();" title="人工接管 / 交还 AI 切换"><span class="more-btn-ico" id="more-takeover-ico">🖐</span><span id="more-takeover-lbl">人工接管</span></button>
+        <button class="more-btn" onclick="sendNav('reload'); closeMoreSheet();"><span class="more-btn-ico">↻</span>刷新</button>
+        <button class="more-btn" id="more-view-fit" onclick="setViewMode('fit', true); closeMoreSheet();"><span class="more-btn-ico">⊡</span>全图</button>
+        <button class="more-btn" id="more-view-h" onclick="setViewMode('fit_height', true); closeMoreSheet();"><span class="more-btn-ico">⊞</span>适高</button>
+        <button class="more-btn" id="more-view-1x" onclick="setViewMode('focus_1x', true); closeMoreSheet();"><span class="more-btn-ico">🔍</span>1:1聚焦</button>
+        <button class="more-btn" id="more-pan-btn" onclick="togglePanMode(); closeMoreSheet();"><span class="more-btn-ico">✋</span>漫游</button>
+        <button class="more-btn" id="more-quality-btn" onclick="cycleQualityPreset();"><span class="more-btn-ico">🎬</span><span id="more-quality-lbl">均衡</span></button>
+        <button class="more-btn" onclick="toggleImmersive(); closeMoreSheet();"><span class="more-btn-ico">⛶</span>沉浸全屏</button>
+      </div>
+    </div>
+
+    <div>
+      <div class="more-section-title">交互、输入与剪贴板</div>
+      <div class="more-grid">
+        <button class="more-btn" onclick="closeMoreSheet(); openKbSheetManual();"><span class="more-btn-ico">⌨️</span>输入法</button>
+        <button class="more-btn" id="more-extract-btn" onclick="closeMoreSheet(); toggleExtractMode();"><span class="more-btn-ico">🖊</span>涂抹选字</button>
+        <button class="more-btn" onclick="closeMoreSheet(); openClipSheetManual();"><span class="more-btn-ico">📋</span>剪贴板</button>
+        <button class="more-btn" onclick="closeMoreSheet(); sendHdScreenshot();"><span class="more-btn-ico">📸</span>高清截图</button>
+        <button class="more-btn" id="more-mode-interact" onclick="setGestureMode('interact'); closeMoreSheet();"><span class="more-btn-ico">👆</span>点按模式</button>
+        <button class="more-btn" id="more-mode-trackpad" onclick="setGestureMode('trackpad'); closeMoreSheet();"><span class="more-btn-ico">🖱</span>触控板</button>
+        <button class="more-btn" id="more-mode-drag" onclick="setGestureMode('drag'); closeMoreSheet();"><span class="more-btn-ico">✊</span>拖拽模式</button>
+        <button class="more-btn" id="more-profile-btn" onclick="closeMoreSheet(); openProfileSheet();"><span class="more-btn-ico">🎭</span>指纹环境</button>
+      </div>
+      <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">
+        <button class="chip hidden" id="more-trackpad-hold-btn" onclick="toggleTrackpadHold()">✋ 触控板按住拖曳</button>
+      </div>
+    </div>
+
+    <div>
+      <div class="more-section-title">快捷按键与翻页</div>
+      <div class="quick-row" style="flex-wrap:wrap;">
+        <button class="chip" onclick="sendKey('Enter')">↵ Enter</button>
+        <button class="chip" onclick="sendKey('Tab')">⇥ Tab</button>
+        <button class="chip" onclick="sendKey('Backspace')">⌫ 退格</button>
+        <button class="chip" onclick="sendKey('Escape')">Esc</button>
+        <button class="chip" onclick="sendKey('Control+v')">Ctrl+V</button>
+        <button class="chip" onclick="sendKey('Control+z')">Ctrl+Z</button>
+        <button class="chip" onclick="sendKey('Control+f')">Ctrl+F</button>
+        <button class="chip" onclick="sendScroll(0, -360)">⬆ 上翻</button>
+        <button class="chip" onclick="sendScroll(0, 360)">⬇ 下翻</button>
+        <button class="chip" onclick="clearField()">清空框</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Chrome Tab Switcher Drawer -->
+  <div id="tabs-backdrop" class="sheet-backdrop hidden" onclick="closeTabsSheet()"></div>
+  <div id="tabs-sheet" class="bottom-sheet hidden" role="dialog" aria-label="标签页管理">
+    <div class="sheet-header">
+      <span id="tabs-sheet-title">📑 所有标签页 (1)</span>
+      <button class="chip" onclick="closeTabsSheet()">关闭 ×</button>
+    </div>
+    <div id="tabs-drawer-list" class="tab-drawer-list"></div>
+    <div style="display:flex;gap:8px;">
+      <button class="btn btn-takeover" style="flex:1;justify-content:center;padding:8px;" onclick="sendInput({ action: 'new_tab' }); closeTabsSheet();">＋ 打开新的标签页</button>
+    </div>
+  </div>
+
   <!-- Bottom Multi-Fingerprint Profile Switcher Drawer -->
   <div id="profile-backdrop" class="hidden" onclick="closeProfileSheet()"></div>
   <div id="profile-sheet" class="hidden" role="dialog" aria-label="浏览器多指纹与出口切换">
@@ -746,7 +1325,7 @@
     <div id="profile-list"></div>
     <div class="profile-sheet-footer">
       <button class="btn btn-danger hidden" id="stop-browser-btn" onclick="stopBrowserManual()">⏹ 关闭浏览器</button>
-      <span style="font-size:11px;color:var(--muted);margin-left:auto;">🔒 Pinned 指纹强制直连且不可修改代理</span>
+      <span style="font-size:11px;color:var(--muted);margin-left:auto;">🔒 Pinned 指纹（如 fisherwseven）强制直连且不可修改指纹/视口</span>
     </div>
   </div>
 
@@ -767,22 +1346,6 @@
     const canvasWrap = document.getElementById('canvas-wrap');
     const remoteCursorEl = document.getElementById('remote-cursor');
     const aiCursorEl = document.getElementById('ai-cursor');
-
-    function syncViewportHeight() {
-      const vv = window.visualViewport;
-      if (vv) {
-        appEl.style.height = Math.round(vv.height) + 'px';
-        window.scrollTo(0, 0);
-      } else {
-        appEl.style.height = window.innerHeight + 'px';
-      }
-      fitCanvasLayout();
-    }
-    if (window.visualViewport) {
-      window.visualViewport.addEventListener('resize', syncViewportHeight);
-      window.visualViewport.addEventListener('scroll', syncViewportHeight);
-    }
-    window.addEventListener('resize', syncViewportHeight);
 
     let ws = null;
     let wsConnGen = 0;
@@ -827,18 +1390,136 @@
     let tgFullscreenActive = false;
 
     let renderedFrameCount = 0;
+    let totalRenderedFrames = 0;
     let currentFps = 0;
     let rttMs = 0;
     let lastFpsTick = performance.now();
 
-    // Latest-frame single-slot decoder (zero frame backlog on mobile)
+    // Latest-frame single-slot decoder & retained source surface for crisp DPR virtual-camera redraws
     let pendingFrameBlob = null;
     let pendingFrameConnGen = 0;
     let pendingFrameGen = 0;
     let decodingFrame = false;
+    let latestFrameBitmap = null;
+    let latestFrameImg = null;
+    let latestFrameW = 0;
+    let latestFrameH = 0;
+    let awaitingFreshFrame = true;
+    let receivedFrameSeq = 0;
+    let renderedFrameSeq = 0;
+    let pendingFrameSeq = 0;
+    let tabCmdCounter = 0;
+    let pendingTabCmdId = null;
+    let pendingTabUnlockAfterFrameSeq = null;
+    const clientInstanceId = (() => {
+      let raw = '';
+      try {
+        if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+          raw = String(crypto.randomUUID()).replace(/[^A-Za-z0-9]/g, '');
+        } else if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+          const buf = new Uint8Array(9);
+          crypto.getRandomValues(buf);
+          raw = Array.from(buf, (b) => b.toString(16).padStart(2, '0')).join('');
+        }
+      } catch (_) {}
+      while (raw.length < 12) {
+        raw += (Date.now().toString(36) + Math.random().toString(36).slice(2)).replace(/[^A-Za-z0-9]/g, '');
+      }
+      return raw.slice(0, 12);
+    })();
+
+    // Virtual Camera & Zoom/Pan state (Single Source of Truth)
+    let scale = 1.0;
+    let panX = 0;
+    let panY = 0;
+    let camera = {
+      cx: 640,
+      cy: 400,
+      effScale: 1.0,
+      viewMode: 'fit' // 'fit' | 'fit_height' | 'focus_1x' | 'custom'
+    };
+    let userPinnedViewMode = false;
+    let lastOrientationPortrait = null;
+    let lastViewportKey = '';
+    let lastActiveTabIndex = -1;
+    let lastTabIdentity = '';
+    let minimapCollapsed = false;
+    let minimapDragging = false;
+    let lastMinimapDrawTs = 0;
+    let hasMinimapFrame = false;
+    let kbSheetOrigin = null;
+
+    // Gesture modes: 'interact' | 'pan' | 'trackpad' | 'drag' | 'extract'
+    let gestureMode = 'interact';
+    let trackpadX = 640;
+    let trackpadY = 400;
+    let trackpadInitialized = false;
+    let trackpadHolding = false;
+    let cursorFadeTimer = null;
+    let aiCursorFadeTimer = null;
+
+    // Normalized remote coordinates for resize re-projection (separate Human & AI cursors)
+    let humanCursorState = { rx: null, ry: null, mode: 'human', visible: false };
+    let aiCursorState = { rx: null, ry: null, visible: false };
+
+    // Active P2 multi-dialog queue / filechooser / download state
+    let pendingDialogs = [];
+    let activeDialogId = null;
+    let activeChooserId = null;
+    let latestDownload = null;
+
+    const REMOTE_INPUT_GATED_ACTIONS = new Set([
+      'click', 'mousedown', 'mouseup', 'move', 'wheel', 'rightclick', 'type', 'press', 'clear_field'
+    ]);
+
+    function hasRenderedFrame() {
+      return !!(latestFrameBitmap || latestFrameImg);
+    }
+
+    function canDispatchRemoteInput() {
+      const wsOpen = !!(ws && ws.readyState === WebSocket.OPEN && authed);
+      if (!wsOpen) return false;
+      if (!state.running) return false;
+      if (!hasRenderedFrame()) return false;
+      if (awaitingFreshFrame) return false;
+      if (pendingTabCmdId !== null) return false;
+      return true;
+    }
+
+    function computeTabIdentity(tabs, fallbackUrl = '') {
+      const list = Array.isArray(tabs) ? tabs : [];
+      const activeObj = list.find((t) => t && t.active);
+      const idx = activeObj && activeObj.index !== undefined ? Number(activeObj.index) : -1;
+      const url = activeObj && activeObj.url !== undefined ? String(activeObj.url) : String(fallbackUrl || '');
+      return `${idx}|${url}|${list.length}`;
+    }
+
+    function clearPendingTabSwitch() {
+      pendingTabCmdId = null;
+      pendingTabUnlockAfterFrameSeq = null;
+    }
+
+    function armPendingTabSwitch() {
+      const cmdId = `tc-${clientInstanceId}-${wsConnGen}-${++tabCmdCounter}`;
+      pendingTabCmdId = cmdId;
+      pendingTabUnlockAfterFrameSeq = null;
+      return cmdId;
+    }
+
+    function isEditableElement(el) {
+      if (!el) return false;
+      const tag = String(el.tagName || '').toUpperCase();
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
+      if (el.isContentEditable) return true;
+      return false;
+    }
 
     function sendWsInput(payload) {
       if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+      const action = payload && payload.action ? String(payload.action) : '';
+      if (REMOTE_INPUT_GATED_ACTIONS.has(action) && !canDispatchRemoteInput()) {
+        return false;
+      }
       ws.send(JSON.stringify({
         type: 'input',
         session_gen: state.session_gen,
@@ -859,30 +1540,6 @@
       return true;
     }
 
-    // Zoom & Pan state
-    let scale = 1.0;
-    let panX = 0;
-    let panY = 0;
-
-    // Gesture modes: 'interact' | 'trackpad' | 'drag' | 'extract'
-    let gestureMode = 'interact';
-    let trackpadX = 640;
-    let trackpadY = 400;
-    let trackpadInitialized = false;
-    let trackpadHolding = false;
-    let cursorFadeTimer = null;
-    let aiCursorFadeTimer = null;
-
-    // Normalized remote coordinates for resize re-projection (separate Human & AI cursors)
-    let humanCursorState = { rx: null, ry: null, mode: 'human', visible: false };
-    let aiCursorState = { rx: null, ry: null, visible: false };
-
-    // Active P2 multi-dialog queue / filechooser / download state
-    let pendingDialogs = [];
-    let activeDialogId = null;
-    let activeChooserId = null;
-    let latestDownload = null;
-
     function haptic(kind = 'light') {
       try { tg?.HapticFeedback?.impactOccurred(kind); } catch (_) {}
     }
@@ -896,20 +1553,483 @@
       toastTimer = setTimeout(() => el.classList.remove('show'), 2200);
     }
 
+    // ---------------- Virtual Camera + DPR Direct-Draw Coordinate System (Single Source of Truth) ----------------
+    function getEffectiveDpr() {
+      const raw = Number(window.devicePixelRatio) || 1;
+      return Math.min(Math.max(1, raw), 3);
+    }
+
+    function getRemoteDims() {
+      return {
+        vw: Math.max(1, Number(state.vw) || latestFrameW || 1280),
+        vh: Math.max(1, Number(state.vh) || latestFrameH || 800)
+      };
+    }
+
+    function getStageMetrics() {
+      const rect = stage.getBoundingClientRect ? stage.getBoundingClientRect() : { left: 0, top: 0, width: 0, height: 0 };
+      const sw = Math.max(1, Number(stage.clientWidth) || Number(rect.width) || 1);
+      const sh = Math.max(1, Number(stage.clientHeight) || Number(rect.height) || 1);
+      return { sw, sh, left: Number(rect.left) || 0, top: Number(rect.top) || 0 };
+    }
+
+    function getBaseFitScale(sw, sh, vw, vh) {
+      return Math.min(sw / Math.max(1, vw), sh / Math.max(1, vh));
+    }
+
+    function getMaxScale() {
+      const { sw, sh } = getStageMetrics();
+      const { vw, vh } = getRemoteDims();
+      const baseFit = Math.max(1e-6, getBaseFitScale(sw, sh, vw, vh));
+      // Allow zooming up to at least 1.25x source CSS pixels (and at least 3.5x on large screens)
+      return Math.max(3.5, 1.25 / baseFit);
+    }
+
+    function getViewModeScale(mode) {
+      const { sw, sh } = getStageMetrics();
+      const { vw, vh } = getRemoteDims();
+      const baseFit = Math.max(1e-6, getBaseFitScale(sw, sh, vw, vh));
+      const maxS = getMaxScale();
+      if (mode === 'fit_height') {
+        const s = (sh / vh) / baseFit;
+        return Math.min(maxS, Math.max(1.0, s));
+      }
+      if (mode === 'focus_1x') {
+        const s = 1.0 / baseFit;
+        return Math.min(maxS, Math.max(1.0, s));
+      }
+      return 1.0;
+    }
+
+    function shouldAutoFocusFitHeight() {
+      const { sw, sh } = getStageMetrics();
+      const { vw, vh } = getRemoteDims();
+      return (vw / vh) > 1.25 && sw < sh;
+    }
+
+    function ensureCanvasDprSize() {
+      const { sw, sh } = getStageMetrics();
+      const dpr = getEffectiveDpr();
+      const targetW = Math.max(1, Math.round(sw * dpr));
+      const targetH = Math.max(1, Math.round(sh * dpr));
+      if (screenCanvas.width !== targetW) screenCanvas.width = targetW;
+      if (screenCanvas.height !== targetH) screenCanvas.height = targetH;
+      screenCanvas.style.width = sw + 'px';
+      screenCanvas.style.height = sh + 'px';
+      // Ensure legacy CSS scale transform is completely unused
+      if (canvasWrap && canvasWrap.style.transform) {
+        canvasWrap.style.transform = '';
+      }
+      return { sw, sh, dpr, canvasW: targetW, canvasH: targetH };
+    }
+
+    function clampPan() {
+      const { sw, sh } = getStageMetrics();
+      const { vw, vh } = getRemoteDims();
+      const baseFit = Math.max(1e-6, getBaseFitScale(sw, sh, vw, vh));
+      const maxS = Math.max(3.5, 1.25 / baseFit);
+      scale = Math.min(maxS, Math.max(1.0, Number(scale) || 1.0));
+      if (scale <= 1.001) {
+        scale = 1.0;
+      }
+      camera.effScale = baseFit * scale;
+
+      const visW = sw / camera.effScale;
+      const visH = sh / camera.effScale;
+
+      if (visW >= vw - 1e-4) {
+        camera.cx = vw / 2;
+      } else {
+        const halfW = visW / 2;
+        camera.cx = Math.max(halfW, Math.min(vw - halfW, Number.isFinite(camera.cx) ? camera.cx : vw / 2));
+      }
+
+      if (visH >= vh - 1e-4) {
+        camera.cy = vh / 2;
+      } else {
+        const halfH = visH / 2;
+        camera.cy = Math.max(halfH, Math.min(vh - halfH, Number.isFinite(camera.cy) ? camera.cy : vh / 2));
+      }
+
+      // Sync legacy panX / panY mirror (stage CSS offset of remote origin)
+      if (scale <= 1.001) {
+        panX = 0;
+        panY = 0;
+      } else {
+        panX = sw / 2 - camera.cx * camera.effScale;
+        panY = sh / 2 - camera.cy * camera.effScale;
+      }
+    }
+
+    function remoteToStage(remoteX, remoteY) {
+      const { sw, sh } = getStageMetrics();
+      const { vw, vh } = getRemoteDims();
+      const eff = camera.effScale > 0 ? camera.effScale : getBaseFitScale(sw, sh, vw, vh);
+      return {
+        stageX: sw / 2 + (remoteX - camera.cx) * eff,
+        stageY: sh / 2 + (remoteY - camera.cy) * eff
+      };
+    }
+
+    function stageToRemote(stageX, stageY, opts = {}) {
+      const { sw, sh } = getStageMetrics();
+      const { vw, vh } = getRemoteDims();
+      const eff = camera.effScale > 0 ? camera.effScale : getBaseFitScale(sw, sh, vw, vh);
+      const rawX = camera.cx + (stageX - sw / 2) / eff;
+      const rawY = camera.cy + (stageY - sh / 2) / eff;
+      if (opts && opts.clamp) {
+        const cx = Math.max(0, Math.min(vw, rawX));
+        const cy = Math.max(0, Math.min(vh, rawY));
+        return { x: Math.round(cx * 10) / 10, y: Math.round(cy * 10) / 10, rawX: cx, rawY: cy };
+      }
+      if (rawX < 0 || rawX > vw || rawY < 0 || rawY > vh) return null;
+      return {
+        x: Math.round(rawX * 10) / 10,
+        y: Math.round(rawY * 10) / 10,
+        rawX,
+        rawY
+      };
+    }
+
+    function getVisibleRemoteRect() {
+      const { sw, sh } = getStageMetrics();
+      const { vw, vh } = getRemoteDims();
+      const eff = camera.effScale > 0 ? camera.effScale : getBaseFitScale(sw, sh, vw, vh);
+      const left = Math.max(0, camera.cx - (sw / 2) / eff);
+      const top = Math.max(0, camera.cy - (sh / 2) / eff);
+      const right = Math.min(vw, camera.cx + (sw / 2) / eff);
+      const bottom = Math.min(vh, camera.cy + (sh / 2) / eff);
+      return {
+        left,
+        top,
+        right,
+        bottom,
+        width: Math.max(0, right - left),
+        height: Math.max(0, bottom - top),
+        vw,
+        vh
+      };
+    }
+
+    function drawSourceToCanvas(src, srcW, srcH) {
+      if (!src || !srcW || !srcH || !ctx) return false;
+      const { sw, sh, dpr, canvasW, canvasH } = ensureCanvasDprSize();
+      const { vw, vh } = getRemoteDims();
+      const eff = camera.effScale > 0 ? camera.effScale : getBaseFitScale(sw, sh, vw, vh);
+
+      const visLeft = Math.max(0, camera.cx - (sw / 2) / eff);
+      const visTop = Math.max(0, camera.cy - (sh / 2) / eff);
+      const visRight = Math.min(vw, camera.cx + (sw / 2) / eff);
+      const visBottom = Math.min(vh, camera.cy + (sh / 2) / eff);
+      if (visRight <= visLeft || visBottom <= visTop) return false;
+
+      const srcScaleX = srcW / vw;
+      const srcScaleY = srcH / vh;
+      const sx = visLeft * srcScaleX;
+      const sy = visTop * srcScaleY;
+      const sWidth = Math.max(1e-3, (visRight - visLeft) * srcScaleX);
+      const sHeight = Math.max(1e-3, (visBottom - visTop) * srcScaleY);
+
+      const topLeft = remoteToStage(visLeft, visTop);
+      const botRight = remoteToStage(visRight, visBottom);
+      // Use actual backing-store scale (canvasW/sw, canvasH/sh) instead of nominal dpr to eliminate fractional DPR drift
+      const scaleX = canvasW / sw;
+      const scaleY = canvasH / sh;
+      const dx = topLeft.stageX * scaleX;
+      const dy = topLeft.stageY * scaleY;
+      const dWidth = Math.max(1, (botRight.stageX - topLeft.stageX) * scaleX);
+      const dHeight = Math.max(1, (botRight.stageY - topLeft.stageY) * scaleY);
+
+      const hasLetterbox = dx > 0.5 || dy > 0.5 || (dx + dWidth) < (canvasW - 0.5) || (dy + dHeight) < (canvasH - 0.5);
+      if (hasLetterbox) {
+        ctx.clearRect(0, 0, canvasW, canvasH);
+      }
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(src, sx, sy, sWidth, sHeight, dx, dy, dWidth, dHeight);
+      return true;
+    }
+
+    function renderLatestFrame() {
+      if (latestFrameBitmap && latestFrameW > 0 && latestFrameH > 0) {
+        try {
+          drawSourceToCanvas(latestFrameBitmap, latestFrameW, latestFrameH);
+          return true;
+        } catch (_) {}
+      }
+      if (latestFrameImg && latestFrameW > 0 && latestFrameH > 0) {
+        try {
+          drawSourceToCanvas(latestFrameImg, latestFrameW, latestFrameH);
+          return true;
+        } catch (_) {}
+      }
+      return false;
+    }
+
+    function updateViewModeUi() {
+      const pct = Math.round(scale * 100) + '%';
+      const zoomBadge = document.getElementById('zoom-badge');
+      if (zoomBadge) zoomBadge.textContent = pct;
+      const moreZoom = document.getElementById('more-zoom-badge');
+      if (moreZoom) moreZoom.textContent = pct;
+      const mmZoom = document.getElementById('minimap-zoom-label');
+      if (mmZoom) mmZoom.textContent = pct;
+
+      const modeInfo = {
+        fit: { ico: '⊡', lbl: '全图', full: '⊡ 全图' },
+        fit_height: { ico: '⊞', lbl: '适高', full: '⊞ 适高' },
+        focus_1x: { ico: '🔍', lbl: '1:1', full: '🔍 1:1' },
+        custom: { ico: '🔎', lbl: pct, full: `🔎 ${pct}` }
+      };
+      const info = modeInfo[camera.viewMode] || modeInfo.custom;
+
+      const vmBadge = document.getElementById('view-mode-badge');
+      if (vmBadge) {
+        vmBadge.textContent = info.full;
+        vmBadge.classList.toggle('active', camera.viewMode !== 'fit');
+      }
+      const fabView = document.getElementById('fab-view-btn');
+      if (fabView) fabView.textContent = info.full;
+
+      const cIco = document.getElementById('chrome-view-ico');
+      const cLbl = document.getElementById('chrome-view-lbl');
+      const cBtn = document.getElementById('chrome-view-btn');
+      if (cIco) cIco.textContent = info.ico;
+      if (cLbl) cLbl.textContent = info.lbl;
+      if (cBtn) cBtn.classList.toggle('accent-on', camera.viewMode !== 'fit');
+
+      const rBtn = document.getElementById('rail-view-btn');
+      if (rBtn) {
+        rBtn.textContent = info.ico;
+        rBtn.classList.toggle('accent-on', camera.viewMode !== 'fit');
+      }
+
+      const mFit = document.getElementById('more-view-fit');
+      const mH = document.getElementById('more-view-h');
+      const m1x = document.getElementById('more-view-1x');
+      if (mFit) mFit.classList.toggle('active', camera.viewMode === 'fit');
+      if (mH) mH.classList.toggle('active', camera.viewMode === 'fit_height');
+      if (m1x) m1x.classList.toggle('active', camera.viewMode === 'focus_1x');
+    }
+
+    function clearMinimapBackingStore() {
+      hasMinimapFrame = false;
+      lastMinimapDrawTs = 0;
+      const box = document.getElementById('minimap-box');
+      if (box) box.classList.add('hidden');
+      const mCanvas = document.getElementById('minimap-canvas');
+      if (mCanvas) {
+        try {
+          const mctx = mCanvas.getContext('2d');
+          if (mctx && typeof mctx.clearRect === 'function') {
+            mctx.clearRect(0, 0, mCanvas.width || 108, mCanvas.height || 60);
+          }
+        } catch (_) {}
+      }
+    }
+
+    function renderMinimap(forceThumb = false) {
+      const box = document.getElementById('minimap-box');
+      if (!box) return;
+      const src = latestFrameBitmap || latestFrameImg;
+      if (!state.running || !src || awaitingFreshFrame || scale <= 1.05) {
+        box.classList.add('hidden');
+        return;
+      }
+
+      const { vw, vh } = getRemoteDims();
+      const surf = document.getElementById('minimap-surface');
+      const mCanvas = document.getElementById('minimap-canvas');
+      const vpEl = document.getElementById('minimap-viewport');
+      const aiDot = document.getElementById('minimap-ai-dot');
+
+      const mapW = 108;
+      const mapH = Math.max(36, Math.min(76, Math.round(mapW * (vh / vw))));
+      if (surf) {
+        surf.style.width = mapW + 'px';
+        surf.style.height = mapH + 'px';
+      }
+      if (mCanvas) {
+        if (mCanvas.width !== mapW) mCanvas.width = mapW;
+        if (mCanvas.height !== mapH) mCanvas.height = mapH;
+        const now = Date.now();
+        if (!hasMinimapFrame || forceThumb || now - lastMinimapDrawTs >= 180) {
+          try {
+            const mctx = mCanvas.getContext('2d');
+            if (mctx && typeof mctx.drawImage === 'function') {
+              mctx.drawImage(src, 0, 0, mapW, mapH);
+              lastMinimapDrawTs = now;
+              hasMinimapFrame = true;
+            }
+          } catch (_) {}
+        }
+      }
+
+      if (!hasMinimapFrame) {
+        box.classList.add('hidden');
+        return;
+      }
+
+      box.classList.remove('hidden');
+      box.classList.toggle('collapsed', minimapCollapsed);
+      const toggleBtn = document.getElementById('minimap-toggle');
+      if (toggleBtn) toggleBtn.textContent = minimapCollapsed ? '🗺' : '−';
+      if (minimapCollapsed) return;
+
+      const vis = getVisibleRemoteRect();
+      if (vpEl) {
+        vpEl.style.left = ((vis.left / vw) * 100).toFixed(2) + '%';
+        vpEl.style.top = ((vis.top / vh) * 100).toFixed(2) + '%';
+        vpEl.style.width = (Math.min(1, vis.width / vw) * 100).toFixed(2) + '%';
+        vpEl.style.height = (Math.min(1, vis.height / vh) * 100).toFixed(2) + '%';
+      }
+      if (aiDot) {
+        if (aiCursorState.visible && aiCursorState.rx !== null && aiCursorState.ry !== null) {
+          aiDot.classList.remove('hidden');
+          aiDot.style.left = (aiCursorState.rx * 100).toFixed(2) + '%';
+          aiDot.style.top = (aiCursorState.ry * 100).toFixed(2) + '%';
+        } else {
+          aiDot.classList.add('hidden');
+        }
+      }
+    }
+
+    function toggleMinimapCollapse() {
+      minimapCollapsed = !minimapCollapsed;
+      haptic('light');
+      renderMinimap(true);
+    }
+
+    function applyCamera(redraw = true) {
+      clampPan();
+      if (redraw) {
+        renderLatestFrame();
+      }
+      updateViewModeUi();
+      reprojectCursors();
+      renderMinimap(false);
+    }
+
+    function applyTransform() {
+      applyCamera(true);
+    }
+
+    function setViewMode(mode, isUserAction = false) {
+      const { sw, sh } = getStageMetrics();
+      const { vw, vh } = getRemoteDims();
+      const targetScale = getViewModeScale(mode);
+      camera.viewMode = mode;
+      scale = targetScale;
+      const baseFit = Math.max(1e-6, getBaseFitScale(sw, sh, vw, vh));
+      camera.effScale = baseFit * scale;
+
+      if (mode === 'fit') {
+        camera.cx = vw / 2;
+        camera.cy = vh / 2;
+      } else if (mode === 'fit_height') {
+        // Anchor on active AI cursor if visible, else horizontal center + upper portion of page
+        if (aiCursorState.visible && aiCursorState.rx !== null && aiCursorState.ry !== null) {
+          camera.cx = aiCursorState.rx * vw;
+          camera.cy = aiCursorState.ry * vh;
+        } else {
+          camera.cx = vw / 2;
+          const visH = sh / camera.effScale;
+          camera.cy = Math.min(vh / 2, visH / 2);
+        }
+      } else if (mode === 'focus_1x') {
+        if (aiCursorState.visible && aiCursorState.rx !== null && aiCursorState.ry !== null && !isUserAction) {
+          camera.cx = aiCursorState.rx * vw;
+          camera.cy = aiCursorState.ry * vh;
+        } else if (!Number.isFinite(camera.cx) || !Number.isFinite(camera.cy)) {
+          camera.cx = vw / 2;
+          camera.cy = Math.min(vh / 2, (sh / camera.effScale) / 2);
+        }
+      }
+      if (isUserAction) {
+        userPinnedViewMode = true;
+        haptic('light');
+        const names = { fit: '⊡ 全图模式', fit_height: '⊞ 适高聚焦（双指可拖视野）', focus_1x: '🔍 1:1 源像素聚焦' };
+        showToast(names[mode] || '已切换视图');
+      }
+      applyCamera(true);
+    }
+
+    function cycleViewMode() {
+      const order = ['fit', 'fit_height', 'focus_1x'];
+      const curIdx = order.indexOf(camera.viewMode);
+      const next = order[(curIdx + 1) % order.length];
+      setViewMode(next, true);
+    }
+
+    function applyAutoDefaultViewMode(force = false) {
+      if (userPinnedViewMode && !force) return;
+      if (shouldAutoFocusFitHeight()) {
+        setViewMode('fit_height', false);
+      } else {
+        setViewMode('fit', false);
+      }
+    }
+
+    function fitCanvasLayout(opts = {}) {
+      ensureCanvasDprSize();
+      const { sw, sh } = getStageMetrics();
+      const isPortrait = sw < sh;
+      const orientationFlipped = lastOrientationPortrait !== null && lastOrientationPortrait !== isPortrait;
+      lastOrientationPortrait = isPortrait;
+
+      if (opts && opts.autoMode) {
+        userPinnedViewMode = false;
+        applyAutoDefaultViewMode(true);
+      } else if (orientationFlipped) {
+        userPinnedViewMode = false;
+        applyAutoDefaultViewMode(true);
+      } else if (camera.viewMode === 'fit' || camera.viewMode === 'fit_height' || camera.viewMode === 'focus_1x') {
+        scale = getViewModeScale(camera.viewMode);
+        applyCamera(true);
+      } else {
+        applyCamera(true);
+      }
+      if (gestureMode === 'trackpad' && state.running) {
+        positionHumanCursor(trackpadX, trackpadY, trackpadHolding ? 'drag' : 'human', true);
+      }
+      reprojectCursors();
+    }
+
+    function resetZoom() {
+      setViewMode('fit', false);
+    }
+
+    function syncViewportHeight() {
+      const vv = window.visualViewport;
+      if (vv) {
+        appEl.style.height = Math.round(vv.height) + 'px';
+        window.scrollTo(0, 0);
+      } else {
+        appEl.style.height = window.innerHeight + 'px';
+      }
+      fitCanvasLayout();
+    }
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener('resize', syncViewportHeight);
+      window.visualViewport.addEventListener('scroll', syncViewportHeight);
+    }
+    window.addEventListener('resize', syncViewportHeight);
+    window.addEventListener('orientationchange', () => setTimeout(syncViewportHeight, 60));
+
     // ---------------- Sharp Small Arrow Cursors (Human & AI Separated, Resize Re-Projected) ----------------
     function updateCursorInverseScale() {
-      const inv = 1 / Math.max(1, scale);
-      const tf = `scale(${inv.toFixed(4)})`;
+      // Canvas uses virtual camera DPR direct-draw (no CSS scale), so cursors stay sharp at 1:1 native scale
+      const tf = 'scale(1.0000)';
       remoteCursorEl.style.transform = tf;
       if (aiCursorEl) aiCursorEl.style.transform = tf;
     }
 
     function applyCursorElementPosition(el, rx, ry) {
-      const localX = rx * (screenCanvas.clientWidth || 1);
-      const localY = ry * (screenCanvas.clientHeight || 1);
-      el.style.left = localX.toFixed(2) + 'px';
-      el.style.top = localY.toFixed(2) + 'px';
-      return { localX, localY };
+      const { vw, vh } = getRemoteDims();
+      const pos = remoteToStage(rx * vw, ry * vh);
+      el.style.left = pos.stageX.toFixed(2) + 'px';
+      el.style.top = pos.stageY.toFixed(2) + 'px';
+      return { localX: pos.stageX, localY: pos.stageY };
     }
 
     function reprojectCursors() {
@@ -923,8 +2043,7 @@
     }
 
     function positionHumanCursor(remoteX, remoteY, mode = 'human', keepVisible = false) {
-      const vw = Math.max(1, state.vw || 1280);
-      const vh = Math.max(1, state.vh || 800);
+      const { vw, vh } = getRemoteDims();
       const clampedX = Math.max(0, Math.min(vw, remoteX));
       const clampedY = Math.max(0, Math.min(vh, remoteY));
       const rx = clampedX / vw;
@@ -949,8 +2068,7 @@
     }
 
     function positionAiCursor(remoteX, remoteY) {
-      const vw = Math.max(1, state.vw || 1280);
-      const vh = Math.max(1, state.vh || 800);
+      const { vw, vh } = getRemoteDims();
       const clampedX = Math.max(0, Math.min(vw, remoteX));
       const clampedY = Math.max(0, Math.min(vh, remoteY));
       const rx = clampedX / vw;
@@ -968,6 +2086,7 @@
           aiCursorEl.classList.add('faded');
         }, 3500);
       }
+      renderMinimap(false);
       return { localX, localY, x: clampedX, y: clampedY };
     }
 
@@ -987,68 +2106,165 @@
       setTimeout(() => r.remove(), 350);
     }
 
-    // ---------------- Viewport Layout, Zoom & Pan Clamping ----------------
-    function getStageBaseOffset() {
-      const sw = stage.clientWidth || 1;
-      const sh = stage.clientHeight || 1;
-      const dw = screenCanvas.clientWidth || 1;
-      const dh = screenCanvas.clientHeight || 1;
-      return { sw, sh, dw, dh, baseLeft: (sw - dw) / 2, baseTop: (sh - dh) / 2 };
+    // ---------------- Chrome Minimal Shell Drawers (`•••` More & Tabs & URL Capsule) ----------------
+    function formatHostDisplay(rawUrl) {
+      if (!rawUrl) return state.running ? 'about:blank' : 'AGY Live Browser';
+      try {
+        const u = new URL(rawUrl);
+        if (u.protocol === 'about:') return rawUrl;
+        return u.hostname.replace(/^www\./, '') || rawUrl;
+      } catch (_) {
+        return rawUrl.replace(/^https?:\/\//, '').split('/')[0] || rawUrl;
+      }
     }
 
-    function clampPan() {
-      const { sw, sh, dw, dh, baseLeft, baseTop } = getStageBaseOffset();
-      const scaledW = dw * scale;
-      const scaledH = dh * scale;
+    function openChromeUrlEdit() {
+      const pill = document.getElementById('chrome-url-pill');
+      const inp = document.getElementById('chrome-url-input');
+      if (!pill || !inp) return;
+      if (pill.classList.contains('editing')) return;
+      pill.classList.add('editing');
+      inp.value = state.url || '';
+      try {
+        inp.focus();
+        if (typeof inp.select === 'function') inp.select();
+      } catch (_) {}
+    }
 
-      if (scaledW <= sw + 0.5) {
-        panX = (dw - scaledW) / 2;
+    function closeChromeUrlEdit() {
+      const pill = document.getElementById('chrome-url-pill');
+      const inp = document.getElementById('chrome-url-input');
+      if (pill) pill.classList.remove('editing');
+      if (inp) inp.blur();
+    }
+
+    const chromeUrlInpEl = document.getElementById('chrome-url-input');
+    if (chromeUrlInpEl) {
+      chromeUrlInpEl.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          if (typeof e.stopPropagation === 'function') e.stopPropagation();
+          const urlInp = document.getElementById('url-input');
+          if (urlInp) urlInp.value = chromeUrlInpEl.value;
+          closeChromeUrlEdit();
+          submitUrl();
+        } else if (e.key === 'Escape') {
+          e.preventDefault();
+          if (typeof e.stopPropagation === 'function') e.stopPropagation();
+          closeChromeUrlEdit();
+        } else if (typeof e.stopPropagation === 'function') {
+          e.stopPropagation();
+        }
+      });
+      chromeUrlInpEl.addEventListener('blur', () => {
+        setTimeout(closeChromeUrlEdit, 80);
+      });
+    }
+
+    function syncMoreTakeoverBtn() {
+      const moreTkBtn = document.getElementById('more-takeover-btn');
+      const moreTkIco = document.getElementById('more-takeover-ico');
+      const moreTkLbl = document.getElementById('more-takeover-lbl');
+      if (!moreTkBtn) return;
+      if (state.takeover) {
+        moreTkBtn.classList.add('takeover-on');
+        moreTkBtn.setAttribute('aria-pressed', 'true');
+        if (moreTkIco) moreTkIco.textContent = '🤖';
+        if (moreTkLbl) moreTkLbl.textContent = '交还AI';
       } else {
-        const minPanX = sw - baseLeft - scaledW;
-        const maxPanX = -baseLeft;
-        panX = Math.max(minPanX, Math.min(maxPanX, panX));
-      }
-
-      if (scaledH <= sh + 0.5) {
-        panY = (dh - scaledH) / 2;
-      } else {
-        const minPanY = sh - baseTop - scaledH;
-        const maxPanY = -baseTop;
-        panY = Math.max(minPanY, Math.min(maxPanY, panY));
+        moreTkBtn.classList.remove('takeover-on');
+        moreTkBtn.setAttribute('aria-pressed', 'false');
+        if (moreTkIco) moreTkIco.textContent = '🖐';
+        if (moreTkLbl) moreTkLbl.textContent = '人工接管';
       }
     }
 
-    function fitCanvasLayout() {
-      const sw = stage.clientWidth;
-      const sh = stage.clientHeight;
-      const iw = screenCanvas.width || 1280;
-      const ih = screenCanvas.height || 800;
-      const baseRatio = Math.min(sw / iw, sh / ih);
-      const dispW = Math.max(1, Math.floor(iw * baseRatio));
-      const dispH = Math.max(1, Math.floor(ih * baseRatio));
-      screenCanvas.style.width = dispW + 'px';
-      screenCanvas.style.height = dispH + 'px';
-      applyTransform();
-      if (gestureMode === 'trackpad' && state.running) {
-        positionHumanCursor(trackpadX, trackpadY, trackpadHolding ? 'drag' : 'human', true);
-      }
-      reprojectCursors();
+    function openMoreSheet() {
+      haptic('light');
+      closeTabsSheet();
+      closeProfileSheet();
+      closeClipSheet();
+      closeKbSheet();
+      updateViewModeUi();
+      renderQualityBadge();
+      updateMetricsUi();
+      syncMoreTakeoverBtn();
+      document.getElementById('more-backdrop').classList.remove('hidden');
+      document.getElementById('more-sheet').classList.remove('hidden');
     }
 
-    function applyTransform() {
-      if (scale <= 1.01) {
-        scale = 1.0; panX = 0; panY = 0;
-      } else {
-        clampPan();
-      }
-      canvasWrap.style.transform = `translate(${panX.toFixed(2)}px, ${panY.toFixed(2)}px) scale(${scale.toFixed(4)})`;
-      document.getElementById('zoom-badge').textContent = Math.round(scale * 100) + '%';
-      updateCursorInverseScale();
+    function closeMoreSheet() {
+      document.getElementById('more-backdrop').classList.add('hidden');
+      document.getElementById('more-sheet').classList.add('hidden');
     }
 
-    function resetZoom() {
-      scale = 1.0; panX = 0; panY = 0;
-      applyTransform();
+    function renderTabsDrawer() {
+      const tabs = Array.isArray(state.tabs) ? state.tabs : [];
+      const count = Math.max(1, tabs.length);
+      const cCnt = document.getElementById('chrome-tabs-count');
+      const rCnt = document.getElementById('rail-tabs-count');
+      if (cCnt) cCnt.textContent = String(count);
+      if (rCnt) rCnt.textContent = String(count);
+      const titleEl = document.getElementById('tabs-sheet-title');
+      if (titleEl) titleEl.textContent = `📑 所有标签页 (${tabs.length})`;
+
+      const listEl = document.getElementById('tabs-drawer-list');
+      if (!listEl) return;
+      listEl.innerHTML = '';
+      if (!tabs.length) {
+        const empty = document.createElement('div');
+        empty.style.cssText = 'font-size:12px;color:var(--muted);padding:12px;text-align:center;';
+        empty.textContent = state.running ? '当前仅有默认标签页' : '浏览器尚未运行';
+        listEl.appendChild(empty);
+        return;
+      }
+      tabs.forEach((t) => {
+        const row = document.createElement('div');
+        row.className = 'tab-drawer-item' + (t.active ? ' active' : '');
+        row.onclick = () => {
+          sendInput({ action: 'switch_tab', index: t.index });
+          closeTabsSheet();
+        };
+        const meta = document.createElement('div');
+        meta.className = 'tab-drawer-meta';
+        const ttl = document.createElement('div');
+        ttl.className = 'tab-drawer-title';
+        ttl.textContent = t.title || t.url || `标签页 ${t.index + 1}`;
+        const uEl = document.createElement('div');
+        uEl.className = 'tab-drawer-url';
+        uEl.textContent = t.url || 'about:blank';
+        meta.appendChild(ttl);
+        meta.appendChild(uEl);
+        row.appendChild(meta);
+
+        if (tabs.length > 1) {
+          const xBtn = document.createElement('button');
+          xBtn.className = 'chip';
+          xBtn.textContent = '×';
+          xBtn.onclick = (e) => {
+            e.stopPropagation();
+            sendInput({ action: 'close_tab', index: t.index });
+          };
+          row.appendChild(xBtn);
+        }
+        listEl.appendChild(row);
+      });
+    }
+
+    function openTabsSheet() {
+      haptic('light');
+      closeMoreSheet();
+      closeProfileSheet();
+      closeClipSheet();
+      closeKbSheet();
+      renderTabsDrawer();
+      document.getElementById('tabs-backdrop').classList.remove('hidden');
+      document.getElementById('tabs-sheet').classList.remove('hidden');
+    }
+
+    function closeTabsSheet() {
+      document.getElementById('tabs-backdrop').classList.add('hidden');
+      document.getElementById('tabs-sheet').classList.add('hidden');
     }
 
     // ---------------- Immersive & TG WebApp 8.0+ Fullscreen ----------------
@@ -1091,7 +2307,7 @@
           fabTk.textContent = '🖐 接管';
         }
       }
-      const modeLabels = { interact: '👆 点按', trackpad: '🖱 触控板', drag: '✋ 拖拽', extract: '🖊 选字' };
+      const modeLabels = { interact: '👆 点按', pan: '✋ 漫游', trackpad: '🖱 触控板', drag: '✋ 拖拽', extract: '🖊 选字' };
       const fabMode = document.getElementById('fab-mode-btn');
       if (fabMode) fabMode.textContent = modeLabels[gestureMode] || '👆 点按';
     }
@@ -1105,6 +2321,11 @@
         btn.classList.remove('hold-active');
         btn.textContent = '✋ 按住拖曳';
       }
+      const mBtn = document.getElementById('more-trackpad-hold-btn');
+      if (mBtn) {
+        mBtn.classList.remove('hold-active');
+        mBtn.textContent = '✋ 触控板按住拖曳';
+      }
       if (state.running && state.takeover && ws && ws.readyState === WebSocket.OPEN) {
         sendWsInput({ action: 'mouseup', x: trackpadX, y: trackpadY, button: 'left' });
       }
@@ -1113,19 +2334,30 @@
 
     function toggleTrackpadHold() {
       if (!ensureTakeoverOrWarn()) return;
+      if (!trackpadHolding && !canDispatchRemoteInput()) {
+        showToast('⏳ 等待画面同步完成后再操作');
+        return;
+      }
       haptic('medium');
       if (trackpadHolding) {
         releaseTrackpadHoldIfNeeded();
         showToast('已松开鼠标左键');
       } else {
+        if (!sendWsInput({ action: 'mousedown', x: trackpadX, y: trackpadY, button: 'left' })) {
+          return;
+        }
         trackpadHolding = true;
         const btn = document.getElementById('trackpad-hold-btn');
         if (btn) {
           btn.classList.add('hold-active');
           btn.textContent = '🟡 拖曳中·点松开';
         }
+        const mBtn = document.getElementById('more-trackpad-hold-btn');
+        if (mBtn) {
+          mBtn.classList.add('hold-active');
+          mBtn.textContent = '🟡 拖曳中·点松开';
+        }
         positionArrowCursor(trackpadX, trackpadY, 'drag', true);
-        sendWsInput({ action: 'mousedown', x: trackpadX, y: trackpadY, button: 'left' });
         showToast('🟡 已按住左键，单指滑动即可拖曳');
       }
     }
@@ -1141,10 +2373,25 @@
       }
       gestureMode = mode;
       document.getElementById('mode-touch-btn').classList.toggle('active', mode === 'interact');
+      const panBtn = document.getElementById('mode-pan-btn');
+      if (panBtn) panBtn.classList.toggle('active', mode === 'pan');
       document.getElementById('mode-trackpad-btn').classList.toggle('active', mode === 'trackpad');
       document.getElementById('mode-drag-btn').classList.toggle('active', mode === 'drag');
       document.getElementById('mode-extract-btn').classList.toggle('active', mode === 'extract');
       document.getElementById('trackpad-hold-btn').classList.toggle('hidden', mode !== 'trackpad');
+
+      const mInt = document.getElementById('more-mode-interact');
+      const mPan = document.getElementById('more-pan-btn');
+      const mTp = document.getElementById('more-mode-trackpad');
+      const mDr = document.getElementById('more-mode-drag');
+      const mEx = document.getElementById('more-extract-btn');
+      const mHold = document.getElementById('more-trackpad-hold-btn');
+      if (mInt) mInt.classList.toggle('active', mode === 'interact');
+      if (mPan) mPan.classList.toggle('active', mode === 'pan');
+      if (mTp) mTp.classList.toggle('active', mode === 'trackpad');
+      if (mDr) mDr.classList.toggle('active', mode === 'drag');
+      if (mEx) mEx.classList.toggle('active', mode === 'extract');
+      if (mHold) mHold.classList.toggle('hidden', mode !== 'trackpad');
 
       const topBtn = document.getElementById('top-extract-btn');
       if (topBtn) {
@@ -1158,7 +2405,18 @@
         document.getElementById('drag-sel-box').classList.add('hidden');
         document.getElementById('live-sel-pill').classList.add('hidden');
       }
-      if (mode === 'trackpad') {
+      if (mode === 'pan') {
+        if (scale <= 1.02) {
+          if (shouldAutoFocusFitHeight()) {
+            setViewMode('fit_height', false);
+          } else {
+            scale = Math.min(getMaxScale(), 1.8);
+            camera.viewMode = 'custom';
+            applyCamera(true);
+          }
+        }
+        showToast('✋ 漫游模式：单指自由拖视野，再点退出');
+      } else if (mode === 'trackpad') {
         if (!trackpadInitialized) {
           trackpadX = Math.round((state.vw || 1280) / 2);
           trackpadY = Math.round((state.vh || 800) / 2);
@@ -1172,8 +2430,13 @@
       updateFabUi();
     }
 
+    function togglePanMode() {
+      haptic('light');
+      setGestureMode(gestureMode === 'pan' ? 'interact' : 'pan');
+    }
+
     function cycleGestureMode() {
-      const order = ['interact', 'trackpad', 'drag', 'extract'];
+      const order = ['interact', 'pan', 'trackpad', 'drag', 'extract'];
       const next = order[(order.indexOf(gestureMode) + 1) % order.length];
       haptic('light');
       setGestureMode(next);
@@ -1187,11 +2450,16 @@
     // ---------------- Quality Preset Switcher ----------------
     const QUALITY_ORDER = ['smooth', 'balanced', 'hd'];
     const QUALITY_LABELS = { smooth: '🎬 流畅', balanced: '🎬 均衡', hd: '🎬 高清' };
+    const QUALITY_SHORT = { smooth: '流畅', balanced: '均衡', hd: '高清' };
 
     function renderQualityBadge() {
       const badge = document.getElementById('quality-badge');
       if (badge) {
         badge.textContent = QUALITY_LABELS[state.quality_preset] || '🎬 均衡';
+      }
+      const mLbl = document.getElementById('more-quality-lbl');
+      if (mLbl) {
+        mLbl.textContent = QUALITY_SHORT[state.quality_preset] || '均衡';
       }
     }
 
@@ -1293,6 +2561,7 @@
     }
 
     document.getElementById('dialog-prompt-input').addEventListener('keydown', (e) => {
+      if (typeof e.stopPropagation === 'function') e.stopPropagation();
       if (e.key === 'Enter') { e.preventDefault(); submitDialog(true); }
       if (e.key === 'Escape') { e.preventDefault(); submitDialog(false); }
     });
@@ -1667,73 +2936,130 @@
       lbl.textContent = `⌨️ 网页输入框：${(info && info.label) ? info.label.slice(0, 28) : '当前焦点框'}`;
       inp.type = (info && info.isPassword) ? 'password' : 'text';
       inp.value = (info && info.value) ? info.value : '';
+      kbSheetOrigin = {
+        sessionGen: state.session_gen,
+        tabIdentity: lastTabIdentity
+      };
       sheet.classList.remove('hidden');
       setTimeout(() => inp.focus(), 30);
     }
 
     function openKbSheetManual() {
       if (!ensureTakeoverOrWarn()) return;
+      if (!canDispatchRemoteInput()) {
+        showToast('⏳ 等待画面同步完成后再输入');
+        return;
+      }
       openKbSheet({ label: '当前网页焦点位置', value: '', isPassword: false });
     }
 
-    function closeKbSheet() {
+    function closeKbSheet(clearInput = false) {
       const sheet = document.getElementById('kb-sheet');
       const inp = document.getElementById('kb-modal-input');
-      inp.blur();
-      sheet.classList.add('hidden');
+      if (inp) {
+        if (clearInput) inp.value = '';
+        inp.blur();
+      }
+      kbSheetOrigin = null;
+      if (sheet) sheet.classList.add('hidden');
     }
 
     function submitKbSheet(submitEnter, replaceExisting) {
+      const sheet = document.getElementById('kb-sheet');
+      if (!sheet || sheet.classList.contains('hidden')) return;
+      if (
+        kbSheetOrigin
+        && (kbSheetOrigin.sessionGen !== state.session_gen || kbSheetOrigin.tabIdentity !== lastTabIdentity)
+      ) {
+        closeKbSheet(true);
+        return;
+      }
       if (!ensureTakeoverOrWarn()) return;
+      if (!canDispatchRemoteInput()) {
+        showToast('⏳ 等待画面同步完成后再提交');
+        return;
+      }
       const inp = document.getElementById('kb-modal-input');
       const text = inp.value;
       haptic('light');
-      sendWsInput({
+      const sent = sendWsInput({
         action: 'type',
         text,
         submit: !!submitEnter,
         replace: !!replaceExisting
       });
+      if (!sent) return;
       inp.value = '';
-      if (submitEnter) closeKbSheet();
+      if (submitEnter) closeKbSheet(true);
     }
 
     document.getElementById('kb-modal-input').addEventListener('keydown', (e) => {
+      if (typeof e.stopPropagation === 'function') e.stopPropagation();
       if (e.key === 'Enter') { e.preventDefault(); submitKbSheet(true, false); }
       if (e.key === 'Escape') { e.preventDefault(); closeKbSheet(); }
     });
 
-    // ---------------- Latest-Frame Single-Slot Decoder (Safe Resource Cleanup & Frame Render Gen) ----------------
+    // ---------------- Latest-Frame Single-Slot Decoder (Retained Bitmap + Safe Cleanup & Frame Render Gen) ----------------
+    function releaseRetainedFrame() {
+      if (latestFrameBitmap) {
+        try { latestFrameBitmap.close(); } catch (_) {}
+        latestFrameBitmap = null;
+      }
+      latestFrameImg = null;
+      latestFrameW = 0;
+      latestFrameH = 0;
+    }
+
     function invalidateFrameSurface(clearCanvas = true) {
       frameRenderGen++;
       pendingFrameBlob = null;
       pendingFrameGen = frameRenderGen;
+      awaitingFreshFrame = true;
+      clearPendingTabSwitch();
+      releaseRetainedFrame();
       if (clearCanvas && ctx && screenCanvas) {
         try {
           ctx.clearRect(0, 0, screenCanvas.width || 1280, screenCanvas.height || 800);
         } catch (_) {}
       }
+      clearMinimapBackingStore();
     }
 
-    async function decodeAndDrawBlob(blob, connGen, renderGen = frameRenderGen) {
+    async function decodeAndDrawBlob(blob, connGen, renderGen = frameRenderGen, frameSeq = null) {
       if (connGen !== wsConnGen || renderGen !== frameRenderGen || authRejected || !authed) return false;
+      const effectiveSeq = (typeof frameSeq === 'number' && frameSeq > 0) ? frameSeq : (++receivedFrameSeq);
       let drew = false;
       if (window.createImageBitmap) {
         let bmp = null;
+        let retained = false;
         try {
           bmp = await createImageBitmap(blob);
           if (connGen !== wsConnGen || renderGen !== frameRenderGen || authRejected || !authed) return false;
-          if (screenCanvas.width !== bmp.width || screenCanvas.height !== bmp.height) {
-            screenCanvas.width = bmp.width;
-            screenCanvas.height = bmp.height;
-            fitCanvasLayout();
+          const prevW = latestFrameW;
+          const prevH = latestFrameH;
+          if (!state.vw || !state.vh) {
+            state.vw = bmp.width;
+            state.vh = bmp.height;
           }
-          ctx.drawImage(bmp, 0, 0);
+          if (prevW === 0 && prevH === 0) {
+            clampPan();
+          }
+          drawSourceToCanvas(bmp, bmp.width, bmp.height);
+          // Retain decoded ImageBitmap for instant crisp DPR pan/zoom redraws; close superseded bitmap
+          const prevBmp = latestFrameBitmap;
+          latestFrameBitmap = bmp;
+          latestFrameImg = null;
+          latestFrameW = bmp.width;
+          latestFrameH = bmp.height;
+          retained = true;
+          if (prevBmp && prevBmp !== bmp) {
+            try { prevBmp.close(); } catch (_) {}
+          }
           drew = true;
         } catch (_) {
           drew = false;
         } finally {
-          if (bmp) {
+          if (bmp && !retained) {
             try { bmp.close(); } catch (_) {}
           }
         }
@@ -1753,12 +3079,21 @@
           img.onload = () => {
             try {
               if (connGen === wsConnGen && renderGen === frameRenderGen && !authRejected && authed) {
-                if (screenCanvas.width !== img.naturalWidth || screenCanvas.height !== img.naturalHeight) {
-                  screenCanvas.width = img.naturalWidth;
-                  screenCanvas.height = img.naturalHeight;
-                  fitCanvasLayout();
+                if (!state.vw || !state.vh) {
+                  state.vw = img.naturalWidth;
+                  state.vh = img.naturalHeight;
                 }
-                ctx.drawImage(img, 0, 0);
+                if (latestFrameW === 0 && latestFrameH === 0) {
+                  clampPan();
+                }
+                drawSourceToCanvas(img, img.naturalWidth, img.naturalHeight);
+                if (latestFrameBitmap) {
+                  try { latestFrameBitmap.close(); } catch (_) {}
+                  latestFrameBitmap = null;
+                }
+                latestFrameImg = img;
+                latestFrameW = img.naturalWidth;
+                latestFrameH = img.naturalHeight;
                 drew = true;
               }
             } catch (_) {
@@ -1777,7 +3112,22 @@
       }
 
       if (drew && connGen === wsConnGen && renderGen === frameRenderGen && !authRejected && authed) {
+        awaitingFreshFrame = false;
         renderedFrameCount++;
+        totalRenderedFrames++;
+        if (effectiveSeq > renderedFrameSeq) {
+          renderedFrameSeq = effectiveSeq;
+        }
+        if (
+          pendingTabCmdId !== null
+          && pendingTabUnlockAfterFrameSeq !== null
+          && renderedFrameSeq >= pendingTabUnlockAfterFrameSeq
+        ) {
+          clearPendingTabSwitch();
+        }
+        if (scale > 1.05) {
+          renderMinimap(!hasMinimapFrame);
+        }
       }
       return drew;
     }
@@ -1790,8 +3140,9 @@
           const blob = pendingFrameBlob;
           const connGen = pendingFrameConnGen;
           const renderGen = pendingFrameGen;
+          const frameSeq = pendingFrameSeq;
           pendingFrameBlob = null;
-          await decodeAndDrawBlob(blob, connGen, renderGen);
+          await decodeAndDrawBlob(blob, connGen, renderGen, frameSeq);
         }
       } finally {
         decodingFrame = false;
@@ -1807,29 +3158,55 @@
       takeoverReqSeq++;
     }
 
-    function resetConnectionControlState() {
-      authed = false;
-      invalidateFrameSurface(true);
-      pendingFrameConnGen = wsConnGen;
-      extractReqGen++;
-      extractDragActive = false;
-      clearPendingUrlGoto();
-      state.takeover = false;
-      prevTakeoverState = false;
-      trackpadHolding = false;
-      const holdBtn = document.getElementById('trackpad-hold-btn');
-      if (holdBtn) {
-        holdBtn.classList.remove('hold-active');
-        holdBtn.textContent = '✋ 按住拖曳';
-      }
-      closeDialogSheet();
-      closeUploadSheet();
-      closeKbSheet();
-      pointers.clear();
+    function cancelInFlightInteraction(opts = {}) {
       clearLongPressTimer();
+      clearPendingDragTimer();
+      clearPendingScrollTimer();
+      pointers.clear();
       gestureStart = null;
       pinchState = null;
       twoFingerTrackpad = null;
+      minimapDragging = false;
+      extractReqGen++;
+      extractDragActive = false;
+      lastTapInfo = { t: 0, x: 0, y: 0 };
+
+      const dragSel = document.getElementById('drag-sel-box');
+      if (dragSel) dragSel.classList.add('hidden');
+      const selPill = document.getElementById('live-sel-pill');
+      if (selPill) selPill.classList.add('hidden');
+
+      if (trackpadHolding) {
+        trackpadHolding = false;
+        const holdBtn = document.getElementById('trackpad-hold-btn');
+        if (holdBtn) {
+          holdBtn.classList.remove('hold-active');
+          holdBtn.textContent = '✋ 按住拖曳';
+        }
+        const mHoldBtn = document.getElementById('more-trackpad-hold-btn');
+        if (mHoldBtn) {
+          mHoldBtn.classList.remove('hold-active');
+          mHoldBtn.textContent = '✋ 触控板按住拖曳';
+        }
+      }
+
+      if (opts.closeKb !== false) {
+        closeKbSheet(true);
+      }
+    }
+
+    function resetConnectionControlState() {
+      authed = false;
+      cancelInFlightInteraction();
+      invalidateFrameSurface(true);
+      pendingFrameConnGen = wsConnGen;
+      clearPendingUrlGoto();
+      state.takeover = false;
+      prevTakeoverState = false;
+      closeDialogSheet();
+      closeUploadSheet();
+      closeMoreSheet();
+      closeTabsSheet();
     }
 
     function showAuthRejectedUi(errMsg) {
@@ -1840,14 +3217,30 @@
       reconnectTimer = null;
       clearPendingUrlGoto();
       document.getElementById('reconnect-bar').classList.add('hidden');
-      document.getElementById('conn-dot').className = 'dot offline';
-      document.getElementById('metrics-text').textContent = '未授权 (403)';
+      setAllConnDots('dot offline');
+      setAllMetricsText('未授权 (403)');
       const ov = document.getElementById('overlay');
       ov.classList.remove('hidden');
       document.getElementById('ov-icon').textContent = '⛔';
       document.getElementById('ov-title').textContent = '403 Forbidden · 拒绝访问';
       document.getElementById('ov-desc').textContent = errMsg || '请从你本人的授权 Telegram 机器人对话内点击【实时画面 / 人工接管】按钮打开。';
       document.getElementById('ov-reconnect-btn').classList.add('hidden');
+    }
+
+    function setAllConnDots(cls) {
+      const d1 = document.getElementById('conn-dot');
+      const d2 = document.getElementById('chrome-conn-dot');
+      const d3 = document.getElementById('more-conn-dot');
+      if (d1) d1.className = cls;
+      if (d2) d2.className = cls;
+      if (d3) d3.className = cls;
+    }
+
+    function setAllMetricsText(txt) {
+      const m1 = document.getElementById('metrics-text');
+      const m2 = document.getElementById('more-metrics-text');
+      if (m1) m1.textContent = txt;
+      if (m2) m2.textContent = txt;
     }
 
     function manualReconnect() {
@@ -1905,9 +3298,11 @@
           handleJsonMessage(msg);
         } else if (ev.data instanceof Blob) {
           if (!authed || authRejected) return;
+          receivedFrameSeq++;
           pendingFrameBlob = ev.data;
           pendingFrameConnGen = myGen;
           pendingFrameGen = frameRenderGen;
+          pendingFrameSeq = receivedFrameSeq;
           pumpFrameDecoder();
         }
       };
@@ -1915,18 +3310,19 @@
       sock.onclose = (ev) => {
         if (sock !== ws || myGen !== wsConnGen) return;
         authed = false;
+        cancelInFlightInteraction();
         invalidateFrameSurface(true);
         clearPendingUrlGoto();
         if (ev && ev.code === 4003) {
           showAuthRejectedUi('Telegram 身份鉴权未通过或权限已被撤销。');
           return;
         }
-        document.getElementById('conn-dot').className = 'dot offline';
+        setAllConnDots('dot offline');
         if (authRejected) {
-          document.getElementById('metrics-text').textContent = '未授权 (403)';
+          setAllMetricsText('未授权 (403)');
           return;
         }
-        document.getElementById('metrics-text').textContent = '连接已断开，重连中...';
+        setAllMetricsText('连接已断开，重连中...');
         scheduleReconnect();
       };
     }
@@ -1943,6 +3339,7 @@
         document.getElementById('overlay').classList.add('hidden');
         document.getElementById('ov-reconnect-btn').classList.add('hidden');
         document.getElementById('reconnect-bar').classList.add('hidden');
+        userPinnedViewMode = false;
         syncViewportHeight();
         updateMetricsUi();
         refreshProfiles();
@@ -1979,6 +3376,14 @@
           }
         } else if (msg.ok === false && msg.error) {
           showToast(msg.error);
+        }
+        return;
+      }
+      if (msg.type === 'tab_cmd_ack') {
+        if (pendingTabCmdId !== null && msg.cmd_id && msg.cmd_id === pendingTabCmdId) {
+          if (msg.status === 'rejected') {
+            clearPendingTabSwitch();
+          }
         }
         return;
       }
@@ -2025,7 +3430,7 @@
         return;
       }
       if (msg.type === 'input_focused') {
-        if (state.takeover && gestureMode !== 'extract') {
+        if (state.takeover && gestureMode !== 'extract' && gestureMode !== 'pan') {
           haptic('light');
           openKbSheet(msg);
         }
@@ -2058,43 +3463,95 @@
         const prevSessionGen = state.session_gen;
         const prevTakeoverGen = state.takeover_gen;
         const prevRunning = !!state.running;
+        const prevVw = state.vw;
+        const prevVh = state.vh;
+        const prevTabIdx = lastActiveTabIndex;
+        const prevTabId = lastTabIdentity;
         const sessionGenChanged = msg.session_gen !== undefined && prevSessionGen !== undefined && msg.session_gen !== prevSessionGen;
+        const takeoverGenChanged = msg.takeover_gen !== undefined && prevTakeoverGen !== undefined && Number(msg.takeover_gen) !== Number(prevTakeoverGen);
         const takeoverGenAdvanced = msg.takeover_gen !== undefined && prevTakeoverGen !== undefined && Number(msg.takeover_gen) > Number(prevTakeoverGen);
+        const nextRunning = msg.running !== undefined ? !!msg.running : prevRunning;
         const stoppedOrRestricted = (msg.running === false && prevRunning) || !!msg.session_restricted;
+        const nextTabs = Array.isArray(msg.tabs) ? msg.tabs : state.tabs;
+        const nextUrl = msg.url !== undefined ? msg.url : state.url;
+        const activeTabObj = Array.isArray(nextTabs) ? nextTabs.find((t) => t && t.active) : null;
+        const nextTabIdx = activeTabObj && activeTabObj.index !== undefined ? Number(activeTabObj.index) : prevTabIdx;
+        const nextTabId = nextRunning ? computeTabIdentity(nextTabs, nextUrl) : '';
+        const tabIdentityChanged = prevRunning && nextRunning && prevTabId !== '' && nextTabId !== prevTabId;
+        const nextVw = msg.vw !== undefined ? msg.vw : state.vw;
+        const nextVh = msg.vh !== undefined ? msg.vh : state.vh;
+        const vpDimsChanged = prevRunning && nextRunning && (prevVw !== nextVw || prevVh !== nextVh);
+
+        // Only invalidate bitmap/canvas on session_gen change or stop/restriction.
+        // NEVER clear latestFrameBitmap on same-session tab switch so `JPEG(B) -> state(B)` preserves B's first frame!
         if (sessionGenChanged || stoppedOrRestricted) {
+          cancelInFlightInteraction();
           invalidateFrameSurface(true);
           if (sessionGenChanged) {
             clearPendingUrlGoto();
+            userPinnedViewMode = false;
           }
+        } else if (tabIdentityChanged || vpDimsChanged) {
+          cancelInFlightInteraction();
         }
         if (takeoverGenAdvanced && msg.takeover === false) {
           clearPendingUrlGoto();
         }
         state = { ...state, ...msg };
+        lastActiveTabIndex = state.running ? nextTabIdx : -1;
+        lastTabIdentity = state.running ? nextTabId : '';
+
+        // Authoritative tab-switch target confirmation via rendered_tab_cmds (zero frame-count/timer guesswork)
+        if (pendingTabCmdId !== null) {
+          if (!state.running || !state.takeover || sessionGenChanged || takeoverGenChanged) {
+            clearPendingTabSwitch();
+          } else if (Array.isArray(msg.rendered_tab_cmds) && msg.rendered_tab_cmds.includes(pendingTabCmdId)) {
+            if (pendingTabUnlockAfterFrameSeq === null) {
+              pendingTabUnlockAfterFrameSeq = receivedFrameSeq;
+            }
+            if (renderedFrameSeq >= pendingTabUnlockAfterFrameSeq && hasRenderedFrame() && !awaitingFreshFrame) {
+              clearPendingTabSwitch();
+            }
+          }
+        }
+
+        const newVpKey = `${state.vw || 0}x${state.vh || 0}`;
+        const vpChanged = (prevVw !== state.vw || prevVh !== state.vh || newVpKey !== lastViewportKey);
+        const startedFresh = !prevRunning && !!state.running;
+        if (state.running && (sessionGenChanged || vpChanged || startedFresh)) {
+          lastViewportKey = newVpKey;
+          userPinnedViewMode = false;
+          fitCanvasLayout({ autoMode: true });
+        } else if (state.running && tabIdentityChanged) {
+          fitCanvasLayout({ autoMode: !userPinnedViewMode });
+        } else if (!state.running) {
+          lastViewportKey = '';
+          renderMinimap(false);
+        }
         renderState(prevUrl !== state.url);
       }
     }
 
     function renderState(urlChanged) {
-      const dot = document.getElementById('conn-dot');
       const btn = document.getElementById('takeover-btn');
       const banner = document.getElementById('mode-banner');
       const bannerText = document.getElementById('banner-text');
+      const moreBannerText = document.getElementById('more-banner-text');
       const idleCard = document.getElementById('idle-card');
 
       idleCard.classList.toggle('hidden', !!state.running);
 
       if (!state.running) {
-        dot.className = 'dot';
+        setAllConnDots('dot');
         remoteCursorEl.classList.add('hidden');
         humanCursorState.visible = false;
         if (aiCursorEl) aiCursorEl.classList.add('hidden');
         aiCursorState.visible = false;
         clearPendingUrlGoto();
       } else if (state.takeover) {
-        dot.className = 'dot takeover';
+        setAllConnDots('dot takeover');
       } else {
-        dot.className = 'dot live';
+        setAllConnDots('dot live');
       }
 
       // Sync Telegram Closing Confirmation during active human takeover
@@ -2110,26 +3567,52 @@
         } catch (_) {}
       }
 
+      const chromeTkBtn = document.getElementById('chrome-takeover-btn');
+      const chromeTkIco = document.getElementById('chrome-takeover-ico');
+      const chromeTkLbl = document.getElementById('chrome-takeover-lbl');
+      const railTkBtn = document.getElementById('rail-takeover-btn');
+      const chromeUrlPill = document.getElementById('chrome-url-pill');
+
+      let statusLine = '';
       if (state.takeover) {
         btn.className = 'btn btn-resume';
         btn.textContent = '▶️ 交还';
         banner.classList.add('takeover-active');
-        bannerText.textContent = state.takeover_reason
+        statusLine = state.takeover_reason
           ? `🖐 接管中：${state.takeover_reason}`
-          : '🖐 接管中 · 长按=右键，双指=缩放/平移，触控板=悬停精点';
+          : '🖐 接管中 · 单指点击/滚页，双指拖视野/缩放';
+        if (chromeTkBtn) chromeTkBtn.classList.add('takeover-on');
+        if (chromeTkIco) chromeTkIco.textContent = '▶';
+        if (chromeTkLbl) chromeTkLbl.textContent = '交还AI';
+        if (railTkBtn) { railTkBtn.classList.add('takeover-on'); railTkBtn.textContent = '▶'; }
+        if (chromeUrlPill) chromeUrlPill.classList.add('takeover');
       } else {
         btn.className = 'btn btn-takeover';
         btn.textContent = '🖐 接管';
         banner.classList.remove('takeover-active');
         closeKbSheet();
-        bannerText.textContent = state.ai_status
+        statusLine = state.ai_status
           ? `🤖 ${state.ai_status}`
-          : '👀 观看模式 · 点右上角【接管】暂停 AI 并手动操作';
+          : '👀 观看模式 · 双指拖动/捏合视野，点【接管】手动操作';
+        if (chromeTkBtn) chromeTkBtn.classList.remove('takeover-on');
+        if (chromeTkIco) chromeTkIco.textContent = '✦';
+        if (chromeTkLbl) chromeTkLbl.textContent = '接管';
+        if (railTkBtn) { railTkBtn.classList.remove('takeover-on'); railTkBtn.textContent = '✦'; }
+        if (chromeUrlPill) chromeUrlPill.classList.remove('takeover');
       }
+      syncMoreTakeoverBtn();
+      bannerText.textContent = statusLine;
+      if (moreBannerText) moreBannerText.textContent = statusLine;
 
       const urlInput = document.getElementById('url-input');
       if (urlChanged && document.activeElement !== urlInput) {
         urlInput.value = state.url || '';
+      }
+      const hostEl = document.getElementById('chrome-url-host');
+      const iconEl = document.getElementById('chrome-url-icon');
+      if (hostEl) hostEl.textContent = formatHostDisplay(state.url);
+      if (iconEl) {
+        iconEl.textContent = (state.url || '').startsWith('https://') ? '🔒' : (state.running ? '🌐' : '🖥');
       }
 
       const tabsBar = document.getElementById('tabs-bar');
@@ -2161,14 +3644,29 @@
         addBtn.onclick = () => sendInput({ action: 'new_tab' });
         tabsBar.appendChild(addBtn);
       }
+      renderTabsDrawer();
 
       if (state.cursor && state.cursor.ts) {
         showRemoteCursor(state.cursor);
       }
       renderQualityBadge();
       renderProfilesUi();
+      updateViewModeUi();
+      renderMinimap(false);
       updateFabUi();
       updateMetricsUi();
+    }
+
+    function formatViewportLabel(p) {
+      if (!p || p.pinned) return '';
+      if (Array.isArray(p.window) && p.window.length === 2) {
+        const w = p.window[0];
+        const h = p.window[1];
+        const isMob = !!p.mobile || w < h;
+        return `${isMob ? '📱' : '🖥'} ${w}×${h}`;
+      }
+      if (p.mobile) return '📱 430×932';
+      return '';
     }
 
     function formatProfileSummary(p) {
@@ -2176,31 +3674,51 @@
       const lock = p.pinned ? '🔒 ' : '';
       const osName = p.os || 'windows';
       const egress = p.egress_display || p.egress || 'direct';
-      return `${lock}${p.name} · ${osName} · ${egress}`;
+      const vp = formatViewportLabel(p);
+      return `${lock}${p.name}${vp ? ' · ' + vp : ''} · ${osName} · ${egress}`;
     }
 
     function renderProfilesUi() {
       const profiles = Array.isArray(state.profiles) ? state.profiles : [];
       const badge = document.getElementById('profile-badge');
+      const chromeBadge = document.getElementById('chrome-profile-badge');
+      const moreStrip = document.getElementById('more-profile-strip');
+      const moreText = document.getElementById('more-profile-text');
+      const activeObj = profiles.find((p) => p.active || (state.profile && p.name === state.profile));
+      let fullBadgeText = '🎭 默认指纹';
+      let shortBadgeText = '🎭 默认';
+      let isPinnedActive = false;
+
+      if (state.running && state.profile) {
+        const lock = state.pinned ? '🔒 ' : '🎭 ';
+        const osPart = state.os || (activeObj && activeObj.os) || 'windows';
+        const egressPart = state.egress || (activeObj && (activeObj.egress_display || activeObj.egress)) || 'direct';
+        fullBadgeText = `${lock}${state.profile} · ${osPart} · ${egressPart}`;
+        shortBadgeText = `${lock}${state.profile}`;
+        isPinnedActive = !!state.pinned;
+      } else if (activeObj) {
+        fullBadgeText = `${activeObj.pinned ? '🔒 ' : '🎭 '}${formatProfileSummary(activeObj)}`;
+        shortBadgeText = `${activeObj.pinned ? '🔒 ' : '🎭 '}${activeObj.name}`;
+        isPinnedActive = !!activeObj.pinned;
+      } else if (profiles.length > 0) {
+        const first = profiles[0];
+        fullBadgeText = `${first.pinned ? '🔒 ' : '🎭 '}${formatProfileSummary(first)}`;
+        shortBadgeText = `${first.pinned ? '🔒 ' : '🎭 '}${first.name}`;
+        isPinnedActive = !!first.pinned;
+      }
+
       if (badge) {
-        const activeObj = profiles.find((p) => p.active || (state.profile && p.name === state.profile));
-        if (state.running && state.profile) {
-          const lock = state.pinned ? '🔒 ' : '🎭 ';
-          const osPart = state.os || (activeObj && activeObj.os) || 'windows';
-          const egressPart = state.egress || (activeObj && (activeObj.egress_display || activeObj.egress)) || 'direct';
-          badge.textContent = `${lock}${state.profile} · ${osPart} · ${egressPart}`;
-          badge.classList.toggle('pinned', !!state.pinned);
-        } else if (activeObj) {
-          badge.textContent = `${activeObj.pinned ? '🔒 ' : '🎭 '}${formatProfileSummary(activeObj)}`;
-          badge.classList.toggle('pinned', !!activeObj.pinned);
-        } else if (profiles.length > 0) {
-          const first = profiles[0];
-          badge.textContent = `${first.pinned ? '🔒 ' : '🎭 '}${formatProfileSummary(first)}`;
-          badge.classList.toggle('pinned', !!first.pinned);
-        } else {
-          badge.textContent = '🎭 默认指纹';
-          badge.classList.remove('pinned');
-        }
+        badge.textContent = fullBadgeText;
+        badge.classList.toggle('pinned', isPinnedActive);
+      }
+      if (chromeBadge) {
+        chromeBadge.textContent = shortBadgeText;
+        chromeBadge.classList.toggle('pinned', isPinnedActive);
+      }
+      if (moreStrip && moreText) {
+        const prefix = state.running ? '运行中指纹：' : '当前指纹：';
+        moreText.textContent = `${prefix}${fullBadgeText}`;
+        moreStrip.classList.toggle('pinned', isPinnedActive);
       }
 
       const sel = document.getElementById('idle-profile-select');
@@ -2288,22 +3806,29 @@
 
         const tags = document.createElement('div');
         tags.className = 'profile-card-tags';
-        const modeTag = p.pinned ? '🔒 Pinned' : (p.persistent === false ? '💨 Ephemeral' : '💾 Persistent');
-        const tagTexts = [
-          modeTag,
-          `💻 ${p.os || 'windows'}`,
-          `🌐 ${p.egress_display || p.egress || 'direct'}`
-        ];
-        if (p.mobile) tagTexts.push('📱 Mobile');
-        if (p.locale) tagTexts.push(`🗣 ${p.locale}`);
-        if (Array.isArray(p.window) && p.window.length === 2) tagTexts.push(`📐 ${p.window[0]}x${p.window[1]}`);
-        if (p.geoip) tagTexts.push('📍 GeoIP');
-        if (p.block_webrtc) tagTexts.push('🛡 No-WebRTC');
+        const tagDefs = [];
+        if (p.pinned) {
+          tagDefs.push({ text: '🔒 Pinned · 锁定指纹/视口不可改', cls: 'pinned-lock' });
+        } else {
+          tagDefs.push({ text: p.persistent === false ? '💨 Ephemeral' : '💾 Persistent', cls: '' });
+        }
+        const vpLabel = formatViewportLabel(p);
+        if (vpLabel) {
+          tagDefs.push({ text: `预设视口 ${vpLabel}`, cls: vpLabel.startsWith('📱') ? 'mobile-vp' : '' });
+        }
+        if (isCurrent && state.vw && state.vh) {
+          tagDefs.push({ text: `实时视口 ${state.vw}×${state.vh}`, cls: '' });
+        }
+        tagDefs.push({ text: `💻 ${p.os || 'windows'}`, cls: '' });
+        tagDefs.push({ text: `🌐 ${p.egress_display || p.egress || 'direct'}`, cls: '' });
+        if (p.locale) tagDefs.push({ text: `🗣 ${p.locale}`, cls: '' });
+        if (p.geoip) tagDefs.push({ text: '📍 GeoIP', cls: '' });
+        if (p.block_webrtc) tagDefs.push({ text: '🛡 No-WebRTC', cls: '' });
 
-        tagTexts.forEach((txt) => {
+        tagDefs.forEach((td) => {
           const sp = document.createElement('span');
-          sp.className = 'profile-tag';
-          sp.textContent = txt;
+          sp.className = 'profile-tag' + (td.cls ? ' ' + td.cls : '');
+          sp.textContent = td.text;
           tags.appendChild(sp);
         });
         card.appendChild(tags);
@@ -2313,6 +3838,8 @@
 
     function openProfileSheet() {
       haptic('light');
+      closeMoreSheet();
+      closeTabsSheet();
       closeClipSheet();
       closeKbSheet();
       renderProfilesUi();
@@ -2353,7 +3880,7 @@
         return;
       }
       if (state.takeover) {
-        showToast('请先点击右上角【▶️ 交还】或先【⏹ 关闭浏览器】再切换');
+        showToast('请先点击【▶️ 交还】或先【⏹ 关闭浏览器】再切换');
         haptic('medium');
         return;
       }
@@ -2412,19 +3939,20 @@
 
     function updateMetricsUi() {
       if (authRejected) {
-        document.getElementById('conn-dot').className = 'dot offline';
-        document.getElementById('metrics-text').textContent = '未授权 (403)';
+        setAllConnDots('dot offline');
+        setAllMetricsText('未授权 (403)');
         return;
       }
       if (!ws || ws.readyState !== WebSocket.OPEN || !authed) {
-        document.getElementById('conn-dot').className = 'dot offline';
+        setAllConnDots('dot offline');
         return;
       }
       const modeMap = { idle: '空闲', async_hosted: '实时', sync_external: '联动' };
       const m = modeMap[state.engine_mode] || state.engine_mode;
-      document.getElementById('metrics-text').textContent = state.running
+      const txt = state.running
         ? `${m} · ${currentFps}fps · ${rttMs || '--'}ms`
         : `待机 · ${rttMs || '--'}ms`;
+      setAllMetricsText(txt);
     }
 
     setInterval(() => {
@@ -2450,7 +3978,7 @@
         return false;
       }
       if (!state.takeover) {
-        showToast('当前为观看模式，请先点右上角【🖐 接管】');
+        showToast('当前为观看模式，请先点【✦ 接管】');
         haptic('medium');
         return false;
       }
@@ -2512,6 +4040,22 @@
 
     function sendInput(payload) {
       if (!ensureTakeoverOrWarn()) return;
+      const action = payload && payload.action ? String(payload.action) : '';
+      if (action === 'switch_tab' || action === 'new_tab' || action === 'close_tab') {
+        if (!ws || ws.readyState !== WebSocket.OPEN || !authed) return;
+        const isNoopSwitch = action === 'switch_tab'
+          && payload.index !== undefined
+          && lastActiveTabIndex !== -1
+          && Number(payload.index) === Number(lastActiveTabIndex);
+        if (!isNoopSwitch) {
+          // Release any committed remote drag on OLD tab strictly BEFORE sending tab-switch command
+          releaseActiveDragBeforeHandback();
+          cancelInFlightInteraction();
+          const cmdId = armPendingTabSwitch();
+          sendWsInput({ ...payload, cmd_id: cmdId });
+          return;
+        }
+      }
       sendWsInput(payload);
     }
 
@@ -2575,6 +4119,7 @@
     }
 
     urlInputEl.addEventListener('keydown', (e) => {
+      if (typeof e.stopPropagation === 'function') e.stopPropagation();
       if (e.key === 'Enter') { e.preventDefault(); submitUrl(); }
     });
 
@@ -2583,12 +4128,14 @@
       const text = el.value;
       if (!text && !submitEnter) return;
       if (!ensureTakeoverOrWarn()) return;
+      if (!canDispatchRemoteInput()) return;
       haptic('light');
-      sendWsInput({ action: 'type', text, submit: !!submitEnter });
+      if (!sendWsInput({ action: 'type', text, submit: !!submitEnter })) return;
       el.value = '';
     }
 
     document.getElementById('text-input').addEventListener('keydown', (e) => {
+      if (typeof e.stopPropagation === 'function') e.stopPropagation();
       if (e.key === 'Enter') { e.preventDefault(); sendText(true); }
     });
 
@@ -2608,9 +4155,9 @@
 
     // Physical keyboard pass-through (Desktop / iPad)
     window.addEventListener('keydown', (e) => {
-      const tag = (document.activeElement && document.activeElement.tagName || '').toUpperCase();
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
-      if (!state.running || !state.takeover || !ws || ws.readyState !== WebSocket.OPEN) return;
+      if (e.defaultPrevented) return;
+      if (isEditableElement(e.target) || isEditableElement(document.activeElement)) return;
+      if (!state.running || !state.takeover || !canDispatchRemoteInput()) return;
       if (e.metaKey || e.ctrlKey || e.altKey) {
         if ((e.ctrlKey || e.metaKey) && !e.altKey) {
           const k = (e.key || '').toLowerCase();
@@ -2640,9 +4187,9 @@
     });
 
     window.addEventListener('paste', (e) => {
-      const tag = (document.activeElement && document.activeElement.tagName || '').toUpperCase();
-      if (tag === 'INPUT' || tag === 'TEXTAREA') return;
-      if (!state.running || !state.takeover || !ws || ws.readyState !== WebSocket.OPEN) return;
+      if (e.defaultPrevented) return;
+      if (isEditableElement(e.target) || isEditableElement(document.activeElement)) return;
+      if (!state.running || !state.takeover || !canDispatchRemoteInput()) return;
       const pasted = (e.clipboardData || window.clipboardData)?.getData('text');
       if (pasted) {
         e.preventDefault();
@@ -2651,20 +4198,78 @@
       }
     });
 
-    // ---------------- Coordinate Mapping, Gestures, Trackpad & Desktop Mouse ----------------
+    // ---------------- Minimap Direct Drag Navigation & Full Event Isolation ----------------
+    const minimapBoxEl = document.getElementById('minimap-box');
+    if (minimapBoxEl) {
+      ['wheel', 'pointerdown', 'pointermove', 'pointerup', 'pointercancel', 'touchstart', 'touchmove', 'touchend', 'touchcancel', 'contextmenu'].forEach((evName) => {
+        minimapBoxEl.addEventListener(evName, (e) => {
+          if (e && typeof e.stopPropagation === 'function') e.stopPropagation();
+          if (evName === 'wheel' || evName === 'touchmove' || evName === 'contextmenu') {
+            if (typeof e.preventDefault === 'function') e.preventDefault();
+          } else if (evName !== 'pointerup' && evName !== 'touchend') {
+            const isToggle = e && e.target && (
+              e.target.id === 'minimap-toggle'
+              || (typeof e.target.closest === 'function' && e.target.closest('#minimap-toggle'))
+            );
+            if (!isToggle && e && typeof e.preventDefault === 'function') e.preventDefault();
+          }
+        }, evName === 'wheel' || evName.startsWith('touch') ? { passive: false } : false);
+      });
+    }
+
+    const minimapSurfaceEl = document.getElementById('minimap-surface');
+    function panCameraToMinimapClient(clientX, clientY) {
+      if (!minimapSurfaceEl) return;
+      const rect = minimapSurfaceEl.getBoundingClientRect();
+      if (!rect || !rect.width || !rect.height) return;
+      const { vw, vh } = getRemoteDims();
+      const nx = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+      const ny = Math.max(0, Math.min(1, (clientY - rect.top) / rect.height));
+      camera.cx = nx * vw;
+      camera.cy = ny * vh;
+      if (camera.viewMode === 'fit') camera.viewMode = 'custom';
+      applyCamera(true);
+    }
+
+    if (minimapSurfaceEl) {
+      minimapSurfaceEl.addEventListener('pointerdown', (e) => {
+        if (typeof e.stopPropagation === 'function') e.stopPropagation();
+        if (typeof e.preventDefault === 'function') e.preventDefault();
+        minimapDragging = true;
+        try { minimapSurfaceEl.setPointerCapture(e.pointerId); } catch (_) {}
+        panCameraToMinimapClient(e.clientX, e.clientY);
+      });
+      minimapSurfaceEl.addEventListener('pointermove', (e) => {
+        if (!minimapDragging) return;
+        if (typeof e.stopPropagation === 'function') e.stopPropagation();
+        if (typeof e.preventDefault === 'function') e.preventDefault();
+        panCameraToMinimapClient(e.clientX, e.clientY);
+      });
+      const endMinimapDrag = (e) => {
+        if (!minimapDragging) return;
+        if (typeof e.stopPropagation === 'function') e.stopPropagation();
+        if (typeof e.preventDefault === 'function') e.preventDefault();
+        minimapDragging = false;
+      };
+      minimapSurfaceEl.addEventListener('pointerup', endMinimapDrag);
+      minimapSurfaceEl.addEventListener('pointercancel', endMinimapDrag);
+    }
+
+    // ---------------- Coordinate Mapping, Two-Finger Pan+Pinch, Gestures & Desktop Mouse ----------------
     function clientToRemoteCoords(clientX, clientY) {
-      const rect = screenCanvas.getBoundingClientRect();
-      if (!rect.width || !rect.height) return null;
-      const rx = (clientX - rect.left) / rect.width;
-      const ry = (clientY - rect.top) / rect.height;
-      if (rx < 0 || rx > 1 || ry < 0 || ry > 1) return null;
-      const localX = rx * screenCanvas.clientWidth;
-      const localY = ry * screenCanvas.clientHeight;
+      const { sw, sh, left, top } = getStageMetrics();
+      if (!sw || !sh) return null;
+      const stageX = clientX - left;
+      const stageY = clientY - top;
+      // Reject points outside #stage bounds (e.g. pointer-captured release outside stage)
+      if (stageX < 0 || stageX > sw || stageY < 0 || stageY > sh) return null;
+      const mapped = stageToRemote(stageX, stageY, { clamp: false });
+      if (!mapped) return null;
       return {
-        x: Math.round(rx * (state.vw || 1280) * 10) / 10,
-        y: Math.round(ry * (state.vh || 800) * 10) / 10,
-        localX,
-        localY
+        x: mapped.x,
+        y: mapped.y,
+        localX: stageX,
+        localY: stageY
       };
     }
 
@@ -2673,10 +4278,18 @@
     let pinchState = null;
     let twoFingerTrackpad = null;
     let longPressTimer = null;
+    let pendingDragTimer = null;
+    let pendingScrollTimer = null;
     let lastWheelSent = 0;
     let lastMoveSent = 0;
     let lastPreviewSent = 0;
     let lastTapInfo = { t: 0, x: 0, y: 0 };
+
+    const INTERACT_SCROLL_MIN_DIST = 14;
+    const INTERACT_SCROLL_FAST_DIST = 24;
+    const TWO_FINGER_JOIN_GRACE_MS = 55;
+    const DRAG_COMMIT_GRACE_MS = 80;
+    const DRAG_COMMIT_DIST = 14;
 
     function clearLongPressTimer() {
       if (longPressTimer) {
@@ -2685,30 +4298,79 @@
       }
     }
 
+    function clearPendingDragTimer() {
+      if (pendingDragTimer) {
+        clearTimeout(pendingDragTimer);
+        pendingDragTimer = null;
+      }
+    }
+
+    function clearPendingScrollTimer() {
+      if (pendingScrollTimer) {
+        clearTimeout(pendingScrollTimer);
+        pendingScrollTimer = null;
+      }
+    }
+
+    function commitPendingDrag() {
+      clearPendingDragTimer();
+      if (!gestureStart || !gestureStart.pendingDrag || gestureStart.dragDownSent || gestureStart.wasPinch) {
+        return false;
+      }
+      if (gestureStart.startedInteractive !== true || pointers.size !== 1 || gestureMode !== 'drag') {
+        gestureStart.pendingDrag = false;
+        return false;
+      }
+      const pt = gestureStart.startRemote;
+      gestureStart.pendingDrag = false;
+      if (!pt || !state.takeover || !canDispatchRemoteInput()) return false;
+      if (sendWsInput({ action: 'mousedown', x: pt.x, y: pt.y, button: 'left' })) {
+        gestureStart.dragDownSent = true;
+        const cur = gestureStart.lastValidRemote;
+        if (cur && (cur.x !== pt.x || cur.y !== pt.y)) {
+          lastMoveSent = Date.now();
+          sendWsInput({ action: 'move', x: cur.x, y: cur.y });
+          positionArrowCursor(cur.x, cur.y, 'drag', true);
+        } else {
+          positionArrowCursor(pt.x, pt.y, 'drag', true);
+        }
+        haptic('light');
+        return true;
+      }
+      return false;
+    }
+
     function sendRemoteMoveThrottled(x, y, intervalMs = 40) {
       const now = Date.now();
       if (now - lastMoveSent < intervalMs) return;
       lastMoveSent = now;
-      if (state.running && state.takeover && ws && ws.readyState === WebSocket.OPEN) {
+      if (state.running && state.takeover && canDispatchRemoteInput()) {
         sendWsInput({ action: 'move', x, y });
       }
     }
 
+    function isIgnoredStageTarget(target) {
+      if (!target || typeof target.closest !== 'function') return false;
+      return !!(target.closest('#idle-card') || target.closest('#download-banner') || target.closest('#minimap-box'));
+    }
+
     // Desktop right-click -> remote rightclick
     stage.addEventListener('contextmenu', (e) => {
-      if (e.target.closest('#idle-card') || e.target.closest('#download-banner')) return;
-      e.preventDefault();
+      if (isIgnoredStageTarget(e.target)) return;
+      if (typeof e.preventDefault === 'function') e.preventDefault();
+      if (!canDispatchRemoteInput()) return;
       const pt = clientToRemoteCoords(e.clientX, e.clientY);
       if (!pt) return;
       if (!ensureTakeoverOrWarn()) return;
       haptic('medium');
-      positionArrowCursor(pt.x, pt.y, 'human', false);
-      spawnClickRing(pt.localX, pt.localY, 'right');
-      sendWsInput({ action: 'rightclick', x: pt.x, y: pt.y });
+      if (sendWsInput({ action: 'rightclick', x: pt.x, y: pt.y })) {
+        positionArrowCursor(pt.x, pt.y, 'human', false);
+        spawnClickRing(pt.localX, pt.localY, 'right');
+      }
     });
 
     stage.addEventListener('pointerdown', (e) => {
-      if (e.target.closest('#idle-card') || e.target.closest('#download-banner')) return;
+      if (isIgnoredStageTarget(e.target)) return;
       if (e.pointerType === 'mouse' && e.button === 2) return; // handled by contextmenu
       pointers.set(e.pointerId, { x: e.clientX, y: e.clientY, pointerType: e.pointerType });
       try { stage.setPointerCapture(e.pointerId); } catch (_) {}
@@ -2716,51 +4378,76 @@
       if (pointers.size === 1) {
         extractReqGen++;
         extractDragActive = false;
+        clearPendingDragTimer();
+        clearPendingScrollTimer();
         const startRemote = clientToRemoteCoords(e.clientX, e.clientY);
+        const startedInteractive = canDispatchRemoteInput();
         gestureStart = {
           x: e.clientX, y: e.clientY,
           lastX: e.clientX, lastY: e.clientY,
+          pointerType: e.pointerType,
           startRemote,
           lastValidRemote: startRemote,
+          startedInteractive,
+          startCx: camera.cx,
+          startCy: camera.cy,
           panX, panY,
           moved: false,
           wasPinch: false,
           longPressed: false,
           dragDownSent: false,
+          pendingDrag: false,
+          scrollCommitted: false,
           t: Date.now()
         };
 
-        // Direct Drag mode: send mousedown immediately on press
-        if (gestureMode === 'drag' && state.running && state.takeover && startRemote) {
-          positionArrowCursor(startRemote.x, startRemote.y, 'drag', true);
-          sendWsInput({ action: 'mousedown', x: startRemote.x, y: startRemote.y, button: 'left' });
-          gestureStart.dragDownSent = true;
-          haptic('light');
+        // Direct Drag mode: defer touch mousedown via pendingDrag so a 2nd finger joining for pinch/pan leaks 0 mousedown/mouseup
+        if (gestureMode === 'drag' && state.takeover && startRemote && startedInteractive) {
+          if (e.pointerType === 'mouse') {
+            if (sendWsInput({ action: 'mousedown', x: startRemote.x, y: startRemote.y, button: 'left' })) {
+              positionArrowCursor(startRemote.x, startRemote.y, 'drag', true);
+              gestureStart.dragDownSent = true;
+              haptic('light');
+            }
+          } else {
+            gestureStart.pendingDrag = true;
+            pendingDragTimer = setTimeout(() => {
+              commitPendingDrag();
+            }, DRAG_COMMIT_GRACE_MS);
+          }
         }
 
-        // Interact mode: arm 480ms long-press right-click
+        // Interact mode: arm 480ms long-press right-click (only when pointerdown started interactive)
         clearLongPressTimer();
-        if (gestureMode === 'interact' && e.pointerType !== 'mouse' && startRemote) {
+        if (gestureMode === 'interact' && e.pointerType !== 'mouse' && startRemote && startedInteractive) {
           longPressTimer = setTimeout(() => {
-            if (!gestureStart || gestureStart.moved || gestureStart.wasPinch || pointers.size !== 1) return;
+            if (!gestureStart || gestureStart.startedInteractive !== true || gestureStart.moved || gestureStart.wasPinch || pointers.size !== 1) return;
+            if (!canDispatchRemoteInput()) return;
             gestureStart.longPressed = true;
             if (!ensureTakeoverOrWarn()) return;
             haptic('heavy');
-            positionArrowCursor(startRemote.x, startRemote.y, 'human', false);
-            spawnClickRing(startRemote.localX, startRemote.localY, 'right');
-            sendWsInput({ action: 'rightclick', x: startRemote.x, y: startRemote.y });
-            showToast('🖱 右键菜单');
+            if (sendWsInput({ action: 'rightclick', x: startRemote.x, y: startRemote.y })) {
+              positionArrowCursor(startRemote.x, startRemote.y, 'human', false);
+              spawnClickRing(startRemote.localX, startRemote.localY, 'right');
+              showToast('🖱 右键菜单');
+            }
           }, 480);
         }
       } else if (pointers.size === 2) {
         clearLongPressTimer();
+        clearPendingDragTimer();
+        clearPendingScrollTimer();
         extractReqGen++;
         extractDragActive = false;
+        if (gestureStart && gestureStart.pendingDrag) {
+          // Second finger joined before drag committed -> cancel pendingDrag cleanly (0 mousedown / 0 mouseup!)
+          gestureStart.pendingDrag = false;
+        }
         if (gestureStart && gestureStart.dragDownSent) {
           const cur = clientToRemoteCoords(gestureStart.lastX, gestureStart.lastY)
             || gestureStart.lastValidRemote
             || gestureStart.startRemote;
-          if (cur && ws && ws.readyState === WebSocket.OPEN) {
+          if (cur && canDispatchRemoteInput()) {
             sendWsInput({ action: 'mouseup', x: cur.x, y: cur.y, button: 'left' });
           }
           gestureStart.dragDownSent = false;
@@ -2768,17 +4455,23 @@
         if (gestureStart) {
           gestureStart.moved = true;
           gestureStart.wasPinch = true;
+          gestureStart.scrollCommitted = false;
         }
         document.getElementById('drag-sel-box').classList.add('hidden');
         document.getElementById('live-sel-pill').classList.add('hidden');
 
         const entries = Array.from(pointers.entries());
         const pts = entries.map(([, p]) => p);
-        const stageRect = stage.getBoundingClientRect();
-        const midX = (pts[0].x + pts[1].x) / 2 - stageRect.left;
-        const midY = (pts[0].y + pts[1].y) / 2 - stageRect.top;
+        const { sw, sh, left, top } = getStageMetrics();
+        const midClientX = (pts[0].x + pts[1].x) / 2;
+        const midClientY = (pts[0].y + pts[1].y) / 2;
+        const midX = midClientX - left;
+        const midY = midClientY - top;
         const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
-        const { baseLeft, baseTop } = getStageBaseOffset();
+        clampPan();
+        const eff = Math.max(1e-6, camera.effScale);
+        const anchorRx = camera.cx + (midX - sw / 2) / eff;
+        const anchorRy = camera.cy + (midY - sh / 2) / eff;
 
         if (gestureMode === 'trackpad') {
           const startPts = {};
@@ -2789,13 +4482,16 @@
             movedIds: new Set(),
             startMidX: midX, startMidY: midY,
             lastMidX: midX, lastMidY: midY,
+            startMidRemote: clientToRemoteCoords(midClientX, midClientY),
+            startedInteractive: canDispatchRemoteInput(),
             startDist: dist,
             startScale: scale,
-            anchorLx: (midX - baseLeft - panX) / scale,
-            anchorLy: (midY - baseTop - panY) / scale,
+            anchorRx,
+            anchorRy,
             mode: null, // 'pinch' | 'scroll' | null
             moved: false,
             canceled: false,
+            rightClickEligible: true,
             t: Date.now()
           };
           pinchState = null;
@@ -2803,8 +4499,10 @@
           pinchState = {
             startDist: dist,
             startScale: scale,
-            anchorLx: (midX - baseLeft - panX) / scale,
-            anchorLy: (midY - baseTop - panY) / scale
+            startMidX: midX,
+            startMidY: midY,
+            anchorRx,
+            anchorRy
           };
           twoFingerTrackpad = null;
         }
@@ -2814,14 +4512,14 @@
     stage.addEventListener('pointermove', (e) => {
       // Desktop hover tracking (no button pressed)
       if (!pointers.has(e.pointerId)) {
-        if (e.pointerType === 'mouse' && state.running && !e.target.closest('#idle-card')) {
+        if (e.pointerType === 'mouse' && state.running && !isIgnoredStageTarget(e.target)) {
           const pt = clientToRemoteCoords(e.clientX, e.clientY);
           if (pt) {
             trackpadX = pt.x;
             trackpadY = pt.y;
             trackpadInitialized = true;
             positionArrowCursor(pt.x, pt.y, 'human', true);
-            if (state.takeover) {
+            if (state.takeover && canDispatchRemoteInput()) {
               sendRemoteMoveThrottled(pt.x, pt.y, 45);
             }
           }
@@ -2834,9 +4532,12 @@
       // Two-finger gestures
       if (pointers.size === 2) {
         const pts = Array.from(pointers.values());
-        const stageRect = stage.getBoundingClientRect();
-        const curMidX = (pts[0].x + pts[1].x) / 2 - stageRect.left;
-        const curMidY = (pts[0].y + pts[1].y) / 2 - stageRect.top;
+        const { sw, sh, left, top } = getStageMetrics();
+        const { vw, vh } = getRemoteDims();
+        const baseFit = Math.max(1e-6, getBaseFitScale(sw, sh, vw, vh));
+        const maxS = getMaxScale();
+        const curMidX = (pts[0].x + pts[1].x) / 2 - left;
+        const curMidY = (pts[0].y + pts[1].y) / 2 - top;
         const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
 
         if (gestureMode === 'trackpad' && twoFingerTrackpad) {
@@ -2844,15 +4545,17 @@
           const curMoveLen = spCur ? Math.hypot(e.clientX - spCur.x, e.clientY - spCur.y) : 0;
           if (curMoveLen > 2) {
             twoFingerTrackpad.movedIds.add(e.pointerId);
+            twoFingerTrackpad.rightClickEligible = false;
           }
           if (curMoveLen > 8) {
             twoFingerTrackpad.moved = true;
           }
           const midDelta = Math.hypot(curMidX - twoFingerTrackpad.startMidX, curMidY - twoFingerTrackpad.startMidY);
           const distDelta = Math.abs(dist - twoFingerTrackpad.startDist);
+          if (midDelta > 2 || distDelta > 2) {
+            twoFingerTrackpad.rightClickEligible = false;
+          }
           if (!twoFingerTrackpad.mode && twoFingerTrackpad.movedIds.size >= 2) {
-            // Require meaningful displacement from BOTH fingers (|d0| >= 4 && |d1| >= 4) and use direction cosine
-            // so staggered same-direction two-finger pans NEVER misclassify as pinch!
             const [id0, id1] = twoFingerTrackpad.ids || [];
             const p0 = pointers.get(id0);
             const p1 = pointers.get(id1);
@@ -2869,20 +4572,20 @@
                 const dot = d0x * d1x + d0y * d1y;
                 const cosTheta = dot / (len0 * len1);
                 if (cosTheta > 0.5) {
-                  // Parallel / same-direction (< 60 deg): strictly scroll, NEVER pinch even when staggered!
                   if (midDelta >= 10) {
                     twoFingerTrackpad.mode = 'scroll';
                     twoFingerTrackpad.moved = true;
+                    twoFingerTrackpad.rightClickEligible = false;
                     lastWheelSent = 0;
                   }
                 } else if (cosTheta < -0.25) {
-                  // Opposing spread/pinch (> 104.5 deg, incl. wide near-vertical symmetric pinch) -> pinch
                   if (
                     twoFingerTrackpad.startDist > 10
                     && (distDelta >= 6 || (Math.min(len0, len1) >= 12 && distDelta >= 3))
                   ) {
                     twoFingerTrackpad.mode = 'pinch';
                     twoFingerTrackpad.moved = true;
+                    twoFingerTrackpad.rightClickEligible = false;
                   }
                 } else if (
                   cosTheta < 0.2
@@ -2892,20 +4595,39 @@
                 ) {
                   twoFingerTrackpad.mode = 'pinch';
                   twoFingerTrackpad.moved = true;
+                  twoFingerTrackpad.rightClickEligible = false;
                 }
               }
             }
           }
           if (twoFingerTrackpad.mode === 'pinch' && twoFingerTrackpad.startDist > 10) {
-            const newScale = Math.min(3.5, Math.max(1.0, twoFingerTrackpad.startScale * (dist / twoFingerTrackpad.startDist)));
-            const { baseLeft, baseTop } = getStageBaseOffset();
+            const newScale = Math.min(maxS, Math.max(1.0, twoFingerTrackpad.startScale * (dist / twoFingerTrackpad.startDist)));
+            const newEff = baseFit * newScale;
             scale = newScale;
-            panX = curMidX - baseLeft - twoFingerTrackpad.anchorLx * newScale;
-            panY = curMidY - baseTop - twoFingerTrackpad.anchorLy * newScale;
-            applyTransform();
+            camera.effScale = newEff;
+            camera.cx = twoFingerTrackpad.anchorRx - (curMidX - sw / 2) / newEff;
+            camera.cy = twoFingerTrackpad.anchorRy - (curMidY - sh / 2) / newEff;
+            camera.viewMode = newScale <= 1.01 ? 'fit' : 'custom';
+            userPinnedViewMode = true;
+            applyCamera(true);
             return;
           }
-          if (twoFingerTrackpad.mode === 'scroll' && state.running && state.takeover) {
+          if (
+            twoFingerTrackpad.mode === 'scroll'
+            && state.running
+            && state.takeover
+            && twoFingerTrackpad.startedInteractive === true
+            && canDispatchRemoteInput()
+          ) {
+            const curMidClientX = (pts[0].x + pts[1].x) / 2;
+            const curMidClientY = (pts[0].y + pts[1].y) / 2;
+            const curMidRemote = clientToRemoteCoords(curMidClientX, curMidClientY);
+            // Reject two-finger trackpad scroll starting or landing in black letterbox bars
+            if (!twoFingerTrackpad.startMidRemote || !curMidRemote) {
+              twoFingerTrackpad.lastMidX = curMidX;
+              twoFingerTrackpad.lastMidY = curMidY;
+              return;
+            }
             const now = Date.now();
             if (now - lastWheelSent >= 40) {
               const stepX = twoFingerTrackpad.lastMidX - curMidX;
@@ -2925,22 +4647,54 @@
           return;
         }
 
-        if (pinchState && pinchState.startDist > 10) {
-          const newScale = Math.min(3.5, Math.max(1.0, pinchState.startScale * (dist / pinchState.startDist)));
-          const { baseLeft, baseTop } = getStageBaseOffset();
+        // Simultaneous Two-Finger Pan + Anchor Pinch-Zoom (never emits remote wheel!)
+        if (pinchState) {
+          const rawScale = pinchState.startDist > 10
+            ? pinchState.startScale * (dist / pinchState.startDist)
+            : pinchState.startScale;
+          const newScale = Math.min(maxS, Math.max(1.0, rawScale));
+          const newEff = baseFit * newScale;
           scale = newScale;
-          panX = curMidX - baseLeft - pinchState.anchorLx * newScale;
-          panY = curMidY - baseTop - pinchState.anchorLy * newScale;
-          applyTransform();
+          camera.effScale = newEff;
+          const targetCx = pinchState.anchorRx - (curMidX - sw / 2) / newEff;
+          const targetCy = pinchState.anchorRy - (curMidY - sh / 2) / newEff;
+          camera.cx = targetCx;
+          camera.cy = targetCy;
+          if (Math.abs(newScale - pinchState.startScale) > 0.03) {
+            camera.viewMode = newScale <= 1.01 ? 'fit' : 'custom';
+            userPinnedViewMode = true;
+          }
+          applyCamera(true);
+          // Re-anchor smoothly if camera hit viewport bounds so reversing direction has zero dead-zone
+          if (Math.abs(camera.cx - targetCx) > 0.5) {
+            pinchState.anchorRx = camera.cx + (curMidX - sw / 2) / camera.effScale;
+          }
+          if (Math.abs(camera.cy - targetCy) > 0.5) {
+            pinchState.anchorRy = camera.cy + (curMidY - sh / 2) / camera.effScale;
+          }
         }
         return;
       }
 
       // Single-finger gestures
       if (pointers.size === 1 && gestureStart) {
+        // Trackpad 2->1 state: any micro-movement of the remaining finger disqualifies two-finger tap right-click!
+        if (twoFingerTrackpad) {
+          const spRem = twoFingerTrackpad.startPts && twoFingerTrackpad.startPts[e.pointerId];
+          const remMove = spRem ? Math.hypot(e.clientX - spRem.x, e.clientY - spRem.y) : Infinity;
+          if (remMove > 0.5) {
+            twoFingerTrackpad.rightClickEligible = false;
+            twoFingerTrackpad.moved = true;
+          }
+        }
+
+        // Never allow leftover finger after a 2-finger gesture to trigger remote wheel/click
+        if (gestureStart.wasPinch) return;
+
         const dxTotal = e.clientX - gestureStart.x;
         const dyTotal = e.clientY - gestureStart.y;
-        if (Math.hypot(dxTotal, dyTotal) > 7) {
+        const distTotal = Math.hypot(dxTotal, dyTotal);
+        if (distTotal > 7) {
           gestureStart.moved = true;
           clearLongPressTimer();
         }
@@ -2952,44 +4706,60 @@
           const stepY = e.clientY - gestureStart.lastY;
           gestureStart.lastX = e.clientX;
           gestureStart.lastY = e.clientY;
-          const dispW = Math.max(1, screenCanvas.clientWidth * scale);
-          const dispH = Math.max(1, screenCanvas.clientHeight * scale);
+          const { vw, vh } = getRemoteDims();
+          const eff = Math.max(1e-6, camera.effScale);
           const gain = 1.35;
-          trackpadX = Math.max(0, Math.min(state.vw || 1280, trackpadX + stepX * ((state.vw || 1280) / dispW) * gain));
-          trackpadY = Math.max(0, Math.min(state.vh || 800, trackpadY + stepY * ((state.vh || 800) / dispH) * gain));
+          trackpadX = Math.max(0, Math.min(vw, trackpadX + (stepX / eff) * gain));
+          trackpadY = Math.max(0, Math.min(vh, trackpadY + (stepY / eff) * gain));
           trackpadInitialized = true;
           positionArrowCursor(trackpadX, trackpadY, trackpadHolding ? 'drag' : 'human', true);
-          if (state.takeover) {
+          if (state.takeover && gestureStart.startedInteractive === true && canDispatchRemoteInput()) {
             sendRemoteMoveThrottled(Math.round(trackpadX * 10) / 10, Math.round(trackpadY * 10) / 10, 38);
           }
           return;
         }
 
-        // Drag mode: continuous remote mouse move while held down
-        if (gestureMode === 'drag' && gestureStart.dragDownSent) {
-          const curPt = clientToRemoteCoords(e.clientX, e.clientY);
-          if (curPt) {
-            gestureStart.lastX = e.clientX;
-            gestureStart.lastY = e.clientY;
-            gestureStart.lastValidRemote = curPt;
-            positionArrowCursor(curPt.x, curPt.y, 'drag', true);
-            sendRemoteMoveThrottled(curPt.x, curPt.y, 35);
+        // Drag mode: for touch, NEVER commit pendingDrag before the 80ms two-finger join grace window elapses
+        if (gestureMode === 'drag') {
+          if (gestureStart.pendingDrag) {
+            const curPt = clientToRemoteCoords(e.clientX, e.clientY);
+            if (curPt) {
+              gestureStart.lastX = e.clientX;
+              gestureStart.lastY = e.clientY;
+              gestureStart.lastValidRemote = curPt;
+            }
+            if ((Date.now() - gestureStart.t) >= DRAG_COMMIT_GRACE_MS) {
+              commitPendingDrag();
+            }
+            return;
+          }
+          if (gestureStart.dragDownSent) {
+            const curPt = clientToRemoteCoords(e.clientX, e.clientY);
+            if (curPt) {
+              gestureStart.lastX = e.clientX;
+              gestureStart.lastY = e.clientY;
+              gestureStart.lastValidRemote = curPt;
+              positionArrowCursor(curPt.x, curPt.y, 'drag', true);
+              sendRemoteMoveThrottled(curPt.x, curPt.y, 35);
+            }
           }
           return;
         }
 
         if (!gestureStart.moved) return;
 
-        // Extract mode: drag-to-select characters
+        // Extract mode: drag-to-select characters (projected via single-source remoteToStage)
         if (gestureMode === 'extract' && state.running && gestureStart.startRemote && !gestureStart.wasPinch) {
           const curPt = clientToRemoteCoords(e.clientX, e.clientY);
           if (curPt) {
             gestureStart.lastValidRemote = curPt;
+            const pA = remoteToStage(gestureStart.startRemote.x, gestureStart.startRemote.y);
+            const pB = remoteToStage(curPt.x, curPt.y);
             const box = document.getElementById('drag-sel-box');
-            const left = Math.min(gestureStart.startRemote.localX, curPt.localX);
-            const top = Math.min(gestureStart.startRemote.localY, curPt.localY);
-            const width = Math.max(4, Math.abs(curPt.localX - gestureStart.startRemote.localX));
-            const height = Math.max(14, Math.abs(curPt.localY - gestureStart.startRemote.localY));
+            const left = Math.min(pA.stageX, pB.stageX);
+            const top = Math.min(pA.stageY, pB.stageY);
+            const width = Math.max(4, Math.abs(pB.stageX - pA.stageX));
+            const height = Math.max(14, Math.abs(pB.stageY - pA.stageY));
             box.style.left = left + 'px';
             box.style.top = (top - 4) + 'px';
             box.style.width = width + 'px';
@@ -3013,12 +4783,29 @@
           return;
         }
 
-        // Interact mode: pan when zoomed in watching mode; wheel scroll in takeover
-        if (!state.takeover && scale > 1.01) {
-          panX = gestureStart.panX + dxTotal;
-          panY = gestureStart.panY + dyTotal;
-          applyTransform();
-        } else if (state.takeover && state.running && !gestureStart.longPressed) {
+        // Single-hand Pan mode ('pan') OR Watch mode while zoomed in: pan virtual camera directly
+        if (gestureMode === 'pan' || (!state.takeover && scale > 1.01)) {
+          const eff = Math.max(1e-6, camera.effScale);
+          camera.cx = gestureStart.startCx - dxTotal / eff;
+          camera.cy = gestureStart.startCy - dyTotal / eff;
+          applyCamera(true);
+        } else if (state.takeover && state.running && gestureStart.startedInteractive === true && !gestureStart.longPressed && canDispatchRemoteInput()) {
+          // Reject single-finger scroll starting or landing in black letterbox bars
+          if (!gestureStart.startRemote || !clientToRemoteCoords(e.clientX, e.clientY)) return;
+
+          // Two-finger join grace / deadzone for touch: never leak wheel on small jitter (<14px) before 2nd finger lands
+          if (!gestureStart.scrollCommitted) {
+            const elapsed = Date.now() - gestureStart.t;
+            const isMouse = e.pointerType === 'mouse';
+            if (isMouse || distTotal >= INTERACT_SCROLL_FAST_DIST || (distTotal >= INTERACT_SCROLL_MIN_DIST && elapsed >= TWO_FINGER_JOIN_GRACE_MS)) {
+              gestureStart.scrollCommitted = true;
+              clearPendingScrollTimer();
+            } else {
+              return;
+            }
+          }
+
+          // Takeover single-finger drag: remote webpage scroll (wheel)
           const now = Date.now();
           if (now - lastWheelSent >= 45) {
             const stepX = gestureStart.lastX - e.clientX;
@@ -3039,41 +4826,49 @@
     });
 
     function fireSmartClick(x, y, localX, localY) {
+      if (!canDispatchRemoteInput()) return false;
       const now = Date.now();
       const nearPrev = Math.hypot(x - lastTapInfo.x, y - lastTapInfo.y) <= 28;
       const isSecondTap = (now - lastTapInfo.t) < 280 && nearPrev;
-      lastTapInfo = isSecondTap ? { t: 0, x: 0, y: 0 } : { t: now, x, y };
-      positionArrowCursor(x, y, 'human', gestureMode === 'trackpad');
-      spawnClickRing(localX, localY, 'human');
-      sendWsInput({
+      const sent = sendWsInput({
         action: 'click',
         x,
         y,
         click_count: isSecondTap ? 2 : 1
       });
+      if (!sent) return false;
+      lastTapInfo = isSecondTap ? { t: 0, x: 0, y: 0 } : { t: now, x, y };
+      positionArrowCursor(x, y, 'human', gestureMode === 'trackpad');
+      spawnClickRing(localX, localY, 'human');
+      return true;
     }
 
     function onPointerCancel(e) {
       if (!pointers.has(e.pointerId)) return;
       pointers.delete(e.pointerId);
       clearLongPressTimer();
+      clearPendingDragTimer();
+      clearPendingScrollTimer();
       extractReqGen++;
       extractDragActive = false;
       document.getElementById('drag-sel-box').classList.add('hidden');
       document.getElementById('live-sel-pill').classList.add('hidden');
 
+      if (gestureStart && gestureStart.pendingDrag) {
+        gestureStart.pendingDrag = false;
+      }
       if (gestureStart && gestureStart.dragDownSent) {
         const endPt = gestureStart.lastValidRemote || gestureStart.startRemote;
         gestureStart.dragDownSent = false;
-        if (endPt && state.running && state.takeover && ws && ws.readyState === WebSocket.OPEN) {
+        if (endPt && state.running && state.takeover && canDispatchRemoteInput()) {
           positionArrowCursor(endPt.x, endPt.y, 'human', false);
           sendWsInput({ action: 'mouseup', x: endPt.x, y: endPt.y, button: 'left' });
         }
       }
       if (twoFingerTrackpad) {
-        // Invalidate two-finger tap candidate so lifting one finger + canceling the other NEVER fires rightclick!
         twoFingerTrackpad.canceled = true;
         twoFingerTrackpad.moved = true;
+        twoFingerTrackpad.rightClickEligible = false;
       }
       if (pointers.size < 2) {
         pinchState = null;
@@ -3088,26 +4883,28 @@
       if (!pointers.has(e.pointerId)) return;
       pointers.delete(e.pointerId);
       clearLongPressTimer();
+      clearPendingDragTimer();
+      clearPendingScrollTimer();
 
-      // Trackpad two-finger tap -> fire right click ONLY after ALL fingers lift cleanly without any cancel!
+      // Trackpad two-finger tap -> fire right click ONLY after ALL fingers lift cleanly without any cancel/move!
       if (gestureMode === 'trackpad' && twoFingerTrackpad) {
         if (pointers.size > 0) {
-          // Wait for the remaining finger to finish cleanly (or cancel) before deciding
           return;
         }
         const tf = twoFingerTrackpad;
         twoFingerTrackpad = null;
         gestureStart = null;
-        if (!tf.canceled && !tf.moved && !tf.mode && (Date.now() - tf.t) < 280) {
-          if (ensureTakeoverOrWarn()) {
+        if (!tf.canceled && tf.startedInteractive === true && tf.rightClickEligible && !tf.moved && !tf.mode && (Date.now() - tf.t) < 280) {
+          if (ensureTakeoverOrWarn() && canDispatchRemoteInput()) {
             haptic('medium');
-            const pos = positionArrowCursor(trackpadX, trackpadY, 'human', true);
-            spawnClickRing(pos.localX, pos.localY, 'right');
-            sendWsInput({
+            if (sendWsInput({
               action: 'rightclick',
               x: Math.round(trackpadX * 10) / 10,
               y: Math.round(trackpadY * 10) / 10
-            });
+            })) {
+              const pos = positionArrowCursor(trackpadX, trackpadY, 'human', true);
+              spawnClickRing(pos.localX, pos.localY, 'right');
+            }
           }
         }
         return;
@@ -3117,16 +4914,25 @@
         pinchState = null;
       }
 
-      // Drag mode release: always fall back to lastValidRemote (never snap back to startRemote)
-      if (pointers.size === 0 && gestureStart && gestureStart.dragDownSent) {
-        const endPt = clientToRemoteCoords(e.clientX, e.clientY)
-          || gestureStart.lastValidRemote
-          || gestureStart.startRemote;
-        gestureStart.dragDownSent = false;
-        if (endPt && ws && ws.readyState === WebSocket.OPEN) {
-          positionArrowCursor(endPt.x, endPt.y, 'human', false);
-          sendWsInput({ action: 'mouseup', x: endPt.x, y: endPt.y, button: 'left' });
+      // Pan mode never emits remote clicks
+      if (pointers.size === 0 && gestureMode === 'pan') {
+        gestureStart = null;
+        return;
+      }
+
+      // Drag mode release: if pendingDrag never committed, emit 0 mousedown/mouseup; otherwise release at lastValidRemote
+      if (pointers.size === 0 && gestureMode === 'drag') {
+        if (gestureStart && gestureStart.dragDownSent) {
+          const endPt = clientToRemoteCoords(e.clientX, e.clientY)
+            || gestureStart.lastValidRemote
+            || gestureStart.startRemote;
+          gestureStart.dragDownSent = false;
+          if (endPt && canDispatchRemoteInput()) {
+            positionArrowCursor(endPt.x, endPt.y, 'human', false);
+            sendWsInput({ action: 'mouseup', x: endPt.x, y: endPt.y, button: 'left' });
+          }
         }
+        if (gestureStart) gestureStart.pendingDrag = false;
         gestureStart = null;
         return;
       }
@@ -3165,10 +4971,10 @@
         return;
       }
 
-      // Trackpad mode: any unmoved single-finger tap (0..470ms) ONLY clicks at arrow tip (never falls through to touch coords!)
+      // Trackpad mode: any unmoved single-finger tap (0..470ms) ONLY clicks at arrow tip
       if (pointers.size === 0 && gestureMode === 'trackpad') {
-        if (gestureStart && !gestureStart.moved && !gestureStart.wasPinch && (Date.now() - gestureStart.t) < 470) {
-          if (ensureTakeoverOrWarn()) {
+        if (gestureStart && gestureStart.startedInteractive === true && !gestureStart.moved && !gestureStart.wasPinch && (Date.now() - gestureStart.t) < 470) {
+          if (ensureTakeoverOrWarn() && canDispatchRemoteInput()) {
             haptic('light');
             const rx = Math.round(trackpadX * 10) / 10;
             const ry = Math.round(trackpadY * 10) / 10;
@@ -3180,10 +4986,20 @@
         return;
       }
 
-      // Interact mode tap -> left click (unless long-press right-click or pinch already fired)
-      if (pointers.size === 0 && gestureStart && !gestureStart.moved && !gestureStart.wasPinch && !gestureStart.longPressed && (Date.now() - gestureStart.t) < 470) {
+      // Interact mode tap -> left click (requires valid down & up inside stage AND interactive at BOTH down & up)
+      if (
+        pointers.size === 0
+        && gestureMode === 'interact'
+        && gestureStart
+        && gestureStart.startedInteractive === true
+        && gestureStart.startRemote
+        && !gestureStart.moved
+        && !gestureStart.wasPinch
+        && !gestureStart.longPressed
+        && (Date.now() - gestureStart.t) < 470
+      ) {
         const pt = clientToRemoteCoords(e.clientX, e.clientY);
-        if (pt) {
+        if (pt && canDispatchRemoteInput()) {
           if (!ensureTakeoverOrWarn()) {
             gestureStart = null;
             return;
@@ -3200,8 +5016,13 @@
     stage.addEventListener('lostpointercapture', onPointerCancel);
 
     stage.addEventListener('wheel', (e) => {
-      e.preventDefault();
-      if (!state.running || !state.takeover) return;
+      if (isIgnoredStageTarget(e.target)) return;
+      if (typeof e.preventDefault === 'function') e.preventDefault();
+      if (!state.running || !state.takeover || !canDispatchRemoteInput()) return;
+      if (typeof e.clientX === 'number' && typeof e.clientY === 'number') {
+        const pt = clientToRemoteCoords(e.clientX, e.clientY);
+        if (!pt) return;
+      }
       const now = Date.now();
       if (now - lastWheelSent >= 40) {
         lastWheelSent = now;

@@ -18,6 +18,8 @@ venv/
 .venv/
 node_modules/
 dist/
+webui/node_modules/
+webui/dist/
 build/
 .ruff_cache/
 *.egg-info/

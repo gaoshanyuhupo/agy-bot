@@ -403,8 +403,13 @@ class TestBridgeAndHookAntiPoisoning(unittest.TestCase):
             )
             transcript.write_text("\n".join(json.dumps(s) for s in steps) + "\n", encoding="utf-8")
 
+            base_env = {
+                k: v
+                for k, v in os.environ.items()
+                if k not in ("AGY_INTERNAL_OBSERVER", "AGY_UNTRUSTED_SESSION", "AGY_MEMORY_READONLY")
+            }
             env = {
-                **os.environ,
+                **base_env,
                 "AGY_MEMORY_TAINT_FILE": str(taint_file),
                 "AGY_SHIM_STATE_FILE": str(root / "shim.json"),
                 "AGY_BUN_BIN": str(fake_bun),
@@ -515,8 +520,13 @@ class TestBridgeAndHookAntiPoisoning(unittest.TestCase):
             self.assertGreaterEqual(len(parsed), 1)
             self.assertIn("UNTRUSTED_WARNING", parsed[-1]["content"])
 
+            base_env = {
+                k: v
+                for k, v in os.environ.items()
+                if k not in ("AGY_INTERNAL_OBSERVER", "AGY_UNTRUSTED_SESSION", "AGY_MEMORY_READONLY")
+            }
             env = {
-                **os.environ,
+                **base_env,
                 "AGY_MEMORY_TAINT_FILE": str(taint_file),
                 "AGY_SHIM_STATE_FILE": str(root / "shim.json"),
                 "AGY_BUN_BIN": str(fake_bun),
@@ -798,6 +808,183 @@ class TestInstinctDaemonAntiPoisoningAndDream(unittest.TestCase):
             rem_count = len(daemon.OBSERVATIONS_FILE.read_text(encoding="utf-8").splitlines())
             self.assertEqual(30, rem_count)
             self.assertEqual(30, final_st["last_analyzed_obs_line"])
+
+    def test_global_plugin_projection_two_pool_slots_and_reload_sentinels(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon, _mg = _load_isolated_instinct_daemon(
+                tmp,
+                extra_env={
+                    "AGY_ACTIVE_RULE_CORE_SLOTS": "3",
+                    "AGY_ACTIVE_RULE_RECENT_SLOTS": "2",
+                    "AGY_ACTIVE_RULE_RECENT_DAYS": "7",
+                },
+            )
+            ref_today = date(2026, 11, 20)
+
+            # Verify jeff reload sentinel is included alongside main & sg
+            reload_names = {p.name for p in daemon.BRIDGE_RELOAD_FILES}
+            self.assertIn("agy_bridge_reload", reload_names)
+            self.assertIn("agy_bridge_sg_reload", reload_names)
+            self.assertIn("agy_bridge_jeff_reload", reload_names)
+
+            # Verify test isolation: GLOBAL_PLUGIN_DIR stays inside tmp
+            self.assertIsNotNone(daemon.GLOBAL_PLUGIN_DIR)
+            self.assertTrue(str(daemon.GLOBAL_PLUGIN_DIR).startswith(tmp))
+
+            # Seed 4 core instincts tied at 0.95: older 'a-old-rule' vs fresher 'z-recent-core'
+            for iid, obs_date in (
+                ("a-old-core", "2026-11-10"),
+                ("b-mid-core", "2026-11-18"),
+                ("m-mid-core", "2026-11-19"),
+                ("z-fresh-core", "2026-11-20"),
+            ):
+                daemon.write_instinct_yaml(
+                    {
+                        "id": iid,
+                        "title": iid,
+                        "trigger": f"when testing {iid}",
+                        "action": f"Apply {iid} directive",
+                        "domain": "workflow",
+                        "confidence": 0.95,
+                        "evidence": [f"Last observed: {obs_date}"],
+                    },
+                    preserve_last_observed=True,
+                )
+
+            # Seed 3 non-core instincts: 2 fresh (0.75 & 0.72 within 7 days) + 1 stale (0.79, 20 days ago)
+            for iid, conf, obs_date in (
+                ("fresh-lesson-1", 0.75, "2026-11-20"),
+                ("fresh-lesson-2", 0.72, "2026-11-19"),
+                ("stale-lesson-old", 0.79, "2026-10-30"),
+            ):
+                daemon.write_instinct_yaml(
+                    {
+                        "id": iid,
+                        "title": iid,
+                        "trigger": f"when handling {iid}",
+                        "action": f"Enforce {iid} guardrail",
+                        "domain": "security",
+                        "confidence": conf,
+                        "evidence": [f"Last observed: {obs_date}"],
+                    },
+                    preserve_last_observed=True,
+                )
+
+            count, changed = daemon.sync_active_instincts_rule(today=ref_today)
+            self.assertEqual(5, count)
+            self.assertTrue(changed)
+
+            ws_txt = daemon.ACTIVE_RULE_FILE.read_text(encoding="utf-8")
+            plugin_txt = daemon.GLOBAL_PLUGIN_RULE_FILE.read_text(encoding="utf-8")
+            manifest = json.loads(daemon.GLOBAL_PLUGIN_MANIFEST.read_text(encoding="utf-8"))
+            self.assertEqual("ecc-instincts", manifest["name"])
+            self.assertTrue(ws_txt.startswith("---\ntrigger: always_on"))
+            self.assertFalse(plugin_txt.startswith("---"), "Plugin rules/AGENTS.md must be plain markdown")
+
+            # Recency broke the 0.95 tie: z-fresh-core wins over older a-old-core
+            self.assertIn("Apply z-fresh-core directive", plugin_txt)
+            self.assertNotIn("Apply a-old-core directive", plugin_txt)
+            # Reserved recent slots admitted both fresh lessons while excluding stale 0.79 lesson
+            self.assertIn("Enforce fresh-lesson-1 guardrail", plugin_txt)
+            self.assertIn("Enforce fresh-lesson-2 guardrail", plugin_txt)
+            self.assertNotIn("Enforce stale-lesson-old guardrail", plugin_txt)
+
+            # Deterministic repeat call preserves prefix cache (changed=False)
+            count2, changed2 = daemon.sync_active_instincts_rule(today=ref_today)
+            self.assertEqual(5, count2)
+            self.assertFalse(changed2)
+
+            # Status reports global plugin projection health
+            st = daemon.get_dream_status()
+            self.assertTrue(st["global_plugin_synced"])
+            self.assertEqual(3, st["core_active_slots"])
+            self.assertEqual(2, st["recent_active_slots"])
+
+    def test_evolve_unblocked_at_cap_and_fast_correction_cooldown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon, _mg = _load_isolated_instinct_daemon(
+                tmp,
+                extra_env={
+                    "AGY_MAX_EVOLVED_SKILLS": "2",
+                    "AGY_EVOLVE_DELTA_MIN": "3",
+                    "AGY_ANALYSIS_COOLDOWN_SEC": "1800",
+                    "AGY_CORRECTION_COOLDOWN_SEC": "60",
+                },
+            )
+            # Pre-populate 2 evolved skills (already at cap=2)
+            for slug in ("alpha-ops", "beta-ops"):
+                sdir = daemon.EVOLVED_SKILLS_DIR / slug
+                sdir.mkdir(parents=True, exist_ok=True)
+                (sdir / "SKILL.md").write_text(
+                    f"---\nname: evolved-{slug}\ndescription: Old {slug}\n---\n\n# Old {slug}\n",
+                    encoding="utf-8",
+                )
+            synced_init, _ = daemon.sync_evolved_skills()
+            self.assertEqual(2, len(synced_init))
+            self.assertTrue((daemon.GLOBAL_PLUGIN_SKILLS_DIR / "evolved-alpha-ops" / "SKILL.md").is_file())
+
+            # Seed 3 strong instincts so evolve_with_llm_and_cli can refresh an existing skill at cap
+            for i in range(3):
+                daemon.write_instinct_yaml(
+                    {
+                        "id": f"ops-new-{i}",
+                        "title": f"Ops New {i}",
+                        "trigger": f"when operating service {i}",
+                        "action": f"Follow strict ops step {i}",
+                        "domain": "ops",
+                        "confidence": 0.85,
+                        "evidence": ["Last observed: 2026-11-20"],
+                    },
+                    preserve_last_observed=True,
+                )
+
+            # At cap, LLM returning a brand-new slug is rejected; returning an existing slug refreshes it!
+            new_slug_reply = json.dumps(
+                {"slug": "gamma-new", "description": "Should not exceed cap", "markdown": "# Gamma"}
+            )
+            with (
+                mock.patch.object(daemon.subprocess, "run"),
+                mock.patch.object(daemon, "call_shim_json", return_value=new_slug_reply),
+            ):
+                daemon.evolve_with_llm_and_cli(quiet=True)
+            self.assertFalse((daemon.EVOLVED_SKILLS_DIR / "gamma-new").exists())
+
+            refresh_reply = json.dumps(
+                {
+                    "slug": "alpha-ops",
+                    "description": "Refreshed alpha ops skill",
+                    "markdown": "# Refreshed Alpha Ops\n\nIncludes ops-new-0..2.\n",
+                }
+            )
+            with (
+                mock.patch.object(daemon.subprocess, "run"),
+                mock.patch.object(daemon, "call_shim_json", return_value=refresh_reply),
+            ):
+                daemon.evolve_with_llm_and_cli(quiet=True)
+            refreshed = (daemon.GLOBAL_PLUGIN_SKILLS_DIR / "evolved-alpha-ops" / "SKILL.md").read_text(encoding="utf-8")
+            self.assertIn("Refreshed Alpha Ops", refreshed)
+
+            # Verify sticky pending_correction + shorter CORRECTION_COOLDOWN_SEC (60s vs 1800s)
+            cid = "conv-corr-cooldown"
+            tpath = daemon.BRAIN_ROOT / cid / ".system_generated" / "logs" / "transcript.jsonl"
+            tpath.parent.mkdir(parents=True, exist_ok=True)
+            lines = [{"type": "USER_INPUT", "content": "不对，以后记住用 verify_gate.py"}] + [
+                {"type": "USER_INPUT", "content": f"Follow up coding step {i}"} for i in range(6)
+            ]
+            tpath.write_text("\n".join(json.dumps(x) for x in lines) + "\n", encoding="utf-8")
+
+            # Set last_analysis_ts to 120s ago (> 60s correction cooldown, < 1800s normal cooldown)
+            now = daemon.time.time()
+            st = daemon.load_daemon_state()
+            st["last_analysis_ts"] = now - 120.0
+            st["evolved_domains"] = ["ops"]  # legacy state with 3 prior instincts -> 6 now? only 3 so no auto-evolve yet
+            daemon.save_daemon_state(st)
+
+            with mock.patch.object(daemon, "call_shim_json", return_value="[]") as m_shim:
+                res = daemon.analyze_observations_batch(force=False)
+            self.assertEqual("analyzed", res["status"])
+            self.assertEqual(1, m_shim.call_count)
+            self.assertFalse(daemon.load_daemon_state().get("pending_correction"))
 
 
 if __name__ == "__main__":

@@ -143,6 +143,8 @@ _ALWAYS_READONLY_COMMANDS = frozenset({
     "/context",
     "/sessions",
     "/files",
+    "/webui",
+    "/studio",
 })
 
 _VIEW_ONLY_WHEN_EMPTY_COMMANDS = frozenset({

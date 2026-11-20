@@ -16,6 +16,7 @@ Provides:
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 import fcntl
 import hashlib
 import hmac
@@ -49,6 +50,18 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger("live-browser")
+
+_TAB_CMD_ID_RE = re.compile(r"^[A-Za-z0-9_:-]{1,48}$")
+
+
+def _sanitize_tab_cmd_id(raw: Any) -> str | None:
+    """Validate and sanitize a client tab-command correlation token."""
+    if not isinstance(raw, str):
+        return None
+    val = raw.strip()
+    if not val or not _TAB_CMD_ID_RE.match(val):
+        return None
+    return val
 
 CONFIG_DIR = Path(os.environ.get("AGY_LIVE_BROWSER_CONFIG_DIR", str(Path.home() / ".config/agy-live-browser")))
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -2627,6 +2640,9 @@ class LiveBrowserHub:
         self.quality_preset: str = "balanced"
         self._tabs_dirty: bool = True
         self._tab_select_rev: int = 0
+        self._frame_broadcast_seq: int = 0
+        self._pending_tab_cmd_ids: list[str] = []
+        self._rendered_tab_cmd_ids: OrderedDict[str, int] = OrderedDict()
         self._last_tabs_refresh: float = 0.0
         self._last_normal_sig: tuple[int, bytes] | None = None
         self._hd_settled: bool = False
@@ -2970,6 +2986,7 @@ class LiveBrowserHub:
             "vw": self.vw,
             "vh": self.vh,
             "tabs": self.tabs,
+            "rendered_tab_cmds": list(self._rendered_tab_cmd_ids.keys()),
             "cursor": self.cursor,
             "quality_preset": self.quality_preset,
             "public_url": self.config.get("public_url") or "",
@@ -3009,10 +3026,22 @@ class LiveBrowserHub:
             "profiles": [],
         }
 
-    def state_dict_for_viewer(self, bot_key: str, user_id: int, role: str) -> dict[str, Any]:
+    def state_dict_for_viewer(
+        self,
+        bot_key: str,
+        user_id: int,
+        role: str,
+        *,
+        viewer_frame_seq: int | None = None,
+    ) -> dict[str, Any]:
         """Return full state for authorized session readers, or redacted placeholder for isolated viewers."""
         if self.engine_mode == "idle" or self._viewer_can_read_session(bot_key, user_id, role):
-            return self.state_dict()
+            st = self.state_dict()
+            if self.engine_mode != "idle" and viewer_frame_seq is not None:
+                st["rendered_tab_cmds"] = [
+                    cid for cid, req_seq in self._rendered_tab_cmd_ids.items() if viewer_frame_seq >= req_seq
+                ]
+            return st
         return self._redacted_state_dict()
 
     async def broadcast_json(self, obj: dict[str, Any]) -> None:
@@ -3115,7 +3144,9 @@ class LiveBrowserHub:
         snap_gen = self.session_gen
         snap_owner = self.session_owner
         snap_mode = self.engine_mode
-        full_payload = json.dumps(self.state_dict(), ensure_ascii=False)
+        base_full_state = self.state_dict()
+        rendered_snapshot = list(self._rendered_tab_cmd_ids.items())
+        full_payload_cache: dict[tuple[str, ...], str] = {}
         redacted_payload = json.dumps(self._redacted_state_dict(), ensure_ascii=False)
         stale: list[web.WebSocketResponse] = []
         for ws in list(self.viewers):
@@ -3138,7 +3169,17 @@ class LiveBrowserHub:
             if self.session_gen != snap_gen or self.session_owner != snap_owner or self.engine_mode != snap_mode:
                 break
             if snap_mode == "idle" or self._viewer_can_read_session(bkey, uid, live_role):
-                out_str = full_payload
+                if snap_mode == "idle":
+                    filtered_cmds: tuple[str, ...] = ()
+                else:
+                    v_seq = int(meta.get("last_frame_seq", 0))
+                    filtered_cmds = tuple(cid for cid, req_seq in rendered_snapshot if v_seq >= req_seq)
+                out_str = full_payload_cache.get(filtered_cmds)
+                if out_str is None:
+                    st_copy = dict(base_full_state)
+                    st_copy["rendered_tab_cmds"] = list(filtered_cmds)
+                    out_str = json.dumps(st_copy, ensure_ascii=False)
+                    full_payload_cache[filtered_cmds] = out_str
             else:
                 out_str = redacted_payload
             try:
@@ -3155,6 +3196,8 @@ class LiveBrowserHub:
         snap_gen = self.session_gen
         snap_owner = self.session_owner
         snap_mode = self.engine_mode
+        self._frame_broadcast_seq += 1
+        frame_seq = self._frame_broadcast_seq
         self.latest_jpeg = jpeg_bytes
         if not self.viewers:
             return
@@ -3190,9 +3233,103 @@ class LiveBrowserHub:
                 await ws.send_bytes(jpeg_bytes)
             except Exception:
                 stale.append(ws)
+            else:
+                if (
+                    self.session_gen == snap_gen
+                    and self.session_owner == snap_owner
+                    and self.engine_mode == snap_mode
+                    and frame_seq > int(meta.get("last_frame_seq", 0))
+                ):
+                    meta["last_frame_seq"] = frame_seq
         for ws in stale:
             self.viewers.discard(ws)
             self.viewer_meta.pop(ws, None)
+
+    async def _catchup_lagging_viewers(self, *, send_state: bool = True) -> int:
+        """Deliver latest_jpeg to authorized viewers that fell behind (e.g. >512 KiB drop) once buffer drains."""
+        if (
+            self.engine_mode == "idle"
+            or not self.viewers
+            or not self.latest_jpeg
+            or self._frame_broadcast_seq <= 0
+        ):
+            return 0
+        snap_gen = self.session_gen
+        snap_owner = self.session_owner
+        snap_mode = self.engine_mode
+        catchup_seq = self._frame_broadcast_seq
+        catchup_jpeg = self.latest_jpeg
+        caught_up = 0
+        stale: list[web.WebSocketResponse] = []
+        for ws in list(self.viewers):
+            if self.session_gen != snap_gen or self.session_owner != snap_owner or self.engine_mode != snap_mode:
+                break
+            if ws.closed:
+                stale.append(ws)
+                continue
+            meta = self.viewer_meta.get(ws)
+            if not meta:
+                await self._evict_revoked_viewer(ws)
+                continue
+            if int(meta.get("last_frame_seq", 0)) >= catchup_seq:
+                continue
+            bkey = str(meta.get("bot_key") or "")
+            uid = int(meta.get("user_id") or 0)
+            live_role = _check_live_user_role(bkey, uid)
+            if live_role == "denied":
+                await self._evict_revoked_viewer(ws)
+                continue
+            meta["role"] = live_role
+            if self.session_gen != snap_gen or self.session_owner != snap_owner or self.engine_mode != snap_mode:
+                break
+            if not self._viewer_can_read_session(bkey, uid, live_role):
+                continue
+            transport = getattr(ws, "_writer", None)
+            if transport and getattr(transport, "transport", None):
+                buf_size = transport.transport.get_write_buffer_size()
+                if buf_size >= 524288:
+                    continue
+            try:
+                await ws.send_bytes(catchup_jpeg)
+            except Exception:
+                stale.append(ws)
+                continue
+            if self.session_gen != snap_gen or self.session_owner != snap_owner or self.engine_mode != snap_mode:
+                break
+            if catchup_seq > int(meta.get("last_frame_seq", 0)):
+                meta["last_frame_seq"] = catchup_seq
+            caught_up += 1
+            if send_state:
+                live_role_after = _check_live_user_role(bkey, uid)
+                if live_role_after == "denied":
+                    await self._evict_revoked_viewer(ws)
+                    continue
+                meta["role"] = live_role_after
+                if (
+                    self.session_gen != snap_gen
+                    or self.session_owner != snap_owner
+                    or self.engine_mode != snap_mode
+                ):
+                    break
+                if not self._viewer_can_read_session(bkey, uid, live_role_after):
+                    continue
+                st_str = json.dumps(
+                    self.state_dict_for_viewer(
+                        bkey,
+                        uid,
+                        live_role_after,
+                        viewer_frame_seq=int(meta.get("last_frame_seq", 0)),
+                    ),
+                    ensure_ascii=False,
+                )
+                try:
+                    await ws.send_str(st_str)
+                except Exception:
+                    stale.append(ws)
+        for ws in stale:
+            self.viewers.discard(ws)
+            self.viewer_meta.pop(ws, None)
+        return caught_up
 
     def _drain_input_queue(self) -> int:
         dropped = 0
@@ -3231,14 +3368,219 @@ class LiveBrowserHub:
                 self.sync_cmd_queue.pop(0)
         self.sync_cmd_queue.append(cmd)
 
-    async def _release_held_mouse_buttons_locked(self) -> list[str]:
+    def _record_rendered_tab_cmd_id(
+        self, cmd_id: Any, *, required_frame_seq: int | None = None
+    ) -> bool:
+        clean = _sanitize_tab_cmd_id(cmd_id)
+        if not clean or clean in self._rendered_tab_cmd_ids:
+            return False
+        req_seq = self._frame_broadcast_seq if required_frame_seq is None else int(required_frame_seq)
+        self._rendered_tab_cmd_ids[clean] = req_seq
+        while len(self._rendered_tab_cmd_ids) > 32:
+            self._rendered_tab_cmd_ids.popitem(last=False)
+        return True
+
+    def _queue_pending_tab_cmd_id(self, cmd_id: Any) -> str | None:
+        clean = _sanitize_tab_cmd_id(cmd_id)
+        if not clean:
+            return None
+        if clean not in self._pending_tab_cmd_ids:
+            self._pending_tab_cmd_ids.append(clean)
+            if len(self._pending_tab_cmd_ids) > 64:
+                self._pending_tab_cmd_ids = self._pending_tab_cmd_ids[-64:]
+        return clean
+
+    def _promote_pending_tab_cmd_ids(
+        self, snap_ids: list[str], *, required_frame_seq: int | None = None
+    ) -> bool:
+        promoted = False
+        for cid in snap_ids:
+            try:
+                self._pending_tab_cmd_ids.remove(cid)
+            except ValueError:
+                pass
+            if self._record_rendered_tab_cmd_id(cid, required_frame_seq=required_frame_seq):
+                promoted = True
+        return promoted
+
+    def _viewer_can_receive_tab_cmd_ack(
+        self,
+        bot_key: str,
+        user_id: int,
+        live_role: str,
+        *,
+        require_explicit_owner: bool = True,
+    ) -> bool:
+        """Strictly gate `tab_cmd_ack` receipts to live admin controllers/owners (fail-closed)."""
+        if live_role != "admin":
+            return False
+        if self.engine_mode == "idle" or self.engine_mode not in ("async_hosted", "sync_external"):
+            return False
+        owner_bot, owner_uid = self._effective_resource_owner()
+        has_explicit_owner = (
+            bool(owner_bot)
+            and owner_uid is not None
+            and not isinstance(owner_uid, bool)
+            and int(owner_uid) > 0
+        )
+        if require_explicit_owner and not has_explicit_owner:
+            return False
+        if has_explicit_owner:
+            if bot_key != owner_bot or int(user_id) != int(owner_uid):  # type: ignore[arg-type]
+                return False
+        if self.session_owner is not None:
+            s_bot, s_uid = self.session_owner
+            if not s_bot or s_uid is None or isinstance(s_uid, bool) or int(s_uid) <= 0:
+                return False
+            if bot_key != s_bot or int(user_id) != int(s_uid):
+                return False
+        if not self._viewer_can_control_takeover(bot_key, user_id, live_role):
+            return False
+        return True
+
+    async def _broadcast_tab_cmd_rejected(
+        self,
+        cmd_id: Any,
+        reason: str = "execution_error",
+        *,
+        expected_session_gen: int | None = None,
+        sync_lease_id: str | None = None,
+    ) -> None:
+        if reason == "unauthorized":
+            return
+        clean_cid = _sanitize_tab_cmd_id(cmd_id)
+        if not clean_cid:
+            return
+        if self.engine_mode == "idle" or not self.viewers:
+            return
+        snap_gen = self.session_gen if expected_session_gen is None else expected_session_gen
+        if self.session_gen != snap_gen:
+            return
+        if sync_lease_id is not None:
+            ok_lease, _, _ = _check_sync_lease_active(self, sync_lease_id, expected_gen=snap_gen)
+            if not ok_lease:
+                return
+        owner_bot, owner_uid = self._effective_resource_owner()
+        if (
+            not owner_bot
+            or owner_uid is None
+            or isinstance(owner_uid, bool)
+            or int(owner_uid) <= 0
+        ):
+            return
+        snap_owner = self.session_owner
+        snap_takeover_owner = self.takeover_owner
+        snap_mode = self.engine_mode
+        payload = json.dumps(
+            {"type": "tab_cmd_ack", "cmd_id": clean_cid, "status": "rejected", "reason": reason},
+            ensure_ascii=False,
+        )
+        stale: list[web.WebSocketResponse] = []
+        for ws in list(self.viewers):
+            if (
+                self.session_gen != snap_gen
+                or self.session_owner != snap_owner
+                or self.takeover_owner != snap_takeover_owner
+                or self.engine_mode != snap_mode
+                or self.engine_mode == "idle"
+            ):
+                break
+            if sync_lease_id is not None:
+                ok_lease, _, _ = _check_sync_lease_active(self, sync_lease_id, expected_gen=snap_gen)
+                if not ok_lease:
+                    break
+            if ws.closed:
+                stale.append(ws)
+                continue
+            meta = self.viewer_meta.get(ws)
+            if not meta:
+                await self._evict_revoked_viewer(ws)
+                continue
+            bkey = str(meta.get("bot_key") or "")
+            uid = int(meta.get("user_id") or 0)
+            live_role = _check_live_user_role(bkey, uid)
+            if live_role == "denied":
+                await self._evict_revoked_viewer(ws)
+                continue
+            meta["role"] = live_role
+            if (
+                self.session_gen != snap_gen
+                or self.session_owner != snap_owner
+                or self.takeover_owner != snap_takeover_owner
+                or self.engine_mode != snap_mode
+                or self.engine_mode == "idle"
+            ):
+                break
+            if sync_lease_id is not None:
+                ok_lease, _, _ = _check_sync_lease_active(self, sync_lease_id, expected_gen=snap_gen)
+                if not ok_lease:
+                    break
+            if live_role != "admin":
+                continue
+            if bkey != owner_bot or uid != int(owner_uid):
+                continue
+            if not self._viewer_can_receive_tab_cmd_ack(bkey, uid, live_role, require_explicit_owner=True):
+                continue
+            try:
+                await ws.send_str(payload)
+            except Exception:
+                stale.append(ws)
+        for ws in stale:
+            self.viewers.discard(ws)
+            self.viewer_meta.pop(ws, None)
+
+    async def _send_tab_cmd_rejected(self, cmd: dict[str, Any], reason: str = "rejected") -> None:
+        if reason == "unauthorized":
+            return
+        act = cmd.get("action")
+        if act not in ("switch_tab", "new_tab", "close_tab"):
+            return
+        cmd_id = _sanitize_tab_cmd_id(cmd.get("cmd_id"))
+        if not cmd_id:
+            return
+        target_ws = cmd.get("_ws")
+        if target_ws is None or getattr(target_ws, "closed", False):
+            return
+        meta = self.viewer_meta.get(target_ws)
+        if not meta:
+            return
+        bkey = str(meta.get("bot_key") or "")
+        uid = int(meta.get("user_id") or 0)
+        live_role = _check_live_user_role(bkey, uid)
+        if live_role == "denied":
+            await self._evict_revoked_viewer(target_ws)
+            return
+        meta["role"] = live_role
+        if not self._viewer_can_receive_tab_cmd_ack(bkey, uid, live_role):
+            return
+        cmd_sgen = _parse_strict_int(cmd.get("_session_gen"))
+        if cmd_sgen is not None and cmd_sgen != self.session_gen:
+            return
+        try:
+            await target_ws.send_str(
+                json.dumps(
+                    {"type": "tab_cmd_ack", "cmd_id": cmd_id, "status": "rejected", "reason": reason},
+                    ensure_ascii=False,
+                )
+            )
+        except Exception:
+            pass
+
+    async def _release_held_mouse_buttons_locked(self, target_page: Any | None = None) -> list[str]:
         """Server-side fallback releasing any held mouse buttons (caller MUST hold `self._exec_lock`)."""
         released: list[str] = []
         buttons = list(self._mouse_buttons_down)
         self._mouse_buttons_down.clear()
         if buttons and self.engine_mode == "async_hosted":
-            page = self._current_page()
+            page = target_page if target_page is not None else self._current_page()
             if page is not None:
+                is_closed_fn = getattr(page, "is_closed", None)
+                if callable(is_closed_fn):
+                    try:
+                        if is_closed_fn():
+                            return released
+                    except Exception:
+                        pass
                 for btn in buttons:
                     try:
                         await asyncio.wait_for(page.mouse.up(button=btn), timeout=1.5)
@@ -3336,6 +3678,82 @@ class LiveBrowserHub:
         await self.broadcast_state()
         asyncio.create_task(self.tg.tick_updates(force=True))
         return True, "ok", res_sgen, res_tgen
+
+    async def release_takeover_on_disconnect(
+        self,
+        bot_key: str,
+        user_id: int,
+        *,
+        had_admin_role: bool,
+        expected_session_gen: int | None = None,
+        expected_takeover_gen: int | None = None,
+        reason: str = "最后一位接管控制者已断开或失权，自动交还 AI",
+    ) -> bool:
+        """Atomically release a named-owner takeover under `_takeover_lock` when its last eligible admin disconnects.
+
+        Security invariants:
+        - NEVER releases ownerless takeovers (`takeover_owner is None` or `owner_uid is None`, e.g. localhost `wait-human`).
+        - NEVER releases on disconnect of a non-admin (`readonly`) viewer or non-matching owner.
+        - Re-checks `takeover`, `takeover_owner`, `session_gen`, `takeover_gen`, and live-admin viewers inside `_takeover_lock`
+          so a concurrent new takeover generation is never clobbered by a stale disconnect.
+        """
+        if not had_admin_role:
+            return False
+        released = False
+        async with self._takeover_lock:
+            if not self.takeover:
+                return False
+            if expected_session_gen is not None and self.session_gen != expected_session_gen:
+                return False
+            if expected_takeover_gen is not None and self.takeover_gen != expected_takeover_gen:
+                return False
+            if self.takeover_owner is None:
+                return False
+            t_bot, t_uid = self.takeover_owner
+            if not t_bot or t_uid is None or isinstance(t_uid, bool) or int(t_uid) <= 0:
+                return False
+            if t_bot != bot_key or int(t_uid) != int(user_id):
+                return False
+            if self._has_eligible_admin_viewer(t_bot, int(t_uid)):
+                return False
+            # Perform formal takeover release atomically while holding `_takeover_lock`
+            self.mark_active()
+            self.takeover_gen += 1
+            self.takeover = False
+            self.takeover_owner = None
+            self.takeover_reason = ""
+            self._drain_input_queue()
+            async with self._exec_lock:
+                await self._release_held_mouse_buttons_locked()
+                if self.engine_mode == "sync_external":
+                    self.sync_cmd_queue.clear()
+                    for btn in list(self._sync_buttons_down):
+                        self.sync_cmd_queue.append(
+                            {
+                                "action": "mouseup",
+                                "button": btn,
+                                "x": 0,
+                                "y": 0,
+                                "session_gen": self.session_gen,
+                                "takeover_gen": self.takeover_gen,
+                                "cleanup": True,
+                                "_server_internal": True,
+                            }
+                        )
+                    self._sync_buttons_down.clear()
+            self.ai_allowed_event.set()
+            log.info(
+                "Takeover AUTO-RELEASED on disconnect (gen=%d owner=(%s,%s)): %s",
+                self.takeover_gen,
+                t_bot,
+                t_uid,
+                reason,
+            )
+            released = True
+        if released:
+            await self.broadcast_state()
+            asyncio.create_task(self.tg.tick_updates(force=True))
+        return released
 
     async def wait_until_ai_allowed(self, timeout: float = 900.0) -> None:
         if self.takeover:
@@ -4193,6 +4611,11 @@ class LiveBrowserHub:
         self._recent_response_cl.clear()
         self._tabs_dirty = True
         self._tab_select_rev += 1
+        self._frame_broadcast_seq = 0
+        self._pending_tab_cmd_ids.clear()
+        self._rendered_tab_cmd_ids.clear()
+        for meta in self.viewer_meta.values():
+            meta["last_frame_seq"] = 0
         self._last_normal_sig = None
         self._hd_settled = False
         self._unchanged_frames = 0
@@ -4516,6 +4939,11 @@ class LiveBrowserHub:
 
                 self.active_tab_index = max(0, len(self._visible_pages(ctx)) - 1)
                 self._tab_select_rev += 1
+                self._frame_broadcast_seq = 0
+                self._pending_tab_cmd_ids.clear()
+                self._rendered_tab_cmd_ids.clear()
+                for meta in self.viewer_meta.values():
+                    meta["last_frame_seq"] = 0
                 self._tabs_dirty = True
                 self._last_normal_sig = None
                 self._hd_settled = False
@@ -4852,6 +5280,8 @@ class LiveBrowserHub:
         if not page:
             return False
         cap_gen = self.session_gen
+        cap_tab_rev = self._tab_select_rev
+        snap_cmd_ids = list(self._pending_tab_cmd_ids)
         try:
             preset_cfg = QUALITY_PRESETS.get(self.quality_preset, QUALITY_PRESETS["balanced"])
             quality = int(preset_cfg["hd_quality"] if hd else preset_cfg["stream_quality"])
@@ -4859,18 +5289,28 @@ class LiveBrowserHub:
                 page.screenshot(type="jpeg", quality=quality, animations="allow"),
                 timeout=3.0,
             )
-            # Guard against late screenshot completing after stop/switch/generation advance
-            if self.engine_mode != "async_hosted" or self.session_gen != cap_gen or self.ctx is None:
+            # Guard against late screenshot completing after stop/tab-switch/generation advance
+            if (
+                self.engine_mode != "async_hosted"
+                or self.session_gen != cap_gen
+                or self._tab_select_rev != cap_tab_rev
+                or self.ctx is None
+            ):
                 return False
 
-            if nonblocking_meta and not force_broadcast:
+            if nonblocking_meta and not force_broadcast and not snap_cmd_ids:
                 self._schedule_metadata_refresh()
             else:
-                meta_changed = await self._refresh_tabs_metadata(force=force_broadcast)
+                meta_changed = await self._refresh_tabs_metadata(force=(force_broadcast or bool(snap_cmd_ids)))
                 if meta_changed:
                     self._meta_changed_pending = True
 
-            if self.engine_mode != "async_hosted" or self.session_gen != cap_gen or self.ctx is None:
+            if (
+                self.engine_mode != "async_hosted"
+                or self.session_gen != cap_gen
+                or self._tab_select_rev != cap_tab_rev
+                or self.ctx is None
+            ):
                 return False
 
             sig = (len(jpeg), hashlib.blake2b(jpeg, digest_size=16).digest())
@@ -4880,7 +5320,15 @@ class LiveBrowserHub:
                 self._hd_pending = False
                 self._hd_settled = True
                 await self.broadcast_frame(jpeg)
-                if self._meta_changed_pending:
+                if (
+                    self.engine_mode != "async_hosted"
+                    or self.session_gen != cap_gen
+                    or self._tab_select_rev != cap_tab_rev
+                    or self.ctx is None
+                ):
+                    return True
+                cmd_promoted = bool(snap_cmd_ids) and self._promote_pending_tab_cmd_ids(snap_cmd_ids)
+                if self._meta_changed_pending or cmd_promoted:
                     self._meta_changed_pending = False
                     await self.broadcast_state()
                 return True
@@ -4889,7 +5337,15 @@ class LiveBrowserHub:
                 self._unchanged_frames += 1
                 if not self._hd_settled:
                     self.latest_jpeg = jpeg
-                if self._meta_changed_pending:
+                cmd_promoted = bool(snap_cmd_ids) and self._promote_pending_tab_cmd_ids(snap_cmd_ids)
+                will_broadcast_state = self._meta_changed_pending or cmd_promoted
+                await self._catchup_lagging_viewers(send_state=not will_broadcast_state)
+                if will_broadcast_state and (
+                    self.engine_mode == "async_hosted"
+                    and self.session_gen == cap_gen
+                    and self._tab_select_rev == cap_tab_rev
+                    and self.ctx is not None
+                ):
                     self._meta_changed_pending = False
                     await self.broadcast_state()
                 return False
@@ -4900,7 +5356,15 @@ class LiveBrowserHub:
             self._hd_settled = False
 
             await self.broadcast_frame(jpeg)
-            if self._meta_changed_pending:
+            if (
+                self.engine_mode != "async_hosted"
+                or self.session_gen != cap_gen
+                or self._tab_select_rev != cap_tab_rev
+                or self.ctx is None
+            ):
+                return True
+            cmd_promoted = bool(snap_cmd_ids) and self._promote_pending_tab_cmd_ids(snap_cmd_ids)
+            if self._meta_changed_pending or cmd_promoted:
                 self._meta_changed_pending = False
                 await self.broadcast_state()
             return True
@@ -5499,6 +5963,7 @@ class LiveBrowserHub:
                 cmd = await self.input_queue.get()
                 cmd = self._coalesce_queued_input(cmd)
                 if not await self._enforce_human_cmd_live_auth_locked(cmd):
+                    await self._send_tab_cmd_rejected(cmd, "unauthorized")
                     continue
                 self.mark_active()
 
@@ -5517,6 +5982,7 @@ class LiveBrowserHub:
                     continue
 
                 if self.engine_mode != "async_hosted":
+                    await self._send_tab_cmd_rejected(cmd, "idle")
                     continue
 
                 await self._execute_human_cmd_async(cmd)
@@ -5531,14 +5997,69 @@ class LiveBrowserHub:
                 log.warning("Human input execution error: %s", exc)
 
     async def _execute_human_cmd_async(self, cmd: dict[str, Any]) -> None:
+        act = cmd.get("action")
+        tab_cmd_id = (
+            _sanitize_tab_cmd_id(cmd.get("cmd_id"))
+            if act in ("switch_tab", "new_tab", "close_tab")
+            else None
+        )
+        exec_state: dict[str, Any] = {"orig_page": None, "orig_ctx": None}
+        try:
+            await self._execute_human_cmd_async_impl(cmd, exec_state=exec_state)
+        except Exception as exc:
+            if act in ("switch_tab", "new_tab", "close_tab") and tab_cmd_id:
+                try:
+                    self._pending_tab_cmd_ids.remove(tab_cmd_id)
+                except ValueError:
+                    pass
+                log.warning("Human tab command %s (%s) execution error: %s", act, tab_cmd_id, exc)
+                orig_page = exec_state.get("orig_page")
+                cur_page = self._current_page()
+                if (
+                    orig_page is not None
+                    and cur_page is orig_page
+                    and not self._is_page_closed(orig_page)
+                ):
+                    await self._broadcast_tab_cmd_rejected(
+                        tab_cmd_id,
+                        "execution_error",
+                        expected_session_gen=cmd.get("_session_gen"),
+                    )
+                elif cur_page is not None and self._is_human_cmd_still_valid(cmd, check_live_rbac=True):
+                    async with self._exec_lock:
+                        if self._current_page() is not None and self._is_human_cmd_still_valid(cmd, check_live_rbac=True):
+                            self._queue_pending_tab_cmd_id(tab_cmd_id)
+                            try:
+                                await self._capture_once(force_broadcast=True)
+                            except Exception as cap_exc:
+                                log.debug("Post-error recovery capture failed for %s: %s", tab_cmd_id, cap_exc)
+                return
+            raise
+
+    async def _execute_human_cmd_async_impl(
+        self,
+        cmd: dict[str, Any],
+        *,
+        exec_state: dict[str, Any] | None = None,
+    ) -> None:
         post_exec_cleanup_task: asyncio.Task[Any] | None = None
         async with self._exec_lock:
             if not await self._enforce_human_cmd_live_auth_locked(cmd):
+                await self._send_tab_cmd_rejected(cmd, "unauthorized")
                 return
             page = self._current_page()
             if not page:
+                await self._send_tab_cmd_rejected(cmd, "no_page")
                 return
+            if exec_state is not None:
+                exec_state["orig_page"] = page
+                exec_state["orig_ctx"] = self.ctx
             act = cmd.get("action")
+            tab_cmd_id = (
+                _sanitize_tab_cmd_id(cmd.get("cmd_id"))
+                if act in ("switch_tab", "new_tab", "close_tab")
+                else None
+            )
             self.mark_active(
                 mark_tabs_dirty=(act in ("goto", "back", "forward", "reload", "switch_tab", "new_tab", "close_tab"))
             )
@@ -5719,15 +6240,59 @@ class LiveBrowserHub:
             elif act == "reload":
                 await page.reload(wait_until="domcontentloaded", timeout=30000)
             elif act == "switch_tab":
+                orig_page = page
+                cur_ctx = self.ctx
                 idx = int(cmd.get("index", 0))
-                pages_vis = self._visible_pages()
+                pages_vis = self._visible_pages(cur_ctx)
                 if 0 <= idx < len(pages_vis):
-                    target_page = pages_vis[idx]
-                    self.active_tab_index = idx
-                    self._tab_select_rev += 1
-                    await target_page.bring_to_front()
+                    target_page: Any | None = pages_vis[idx]
+                    if self._mouse_buttons_down and target_page is not page:
+                        await self._release_held_mouse_buttons_locked(target_page=page)
+                        if not await self._enforce_human_cmd_live_auth_locked(cmd) or self.ctx is not cur_ctx:
+                            await self._send_tab_cmd_rejected(cmd, "unauthorized")
+                            return
+                        pages_vis = self._visible_pages(cur_ctx)
+                        target_page = pages_vis[idx] if 0 <= idx < len(pages_vis) else None
+                    if target_page is not None:
+                        try:
+                            await target_page.bring_to_front()
+                        except Exception:
+                            if self.ctx is cur_ctx:
+                                pages_fb = self._visible_pages(cur_ctx)
+                                if orig_page in pages_fb:
+                                    self.active_tab_index = pages_fb.index(orig_page)
+                            raise
+                        if not await self._enforce_human_cmd_live_auth_locked(cmd) or self.ctx is not cur_ctx:
+                            if self.ctx is cur_ctx:
+                                pages_fb = self._visible_pages(cur_ctx)
+                                if orig_page in pages_fb:
+                                    self.active_tab_index = pages_fb.index(orig_page)
+                            await self._send_tab_cmd_rejected(cmd, "unauthorized")
+                            return
+                        pages_after = self._visible_pages(cur_ctx)
+                        if target_page in pages_after:
+                            self.active_tab_index = pages_after.index(target_page)
+                            self._tab_select_rev += 1
+                            if tab_cmd_id:
+                                self._queue_pending_tab_cmd_id(tab_cmd_id)
+                        else:
+                            if orig_page in pages_after:
+                                self.active_tab_index = pages_after.index(orig_page)
+                            if tab_cmd_id:
+                                await self._send_tab_cmd_rejected(cmd, "target_closed")
+                                return
+                    elif tab_cmd_id:
+                        self._queue_pending_tab_cmd_id(tab_cmd_id)
+                elif tab_cmd_id:
+                    self._queue_pending_tab_cmd_id(tab_cmd_id)
             elif act == "new_tab":
+                orig_page = page
                 if self.ctx:
+                    if self._mouse_buttons_down:
+                        await self._release_held_mouse_buttons_locked(target_page=page)
+                        if not await self._enforce_human_cmd_live_auth_locked(cmd) or not self.ctx:
+                            await self._send_tab_cmd_rejected(cmd, "unauthorized")
+                            return
                     cur_ctx = self.ctx
                     self._explicit_new_tab_in_flight += 1
                     try:
@@ -5737,12 +6302,14 @@ class LiveBrowserHub:
                     # Re-verify (session_gen, takeover_gen, owner, live admin RBAC) AFTER `await new_page()`
                     # BEFORE updating tab selection or navigating; quarantine & fail-closed close outside `_exec_lock` if revoked!
                     if not await self._enforce_human_cmd_live_auth_locked(cmd) or self.ctx is not cur_ctx:
+                        await self._send_tab_cmd_rejected(cmd, "unauthorized")
                         post_exec_cleanup_task = self._schedule_fail_closed_close_unguarded_page(
                             np, expected_ctx=cur_ctx, bump_tab_rev=False
                         )
                     elif id(np) in self._closing_unguarded_pages:
                         # Callback `ctx.on('page')` already caught a guard failure during `new_page()`:
                         # merge onto the same deduplicated cleanup task and release `_exec_lock` before awaiting!
+                        await self._send_tab_cmd_rejected(cmd, "guard_failed")
                         post_exec_cleanup_task = self._schedule_fail_closed_close_unguarded_page(
                             np, expected_ctx=cur_ctx
                         )
@@ -5751,36 +6318,75 @@ class LiveBrowserHub:
                             self._attach_page_listeners(np)
                         except Exception as guard_exc:
                             log.error("new_tab listener attachment failed (fail-closed): %s", guard_exc)
+                            await self._send_tab_cmd_rejected(cmd, "guard_failed")
                             post_exec_cleanup_task = self._schedule_fail_closed_close_unguarded_page(
                                 np, expected_ctx=cur_ctx
                             )
                         else:
-                            pages_now = self._visible_pages(cur_ctx)
-                            if np in pages_now:
-                                self.active_tab_index = pages_now.index(np)
-                                self._tab_select_rev += 1
                             new_tab_url = (
                                 "https://www.google.com" if self._is_active_pinned_verified() else "about:blank"
                             )
-                            await np.goto(new_tab_url, wait_until="domcontentloaded", timeout=30000)
+                            try:
+                                await np.goto(new_tab_url, wait_until="domcontentloaded", timeout=30000)
+                            except Exception:
+                                if self.ctx is cur_ctx:
+                                    pages_fb = self._visible_pages(cur_ctx)
+                                    if orig_page in pages_fb:
+                                        self.active_tab_index = pages_fb.index(orig_page)
+                                raise
+                            if not await self._enforce_human_cmd_live_auth_locked(cmd) or self.ctx is not cur_ctx:
+                                if self.ctx is cur_ctx:
+                                    pages_fb = self._visible_pages(cur_ctx)
+                                    if orig_page in pages_fb:
+                                        self.active_tab_index = pages_fb.index(orig_page)
+                                await self._send_tab_cmd_rejected(cmd, "unauthorized")
+                                post_exec_cleanup_task = self._schedule_fail_closed_close_unguarded_page(
+                                    np, expected_ctx=cur_ctx, bump_tab_rev=False
+                                )
+                            else:
+                                pages_now = self._visible_pages(cur_ctx)
+                                if np in pages_now:
+                                    self.active_tab_index = pages_now.index(np)
+                                    self._tab_select_rev += 1
+                                    if tab_cmd_id:
+                                        self._queue_pending_tab_cmd_id(tab_cmd_id)
+                                else:
+                                    if orig_page in pages_now:
+                                        self.active_tab_index = pages_now.index(orig_page)
+                                    if tab_cmd_id:
+                                        await self._send_tab_cmd_rejected(cmd, "target_closed")
+                                        return
+                elif tab_cmd_id:
+                    await self._send_tab_cmd_rejected(cmd, "no_ctx")
             elif act == "close_tab":
                 idx = int(cmd.get("index", -1))
                 pages_vis = self._visible_pages()
                 if self.ctx and len(pages_vis) > 1 and 0 <= idx < len(pages_vis):
                     cur_ctx = self.ctx
                     target_page = pages_vis[idx]
-                    self._explicit_close_tab_in_flight += 1
-                    try:
-                        await target_page.close()
-                    finally:
-                        self._explicit_close_tab_in_flight = max(0, self._explicit_close_tab_in_flight - 1)
-                    # Re-verify (session_gen, takeover_gen, owner, live admin RBAC) AFTER `await close()`
-                    # BEFORE updating selected tab index!
-                    if not await self._enforce_human_cmd_live_auth_locked(cmd) or self.ctx is not cur_ctx:
-                        return
-                    rem_pages = self._visible_pages(cur_ctx)
-                    self.active_tab_index = max(0, min(self.active_tab_index, len(rem_pages) - 1)) if rem_pages else 0
-                    self._tab_select_rev += 1
+                    if self._mouse_buttons_down:
+                        await self._release_held_mouse_buttons_locked(target_page=page)
+                        if not await self._enforce_human_cmd_live_auth_locked(cmd) or self.ctx is not cur_ctx:
+                            await self._send_tab_cmd_rejected(cmd, "unauthorized")
+                            return
+                        pages_vis = self._visible_pages(cur_ctx)
+                        target_page = pages_vis[idx] if (len(pages_vis) > 1 and 0 <= idx < len(pages_vis)) else None
+                    if target_page is not None:
+                        self._explicit_close_tab_in_flight += 1
+                        try:
+                            await target_page.close()
+                        finally:
+                            self._explicit_close_tab_in_flight = max(0, self._explicit_close_tab_in_flight - 1)
+                        # Re-verify (session_gen, takeover_gen, owner, live admin RBAC) AFTER `await close()`
+                        # BEFORE updating selected tab index!
+                        if not await self._enforce_human_cmd_live_auth_locked(cmd) or self.ctx is not cur_ctx:
+                            await self._send_tab_cmd_rejected(cmd, "unauthorized")
+                            return
+                        rem_pages = self._visible_pages(cur_ctx)
+                        self.active_tab_index = max(0, min(self.active_tab_index, len(rem_pages) - 1)) if rem_pages else 0
+                        self._tab_select_rev += 1
+                if tab_cmd_id:
+                    self._queue_pending_tab_cmd_id(tab_cmd_id)
 
             if post_exec_cleanup_task is None and self._is_human_cmd_still_valid(cmd, check_live_rbac=True):
                 await self._capture_once()
@@ -5970,6 +6576,44 @@ def check_local_auth(request: web.Request, hub: LiveBrowserHub) -> None:
         raise web.HTTPForbidden(text="Invalid local token")
 
 
+def _authenticate_internal_delegated(
+    request: web.Request,
+    hub: LiveBrowserHub,
+    *,
+    bot_key: Any,
+    raw_user_id: Any,
+    extra_fields: dict[str, Any] | None = None,
+) -> tuple[bool, dict[str, Any] | None, str]:
+    """Strict loopback-only delegated auth for AGY Studio (recomputes live RBAC, rejects caller-supplied role)."""
+    if (request.remote or "") not in ("127.0.0.1", "::1"):
+        return False, None, "内部受托鉴权仅允许本机回环访问"
+    if "X-Forwarded-For" in request.headers or "CF-Connecting-IP" in request.headers:
+        return False, None, "内部受托鉴权拒绝代理转发头"
+    if "X-Studio-Role" in request.headers or (extra_fields is not None and "role" in extra_fields):
+        return False, None, "内部受托鉴权禁止调用方声明 role 字段"
+    tok = request.headers.get("X-Internal-Token", "")
+    if not hub.local_token or not tok or not hmac.compare_digest(tok, hub.local_token):
+        return False, None, "内部受托令牌无效"
+    clean_bot, uid = str(bot_key or "").strip(), _parse_strict_int(raw_user_id)
+    if not clean_bot or uid is None or uid <= 0:
+        return False, None, "缺少有效的受托 Bot 或用户标识"
+    role = _check_live_user_role(clean_bot, uid)
+    if role not in ("admin", "readonly"):
+        return False, None, f"账号 {uid} 在机器人 {clean_bot} 上无有效访问角色"
+    return True, {"user": {"id": uid}, "user_id": uid, "bot": clean_bot, "role": role}, ""
+
+
+def _authenticate_http_api(request: web.Request, hub: LiveBrowserHub) -> tuple[bool, dict[str, Any] | None, str]:
+    """Authenticate upload/download via TG initData OR loopback internal delegation (zero fallback)."""
+    if "X-TG-Init-Data" in request.headers:
+        return _authenticate_init_data(request.headers.get("X-TG-Init-Data", ""))
+    if "X-Internal-Token" in request.headers:
+        return _authenticate_internal_delegated(
+            request, hub, bot_key=request.headers.get("X-Studio-Bot", ""), raw_user_id=request.headers.get("X-Studio-User-Id")
+        )
+    return _authenticate_init_data("")
+
+
 async def handle_index(_request: web.Request) -> web.FileResponse:
     # Serves ONLY the zero-data static UI shell; all state/frames require WS HMAC auth.
     return web.FileResponse(
@@ -6063,6 +6707,7 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
     bot_key = ""
     user_id = 0
     role = "denied"
+    had_admin_role = False
     try:
         # First message within 8s MUST be valid Telegram initData auth
         first_msg = await asyncio.wait_for(ws.receive(), timeout=8.0)
@@ -6071,12 +6716,21 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
             return ws
 
         auth_payload = json.loads(first_msg.data)
-        if auth_payload.get("type") != "auth":
+        auth_type = auth_payload.get("type")
+        if auth_type == "auth":
+            ok, info, err = _authenticate_init_data(str(auth_payload.get("initData", "")))
+        elif auth_type == "internal_auth":
+            ok, info, err = _authenticate_internal_delegated(
+                request,
+                hub,
+                bot_key=auth_payload.get("bot"),
+                raw_user_id=auth_payload.get("user_id"),
+                extra_fields=auth_payload,
+            )
+        else:
             await ws.send_str(json.dumps({"type": "auth_error", "error": "未提供身份认证帧"}))
             await ws.close(code=WS_CLOSE_AUTH_FORBIDDEN, message=b"Forbidden")
             return ws
-
-        ok, info, err = _authenticate_init_data(str(auth_payload.get("initData", "")))
         if not ok or not info:
             log.warning("Rejected Mini App WS auth from %s: %s", request.remote, err)
             await ws.send_str(json.dumps({"type": "auth_error", "error": err}))
@@ -6087,8 +6741,9 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
         bot_key = str(info["bot"])
         user_id = int(info["user_id"])
         role = str(info.get("role") or "admin")
+        had_admin_role = role == "admin"
         hub.viewers.add(ws)
-        hub.viewer_meta[ws] = {"user_id": user_id, "bot_key": bot_key, "role": role}
+        hub.viewer_meta[ws] = {"user_id": user_id, "bot_key": bot_key, "role": role, "last_frame_seq": 0}
         hub.mark_active()
         log.info(
             "Mini App viewer connected (user=%s, bot=%s, role=%s, total=%d)",
@@ -6099,12 +6754,14 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
         )
 
         async def _require_live_auth() -> bool:
-            nonlocal role
+            nonlocal role, had_admin_role
             live_role = _check_live_user_role(bot_key, user_id)
             if live_role == "denied":
                 await hub._evict_revoked_viewer(ws, reason="访问权限已被撤销")
                 return False
             role = live_role
+            if role == "admin":
+                had_admin_role = True
             if ws in hub.viewer_meta:
                 hub.viewer_meta[ws]["role"] = role
             return True
@@ -6152,7 +6809,13 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
         snap_gen = hub.session_gen
         snap_owner = hub.session_owner
         snap_mode = hub.engine_mode
-        snap_state_full = json.dumps(hub.state_dict(), ensure_ascii=False)
+        snap_frame_seq = hub._frame_broadcast_seq
+        snap_state_dict = hub.state_dict()
+        if snap_mode != "idle":
+            snap_state_dict["rendered_tab_cmds"] = [
+                cid for cid, req_seq in hub._rendered_tab_cmd_ids.items() if 0 >= req_seq
+            ]
+        snap_state_full = json.dumps(snap_state_dict, ensure_ascii=False)
         snap_state_redacted = json.dumps(hub._redacted_state_dict(), ensure_ascii=False)
         snap_jpeg = hub.latest_jpeg
         snap_dialogs = [
@@ -6187,13 +6850,23 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
             # Session transitioned during auth_ok send; send fresh state bound to live auth/owner
             if not await _require_live_auth():
                 return ws
-            await ws.send_str(json.dumps(hub.state_dict_for_viewer(bot_key, user_id, role), ensure_ascii=False))
+            cur_v_seq = int((hub.viewer_meta.get(ws) or {}).get("last_frame_seq", 0))
+            await ws.send_str(
+                json.dumps(
+                    hub.state_dict_for_viewer(bot_key, user_id, role, viewer_frame_seq=cur_v_seq),
+                    ensure_ascii=False,
+                )
+            )
 
         if snap_jpeg and snap_mode != "idle":
             if not await _require_live_auth():
                 return ws
             if _snap_still_current() and hub._viewer_can_read_session(bot_key, user_id, role):
                 await ws.send_bytes(snap_jpeg)
+                if _snap_still_current() and ws in hub.viewer_meta:
+                    cur_meta = hub.viewer_meta[ws]
+                    if snap_frame_seq > int(cur_meta.get("last_frame_seq", 0)):
+                        cur_meta["last_frame_seq"] = snap_frame_seq
 
         for pending in snap_dialogs:
             if not await _require_live_auth():
@@ -6744,6 +7417,24 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                         )
                     )
             elif mtype == "input":
+                raw_action = str(data.get("action") or "")
+                tab_cmd_id = (
+                    _sanitize_tab_cmd_id(data.get("cmd_id"))
+                    if raw_action in ("switch_tab", "new_tab", "close_tab")
+                    else None
+                )
+
+                async def _send_tab_reject(reason: str) -> None:
+                    if not tab_cmd_id or ws.closed:
+                        return
+                    live_r = _check_live_user_role(bot_key, user_id)
+                    if not hub._viewer_can_receive_tab_cmd_ack(bot_key, user_id, live_r):
+                        return
+                    await _ws_send_json(
+                        ws,
+                        {"type": "tab_cmd_ack", "cmd_id": tab_cmd_id, "status": "rejected", "reason": reason},
+                    )
+
                 if not await _require_live_admin("操作浏览器"):
                     if ws.closed:
                         break
@@ -6752,29 +7443,38 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                     await ws.send_str(
                         json.dumps({"type": "toast", "message": "请先点击右上角【🖐 一键接管】"})
                     )
+                    await _send_tab_reject("no_takeover")
                     continue
                 if not hub._viewer_can_control_takeover(bot_key, user_id, role):
                     await _ws_send_json(ws, {"type": "toast", "message": "🔒 当前接管控制权属于其他 Bot/用户"})
+                    continue
+                if hub.engine_mode not in ("async_hosted", "sync_external"):
+                    await _send_tab_reject("idle")
                     continue
                 # STRICT generation requirement: missing or stale `session_gen` / `takeover_gen` MUST be dropped, NEVER auto-filled!
                 cli_sgen = _parse_strict_int(data.get("session_gen"))
                 cli_tgen = _parse_strict_int(data.get("takeover_gen"))
                 if cli_sgen is None or cli_sgen != hub.session_gen:
+                    await _send_tab_reject("stale_session")
                     continue
                 if cli_tgen is None or cli_tgen != hub.takeover_gen:
+                    await _send_tab_reject("stale_takeover")
                     continue
 
                 clean_payload = {
                     k: v
                     for k, v in data.items()
-                    if k not in ("session_gen", "takeover_gen", "cleanup") and not str(k).startswith("_")
+                    if k not in ("session_gen", "takeover_gen", "cleanup", "cmd_id") and not str(k).startswith("_")
                 }
+                if tab_cmd_id:
+                    clean_payload["cmd_id"] = tab_cmd_id
                 enriched = {
                     **clean_payload,
                     "_session_gen": cli_sgen,
                     "_takeover_gen": cli_tgen,
                     "_bot_key": bot_key,
                     "_user_id": user_id,
+                    "_ws": ws,
                 }
                 if hub.input_queue.full():
                     # Never silently drop mouseup on overflow: make room or force fallback release
@@ -6797,52 +7497,31 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
         if authenticated:
             hub.viewers.discard(ws)
             hub.viewer_meta.pop(ws, None)
+            snap_sgen = hub.session_gen
+            snap_tgen = hub.takeover_gen
             log.info("Mini App viewer disconnected (user=%s, bot=%s, remaining=%d)", user_id, bot_key, len(hub.viewers))
-            # Check if disconnecting viewer held takeover control and no other WS for that owner remains
-            is_takeover_holder = hub.takeover and (
-                hub.takeover_owner is None
-                or (
-                    hub.takeover_owner[0] == bot_key
-                    and (hub.takeover_owner[1] is None or hub.takeover_owner[1] == user_id)
-                )
+            # Release takeover ONLY when disconnecting WS was an eligible admin matching a NAMED takeover owner
+            # and no remaining live-admin WS for that owner exists (verified atomically inside `_takeover_lock`).
+            # Ownerless takeovers (e.g. localhost `wait-human`) are NEVER released by remote WS disconnects.
+            released = await hub.release_takeover_on_disconnect(
+                bot_key,
+                user_id,
+                had_admin_role=had_admin_role,
+                expected_session_gen=snap_sgen,
+                expected_takeover_gen=snap_tgen,
             )
-            still_has_owner_ws = any(
-                not getattr(other_ws, "closed", False)
-                and (hub.viewer_meta.get(other_ws) or {}).get("bot_key") == bot_key
-                and (hub.viewer_meta.get(other_ws) or {}).get("user_id") == user_id
-                for other_ws in list(hub.viewers)
-            )
-            if is_takeover_holder and not still_has_owner_ws:
-                # Immediately bump takeover_gen BEFORE acquiring _exec_lock so any suspended
-                # in-flight `mousedown` (e.g. awaiting `mouse.move`) sees stale gen and skips `mouse.down`!
-                hub.takeover_gen += 1
-                hub._drain_input_queue()
-                async with hub._exec_lock:
-                    await hub._release_held_mouse_buttons_locked()
-                    if hub.engine_mode == "sync_external" and hub._sync_buttons_down:
-                        for btn in list(hub._sync_buttons_down):
-                            hub.sync_cmd_queue.append(
-                                {
-                                    "action": "mouseup",
-                                    "button": btn,
-                                    "x": 0,
-                                    "y": 0,
-                                    "session_gen": hub.session_gen,
-                                    "takeover_gen": hub.takeover_gen,
-                                    "cleanup": True,
-                                    "_server_internal": True,
-                                }
-                            )
-                        hub._sync_buttons_down.clear()
-            elif hub._mouse_buttons_down and (
-                hub.takeover_owner is None
-                or (
-                    hub.takeover_owner[0] == bot_key
-                    and (hub.takeover_owner[1] is None or hub.takeover_owner[1] == user_id)
-                )
-            ):
-                async with hub._exec_lock:
-                    await hub._release_held_mouse_buttons_locked()
+            if not released and had_admin_role and hub._mouse_buttons_down:
+                cur_owner = hub.takeover_owner
+                if (
+                    cur_owner is not None
+                    and cur_owner[0] == bot_key
+                    and cur_owner[1] is not None
+                    and not isinstance(cur_owner[1], bool)
+                    and int(cur_owner[1]) == int(user_id)
+                    and not hub._has_eligible_admin_viewer(bot_key, user_id)
+                ):
+                    async with hub._exec_lock:
+                        await hub._release_held_mouse_buttons_locked()
             # Auto-dismiss any pending dialogs with no eligible admin viewer left
             if hub.pending_dialogs:
                 await hub._dismiss_orphaned_dialogs_on_disconnect()
@@ -6908,8 +7587,7 @@ class _CountingStreamReader:
 async def handle_api_upload(request: web.Request) -> web.Response:
     """Authenticated multipart upload handler backing Playwright `filechooser` with pre-disk validation."""
     hub: LiveBrowserHub = request.app["hub"]
-    init_data = request.headers.get("X-TG-Init-Data", "")
-    ok, info, err = _authenticate_init_data(init_data)
+    ok, info, err = _authenticate_http_api(request, hub)
     if not ok or not info:
         return web.json_response({"ok": False, "error": err or "Forbidden"}, status=403)
     bot_key = str(info["bot"])
@@ -7205,8 +7883,7 @@ async def handle_api_upload(request: web.Request) -> web.Response:
 async def handle_api_download(request: web.Request) -> web.StreamResponse:
     """Authenticated download endpoint enforcing per-bot/owner/role/session_gen isolation & safe headers."""
     hub: LiveBrowserHub = request.app["hub"]
-    init_data = request.headers.get("X-TG-Init-Data", "")
-    ok, info, err = _authenticate_init_data(init_data)
+    ok, info, err = _authenticate_http_api(request, hub)
     if not ok or not info:
         return web.json_response({"ok": False, "error": err or "Forbidden"}, status=403)
     bot_key = str(info["bot"])
@@ -7973,8 +8650,48 @@ async def internal_sync_push(request: web.Request) -> web.Response:
         except Exception:
             pass
 
+    raw_ack_cmds = str(q.get("ack_tab_cmds") or "").strip()
+    ack_tab_cmds: list[str] = []
+    if raw_ack_cmds:
+        for part in raw_ack_cmds.split(","):
+            clean_cid = _sanitize_tab_cmd_id(part)
+            if clean_cid and clean_cid not in ack_tab_cmds:
+                ack_tab_cmds.append(clean_cid)
+                if len(ack_tab_cmds) >= 32:
+                    break
+
+    raw_reject_cmds = str(q.get("reject_tab_cmds") or "").strip()
+    reject_tab_cmds: list[str] = []
+    if raw_reject_cmds:
+        for part in raw_reject_cmds.split(","):
+            clean_cid = _sanitize_tab_cmd_id(part)
+            if clean_cid and clean_cid not in reject_tab_cmds:
+                reject_tab_cmds.append(clean_cid)
+                if len(reject_tab_cmds) >= 32:
+                    break
+
     if jpeg:
         await hub.broadcast_frame(jpeg)
+        if ack_tab_cmds:
+            ok_ack, st_ack, err_ack = _check_sync_lease_active(hub, req_lease, expected_gen=start_gen)
+            if not ok_ack:
+                return web.json_response({"ok": False, "error": err_ack}, status=st_ack)
+            for cid in ack_tab_cmds:
+                hub._record_rendered_tab_cmd_id(cid)
+    if reject_tab_cmds:
+        for cid in reject_tab_cmds:
+            ok_rej, st_rej, err_rej = _check_sync_lease_active(hub, req_lease, expected_gen=start_gen)
+            if not ok_rej:
+                return web.json_response({"ok": False, "error": err_rej}, status=st_rej)
+            await hub._broadcast_tab_cmd_rejected(
+                cid,
+                "execution_error",
+                expected_session_gen=start_gen,
+                sync_lease_id=req_lease,
+            )
+    ok_pre_state, st_pre_state, err_pre_state = _check_sync_lease_active(hub, req_lease, expected_gen=start_gen)
+    if not ok_pre_state:
+        return web.json_response({"ok": False, "error": err_pre_state}, status=st_pre_state)
     await hub.broadcast_state()
 
     # 3. Final validation AFTER broadcast awaits — BEFORE dequeuing sync commands or auto-creating cards!
