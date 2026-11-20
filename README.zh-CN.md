@@ -6,7 +6,8 @@
 - **Telegram 群组多 Bot 团队高效协作与 RBAC**：支持 Bot API 9.5+ `sendMessageDraft` 实时流式输出、群聊防 429 自适应退避、`acb-team` 异步委派、可选 Git Worktree（`worktree: true`）并发隔离，以及群聊/成员 RBAC 权限隔离（`AGY_TG_ADMIN_USERS` / `AGY_TG_READONLY_USERS`）。
 - **多指纹多出口 Camoufox 浏览器 + Telegram Mini App 人工接管**：支持按命名 Profile 独立配置 OS、视口分辨率、WebGL、WebRTC/GeoIP 与代理出口按需切换（隔离任务环境并应对 Cloudflare 等站点严格风控检查），同时支持对核心账号严格锁定持久化指纹 + 宿主机直出；内置 Mini App 可视化指纹切换抽屉与 Telegram `/browser` 内联控制面板，遇到人机验证或交互确认时可一键人工接管，处理完毕后交还 AI 继续执行。
 - **跨会话防遗忘、记忆防投毒、`/dream` 记忆合并与自愈运维**：支持 `/compact` 无损重水合、本地无状态观察者 Shim、三层防记忆投毒守卫（`bridge/memory_guard.py` + Hook Gate + Instinct Daemon 全步审计）、`/dream` 定期本能归并与 `observations.jsonl` gzip 归档、Continuous-Learning v2 习惯演化、`mem-search` 检索、`/undo`/`/redo`、`/schedule`/`/cron`、`/project`、`/usage`/`/cost`、输出前主备模型自动降级（`AGY_TG_FALLBACK_MODELS` / `/model fallback`）、`agy-bot setup`（`--bots ... --systemd-out ...`）/`doctor --fix` 自愈、Docker 容器化部署（[`Dockerfile`](./Dockerfile)、[`docker-compose.example.yml`](./docker-compose.example.yml)、[AI-INSTALL 安装指南](./docs/AI-INSTALL.md)）、`_JobQueue` 原子落盘重启恢复及前置自检 + LKG 自动回滚的零停机热重载。
-- **自部署 OpenBao 无痕用密示例 + 全链路脱敏门禁**：提供完全脱敏的 [OpenBao 无痕用密实战指南](./docs/OPENBAO_SECRETOPS_GUIDE.md)，配合工作区与 Git 历史结构化扫描及 Python 3.11–3.14 CI 矩阵闭环保障。
+- **AGY Studio WebUI 控制面（`studio/` + `webui/`）**：基于密码鉴权（`AGY_STUDIO_AUTH_MODE=password`，scrypt + `HttpOnly`/`SameSite` Cookie + CSRF + 脱敏访问日志）的 React + aiohttp 本地 Sidecar，提供基于单写者 IPC（`bridge/studio_ipc.py`）的 Workspace 实时流式对话、Jobs 派工/取消/重试控制面、安全 Schedules 调度管理、全局实时 SSE（`/api/events`）以及同源 Live-Browser 人工接管抽屉，全量 MIT 净室开源。
+- **自部署 OpenBao 无痕用密示例 + 全链路脱敏门禁**：提供完全脱敏的 [OpenBao 无痕用密实战指南](./docs/OPENBAO_SECRETOPS_GUIDE.md)，配合工作区与 Git 历史结构化扫描及 Python 3.11–3.14 + Node 22 CI 矩阵闭环保障。
 
 - **开源协议**：[MIT](./LICENSE)
 - **代码仓库**：`https://github.com/gaoshanyuhupo/agy-bot`
@@ -56,7 +57,13 @@
 - **`agy_llm_shim.py`**：兼容 OpenAI/Anthropic 协议的本地 HTTP Shim，由无工具隔离的 `pure-llm` 沙盒驱动（`mem-hub/observer-sandbox/`），支持无状态轮转。
 - **`agy_instinct_daemon.py`**：基于置信度提取会话经验（Instinct），通过 `memory_guard` 对采集全步（`USER_INPUT`、`PLANNER_RESPONSE`、工具调用与输出）及 LLM 候选规则进行防投毒校验，维护 `.agents/rules/ecc-active-instincts.md` 并演化受控上限的复用技能；内置 `/dream`（`dream`）定期记忆合并流水线（不安全本能隔离、时间衰减归档、同域相似本能合并、`observations.jsonl` 滚动 gzip 归档压缩及偏移量精确重算）。
 
-### 5. `scripts/`、`tests/` 与 `docs/OPENBAO_SECRETOPS_GUIDE.md` — 无痕用密示例、脱敏门禁与成本核算
+### 5. `studio/` 与 `webui/` — AGY Studio Phase A（Workspace 流式对话、控制面与浏览器抽屉）
+- **Workspace 流式对话与单写者 IPC（`studio/chat_service.py`、`bridge/studio_ipc.py`）**：提供实时 SSE Token 流式输出、会话历史与模型目录查询、中止控制，以及纯 React 安全 Markdown 渲染（`SafeMarkdown.tsx`，零原始 HTML 注入风险）。
+- **Jobs 派工控制面与安全定时调度（`studio/control_plane.py`、`studio/event_hub.py`）**：支持 `acb-team` 任务派发、详情查看、取消与重试；在命令与安全间隔护栏内新增、启停、立即执行或删除定时任务；并通过全局 SSE（`/api/events`）实时推送状态变更。
+- **同源 Live-Browser 抽屉（`studio/browser_proxy.py`）**：以同源鉴权代理转发本地 `live-browser` WebSocket 与文件传输，无需直接暴露上游端口。
+- **零信任密码鉴权（`studio/auth.py`）**：默认启用 `AGY_STUDIO_AUTH_MODE=password`，凭据存储于仓库外 `0600` 的 `users.json`（可通过 `python3 -m studio.auth set-user` 初始化），强制执行首次改密（`must_change_password`）、同源与 CSRF 校验、实时 RBAC 降权驱逐及脱敏访问日志；脱敏服务模板见 [`systemd/examples/agy-studio.service.example`](./systemd/examples/agy-studio.service.example)。
+
+### 6. `scripts/`、`tests/` 与 `docs/OPENBAO_SECRETOPS_GUIDE.md` — 无痕用密示例、脱敏门禁与成本核算
 - **自部署 OpenBao 无痕用密示例指南**：完全脱敏的实战范式（`0600` 本地凭据初始化、CLI 短暂环境变量注入、Python 内存动态提取与 `live-browser --proxy-bao` 零落盘代理），详见 [docs/OPENBAO_SECRETOPS_GUIDE.md](./docs/OPENBAO_SECRETOPS_GUIDE.md)。
 - **`scripts/security_audit.py`**：零泄漏结构化扫描器，覆盖明文密钥/Token、半掩码前缀、含凭证 URL、非白名单外链与裸域名、长数字/Hex/UUID ID、个人邮箱与未登记 `@handle`、硬编码 `/home/<user>` 或 `User=` 路径、非文档 IP、高危运行态文件及 Git 全量提交历史（`--check-history`），支持外部黑名单文件（`--blocklist-file` / `~/.config/agy-audit-blocklist.txt`）。
 - **`tests/`**：全离线 `unittest` 回归套件，覆盖脱敏门禁（`test_desensitization.py`）、P0 稳定性加固（`test_bridge_p0.py`）、核心引擎与撤销/相册/429（`test_bridge_core.py`）、群聊 RBAC（`test_access_control.py`）、模型主备降级（`test_model_failover.py`）、定时调度（`test_scheduler.py`）、CLI 体检向导（`test_cli_doctor.py`）、Mini App 与 `/browser` 面板（`test_browser_panel.py`）、多指纹/固定指纹隔离（`test_live_browser_profiles.py`）、GitHub Webhook 安全（`test_github_webhook.py`）、每周对标雷达（`test_benchmark_digest.py`）、三层防记忆投毒与 `/dream` 合并（`test_memory_guard_and_dream.py`）、`_JobQueue` 持久化恢复与 LKG 热重载回滚（`test_queue_persistence_and_rollback.py`）与多 Bot 总线及 Worktree 隔离（`test_bot_bus.py`、`test_bot_bus_worktree.py`、`test_group_chat_bus.py`）。
@@ -71,15 +78,17 @@
 agy-bot/
 ├── .agents/                  # 通用技能（live-browser、continuous-learning-v2、altare、mem-search）与工作流
 ├── .github/                  # CI 工作流、Issue 表单模板与 PR 脱敏自检清单
-├── bridge/                   # Telegram Bridge v3（bridge.py、memory_guard.py、github_webhook.py、access_control.py、model_failover.py、scheduler.py、bot_bus*.py、cli.py、.env.example）
+├── bridge/                   # Telegram Bridge v3（bridge.py、studio_ipc.py、memory_guard.py、github_webhook.py、access_control.py、model_failover.py、scheduler.py、bot_bus*.py、cli.py、.env.example）
 ├── config/                   # 脱敏后的 MCP 配置模板（mcp_config.example.json）
 ├── docs/                     # AI-INSTALL 安装指南、系统架构图、Live Browser 指南与 OpenBao 无痕用密指南
 ├── hooks/                    # hooks.json、无损 rehydrate_after_compact.py 与生命周期门控
 ├── legacy/sdk-bridge/        # 早期 SDK bridge v1 历史参考
 ├── mem-hub/                  # agy_llm_shim.py、agy_instinct_daemon.py 与隔离 observer-sandbox/
-├── scripts/                  # security_audit.py 脱敏审计器、benchmark_digest.py 对标雷达与 calc_cycle_cost.py 账单工具
-├── systemd/examples/         # 通用 systemd 单元模板（含 agy-github-webhook.service.example、YOUR_USER 占位符）
-├── tests/                    # 脱敏审计、RBAC、降级、桥接核心、调度器、CLI 向导、浏览器面板与协作总线单测
+├── scripts/                  # security_audit.py 脱敏审计器、verify_gate.py、benchmark_digest.py 对标雷达与 calc_cycle_cost.py 账单工具
+├── studio/                   # AGY Studio aiohttp Sidecar（server.py、auth.py、chat_service.py、control_plane.py、event_hub.py、data_sources.py、browser_proxy.py、requirements.txt）
+├── systemd/examples/         # 通用 systemd 单元模板（含 agy-studio.service.example、agy-github-webhook.service.example 与 YOUR_USER 占位符）
+├── tests/                    # 脱敏审计、Studio/WebUI、RBAC、降级、桥接核心、调度器、CLI 向导、浏览器面板与协作总线单测
+├── webui/                    # AGY Studio React + Vite + Tailwind 前端源码（通过 `npm ci && npm run build` 构建 `webui/dist`）
 ├── workspace/                # 通用工作区 Agent 规范（AGENTS.md）
 ├── Dockerfile                # 基于 pyproject.toml 的非 root 容器镜像构建模板
 ├── docker-compose.example.yml # 脱敏版 Coordinator + Worker Docker Compose 编排模板
@@ -142,11 +151,25 @@ EOF
 chmod 600 "$HOME/.config/agy-live-browser/tunnel.env"
 ```
 
-### 3. Systemd 托管部署（可选）
+### 3. AGY Studio WebUI（可选）
 
-通用服务模板位于 [`systemd/examples/`](./systemd/examples)，桥接服务均已配置 `KillMode=mixed`（支持平滑退出与后台子进程隔离）。部署前请将模板中的 `YOUR_USER` 替换为实际 Linux 用户名后安装到 `/etc/systemd/system/` 或 `~/.config/systemd/user/`。
+```bash
+# 安装 Studio 后端依赖并构建 React WebUI 静态产物
+python3 -m pip install -r studio/requirements.txt
+(cd webui && npm ci && npm run build)
 
-### 4. 运行脱敏门禁、Lint 与单元测试
+# 在 ~/.config/agy-studio/users.json（0600）初始化密码模式管理员账号
+python3 -m studio.auth set-user --username admin --bot main --user-id 123456789 --role admin
+
+# 启动本地环回 Sidecar（127.0.0.1:18796）
+python3 -m studio.server
+```
+
+### 4. Systemd 托管部署（可选）
+
+通用服务模板位于 [`systemd/examples/`](./systemd/examples)（含 [`agy-studio.service.example`](./systemd/examples/agy-studio.service.example)），桥接服务均已配置 `KillMode=mixed`（支持平滑退出与后台子进程隔离）。部署前请将模板中的 `YOUR_USER` 与 `/path/to/agy-bot` 替换为实际路径后安装到 `/etc/systemd/system/` 或 `~/.config/systemd/user/`。
+
+### 5. 运行脱敏门禁、Lint 与单元测试
 
 ```bash
 # 对工作区与全部 Git 历史执行严格公开级脱敏审计
@@ -155,7 +178,8 @@ python3 scripts/security_audit.py --mode public-release --check-history
 # 代码 Lint 检查（可通过 pip install -e ".[dev]" 安装 ruff）
 ruff check .
 
-# 运行全量脱敏与核心功能单测
+# 运行全量脱敏、Bridge 与 Studio 单元测试
+python3 -m pip install -r bridge/requirements.txt -r studio/requirements.txt
 python3 -m unittest discover -s tests -v
 ```
 

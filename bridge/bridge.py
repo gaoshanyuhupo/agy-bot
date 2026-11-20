@@ -85,6 +85,11 @@ try:
 except ImportError:
     from bridge import gateway_adapter
 
+try:
+    import studio_ipc
+except ImportError:
+    from bridge import studio_ipc
+
 # Load local .env file if present
 _env_file = os.environ.get("AGY_TG_ENV_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 if os.path.isfile(_env_file):
@@ -520,6 +525,51 @@ class _JobQueue:
                 self._persist_locked()
         return removed
 
+    def cancel_web_turn(self, turn_id):
+        """Remove a queued `__WEB_TURN__` matching `turn_id` without disturbing any Telegram items."""
+        removed = False
+        kept = collections.deque()
+        with self._cond:
+            while self._entries:
+                ent = self._entries.popleft()
+                item = ent["item"]
+                payload = item[3] if isinstance(item, tuple) and len(item) >= 4 else None
+                if (
+                    isinstance(payload, tuple)
+                    and len(payload) == 2
+                    and payload[0] == "__WEB_TURN__"
+                    and isinstance(payload[1], dict)
+                    and payload[1].get("turn_id") == turn_id
+                ):
+                    removed = True
+                else:
+                    kept.append(ent)
+            self._entries = kept
+        return removed
+
+    def cancel_bus_job(self, job_id):
+        """Remove a queued `__BUS_JOB__` matching `job_id` without disturbing Telegram items or other jobs."""
+        removed = False
+        kept = collections.deque()
+        with self._cond:
+            while self._entries:
+                ent = self._entries.popleft()
+                item = ent["item"]
+                payload = item[3] if isinstance(item, tuple) and len(item) >= 4 else None
+                if (
+                    isinstance(payload, tuple)
+                    and len(payload) == 2
+                    and payload[0] == "__BUS_JOB__"
+                    and str(payload[1] or "") == str(job_id)
+                ):
+                    removed = True
+                else:
+                    kept.append(ent)
+            self._entries = kept
+            if removed:
+                self._persist_locked()
+        return removed
+
     def clear_all(self):
         with self._cond:
             removed = len(self._entries)
@@ -681,8 +731,13 @@ _session_pool = {}          # scope_key -> warm AgySession instance
 turn_running = False        # True ONLY while run_agy / run_compact is executing a turn
 turn_running_scope = None   # scope_key of currently executing interactive turn
 turn_running_chat = None    # chat_id of currently executing interactive turn
+turn_running_web_id = None  # turn_id if currently executing turn is a Web Studio IPC turn
+turn_running_cid = None     # conversation_id of currently executing interactive turn
 session_dirty_scopes = set()  # scope_keys whose warm session must recycle after active turn
 cancel_requested = False    # True if user triggered /cancel or native Stop button
+
+_studio_ipc_buffer = studio_ipc.TurnEventBuffer()
+_studio_ipc_server = None
 
 state_lock = threading.Lock()
 # Strict lock hierarchy (never acquire in reverse):
@@ -756,6 +811,8 @@ def parse_scope_key(scope_key):
     if not scope_key or scope_key == "default":
         return PRIMARY_CHAT_ID, None
     s = str(scope_key)
+    if s.startswith("web:"):
+        return 0, None
     if ":" in s:
         c_part, t_part = s.split(":", 1)
         try:
@@ -1487,6 +1544,42 @@ def _desired_bus_enable(scope_key=None):
         origin_chat, _ = parse_scope_key(scope_key)
         return bool(origin_chat and int(origin_chat) < 0)
     return False
+
+
+COORDINATOR_FIRST_TURN_MARKER = "[ACB_COORDINATOR_ROLE]"
+_DEFAULT_COORDINATOR_SPECIALTY = "总指挥与多 Bot 任务协调（拆分目标、异步派工、跟踪验收与汇总汇报）"
+
+
+def _sanitize_coordinator_field(text, max_len=160):
+    """Collapse control chars and whitespace into a compact deterministic single line."""
+    cleaned = re.sub(r"[\x00-\x1f\x7f]+", " ", str(text or ""))
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if len(cleaned) > max_len:
+        cleaned = cleaned[: max_len - 1].rstrip() + "…"
+    return cleaned
+
+
+def _build_coordinator_first_turn_prefix(handle=None, specialty=None):
+    """Build a compact, deterministic first-turn role & `acb-team` dispatch header for coordinator bots."""
+    raw_handle = _current_bot_handle() if handle is None else handle
+    clean_handle = _sanitize_coordinator_field(str(raw_handle or "").lstrip("@"), max_len=64) or "coordinator"
+    if specialty is None:
+        cfg = _current_bot_cfg()
+        raw_spec = cfg.get("specialty") if isinstance(cfg, dict) else ""
+    else:
+        raw_spec = specialty
+    clean_spec = _sanitize_coordinator_field(raw_spec, max_len=160) or _DEFAULT_COORDINATOR_SPECIALTY
+    lines = [
+        f"{COORDINATOR_FIRST_TURN_MARKER} bot=@{clean_handle} role=coordinator",
+        f"专长职责：{clean_spec}",
+        "运行原则：作为总指挥保持随时空闲接新指令；将编码、测试、排查与发版优先异步派给专职成员，完成后统一验收汇报。",
+        "协作工具（`acb-team` 为延迟加载 MCP，通过 `call_mcp_tool` 调用 `acb-team` 服务器）：",
+        "- `team_roster`：查看实时成员角色、专长与模型，按专长路由派工。",
+        "- `team_dispatch`：派发任务（默认 `wait=false` 异步派单，自动 `batch_done` 唤醒；同仓并行编辑设 `worktree=true`）。",
+        "- `team_job`：查询、取消、重试后台派单，或验收后清理 worktree（`cleanup_worktree`）。",
+        "- `group_say` / `team_broadcast`：发送简短状态同步或群内协作通知。",
+    ]
+    return "\n".join(lines)
 
 
 def _init_bot_identity():
@@ -2245,6 +2338,7 @@ def idle_session_reaper():
 def check_and_recover_in_flight():
     """If the bridge died while one or more turns were in-flight, recover per scope and notify exact route."""
     pending = []
+    stale_web_scopes = []
     with state_lock:
         scopes = state.get("scopes") or {}
         for sk, sc in scopes.items():
@@ -2252,7 +2346,14 @@ def check_and_recover_in_flight():
                 continue
             inf = sc.get("in_flight")
             if isinstance(inf, dict):
+                if isinstance(sk, str) and sk.startswith("web:"):
+                    stale_web_scopes.append(sk)
+                    continue
                 pending.append((sk, dict(inf), sc.get("conversation_id")))
+    for wsk in stale_web_scopes:
+        update_scope_state(wsk, in_flight=None)
+    if stale_web_scopes and not pending:
+        save_state()
     if not pending:
         return []
 
@@ -3834,6 +3935,7 @@ def _apply_checkpoint_changes(entry, reverse=False, force=False):
 def _acquire_session(scope_key, conv, mode, model, effort, project, workdir, force_new=False, readonly=False, untrusted=False):
     skey = scope_key or PRIMARY_SCOPE_KEY
     to_close = []
+    same_conv_to_close = []
     with session_lock:
         existing = _session_pool.get(skey)
         if not force_new and existing is not None and existing.matches(
@@ -3842,12 +3944,15 @@ def _acquire_session(scope_key, conv, mode, model, effort, project, workdir, for
             return existing, True
         if existing is not None:
             _session_pool.pop(skey, None)
-            to_close.append(existing)
+            if conv and existing.cid == conv:
+                same_conv_to_close.append(existing)
+            else:
+                to_close.append(existing)
         if conv:
             for k, s in list(_session_pool.items()):
                 if k != skey and s.cid == conv and not (turn_running and turn_running_scope == k):
                     _session_pool.pop(k, None)
-                    to_close.append(s)
+                    same_conv_to_close.append(s)
                     log("Evicting duplicate warm session holding conv=%s from scope=%s" % (conv[:8], k))
         while len(_session_pool) >= MAX_WARM_SESSIONS:
             candidates = [
@@ -3861,10 +3966,23 @@ def _acquire_session(scope_key, conv, mode, model, effort, project, workdir, for
             _session_pool.pop(evict_k, None)
             to_close.append(evict_s)
             log("Warm session pool cap (%d) reached; evicting LRU scope=%s" % (MAX_WARM_SESSIONS, evict_k))
-        sess = AgySession(
-            conv, mode, model, effort,
-            project=project, workdir=workdir, scope_key=skey, readonly=readonly, untrusted=untrusted,
-        )
+
+    # Synchronously close any evicted warm AgySession holding the SAME conv BEFORE spawning the new process
+    # so zero concurrent `agy` writers can exist for the same conversation_id.
+    for old_same in same_conv_to_close:
+        try:
+            old_same.close(force=False)
+        except Exception:
+            pass
+
+    sess = AgySession(
+        conv, mode, model, effort,
+        project=project, workdir=workdir, scope_key=skey, readonly=readonly, untrusted=untrusted,
+    )
+    with session_lock:
+        prev_raced = _session_pool.get(skey)
+        if prev_raced is not None and prev_raced is not sess:
+            to_close.append(prev_raced)
         _session_pool[skey] = sess
     for old in to_close:
         close_session_async(old, force=False)
@@ -4450,6 +4568,46 @@ def _run_fast_group_reply(
         _fast_chat_sem.release()
 
 
+class _NoOpStreamer:
+    """Zero-Telegram stub streamer used when `run_agy` executes a Web Studio IPC turn."""
+
+    def __init__(self, cid=None, start_line=0):
+        self.cid = cid
+        self.start_line = start_line
+        self.status_override = None
+
+    def start(self):
+        return
+
+    def stop(self):
+        return
+
+    def set_cid(self, cid):
+        if cid:
+            self.cid = cid
+
+    def set_status_override(self, template_html):
+        self.status_override = template_html
+
+    def on_thinking(self, text):
+        return
+
+    def on_tool_start(self, tool_name, tool_info):
+        return
+
+    def on_tool_done(self, tool_name, tool_info, duration_seconds=None):
+        return
+
+    def on_text_delta(self, text):
+        return
+
+    def finalize_step(self, *args, **kwargs):
+        return (None, None)
+
+    def start_next_segment(self, start_line=0):
+        self.start_line = start_line
+
+
 def run_agy(
     chat_id,
     prompt,
@@ -4460,15 +4618,31 @@ def run_agy(
     chain_id="",
     user_role="admin",
     user_id=None,
+    event_sink=None,
+    web_turn_id=None,
+    override_cid=None,
+    override_model=None,
+    override_effort=None,
+    override_project=None,
+    override_workdir=None,
 ):
-    global turn_running, turn_running_scope, turn_running_chat, cancel_requested
+    global turn_running, turn_running_scope, turn_running_chat, turn_running_web_id, turn_running_cid, cancel_requested
+
+    is_web_turn = event_sink is not None
+
+    def _emit_web(ev_type, payload=None):
+        if event_sink is not None:
+            try:
+                event_sink(ev_type, payload or {})
+            except Exception as sink_err:
+                log("web event_sink error (%s): %r" % (ev_type, sink_err))
 
     norm_tid = _normalize_thread_id(thread_id)
     skey = scope_key or scope_key_for(chat_id, norm_tid)
     session_readonly = (user_role == "readonly")
     exec_skey = f"{skey}:ro:{user_id if user_id is not None else 'guest'}" if session_readonly else skey
 
-    if not session_readonly:
+    if not session_readonly and not is_web_turn:
         bot_bus.set_origin_context(
             exec_skey,
             bot_handle=_current_bot_handle(),
@@ -4483,20 +4657,21 @@ def run_agy(
         sc = _ensure_scope_locked(skey)
         mode = "safe" if session_readonly else sc.get("mode", "auto")
         scope_fallback = sc.get("fallback_models")
-        effort = sc.get("effort") or ENV_BOT_EFFORT
+        effort = override_effort or sc.get("effort") or ENV_BOT_EFFORT
         show_thinking = sc.get("thinking", True)
-        project = sc.get("project") or None
-        wdir_raw = sc.get("workdir")
+        project = override_project if override_project is not None else (sc.get("project") or None)
+        wdir_raw = override_workdir if override_workdir is not None else sc.get("workdir")
         if session_readonly:
             ro_sc = _ensure_scope_locked(exec_skey)
-            conv = ro_sc.get("conversation_id")
+            conv = override_cid if override_cid is not None else ro_sc.get("conversation_id")
             undo_notice = None
         else:
-            conv = sc.get("conversation_id")
-            undo_notice = sc.get("pending_undo_notice")
-            sc["pending_undo_notice"] = None
+            conv = override_cid if override_cid is not None else sc.get("conversation_id")
+            undo_notice = None if is_web_turn else sc.get("pending_undo_notice")
+            if not is_web_turn:
+                sc["pending_undo_notice"] = None
 
-    model = _resolve_effective_model(skey)
+    model = override_model or _resolve_effective_model(skey)
     workdir = WORKDIR
     if wdir_raw:
         rw = os.path.realpath(os.path.expanduser(wdir_raw))
@@ -4514,6 +4689,13 @@ def run_agy(
     prompt_parts = []
     if session_readonly:
         prompt_parts.append(access_control.build_readonly_prompt_prefix(user_id))
+    elif (
+        conv is None
+        and _current_bot_role() == "coordinator"
+        and _desired_bus_enable(exec_skey)
+        and COORDINATOR_FIRST_TURN_MARKER not in (prompt or "")
+    ):
+        prompt_parts.append(_build_coordinator_first_turn_prefix())
     if undo_notice:
         prompt_parts.append(undo_notice)
     if chat_id and int(chat_id) < 0 and not (prompt or "").lstrip().startswith("/"):
@@ -4562,10 +4744,26 @@ def run_agy(
     segment_start_line = get_transcript_line_count(conv)
     started = time.time()
 
+    conv_lease = None
+    if conv:
+        conv_lease = studio_ipc.ConversationLease.try_acquire(bot_bus.BUS_DIR, conv)
+        if conv_lease is None:
+            if is_web_turn:
+                _emit_web("error", {
+                    "code": "session_busy",
+                    "error": "会话正被其他进程占用（session_busy）",
+                    "conversation_id": conv,
+                    "status": "ERROR",
+                })
+                return
+            log("Conversation lease busy for conv=%s; proceeding on TG path after warning" % (conv[:8],))
+
     with session_lock:
         turn_running = True
         turn_running_scope = exec_skey
         turn_running_chat = chat_id
+        turn_running_web_id = web_turn_id
+        turn_running_cid = conv
         cancel_requested = False
 
     update_scope_state(
@@ -4589,12 +4787,23 @@ def run_agy(
     )
     save_state()
 
-    # Start instant native sendMessageDraft ("Thinking…" at t=0.00s!) BEFORE even spawning/writing to agy!
-    streamer = LiveDraftStreamer(
-        chat_id, started, cid=conv, start_line=segment_start_line,
-        enabled=(mode == "auto"), thread_id=norm_tid,
-    )
-    streamer.start()
+    if is_web_turn:
+        streamer = _NoOpStreamer(cid=conv, start_line=segment_start_line)
+        _emit_web("turn_start", {
+            "turn_id": web_turn_id,
+            "conversation_id": conv,
+            "model": candidates[0] if candidates else model,
+            "effort": effort,
+            "project": project,
+            "untrusted": bool(turn_untrusted),
+        })
+    else:
+        # Start instant native sendMessageDraft ("Thinking…" at t=0.00s!) BEFORE even spawning/writing to agy!
+        streamer = LiveDraftStreamer(
+            chat_id, started, cid=conv, start_line=segment_start_line,
+            enabled=(mode == "auto"), thread_id=norm_tid,
+        )
+        streamer.start()
 
     sent_images = {}  # realpath -> last_sent_mtime
     turn_start_line = segment_start_line
@@ -4673,7 +4882,7 @@ def run_agy(
             got_turn_event = False
             while not cancel_requested and not shutting_down:
                 ev = sess.next_event(timeout=0.25)
-                if (time.time() - last_live_img_scan) >= 2.0:
+                if not is_web_turn and (time.time() - last_live_img_scan) >= 2.0:
                     last_live_img_scan = time.time()
                     push_step_images(
                         chat_id, "", conv, started, before_files, sent_images,
@@ -4692,6 +4901,10 @@ def run_agy(
                     if cid:
                         sess.cid = cid
                         conv = cid
+                        with session_lock:
+                            turn_running_cid = cid
+                        if conv_lease is None and studio_ipc.is_valid_cid(cid):
+                            conv_lease = studio_ipc.ConversationLease.try_acquire(bot_bus.BUS_DIR, cid)
                         if turn_untrusted:
                             memory_guard.mark_tainted(
                                 cid,
@@ -4708,6 +4921,7 @@ def run_agy(
                                 sc_w["last_turn"]["conv"] = cid
                         save_state()
                         streamer.set_cid(cid)
+                        _emit_web("init", {"conversation_id": cid})
                     continue
 
                 got_turn_event = True
@@ -4724,6 +4938,7 @@ def run_agy(
                     th_delta = su.get("thinking_delta") or su.get("thinking")
                     if th_delta:
                         streamer.on_thinking(th_delta)
+                        _emit_web("thinking", {"delta": str(th_delta), "step_index": step_idx})
 
                     if st == "tool":
                         tinfo = su.get("tool_info")
@@ -4738,14 +4953,26 @@ def run_agy(
                         if state_kind == "ACTIVE":
                             attempt_tools += 1
                             streamer.on_tool_start(tname, tinfo)
+                            _emit_web("tool_use", {
+                                "tool_name": tname,
+                                "tool_info": tinfo if isinstance(tinfo, dict) else {},
+                                "step_index": step_idx,
+                            })
                         elif state_kind == "DONE":
                             streamer.on_tool_done(tname, tinfo, su.get("duration_seconds"))
+                            _emit_web("tool_result", {
+                                "tool_name": tname,
+                                "duration_seconds": su.get("duration_seconds"),
+                                "step_index": step_idx,
+                            })
 
                     elif st == "checkpoint":
                         if state_kind == "ACTIVE":
                             streamer.on_tool_start("context_compaction", {})
+                            _emit_web("status", {"message": "正在压缩上下文..."})
                         elif state_kind == "DONE":
                             streamer.on_tool_done("context_compaction", {}, su.get("duration_seconds"))
+                            _emit_web("status", {"message": "上下文压缩完成"})
                             if conv:
                                 _last_compacted_line[conv] = get_transcript_line_count(conv)
 
@@ -4753,6 +4980,7 @@ def run_agy(
                         delta = su.get("text_delta") or ""
                         if delta:
                             step_buffers[step_idx] = step_buffers.get(step_idx, "") + delta
+                            _emit_web("text_delta", {"delta": delta, "step_index": step_idx})
                         cur_text = step_buffers.get(step_idx, "")
 
                         if state_kind == "ACTIVE":
@@ -4765,6 +4993,14 @@ def run_agy(
                                 active_step_idx = None
                             final_step_text = cur_text.strip()
                             if not final_step_text:
+                                continue
+
+                            if is_web_turn:
+                                delivered_steps += 1
+                                imm_res, _ = sess.peek_immediate_result(timeout=0.065)
+                                if imm_res is not None:
+                                    result = imm_res
+                                    break
                                 continue
 
                             cur_cid = conv or get_scope_value(exec_skey, "conversation_id")
@@ -4966,6 +5202,26 @@ def run_agy(
                 if delivered_steps == 0 and pre_turn_conv is None:
                     sc_w["conversation_id"] = None
             partial = (step_buffers.get(active_step_idx, "") if active_step_idx is not None else "").strip()
+            if is_web_turn:
+                if cancel_requested or (sess and sess.proc.returncode in (-15, 143, -2, 130)):
+                    _emit_web("aborted", {
+                        "conversation_id": conv,
+                        "partial_text": partial,
+                        "reason": "cancelled" if cancel_requested else "interrupted",
+                    })
+                else:
+                    rc = sess.proc.returncode if sess else "?"
+                    err = sess.get_stderr_text() if sess else ""
+                    if len(attempted_models) > 1:
+                        msg_err = model_failover.format_failover_exhausted_error(attempted_models, f"exit {rc}: {err}".strip())
+                    else:
+                        msg_err = "agy produced no result (exit %s) %s" % (rc, err)
+                    _emit_web("error", {
+                        "conversation_id": conv,
+                        "error": msg_err.strip(),
+                        "status": "ERROR",
+                    })
+                return
             if cancel_requested:
                 if partial:
                     send_rich(chat_id, partial + "\n\n*🛑 [已手动停止生成]*",
@@ -5048,6 +5304,38 @@ def run_agy(
             sc_w = _ensure_scope_locked(exec_skey)
             if isinstance(sc_w.get("last_turn"), dict):
                 sc_w["last_turn"]["status"] = status or "UNKNOWN"
+
+        if is_web_turn:
+            dur_sec = round(max(0.0, time.time() - started), 2)
+            if status in ("SUCCESS", "WAITING"):
+                _emit_web("done", {
+                    "conversation_id": conv,
+                    "response": resp,
+                    "status": status,
+                    "model": active_model,
+                    "effort": effort,
+                    "usage": result.get("usage") or {},
+                    "duration_seconds": dur_sec,
+                })
+            elif finished_reason == "interrupted" or cancel_requested:
+                _emit_web("aborted", {
+                    "conversation_id": conv,
+                    "partial_text": resp,
+                    "reason": "interrupted",
+                })
+            else:
+                if status == "ERROR" and len(attempted_models) > 1:
+                    err_out = model_failover.format_failover_exhausted_error(
+                        attempted_models, result.get("error") or resp or "(no details)"
+                    )
+                else:
+                    err_out = str(result.get("error") or resp or f"agy {status}")
+                _emit_web("error", {
+                    "conversation_id": conv,
+                    "error": err_out,
+                    "status": status or "ERROR",
+                })
+            return
 
         fb_from = (primary_model_label or "default") if candidate_idx > 0 else None
         footer_str, reply_markup = _compute_workspace_diff_and_footer(
@@ -5147,9 +5435,13 @@ def run_agy(
             turn_running = False
             turn_running_scope = None
             turn_running_chat = None
+            turn_running_web_id = None
+            turn_running_cid = None
             if exec_skey in session_dirty_scopes and exec_skey in _session_pool:
                 recycle = _session_pool.pop(exec_skey, None)
                 session_dirty_scopes.discard(exec_skey)
+        if conv_lease is not None:
+            conv_lease.release()
         if recycle is not None:
             close_session_async(recycle, force=False)
         update_scope_state(exec_skey, in_flight=None)
@@ -5424,6 +5716,7 @@ def perform_hot_reload(notify_chat_id=None, notify_thread_id=None):
     if notify_chat_id:
         send(notify_chat_id, "🔄 正在热重载桥接服务...", thread_id=notify_thread_id)
     close_all_sessions_sync()
+    _stop_studio_ipc()
     _stop_gateway_adapter()
     time.sleep(0.3)
     argv_clean = [a for a in sys.argv if a != "--self-check"]
@@ -5653,7 +5946,19 @@ def execute_scheduled_task(task):
                         has_no_handoff=has_no_handoff,
                     )
 
-        elif ttype in ("agent", "browser"):
+        elif ttype == "reminder":
+            reminder_text = (payload.get("prompt") or payload.get("message") or tname or "").strip()
+            if not reminder_text:
+                raise ValueError("No reminder text provided")
+            send(
+                target_chat,
+                f"⏰ <b>[定时提醒] {html_mod.escape(tname)}</b>\n\n{html_mod.escape(reminder_text[:3500])}",
+                parse_mode="HTML",
+                thread_id=target_thread,
+            )
+            scheduler.task_mgr.record_completion(tid, "success", last_snippet=reminder_text[:300])
+
+        elif ttype in ("agent", "browser", "prompt"):
             prompt = (payload.get("prompt") or "").strip()
             if not prompt:
                 raise ValueError("No prompt provided for agent task")
@@ -5678,7 +5983,8 @@ def execute_scheduled_task(task):
                 env["AGY_UNTRUSTED_SESSION"] = "1"
                 env["AGY_MEMORY_READONLY"] = "1"
 
-            precheck_cmd = (payload.get("precheck_cmd") or "").strip()
+            # Studio-created `prompt` tasks strictly forbid shell precheck commands (defense-in-depth).
+            precheck_cmd = "" if ttype == "prompt" else (payload.get("precheck_cmd") or "").strip()
             precheck_section = ""
             if precheck_cmd:
                 try:
@@ -6386,6 +6692,7 @@ def _publish_bot_heartbeat():
             "workdir": sc.get("workdir") or WORKDIR,
             "project": current_project(PRIMARY_SCOPE_KEY) or "",
             "allowed_chats": sorted(ALLOWED),
+            "ipc_sock": _studio_ipc_sock_path(),
             "busy": busy,
             "current_job": cur_job,
             "queue_depth": job_q.qsize(),
@@ -6620,6 +6927,336 @@ def _bot_bus_loop():
         time.sleep(0.35)
 
 
+def _studio_ipc_sock_path():
+    srv = _studio_ipc_server
+    if srv is None:
+        return ""
+    try:
+        return str(srv.sock_path)
+    except Exception:
+        return ""
+
+
+def _studio_ipc_resolve_role(user_id):
+    return _get_user_role(user_id, from_user={"id": int(user_id)}, allow_uid_fallback=True)
+
+
+def _studio_ipc_get_meta():
+    cfg = _current_bot_cfg()
+    try:
+        models_raw = agy_models(include_gateways=True, force_refresh=False)
+    except Exception:
+        models_raw = []
+    models_out = [{"id": str(slug), "label": str(desc)} for slug, desc in models_raw[:120]]
+    try:
+        projs_raw = list_agy_projects()
+    except Exception:
+        projs_raw = []
+    # Never expose raw filesystem paths in Studio IPC meta
+    projects_out = [{"id": str(p.get("id") or ""), "name": str(p.get("name") or "")} for p in projs_raw if p.get("id")]
+    with session_lock:
+        busy = bool(turn_running)
+        active_web_id = turn_running_web_id
+        active_cid = turn_running_cid
+    return {
+        "handle": _current_bot_handle(),
+        "display_name": BOT_META.get("first_name") or _current_bot_handle(),
+        "role": cfg.get("role") or "peer",
+        "busy": busy,
+        "active_turn_id": active_web_id,
+        "active_cid": active_cid,
+        "active_model": _resolve_dm_effective_model() or "",
+        "default_project": current_project(PRIMARY_SCOPE_KEY) or "",
+        "efforts": list(EFFORTS),
+        "models": models_out,
+        "projects": projects_out,
+    }
+
+
+def _studio_ipc_enqueue_turn(req):
+    cid = req.get("cid")
+    uid = int(req["user_id"])
+    if cid:
+        with session_lock:
+            if turn_running and turn_running_cid == cid:
+                return 409, {"ok": False, "code": "session_busy", "error": "会话正在执行中（session_busy）"}
+        if _studio_ipc_buffer.find_active_turn_for_cid(cid):
+            return 409, {"ok": False, "code": "session_busy", "error": "会话已有排队或执行中的轮次（session_busy）"}
+        if studio_ipc.is_conversation_locked(bot_bus.BUS_DIR, cid):
+            return 409, {"ok": False, "code": "session_busy", "error": "会话已被其他进程占用（session_busy）"}
+
+    turn_id = f"turn-{uuid.uuid4().hex[:16]}"
+    scope_key = f"web:{uid}:{cid or turn_id}"
+    _studio_ipc_buffer.create_turn(
+        turn_id,
+        owner_user_id=uid,
+        actor_username=str(req.get("actor_username") or ""),
+        bot_handle=_current_bot_handle(),
+        scope_key=scope_key,
+        cid=cid,
+    )
+    web_req = {
+        "turn_id": turn_id,
+        "user_id": uid,
+        "actor_username": str(req.get("actor_username") or ""),
+        "scope_key": scope_key,
+        "prompt": req["prompt"],
+        "cid": cid,
+        "project": req.get("project"),
+        "model": req.get("model"),
+        "effort": req.get("effort"),
+    }
+    job_q.put((0, None, scope_key, ("__WEB_TURN__", web_req)))
+    return 202, {
+        "ok": True,
+        "turn_id": turn_id,
+        "bot": _current_bot_handle(),
+        "cid": cid,
+        "status": "queued",
+    }
+
+
+def _studio_ipc_abort_turn(turn_id, user_id):
+    global cancel_requested
+    info = _studio_ipc_buffer.get_turn_info(turn_id)
+    if info is None:
+        return 404, {"ok": False, "error": "未找到对应的对话轮次"}
+    if int(info["owner_user_id"]) != int(user_id):
+        return 403, {"ok": False, "error": "无权中止其他用户的对话轮次"}
+
+    if job_q.cancel_web_turn(turn_id):
+        _studio_ipc_buffer.mark_aborted(turn_id)
+        _studio_ipc_buffer.append(
+            turn_id,
+            "aborted",
+            {"conversation_id": info.get("cid"), "partial_text": "", "reason": "cancelled_in_queue"},
+        )
+        return 200, {"ok": True, "aborted": True, "turn_id": turn_id, "was_queued": True}
+
+    to_kill = None
+    aborted_running = False
+    with session_lock:
+        if turn_running and turn_running_web_id == turn_id:
+            cancel_requested = True
+            target_sk = turn_running_scope
+            if target_sk:
+                to_kill = _session_pool.pop(target_sk, None)
+            aborted_running = True
+
+    if aborted_running:
+        _studio_ipc_buffer.mark_aborted(turn_id)
+        if to_kill is not None:
+            close_session_async(to_kill, force=True)
+        return 200, {"ok": True, "aborted": True, "turn_id": turn_id, "was_running": True}
+
+    # Never touch unrelated Telegram turns or already-finished turns
+    return 200, {"ok": True, "aborted": False, "turn_id": turn_id, "status": info["status"]}
+
+
+def _is_forbidden_webui_schedule(task):
+    """Defense-in-depth Bridge check: reject any `script` or shell/precheck_cmd task from WebUI IPC."""
+    if not isinstance(task, dict):
+        return True
+    ttype = str(task.get("task_type") or "").strip().lower()
+    if ttype == "script":
+        return True
+    if str(task.get("precheck_cmd") or "").strip():
+        return True
+    payload = task.get("payload")
+    if isinstance(payload, dict):
+        for key in ("precheck_cmd", "script", "command", "cmd", "shell"):
+            val = payload.get(key)
+            if isinstance(val, str) and val.strip():
+                return True
+            if val is not None and not isinstance(val, str) and bool(val):
+                return True
+    return False
+
+
+def _studio_ipc_cancel_job(job_id, user_id):
+    """Precisely cancel a queued or running bus job without affecting unrelated Telegram turns or other jobs."""
+    global cancel_requested
+    job = bot_bus.get_job(job_id)
+    if not isinstance(job, dict):
+        return 404, {"ok": False, "error": "未找到对应的派工单"}
+
+    cur_status = str(job.get("status") or "").lower()
+    if cur_status in bot_bus.TERMINAL_STATUSES:
+        return 200, {
+            "ok": True,
+            "job_id": job_id,
+            "already_terminal": True,
+            "cancelled": False,
+            "status": cur_status,
+        }
+
+    removed_from_q = job_q.cancel_bus_job(job_id)
+    updated = bot_bus.cancel_job(job_id, reason="cancelled_by_studio")
+    updated_status = str((updated or job).get("status") or cur_status).lower()
+
+    matched_running = False
+    with session_lock:
+        if (
+            turn_running
+            and _active_bus_job_id == job_id
+            and turn_running_scope == f"bus:{job_id}"
+        ):
+            cancel_requested = True
+            matched_running = True
+
+    if matched_running:
+        return 200, {
+            "ok": True,
+            "job_id": job_id,
+            "already_terminal": False,
+            "cancelled": True,
+            "was_running": True,
+            "status": "cancelling",
+        }
+    if removed_from_q or updated_status == "cancelled":
+        return 200, {
+            "ok": True,
+            "job_id": job_id,
+            "already_terminal": False,
+            "cancelled": True,
+            "was_queued": True,
+            "status": "cancelled",
+        }
+    return 200, {
+        "ok": True,
+        "job_id": job_id,
+        "already_terminal": updated_status in bot_bus.TERMINAL_STATUSES,
+        "cancelled": bool((updated or {}).get("cancel_requested")),
+        "status": updated_status,
+    }
+
+
+def _studio_ipc_run_schedule(schedule_id, user_id):
+    """Trigger a single safe scheduled task immediately; strictly refuses `script` and `precheck_cmd`."""
+    task = scheduler.task_mgr.get_task(schedule_id)
+    if not isinstance(task, dict):
+        return 404, {"ok": False, "error": "未找到对应的定时任务"}
+
+    # Defense-in-depth RCE ban on Bridge side: NEVER execute shell=True tasks via WebUI/IPC
+    if _is_forbidden_webui_schedule(task):
+        return 403, {
+            "ok": False,
+            "source": "bridge_ipc",
+            "error": "禁止通过 WebUI/IPC 触发 script 或包含 precheck_cmd 的定时任务",
+        }
+
+    task_copy = json.loads(json.dumps(task))
+    deliv = task_copy.setdefault("delivery", {})
+    target_chat = deliv.get("target_chat_id")
+    target_thread = _normalize_thread_id(deliv.get("target_thread_id"))
+    if not target_chat:
+        if ALLOWED:
+            target_chat = PRIMARY_CHAT_ID or next(iter(ALLOWED))
+        elif user_id:
+            target_chat = int(user_id)
+        if target_chat:
+            deliv["target_chat_id"] = target_chat
+
+    skey = scope_key_for(target_chat or 0, target_thread)
+    job_q.put((target_chat or 0, target_thread, skey, ("__SCHEDULED__", task_copy)))
+    return 202, {
+        "ok": True,
+        "queued": True,
+        "schedule_id": schedule_id,
+        "task_type": str(task.get("task_type") or ""),
+        "bot": _current_bot_handle(),
+    }
+
+
+def _execute_web_turn(web_req):
+    turn_id = web_req["turn_id"]
+    uid = int(web_req["user_id"])
+    scope_key = web_req["scope_key"]
+    project = web_req.get("project")
+    override_workdir = None
+    if project:
+        for p in list_agy_projects():
+            if p.get("id") == project or p.get("name") == project:
+                override_workdir = p.get("workdir")
+                project = p.get("id")
+                break
+
+    def _sink(ev_type, payload):
+        _studio_ipc_buffer.append(turn_id, ev_type, payload)
+
+    try:
+        run_agy(
+            0,
+            web_req["prompt"],
+            thread_id=None,
+            scope_key=scope_key,
+            user_role="admin",
+            user_id=uid,
+            event_sink=_sink,
+            web_turn_id=turn_id,
+            override_cid=web_req.get("cid"),
+            override_model=web_req.get("model"),
+            override_effort=web_req.get("effort"),
+            override_project=project,
+            override_workdir=override_workdir,
+        )
+    except Exception as exc:
+        log("web turn %s failed: %r" % (turn_id, exc))
+        _studio_ipc_buffer.append(
+            turn_id,
+            "error",
+            {"conversation_id": web_req.get("cid"), "error": f"bridge execution error: {type(exc).__name__}", "status": "ERROR"},
+        )
+    finally:
+        info = _studio_ipc_buffer.get_turn_info(turn_id)
+        if info is not None and not info.get("finished"):
+            _studio_ipc_buffer.append(
+                turn_id,
+                "error",
+                {"conversation_id": info.get("cid"), "error": "turn ended unexpectedly", "status": "ERROR"},
+            )
+
+
+def _start_studio_ipc():
+    global _studio_ipc_server
+    if os.environ.get("AGY_STUDIO_IPC_DISABLE", "").strip() == "1":
+        return None
+    if _studio_ipc_server is not None:
+        return _studio_ipc_server
+    try:
+        srv = studio_ipc.StudioIPCServer(
+            bus_dir=bot_bus.BUS_DIR,
+            bot_handle=_current_bot_handle(),
+            resolve_role_fn=_studio_ipc_resolve_role,
+            get_meta_fn=_studio_ipc_get_meta,
+            enqueue_turn_fn=_studio_ipc_enqueue_turn,
+            abort_turn_fn=_studio_ipc_abort_turn,
+            cancel_job_fn=_studio_ipc_cancel_job,
+            run_schedule_fn=_studio_ipc_run_schedule,
+            buffer=_studio_ipc_buffer,
+            summaries_db=SUMMARIES_DB,
+            meta_file=META_FILE,
+        )
+        srv.start()
+        _studio_ipc_server = srv
+        log("Studio IPC server listening on %s" % srv.sock_path)
+        return srv
+    except Exception as e:
+        log("Failed to start Studio IPC server: %r" % e)
+        return None
+
+
+def _stop_studio_ipc():
+    global _studio_ipc_server
+    srv = _studio_ipc_server
+    _studio_ipc_server = None
+    if srv is not None:
+        try:
+            srv.stop()
+        except Exception as e:
+            log("Error stopping Studio IPC server: %r" % e)
+
+
 def worker():
     while True:
         item = job_q.get()
@@ -6635,6 +7272,7 @@ def worker():
             if perform_hot_reload(notify_chat_id=chat_id, notify_thread_id=thread_id):
                 return
             continue
+        is_web_item = isinstance(prompt, tuple) and len(prompt) == 2 and prompt[0] == "__WEB_TURN__"
         try:
             if isinstance(prompt, tuple) and len(prompt) == 2 and prompt[0] == "__COMPACT__":
                 run_compact(chat_id, instruction=prompt[1], thread_id=thread_id, scope_key=skey)
@@ -6642,6 +7280,8 @@ def worker():
                 execute_scheduled_task(prompt[1])
             elif isinstance(prompt, tuple) and len(prompt) == 2 and prompt[0] == "__BUS_JOB__":
                 _execute_bus_job(prompt[1])
+            elif is_web_item:
+                _execute_web_turn(prompt[1])
             elif isinstance(prompt, tuple) and len(prompt) == 2 and prompt[0] == "__CHAT_TURN__":
                 meta = prompt[1]
                 run_agy(
@@ -6659,7 +7299,14 @@ def worker():
                 run_agy(chat_id, prompt, thread_id=thread_id, scope_key=skey)
         except Exception as e:
             log("worker error: %r" % e)
-            send(chat_id, "⚠️ bridge error: %r" % e, thread_id=thread_id)
+            if is_web_item and isinstance(prompt[1], dict) and prompt[1].get("turn_id"):
+                _studio_ipc_buffer.append(
+                    prompt[1]["turn_id"],
+                    "error",
+                    {"error": f"bridge worker error: {type(e).__name__}", "status": "ERROR"},
+                )
+            elif chat_id:
+                send(chat_id, "⚠️ bridge error: %r" % e, thread_id=thread_id)
         finally:
             job_q.task_done()
             if os.path.exists(RELOAD_TRIGGER):
@@ -11107,6 +11754,7 @@ def main():
         os.makedirs(UPLOADDIR, exist_ok=True)
         _init_bot_identity()
         ensure_team_mcp_configured()
+        _start_studio_ipc()
         _publish_bot_heartbeat()
         register_bot_commands()
         recovered_sigs = check_and_recover_in_flight()
@@ -11162,6 +11810,7 @@ def main():
         invalidate_session("shutdown_timeout", force=True)
     else:
         close_all_sessions_sync()
+    _stop_studio_ipc()
     _stop_gateway_adapter()
 
     log("Graceful shutdown complete. Exiting.")

@@ -8,6 +8,7 @@ import os
 import re
 import json
 import time
+import uuid
 import fcntl
 import datetime
 import html as html_mod
@@ -228,14 +229,76 @@ def next_cron_occurrence(cron_expr, from_dt, tz):
     return None
 
 
+def _cron_date_matches(d, doms, months, dows, dom_res, dow_res):
+    if d.month not in months:
+        return False
+    dow = (d.weekday() + 1) % 7  # 0=Sun..6=Sat
+    if dom_res and dow_res:
+        return (d.day in doms) or (dow in dows)
+    if dom_res:
+        return d.day in doms
+    if dow_res:
+        return dow in dows
+    return True
+
+
+def _cron_has_consecutive_matching_days(doms, months, dows, dom_res, dow_res):
+    """Deterministically check whether any two consecutive calendar days both match."""
+    # 731 days from 2024-01-01 covers a full leap year (2024) + non-leap year (2025) + year boundaries.
+    # When both DOM and DOW are restricted (OR semantics), a 28-year Gregorian cycle (10227 days)
+    # guarantees every (month, dom, dow) combination including Feb 29 is checked.
+    span_days = 10227 if (dom_res and dow_res) else 731
+    start = datetime.date(2024, 1, 1)
+    prev_match = False
+    for offset in range(span_days + 1):
+        d = start + datetime.timedelta(days=offset)
+        cur_match = _cron_date_matches(d, doms, months, dows, dom_res, dow_res)
+        if prev_match and cur_match:
+            return True
+        prev_match = cur_match
+    return False
+
+
 def validate_cron_min_interval(cron_expr, tz, min_secs=MIN_CRON_INTERVAL_SECS, from_dt=None):
     """Validate cron syntax and enforce minimum interval floor between consecutive triggers."""
+    minutes, hours, doms, months, dows, dom_res, dow_res = parse_cron_expression(cron_expr)
+
     probe = from_dt or datetime.datetime.now(datetime.timezone.utc)
     first_dt = next_cron_occurrence(cron_expr, probe, tz)
     if not first_dt:
         raise ValueError(f"无效或永不触发的 Cron 日期表达式: {cron_expr}")
+
+    # Deterministic structural minimum-interval checks across minutes, hours, and midnight wraps
+    m_sorted = sorted(minutes)
+    h_sorted = sorted(hours)
+
+    # 1. Same-hour adjacent minutes
+    for i in range(len(m_sorted) - 1):
+        gap = (m_sorted[i + 1] - m_sorted[i]) * 60
+        if gap < min_secs:
+            raise ValueError(
+                f"Cron 触发间隔过短 ({int(gap)}秒)，周期性任务最小间隔限制为 {min_secs // 60} 分钟"
+            )
+
+    # 2. Same-day adjacent hours (covers both wrap across h -> h+1 and multi-hour min_secs > 3600)
+    for i in range(len(h_sorted) - 1):
+        gap = (h_sorted[i + 1] - h_sorted[i]) * 3600 + (m_sorted[0] - m_sorted[-1]) * 60
+        if gap < min_secs:
+            raise ValueError(
+                f"Cron 触发间隔过短 ({int(gap)}秒)，周期性任务最小间隔限制为 {min_secs // 60} 分钟"
+            )
+
+    # 3. Cross-midnight gap between last trigger on day D and first trigger on day D+1
+    midnight_gap = (24 - h_sorted[-1] + h_sorted[0]) * 3600 + (m_sorted[0] - m_sorted[-1]) * 60
+    if midnight_gap < min_secs:
+        if _cron_has_consecutive_matching_days(doms, months, dows, dom_res, dow_res):
+            raise ValueError(
+                f"Cron 触发间隔过短 ({int(midnight_gap)}秒)，周期性任务最小间隔限制为 {min_secs // 60} 分钟"
+            )
+
+    # 4. Forward occurrence sampling fallback (also guards DST transitions and multi-day min_secs)
     prev_dt = first_dt
-    for _ in range(5):
+    for _ in range(60):
         nxt_dt = next_cron_occurrence(cron_expr, prev_dt, tz)
         if not nxt_dt:
             break
@@ -381,10 +444,23 @@ class TaskManager:
             return {"version": 1, "tasks": {}}
 
     def _save_raw(self, data):
-        tmp = f"{self.filepath}.{os.getpid()}.tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        os.replace(tmp, self.filepath)
+        parent = os.path.dirname(os.path.abspath(self.filepath))
+        os.makedirs(parent, mode=0o700, exist_ok=True)
+        tmp = f"{self.filepath}.{os.getpid()}.{uuid.uuid4().hex[:6]}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, self.filepath)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     @staticmethod
     def _matches_bot(task, bot_instance_id):
@@ -418,7 +494,8 @@ class TaskManager:
                     target_chat_id=None, target_thread_id=None, session_mode="isolated",
                     model="gemini-3.8-flash-low", project=None, workdir=None,
                     timeout_secs=None, silent_if_empty=None, custom_id=None,
-                    bot_instance_id=None, precheck_cmd=None, handoff_bot=None):
+                    bot_instance_id=None, precheck_cmd=None, handoff_bot=None,
+                    enabled=True):
         """Validate, create, and atomically persist a new scheduled task."""
         now_utc = datetime.datetime.now(datetime.timezone.utc)
         tz, _ = get_scheduler_tz()
@@ -434,15 +511,15 @@ class TaskManager:
             next_run_dt = validate_cron_min_interval(cron_expr, tz, from_dt=now_utc)
 
         if silent_if_empty is None:
-            if sched_type == "once" or task_type in ("cost_report", "usage_report", "browser"):
+            if sched_type == "once" or task_type in ("cost_report", "usage_report", "browser", "reminder"):
                 silent_if_empty = False
             else:
                 silent_if_empty = True
 
         if timeout_secs is None:
-            timeout_secs = 300 if task_type == "browser" else (240 if task_type == "agent" else 180)
+            timeout_secs = 300 if task_type == "browser" else (240 if task_type in ("agent", "prompt") else 180)
 
-        tid = custom_id or f"task-{int(time.time() * 1000) % 1000000:06x}"
+        tid = custom_id or f"task-{int(time.time() * 1000) % 1000000:06x}-{uuid.uuid4().hex[:4]}"
 
         task_payload = dict(payload or {})
         clean_precheck = str(precheck_cmd).strip() if precheck_cmd is not None else ""
@@ -463,17 +540,17 @@ class TaskManager:
         task = {
             "id": tid,
             "name": (name or "").strip() or f"Task-{tid}",
-            "enabled": True,
+            "enabled": bool(enabled),
             "bot_instance_id": bot_instance_id,
             "schedule_type": sched_type,
             "schedule_expr": schedule_expr.strip(),
             "cron_expr": cron_expr,
-            "task_type": task_type,  # 'agent', 'script', 'cost_report', 'browser'
+            "task_type": task_type,  # 'agent', 'prompt', 'reminder', 'script', 'cost_report', 'browser'
             "payload": task_payload,
             "execution": {
                 "session_mode": session_mode or "isolated",
-                "model": model or "gemini-3.8-flash-low",
-                "project": project or "agy-cli-bot",
+                "model": model if model is not None else "gemini-3.8-flash-low",
+                "project": project if project is not None else "agy-cli-bot",
                 "workdir": workdir,
                 "timeout_secs": int(timeout_secs),
             },
@@ -499,13 +576,41 @@ class TaskManager:
 
         return task
 
-    def delete_task(self, task_id):
+    def update_task(self, task_id, mutator):
+        """Atomically read-modify-write a single task under exclusive flock.
+
+        `mutator(task_dict)` mutates in place (or raises to abort without writing).
+        Returns the updated task dict, or None if `task_id` does not exist.
+        """
         with open(self.lockpath, "a+", encoding="utf-8") as lf:
             fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
             try:
                 data = self._load_raw()
-                if task_id in data.get("tasks", {}):
-                    del data["tasks"][task_id]
+                t = data.get("tasks", {}).get(task_id)
+                if not isinstance(t, dict):
+                    return None
+                mutator(t)
+                data["tasks"][task_id] = t
+                self._save_raw(data)
+                return dict(t)
+            finally:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+
+    def delete_task(self, task_id, guard=None):
+        """Atomically delete a task under exclusive flock.
+
+        If `guard(task_dict)` is provided, it runs under the exclusive lock before
+        deletion and may raise to abort without modifying the schedule store.
+        """
+        with open(self.lockpath, "a+", encoding="utf-8") as lf:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+            try:
+                data = self._load_raw()
+                tasks = data.get("tasks", {})
+                if task_id in tasks:
+                    if guard is not None:
+                        guard(tasks[task_id])
+                    del tasks[task_id]
                     self._save_raw(data)
                     return True
                 return False

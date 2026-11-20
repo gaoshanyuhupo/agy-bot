@@ -1,0 +1,25 @@
+[Unit]
+Description=AGY Studio WebUI Sidecar (Workspace Chat, Control Plane & Same-Origin Live Browser Proxy)
+After=network-online.target agy-live-browser.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_USER
+WorkingDirectory=/path/to/agy-bot
+Environment=HOME=/home/YOUR_USER
+Environment=AGY_STUDIO_HOST=127.0.0.1
+Environment=AGY_STUDIO_PORT=18796
+Environment=AGY_STUDIO_AUTH_MODE=password
+Environment=AGY_STUDIO_CONFIG_DIR=/home/YOUR_USER/.config/agy-studio
+Environment=AGY_LIVE_BROWSER_URL=http://127.0.0.1:18795
+ExecStart=/path/to/agy-bot/venv/bin/python3 -m studio.server
+Restart=on-failure
+RestartSec=3
+KillMode=control-group
+TimeoutStopSec=20
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -27,8 +27,10 @@ def _load_memory_guard():
         Path(os.environ.get("AGY_BRIDGE_DIR", str(Path.home() / "agy-tg-bridge"))),
     ]
     for cand in candidates:
-        if (cand / "memory_guard.py").is_file() and str(cand) not in sys.path:
-            sys.path.insert(0, str(cand))
+        if (cand / "memory_guard.py").is_file():
+            if str(cand) not in sys.path:
+                sys.path.insert(0, str(cand))
+            break
     try:
         import memory_guard  # type: ignore
 

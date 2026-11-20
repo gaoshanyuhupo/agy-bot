@@ -20,16 +20,18 @@ Audits working-tree files and (optionally) full Git commit history across:
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_right
 import dataclasses
 import ipaddress
 import json
+from json.decoder import scanstring as _json_scanstring
 import math
 import os
 import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Iterable, List, Optional, Sequence, Set, Tuple
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -72,8 +74,10 @@ HOST_PRIVATE_EXACT: Set[str] = {
     "bin/bao",
     "bin/gh-bao",
     "bin/wrangler-bao",
+    "scripts/export_public.py",
     "scripts/howtofix_daily_checkin.py",
     "scripts/sync_live.py",
+    "tests/test_export_public.py",
 }
 
 HOST_PRIVATE_PREFIXES: Tuple[str, ...] = (
@@ -205,6 +209,20 @@ SAFE_PUBLIC_HOSTS: Set[str] = {
     "pypi.python.org",
     "systemd.io",
 }
+
+# Verified funding metadata hosts permitted ONLY inside validated npm `package-lock.json` `funding` fields
+SAFE_LOCKFILE_FUNDING_HOSTS: Set[str] = {
+    "opencollective" + ".com",
+    "tidelift" + ".com",
+}
+
+# Exact official vendor documentation URL prefixes permitted ONLY in built `webui/dist/assets/*.js`
+DIST_JS_DOC_URL_PREFIXES: Tuple[str, ...] = (
+    "https://" + "react" + ".dev/errors/",
+    "https://" + "react" + ".dev/link/",
+)
+# Exact vendor license URL permitted ONLY inside a CSS license block comment in `webui/dist/assets/*.css`
+DIST_CSS_LICENSE_URL: str = "https://" + "tailwindcss" + ".com"
 
 SAFE_PUBLIC_HOST_SUFFIXES: Tuple[str, ...] = (
     ".example.com",
@@ -559,6 +577,510 @@ def _scan_raw_secrets(text: str, rel_path: str, commit: Optional[str] = None) ->
     return findings
 
 
+_NPM_SCOPED_PKG_RE = re.compile(r"^@[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*$")
+_NPM_DEP_SECTIONS = frozenset(
+    {"dependencies", "devDependencies", "optionalDependencies", "peerDependencies", "peerDependenciesMeta"}
+)
+_JSON_WS_RE = re.compile(r"[ \t\r\n]*")
+_JSON_NUM_RE = re.compile(r"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?")
+_TS_IMPORT_SCOPE_RE = re.compile(
+    r"""(?:^|[\n;])[ \t]*import\s+(?:type\s+)?(?:[^"'`\n;]*?\s+from\s+)?(["'])(@[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*)(?:/[A-Za-z0-9._-]+)*\1""",
+    re.MULTILINE,
+)
+_JS_REGEX_PREV_KEYWORDS = frozenset(
+    {"return", "case", "throw", "in", "of", "typeof", "void", "delete", "new", "else", "do", "yield", "await"}
+)
+_JS_REGEX_PREV_PUNCT = frozenset("=(,:?!&|{;[~^+-*%<>")
+
+
+def _is_dist_js_path(rel_path: str) -> bool:
+    norm = rel_path.replace("\\", "/")
+    return norm.startswith("webui/dist/assets/") and norm.endswith(".js")
+
+
+def _is_dist_css_path(rel_path: str) -> bool:
+    norm = rel_path.replace("\\", "/")
+    return norm.startswith("webui/dist/assets/") and norm.endswith(".css")
+
+
+def _span_contains(sorted_spans: Sequence[Tuple[int, int]], start: int, end: int) -> bool:
+    """Return True if `[start, end)` lies strictly inside one of the disjoint sorted spans."""
+    if not sorted_spans:
+        return False
+    idx = bisect_right(sorted_spans, (start, 1 << 60)) - 1
+    if idx < 0:
+        return False
+    s, e = sorted_spans[idx]
+    return s <= start and end <= e
+
+
+def _span_overlaps(sorted_spans: Sequence[Tuple[int, int]], start: int, end: int) -> bool:
+    """Return True if `[start, end)` overlaps any span in the disjoint sorted span list."""
+    if not sorted_spans:
+        return False
+    idx = bisect_right(sorted_spans, (start, 1 << 60)) - 1
+    if idx >= 0:
+        s, e = sorted_spans[idx]
+        if s < end and start < e:
+            return True
+    nxt = idx + 1
+    if 0 <= nxt < len(sorted_spans):
+        s, e = sorted_spans[nxt]
+        if s < end and start < e:
+            return True
+    return False
+
+
+def _parse_json_with_spans(text: str) -> Optional[Any]:
+    """Strict JSON parser returning an AST with exact character spans `(start, end)` for strings/objects/arrays."""
+    n = len(text)
+    pos = _JSON_WS_RE.match(text, 0).end()  # type: ignore[union-attr]
+
+    def _skip_ws(i: int) -> int:
+        m = _JSON_WS_RE.match(text, i)
+        return m.end() if m else i
+
+    def _parse_value(i: int) -> Tuple[Any, int]:
+        if i >= n:
+            raise ValueError("unexpected EOF")
+        ch = text[i]
+        if ch == '"':
+            val, end = _json_scanstring(text, i + 1)
+            return ("str", val, i, end), end
+        if ch == "{":
+            j = _skip_ws(i + 1)
+            entries: List[Tuple[str, int, int, Any]] = []
+            if j < n and text[j] == "}":
+                return ("obj", entries, i, j + 1), j + 1
+            while True:
+                if j >= n or text[j] != '"':
+                    raise ValueError("expected string key")
+                k_start = j
+                k_str, k_end = _json_scanstring(text, j + 1)
+                j = _skip_ws(k_end)
+                if j >= n or text[j] != ":":
+                    raise ValueError("expected :")
+                j = _skip_ws(j + 1)
+                val_node, j = _parse_value(j)
+                entries.append((k_str, k_start, k_end, val_node))
+                j = _skip_ws(j)
+                if j >= n:
+                    raise ValueError("unterminated object")
+                if text[j] == ",":
+                    j = _skip_ws(j + 1)
+                    continue
+                if text[j] == "}":
+                    return ("obj", entries, i, j + 1), j + 1
+                raise ValueError("expected , or }")
+        if ch == "[":
+            j = _skip_ws(i + 1)
+            items: List[Any] = []
+            if j < n and text[j] == "]":
+                return ("arr", items, i, j + 1), j + 1
+            while True:
+                val_node, j = _parse_value(j)
+                items.append(val_node)
+                j = _skip_ws(j)
+                if j >= n:
+                    raise ValueError("unterminated array")
+                if text[j] == ",":
+                    j = _skip_ws(j + 1)
+                    continue
+                if text[j] == "]":
+                    return ("arr", items, i, j + 1), j + 1
+                raise ValueError("expected , or ]")
+        if text.startswith("true", i):
+            return ("prim", True, i, i + 4), i + 4
+        if text.startswith("false", i):
+            return ("prim", False, i, i + 5), i + 5
+        if text.startswith("null", i):
+            return ("prim", None, i, i + 4), i + 4
+        m_num = _JSON_NUM_RE.match(text, i)
+        if m_num:
+            return ("prim", m_num.group(0), i, m_num.end()), m_num.end()
+        raise ValueError(f"unexpected token at {i}")
+
+    try:
+        root, end_pos = _parse_value(pos)
+        end_pos = _skip_ws(end_pos)
+        if end_pos != n:
+            return None
+        return root
+    except Exception:
+        return None
+
+
+def _load_declared_webui_scoped_packages() -> Set[str]:
+    """Load declared scoped npm dependency names from `webui/package.json`."""
+    pkg_json = REPO_ROOT / "webui" / "package.json"
+    out: Set[str] = set()
+    if not pkg_json.is_file():
+        return out
+    try:
+        data = json.loads(pkg_json.read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        return out
+    if not isinstance(data, dict):
+        return out
+    for sec in ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies"):
+        sec_obj = data.get(sec)
+        if isinstance(sec_obj, dict):
+            for k in sec_obj:
+                if isinstance(k, str) and _NPM_SCOPED_PKG_RE.fullmatch(k):
+                    out.add(k)
+    return out
+
+
+def _extract_package_json_dep_spans(text: str) -> List[Tuple[int, int]]:
+    """Return exact JSON key spans for verified scoped npm dependency keys in `webui/package.json`."""
+    ast = _parse_json_with_spans(text)
+    if not ast or ast[0] != "obj":
+        return []
+    spans: List[Tuple[int, int]] = []
+    for key, _ks, _ke, val in ast[1]:
+        if key not in ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies"):
+            continue
+        if val[0] != "obj":
+            continue
+        for dep_key, dks, dke, _dval in val[1]:
+            if _NPM_SCOPED_PKG_RE.fullmatch(dep_key):
+                spans.append((dks, dke))
+    spans.sort()
+    return spans
+
+
+def _extract_lockfile_verified_spans(text: str) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]:
+    """Parse `webui/package-lock.json` and return `(npm_dep_key_spans, verified_funding_url_spans)`.
+
+    - `npm_dep_key_spans`: ONLY real dependency keys inside valid `packages` entries (NEVER arbitrary string values,
+      descriptions, authors, or non-dependency fields).
+    - `verified_funding_url_spans`: ONLY `"funding"` URL string spans inside package entries that have BOTH
+      `resolved` starting with `https://registry.npmjs.org/` AND `integrity` starting with `sha512-`.
+    """
+    ast = _parse_json_with_spans(text)
+    if not ast or ast[0] != "obj":
+        return [], []
+
+    packages_node = None
+    for key, _ks, _ke, val in ast[1]:
+        if key == "packages" and val[0] == "obj":
+            packages_node = val
+            break
+    if packages_node is None:
+        return [], []
+
+    dep_spans: List[Tuple[int, int]] = []
+    funding_spans: List[Tuple[int, int]] = []
+
+    def _collect_funding(node: Any) -> None:
+        kind = node[0]
+        if kind == "str":
+            funding_spans.append((node[2], node[3]))
+        elif kind == "obj":
+            for fk, _fks, _fke, fvn in node[1]:
+                if fk == "url" and fvn[0] == "str":
+                    funding_spans.append((fvn[2], fvn[3]))
+        elif kind == "arr":
+            for item in node[1]:
+                _collect_funding(item)
+
+    # First pass: gather verified package names from lockfile entries with authentic npm registry metadata
+    verified_pkg_names: Set[str] = _load_declared_webui_scoped_packages()
+    for pkg_path, _pks, _pke, pkg_val in packages_node[1]:
+        if pkg_val[0] != "obj":
+            continue
+        fmap = {k: v for k, _ks, _ke, v in pkg_val[1]}
+        res_node = fmap.get("resolved")
+        int_node = fmap.get("integrity")
+        res_str = res_node[1] if (res_node and res_node[0] == "str") else ""
+        int_str = int_node[1] if (int_node and int_node[0] == "str") else ""
+        has_strict_reg = res_str.startswith("https://registry.npmjs.org/") and int_str.startswith("sha512-")
+        has_bundled_meta = (
+            (not res_str)
+            and ("version" in fmap)
+            and any(flag in fmap for flag in ("optional", "dev", "devOptional", "peer", "inBundle"))
+        )
+        if has_strict_reg or has_bundled_meta:
+            if "node_modules/" in pkg_path:
+                tail = pkg_path.rsplit("node_modules/", 1)[1]
+                if _NPM_SCOPED_PKG_RE.fullmatch(tail):
+                    verified_pkg_names.add(tail)
+
+    # Second pass: emit exact spans ONLY for authentic dependency keys and verified funding fields
+    for pkg_path, pks, pke, pkg_val in packages_node[1]:
+        if pkg_val[0] != "obj":
+            continue
+        fmap = {k: v for k, _ks, _ke, v in pkg_val[1]}
+        res_node = fmap.get("resolved")
+        int_node = fmap.get("integrity")
+        res_str = res_node[1] if (res_node and res_node[0] == "str") else ""
+        int_str = int_node[1] if (int_node and int_node[0] == "str") else ""
+        has_strict_reg = res_str.startswith("https://registry.npmjs.org/") and int_str.startswith("sha512-")
+        has_bundled_meta = (
+            (not res_str)
+            and ("version" in fmap)
+            and any(flag in fmap for flag in ("optional", "dev", "devOptional", "peer", "inBundle"))
+        )
+        is_root_pkg = pkg_path == ""
+
+        if is_root_pkg or has_strict_reg or has_bundled_meta:
+            if "node_modules/" in pkg_path:
+                tail = pkg_path.rsplit("node_modules/", 1)[1]
+                if _NPM_SCOPED_PKG_RE.fullmatch(tail) and tail in verified_pkg_names:
+                    dep_spans.append((pks, pke))
+            for sec in _NPM_DEP_SECTIONS:
+                sec_node = fmap.get(sec)
+                if not sec_node or sec_node[0] != "obj":
+                    continue
+                for dk, dks, dke, _dv in sec_node[1]:
+                    if not _NPM_SCOPED_PKG_RE.fullmatch(dk):
+                        continue
+                    # For root package, require exact declared/verified package; for registry-verified packages,
+                    # allow verified packages plus optional/peer metadata entries.
+                    if dk in verified_pkg_names or (
+                        has_strict_reg and sec in ("optionalDependencies", "peerDependencies", "peerDependenciesMeta")
+                    ):
+                        dep_spans.append((dks, dke))
+            if has_strict_reg and "bundleDependencies" in fmap:
+                bnode = fmap["bundleDependencies"]
+                if bnode[0] == "arr":
+                    for item in bnode[1]:
+                        if item[0] == "str" and _NPM_SCOPED_PKG_RE.fullmatch(item[1]) and item[1] in verified_pkg_names:
+                            dep_spans.append((item[2], item[3]))
+
+        # Funding URLs allowed ONLY on strictly registry-verified packages (resolved + sha512 integrity)
+        if has_strict_reg and "funding" in fmap:
+            _collect_funding(fmap["funding"])
+
+    dep_spans.sort()
+    funding_spans.sort()
+    return dep_spans, funding_spans
+
+
+def _lex_js_spans(text: str) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]], List[Tuple[int, int]]]:
+    """Lex JS/TS source into disjoint sorted `(string_spans, block_comment_spans, line_comment_spans)`.
+
+    Properly distinguishes string literals, template literals, block/line comments, and regex literals
+    so quotes inside regexes or comments never desynchronize string detection.
+    """
+    string_spans: List[Tuple[int, int]] = []
+    block_comment_spans: List[Tuple[int, int]] = []
+    line_comment_spans: List[Tuple[int, int]] = []
+    n = len(text)
+    i = 0
+    prev_non_ws = ""
+    prev_ident = ""
+
+    while i < n:
+        ch = text[i]
+        if ch in " \t\r\n":
+            i += 1
+            continue
+        if ch == "/" and i + 1 < n:
+            nxt = text[i + 1]
+            if nxt == "*":
+                end = text.find("*/", i + 2)
+                end_pos = (end + 2) if end != -1 else n
+                block_comment_spans.append((i, end_pos))
+                i = end_pos
+                continue
+            if nxt == "/":
+                end = text.find("\n", i + 2)
+                end_pos = end if end != -1 else n
+                line_comment_spans.append((i, end_pos))
+                i = end_pos
+                continue
+            # Possible regex literal if preceded by operator/punctuation/regex-allowing keyword
+            if (not prev_non_ws) or (prev_non_ws in _JS_REGEX_PREV_PUNCT) or (prev_ident in _JS_REGEX_PREV_KEYWORDS):
+                j = i + 1
+                in_class = False
+                valid_rx = False
+                while j < n:
+                    rc = text[j]
+                    if rc == "\n" or rc == "\r":
+                        break
+                    if rc == "\\":
+                        j += 2
+                        continue
+                    if rc == "[":
+                        in_class = True
+                    elif rc == "]" and in_class:
+                        in_class = False
+                    elif rc == "/" and not in_class:
+                        j += 1
+                        while j < n and text[j].isalpha():
+                            j += 1
+                        valid_rx = True
+                        break
+                    j += 1
+                if valid_rx:
+                    prev_non_ws = "/"
+                    prev_ident = ""
+                    i = j
+                    continue
+        if ch in ('"', "'", "`"):
+            quote = ch
+            j = i + 1
+            while j < n:
+                sc = text[j]
+                if sc == "\\":
+                    j += 2
+                    continue
+                if sc == quote:
+                    j += 1
+                    break
+                j += 1
+            string_spans.append((i, j))
+            prev_non_ws = quote
+            prev_ident = ""
+            i = j
+            continue
+        if ch.isalpha() or ch in ("_", "$"):
+            j = i + 1
+            while j < n and (text[j].isalnum() or text[j] in ("_", "$")):
+                j += 1
+            prev_ident = text[i:j]
+            prev_non_ws = text[j - 1]
+            i = j
+            continue
+        prev_non_ws = ch
+        prev_ident = ""
+        i += 1
+
+    return string_spans, block_comment_spans, line_comment_spans
+
+
+def _lex_css_spans(text: str) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]:
+    """Lex CSS into disjoint sorted `(string_spans, block_comment_spans)`."""
+    string_spans: List[Tuple[int, int]] = []
+    block_comment_spans: List[Tuple[int, int]] = []
+    n = len(text)
+    i = 0
+    while i < n:
+        ch = text[i]
+        if ch == "/" and i + 1 < n and text[i + 1] == "*":
+            end = text.find("*/", i + 2)
+            end_pos = (end + 2) if end != -1 else n
+            block_comment_spans.append((i, end_pos))
+            i = end_pos
+            continue
+        if ch in ('"', "'"):
+            quote = ch
+            j = i + 1
+            while j < n:
+                sc = text[j]
+                if sc == "\\":
+                    j += 2
+                    continue
+                if sc == quote:
+                    j += 1
+                    break
+                j += 1
+            string_spans.append((i, j))
+            i = j
+            continue
+        i += 1
+    return string_spans, block_comment_spans
+
+
+def _extract_ts_import_scope_spans(text: str, allowed_scoped_pkgs: Set[str]) -> List[Tuple[int, int]]:
+    """Return exact spans of declared scoped npm packages inside static ES `import` statements (excluding comments)."""
+    if not allowed_scoped_pkgs:
+        return []
+    _str_spans, blk_spans, line_spans = _lex_js_spans(text)
+    spans: List[Tuple[int, int]] = []
+    for m in _TS_IMPORT_SCOPE_RE.finditer(text):
+        pkg = m.group(2)
+        if pkg not in allowed_scoped_pkgs:
+            continue
+        imp_pos = text.find("import", m.start(), m.end())
+        if imp_pos < 0:
+            continue
+        if _span_overlaps(blk_spans, imp_pos, imp_pos + 6) or _span_overlaps(line_spans, imp_pos, imp_pos + 6):
+            continue
+        spans.append((m.start(2), m.end(2)))
+    spans.sort()
+    return spans
+
+
+def _is_css_hex_color_context(text: str, hash_idx: int, end: int) -> bool:
+    """Verify `#RRGGBBAA` sits in a real CSS property value (not a comment or arbitrary identifier)."""
+    if hash_idx <= 0 or text[hash_idx] != "#":
+        return False
+    prev_i = hash_idx - 1
+    while prev_i >= 0 and text[prev_i] in " \t\r\n":
+        prev_i -= 1
+    if prev_i < 0 or text[prev_i] not in ":,({":
+        # Also allow space-separated shorthand property values like `border: 1px solid #RRGGBBAA;`
+        if not (hash_idx > 0 and text[hash_idx - 1] in " \t"):
+            return False
+    if end < len(text) and text[end] not in ";},) \t\r\n":
+        return False
+    return True
+
+
+def _is_js_bitmask_literal(
+    text: str,
+    start: int,
+    end: int,
+    val_str: str,
+    *,
+    string_spans: Sequence[Tuple[int, int]],
+    block_comment_spans: Sequence[Tuple[int, int]],
+    line_comment_spans: Sequence[Tuple[int, int]],
+) -> bool:
+    """Return True ONLY for verified non-string 31-bit JS bitmask/lane constants in built dist JS bundles.
+
+    NEVER exempts numbers inside quoted strings/template literals/comments,
+    Telegram supergroup IDs (`-100...`), arbitrary user/chat numeric IDs, or values outside signed 32-bit range.
+    """
+    # Hard guard: NEVER exempt anything inside strings or comments, or adjacent to quotes
+    if (
+        _span_overlaps(string_spans, start, end)
+        or _span_overlaps(block_comment_spans, start, end)
+        or _span_overlaps(line_comment_spans, start, end)
+    ):
+        return False
+    if start > 0 and text[start - 1] in ('"', "'", "`"):
+        return False
+    if end < len(text) and text[end] in ('"', "'", "`"):
+        return False
+
+    # Require valid JS numeric expression delimiters before & after
+    if start > 0 and text[start - 1] not in " \t\r\n=:,(&|^~!<>{;+?*/[":
+        return False
+    if end < len(text) and text[end] not in " \t\r\n;,)}:&|^?=!<>+-*/]":
+        return False
+
+    try:
+        n = int(val_str)
+    except ValueError:
+        return False
+    # Telegram supergroup IDs (-100...) and 12+ digit IDs are outside signed 32-bit range
+    if n < -(1 << 31) or n > (1 << 31):
+        return False
+    # Exact power-of-2, Mersenne mask ((1<<k)-1), or bitwise-not power-of-2 (~(1<<k) = -(1<<k)-1)
+    if n > 0 and ((n & (n - 1)) == 0 or (n & (n + 1)) == 0):
+        return True
+    if n < 0:
+        inv = -n - 1
+        if inv > 0 and (inv & (inv - 1)) == 0:
+            return True
+    # Syntactically adjacent to JS bitwise operators (&, |, &=, |=, ^, ^=, ~)
+    prev_slice = text[max(0, start - 3) : start]
+    next_slice = text[end : min(len(text), end + 2)]
+    if prev_slice.endswith(("&", "|", "^", "~", "&=", "|=", "^=")):
+        return True
+    if next_slice.startswith(("&", "|", "^")):
+        return True
+    # Bitmask comparison or ternary branch inside a bitwise expression, strictly low-12-bit aligned
+    if (abs(n) & 0xFFF) == 0:
+        window = text[max(0, start - 28) : min(len(text), end + 12)]
+        if any(op in window for op in ("&=", "|=", "&", "|")):
+            return True
+    return False
+
+
 def _scan_strict_exposures(
     text: str,
     rel_path: str,
@@ -567,6 +1089,34 @@ def _scan_strict_exposures(
     extra_rules: Sequence[Tuple[str, re.Pattern[str]]] = (),
 ) -> List[Finding]:
     findings: List[Finding] = []
+    norm_rel = rel_path.replace("\\", "/")
+    is_pkg_json = norm_rel == "webui/package.json"
+    is_lockfile = norm_rel == "webui/package-lock.json"
+    is_webui_ts = norm_rel in {"webui/vite.config.ts", "webui/vite.config.js"} or (
+        norm_rel.startswith("webui/src/") and norm_rel.endswith((".ts", ".tsx"))
+    )
+    is_dist_js = _is_dist_js_path(norm_rel)
+    is_dist_css = _is_dist_css_path(norm_rel)
+
+    # Pre-compute exact syntax-verified exemption spans for WebUI files ONLY
+    npm_scope_spans: List[Tuple[int, int]] = []
+    funding_url_spans: List[Tuple[int, int]] = []
+    js_string_spans: List[Tuple[int, int]] = []
+    js_block_comment_spans: List[Tuple[int, int]] = []
+    js_line_comment_spans: List[Tuple[int, int]] = []
+    css_string_spans: List[Tuple[int, int]] = []
+    css_block_comment_spans: List[Tuple[int, int]] = []
+
+    if is_pkg_json:
+        npm_scope_spans = _extract_package_json_dep_spans(text)
+    elif is_lockfile:
+        npm_scope_spans, funding_url_spans = _extract_lockfile_verified_spans(text)
+    elif is_webui_ts:
+        npm_scope_spans = _extract_ts_import_scope_spans(text, _load_declared_webui_scoped_packages())
+    elif is_dist_js:
+        js_string_spans, js_block_comment_spans, js_line_comment_spans = _lex_js_spans(text)
+    elif is_dist_css:
+        css_string_spans, css_block_comment_spans = _lex_css_spans(text)
 
     for m in MASKED_KEY_RE.finditer(text):
         val = m.group(0)
@@ -603,6 +1153,33 @@ def _scan_strict_exposures(
                     re.IGNORECASE,
                 ):
                     continue
+                if (
+                    rule == "standalone_long_numeric_id"
+                    and is_dist_css
+                    and len(val) == 8
+                    and not val.startswith("-")
+                    and not _span_overlaps(css_string_spans, m.start(), m.end())
+                    and not _span_overlaps(css_block_comment_spans, m.start(), m.end())
+                    and m.start() > 0
+                    and text[m.start() - 1] == "#"
+                    and _is_css_hex_color_context(text, m.start() - 1, m.end())
+                ):
+                    # CSS 8-digit #RRGGBBAA hex color literal inside real CSS property value
+                    continue
+            if (
+                rule in ("standalone_long_numeric_id", "telegram_group_or_channel_id")
+                and is_dist_js
+                and _is_js_bitmask_literal(
+                    text,
+                    m.start(),
+                    m.end(),
+                    val,
+                    string_spans=js_string_spans,
+                    block_comment_spans=js_block_comment_spans,
+                    line_comment_spans=js_line_comment_spans,
+                )
+            ):
+                continue
             findings.append(
                 Finding(
                     severity=severity,
@@ -638,10 +1215,24 @@ def _scan_strict_exposures(
 
     for m in AT_HANDLE_RE.finditer(text):
         pos = m.start(1)
+        end_pos = m.end(1)
         if any(s <= pos < e for s, e in email_spans):
             continue
         handle = m.group(1)
         if handle.lower() in SAFE_AT_TOKENS:
+            continue
+        # Verified npm scoped package ONLY in exact JSON dep keys or static TS/Vite `import` specifiers
+        if npm_scope_spans and _span_contains(npm_scope_spans, pos, end_pos):
+            continue
+        # License tag permitted ONLY inside actual block comments in built dist JS/CSS
+        if (is_dist_js or is_dist_css) and handle == ("@" + "license"):
+            c_spans = js_block_comment_spans if is_dist_js else css_block_comment_spans
+            if _span_contains(c_spans, pos, end_pos):
+                continue
+        # React/ES6 built JS runtime symbols (double-at iterator & stack frame sentinel)
+        if is_dist_js and handle == ("@" + "iterator") and pos > 0 and text[pos - 1] == "@":
+            continue
+        if is_dist_js and handle == ("@" + "unknown") and text[pos : pos + 12] == ("@" + "unknown:0:0"):
             continue
         findings.append(
             Finding(
@@ -659,10 +1250,29 @@ def _scan_strict_exposures(
     url_spans: List[Tuple[int, int]] = []
     for m in URL_RE.finditer(text):
         url_spans.append((m.start(), m.end()))
+        full_url = m.group(0)
         host_port = m.group(1)
         if "@" in host_port:
             host_port = host_port.rsplit("@", 1)[1]
         if _has_placeholder(host_port) or "{" in host_port or "%" in host_port:
+            continue
+        host_only = host_port.strip().lower().rstrip(".").split(":", 1)[0].strip("[]")
+        # Verified npm lockfile funding URLs ONLY inside validated `funding` field of registry-verified packages
+        if (
+            is_lockfile
+            and host_only in SAFE_LOCKFILE_FUNDING_HOSTS
+            and _span_contains(funding_url_spans, m.start(), m.end())
+        ):
+            continue
+        # Official React error/link doc URLs ONLY in built `webui/dist/assets/*.js`
+        if is_dist_js and full_url.startswith(DIST_JS_DOC_URL_PREFIXES):
+            continue
+        # Official Tailwind license URL ONLY inside CSS block comment in `webui/dist/assets/*.css`
+        if (
+            is_dist_css
+            and full_url == DIST_CSS_LICENSE_URL
+            and _span_contains(css_block_comment_spans, m.start(), m.end())
+        ):
             continue
         if not _is_safe_public_host(host_port):
             findings.append(
@@ -680,9 +1290,16 @@ def _scan_strict_exposures(
 
     for m in BARE_DOMAIN_RE.finditer(text):
         pos = m.start(1)
+        end_pos = m.end(1)
         if any(s <= pos < e for s, e in url_spans) or any(s <= pos < e for s, e in email_spans):
             continue
         dom = m.group(1).lower()
+        if (
+            is_lockfile
+            and dom in SAFE_LOCKFILE_FUNDING_HOSTS
+            and _span_contains(funding_url_spans, pos, end_pos)
+        ):
+            continue
         if _is_safe_public_host(dom) or _has_placeholder(dom):
             continue
         findings.append(
@@ -783,9 +1400,23 @@ def scan_text(
     return findings
 
 
+def _is_forbidden_secret_filename(name: str) -> bool:
+    return name in FORBIDDEN_RUNTIME_NAMES or (name.startswith(".env.") and name != ".env.example")
+
+
+def _is_forbidden_artifact_suffix(name: str) -> bool:
+    return any(name.endswith(suf) for suf in FORBIDDEN_RUNTIME_SUFFIXES) or ".bak-" in name
+
+
+def is_forbidden_runtime_file(rel_path: str) -> bool:
+    """Return True if basename matches a forbidden runtime secret or artifact file."""
+    name = Path(rel_path).name
+    return _is_forbidden_secret_filename(name) or _is_forbidden_artifact_suffix(name)
+
+
 def _check_forbidden_file(rel_path: str, mode: str) -> List[Finding]:
     name = Path(rel_path).name
-    if name in FORBIDDEN_RUNTIME_NAMES or (name.startswith(".env.") and name != ".env.example"):
+    if _is_forbidden_secret_filename(name):
         return [
             Finding(
                 severity="CRITICAL",
@@ -797,7 +1428,7 @@ def _check_forbidden_file(rel_path: str, mode: str) -> List[Finding]:
                 detail="Runtime secret/state `.env` or credential file must never be published",
             )
         ]
-    if any(name.endswith(suf) for suf in FORBIDDEN_RUNTIME_SUFFIXES) or ".bak-" in name:
+    if _is_forbidden_artifact_suffix(name):
         return [
             Finding(
                 severity="CRITICAL",

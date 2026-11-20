@@ -6,7 +6,8 @@ Open-source companion stack built natively on the **official Google Antigravity 
 - **Telegram Group Multi-Bot Team Collaboration & RBAC**: `sendMessageDraft` real-time streaming, group anti-429 adaptive fallback, `acb-team` async delegation, optional Git Worktree (`worktree: true`) concurrent isolation, and group/user RBAC (`AGY_TG_ADMIN_USERS` / `AGY_TG_READONLY_USERS`).
 - **Multi-Fingerprint, Multi-Egress Camoufox Browser & Telegram Mini App Takeover**: Named profiles with per-profile OS, viewport, WebGL, WebRTC/GeoIP, and proxy egress switching to isolate tasks and handle strict anti-bot checks (such as Cloudflare challenges), while supporting locked persistent fingerprints + direct host egress for core accounts; visual in-app profile switcher drawer + Telegram `/browser` inline control panel and 1-click Mini App human takeover let you resolve interactive challenges and hand control back to AI.
 - **Cross-Session Anti-Forgetting, Memory Guard, `/dream` & Self-Healing Ops**: Lossless `/compact` transcript rehydration, stateless local observer LLM shim, 3-layer anti-poisoning memory guard (`bridge/memory_guard.py` + Hook Gate + Instinct Daemon full-step audit), `/dream` periodic instinct consolidation & `observations.jsonl` gzip archival, Continuous-Learning v2, `mem-search`, `/undo`/`/redo`, `/schedule`/`/cron`, `/project`, `/usage`/`/cost`, pre-output model failover (`AGY_TG_FALLBACK_MODELS` / `/model fallback`), `agy-bot setup` (`--bots ... --systemd-out ...`) / `doctor --fix`, Docker deployment ([`Dockerfile`](./Dockerfile), [`docker-compose.example.yml`](./docker-compose.example.yml), [AI-INSTALL Guide](./docs/AI-INSTALL.md)), atomic `_JobQueue` restart recovery, and pre-checked zero-downtime hot reload with LKG auto-rollback.
-- **Zero-Trace OpenBao Secret Ops & Automated Desensitization Gate**: Sanitized [OpenBao Zero-Trace Secret Ops Guide](./docs/OPENBAO_SECRETOPS_GUIDE.md) paired with structural working-tree + Git history auditing and a Python 3.11–3.14 CI matrix.
+- **AGY Studio WebUI Control Plane (`studio/` + `webui/`)**: Password-authenticated (`AGY_STUDIO_AUTH_MODE=password`, scrypt + `HttpOnly`/`SameSite` cookies + CSRF + sanitized access logging) React + aiohttp sidecar providing real-time Workspace streaming chat via single-writer IPC (`bridge/studio_ipc.py`), Jobs dispatch/cancel/retry control plane, safe Schedules management, global SSE (`/api/events`), and a same-origin Live-Browser takeover drawer—all MIT-licensed clean-room code.
+- **Zero-Trace OpenBao Secret Ops & Automated Desensitization Gate**: Sanitized [OpenBao Zero-Trace Secret Ops Guide](./docs/OPENBAO_SECRETOPS_GUIDE.md) paired with structural working-tree + Git history auditing and a Python 3.11–3.14 + Node 22 CI matrix.
 
 - **License**: [MIT](./LICENSE)
 - **Repository**: `https://github.com/gaoshanyuhupo/agy-bot`
@@ -57,7 +58,13 @@ Open-source companion stack built natively on the **official Google Antigravity 
 - **`agy_llm_shim.py`**: Local OpenAI/Anthropic-compatible HTTP shim backed by an isolated tool-free `pure-llm` agent (`mem-hub/observer-sandbox/`) with clean stateless session rotation.
 - **`agy_instinct_daemon.py`**: Extracts session instincts with confidence scoring, audits every harvested transcript step and LLM instinct candidate via `memory_guard`, updates `.agents/rules/ecc-active-instincts.md`, evolves non-redundant instincts into capped reusable skills, and runs periodic `/dream` (`dream`) memory consolidation (quarantining unsafe instincts, time-decay archival, similarity deduplication/merging, and rolling gzip archival of `observations.jsonl` with exact offset recalculation).
 
-### 5. `scripts/`, `tests/` & `docs/OPENBAO_SECRETOPS_GUIDE.md` — Zero-Trace Secret Ops, Desensitization Gate & Cost Accounting
+### 5. `studio/` & `webui/` — AGY Studio Phase A (Workspace Chat, Control Plane & Browser Drawer)
+- **Workspace Streaming Chat & Single-Writer IPC (`studio/chat_service.py`, `bridge/studio_ipc.py`)**: Real-time SSE token streaming, session history & model catalog inspection, abort controls, and pure-React safe Markdown rendering (`SafeMarkdown.tsx`, zero raw HTML injection).
+- **Jobs Control Plane & Safe Schedules (`studio/control_plane.py`, `studio/event_hub.py`)**: Dispatch, inspect, cancel, and retry `acb-team` jobs; create, toggle, run, or delete schedules under strict command/interval guardrails; and receive live global SSE updates (`/api/events`).
+- **Same-Origin Live-Browser Drawer (`studio/browser_proxy.py`)**: Authenticated WebSocket & file-transfer proxy to the local `live-browser` daemon without exposing upstream ports directly.
+- **Zero-Trust Password Authentication (`studio/auth.py`)**: Defaults to `AGY_STUDIO_AUTH_MODE=password` backed by an external `0600` `users.json` scrypt store (provision via `python3 -m studio.auth set-user`), enforcing `must_change_password`, CSRF/Same-Origin checks, live RBAC downgrade/eviction, and query/header-sanitized access logs. Sanitized service template: [`systemd/examples/agy-studio.service.example`](./systemd/examples/agy-studio.service.example).
+
+### 6. `scripts/`, `tests/` & `docs/OPENBAO_SECRETOPS_GUIDE.md` — Zero-Trace Secret Ops, Desensitization Gate & Cost Accounting
 - **Self-Hosted OpenBao Zero-Trace Secret Guide**: Fully sanitized patterns for `0600` local Vault credentials, ephemeral CLI env injection, in-memory Python helpers, and disk-free `live-browser --proxy-bao` egress in [docs/OPENBAO_SECRETOPS_GUIDE.md](./docs/OPENBAO_SECRETOPS_GUIDE.md).
 - **`scripts/security_audit.py`**: Zero-leak structural scanner covering raw API keys/tokens, half-masked prefixes, credentialed URLs, unallowlisted external endpoints/domains, numeric/hex/UUID IDs, emails/`@handles`, hardcoded `/home/<user>` or `User=` paths, non-doc IPs, forbidden runtime files, and Git commit history (`--check-history`). Supports optional external blocklists (`--blocklist-file` / `~/.config/agy-audit-blocklist.txt`).
 - **`tests/`**: Automated `unittest` suite covering desensitization boundaries (`test_desensitization.py`), P0 hardening (`test_bridge_p0.py`), core bridge subsystems (`test_bridge_core.py`), group RBAC (`test_access_control.py`), model failover (`test_model_failover.py`), cron scheduler (`test_scheduler.py`), CLI diagnostics (`test_cli_doctor.py`), Mini App & `/browser` panel (`test_browser_panel.py`), live-browser multi-fingerprint/pinned-profile isolation (`test_live_browser_profiles.py`), GitHub webhook security (`test_github_webhook.py`), weekly benchmark digest (`test_benchmark_digest.py`), 3-layer memory poisoning guard & `/dream` consolidation (`test_memory_guard_and_dream.py`), atomic `_JobQueue` recovery & LKG hot-reload rollback (`test_queue_persistence_and_rollback.py`), and multi-bot team bus & worktree isolation (`test_bot_bus.py`, `test_bot_bus_worktree.py`, `test_group_chat_bus.py`).
@@ -72,15 +79,17 @@ Open-source companion stack built natively on the **official Google Antigravity 
 agy-bot/
 ├── .agents/                  # Shared skills (live-browser, continuous-learning-v2, altare, mem-search) & workflows
 ├── .github/                  # CI workflows, Issue forms, and PR desensitization checklist
-├── bridge/                   # Telegram Bridge v3 (bridge.py, memory_guard.py, github_webhook.py, access_control.py, model_failover.py, scheduler.py, bot_bus*.py, cli.py, .env.example)
+├── bridge/                   # Telegram Bridge v3 (bridge.py, studio_ipc.py, memory_guard.py, github_webhook.py, access_control.py, model_failover.py, scheduler.py, bot_bus*.py, cli.py, .env.example)
 ├── config/                   # Sanitized MCP configuration template (mcp_config.example.json)
 ├── docs/                     # AI-INSTALL guide, architecture diagram, Live Browser guide & OpenBao zero-trace secret guide
 ├── hooks/                    # hooks.json + lossless rehydrate_after_compact.py + hook gate
 ├── legacy/sdk-bridge/        # Historical SDK bridge v1 reference
 ├── mem-hub/                  # agy_llm_shim.py, agy_instinct_daemon.py, and isolated observer-sandbox/
-├── scripts/                  # security_audit.py, benchmark_digest.py, and standalone calc_cycle_cost.py
-├── systemd/examples/         # Generic systemd unit templates (including agy-github-webhook.service.example, YOUR_USER placeholders)
-├── tests/                    # Automated desensitization, RBAC, failover, bridge, scheduler, CLI, browser panel & team-bus tests
+├── scripts/                  # security_audit.py, verify_gate.py, benchmark_digest.py, and standalone calc_cycle_cost.py
+├── studio/                   # AGY Studio aiohttp sidecar (server.py, auth.py, chat_service.py, control_plane.py, event_hub.py, data_sources.py, browser_proxy.py, requirements.txt)
+├── systemd/examples/         # Generic systemd unit templates (including agy-studio.service.example & agy-github-webhook.service.example, YOUR_USER placeholders)
+├── tests/                    # Automated desensitization, Studio/WebUI, RBAC, failover, bridge, scheduler, CLI, browser panel & team-bus tests
+├── webui/                    # React + Vite + Tailwind WebUI source for AGY Studio (build `webui/dist` via `npm ci && npm run build`)
 ├── workspace/                # Shared workspace agent delivery guidelines (AGENTS.md)
 ├── Dockerfile                # Non-root container image built from pyproject.toml
 ├── docker-compose.example.yml # Sanitized Coordinator + Worker Docker Compose template
@@ -143,11 +152,25 @@ EOF
 chmod 600 "$HOME/.config/agy-live-browser/tunnel.env"
 ```
 
-### 3. Systemd Deployment (Optional)
+### 3. AGY Studio WebUI (Optional)
 
-Generic unit templates are in [`systemd/examples/`](./systemd/examples) with `KillMode=mixed` (preserving child processes gracefully while cleaning up cleanly). Replace `YOUR_USER` with your Linux username before installing into `/etc/systemd/system/` or `~/.config/systemd/user/`.
+```bash
+# Install Studio backend dependencies and build the React WebUI bundle
+python3 -m pip install -r studio/requirements.txt
+(cd webui && npm ci && npm run build)
 
-### 4. Run Desensitization Audit, Lint & Tests
+# Provision an initial password-mode user in ~/.config/agy-studio/users.json (0600)
+python3 -m studio.auth set-user --username admin --bot main --user-id 123456789 --role admin
+
+# Start the loopback sidecar (127.0.0.1:18796)
+python3 -m studio.server
+```
+
+### 4. Systemd Deployment (Optional)
+
+Generic unit templates are in [`systemd/examples/`](./systemd/examples) (including [`agy-studio.service.example`](./systemd/examples/agy-studio.service.example)) with `KillMode=mixed` for bridges. Replace `YOUR_USER` and `/path/to/agy-bot` before installing into `/etc/systemd/system/` or `~/.config/systemd/user/`.
+
+### 5. Run Desensitization Audit, Lint & Tests
 
 ```bash
 # Strict audit across working tree + full Git history
@@ -156,7 +179,8 @@ python3 scripts/security_audit.py --mode public-release --check-history
 # Lint check (optional dev dependency: pip install -e ".[dev]")
 ruff check .
 
-# Run full desensitization & runtime test suite
+# Run full desensitization, Bridge & Studio test suite
+python3 -m pip install -r bridge/requirements.txt -r studio/requirements.txt
 python3 -m unittest discover -s tests -v
 ```
 

@@ -474,6 +474,7 @@ def _merge_bot_view(handle: str, raw_roster: Dict[str, Any], raw_cfg: Dict[str, 
         "default_workdir": cfg.get("default_workdir") or r.get("workdir") or "",
         "default_project": cfg.get("default_project") if cfg.get("default_project") is not None else (r.get("project") or ""),
         "allowed_chats": list(r.get("allowed_chats") or []),
+        "ipc_sock": str(r.get("ipc_sock") or "") if online else "",
         "mirror_chat_id": int(m_chat or 0),
         "mirror_thread_id": m_thread,
         "last_seen": last_seen,
@@ -987,6 +988,157 @@ def cancel_job(job_id: str, requester_bot: str = "", reason: str = "cancelled") 
         else:
             _atomic_write_json(fp, job)
         return dict(job)
+
+
+def dispatch_jobs_in_dir(
+    bus_dir: str,
+    from_bot: str,
+    assignments: List[Dict[str, Any]],
+    *,
+    max_fanout: int = 6,
+) -> Dict[str, Any]:
+    """Atomically enqueue jobs into an explicit `bus_dir` under `bus.lock` (safe for multi-dir / Studio isolation)."""
+    bdir = os.path.abspath(bus_dir)
+    jobs_dir = os.path.join(bdir, "jobs")
+    inbox_dir = os.path.join(bdir, "inbox")
+    lock_file = os.path.join(bdir, "bus.lock")
+    os.makedirs(bdir, mode=0o700, exist_ok=True)
+    os.makedirs(jobs_dir, mode=0o700, exist_ok=True)
+    os.makedirs(inbox_dir, mode=0o700, exist_ok=True)
+
+    sender = normalize_handle(from_bot) or "studio"
+    if not assignments or not isinstance(assignments, list):
+        raise ValueError("At least one assignment is required")
+    if len(assignments) > max_fanout:
+        raise ValueError(f"Too many fan-out assignments ({len(assignments)} > {max_fanout})")
+
+    now = time.time()
+    group_id = f"batch-{uuid.uuid4().hex[:8]}"
+    created_jobs: List[Dict[str, Any]] = []
+
+    with open(lock_file, "a+", encoding="utf-8") as lf:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        try:
+            job_ids = [f"job-{uuid.uuid4().hex[:10]}" for _ in assignments]
+            wm_path = os.path.join(inbox_dir, ".last_pkt_ns")
+            prev_ns = 0
+            try:
+                with open(wm_path, "r", encoding="utf-8") as wf:
+                    raw_wm = wf.read().strip()
+                if raw_wm.isdigit():
+                    prev_ns = int(raw_wm)
+            except OSError:
+                prev_ns = 0
+
+            for idx, (spec, jid) in enumerate(zip(assignments, job_ids)):
+                th = normalize_handle(str(spec.get("bot") or ""))
+                if not th:
+                    raise ValueError(f"Assignment #{idx + 1} requires a valid target bot")
+                job = {
+                    "job_id": jid,
+                    "group_id": group_id,
+                    "batch_index": idx,
+                    "batch_size": len(job_ids),
+                    "batch_job_ids": list(job_ids),
+                    "wake_on_async": False,
+                    "batch_notified": False,
+                    "label": str(spec.get("label") or "")[:120],
+                    "from_bot": sender,
+                    "target_bot": th,
+                    "prompt": str(spec.get("prompt") or "").strip(),
+                    "project": str(spec.get("project") or ""),
+                    "workdir": str(spec.get("workdir") or ""),
+                    "model": str(spec.get("model") or ""),
+                    "effort": str(spec.get("effort") or ""),
+                    "mode": str(spec.get("mode") or ""),
+                    "thread_key": "",
+                    "resume_cid": "",
+                    "worktree": False,
+                    "worktree_info": {},
+                    "notify_group": False,
+                    "origin_scope_key": "",
+                    "origin_chat_id": 0,
+                    "origin_thread_id": None,
+                    "origin_msg_id": 0,
+                    "chain": [sender, th],
+                    "depth": 1,
+                    "status": "queued",
+                    "cancel_requested": False,
+                    "cancel_reason": "",
+                    "group_delivered": False,
+                    "created_at": now,
+                    "started_at": 0.0,
+                    "finished_at": 0.0,
+                    "worker_pid": 0,
+                    "worker_cid": "",
+                    "progress": "",
+                    "result_text": "",
+                    "error": "",
+                    "artifacts": [],
+                    "usage": {},
+                }
+                safe_id = re.sub(r"[^a-zA-Z0-9_.-]+", "", jid)
+                _atomic_write_json(os.path.join(jobs_dir, f"{safe_id}.json"), job)
+
+                bot_inbox = os.path.join(inbox_dir, th)
+                os.makedirs(bot_inbox, mode=0o700, exist_ok=True)
+                now_ns = time.time_ns()
+                mono_ns = now_ns if now_ns > prev_ns else (prev_ns + 1)
+                prev_ns = mono_ns
+                pkt_name = f"{mono_ns:020d}_{idx:06d}_{uuid.uuid4().hex[:8]}.json"
+                _atomic_write_json(
+                    os.path.join(bot_inbox, pkt_name),
+                    {"type": "job", "job_id": jid, "from_bot": sender, "created_at": now},
+                )
+                created_jobs.append(job)
+
+            if prev_ns > 0:
+                tmp_wm = f"{wm_path}.{os.getpid()}.{uuid.uuid4().hex[:6]}.tmp"
+                with open(tmp_wm, "w", encoding="utf-8") as wf:
+                    wf.write(str(prev_ns))
+                os.chmod(tmp_wm, 0o600)
+                os.replace(tmp_wm, wm_path)
+        finally:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+
+    return {"group_id": group_id, "jobs": created_jobs}
+
+
+def cancel_job_in_dir(
+    bus_dir: str,
+    job_id: str,
+    *,
+    reason: str = "cancelled_by_studio",
+) -> Tuple[Optional[Dict[str, Any]], bool]:
+    """Atomically cancel a job in an explicit `bus_dir`. Returns `(job_dict_or_none, already_terminal)`."""
+    bdir = os.path.abspath(bus_dir)
+    jobs_dir = os.path.join(bdir, "jobs")
+    lock_file = os.path.join(bdir, "bus.lock")
+    os.makedirs(bdir, mode=0o700, exist_ok=True)
+    safe_id = re.sub(r"[^a-zA-Z0-9_.-]+", "", job_id)
+    fp = os.path.join(jobs_dir, f"{safe_id}.json")
+    if not os.path.isfile(fp):
+        return None, False
+
+    with open(lock_file, "a+", encoding="utf-8") as lf:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        try:
+            job = _read_json(fp, None)
+            if not isinstance(job, dict):
+                return None, False
+            st = str(job.get("status") or "").lower()
+            if st in TERMINAL_STATUSES or st == "failed":
+                return dict(job), True
+            job["cancel_requested"] = True
+            job["cancel_reason"] = reason
+            if st == "queued":
+                job["status"] = "cancelled"
+                job["finished_at"] = time.time()
+                job["error"] = reason
+            _atomic_write_json(fp, job)
+            return dict(job), False
+        finally:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
 
 
 def retry_job(job_id: str, requester_bot: str, prompt_override: str = "") -> Dict[str, Any]:
