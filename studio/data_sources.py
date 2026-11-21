@@ -91,7 +91,7 @@ _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
     _COOKIE_INLINE_RE,
     re.compile(r"(?i)\bagy_studio_session\s*=\s*[^\s;,\"'`)\]}]+"),
     re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{8,}\b"),
-    re.compile(r"\b\d{8,11}:[A-Za-z0-9_-]{24,45}\b"),
+    re.compile(r"(?<![A-Za-z0-9_.-])\d{8,11}:[A-Za-z0-9_-]{24,45}\b"),
     re.compile(r"\bAIza[0-9A-Za-z_-]{16,}\b"),
     re.compile(r"\bsk-(?:proj-|ant-|svcacct-|admin-)?[A-Za-z0-9_-]{16,}\b"),
     re.compile(r"\b(?:cfut|cfsd|cfat|ibk|ibssh|alt)_[A-Za-z0-9_-]{8,}\b"),
@@ -110,8 +110,10 @@ _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
 MAX_MESSAGE_BYTES = 32 * 1024
 MAX_TRANSCRIPT_SCAN_BYTES = 8 * 1024 * 1024
 _TRANSCRIPT_CHUNK_BYTES = 64 * 1024
+MAX_MODEL_SLUG_LEN = 160
 
 _SAFE_SLUG_RE = re.compile(r"[^A-Za-z0-9._:@/-]+")
+_SLUG_CTRL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]+")
 _CONTROLLED_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,47}$")
 _ALLOWED_JOB_STATUSES = frozenset({"queued", "running", "done", "error", "failed", "cancelled", "unknown"})
 _ALLOWED_BOT_ROLES = frozenset({"coordinator", "peer", "worker"})
@@ -254,14 +256,30 @@ def _normalize_iso_utc(raw: Any) -> tuple[datetime.datetime | None, str | None]:
 
 
 def _sanitize_slug(raw: Any, max_len: int = 64) -> str:
-    """Whitelist-sanitize an identifier/slug (never allowing absolute paths or secrets)."""
+    """Whitelist-sanitize an identifier/slug (never allowing absolute paths, traversal, or secrets).
+
+    Supports long external model refs (e.g. `gw:<id>:<org/model-name:variant>`, up to `max_len=160`)
+    without truncating or corrupting trailing characters, while rejecting control chars, `..`,
+    host paths, and credentials.
+    """
     text = str(raw or "").strip()
+    if not text:
+        return ""
+    text = _SLUG_CTRL_CHARS_RE.sub("", text).strip()
     if not text:
         return ""
     if text.startswith(("/", "~")):
         text = Path(text).name
-    text = redact_sensitive_text(text, max_len=max_len)
-    if "[REDACTED]" in text:
+    if ".." in text:
+        return "[REDACTED]"
+    red_secrets = redact_secrets_only(text)
+    if "[REDACTED]" in red_secrets:
+        return "[REDACTED]"
+    if _EMAIL_RE.search(text) or _SENSITIVE_HOST_PATH_RE.search(text):
+        return "[REDACTED]"
+    if not text.startswith("gw:") and _ABS_PATH_RE.search(text):
+        return "[REDACTED]"
+    if not text.startswith("gw:") and _TG_AND_LONG_ID_RE.search(text):
         return "[REDACTED]"
     return _SAFE_SLUG_RE.sub("_", text)[:max_len]
 
@@ -987,8 +1005,8 @@ class StudioDataSources:
                 "queue_depth": int(merged["queue_depth"] or 0),
                 "specialty": redact_sensitive_text(merged.get("specialty"), max_len=100),
                 "model_mode": _sanitize_slug(merged.get("model_mode"), max_len=32),
-                "effective_model": _sanitize_slug(merged.get("effective_model") or merged.get("active_model") or "default", max_len=64),
-                "active_model": _sanitize_slug(merged.get("active_model") or "", max_len=64),
+                "effective_model": _sanitize_slug(merged.get("effective_model") or merged.get("active_model") or "default", max_len=MAX_MODEL_SLUG_LEN),
+                "active_model": _sanitize_slug(merged.get("active_model") or "", max_len=MAX_MODEL_SLUG_LEN),
                 "default_effort": _sanitize_slug(merged.get("default_effort") or "", max_len=16),
                 "default_project": _sanitize_slug(merged.get("default_project") or "", max_len=64),
                 "last_seen": float(merged["last_seen"] or 0.0),
@@ -1066,7 +1084,7 @@ class StudioDataSources:
                 "target_bot": _sanitize_slug(j.get("target_bot"), max_len=64),
                 "status": st_enum,
                 "project": _sanitize_slug(j.get("project"), max_len=64),
-                "model": _sanitize_slug(j.get("model"), max_len=64),
+                "model": _sanitize_slug(j.get("model"), max_len=MAX_MODEL_SLUG_LEN),
                 "effort": _sanitize_slug(j.get("effort"), max_len=32),
                 "created_at": created,
                 "started_at": started or None,
@@ -1308,7 +1326,7 @@ class StudioDataSources:
                 "target_bot": _sanitize_slug(j.get("target_bot"), max_len=64),
                 "status": st_enum,
                 "project": _sanitize_slug(j.get("project"), max_len=64),
-                "model": _sanitize_slug(j.get("model"), max_len=64),
+                "model": _sanitize_slug(j.get("model"), max_len=MAX_MODEL_SLUG_LEN),
                 "effort": _sanitize_slug(j.get("effort"), max_len=32),
                 "created_at": created,
                 "started_at": started or None,

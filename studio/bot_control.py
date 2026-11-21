@@ -35,6 +35,7 @@ from .chat_service import (
 )
 from .control_plane import _find_forbidden_key_recursive
 from .data_sources import (
+    MAX_MODEL_SLUG_LEN,
     StudioDataSources,
     _SENSITIVE_HOST_PATH_RE,
     _sanitize_slug,
@@ -248,7 +249,7 @@ class StudioBotControlService:
     ) -> tuple[bool, dict[str, Any] | None, web.Response | None]:
         client_ip = self.auth_mgr.extract_client_ip(request)
 
-        # Gate 1: Strict Same-Origin
+        # Gate 1a: Strict Same-Origin
         ok_orig, err_orig = self.auth_mgr.check_same_origin(request, require_origin=True)
         if not ok_orig:
             self.audit.record(
@@ -259,6 +260,21 @@ class StudioBotControlService:
                 target_id=target_id,
             )
             return False, None, studio_auth_error(err_orig, status=403)
+
+        # Gate 1b: Sec-Fetch-Site validation when header is sent by browser
+        sfs = (request.headers.get("Sec-Fetch-Site") or "").strip().lower()
+        if sfs and sfs not in ("same-origin", "none"):
+            self.audit.record(
+                action=action,
+                status_code=403,
+                outcome="denied_sec_fetch_site",
+                client_ip=client_ip,
+                target_id=target_id,
+            )
+            return False, None, studio_auth_error(
+                "Sec-Fetch-Site 跨站写请求已拦截",
+                status=403,
+            )
 
         # Gate 2: Non-simple Content-Type
         media_type = _extract_media_type(request)
@@ -327,8 +343,8 @@ class StudioBotControlService:
     ) -> dict[str, Any]:
         models_out = [
             {
-                "id": _sanitize_slug(m.get("id"), max_len=80),
-                "label": _redact_bot_text(m.get("label") or m.get("id") or "", max_len=120),
+                "id": _sanitize_slug(m.get("id"), max_len=MAX_MODEL_SLUG_LEN),
+                "label": _redact_bot_text(m.get("label") or m.get("id") or "", max_len=160),
             }
             for m in (raw.get("models") or [])[:120]
             if isinstance(m, dict) and m.get("id")
@@ -370,10 +386,10 @@ class StudioBotControlService:
             "role": _sanitize_slug(raw.get("role") or "worker", max_len=24),
             "specialty": _redact_bot_text(raw.get("specialty") or "", max_len=160),
             "model_mode": mode_val,
-            "configured_model": _sanitize_slug(raw.get("configured_model") or "", max_len=80),
-            "effective_model": _sanitize_slug(raw.get("effective_model") or raw.get("active_model") or "default", max_len=80),
-            "dm_model": _sanitize_slug(raw.get("dm_model") or "", max_len=80),
-            "env_default_model": _sanitize_slug(raw.get("env_default_model") or "", max_len=80),
+            "configured_model": _sanitize_slug(raw.get("configured_model") or "", max_len=MAX_MODEL_SLUG_LEN),
+            "effective_model": _sanitize_slug(raw.get("effective_model") or raw.get("active_model") or "default", max_len=MAX_MODEL_SLUG_LEN),
+            "dm_model": _sanitize_slug(raw.get("dm_model") or "", max_len=MAX_MODEL_SLUG_LEN),
+            "env_default_model": _sanitize_slug(raw.get("env_default_model") or "", max_len=MAX_MODEL_SLUG_LEN),
             "default_effort": eff_val,
             "default_project": _sanitize_slug(raw.get("default_project") or "", max_len=64),
             "efforts": efforts_out,
@@ -585,7 +601,14 @@ class StudioBotControlService:
             ipc_payload["model_mode"] = norm_mode
             if norm_mode == "custom":
                 raw_m = body.get("model")
-                if not isinstance(raw_m, str) or not raw_m.strip() or len(raw_m.strip()) > 128:
+                clean_m = raw_m.strip() if isinstance(raw_m, str) else ""
+                if (
+                    not clean_m
+                    or len(clean_m) > MAX_MODEL_SLUG_LEN
+                    or ".." in clean_m
+                    or clean_m.startswith(("/", "~"))
+                    or any(ord(ch) < 32 or ord(ch) == 127 for ch in clean_m)
+                ):
                     self.audit.record(
                         action="bot.config.patch",
                         status_code=400,
@@ -599,7 +622,7 @@ class StudioBotControlService:
                         {"ok": False, "source": "studio_api", "error": "custom 模式必须提供有效的模型 slug"},
                         status=400,
                     )
-                ipc_payload["model"] = raw_m.strip()
+                ipc_payload["model"] = clean_m
             else:
                 if body.get("model") not in (None, ""):
                     self.audit.record(

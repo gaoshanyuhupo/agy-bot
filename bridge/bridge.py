@@ -1859,6 +1859,7 @@ def _get_gateways_map():
         if os.path.isfile(cand):
             gw_file = cand
     gws = gateway_adapter.load_gateways_config(gateways_file=gw_file, gateways_json=gw_json)
+    _gateway_runtime.sync_gateways(gws)
     with _gateway_lock:
         if _gateway_adapter_srv is not None:
             _gateway_adapter_srv.update_gateways(gws)
@@ -7482,17 +7483,31 @@ def _studio_ipc_resolve_role(user_id):
 
 def _studio_ipc_get_meta():
     cfg = _current_bot_cfg()
+    sc = get_scope_state(PRIMARY_SCOPE_KEY)
     try:
         models_raw = agy_models(include_gateways=True, force_refresh=False)
     except Exception:
         models_raw = []
-    models_out = [{"id": str(slug), "label": str(desc)} for slug, desc in models_raw[:120]]
+    models_out = [
+        {"id": _sanitize_ipc_slug(slug, max_len=MAX_IPC_MODEL_SLUG_LEN), "label": _redact_ipc_text(desc, max_len=160)}
+        for slug, desc in models_raw[:120]
+    ]
     try:
         projs_raw = list_agy_projects()
     except Exception:
         projs_raw = []
     # Never expose raw filesystem paths in Studio IPC meta
     projects_out = [{"id": str(p.get("id") or ""), "name": str(p.get("name") or "")} for p in projs_raw if p.get("id")]
+    model_mode = str(cfg.get("model_mode") or bot_bus.MODEL_MODE_DEFAULT)
+    configured_model = str(cfg.get("configured_model") or "")
+    dm_eff = _resolve_dm_effective_model() or ""
+    if model_mode == bot_bus.MODEL_MODE_CUSTOM:
+        effective_model = configured_model or dm_eff
+    elif model_mode == bot_bus.MODEL_MODE_FOLLOW:
+        effective_model = dm_eff
+    else:
+        effective_model = ENV_BOT_MODEL or dm_eff
+    default_effort = str(sc.get("effort") or cfg.get("default_effort") or ENV_BOT_EFFORT or "").strip().lower()
     with session_lock:
         busy = bool(turn_running)
         active_web_id = turn_running_web_id
@@ -7504,7 +7519,10 @@ def _studio_ipc_get_meta():
         "busy": busy,
         "active_turn_id": active_web_id,
         "active_cid": active_cid,
-        "active_model": _resolve_dm_effective_model() or "",
+        "model_mode": model_mode,
+        "active_model": _sanitize_ipc_slug(effective_model or dm_eff or "", max_len=MAX_IPC_MODEL_SLUG_LEN),
+        "effective_model": _sanitize_ipc_slug(effective_model or "", max_len=MAX_IPC_MODEL_SLUG_LEN),
+        "default_effort": default_effort if default_effort in ("", "low", "medium", "high", "xhigh", "max") else "",
         "default_project": current_project(PRIMARY_SCOPE_KEY) or "",
         "efforts": list(EFFORTS),
         "models": models_out,
@@ -7802,7 +7820,7 @@ SKILLS_SEARCH_DIRS = None  # Optional override list of `(scope, dir_path)` for t
 
 _IPC_SECRET_PATTERNS = (
     re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{8,}\b"),
-    re.compile(r"\b\d{8,11}:[A-Za-z0-9_-]{24,45}\b"),
+    re.compile(r"(?<![A-Za-z0-9_.-])\d{8,11}:[A-Za-z0-9_-]{24,45}\b"),
     re.compile(r"\bAIza[0-9A-Za-z_-]{16,}\b"),
     re.compile(r"\bsk-(?:proj-|ant-|svcacct-|admin-)?[A-Za-z0-9_-]{16,}\b"),
     re.compile(r"\b(?:cfut|cfsd|cfat|ibk|ibssh|alt)_[A-Za-z0-9_-]{8,}\b"),
@@ -7821,7 +7839,9 @@ _IPC_HOST_PATH_RE = re.compile(
     r"|[A-Za-z]:[\\/][^\s,'\"`<>)\]}]+"
     r"|[^\s(\[\{\"'`=:;,<>)\]}+\-]+\.sock\b)"
 )
+MAX_IPC_MODEL_SLUG_LEN = 160
 _IPC_SLUG_CLEAN_RE = re.compile(r"[^A-Za-z0-9._:@/-]+")
+_IPC_CTRL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]+")
 
 
 def _redact_ipc_text(raw, max_len=160):
@@ -7841,10 +7861,17 @@ def _sanitize_ipc_slug(raw, max_len=64):
     text = str(raw or "").strip()
     if not text:
         return ""
+    text = _IPC_CTRL_CHARS_RE.sub("", text).strip()
+    if not text:
+        return ""
     if text.startswith(("/", "~")):
         text = os.path.basename(text)
-    text = _redact_ipc_text(text, max_len=max_len)
-    if "[REDACTED]" in text:
+    if ".." in text:
+        return "[REDACTED]"
+    for pat in _IPC_SECRET_PATTERNS:
+        if pat.search(text):
+            return "[REDACTED]"
+    if _IPC_HOST_PATH_RE.search(text):
         return "[REDACTED]"
     return _IPC_SLUG_CLEAN_RE.sub("_", text)[:max_len]
 
@@ -8241,7 +8268,10 @@ def _studio_ipc_get_bot_config():
         models_raw = agy_models(include_gateways=True, force_refresh=False)
     except Exception:
         models_raw = []
-    models_out = [{"id": str(slug), "label": str(desc)} for slug, desc in models_raw[:120]]
+    models_out = [
+        {"id": _sanitize_ipc_slug(slug, max_len=MAX_IPC_MODEL_SLUG_LEN), "label": _redact_ipc_text(desc, max_len=160)}
+        for slug, desc in models_raw[:120]
+    ]
     try:
         projs_raw = list_agy_projects()
     except Exception:
@@ -8270,10 +8300,10 @@ def _studio_ipc_get_bot_config():
         "role": _sanitize_ipc_slug(cfg.get("role") or "peer", max_len=24),
         "specialty": _redact_ipc_text(cfg.get("specialty") or "", max_len=160),
         "model_mode": model_mode,
-        "configured_model": _sanitize_ipc_slug(configured_model, max_len=80),
-        "effective_model": _sanitize_ipc_slug(effective_model, max_len=80),
-        "dm_model": _sanitize_ipc_slug(_resolve_dm_raw_model() or "", max_len=80),
-        "env_default_model": _sanitize_ipc_slug(ENV_BOT_MODEL or "", max_len=80),
+        "configured_model": _sanitize_ipc_slug(configured_model, max_len=MAX_IPC_MODEL_SLUG_LEN),
+        "effective_model": _sanitize_ipc_slug(effective_model, max_len=MAX_IPC_MODEL_SLUG_LEN),
+        "dm_model": _sanitize_ipc_slug(_resolve_dm_raw_model() or "", max_len=MAX_IPC_MODEL_SLUG_LEN),
+        "env_default_model": _sanitize_ipc_slug(ENV_BOT_MODEL or "", max_len=MAX_IPC_MODEL_SLUG_LEN),
         "default_effort": default_effort if default_effort in ("", "low", "medium", "high", "xhigh", "max") else "",
         "default_project": _sanitize_ipc_slug(current_project(PRIMARY_SCOPE_KEY) or cfg.get("default_project") or "", max_len=64),
         "efforts": list(EFFORTS),
@@ -8284,6 +8314,54 @@ def _studio_ipc_get_bot_config():
         "busy": busy,
         "queue_depth": job_q.qsize(),
     }
+
+
+def _is_allowed_bot_config_model(clean_model):
+    """Hot-validate a native or external gateway model slug against current catalog & gateways.json."""
+    if (
+        not isinstance(clean_model, str)
+        or not clean_model
+        or len(clean_model) > MAX_IPC_MODEL_SLUG_LEN
+        or ".." in clean_model
+        or clean_model.startswith(("/", "~"))
+        or _IPC_CTRL_CHARS_RE.search(clean_model)
+    ):
+        return False
+
+    try:
+        catalog = agy_models(include_gateways=True, force_refresh=False) or []
+    except Exception:
+        catalog = []
+    allowed_models = {str(slug) for slug, _ in catalog}
+    if clean_model in allowed_models:
+        return True
+
+    # Support explicit `gw:<gw_id>:<upstream_model>` even when upstream_model is unique across gateways
+    explicit = gateway_adapter.parse_gateway_model_ref(clean_model)
+    if explicit is not None:
+        gid, upstream = explicit
+        try:
+            gws = _get_gateways_map()
+        except Exception:
+            return False
+        gw = gws.get(gid)
+        if gw is None or not gw.enabled:
+            return False
+        if not gateway_adapter.model_matches_filters(upstream, gw.include_models, gw.exclude_models):
+            return False
+        try:
+            gw_catalogs = _get_gateway_catalogs({gid: gw}, force_refresh=False)
+            exposed = list(gw_catalogs.get(gid) or ())
+        except Exception:
+            exposed = []
+        for static_m in gw.models:
+            if static_m not in exposed and gateway_adapter.model_matches_filters(
+                static_m, gw.include_models, gw.exclude_models
+            ):
+                exposed.append(static_m)
+        return upstream in exposed
+
+    return False
 
 
 def _studio_ipc_update_bot_config(req):
@@ -8315,11 +8393,7 @@ def _studio_ipc_update_bot_config(req):
             if not isinstance(raw_m, str) or not raw_m.strip():
                 return 400, {"ok": False, "error": "custom 模式必须指定具体模型 slug"}
             clean_model = raw_m.strip()
-            try:
-                allowed_models = {str(slug) for slug, _ in (agy_models(include_gateways=True, force_refresh=False) or [])}
-            except Exception:
-                allowed_models = set()
-            if clean_model not in allowed_models:
+            if not _is_allowed_bot_config_model(clean_model):
                 return 400, {"ok": False, "error": "指定模型不在可用模型白名单内"}
         else:
             if raw_m is not None and str(raw_m).strip() != "":

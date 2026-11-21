@@ -27,13 +27,32 @@ import {
   Shield,
   ShieldCheck,
   Sliders,
-  Sparkles,
   Trash2,
   X,
 } from "lucide-react";
-import { StudioApiError, fetchBots, fetchModels, fetchOpenBaoConfig } from "../api";
+import {
+  StudioApiError,
+  createGateway,
+  deleteGateway,
+  fetchBots,
+  fetchGateways,
+  fetchModels,
+  fetchOpenBaoConfig,
+  patchGateway,
+  probeGatewayById,
+  probeGatewayDraft,
+  updateGateway,
+} from "../api";
 import type {
   BotRosterItem,
+  GatewayDialectId,
+  GatewayEffortMode,
+  GatewayItem,
+  GatewayMaxTokensField,
+  GatewayMutationPayload,
+  GatewayProbeResponse,
+  GatewaySecretBackend,
+  GatewaySecretStoreStatus,
   ModelOption,
   NavTab,
   OpenBaoConfigResponse,
@@ -46,33 +65,17 @@ interface ExternalModelsViewProps {
   onSessionRevoked?: (reason: string) => void;
 }
 
-type DialectId =
-  | "new_api"
-  | "cpa"
-  | "openrouter"
-  | "deepseek"
-  | "zhipu"
-  | "ark"
-  | "litellm"
-  | "openai_2api"
-  | "openai_strict";
-
-type EffortMode = "body" | "model_paren" | "none";
-type MaxTokensField = "max_completion_tokens" | "max_tokens" | "omit";
-type CredentialKind = "api_key" | "api_key_env" | "server_cmd_readonly";
-
 interface DialectPreset {
-  id: DialectId;
+  id: GatewayDialectId;
   label: string;
   shortLabel: string;
   tagline: string;
   placeholderUrl: string;
-  sampleModels: string[];
   supports_reasoning_effort: boolean;
-  effort_mode: EffortMode;
+  effort_mode: GatewayEffortMode;
   flatten_system_content: boolean;
   strip_stream_options: boolean;
-  max_tokens_field: MaxTokensField;
+  max_tokens_field: GatewayMaxTokensField;
   max_tokens_cap: number | null;
   adaptive_400_fallback: boolean;
 }
@@ -82,75 +85,50 @@ interface ExtraHeaderPair {
   value: string;
 }
 
-interface GatewayRecord {
-  id: string;
-  name: string;
-  base_url: string;
-  dialect: DialectId;
-  enabled: boolean;
-  source: "live" | "preview";
-  credential_kind: CredentialKind;
-  api_key_masked: string;
-  api_key_env: string;
-  include_models: string[];
-  exclude_models: string[];
-  models: string[];
-  discovered_models: string[];
-  supports_reasoning_effort: boolean;
-  effort_mode: EffortMode;
-  flatten_system_content: boolean;
-  strip_stream_options: boolean;
-  max_tokens_field: MaxTokensField;
-  max_tokens_cap: number | null;
-  adaptive_400_fallback: boolean;
-  timeout_s: number;
-  extra_headers: ExtraHeaderPair[];
-  updated_at?: number;
-}
-
-interface ProbeResult {
-  ok: boolean;
-  latencyMs: number;
-  discoveredCount: number;
-  exposedCount: number;
-  endpoint: string;
-  summary: string;
+interface ProbeStateRecord extends GatewayProbeResponse {
   checkedAt: string;
 }
 
-const PREVIEW_STORAGE_KEY = "agy_studio_external_gateways_preview_v1";
 const GW_ID_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 const ENV_NAME_RE = /^[A-Z_][A-Z0-9_]{0,63}$/;
 const MODEL_PROVIDER_PREFIX_RE = /^\[([^\]]+)\]\s*(.+)$/;
-const FORBIDDEN_IDS = new Set(["__proto__", "prototype", "constructor"]);
-const SENSITIVE_HEADER_KEYS = new Set([
+const FORBIDDEN_IDS = new Set(["__proto__", "prototype", "constructor", "probe"]);
+const SENSITIVE_HEADER_TOKENS = [
   "authorization",
-  "x-api-key",
-  "api-key",
   "proxy-authorization",
   "cookie",
-  "x-auth-token",
-]);
+  "token",
+  "secret",
+  "key",
+  "auth",
+  "passwd",
+  "password",
+  "credential",
+];
 
 function isSensitiveHeaderKey(key: string): boolean {
-  return SENSITIVE_HEADER_KEYS.has(key.trim().toLowerCase());
+  const low = key.trim().toLowerCase();
+  if (!low) return false;
+  return SENSITIVE_HEADER_TOKENS.some((tok) => low.includes(tok));
 }
 
-function sanitizeExtraHeaders(headers: ExtraHeaderPair[]): ExtraHeaderPair[] {
-  return headers
-    .map((h) => {
-      const k = h.key.trim();
-      const v = h.value.trim();
-      if (!k) return null;
-      return {
-        key: k,
-        value: isSensitiveHeaderKey(k) ? "[REDACTED]" : v,
-      };
-    })
-    .filter((h): h is ExtraHeaderPair => h !== null);
+function headersRecordToPairs(headers: Record<string, string> | undefined): ExtraHeaderPair[] {
+  if (!headers) return [];
+  return Object.entries(headers).map(([key, value]) => ({ key, value }));
 }
 
-// 1:1 mirror of DIALECT_PRESETS in bridge/gateway_adapter.py
+function pairsToHeadersRecord(pairs: ExtraHeaderPair[]): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const p of pairs) {
+    const k = p.key.trim();
+    const v = p.value.trim();
+    if (!k) continue;
+    out[k] = v;
+  }
+  return out;
+}
+
+// 1:1 mirror of DIALECT_PRESETS in bridge/gateway_adapter.py (all template URLs use safe .example.com / loopback)
 const DIALECT_PRESETS: DialectPreset[] = [
   {
     id: "new_api",
@@ -158,13 +136,6 @@ const DIALECT_PRESETS: DialectPreset[] = [
     shortLabel: "New API",
     tagline: "最常见中转站，默认拍平 system、裁剪 stream_options 并启用 400 降级",
     placeholderUrl: "https://api.example-newapi.com/v1",
-    sampleModels: [
-      "claude-sonnet-4-5",
-      "gpt-5.1",
-      "deepseek-chat",
-      "dall-e-3-image-hd",
-      "text-embedding-3-large",
-    ],
     supports_reasoning_effort: true,
     effort_mode: "body",
     flatten_system_content: true,
@@ -179,7 +150,6 @@ const DIALECT_PRESETS: DialectPreset[] = [
     shortLabel: "CPA",
     tagline: "完整支持 reasoning_effort 与 max_completion_tokens，保留多段 system",
     placeholderUrl: "https://cpa.example.com/v1",
-    sampleModels: ["team/gpt-5.4", "team/claude-sonnet-4-6", "team/gemini-2.5-pro"],
     supports_reasoning_effort: true,
     effort_mode: "body",
     flatten_system_content: false,
@@ -194,12 +164,6 @@ const DIALECT_PRESETS: DialectPreset[] = [
     shortLabel: "OpenRouter",
     tagline: "聚合全球主流模型，支持 body effort 且不限制 max_tokens_cap",
     placeholderUrl: "https://openrouter.example.com/api/v1",
-    sampleModels: [
-      "anthropic/claude-sonnet-4",
-      "openai/gpt-5",
-      "google/gemini-2.5-pro",
-      "deepseek/deepseek-r1",
-    ],
     supports_reasoning_effort: true,
     effort_mode: "body",
     flatten_system_content: false,
@@ -214,7 +178,6 @@ const DIALECT_PRESETS: DialectPreset[] = [
     shortLabel: "DeepSeek",
     tagline: "官方兼容协议，默认 8192 输出上限，自动剥离不兼容扩展字段",
     placeholderUrl: "https://deepseek.example.com/v1",
-    sampleModels: ["deepseek-chat", "deepseek-reasoner"],
     supports_reasoning_effort: false,
     effort_mode: "none",
     flatten_system_content: true,
@@ -229,7 +192,6 @@ const DIALECT_PRESETS: DialectPreset[] = [
     shortLabel: "智谱 GLM",
     tagline: "BigModel v4 兼容模式，默认拍平 system 并启用 400 自适应降级",
     placeholderUrl: "https://bigmodel.example.com/api/paas/v4",
-    sampleModels: ["glm-4.5", "glm-4-plus", "glm-4-air", "embedding-3"],
     supports_reasoning_effort: false,
     effort_mode: "none",
     flatten_system_content: true,
@@ -244,7 +206,6 @@ const DIALECT_PRESETS: DialectPreset[] = [
     shortLabel: "火山 Ark",
     tagline: "支持推理强度 body 参数，兼容 Doubao 与方舟托管 DeepSeek 端点",
     placeholderUrl: "https://ark.example.com/api/v3",
-    sampleModels: ["doubao-1.5-thinking-pro", "deepseek-r1-250528"],
     supports_reasoning_effort: true,
     effort_mode: "body",
     flatten_system_content: true,
@@ -255,11 +216,10 @@ const DIALECT_PRESETS: DialectPreset[] = [
   },
   {
     id: "litellm",
-    label: "LiteLLM",
+    label: "LiteLLM / 本机服务",
     shortLabel: "LiteLLM",
-    tagline: "自建 LiteLLM Proxy，直通 max_completion_tokens 与结构化 system",
+    tagline: "自建 LiteLLM / Ollama / vLLM Proxy，直通 max_completion_tokens 与结构化 system",
     placeholderUrl: "http://127.0.0.1:4000/v1",
-    sampleModels: ["gpt-5", "claude-sonnet-4", "o3-mini"],
     supports_reasoning_effort: true,
     effort_mode: "body",
     flatten_system_content: false,
@@ -274,7 +234,6 @@ const DIALECT_PRESETS: DialectPreset[] = [
     shortLabel: "2API",
     tagline: "采用 model(effort) 括号模式传递推理强度，适配各类逆向/二开中转",
     placeholderUrl: "https://2api.example.com/v1",
-    sampleModels: ["gpt-5", "claude-sonnet-4", "o4-mini"],
     supports_reasoning_effort: true,
     effort_mode: "model_paren",
     flatten_system_content: true,
@@ -288,8 +247,7 @@ const DIALECT_PRESETS: DialectPreset[] = [
     label: "通用 OpenAI 兼容",
     shortLabel: "OpenAI 兼容",
     tagline: "保守兼容预设，仅发送标准 OpenAI 字段，适配任意自建兼容端点",
-    placeholderUrl: "https://api.openai.com/v1",
-    sampleModels: ["gpt-4.1", "gpt-4o-mini"],
+    placeholderUrl: "https://openai.example.com/v1",
     supports_reasoning_effort: false,
     effort_mode: "none",
     flatten_system_content: true,
@@ -300,16 +258,16 @@ const DIALECT_PRESETS: DialectPreset[] = [
   },
 ];
 
-const DIALECT_MAP: Record<DialectId, DialectPreset> = DIALECT_PRESETS.reduce(
+const DIALECT_MAP: Record<GatewayDialectId, DialectPreset> = DIALECT_PRESETS.reduce(
   (acc, item) => {
     acc[item.id] = item;
     return acc;
   },
-  {} as Record<DialectId, DialectPreset>,
+  {} as Record<GatewayDialectId, DialectPreset>,
 );
 
 function getDialectPreset(id: string): DialectPreset {
-  return DIALECT_MAP[id as DialectId] || DIALECT_MAP.openai_strict;
+  return DIALECT_MAP[id as GatewayDialectId] || DIALECT_MAP.openai_strict;
 }
 
 function slugifyGatewayId(name: string): string {
@@ -323,18 +281,6 @@ function slugifyGatewayId(name: string): string {
     .slice(0, 32);
   if (!base || FORBIDDEN_IDS.has(base)) return "";
   return base;
-}
-
-function maskApiKey(raw: string): string {
-  const trimmed = raw.trim();
-  if (!trimmed) return "";
-  if (trimmed.includes("••••")) return trimmed;
-  if (trimmed.length <= 6) {
-    return `${trimmed.slice(0, 2)}••••`;
-  }
-  const prefix = trimmed.startsWith("sk-") ? "sk-" : trimmed.slice(0, 3);
-  const suffix = trimmed.slice(-4);
-  return `${prefix}••••${suffix}`;
 }
 
 function parsePatternList(raw: string): string[] {
@@ -396,164 +342,79 @@ function modelMatchesFilters(
   return true;
 }
 
-function buildUpstreamModelsUrl(baseUrl: string): string {
-  const clean = (baseUrl || "").trim().replace(/\/+$/, "");
-  if (!clean) return "(由后端 gateways.json 托管)/v1/models";
-  try {
-    const parsed = new URL(clean);
-    if (parsed.pathname.replace(/^\/+|\/+$/g, "")) {
-      return `${clean}/models`;
-    }
-    return `${clean}/v1/models`;
-  } catch {
-    return `${clean}/v1/models`;
+function renderSecretBackendBadge(gw: GatewayItem) {
+  const backend: GatewaySecretBackend = gw.secret_backend;
+  if (gw.read_only_cmd || backend === "host_cmd_readonly") {
+    return (
+      <span className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-200 border border-amber-500/30">
+        <Lock className="w-2.5 h-2.5 text-amber-400" />
+        宿主机命令（只读）
+      </span>
+    );
   }
+  if (backend === "openbao") {
+    return (
+      <span className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-200 border border-emerald-500/30">
+        <ShieldCheck className="w-2.5 h-2.5 text-emerald-400" />
+        OpenBao KV
+        {gw.api_key_hint ? ` · ${gw.api_key_hint}` : ""}
+      </span>
+    );
+  }
+  if (backend === "local_0600") {
+    return (
+      <span className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-sky-500/15 text-sky-200 border border-sky-500/30">
+        <Lock className="w-2.5 h-2.5 text-sky-400" />
+        本机 0600
+        {gw.api_key_hint ? ` · ${gw.api_key_hint}` : ""}
+      </span>
+    );
+  }
+  if (backend === "env") {
+    return (
+      <span className="inline-flex items-center gap-1 text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-800/90 text-sky-300 border border-slate-700/80">
+        <KeyRound className="w-2.5 h-2.5" />
+        环境变量 · {gw.api_key_env || "ENV"}
+      </span>
+    );
+  }
+  if (backend === "security_card") {
+    return (
+      <span className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-violet-500/15 text-violet-200 border border-violet-500/30">
+        <CreditCard className="w-2.5 h-2.5 text-violet-400" />
+        安全卡（预留）
+      </span>
+    );
+  }
+  if (backend === "legacy_plaintext") {
+    return (
+      <span className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-200 border border-amber-500/30">
+        <KeyRound className="w-2.5 h-2.5 text-amber-400" />
+        待迁移密钥 · {gw.api_key_hint || "已脱敏"}
+      </span>
+    );
+  }
+  return (
+    <span className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700/70">
+      无密钥（开放端点）
+    </span>
+  );
 }
 
-function inferDialectFromProvider(label: string, id: string): DialectId {
-  const s = `${label} ${id}`.toLowerCase();
-  if (s.includes("cpa") || s.includes("cliproxy")) return "cpa";
-  if (s.includes("openrouter")) return "openrouter";
-  if (s.includes("deepseek")) return "deepseek";
-  if (s.includes("zhipu") || s.includes("glm") || s.includes("bigmodel")) return "zhipu";
-  if (s.includes("ark") || s.includes("doubao") || s.includes("volces")) return "ark";
-  if (s.includes("litellm")) return "litellm";
-  if (s.includes("2api")) return "openai_2api";
-  if (s.includes("newapi") || s.includes("new-api") || s.includes("oneapi") || s.includes("one-api")) {
-    return "new_api";
-  }
-  return "openai_strict";
-}
-
-function loadPreviewGateways(): GatewayRecord[] {
-  try {
-    const raw = window.localStorage.getItem(PREVIEW_STORAGE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    const out: GatewayRecord[] = [];
-    for (const item of parsed) {
-      if (!item || typeof item !== "object") continue;
-      const rec = item as Record<string, unknown>;
-      const id = typeof rec.id === "string" ? rec.id.trim().toLowerCase() : "";
-      if (!id || !GW_ID_RE.test(id) || FORBIDDEN_IDS.has(id)) continue;
-      const dialect = getDialectPreset(typeof rec.dialect === "string" ? rec.dialect : "openai_strict").id;
-      const preset = DIALECT_MAP[dialect];
-      const credKind: CredentialKind =
-        rec.credential_kind === "api_key_env"
-          ? "api_key_env"
-          : rec.credential_kind === "server_cmd_readonly"
-            ? "server_cmd_readonly"
-            : "api_key";
-      const rawMasked = typeof rec.api_key_masked === "string" ? rec.api_key_masked : "";
-      out.push({
-        id,
-        name: typeof rec.name === "string" && rec.name.trim() ? rec.name.trim() : id,
-        base_url: typeof rec.base_url === "string" ? rec.base_url.trim() : "",
-        dialect,
-        enabled: typeof rec.enabled === "boolean" ? rec.enabled : true,
-        source: "preview",
-        credential_kind: credKind,
-        // Defensive: always ensure stored value is masked even if manually tampered
-        api_key_masked: rawMasked ? maskApiKey(rawMasked) : "",
-        api_key_env: typeof rec.api_key_env === "string" ? rec.api_key_env.trim() : "",
-        include_models: Array.isArray(rec.include_models)
-          ? rec.include_models.filter((x): x is string => typeof x === "string" && Boolean(x.trim()))
-          : [],
-        exclude_models: Array.isArray(rec.exclude_models)
-          ? rec.exclude_models.filter((x): x is string => typeof x === "string" && Boolean(x.trim()))
-          : [],
-        models: Array.isArray(rec.models)
-          ? rec.models.filter((x): x is string => typeof x === "string" && Boolean(x.trim()))
-          : [],
-        discovered_models: Array.isArray(rec.discovered_models)
-          ? rec.discovered_models.filter((x): x is string => typeof x === "string" && Boolean(x.trim()))
-          : [],
-        supports_reasoning_effort:
-          typeof rec.supports_reasoning_effort === "boolean"
-            ? rec.supports_reasoning_effort
-            : preset.supports_reasoning_effort,
-        effort_mode:
-          rec.effort_mode === "body" || rec.effort_mode === "model_paren" || rec.effort_mode === "none"
-            ? rec.effort_mode
-            : preset.effort_mode,
-        flatten_system_content:
-          typeof rec.flatten_system_content === "boolean"
-            ? rec.flatten_system_content
-            : preset.flatten_system_content,
-        strip_stream_options:
-          typeof rec.strip_stream_options === "boolean"
-            ? rec.strip_stream_options
-            : preset.strip_stream_options,
-        max_tokens_field:
-          rec.max_tokens_field === "max_completion_tokens" ||
-          rec.max_tokens_field === "max_tokens" ||
-          rec.max_tokens_field === "omit"
-            ? rec.max_tokens_field
-            : preset.max_tokens_field,
-        max_tokens_cap:
-          typeof rec.max_tokens_cap === "number" && Number.isFinite(rec.max_tokens_cap) && rec.max_tokens_cap > 0
-            ? Math.floor(rec.max_tokens_cap)
-            : null,
-        adaptive_400_fallback:
-          typeof rec.adaptive_400_fallback === "boolean"
-            ? rec.adaptive_400_fallback
-            : preset.adaptive_400_fallback,
-        timeout_s:
-          typeof rec.timeout_s === "number" && Number.isFinite(rec.timeout_s) && rec.timeout_s >= 5
-            ? rec.timeout_s
-            : 300,
-        extra_headers: Array.isArray(rec.extra_headers)
-          ? sanitizeExtraHeaders(
-              rec.extra_headers.filter(
-                (h): h is ExtraHeaderPair =>
-                  Boolean(h) &&
-                  typeof (h as ExtraHeaderPair).key === "string" &&
-                  typeof (h as ExtraHeaderPair).value === "string",
-              ),
-            )
-          : [],
-        updated_at: typeof rec.updated_at === "number" ? rec.updated_at : undefined,
-      });
-    }
-    return out;
-  } catch {
-    return [];
-  }
-}
-
-function savePreviewGateways(list: GatewayRecord[]): void {
-  try {
-    const safeList = list
-      .filter((g) => g.source === "preview")
-      .map((g) => ({
-        ...g,
-        // Never persist plaintext API keys or sensitive header values into localStorage
-        api_key_masked: g.api_key_masked ? maskApiKey(g.api_key_masked) : "",
-        extra_headers: sanitizeExtraHeaders(g.extra_headers),
-      }));
-    window.localStorage.setItem(PREVIEW_STORAGE_KEY, JSON.stringify(safeList));
-  } catch {
-    // Ignore storage quota errors
-  }
-}
-
-interface ParsedExternalCatalog {
-  liveGateways: GatewayRecord[];
+interface ParsedModelCatalog {
   nativeCount: number;
   externalModelCount: number;
-  modelOptionsByGateway: Record<string, { slug: string; upstream: string; label: string }[]>;
+  byGatewayId: Record<string, { slug: string; upstream: string; label: string }[]>;
 }
 
-function extractExternalCatalog(models: ModelOption[]): ParsedExternalCatalog {
-  const groups = new Map<
-    string,
-    {
-      id: string;
-      name: string;
-      models: { slug: string; upstream: string; label: string }[];
-    }
-  >();
+function indexLiveModels(models: ModelOption[], gateways: GatewayItem[]): ParsedModelCatalog {
+  const byGatewayId: Record<string, { slug: string; upstream: string; label: string }[]> = {};
+  const nameToId = new Map<string, string>();
+  for (const gw of gateways) {
+    nameToId.set(gw.name.trim().toLowerCase(), gw.id);
+    nameToId.set(gw.id.trim().toLowerCase(), gw.id);
+  }
+
   let nativeCount = 0;
   let externalModelCount = 0;
 
@@ -580,81 +441,41 @@ function extractExternalCatalog(models: ModelOption[]): ParsedExternalCatalog {
         gwId = rest.slice(0, colonIdx).trim().toLowerCase();
       }
     }
-    if (!gwId || !GW_ID_RE.test(gwId)) {
-      gwId = slugifyGatewayId(providerLabel) || "external";
+    if (!gwId) {
+      gwId =
+        nameToId.get(providerLabel.toLowerCase()) ||
+        slugifyGatewayId(providerLabel) ||
+        "external";
     }
-
-    const existing = groups.get(gwId);
-    if (existing) {
-      existing.models.push({ slug: item.id, upstream: upstreamModel, label });
-    } else {
-      groups.set(gwId, {
-        id: gwId,
-        name: providerLabel,
-        models: [{ slug: item.id, upstream: upstreamModel, label }],
-      });
-    }
+    if (!byGatewayId[gwId]) byGatewayId[gwId] = [];
+    byGatewayId[gwId].push({ slug: item.id, upstream: upstreamModel, label });
   }
 
-  const liveGateways: GatewayRecord[] = [];
-  const modelOptionsByGateway: Record<string, { slug: string; upstream: string; label: string }[]> =
-    {};
-
-  for (const grp of groups.values()) {
-    const dialect = inferDialectFromProvider(grp.name, grp.id);
-    const preset = DIALECT_MAP[dialect];
-    modelOptionsByGateway[grp.id] = grp.models;
-    liveGateways.push({
-      id: grp.id,
-      name: grp.name,
-      base_url: "",
-      dialect,
-      enabled: true,
-      source: "live",
-      credential_kind: "server_cmd_readonly",
-      api_key_masked: "",
-      api_key_env: "",
-      include_models: [],
-      exclude_models: [],
-      models: [],
-      discovered_models: grp.models.map((m) => m.upstream),
-      supports_reasoning_effort: preset.supports_reasoning_effort,
-      effort_mode: preset.effort_mode,
-      flatten_system_content: preset.flatten_system_content,
-      strip_stream_options: preset.strip_stream_options,
-      max_tokens_field: preset.max_tokens_field,
-      max_tokens_cap: preset.max_tokens_cap,
-      adaptive_400_fallback: preset.adaptive_400_fallback,
-      timeout_s: 300,
-      extra_headers: [],
-    });
-  }
-
-  return { liveGateways, nativeCount, externalModelCount, modelOptionsByGateway };
+  return { nativeCount, externalModelCount, byGatewayId };
 }
 
 interface GatewayEditorState {
   mode: "create" | "edit";
-  editingLiveOrigin: boolean;
   name: string;
   id: string;
   idTouched: boolean;
   base_url: string;
-  dialect: DialectId;
+  dialect: GatewayDialectId;
   enabled: boolean;
-  credential_kind: CredentialKind;
+  credential_kind: "api_key" | "api_key_env" | "none";
   api_key_input: string;
-  api_key_masked_existing: string;
+  api_key_hint_existing: string;
+  secret_backend_existing: GatewaySecretBackend;
   api_key_env: string;
   include_models_text: string;
   exclude_models_text: string;
   static_models_text: string;
   discovered_models: string[];
   supports_reasoning_effort: boolean;
-  effort_mode: EffortMode;
+  effort_mode: GatewayEffortMode;
   flatten_system_content: boolean;
   strip_stream_options: boolean;
-  max_tokens_field: MaxTokensField;
+  max_tokens_field: GatewayMaxTokensField;
   max_tokens_cap_text: string;
   adaptive_400_fallback: boolean;
   timeout_s_text: string;
@@ -662,11 +483,10 @@ interface GatewayEditorState {
   advancedOpen: boolean;
 }
 
-function makeEditorStateFromPreset(dialect: DialectId = "new_api"): GatewayEditorState {
+function makeEditorStateFromPreset(dialect: GatewayDialectId = "new_api"): GatewayEditorState {
   const preset = DIALECT_MAP[dialect];
   return {
     mode: "create",
-    editingLiveOrigin: false,
     name: "",
     id: "",
     idTouched: false,
@@ -675,12 +495,13 @@ function makeEditorStateFromPreset(dialect: DialectId = "new_api"): GatewayEdito
     enabled: true,
     credential_kind: "api_key",
     api_key_input: "",
-    api_key_masked_existing: "",
+    api_key_hint_existing: "",
+    secret_backend_existing: "none",
     api_key_env: "",
     include_models_text: "",
     exclude_models_text: "*-image-*, *-embedding-*",
     static_models_text: "",
-    discovered_models: [...preset.sampleModels],
+    discovered_models: [],
     supports_reasoning_effort: preset.supports_reasoning_effort,
     effort_mode: preset.effort_mode,
     flatten_system_content: preset.flatten_system_content,
@@ -694,27 +515,33 @@ function makeEditorStateFromPreset(dialect: DialectId = "new_api"): GatewayEdito
   };
 }
 
-function makeEditorStateFromRecord(gw: GatewayRecord): GatewayEditorState {
+function makeEditorStateFromRecord(
+  gw: GatewayItem,
+  knownDiscovered: string[],
+): GatewayEditorState {
+  const credKind: "api_key" | "api_key_env" | "none" =
+    gw.credential_kind === "api_key_env"
+      ? "api_key_env"
+      : gw.credential_kind === "none"
+        ? "none"
+        : "api_key";
   return {
     mode: "edit",
-    editingLiveOrigin: gw.source === "live",
     name: gw.name,
     id: gw.id,
     idTouched: true,
-    base_url: gw.base_url || getDialectPreset(gw.dialect).placeholderUrl,
+    base_url: gw.base_url,
     dialect: gw.dialect,
     enabled: gw.enabled,
-    credential_kind: gw.credential_kind,
+    credential_kind: credKind,
     api_key_input: "",
-    api_key_masked_existing: gw.api_key_masked,
+    api_key_hint_existing: gw.api_key_hint,
+    secret_backend_existing: gw.secret_backend,
     api_key_env: gw.api_key_env,
     include_models_text: gw.include_models.join(", "),
     exclude_models_text: gw.exclude_models.join(", "),
     static_models_text: gw.models.join(", "),
-    discovered_models:
-      gw.discovered_models.length > 0
-        ? [...gw.discovered_models]
-        : [...getDialectPreset(gw.dialect).sampleModels],
+    discovered_models: [...knownDiscovered],
     supports_reasoning_effort: gw.supports_reasoning_effort,
     effort_mode: gw.effort_mode,
     flatten_system_content: gw.flatten_system_content,
@@ -723,7 +550,7 @@ function makeEditorStateFromRecord(gw: GatewayRecord): GatewayEditorState {
     max_tokens_cap_text: gw.max_tokens_cap ? String(gw.max_tokens_cap) : "",
     adaptive_400_fallback: gw.adaptive_400_fallback,
     timeout_s_text: String(gw.timeout_s || 300),
-    extra_headers: gw.extra_headers.map((h) => ({ ...h })),
+    extra_headers: headersRecordToPairs(gw.extra_headers),
     advancedOpen: false,
   };
 }
@@ -738,34 +565,38 @@ export function ExternalModelsView({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [ipcOnline, setIpcOnline] = useState(true);
+  const [gateways, setGateways] = useState<GatewayItem[]>([]);
+  const [secretStoreStatus, setSecretStoreStatus] = useState<GatewaySecretStoreStatus | null>(null);
   const [liveModels, setLiveModels] = useState<ModelOption[]>([]);
   const [bots, setBots] = useState<BotRosterItem[]>([]);
   const [openBaoStatus, setOpenBaoStatus] = useState<OpenBaoConfigResponse | null>(null);
-  const [previewGateways, setPreviewGateways] = useState<GatewayRecord[]>(() =>
-    loadPreviewGateways(),
-  );
   const [selectedId, setSelectedId] = useState<string | null>(null);
 
-  // Interactive filter sandbox state on inspector (for testing globs against selected gateway)
+  // Per-gateway discovered models cache populated by real `/probe` calls
+  const [probedModelsByGateway, setProbedModelsByGateway] = useState<Record<string, string[]>>({});
+  const [probeResults, setProbeResults] = useState<Record<string, ProbeStateRecord>>({});
+  const [probingId, setProbingId] = useState<string | null>(null);
+  const [busyId, setBusyId] = useState<string | null>(null);
+
+  // Inspector filter sandbox
   const [inspectorIncludeText, setInspectorIncludeText] = useState("");
   const [inspectorExcludeText, setInspectorExcludeText] = useState("");
   const [inspectorModelQuery, setInspectorModelQuery] = useState("");
+  const [savingFilters, setSavingFilters] = useState(false);
   const [showJsonSnippet, setShowJsonSnippet] = useState(false);
   const [showArchCard, setShowArchCard] = useState(false);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
-  // Probe simulation state
-  const [probingId, setProbingId] = useState<string | null>(null);
-  const [probeResults, setProbeResults] = useState<Record<string, ProbeResult>>({});
-
   // Editor modal state
   const [editor, setEditor] = useState<GatewayEditorState | null>(null);
+  const [editorSaving, setEditorSaving] = useState(false);
   const [editorError, setEditorError] = useState<string | null>(null);
-  const [editorProbeMsg, setEditorProbeMsg] = useState<string | null>(null);
+  const [editorProbeResp, setEditorProbeResp] = useState<GatewayProbeResponse | null>(null);
   const [editorProbing, setEditorProbing] = useState(false);
 
-  // Delete confirmation modal state
-  const [deleteTarget, setDeleteTarget] = useState<GatewayRecord | null>(null);
+  // Delete confirmation modal
+  const [deleteTarget, setDeleteTarget] = useState<GatewayItem | null>(null);
+  const [deleting, setDeleting] = useState(false);
   const [bannerNotice, setBannerNotice] = useState<string | null>(null);
 
   const mountedRef = useRef(true);
@@ -789,24 +620,31 @@ export function ExternalModelsView({
     [onSessionRevoked],
   );
 
-  const loadLiveCatalog = useCallback(async () => {
+  const loadAll = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const [modelsRes, botsRes, openBaoRes] = await Promise.all([
-        fetchModels(),
-        fetchBots(),
+      const [gwRes, modelsRes, botsRes, openBaoRes] = await Promise.all([
+        fetchGateways(),
+        fetchModels().catch(() => null),
+        fetchBots().catch(() => null),
         fetchOpenBaoConfig().catch(() => null),
       ]);
       if (!mountedRef.current) return;
-      setLiveModels(modelsRes.models || []);
-      setIpcOnline(Boolean(modelsRes.ipc_online));
-      setBots(botsRes.bots || []);
+      setGateways(gwRes.gateways || []);
+      setSecretStoreStatus(gwRes.secret_store || null);
+      if (modelsRes) {
+        setLiveModels(modelsRes.models || []);
+        setIpcOnline(Boolean(modelsRes.ipc_online));
+      }
+      if (botsRes) {
+        setBots(botsRes.bots || []);
+      }
       setOpenBaoStatus(openBaoRes);
     } catch (e) {
       if (!mountedRef.current) return;
       if (!handleAuthErr(e)) {
-        setError(e instanceof Error ? e.message : "加载实时模型目录失败");
+        setError(e instanceof Error ? e.message : "加载外部中转站配置失败");
       }
     } finally {
       if (mountedRef.current) {
@@ -816,52 +654,39 @@ export function ExternalModelsView({
   }, [handleAuthErr]);
 
   useEffect(() => {
-    void loadLiveCatalog();
-  }, [loadLiveCatalog]);
+    void loadAll();
+  }, [loadAll]);
 
-  const parsedCatalog = useMemo(() => extractExternalCatalog(liveModels), [liveModels]);
+  const parsedCatalog = useMemo(
+    () => indexLiveModels(liveModels, gateways),
+    [liveModels, gateways],
+  );
 
-  // Merge live gateways + preview gateways (preview overrides if same id, keeping live discovered models)
-  const allGateways = useMemo<GatewayRecord[]>(() => {
-    const map = new Map<string, GatewayRecord>();
-    for (const lg of parsedCatalog.liveGateways) {
-      map.set(lg.id, lg);
-    }
-    for (const pg of previewGateways) {
-      const liveMatch = map.get(pg.id);
-      if (liveMatch) {
-        map.set(pg.id, {
-          ...pg,
-          discovered_models:
-            liveMatch.discovered_models.length > 0
-              ? liveMatch.discovered_models
-              : pg.discovered_models,
-        });
-      } else {
-        map.set(pg.id, pg);
-      }
-    }
-    return Array.from(map.values());
-  }, [parsedCatalog.liveGateways, previewGateways]);
+  const getDiscoveredForGateway = useCallback(
+    (gw: GatewayItem): string[] => {
+      const probed = probedModelsByGateway[gw.id] || [];
+      const live = (parsedCatalog.byGatewayId[gw.id] || []).map((m) => m.upstream);
+      return Array.from(new Set([...probed, ...live]));
+    },
+    [probedModelsByGateway, parsedCatalog.byGatewayId],
+  );
 
-  // Ensure a valid selected gateway when list changes
   useEffect(() => {
-    if (allGateways.length === 0) {
+    if (gateways.length === 0) {
       setSelectedId(null);
       return;
     }
     setSelectedId((cur) => {
-      if (cur && allGateways.some((g) => g.id === cur)) return cur;
-      return allGateways[0].id;
+      if (cur && gateways.some((g) => g.id === cur)) return cur;
+      return gateways[0].id;
     });
-  }, [allGateways]);
+  }, [gateways]);
 
   const selectedGateway = useMemo(
-    () => allGateways.find((g) => g.id === selectedId) || null,
-    [allGateways, selectedId],
+    () => gateways.find((g) => g.id === selectedId) || null,
+    [gateways, selectedId],
   );
 
-  // Sync inspector filter sandbox when selected gateway changes
   useEffect(() => {
     if (!selectedGateway) {
       setInspectorIncludeText("");
@@ -872,24 +697,28 @@ export function ExternalModelsView({
     setInspectorIncludeText(selectedGateway.include_models.join(", "));
     setInspectorExcludeText(selectedGateway.exclude_models.join(", "));
     setInspectorModelQuery("");
-  }, [selectedGateway?.id, selectedGateway?.include_models.join(","), selectedGateway?.exclude_models.join(",")]);
+  }, [
+    selectedGateway?.id,
+    selectedGateway?.include_models.join(","),
+    selectedGateway?.exclude_models.join(","),
+  ]);
 
-  // Map each gateway id -> bots currently using any model from that gateway
   const botBindingsByGateway = useMemo<Record<string, BotRosterItem[]>>(() => {
     const result: Record<string, BotRosterItem[]> = {};
-    for (const gw of allGateways) {
-      const liveOpts = parsedCatalog.modelOptionsByGateway[gw.id] || [];
+    for (const gw of gateways) {
+      const liveOpts = parsedCatalog.byGatewayId[gw.id] || [];
+      const discovered = getDiscoveredForGateway(gw);
       const candidateIds = new Set<string>();
       for (const opt of liveOpts) {
         candidateIds.add(opt.slug);
         candidateIds.add(opt.upstream);
         candidateIds.add(`gw:${gw.id}:${opt.upstream}`);
       }
-      for (const m of [...gw.discovered_models, ...gw.models]) {
+      for (const m of [...discovered, ...gw.models]) {
         candidateIds.add(m);
         candidateIds.add(`gw:${gw.id}:${m}`);
       }
-      const matched = bots.filter((b) => {
+      result[gw.id] = bots.filter((b) => {
         const eff = (b.effective_model || "").trim();
         const act = (b.active_model || "").trim();
         return (
@@ -897,25 +726,23 @@ export function ExternalModelsView({
           (act && (candidateIds.has(act) || act.startsWith(`gw:${gw.id}:`)))
         );
       });
-      result[gw.id] = matched;
     }
     return result;
-  }, [allGateways, bots, parsedCatalog.modelOptionsByGateway]);
+  }, [gateways, bots, parsedCatalog.byGatewayId, getDiscoveredForGateway]);
 
-  // KPI metrics
   const stats = useMemo(() => {
-    const total = allGateways.length;
-    const enabled = allGateways.filter((g) => g.enabled).length;
-    const liveCount = allGateways.filter((g) => g.source === "live").length;
-    const previewCount = allGateways.filter((g) => g.source === "preview").length;
+    const total = gateways.length;
+    const enabled = gateways.filter((g) => g.enabled).length;
+    const openbaoCount = gateways.filter((g) => g.secret_backend === "openbao").length;
+    const localCount = gateways.filter((g) => g.secret_backend === "local_0600").length;
     const activeBotSet = new Set<string>();
     for (const list of Object.values(botBindingsByGateway)) {
       for (const b of list) activeBotSet.add(b.handle);
     }
     let exposedTotal = 0;
-    for (const gw of allGateways) {
+    for (const gw of gateways) {
       if (!gw.enabled) continue;
-      const pool = Array.from(new Set([...gw.discovered_models, ...gw.models]));
+      const pool = Array.from(new Set([...getDiscoveredForGateway(gw), ...gw.models]));
       exposedTotal += pool.filter((m) =>
         modelMatchesFilters(m, gw.include_models, gw.exclude_models),
       ).length;
@@ -923,67 +750,86 @@ export function ExternalModelsView({
     return {
       total,
       enabled,
-      liveCount,
-      previewCount,
+      openbaoCount,
+      localCount,
       activeBotsCount: activeBotSet.size,
       exposedTotal,
     };
-  }, [allGateways, botBindingsByGateway]);
+  }, [gateways, botBindingsByGateway, getDiscoveredForGateway]);
 
-  const persistPreviewList = useCallback((next: GatewayRecord[]) => {
-    setPreviewGateways(next);
-    savePreviewGateways(next);
-  }, []);
-
-  const handleToggleEnabled = (gw: GatewayRecord) => {
-    if (isReadonly) return;
-    if (gw.source === "live") {
+  const handleToggleEnabled = async (gw: GatewayItem) => {
+    if (isReadonly || gw.read_only_cmd || busyId) return;
+    setBusyId(gw.id);
+    setError(null);
+    try {
+      const res = await patchGateway(gw.id, { enabled: !gw.enabled });
+      if (!mountedRef.current) return;
       setBannerNotice(
-        `「${gw.name}」当前由后端 gateways.json 托管；点击「编辑」可创建预演覆盖草稿，接入后端写 API 后将支持在线启停热生效。`,
+        `已${res.gateway.enabled ? "启用" : "停用"}中转站「${res.gateway.name}」，已热写入 gateways.json。`,
       );
-      return;
+      await loadAll();
+    } catch (e) {
+      if (!mountedRef.current) return;
+      if (!handleAuthErr(e)) {
+        setError(e instanceof Error ? e.message : "切换站点状态失败");
+      }
+    } finally {
+      if (mountedRef.current) setBusyId(null);
     }
-    const next = previewGateways.map((item) =>
-      item.id === gw.id ? { ...item, enabled: !item.enabled, updated_at: Date.now() } : item,
-    );
-    persistPreviewList(next);
-    setBannerNotice(`已${gw.enabled ? "停用" : "启用"}预演站点「${gw.name}」。`);
   };
 
-  const handleRunProbe = (gw: GatewayRecord) => {
+  const handleRunProbe = async (gw: GatewayItem) => {
+    if (isReadonly || gw.read_only_cmd || probingId) return;
     setProbingId(gw.id);
-    window.setTimeout(() => {
+    setError(null);
+    try {
+      const res = await probeGatewayById(gw.id);
       if (!mountedRef.current) return;
-      const pool = Array.from(
-        new Set([
-          ...gw.discovered_models,
-          ...gw.models,
-          ...(gw.discovered_models.length === 0 && gw.models.length === 0
-            ? getDialectPreset(gw.dialect).sampleModels
-            : []),
-        ]),
-      );
-      const exposed = pool.filter((m) =>
-        modelMatchesFilters(m, gw.include_models, gw.exclude_models),
-      );
-      const latency = gw.source === "live" ? 118 : 164;
       setProbeResults((prev) => ({
         ...prev,
         [gw.id]: {
-          ok: true,
-          latencyMs: latency,
-          discoveredCount: pool.length,
-          exposedCount: exposed.length,
-          endpoint: buildUpstreamModelsUrl(gw.base_url),
-          summary:
-            gw.source === "live"
-              ? `已关联实时目录（${pool.length} 个上游模型）；接入 POST /api/gateways/${gw.id}/probe 后将由后端直连探测延迟与鉴权状态。`
-              : `预演探测模拟通过（方言 ${gw.dialect}）；接入 POST /api/gateways/${gw.id}/probe 后将真实拉取上游 /v1/models 并缓存目录。`,
+          ...res,
           checkedAt: new Date().toLocaleTimeString(),
         },
       }));
-      setProbingId(null);
-    }, 450);
+      if (res.discovered_models && res.discovered_models.length > 0) {
+        setProbedModelsByGateway((prev) => ({
+          ...prev,
+          [gw.id]: res.discovered_models,
+        }));
+      }
+    } catch (e) {
+      if (!mountedRef.current) return;
+      if (!handleAuthErr(e)) {
+        setError(e instanceof Error ? e.message : "探测上游连通性失败");
+      }
+    } finally {
+      if (mountedRef.current) setProbingId(null);
+    }
+  };
+
+  const handleSaveInspectorFilters = async () => {
+    if (!selectedGateway || isReadonly || selectedGateway.read_only_cmd || savingFilters) return;
+    setSavingFilters(true);
+    setError(null);
+    try {
+      const inc = parsePatternList(inspectorIncludeText);
+      const exc = parsePatternList(inspectorExcludeText);
+      await patchGateway(selectedGateway.id, {
+        include_models: inc,
+        exclude_models: exc,
+      });
+      if (!mountedRef.current) return;
+      setBannerNotice(`已保存「${selectedGateway.name}」的模型过滤规则，Bridge 将即时热生效。`);
+      await loadAll();
+    } catch (e) {
+      if (!mountedRef.current) return;
+      if (!handleAuthErr(e)) {
+        setError(e instanceof Error ? e.message : "保存过滤规则失败");
+      }
+    } finally {
+      if (mountedRef.current) setSavingFilters(false);
+    }
   };
 
   const handleCopyText = (key: string, text: string) => {
@@ -1000,18 +846,18 @@ export function ExternalModelsView({
   const openCreateModal = () => {
     if (isReadonly) return;
     setEditorError(null);
-    setEditorProbeMsg(null);
+    setEditorProbeResp(null);
     setEditor(makeEditorStateFromPreset("new_api"));
   };
 
-  const openEditModal = (gw: GatewayRecord) => {
-    if (isReadonly) return;
+  const openEditModal = (gw: GatewayItem) => {
+    if (isReadonly || gw.read_only_cmd) return;
     setEditorError(null);
-    setEditorProbeMsg(null);
-    setEditor(makeEditorStateFromRecord(gw));
+    setEditorProbeResp(null);
+    setEditor(makeEditorStateFromRecord(gw, getDiscoveredForGateway(gw)));
   };
 
-  const applyDialectTemplate = (dialectId: DialectId) => {
+  const applyDialectTemplate = (dialectId: GatewayDialectId) => {
     const preset = DIALECT_MAP[dialectId];
     setEditor((cur) => {
       if (!cur) return cur;
@@ -1025,54 +871,56 @@ export function ExternalModelsView({
         max_tokens_field: preset.max_tokens_field,
         max_tokens_cap_text: preset.max_tokens_cap ? String(preset.max_tokens_cap) : "",
         adaptive_400_fallback: preset.adaptive_400_fallback,
-        discovered_models:
-          cur.mode === "create" ? [...preset.sampleModels] : cur.discovered_models,
       };
     });
   };
 
-  const handleEditorProbe = () => {
-    if (!editor) return;
+  const handleEditorProbe = async () => {
+    if (!editor || isReadonly || editorProbing) return;
     setEditorError(null);
-    const cleanUrl = editor.base_url.trim();
+    setEditorProbeResp(null);
+
+    const cleanUrl = editor.base_url.trim().replace(/\/+$/, "");
     if (!cleanUrl) {
       setEditorError("请先填写 Base URL 再测试连通性");
       return;
     }
-    try {
-      const u = new URL(cleanUrl);
-      if (u.protocol !== "http:" && u.protocol !== "https:") {
-        setEditorError("Base URL 必须使用 http:// 或 https:// 协议");
-        return;
-      }
-    } catch {
-      setEditorError("Base URL 格式不正确，请检查域名与协议");
-      return;
-    }
+
     setEditorProbing(true);
-    setEditorProbeMsg(null);
-    window.setTimeout(() => {
+    try {
+      const payload: Parameters<typeof probeGatewayDraft>[0] = {
+        gateway_id: editor.mode === "edit" ? editor.id : undefined,
+        base_url: cleanUrl,
+        dialect: editor.dialect,
+        credential_kind: editor.credential_kind,
+        include_models: parsePatternList(editor.include_models_text),
+        exclude_models: parsePatternList(editor.exclude_models_text),
+        models: parsePatternList(editor.static_models_text),
+        extra_headers: pairsToHeadersRecord(editor.extra_headers),
+      };
+      if (editor.credential_kind === "api_key" && editor.api_key_input.trim()) {
+        payload.api_key = editor.api_key_input.trim();
+      } else if (editor.credential_kind === "api_key_env" && editor.api_key_env.trim()) {
+        payload.api_key_env = editor.api_key_env.trim();
+      }
+      const res = await probeGatewayDraft(payload);
       if (!mountedRef.current) return;
-      const preset = getDialectPreset(editor.dialect);
-      const discovered =
-        editor.discovered_models.length > 0
-          ? editor.discovered_models
-          : [...preset.sampleModels];
-      const inc = parsePatternList(editor.include_models_text);
-      const exc = parsePatternList(editor.exclude_models_text);
-      const stat = parsePatternList(editor.static_models_text);
-      const union = Array.from(new Set([...discovered, ...stat]));
-      const passed = union.filter((m) => modelMatchesFilters(m, inc, exc));
-      setEditor((cur) => (cur ? { ...cur, discovered_models: discovered } : cur));
-      setEditorProbeMsg(
-        `预演探测模拟成功（${buildUpstreamModelsUrl(cleanUrl)} · 152ms）：发现 ${union.length} 个候选模型，过滤后暴露 ${passed.length} 个。接入后端 POST /api/gateways/{id}/probe 后将真实请求上游。`,
-      );
-      setEditorProbing(false);
-    }, 450);
+      setEditorProbeResp(res);
+      if (res.discovered_models && res.discovered_models.length > 0) {
+        setEditor((cur) => (cur ? { ...cur, discovered_models: res.discovered_models } : cur));
+      }
+    } catch (e) {
+      if (!mountedRef.current) return;
+      if (!handleAuthErr(e)) {
+        setEditorError(e instanceof Error ? e.message : "上游探测请求失败");
+      }
+    } finally {
+      if (mountedRef.current) setEditorProbing(false);
+    }
   };
 
-  const handleSaveEditor = () => {
-    if (!editor || isReadonly) return;
+  const handleSaveEditor = async () => {
+    if (!editor || isReadonly || editorSaving) return;
     setEditorError(null);
 
     const name = editor.name.trim();
@@ -1087,7 +935,7 @@ export function ExternalModelsView({
       setEditorError("站点 ID 须满足 ^[a-z0-9][a-z0-9_-]{0,31}$，不可包含冒号或斜杠");
       return;
     }
-    if (editor.mode === "create" && allGateways.some((g) => g.id === id)) {
+    if (editor.mode === "create" && gateways.some((g) => g.id === id)) {
       setEditorError(`站点 ID「${id}」已存在，请换用唯一标识`);
       return;
     }
@@ -1095,34 +943,25 @@ export function ExternalModelsView({
       setEditorError("请填写 Base URL");
       return;
     }
-    try {
-      const parsed = new URL(baseUrl);
-      if ((parsed.protocol !== "http:" && parsed.protocol !== "https:") || !parsed.host) {
-        setEditorError("Base URL 必须是有效的 http:// 或 https:// 地址");
+
+    if (editor.credential_kind === "api_key") {
+      if (editor.mode === "create" && !editor.api_key_input.trim()) {
+        setEditorError("请输入 API Key，或切换为「环境变量」/「无密钥」模式");
         return;
       }
-    } catch {
-      setEditorError("Base URL 格式不合法，请输入完整 http(s):// 地址");
-      return;
-    }
-
-    let apiKeyMasked = editor.api_key_masked_existing;
-    let apiKeyEnv = "";
-    if (editor.credential_kind === "api_key") {
-      const rawKey = editor.api_key_input.trim();
-      if (rawKey) {
-        apiKeyMasked = maskApiKey(rawKey);
-      } else if (!apiKeyMasked) {
-        setEditorError("请输入 API Key，或切换为「环境变量」凭证模式");
+      if (
+        editor.mode === "edit" &&
+        !editor.api_key_input.trim() &&
+        !editor.api_key_hint_existing
+      ) {
+        setEditorError("请输入 API Key，或切换为「环境变量」/「无密钥」模式");
         return;
       }
     } else if (editor.credential_kind === "api_key_env") {
-      apiKeyEnv = editor.api_key_env.trim();
-      if (!apiKeyEnv || !ENV_NAME_RE.test(apiKeyEnv)) {
+      if (!editor.api_key_env.trim() || !ENV_NAME_RE.test(editor.api_key_env.trim())) {
         setEditorError("环境变量名须为大写字母/数字/下划线（例如 NEW_API_KEY）");
         return;
       }
-      apiKeyMasked = "";
     }
 
     let maxTokensCap: number | null = null;
@@ -1141,7 +980,7 @@ export function ExternalModelsView({
       return;
     }
 
-    const cleanHeaders: ExtraHeaderPair[] = [];
+    const extraHeadersObj: Record<string, string> = {};
     for (const pair of editor.extra_headers) {
       const k = pair.key.trim();
       const v = pair.value.trim();
@@ -1150,26 +989,18 @@ export function ExternalModelsView({
         setEditorError("自定义请求头名称或值包含非法字符");
         return;
       }
-      cleanHeaders.push({ key: k, value: v });
+      extraHeadersObj[k] = v;
     }
 
-    const record: GatewayRecord = {
-      id,
+    const payload: GatewayMutationPayload = {
       name,
       base_url: baseUrl,
       dialect: editor.dialect,
       enabled: editor.enabled,
-      source: "preview",
       credential_kind: editor.credential_kind,
-      api_key_masked: apiKeyMasked,
-      api_key_env: apiKeyEnv,
       include_models: parsePatternList(editor.include_models_text),
       exclude_models: parsePatternList(editor.exclude_models_text),
       models: parsePatternList(editor.static_models_text),
-      discovered_models:
-        editor.discovered_models.length > 0
-          ? editor.discovered_models
-          : [...getDialectPreset(editor.dialect).sampleModels],
       supports_reasoning_effort: editor.supports_reasoning_effort,
       effort_mode: editor.effort_mode,
       flatten_system_content: editor.flatten_system_content,
@@ -1178,36 +1009,80 @@ export function ExternalModelsView({
       max_tokens_cap: maxTokensCap,
       adaptive_400_fallback: editor.adaptive_400_fallback,
       timeout_s: timeoutVal,
-      extra_headers: sanitizeExtraHeaders(cleanHeaders),
-      updated_at: Date.now(),
+      extra_headers: extraHeadersObj,
     };
 
-    const existsInPreview = previewGateways.some((g) => g.id === record.id);
-    const nextList = existsInPreview
-      ? previewGateways.map((g) => (g.id === record.id ? record : g))
-      : [...previewGateways, record];
+    if (editor.mode === "create") {
+      payload.id = id;
+    }
+    if (editor.credential_kind === "api_key" && editor.api_key_input.trim()) {
+      payload.api_key = editor.api_key_input.trim();
+    }
+    if (editor.credential_kind === "api_key_env") {
+      payload.api_key_env = editor.api_key_env.trim();
+    }
 
-    persistPreviewList(nextList);
-    setSelectedId(record.id);
-    setEditor(null);
-    setBannerNotice(
-      `已保存「${record.name}」到预演配置（明文密钥未写入本地存储，仅保留脱敏状态）。接入后端 API 后将原子写入 gateways.json / OpenBao 并热重载。`,
-    );
+    setEditorSaving(true);
+    try {
+      const res =
+        editor.mode === "create"
+          ? await createGateway(payload)
+          : await updateGateway(id, payload);
+      if (!mountedRef.current) return;
+      if (editor.discovered_models.length > 0) {
+        setProbedModelsByGateway((prev) => ({
+          ...prev,
+          [res.gateway.id]: editor.discovered_models,
+        }));
+      }
+      const backendLabel =
+        res.secret_backend === "openbao"
+          ? "OpenBao KV"
+          : res.secret_backend === "local_0600"
+            ? res.fallback_used
+              ? "本机 0600（OpenBao 不可用自动降级）"
+              : "本机 0600"
+            : res.secret_backend === "env"
+              ? "环境变量"
+              : "无密钥";
+      setSelectedId(res.gateway.id);
+      setEditor(null);
+      setBannerNotice(
+        `已保存「${res.gateway.name}」至 gateways.json（密钥托管：${backendLabel}，零明文落盘），Bridge 即时热生效。`,
+      );
+      await loadAll();
+    } catch (e) {
+      if (!mountedRef.current) return;
+      if (!handleAuthErr(e)) {
+        setEditorError(e instanceof Error ? e.message : "保存中转站失败");
+      }
+    } finally {
+      if (mountedRef.current) setEditorSaving(false);
+    }
   };
 
-  const handleConfirmDelete = () => {
-    if (!deleteTarget || isReadonly) return;
+  const handleConfirmDelete = async () => {
+    if (!deleteTarget || isReadonly || deleteTarget.read_only_cmd || deleting) return;
     const target = deleteTarget;
-    setDeleteTarget(null);
-    if (target.source === "live") {
+    setDeleting(true);
+    setError(null);
+    try {
+      const res = await deleteGateway(target.id);
+      if (!mountedRef.current) return;
+      setDeleteTarget(null);
       setBannerNotice(
-        `「${target.name}」属于后端 gateways.json 实时生效站点，预演阶段不可删除；接入 DELETE /api/gateways/${target.id} 后支持受控移除。`,
+        `已移除中转站「${target.name}」${res.secret_deleted ? "并同步清理托管密钥槽" : ""}。`,
       );
-      return;
+      await loadAll();
+    } catch (e) {
+      if (!mountedRef.current) return;
+      setDeleteTarget(null);
+      if (!handleAuthErr(e)) {
+        setError(e instanceof Error ? e.message : "删除中转站失败");
+      }
+    } finally {
+      if (mountedRef.current) setDeleting(false);
     }
-    const next = previewGateways.filter((g) => g.id !== target.id);
-    persistPreviewList(next);
-    setBannerNotice(`已移除预演中转站「${target.name}」。`);
   };
 
   // Inspector real-time model filter evaluation
@@ -1221,22 +1096,21 @@ export function ExternalModelsView({
     const savedExc = selectedGateway.exclude_models.join(",");
     const isDirtySandbox = inc.join(",") !== savedInc || exc.join(",") !== savedExc;
 
-    const liveOpts = parsedCatalog.modelOptionsByGateway[selectedGateway.id] || [];
+    const liveOpts = parsedCatalog.byGatewayId[selectedGateway.id] || [];
     const slugMap = new Map<string, string>();
     for (const o of liveOpts) {
       slugMap.set(o.upstream, o.slug);
     }
 
+    const discovered = getDiscoveredForGateway(selectedGateway);
     const staticSet = new Set(selectedGateway.models);
-    const pool = Array.from(
-      new Set([...selectedGateway.discovered_models, ...selectedGateway.models]),
-    );
+    const pool = Array.from(new Set([...discovered, ...selectedGateway.models]));
     const q = inspectorModelQuery.trim().toLowerCase();
 
     const rows = pool
       .map((modelId) => {
         const matched = modelMatchesFilters(modelId, inc, exc);
-        const isStatic = staticSet.has(modelId) && !selectedGateway.discovered_models.includes(modelId);
+        const isStatic = staticSet.has(modelId) && !discovered.includes(modelId);
         const refSlug = slugMap.get(modelId) || `gw:${selectedGateway.id}:${modelId}`;
         return {
           modelId,
@@ -1246,7 +1120,12 @@ export function ExternalModelsView({
           refSlug,
         };
       })
-      .filter((row) => !q || row.modelId.toLowerCase().includes(q) || row.displayLabel.toLowerCase().includes(q));
+      .filter(
+        (row) =>
+          !q ||
+          row.modelId.toLowerCase().includes(q) ||
+          row.displayLabel.toLowerCase().includes(q),
+      );
 
     const exposedCount = rows.filter((r) => r.matched).length;
     const filteredOutCount = rows.length - exposedCount;
@@ -1256,7 +1135,8 @@ export function ExternalModelsView({
     inspectorIncludeText,
     inspectorExcludeText,
     inspectorModelQuery,
-    parsedCatalog.modelOptionsByGateway,
+    parsedCatalog.byGatewayId,
+    getDiscoveredForGateway,
   ]);
 
   // Editor live filter preview
@@ -1279,24 +1159,22 @@ export function ExternalModelsView({
     };
   }, [editor]);
 
-  // Sanitized gateways.json preview snippet for selected gateway
+  // Sanitized gateways.json preview snippet (strictly zero plaintext secrets)
   const jsonSnippet = useMemo(() => {
     if (!selectedGateway) return "";
     const obj: Record<string, unknown> = {
       id: selectedGateway.id,
       name: selectedGateway.name,
-      base_url:
-        selectedGateway.base_url ||
-        getDialectPreset(selectedGateway.dialect).placeholderUrl,
+      base_url: selectedGateway.base_url,
       dialect: selectedGateway.dialect,
       enabled: selectedGateway.enabled,
     };
-    if (selectedGateway.credential_kind === "server_cmd_readonly") {
-      obj.api_key_cmd = "[REDACTED · 服务端 OpenBao/命令凭证托管]";
-    } else if (selectedGateway.credential_kind === "api_key_env") {
-      obj.api_key_env = selectedGateway.api_key_env || "GATEWAY_API_KEY";
-    } else {
-      obj.api_key = selectedGateway.api_key_masked || "[REDACTED]";
+    if (selectedGateway.read_only_cmd) {
+      obj.api_key_cmd = "[REDACTED · 宿主机命令只读托管]";
+    } else if (selectedGateway.secret_ref_summary) {
+      obj.secret_ref = selectedGateway.secret_ref_summary;
+    } else if (selectedGateway.api_key_env) {
+      obj.api_key_env = selectedGateway.api_key_env;
     }
     if (selectedGateway.include_models.length > 0) {
       obj.include_models = selectedGateway.include_models;
@@ -1319,13 +1197,16 @@ export function ExternalModelsView({
     if (selectedGateway.timeout_s !== 300) {
       obj.timeout_s = selectedGateway.timeout_s;
     }
-    if (selectedGateway.extra_headers.length > 0) {
-      obj.extra_headers = Object.fromEntries(
-        sanitizeExtraHeaders(selectedGateway.extra_headers).map((h) => [h.key, h.value]),
-      );
+    if (Object.keys(selectedGateway.extra_headers || {}).length > 0) {
+      obj.extra_headers = selectedGateway.extra_headers;
     }
     return JSON.stringify(obj, null, 2);
   }, [selectedGateway]);
+
+  const openBaoReady = Boolean(
+    secretStoreStatus?.openbao_ready ||
+      (openBaoStatus?.enabled && openBaoStatus?.credential_configured),
+  );
 
   return (
     <div className="p-5 md:p-6 max-w-6xl mx-auto space-y-5">
@@ -1334,24 +1215,26 @@ export function ExternalModelsView({
         <div>
           <div className="flex flex-wrap items-center gap-2">
             <h2 className="text-lg font-semibold text-slate-100">外部模型与中转站</h2>
-            <span className="inline-flex items-center gap-1 rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-300">
-              <Sparkles className="w-3 h-3" />
-              MVP-Preview 交互预演
+            <span className="inline-flex items-center gap-1 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 text-[11px] font-medium text-emerald-300">
+              <ShieldCheck className="w-3 h-3" />
+              实时后端 · SecretStore 托管
             </span>
           </div>
           <p className="text-xs text-slate-400 mt-1">
-            底层对接 <code className="font-mono text-slate-300">bridge/gateway_adapter.py</code> 多网关适配器（9 种方言预设），支持 WebUI 工作台、Bot 团队与 Telegram <code className="font-mono text-slate-300">/model</code> 共享生效
+            直连 <code className="font-mono text-slate-300">gateways.json</code> 与{" "}
+            <code className="font-mono text-slate-300">bridge/gateway_adapter.py</code>{" "}
+            多网关适配器（9 种方言预设），新增/修改即时热生效，零明文密钥落盘
           </p>
         </div>
 
         <div className="flex items-center gap-2">
           <button
             type="button"
-            onClick={() => void loadLiveCatalog()}
+            onClick={() => void loadAll()}
             className="inline-flex items-center gap-1.5 rounded-lg border border-slate-800 bg-slate-900 hover:bg-slate-800 px-3 py-1.5 text-xs text-slate-200 cursor-pointer"
           >
             <RefreshCw className={`w-3.5 h-3.5 ${loading ? "animate-spin" : ""}`} />
-            刷新模型目录
+            刷新列表与目录
           </button>
           {!isReadonly && (
             <button
@@ -1371,7 +1254,7 @@ export function ExternalModelsView({
         <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-3.5 py-2.5 flex items-center gap-2 text-xs text-amber-200">
           <Lock className="w-4 h-4 shrink-0 text-amber-400" />
           <span>
-            当前为只读权限（readonly）：仅可查看实时发现的外部中转站、暴露模型目录与 Bot 绑定状态，新增/编辑/启停/删除操作已隐藏。
+            当前为只读权限（readonly）：仅可查看脱敏后的中转站清单、暴露模型目录与 Bot 绑定状态，新增/编辑/启停/删除与探测操作已禁用。
           </span>
         </div>
       )}
@@ -1379,46 +1262,44 @@ export function ExternalModelsView({
       {/* Secret Hosting Status & Quick Navigation */}
       <div
         className={`rounded-xl border px-3.5 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs ${
-          openBaoStatus?.enabled && openBaoStatus?.credential_configured
+          openBaoReady
             ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-100"
             : "border-sky-500/25 bg-sky-500/10 text-sky-100"
         }`}
       >
         <div className="flex items-start gap-2.5 min-w-0">
-          {openBaoStatus?.enabled && openBaoStatus?.credential_configured ? (
+          {openBaoReady ? (
             <ShieldCheck className="w-4 h-4 shrink-0 text-emerald-400 mt-0.5" />
           ) : (
             <Info className="w-4 h-4 shrink-0 text-sky-400 mt-0.5" />
           )}
           <div className="space-y-1 leading-relaxed min-w-0">
             <div className="font-medium flex flex-wrap items-center gap-1.5">
-              {openBaoStatus?.enabled && openBaoStatus?.credential_configured ? (
+              {openBaoReady ? (
                 <>
                   <span>
-                    🔒 已接入 OpenBao（未来保存将自动转存
-                    {!isReadonly && openBaoStatus.gateway_path_prefix
-                      ? `至 ${openBaoStatus.gateway_path_prefix}/<id>`
+                    当前默认密钥托管：OpenBao KV
+                    {!isReadonly && openBaoStatus?.gateway_path_prefix
+                      ? `（${openBaoStatus.kv_mount}/${openBaoStatus.gateway_path_prefix}/<id>）`
                       : ""}
-                    ）
                   </span>
-                  {openBaoStatus.source === "host_auto" && (
+                  {openBaoStatus?.source === "host_auto" && (
                     <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-200 border border-emerald-500/30">
-                      已自动载入本机配置
+                      已自动载入本机 OpenBao
                     </span>
                   )}
                 </>
               ) : (
-                <span>🛡️ 未配置 OpenBao（将使用本机 0600 兜底 / 后续安全卡存档）</span>
+                <span>
+                  当前默认密钥托管：本机 0600 隔离密钥槽（未启用 OpenBao 时自动降级，安全卡已预留接口）
+                </span>
               )}
             </div>
-            {!isReadonly && (
-              <div className="text-[11px] opacity-85">
-                标有「后端生效」的站点来自当前在线 Bridge 的真实{" "}
-                <code className="font-mono">/api/models</code> 目录；新增或编辑的站点保存在预演草稿中，
-                <strong>明文 API Key 绝不写入浏览器存储</strong>（仅保留脱敏掩码{" "}
-                <code className="font-mono">[REDACTED]</code>）。
-              </div>
-            )}
+            <div className="text-[11px] opacity-85">
+              保存网关时仅向 <code className="font-mono">gateways.json</code> 写入{" "}
+              <code className="font-mono">secret_ref</code> 引用，
+              <strong>绝不落盘明文 API Key</strong>；所有敏感请求头在只读与编辑视图中均保持脱敏。
+            </div>
           </div>
         </div>
 
@@ -1462,11 +1343,21 @@ export function ExternalModelsView({
         </div>
       )}
 
-      {/* Load Error */}
+      {/* Error */}
       {error && (
-        <div className="rounded-xl border border-rose-500/30 bg-rose-500/10 p-3 flex items-center gap-2 text-xs text-rose-200">
-          <AlertTriangle className="w-4 h-4 shrink-0 text-rose-400" />
-          <span>{error}</span>
+        <div className="rounded-xl border border-rose-500/30 bg-rose-500/10 p-3 flex items-center justify-between gap-2 text-xs text-rose-200">
+          <div className="flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 shrink-0 text-rose-400" />
+            <span>{error}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setError(null)}
+            aria-label="关闭错误"
+            className="text-rose-300/80 hover:text-rose-100 cursor-pointer"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
         </div>
       )}
 
@@ -1480,7 +1371,7 @@ export function ExternalModelsView({
           <div className="flex items-baseline gap-2">
             <span className="text-2xl font-semibold text-slate-100">{stats.total}</span>
             <span className="text-xs text-slate-400 font-mono">
-              {stats.liveCount} 后端生效 · {stats.previewCount} 预演草稿
+              OpenBao {stats.openbaoCount} · 本机0600 {stats.localCount}
             </span>
           </div>
         </div>
@@ -1513,29 +1404,29 @@ export function ExternalModelsView({
         </div>
       </div>
 
-      {/* Main Split Workspace: Left Gateway Cards + Right Inspector */}
+      {/* Main Split Workspace */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-start">
         {/* Left: Gateway List */}
         <div className="lg:col-span-5 space-y-2.5">
           <div className="flex items-center justify-between px-1">
             <span className="text-xs font-semibold text-slate-300">
-              中转站清单 ({allGateways.length})
+              中转站清单 ({gateways.length})
             </span>
             <span className="text-[11px] text-slate-500">点击查看模型过滤与协议配置</span>
           </div>
 
-          {loading && allGateways.length === 0 ? (
+          {loading && gateways.length === 0 ? (
             <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-8 flex items-center justify-center gap-2 text-xs text-slate-400">
               <Loader2 className="w-4 h-4 animate-spin text-sky-400" />
-              正在同步实时模型目录与 Bot 状态…
+              正在加载 gateways.json 与实时模型目录…
             </div>
-          ) : allGateways.length === 0 ? (
+          ) : gateways.length === 0 ? (
             <div className="rounded-xl border border-dashed border-slate-800 bg-slate-900/40 p-8 text-center space-y-3">
               <Layers className="w-7 h-7 text-slate-600 mx-auto" />
               <div className="space-y-1">
-                <div className="text-sm font-medium text-slate-200">暂未发现外部中转站</div>
+                <div className="text-sm font-medium text-slate-200">暂未配置外部中转站</div>
                 <p className="text-xs text-slate-400">
-                  当前仅使用 AGY 原生模型（{parsedCatalog.nativeCount} 个）。点击下方按钮选择模板，3 步接入 New API / OpenRouter / DeepSeek / CPA 等中转站。
+                  当前仅使用 AGY 原生模型（{parsedCatalog.nativeCount} 个）。点击下方按钮接入 New API / OpenRouter / DeepSeek / CPA / 本机 Ollama 等兼容端点。
                 </p>
               </div>
               {!isReadonly && (
@@ -1551,10 +1442,10 @@ export function ExternalModelsView({
             </div>
           ) : (
             <div className="space-y-2.5">
-              {allGateways.map((gw) => {
+              {gateways.map((gw) => {
                 const selected = gw.id === selectedId;
                 const preset = getDialectPreset(gw.dialect);
-                const pool = Array.from(new Set([...gw.discovered_models, ...gw.models]));
+                const pool = Array.from(new Set([...getDiscoveredForGateway(gw), ...gw.models]));
                 const exposedCount = pool.filter((m) =>
                   modelMatchesFilters(m, gw.include_models, gw.exclude_models),
                 ).length;
@@ -1594,48 +1485,25 @@ export function ExternalModelsView({
                           </span>
                         </div>
                         <div className="mt-1 flex items-center gap-1.5 flex-wrap">
-                          <span
-                            className={`text-[10px] font-medium px-1.5 py-0.5 rounded border ${
-                              gw.source === "live"
-                                ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/30"
-                                : "bg-amber-500/15 text-amber-300 border-amber-500/30"
-                            }`}
-                          >
-                            {gw.source === "live" ? "后端生效 · gateways.json" : "预演草稿"}
-                          </span>
                           <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-800 text-slate-300">
                             {preset.shortLabel}
                           </span>
-                          {gw.credential_kind === "server_cmd_readonly" ? (
-                            <span className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-slate-800/90 text-slate-300 border border-slate-700/80">
-                              <Lock className="w-2.5 h-2.5 text-emerald-400" />
-                              服务端命令凭证
-                            </span>
-                          ) : gw.credential_kind === "api_key_env" ? (
-                            <span className="inline-flex items-center gap-1 text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-800/90 text-sky-300">
-                              <KeyRound className="w-2.5 h-2.5" />
-                              env:{gw.api_key_env}
-                            </span>
-                          ) : (
-                            <span className="inline-flex items-center gap-1 text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-800/90 text-slate-300">
-                              <KeyRound className="w-2.5 h-2.5 text-amber-400" />
-                              {gw.api_key_masked || "已脱敏"}
-                            </span>
-                          )}
+                          {renderSecretBackendBadge(gw)}
                         </div>
                       </div>
 
-                      {!isReadonly && (
+                      {!isReadonly && !gw.read_only_cmd && (
                         <div
                           className="flex items-center gap-1 shrink-0"
                           onClick={(e) => e.stopPropagation()}
                         >
                           <button
                             type="button"
-                            onClick={() => handleToggleEnabled(gw)}
+                            disabled={busyId === gw.id}
+                            onClick={() => void handleToggleEnabled(gw)}
                             title={gw.enabled ? "停用该站点" : "启用该站点"}
                             aria-label={gw.enabled ? `停用 ${gw.name}` : `启用 ${gw.name}`}
-                            className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors cursor-pointer ${
+                            className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors cursor-pointer disabled:opacity-50 ${
                               gw.enabled ? "bg-emerald-500/80" : "bg-slate-700"
                             }`}
                           >
@@ -1668,9 +1536,7 @@ export function ExternalModelsView({
                     </div>
 
                     <div className="flex items-center justify-between text-[11px] text-slate-400 pt-1 border-t border-slate-800/80">
-                      <span className="font-mono truncate max-w-[65%]">
-                        {gw.base_url || "由后端 gateways.json 托管端点"}
-                      </span>
+                      <span className="font-mono truncate max-w-[65%]">{gw.base_url}</span>
                       <span className="font-mono text-sky-300 shrink-0">
                         {exposedCount} / {pool.length} 模型
                       </span>
@@ -1697,7 +1563,7 @@ export function ExternalModelsView({
           )}
         </div>
 
-        {/* Right: Selected Gateway Inspector & Real-Time Filter Preview */}
+        {/* Right: Selected Gateway Inspector */}
         <div className="lg:col-span-7 space-y-4">
           {!selectedGateway ? (
             <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-10 text-center text-xs text-slate-500">
@@ -1724,62 +1590,89 @@ export function ExternalModelsView({
                     >
                       {selectedGateway.enabled ? "已启用" : "已停用"}
                     </span>
+                    {renderSecretBackendBadge(selectedGateway)}
                   </div>
                   <div className="text-xs text-slate-400 font-mono flex items-center gap-1.5 truncate">
                     <Globe className="w-3.5 h-3.5 text-slate-500 shrink-0" />
-                    <span className="truncate">
-                      {selectedGateway.base_url || "后端 gateways.json 托管（未在只读接口暴露上游地址）"}
-                    </span>
+                    <span className="truncate">{selectedGateway.base_url}</span>
                   </div>
                 </div>
 
-                <div className="flex items-center gap-2 flex-wrap">
-                  <button
-                    type="button"
-                    disabled={probingId === selectedGateway.id}
-                    onClick={() => handleRunProbe(selectedGateway)}
-                    className="inline-flex items-center gap-1.5 rounded-lg border border-sky-500/30 bg-sky-500/15 hover:bg-sky-500/25 px-3 py-1.5 text-xs font-medium text-sky-200 disabled:opacity-50 cursor-pointer"
-                  >
-                    {probingId === selectedGateway.id ? (
-                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                    ) : (
-                      <Play className="w-3.5 h-3.5" />
-                    )}
-                    测试连通 & 拉取模型
-                  </button>
-                  {!isReadonly && (
+                {!isReadonly && !selectedGateway.read_only_cmd && (
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <button
+                      type="button"
+                      disabled={probingId === selectedGateway.id}
+                      onClick={() => void handleRunProbe(selectedGateway)}
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-sky-500/30 bg-sky-500/15 hover:bg-sky-500/25 px-3 py-1.5 text-xs font-medium text-sky-200 disabled:opacity-50 cursor-pointer"
+                    >
+                      {probingId === selectedGateway.id ? (
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      ) : (
+                        <Play className="w-3.5 h-3.5" />
+                      )}
+                      测试连通 & 拉取模型
+                    </button>
                     <button
                       type="button"
                       onClick={() => openEditModal(selectedGateway)}
                       className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-900 hover:bg-slate-800 px-3 py-1.5 text-xs text-slate-200 cursor-pointer"
                     >
                       <Edit3 className="w-3.5 h-3.5" />
-                      {selectedGateway.source === "live" ? "调整预演配置" : "编辑"}
+                      编辑
                     </button>
-                  )}
-                </div>
+                  </div>
+                )}
               </div>
 
               <div className="p-4 space-y-4">
-                {/* Probe Result Feedback */}
+                {selectedGateway.read_only_cmd && (
+                  <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 flex items-start gap-2 text-xs text-amber-200">
+                    <Lock className="w-4 h-4 shrink-0 text-amber-400 mt-0.5" />
+                    <span>
+                      该站点由宿主机 <code className="font-mono">gateways.json</code> 中的{" "}
+                      <code className="font-mono">api_key_cmd</code> 托管（防 RCE 只读模式）：Web 端仅可查看，不可改写命令、删除或从 Web 触发命令执行。
+                    </span>
+                  </div>
+                )}
+
+                {/* Real Probe Result Feedback */}
                 {probeResults[selectedGateway.id] && (
-                  <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-3 space-y-1 text-xs">
-                    <div className="flex items-center justify-between gap-2 text-emerald-200 font-medium">
+                  <div
+                    className={`rounded-lg border p-3 space-y-1 text-xs ${
+                      probeResults[selectedGateway.id].ok
+                        ? "border-emerald-500/30 bg-emerald-500/10"
+                        : "border-rose-500/30 bg-rose-500/10"
+                    }`}
+                  >
+                    <div
+                      className={`flex items-center justify-between gap-2 font-medium ${
+                        probeResults[selectedGateway.id].ok ? "text-emerald-200" : "text-rose-200"
+                      }`}
+                    >
                       <span className="inline-flex items-center gap-1.5">
-                        <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-                        连通探测结果（预演模拟 · {probeResults[selectedGateway.id].latencyMs}ms）
+                        {probeResults[selectedGateway.id].ok ? (
+                          <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                        ) : (
+                          <AlertTriangle className="w-3.5 h-3.5 text-rose-400" />
+                        )}
+                        实测探测结果（{probeResults[selectedGateway.id].latency_ms}ms
+                        {probeResults[selectedGateway.id].http_status
+                          ? ` · HTTP ${probeResults[selectedGateway.id].http_status}`
+                          : ""}
+                        ）
                       </span>
-                      <span className="text-[11px] font-mono text-emerald-300/80">
+                      <span className="text-[11px] font-mono opacity-80">
                         {probeResults[selectedGateway.id].checkedAt}
                       </span>
                     </div>
                     <div className="text-[11px] font-mono text-slate-300 truncate">
                       GET {probeResults[selectedGateway.id].endpoint} → 发现{" "}
-                      {probeResults[selectedGateway.id].discoveredCount} 个，过滤后暴露{" "}
-                      {probeResults[selectedGateway.id].exposedCount} 个
+                      {probeResults[selectedGateway.id].discovered_count} 个，过滤后暴露{" "}
+                      {probeResults[selectedGateway.id].exposed_count} 个
                     </div>
-                    <p className="text-[11px] text-emerald-200/90">
-                      {probeResults[selectedGateway.id].summary}
+                    <p className="text-[11px] opacity-90">
+                      {probeResults[selectedGateway.id].message}
                     </p>
                   </div>
                 )}
@@ -1791,13 +1684,12 @@ export function ExternalModelsView({
                       <Bot className="w-3.5 h-3.5 text-sky-400" />
                       当前使用该中转站的 Bot
                     </span>
-                    <span className="text-[11px] font-mono text-slate-500">
-                      来自实时 /api/bots
-                    </span>
+                    <span className="text-[11px] font-mono text-slate-500">来自实时 /api/bots</span>
                   </div>
                   {(botBindingsByGateway[selectedGateway.id] || []).length === 0 ? (
                     <div className="text-[11px] text-slate-500">
-                      暂无 Bot 将默认模型固定到此站点（仍可在工作台或 Telegram <code className="font-mono text-slate-400">/model</code> 中随时按会话选用）。
+                      暂无 Bot 将默认模型固定到此站点（仍可在工作台或 Telegram{" "}
+                      <code className="font-mono text-slate-400">/model</code> 中随时按会话选用）。
                     </div>
                   ) : (
                     <div className="flex flex-wrap gap-2">
@@ -1830,13 +1722,9 @@ export function ExternalModelsView({
                       模型目录与过滤实时预览
                     </div>
                     <div className="flex items-center gap-2 text-[11px] font-mono">
-                      <span className="text-emerald-400">
-                        暴露 {inspectorEval.exposedCount}
-                      </span>
+                      <span className="text-emerald-400">暴露 {inspectorEval.exposedCount}</span>
                       <span className="text-slate-600">/</span>
-                      <span className="text-slate-400">
-                        过滤 {inspectorEval.filteredOutCount}
-                      </span>
+                      <span className="text-slate-400">过滤 {inspectorEval.filteredOutCount}</span>
                     </div>
                   </div>
 
@@ -1849,10 +1737,11 @@ export function ExternalModelsView({
                       </label>
                       <input
                         type="text"
+                        disabled={isReadonly || selectedGateway.read_only_cmd}
                         value={inspectorIncludeText}
                         onChange={(e) => setInspectorIncludeText(e.target.value)}
                         placeholder="例：team/*, claude-*, gpt-5*"
-                        className="w-full rounded-lg border border-slate-800 bg-slate-950 px-2.5 py-1.5 text-xs font-mono text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-sky-500"
+                        className="w-full rounded-lg border border-slate-800 bg-slate-950 px-2.5 py-1.5 text-xs font-mono text-slate-200 placeholder:text-slate-600 disabled:opacity-60 focus:outline-none focus:border-sky-500"
                       />
                     </div>
                     <div className="space-y-1">
@@ -1862,51 +1751,29 @@ export function ExternalModelsView({
                       </label>
                       <input
                         type="text"
+                        disabled={isReadonly || selectedGateway.read_only_cmd}
                         value={inspectorExcludeText}
                         onChange={(e) => setInspectorExcludeText(e.target.value)}
                         placeholder="例：*-image-*, *-embedding-*"
-                        className="w-full rounded-lg border border-slate-800 bg-slate-950 px-2.5 py-1.5 text-xs font-mono text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-sky-500"
+                        className="w-full rounded-lg border border-slate-800 bg-slate-950 px-2.5 py-1.5 text-xs font-mono text-slate-200 placeholder:text-slate-600 disabled:opacity-60 focus:outline-none focus:border-sky-500"
                       />
                     </div>
                   </div>
 
-                  {inspectorEval.isDirtySandbox && !isReadonly && (
+                  {inspectorEval.isDirtySandbox && !isReadonly && !selectedGateway.read_only_cmd && (
                     <div className="flex items-center justify-between gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-1.5 text-[11px] text-amber-200">
-                      <span>正在实时试算过滤规则（尚未保存到站点配置）</span>
+                      <span>过滤规则已修改（尚未落盘至 gateways.json）</span>
                       <button
                         type="button"
-                        onClick={() => {
-                          const inc = parsePatternList(inspectorIncludeText);
-                          const exc = parsePatternList(inspectorExcludeText);
-                          if (selectedGateway.source === "preview") {
-                            const next = previewGateways.map((g) =>
-                              g.id === selectedGateway.id
-                                ? {
-                                    ...g,
-                                    include_models: inc,
-                                    exclude_models: exc,
-                                    updated_at: Date.now(),
-                                  }
-                                : g,
-                            );
-                            persistPreviewList(next);
-                            setBannerNotice(`已应用过滤规则到预演站点「${selectedGateway.name}」。`);
-                          } else {
-                            openEditModal({
-                              ...selectedGateway,
-                              include_models: inc,
-                              exclude_models: exc,
-                            });
-                          }
-                        }}
-                        className="rounded bg-amber-500/20 hover:bg-amber-500/30 px-2 py-0.5 text-amber-100 font-medium cursor-pointer"
+                        disabled={savingFilters}
+                        onClick={() => void handleSaveInspectorFilters()}
+                        className="rounded bg-amber-500/20 hover:bg-amber-500/30 px-2.5 py-0.5 text-amber-100 font-medium cursor-pointer disabled:opacity-50"
                       >
-                        {selectedGateway.source === "preview" ? "应用到草稿" : "进入编辑保存"}
+                        {savingFilters ? "保存中…" : "保存过滤规则"}
                       </button>
                     </div>
                   )}
 
-                  {/* Search inside models */}
                   <input
                     type="text"
                     value={inspectorModelQuery}
@@ -1915,11 +1782,11 @@ export function ExternalModelsView({
                     className="w-full rounded-lg border border-slate-800 bg-slate-950/70 px-2.5 py-1.5 text-xs text-slate-200 placeholder:text-slate-500 focus:outline-none focus:border-sky-500"
                   />
 
-                  {/* Model Exposure List */}
                   <div className="rounded-lg border border-slate-800 bg-slate-950/60 max-h-60 overflow-y-auto divide-y divide-slate-800/70">
                     {inspectorEval.rows.length === 0 ? (
                       <div className="p-5 text-center text-xs text-slate-500">
-                        暂无匹配的候选模型（可在编辑中补充静态兜底列表 <code className="font-mono">models</code>）
+                        暂无匹配的候选模型（点击上方「测试连通 &amp; 拉取模型」或在编辑中补充静态兜底列表{" "}
+                        <code className="font-mono">models</code>）
                       </div>
                     ) : (
                       inspectorEval.rows.map((row) => (
@@ -1988,7 +1855,7 @@ export function ExternalModelsView({
                       className="inline-flex items-center gap-1 text-[11px] text-sky-400 hover:text-sky-300 cursor-pointer"
                     >
                       <Code2 className="w-3.5 h-3.5" />
-                      {showJsonSnippet ? "隐藏 JSON 片段" : "查看 gateways.json 片段"}
+                      {showJsonSnippet ? "隐藏脱敏 JSON" : "查看脱敏 JSON"}
                     </button>
                   </div>
 
@@ -2038,7 +1905,8 @@ export function ExternalModelsView({
                     <div className="rounded-md bg-slate-900/80 border border-slate-800/80 px-2.5 py-1.5">
                       <div className="text-slate-500">超时 / 自定义头</div>
                       <div className="font-mono text-slate-200 mt-0.5">
-                        {selectedGateway.timeout_s}s · {selectedGateway.extra_headers.length} 头
+                        {selectedGateway.timeout_s}s ·{" "}
+                        {Object.keys(selectedGateway.extra_headers || {}).length} 头
                       </div>
                     </div>
                   </div>
@@ -2083,7 +1951,7 @@ export function ExternalModelsView({
         >
           <div className="flex items-center gap-2 text-xs font-semibold text-slate-200">
             <Shield className="w-4 h-4 text-sky-400" />
-            <span>项目协同闭环：工作台 ↔ gateways.json ↔ Telegram /model ↔ 故障回退 ↔ 用量账单</span>
+            <span>项目协同闭环：工作台 ↔ gateways.json ↔ SecretStore ↔ Bridge 热解析 ↔ Telegram /model</span>
           </div>
           {showArchCard ? (
             <ChevronDown className="w-4 h-4 text-slate-400" />
@@ -2097,29 +1965,29 @@ export function ExternalModelsView({
             <div className="grid grid-cols-1 md:grid-cols-5 gap-2.5">
               {[
                 {
-                  step: "1. 统一配置源",
+                  step: "1. 零明文配置源",
                   detail:
-                    "通过 gateways.json 集中定义中转站，Bridge 启动内嵌回环适配代理 (127.0.0.1:0/g/<token>/v1)，密钥不透传给子进程。",
+                    "gateways.json 仅保存非敏感配置与 secret_ref 引用，API Key 自动托管至 OpenBao KV 或本机 0600 隔离槽。",
                 },
                 {
-                  step: "2. WebUI 工作台",
+                  step: "2. Bridge 即时热读",
+                  detail:
+                    "gateway_adapter.py 通过配置指纹自动失效缓存并解析 secret_ref，修改站点无需重启 Bridge 进程。",
+                },
+                {
+                  step: "3. WebUI 工作台",
                   detail:
                     "自动按 [供应商] 分组展示模型下拉，选定后通过 gw:<id>:<model> 精确路由，避免同名模型冲突。",
                 },
                 {
-                  step: "3. Telegram /model",
+                  step: "4. Telegram /model",
                   detail:
                     "所有多 Bot 实例共享同一套中转站模型目录，私聊、群聊与 Bot 团队默认模型均可一键切换。",
                 },
                 {
-                  step: "4. 故障回退链",
+                  step: "5. 故障回退 & 账单",
                   detail:
-                    "配合 model_failover 与 400 自适应降级，主站限流或协议报错时自动无感回退至备选中转站或原生模型。",
-                },
-                {
-                  step: "5. 用量账单归集",
-                  detail:
-                    "用量账本按 gateway:<id> 模型家族归集 Token 与估算费用，便于评估不同中转站性价比。",
+                    "配合 model_failover 与 400 自适应降级自动回退，并按 gateway:<id> 归集 Token 与估算费用。",
                 },
               ].map((card) => (
                 <div
@@ -2131,12 +1999,6 @@ export function ExternalModelsView({
                 </div>
               ))}
             </div>
-            <div className="text-[11px] text-slate-400 flex flex-wrap items-center gap-x-4 gap-y-1">
-              <span>下一阶段可扩展方向：</span>
-              <span className="text-slate-300">• 全局故障回退链（model_failover）可视化排序</span>
-              <span className="text-slate-300">• 按站点维度的可用率 / 延迟 / 账单下钻</span>
-              <span className="text-slate-300">• OpenBao 密钥直连引用（免明文落盘）</span>
-            </div>
           </div>
         )}
       </div>
@@ -2145,7 +2007,7 @@ export function ExternalModelsView({
       {editor && !isReadonly && (
         <div
           className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-xs flex items-center justify-center p-3 sm:p-5"
-          onClick={() => setEditor(null)}
+          onClick={() => !editorSaving && setEditor(null)}
         >
           <div
             className="w-full max-w-3xl max-h-[90vh] rounded-2xl border border-slate-800 bg-slate-900 shadow-2xl flex flex-col overflow-hidden"
@@ -2157,16 +2019,15 @@ export function ExternalModelsView({
                 <h3 className="text-sm font-semibold text-slate-100">
                   {editor.mode === "create"
                     ? "添加外部中转站"
-                    : editor.editingLiveOrigin
-                      ? `调整预演配置 · ${editor.name}`
-                      : `编辑中转站 · ${editor.name}`}
+                    : `编辑中转站 · ${editor.name}`}
                 </h3>
                 <p className="text-[11px] text-slate-400 mt-0.5">
-                  3 步完成中转站接入；选择方言模板后自动预设兼容参数，一般无需修改高级区
+                  密钥将自动存入 {openBaoReady ? "OpenBao KV（不可用时自动降级本机 0600）" : "本机 0600 隔离槽"}，gateways.json 零明文落盘
                 </p>
               </div>
               <button
                 type="button"
+                disabled={editorSaving}
                 onClick={() => setEditor(null)}
                 aria-label="关闭弹窗"
                 className="h-8 w-8 rounded-lg inline-flex items-center justify-center text-slate-400 hover:bg-slate-800 hover:text-slate-100 cursor-pointer"
@@ -2184,7 +2045,7 @@ export function ExternalModelsView({
                 </div>
               )}
 
-              {/* Step 1: 9 Dialect Templates */}
+              {/* Step 1: Dialect Templates */}
               <section className="space-y-2.5">
                 <div className="flex items-center justify-between">
                   <span className="text-xs font-semibold text-slate-200">
@@ -2209,9 +2070,7 @@ export function ExternalModelsView({
                         }`}
                       >
                         <div className="flex items-center justify-between gap-1">
-                          <span className="text-xs font-semibold truncate">
-                            {preset.label}
-                          </span>
+                          <span className="text-xs font-semibold truncate">{preset.label}</span>
                           {active && <Check className="w-3.5 h-3.5 text-sky-400 shrink-0" />}
                         </div>
                         <div className="text-[10px] text-slate-400 mt-1 line-clamp-2 leading-snug">
@@ -2223,11 +2082,9 @@ export function ExternalModelsView({
                 </div>
               </section>
 
-              {/* Step 2: Core Required Fields */}
+              {/* Step 2: Core Fields */}
               <section className="space-y-3 pt-2 border-t border-slate-800/80">
-                <div className="text-xs font-semibold text-slate-200">
-                  2. 核心连接与凭证信息
-                </div>
+                <div className="text-xs font-semibold text-slate-200">2. 核心连接与凭证信息</div>
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                   <div className="space-y-1">
@@ -2292,7 +2149,7 @@ export function ExternalModelsView({
                       Base URL <span className="text-rose-400">*</span>
                     </span>
                     <span className="text-[10px] text-slate-500">
-                      仅支持 http(s)://，未带路径时自动拼接 /v1
+                      支持 https:// 与本机 127.0.0.1 / localhost，未带路径自动拼接 /v1
                     </span>
                   </label>
                   <input
@@ -2306,65 +2163,39 @@ export function ExternalModelsView({
                   />
                 </div>
 
-                {/* Credential Source Switch (Strict No-RCE, No Plaintext LocalStorage) */}
+                {/* Credential Source Switch */}
                 <div className="space-y-2">
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <label className="text-[11px] text-slate-300">凭证来源</label>
-                    {editor.credential_kind !== "server_cmd_readonly" && (
-                      <div className="inline-flex rounded-lg border border-slate-800 bg-slate-950 p-0.5 text-[11px]">
+                    <div className="inline-flex rounded-lg border border-slate-800 bg-slate-950 p-0.5 text-[11px]">
+                      {(
+                        [
+                          ["api_key", "API Key（自动加密托管）"],
+                          ["api_key_env", "环境变量"],
+                          ["none", "无密钥"],
+                        ] as const
+                      ).map(([kind, label]) => (
                         <button
+                          key={kind}
                           type="button"
                           onClick={() =>
                             setEditor((cur) =>
-                              cur ? { ...cur, credential_kind: "api_key" } : cur,
+                              cur ? { ...cur, credential_kind: kind } : cur,
                             )
                           }
                           className={`px-2.5 py-1 rounded-md cursor-pointer ${
-                            editor.credential_kind === "api_key"
+                            editor.credential_kind === kind
                               ? "bg-sky-600 text-white"
                               : "text-slate-400 hover:text-slate-200"
                           }`}
                         >
-                          API Key
+                          {label}
                         </button>
-                        <button
-                          type="button"
-                          onClick={() =>
-                            setEditor((cur) =>
-                              cur ? { ...cur, credential_kind: "api_key_env" } : cur,
-                            )
-                          }
-                          className={`px-2.5 py-1 rounded-md cursor-pointer ${
-                            editor.credential_kind === "api_key_env"
-                              ? "bg-sky-600 text-white"
-                              : "text-slate-400 hover:text-slate-200"
-                          }`}
-                        >
-                          环境变量 (api_key_env)
-                        </button>
-                      </div>
-                    )}
+                      ))}
+                    </div>
                   </div>
 
-                  {editor.credential_kind === "server_cmd_readonly" ? (
-                    <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-2.5 flex items-center justify-between gap-2 text-xs text-emerald-200">
-                      <span className="inline-flex items-center gap-1.5">
-                        <Lock className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                        服务端命令凭证（只读 · OpenBao/主机托管，前端禁止编辑命令防 RCE）
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setEditor((cur) =>
-                            cur ? { ...cur, credential_kind: "api_key_env" } : cur,
-                          )
-                        }
-                        className="shrink-0 text-[11px] underline text-emerald-300 hover:text-emerald-100 cursor-pointer"
-                      >
-                        改用环境变量
-                      </button>
-                    </div>
-                  ) : editor.credential_kind === "api_key" ? (
+                  {editor.credential_kind === "api_key" ? (
                     <div className="space-y-1.5">
                       <input
                         type="password"
@@ -2376,18 +2207,20 @@ export function ExternalModelsView({
                           )
                         }
                         placeholder={
-                          editor.api_key_masked_existing
-                            ? `已脱敏保存（${editor.api_key_masked_existing}），留空保持不变`
-                            : "输入 sk-... 密钥（预演态仅保留脱敏掩码）"
+                          editor.mode === "edit" && editor.api_key_hint_existing
+                            ? `已托管（${editor.api_key_hint_existing}），留空则保持不变，输入新值将覆盖`
+                            : "输入上游 API Key（如 sk-...）"
                         }
                         className="w-full rounded-lg border border-slate-800 bg-slate-950 px-3 py-2 text-xs font-mono text-slate-100 placeholder:text-slate-600 focus:outline-none focus:border-sky-500"
                       />
-                      <p className="text-[11px] text-amber-300/90">
-                        安全保护：前端预演绝不将明文 API Key 存入浏览器 localStorage（保存时立即脱敏为 [REDACTED]）；接入后端 API 后将写入受保护配置 / OpenBao。
+                      <p className="text-[11px] text-slate-500">
+                        提交后由服务端 SecretStore 自动存入{" "}
+                        {openBaoReady ? "OpenBao KV（失败时降级本机 0600）" : "本机 0600 隔离槽"}
+                        ，前端与 gateways.json 绝不保留明文。
                       </p>
                     </div>
-                  ) : (
-                    <div className="space-y-1">
+                  ) : editor.credential_kind === "api_key_env" ? (
+                    <div className="space-y-1.5">
                       <input
                         type="text"
                         value={editor.api_key_env}
@@ -2396,27 +2229,31 @@ export function ExternalModelsView({
                             cur ? { ...cur, api_key_env: e.target.value.toUpperCase() } : cur,
                           )
                         }
-                        placeholder="例：NEW_API_KEY 或 OPENROUTER_API_KEY"
+                        placeholder="例如：NEW_API_KEY"
                         className="w-full rounded-lg border border-slate-800 bg-slate-950 px-3 py-2 text-xs font-mono text-slate-100 placeholder:text-slate-600 focus:outline-none focus:border-sky-500"
                       />
                       <p className="text-[11px] text-slate-500">
-                        Bridge 运行时从宿主环境或 systemd EnvironmentFile 读取该变量，推荐生产环境使用。
+                        Bridge 运行时从宿主环境或 systemd EnvironmentFile 读取该变量。
                       </p>
                     </div>
+                  ) : (
+                    <p className="text-[11px] text-slate-500 rounded-lg border border-slate-800/80 bg-slate-950/60 px-3 py-2">
+                      适用于本机 Ollama / vLLM 等无需鉴权的开放端点。
+                    </p>
                   )}
                 </div>
               </section>
 
-              {/* Step 3: Model Filtering & Live Preview */}
+              {/* Step 3: Probe & Model Filters */}
               <section className="space-y-3 pt-2 border-t border-slate-800/80">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <span className="text-xs font-semibold text-slate-200">
-                    3. 模型过滤与静态兜底目录
+                    3. 连通性实测与模型过滤
                   </span>
                   <button
                     type="button"
                     disabled={editorProbing}
-                    onClick={handleEditorProbe}
+                    onClick={() => void handleEditorProbe()}
                     className="inline-flex items-center gap-1.5 rounded-lg border border-sky-500/30 bg-sky-500/15 hover:bg-sky-500/25 px-2.5 py-1 text-[11px] font-medium text-sky-200 disabled:opacity-50 cursor-pointer"
                   >
                     {editorProbing ? (
@@ -2424,13 +2261,23 @@ export function ExternalModelsView({
                     ) : (
                       <Play className="w-3 h-3" />
                     )}
-                    测试连通 & 拉取模型
+                    测试连通 &amp; 自动拉取模型
                   </button>
                 </div>
 
-                {editorProbeMsg && (
-                  <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-[11px] text-emerald-200">
-                    {editorProbeMsg}
+                {editorProbeResp && (
+                  <div
+                    className={`rounded-lg border px-3 py-2 text-[11px] space-y-0.5 ${
+                      editorProbeResp.ok
+                        ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-200"
+                        : "border-rose-500/30 bg-rose-500/10 text-rose-200"
+                    }`}
+                  >
+                    <div className="font-medium">
+                      {editorProbeResp.ok ? "探测通过" : "探测未通过"} · {editorProbeResp.latency_ms}ms
+                      {editorProbeResp.http_status ? ` · HTTP ${editorProbeResp.http_status}` : ""}
+                    </div>
+                    <div>{editorProbeResp.message}</div>
                   </div>
                 )}
 
@@ -2486,32 +2333,33 @@ export function ExternalModelsView({
                   />
                 </div>
 
-                {/* Live Filter Preview inside Editor */}
-                <div className="rounded-lg border border-slate-800 bg-slate-950/70 p-3 space-y-2">
-                  <div className="flex items-center justify-between text-[11px]">
-                    <span className="inline-flex items-center gap-1.5 text-slate-300 font-medium">
-                      <Eye className="w-3.5 h-3.5 text-sky-400" />
-                      工作台 / Telegram 暴露预览
-                    </span>
-                    <span className="font-mono text-emerald-400">
-                      {editorFilterPreview.exposedCount} / {editorFilterPreview.totalCount} 将暴露
-                    </span>
-                  </div>
-                  <div className="flex flex-wrap gap-1.5 max-h-28 overflow-y-auto">
-                    {editorFilterPreview.rows.map((row) => (
-                      <span
-                        key={row.modelId}
-                        className={`px-2 py-0.5 rounded text-[11px] font-mono border ${
-                          row.matched
-                            ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-200"
-                            : "border-slate-800 bg-slate-900 text-slate-500 line-through"
-                        }`}
-                      >
-                        {row.displayLabel}
+                {editorFilterPreview.totalCount > 0 && (
+                  <div className="rounded-lg border border-slate-800 bg-slate-950/70 p-3 space-y-2">
+                    <div className="flex items-center justify-between text-[11px]">
+                      <span className="inline-flex items-center gap-1.5 text-slate-300 font-medium">
+                        <Eye className="w-3.5 h-3.5 text-sky-400" />
+                        工作台 / Telegram 暴露预览
                       </span>
-                    ))}
+                      <span className="font-mono text-emerald-400">
+                        {editorFilterPreview.exposedCount} / {editorFilterPreview.totalCount} 将暴露
+                      </span>
+                    </div>
+                    <div className="flex flex-wrap gap-1.5 max-h-28 overflow-y-auto">
+                      {editorFilterPreview.rows.map((row) => (
+                        <span
+                          key={row.modelId}
+                          className={`px-2 py-0.5 rounded text-[11px] font-mono border ${
+                            row.matched
+                              ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-200"
+                              : "border-slate-800 bg-slate-900 text-slate-500 line-through"
+                          }`}
+                        >
+                          {row.displayLabel}
+                        </span>
+                      ))}
+                    </div>
                   </div>
-                </div>
+                )}
               </section>
 
               {/* Collapsible Advanced Dialect Adaptation */}
@@ -2546,7 +2394,7 @@ export function ExternalModelsView({
                           onChange={(e) =>
                             setEditor((cur) =>
                               cur
-                                ? { ...cur, effort_mode: e.target.value as EffortMode }
+                                ? { ...cur, effort_mode: e.target.value as GatewayEffortMode }
                                 : cur,
                             )
                           }
@@ -2567,7 +2415,7 @@ export function ExternalModelsView({
                               cur
                                 ? {
                                     ...cur,
-                                    max_tokens_field: e.target.value as MaxTokensField,
+                                    max_tokens_field: e.target.value as GatewayMaxTokensField,
                                   }
                                 : cur,
                             )
@@ -2602,22 +2450,10 @@ export function ExternalModelsView({
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                       {(
                         [
-                          [
-                            "supports_reasoning_effort",
-                            "支持推理强度 (supports_reasoning_effort)",
-                          ],
-                          [
-                            "flatten_system_content",
-                            "拍平多段 system 消息 (flatten_system_content)",
-                          ],
-                          [
-                            "strip_stream_options",
-                            "移除 stream_options (strip_stream_options)",
-                          ],
-                          [
-                            "adaptive_400_fallback",
-                            "400 错误自适应降级重试 (adaptive_400_fallback)",
-                          ],
+                          ["supports_reasoning_effort", "支持推理强度 (supports_reasoning_effort)"],
+                          ["flatten_system_content", "拍平多段 system 消息 (flatten_system_content)"],
+                          ["strip_stream_options", "移除 stream_options (strip_stream_options)"],
+                          ["adaptive_400_fallback", "400 错误自适应降级重试 (adaptive_400_fallback)"],
                         ] as const
                       ).map(([field, label]) => (
                         <label
@@ -2676,7 +2512,7 @@ export function ExternalModelsView({
                     <div className="space-y-2">
                       <div className="flex items-center justify-between">
                         <span className="text-[11px] text-slate-400">
-                          自定义请求头 (extra_headers，如 HTTP-Referer / X-Title)
+                          自定义请求头 (extra_headers，敏感头自动脱敏，保留 [REDACTED] 不覆盖旧值)
                         </span>
                         <button
                           type="button"
@@ -2685,10 +2521,7 @@ export function ExternalModelsView({
                               cur
                                 ? {
                                     ...cur,
-                                    extra_headers: [
-                                      ...cur.extra_headers,
-                                      { key: "", value: "" },
-                                    ],
+                                    extra_headers: [...cur.extra_headers, { key: "", value: "" }],
                                   }
                                 : cur,
                             )
@@ -2701,54 +2534,58 @@ export function ExternalModelsView({
                       </div>
                       {editor.extra_headers.length > 0 && (
                         <div className="space-y-1.5">
-                          {editor.extra_headers.map((pair, idx) => (
-                            <div key={idx} className="flex items-center gap-2">
-                              <input
-                                type="text"
-                                value={pair.key}
-                                onChange={(e) =>
-                                  setEditor((cur) => {
-                                    if (!cur) return cur;
-                                    const next = [...cur.extra_headers];
-                                    next[idx] = { ...next[idx], key: e.target.value };
-                                    return { ...cur, extra_headers: next };
-                                  })
-                                }
-                                placeholder="Header 名称"
-                                className="flex-1 rounded-lg border border-slate-800 bg-slate-950 px-2.5 py-1 text-xs font-mono text-slate-200 focus:outline-none focus:border-sky-500"
-                              />
-                              <input
-                                type="text"
-                                value={pair.value}
-                                onChange={(e) =>
-                                  setEditor((cur) => {
-                                    if (!cur) return cur;
-                                    const next = [...cur.extra_headers];
-                                    next[idx] = { ...next[idx], value: e.target.value };
-                                    return { ...cur, extra_headers: next };
-                                  })
-                                }
-                                placeholder="Header 值"
-                                className="flex-1 rounded-lg border border-slate-800 bg-slate-950 px-2.5 py-1 text-xs font-mono text-slate-200 focus:outline-none focus:border-sky-500"
-                              />
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  setEditor((cur) => {
-                                    if (!cur) return cur;
-                                    return {
-                                      ...cur,
-                                      extra_headers: cur.extra_headers.filter((_, i) => i !== idx),
-                                    };
-                                  })
-                                }
-                                aria-label="删除请求头"
-                                className="p-1 rounded text-slate-400 hover:text-rose-300 hover:bg-rose-500/10 cursor-pointer"
-                              >
-                                <Trash2 className="w-3.5 h-3.5" />
-                              </button>
-                            </div>
-                          ))}
+                          {editor.extra_headers.map((pair, idx) => {
+                            const sensitive = isSensitiveHeaderKey(pair.key);
+                            return (
+                              <div key={idx} className="flex items-center gap-2">
+                                <input
+                                  type="text"
+                                  value={pair.key}
+                                  onChange={(e) =>
+                                    setEditor((cur) => {
+                                      if (!cur) return cur;
+                                      const next = [...cur.extra_headers];
+                                      next[idx] = { ...next[idx], key: e.target.value };
+                                      return { ...cur, extra_headers: next };
+                                    })
+                                  }
+                                  placeholder="Header 名称"
+                                  className="flex-1 rounded-lg border border-slate-800 bg-slate-950 px-2.5 py-1 text-xs font-mono text-slate-200 focus:outline-none focus:border-sky-500"
+                                />
+                                <input
+                                  type={sensitive && pair.value !== "[REDACTED]" ? "password" : "text"}
+                                  autoComplete="off"
+                                  value={pair.value}
+                                  onChange={(e) =>
+                                    setEditor((cur) => {
+                                      if (!cur) return cur;
+                                      const next = [...cur.extra_headers];
+                                      next[idx] = { ...next[idx], value: e.target.value };
+                                      return { ...cur, extra_headers: next };
+                                    })
+                                  }
+                                  placeholder={sensitive ? "敏感值（输入新值覆盖）" : "Header 值"}
+                                  className="flex-1 rounded-lg border border-slate-800 bg-slate-950 px-2.5 py-1 text-xs font-mono text-slate-200 focus:outline-none focus:border-sky-500"
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setEditor((cur) => {
+                                      if (!cur) return cur;
+                                      return {
+                                        ...cur,
+                                        extra_headers: cur.extra_headers.filter((_, i) => i !== idx),
+                                      };
+                                    })
+                                  }
+                                  aria-label="删除请求头"
+                                  className="p-1 rounded text-slate-400 hover:text-rose-300 hover:bg-rose-500/10 cursor-pointer"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              </div>
+                            );
+                          })}
                         </div>
                       )}
                     </div>
@@ -2761,6 +2598,7 @@ export function ExternalModelsView({
             <div className="px-5 py-3 border-t border-slate-800 bg-slate-950/60 flex items-center justify-end gap-2">
               <button
                 type="button"
+                disabled={editorSaving}
                 onClick={() => setEditor(null)}
                 className="rounded-lg border border-slate-700 bg-slate-900 hover:bg-slate-800 px-3.5 py-1.5 text-xs text-slate-300 cursor-pointer"
               >
@@ -2768,11 +2606,16 @@ export function ExternalModelsView({
               </button>
               <button
                 type="button"
-                onClick={handleSaveEditor}
-                className="inline-flex items-center gap-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 px-4 py-1.5 text-xs font-medium text-white cursor-pointer"
+                disabled={editorSaving}
+                onClick={() => void handleSaveEditor()}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 px-4 py-1.5 text-xs font-medium text-white disabled:opacity-50 cursor-pointer"
               >
-                <Check className="w-3.5 h-3.5" />
-                保存到预演列表
+                {editorSaving ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <Check className="w-3.5 h-3.5" />
+                )}
+                保存并热生效
               </button>
             </div>
           </div>
@@ -2780,10 +2623,10 @@ export function ExternalModelsView({
       )}
 
       {/* Controlled Delete Confirmation Modal */}
-      {deleteTarget && !isReadonly && (
+      {deleteTarget && !isReadonly && !deleteTarget.read_only_cmd && (
         <div
           className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-xs flex items-center justify-center p-4"
-          onClick={() => setDeleteTarget(null)}
+          onClick={() => !deleting && setDeleteTarget(null)}
         >
           <div
             className="w-full max-w-md rounded-2xl border border-slate-800 bg-slate-900 p-5 space-y-4 shadow-2xl"
@@ -2798,15 +2641,16 @@ export function ExternalModelsView({
                   确认移除中转站「{deleteTarget.name}」？
                 </h3>
                 <p className="text-xs text-slate-400 leading-relaxed">
-                  {deleteTarget.source === "live"
-                    ? `站点 ${deleteTarget.id} 当前由后端 gateways.json 托管。预演阶段不会修改服务器文件，正式接入后端 API 后移除将同步刷新模型目录。`
-                    : `将从当前预演配置中移除站点 ${deleteTarget.id} 及其过滤规则。`}
+                  将从 <code className="font-mono">gateways.json</code> 移除站点{" "}
+                  <code className="font-mono">{deleteTarget.id}</code>
+                  ，并同步删除 SecretStore 中关联的托管密钥。Bridge 将即时停止路由该站点。
                 </p>
               </div>
             </div>
             <div className="flex items-center justify-end gap-2 pt-1">
               <button
                 type="button"
+                disabled={deleting}
                 onClick={() => setDeleteTarget(null)}
                 className="rounded-lg border border-slate-700 bg-slate-900 hover:bg-slate-800 px-3.5 py-1.5 text-xs text-slate-300 cursor-pointer"
               >
@@ -2814,10 +2658,12 @@ export function ExternalModelsView({
               </button>
               <button
                 type="button"
-                onClick={handleConfirmDelete}
-                className="rounded-lg bg-rose-600 hover:bg-rose-500 px-3.5 py-1.5 text-xs font-medium text-white cursor-pointer"
+                disabled={deleting}
+                onClick={() => void handleConfirmDelete()}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-rose-600 hover:bg-rose-500 px-3.5 py-1.5 text-xs font-medium text-white disabled:opacity-50 cursor-pointer"
               >
-                {deleteTarget.source === "live" ? "知道了" : "确认移除"}
+                {deleting && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                确认移除
               </button>
             </div>
           </div>

@@ -49,11 +49,15 @@ import {
   StudioApiError,
   abortChatTurn,
   fetchActiveSessionTurn,
+  fetchBotConfig,
   fetchBots,
   fetchModels,
   fetchSessionMessages,
   fetchSessions,
+  fetchWorkbenchState,
   sendChatTurn,
+  updateBotConfig,
+  updateWorkbenchState,
 } from "../api";
 import {
   MAX_CLIENT_CHAT_STREAMS,
@@ -74,8 +78,10 @@ import type {
   SessionSummaryItem,
   SessionUpdatedEvent,
   StudioSession,
+  WorkbenchCustomProjectItem,
   WorkbenchLayoutPrefs,
   WorkbenchPaneConfig,
+  WorkbenchSidebarState,
 } from "../types";
 import { AttentionPanel } from "./AttentionPanel";
 import { BrowserView } from "./BrowserView";
@@ -134,23 +140,7 @@ interface ParsedModelOption {
   displayName: string;
 }
 
-interface CustomProjectItem {
-  id: string;
-  name: string;
-  createdAt?: number;
-}
-
-interface WorkbenchSidebarState {
-  customProjects: CustomProjectItem[];
-  projectRenames: Record<string, string>;
-  hiddenProjectIds: string[];
-  hiddenSessionCids: string[];
-  pinnedSessionCids: string[];
-  archivedSessionCids: string[];
-  unreadSessionCids: string[];
-  sessionRenames: Record<string, string>;
-  showArchived: boolean;
-}
+type CustomProjectItem = WorkbenchCustomProjectItem;
 
 interface StoredWorkbenchPrefs extends WorkbenchLayoutPrefs, WorkbenchSidebarState {}
 
@@ -621,6 +611,88 @@ function saveWorkbenchPrefs(prefs: StoredWorkbenchPrefs): void {
   }
 }
 
+function extractSidebarState(prefs: StoredWorkbenchPrefs): WorkbenchSidebarState {
+  return {
+    customProjects: sanitizeCustomProjects(prefs.customProjects),
+    projectRenames: sanitizeProjectRenames(prefs.projectRenames),
+    hiddenProjectIds: sanitizeSlugList(prefs.hiddenProjectIds, MAX_HIDDEN_PROJECT_IDS, 64),
+    hiddenSessionCids: sanitizeSessionCidList(prefs.hiddenSessionCids, MAX_HIDDEN_SESSION_CIDS),
+    pinnedSessionCids: sanitizeSessionCidList(prefs.pinnedSessionCids, MAX_PINNED_SESSION_CIDS),
+    archivedSessionCids: sanitizeSessionCidList(
+      prefs.archivedSessionCids,
+      MAX_ARCHIVED_SESSION_CIDS,
+    ),
+    unreadSessionCids: sanitizeSessionCidList(prefs.unreadSessionCids, MAX_UNREAD_SESSION_CIDS),
+    sessionRenames: sanitizeSessionRenames(prefs.sessionRenames),
+    showArchived: Boolean(prefs.showArchived),
+  };
+}
+
+function sanitizeSidebarState(raw: unknown): WorkbenchSidebarState {
+  const obj = raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
+  return {
+    customProjects: sanitizeCustomProjects(obj.customProjects),
+    projectRenames: sanitizeProjectRenames(obj.projectRenames),
+    hiddenProjectIds: sanitizeSlugList(obj.hiddenProjectIds, MAX_HIDDEN_PROJECT_IDS, 64),
+    hiddenSessionCids: sanitizeSessionCidList(obj.hiddenSessionCids, MAX_HIDDEN_SESSION_CIDS),
+    pinnedSessionCids: sanitizeSessionCidList(obj.pinnedSessionCids, MAX_PINNED_SESSION_CIDS),
+    archivedSessionCids: sanitizeSessionCidList(
+      obj.archivedSessionCids,
+      MAX_ARCHIVED_SESSION_CIDS,
+    ),
+    unreadSessionCids: sanitizeSessionCidList(obj.unreadSessionCids, MAX_UNREAD_SESSION_CIDS),
+    sessionRenames: sanitizeSessionRenames(obj.sessionRenames),
+    showArchived: Boolean(obj.showArchived === true),
+  };
+}
+
+function hasNonEmptySidebarState(state: WorkbenchSidebarState): boolean {
+  return (
+    state.customProjects.length > 0 ||
+    Object.keys(state.projectRenames).length > 0 ||
+    state.hiddenProjectIds.length > 0 ||
+    state.hiddenSessionCids.length > 0 ||
+    state.pinnedSessionCids.length > 0 ||
+    state.archivedSessionCids.length > 0 ||
+    state.unreadSessionCids.length > 0 ||
+    Object.keys(state.sessionRenames).length > 0 ||
+    state.showArchived
+  );
+}
+
+function mergeSidebarStates(
+  remote: WorkbenchSidebarState,
+  local: WorkbenchSidebarState,
+): WorkbenchSidebarState {
+  return {
+    customProjects: sanitizeCustomProjects([...local.customProjects, ...remote.customProjects]),
+    projectRenames: sanitizeProjectRenames({ ...remote.projectRenames, ...local.projectRenames }),
+    hiddenProjectIds: sanitizeSlugList(
+      [...local.hiddenProjectIds, ...remote.hiddenProjectIds],
+      MAX_HIDDEN_PROJECT_IDS,
+      64,
+    ),
+    hiddenSessionCids: sanitizeSessionCidList(
+      [...local.hiddenSessionCids, ...remote.hiddenSessionCids],
+      MAX_HIDDEN_SESSION_CIDS,
+    ),
+    pinnedSessionCids: sanitizeSessionCidList(
+      [...local.pinnedSessionCids, ...remote.pinnedSessionCids],
+      MAX_PINNED_SESSION_CIDS,
+    ),
+    archivedSessionCids: sanitizeSessionCidList(
+      [...local.archivedSessionCids, ...remote.archivedSessionCids],
+      MAX_ARCHIVED_SESSION_CIDS,
+    ),
+    unreadSessionCids: sanitizeSessionCidList(
+      [...local.unreadSessionCids, ...remote.unreadSessionCids],
+      MAX_UNREAD_SESSION_CIDS,
+    ),
+    sessionRenames: sanitizeSessionRenames({ ...remote.sessionRenames, ...local.sessionRenames }),
+    showArchived: Boolean(local.showArchived),
+  };
+}
+
 function persistSidebarStateStandalone(nextState: WorkbenchSidebarState): void {
   const current = loadWorkbenchPrefs();
   saveWorkbenchPrefs({
@@ -653,6 +725,8 @@ export interface ChatPaneProps {
   sessionSyncEvent?: SessionUpdatedEvent | null;
   roomEvent?: RoomLiveEvent | null;
   roomEvents?: RoomLiveEvent[];
+  botsEventVer?: number;
+  gatewaysEventVer?: number;
   pendingQuote?: PendingQuotePayload | null;
   onQuoteConsumed?: (quoteId: number) => void;
   pendingOpenSession?: PendingOpenSessionPayload | null;
@@ -696,6 +770,8 @@ export function ChatPane({
   sessionSyncEvent,
   roomEvent,
   roomEvents,
+  botsEventVer = 0,
+  gatewaysEventVer = 0,
   pendingQuote,
   onQuoteConsumed,
   pendingOpenSession,
@@ -800,6 +876,8 @@ export function ChatPane({
   const [selectedProvider, setSelectedProvider] = useState<string>(ALL_PROVIDERS_ID);
   const [selectedModel, setSelectedModel] = useState<string>("");
   const [selectedEffort, setSelectedEffort] = useState<string>("");
+  const [botConfigCanEdit, setBotConfigCanEdit] = useState<boolean>(false);
+  const [savingBotConfig, setSavingBotConfig] = useState<boolean>(false);
   const [projectExpandOverrides, setProjectExpandOverrides] = useState<Record<string, boolean>>({});
   const [expandedSessionLists, setExpandedSessionLists] = useState<Record<string, boolean>>({});
 
@@ -922,7 +1000,13 @@ export function ChatPane({
   effectiveBotRef.current = effectiveBot;
   const selectedModelRef = useRef<string>(selectedModel);
   selectedModelRef.current = selectedModel;
+  const selectedEffortRef = useRef<string>(selectedEffort);
+  selectedEffortRef.current = selectedEffort;
+  const selectedProviderRef = useRef<string>(selectedProvider);
+  selectedProviderRef.current = selectedProvider;
   const userChoseAllProvidersRef = useRef<boolean>(false);
+  const prevLoadedBotRef = useRef<string>("");
+  const botConfigPatchSeqRef = useRef<number>(0);
   const lastAutoExpandedCidRef = useRef<string | null>(null);
   const streamingRef = useRef<boolean>(false);
   const interruptingRef = useRef<boolean>(false);
@@ -1089,58 +1173,120 @@ export function ChatPane({
           handleApiAuthError(err);
         }
       });
-  }, [handleApiAuthError]);
+  }, [botsEventVer, gatewaysEventVer, handleApiAuthError]);
 
   useEffect(() => {
     const seq = ++modelsSeqRef.current;
     const reqBot = effectiveBot && effectiveBot !== TEAM_TARGET_ID ? effectiveBot : "";
-    void fetchModels(reqBot || undefined)
-      .then((res) => {
-        if (!mountedRef.current || modelsSeqRef.current !== seq || effectiveBotRef.current !== reqBot) {
-          return;
-        }
-        setMeta(res);
-        const parsed = (res.models || []).map(parseModelOption);
-        let resolvedModel = selectedModelRef.current;
-        if (!resolvedModel || (parsed.length > 0 && !parsed.some((m) => m.id === resolvedModel))) {
-          resolvedModel = res.active_model || "";
-          setSelectedModel(resolvedModel);
-        }
-        if (!userChoseAllProvidersRef.current) {
-          const matched =
-            parsed.find((m) => m.id === resolvedModel) ||
-            parsed.find((m) => m.id === res.active_model);
-          setSelectedProvider(matched ? matched.provider : ALL_PROVIDERS_ID);
-        }
-        setSelectedProject((cur) => {
-          const hiddenSet = hiddenProjectIdSetRef.current;
-          if (cur && !hiddenSet.has(cur)) return cur;
-          const visibleBackendProjects = (res.projects || []).filter(
-            (p) =>
-              p.id &&
-              !hiddenSet.has(p.id) &&
-              !isTempProjectName((p.name || p.id).trim()) &&
-              !isTempProjectName(p.id),
-          );
-          const candidate =
-            (res.default_project && !hiddenSet.has(res.default_project)
-              ? res.default_project
-              : "") ||
-            visibleBackendProjects[0]?.id ||
-            customProjectsRef.current[0]?.id ||
-            "";
-          if (candidate !== cur) {
-            onProjectChangeRef.current?.(candidate);
-          }
-          return candidate;
-        });
-      })
-      .catch((err) => {
-        if (mountedRef.current && modelsSeqRef.current === seq) {
-          handleApiAuthError(err);
-        }
+    const botSwitched = prevLoadedBotRef.current !== reqBot;
+    if (botSwitched) {
+      prevLoadedBotRef.current = reqBot;
+      userChoseAllProvidersRef.current = false;
+      botConfigPatchSeqRef.current += 1;
+      setSavingBotConfig(false);
+    }
+
+    const modelsPromise = fetchModels(reqBot || undefined);
+    const configPromise = reqBot ? fetchBotConfig(reqBot) : Promise.resolve(null);
+
+    void Promise.allSettled([modelsPromise, configPromise]).then(([modelsSettled, cfgSettled]) => {
+      if (!mountedRef.current || modelsSeqRef.current !== seq || effectiveBotRef.current !== reqBot) {
+        return;
+      }
+
+      if (modelsSettled.status === "rejected" && cfgSettled.status === "rejected") {
+        handleApiAuthError(modelsSettled.reason);
+        handleApiAuthError(cfgSettled.reason);
+        setBotConfigCanEdit(false);
+        return;
+      }
+      if (modelsSettled.status === "rejected") {
+        handleApiAuthError(modelsSettled.reason);
+      }
+      if (cfgSettled.status === "rejected") {
+        handleApiAuthError(cfgSettled.reason);
+      }
+
+      const modelsRes = modelsSettled.status === "fulfilled" ? modelsSettled.value : null;
+      const cfgRes = cfgSettled.status === "fulfilled" ? cfgSettled.value : null;
+
+      const mergedModels =
+        cfgRes && cfgRes.models.length > 0 ? cfgRes.models : modelsRes?.models || [];
+      const mergedEfforts =
+        cfgRes && cfgRes.efforts.length > 0
+          ? cfgRes.efforts
+          : modelsRes?.efforts || ["low", "medium", "high", "xhigh", "max"];
+      const mergedProjects =
+        modelsRes && modelsRes.projects.length > 0 ? modelsRes.projects : cfgRes?.projects || [];
+
+      const rawServerModel =
+        (cfgRes?.effective_model && cfgRes.effective_model !== "default"
+          ? cfgRes.effective_model
+          : "") ||
+        (modelsRes?.effective_model && modelsRes.effective_model !== "default"
+          ? modelsRes.effective_model
+          : "") ||
+        (modelsRes?.active_model && modelsRes.active_model !== "default"
+          ? modelsRes.active_model
+          : "");
+      const serverEffort = (cfgRes?.default_effort ?? modelsRes?.default_effort ?? "")
+        .trim()
+        .toLowerCase();
+      const serverDefaultProject =
+        modelsRes?.default_project || cfgRes?.default_project || "";
+      const ipcOnline = Boolean(cfgRes ? cfgRes.ipc_online : modelsRes?.ipc_online);
+
+      setMeta({
+        ok: true,
+        bot: cfgRes?.handle || modelsRes?.bot || reqBot,
+        active_model: rawServerModel,
+        effective_model: rawServerModel,
+        model_mode: cfgRes?.model_mode || modelsRes?.model_mode,
+        default_effort: serverEffort,
+        default_project: serverDefaultProject,
+        efforts: mergedEfforts,
+        models: mergedModels,
+        projects: mergedProjects,
+        ipc_online: ipcOnline,
       });
-  }, [effectiveBot, handleApiAuthError]);
+
+      setBotConfigCanEdit(!isReadonly && Boolean(reqBot) && (cfgRes ? cfgRes.can_edit : ipcOnline));
+
+      // Authoritative passive echo from server (C8): ALWAYS sync top bar to target Bot's server
+      // effective_model & default_effort without triggering any reverse PATCH writeback loop.
+      setSelectedModel(rawServerModel);
+      setSelectedEffort(serverEffort);
+
+      const parsed = mergedModels.map(parseModelOption);
+      if (!userChoseAllProvidersRef.current) {
+        const matched = parsed.find((m) => m.id === rawServerModel);
+        setSelectedProvider(matched ? matched.provider : ALL_PROVIDERS_ID);
+      }
+
+      setSelectedProject((cur) => {
+        const hiddenSet = hiddenProjectIdSetRef.current;
+        if (cur && !hiddenSet.has(cur)) return cur;
+        const visibleBackendProjects = mergedProjects.filter(
+          (p) =>
+            p.id &&
+            !hiddenSet.has(p.id) &&
+            !isTempProjectName((p.name || p.id).trim()) &&
+            !isTempProjectName(p.id),
+        );
+        const candidate =
+          (serverDefaultProject && !hiddenSet.has(serverDefaultProject)
+            ? serverDefaultProject
+            : "") ||
+          visibleBackendProjects[0]?.id ||
+          customProjectsRef.current[0]?.id ||
+          "";
+        if (candidate !== cur) {
+          onProjectChangeRef.current?.(candidate);
+        }
+        return candidate;
+      });
+    });
+  }, [effectiveBot, botsEventVer, gatewaysEventVer, isReadonly, handleApiAuthError]);
 
   const parsedModels = useMemo<ParsedModelOption[]>(
     () => (meta?.models || []).map(parseModelOption),
@@ -1178,14 +1324,133 @@ export function ChatPane({
     return parsedModels.filter((m) => m.provider === effectiveProvider);
   }, [parsedModels, effectiveProvider]);
 
+  const persistBotConfigPatch = useCallback(
+    (
+      targetBot: string,
+      patch: { model_mode?: "default" | "follow" | "custom"; model?: string; default_effort?: string },
+      rollback: { model: string; effort: string; provider: string },
+    ) => {
+      if (isReadonly || !targetBot || isTeamModeRef.current) return;
+      const patchSeq = ++botConfigPatchSeqRef.current;
+      // Supersede any older in-flight GET so stale config snapshots cannot overwrite this user change
+      modelsSeqRef.current += 1;
+      setSavingBotConfig(true);
+      setErrorBanner(null);
+
+      void updateBotConfig(targetBot, patch)
+        .then((res) => {
+          if (
+            !mountedRef.current ||
+            botConfigPatchSeqRef.current !== patchSeq ||
+            effectiveBotRef.current !== targetBot
+          ) {
+            return;
+          }
+          const canonicalModel =
+            res.effective_model && res.effective_model !== "default" ? res.effective_model : "";
+          const canonicalEffort = (res.default_effort || "").trim().toLowerCase();
+          setSelectedModel(canonicalModel);
+          setSelectedEffort(canonicalEffort);
+          setBotConfigCanEdit(Boolean(res.can_edit));
+          setMeta((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  active_model: canonicalModel,
+                  effective_model: canonicalModel,
+                  model_mode: res.model_mode,
+                  default_effort: canonicalEffort,
+                  efforts: res.efforts.length > 0 ? res.efforts : prev.efforts,
+                  models: res.models.length > 0 ? res.models : prev.models,
+                  ipc_online: res.ipc_online,
+                }
+              : prev,
+          );
+          if (!userChoseAllProvidersRef.current) {
+            const parsed = (res.models || []).map(parseModelOption);
+            const matched = parsed.find((m) => m.id === canonicalModel);
+            setSelectedProvider(matched ? matched.provider : ALL_PROVIDERS_ID);
+          }
+          setStatusNotice("已同步写入 TG 默认模型/思考强度配置");
+        })
+        .catch((err) => {
+          if (
+            !mountedRef.current ||
+            botConfigPatchSeqRef.current !== patchSeq ||
+            effectiveBotRef.current !== targetBot
+          ) {
+            return;
+          }
+          setSelectedModel(rollback.model);
+          setSelectedEffort(rollback.effort);
+          setSelectedProvider(rollback.provider);
+          if (!handleApiAuthError(err)) {
+            setErrorBanner(err instanceof Error ? err.message : "同步 Bot 默认配置失败");
+          }
+        })
+        .finally(() => {
+          if (mountedRef.current && botConfigPatchSeqRef.current === patchSeq) {
+            setSavingBotConfig(false);
+          }
+        });
+    },
+    [handleApiAuthError, isReadonly],
+  );
+
+  const handleModelChange = useCallback(
+    (nextModel: string) => {
+      if (isReadonly) return;
+      const targetBot = effectiveBotRef.current;
+      if (!targetBot || targetBot === TEAM_TARGET_ID) return;
+      const rollback = {
+        model: selectedModelRef.current,
+        effort: selectedEffortRef.current,
+        provider: selectedProviderRef.current,
+      };
+      setSelectedModel(nextModel);
+      const patch = nextModel
+        ? { model_mode: "custom" as const, model: nextModel }
+        : { model_mode: "default" as const };
+      persistBotConfigPatch(targetBot, patch, rollback);
+    },
+    [isReadonly, persistBotConfigPatch],
+  );
+
+  const handleEffortChange = useCallback(
+    (nextEffort: string) => {
+      if (isReadonly) return;
+      const targetBot = effectiveBotRef.current;
+      if (!targetBot || targetBot === TEAM_TARGET_ID) return;
+      const rollback = {
+        model: selectedModelRef.current,
+        effort: selectedEffortRef.current,
+        provider: selectedProviderRef.current,
+      };
+      setSelectedEffort(nextEffort);
+      persistBotConfigPatch(targetBot, { default_effort: nextEffort }, rollback);
+    },
+    [isReadonly, persistBotConfigPatch],
+  );
+
   const handleProviderChange = (nextProvider: string) => {
+    if (isReadonly) return;
     userChoseAllProvidersRef.current = nextProvider === ALL_PROVIDERS_ID;
+    const prevProvider = selectedProviderRef.current;
     setSelectedProvider(nextProvider);
     if (nextProvider === ALL_PROVIDERS_ID) return;
     const candidates = parsedModels.filter((m) => m.provider === nextProvider);
     if (candidates.length === 0) return;
     if (!candidates.some((m) => m.id === selectedModel)) {
-      setSelectedModel(candidates[0].id);
+      const targetBot = effectiveBotRef.current;
+      if (!targetBot || targetBot === TEAM_TARGET_ID) return;
+      const rollback = {
+        model: selectedModelRef.current,
+        effort: selectedEffortRef.current,
+        provider: prevProvider,
+      };
+      const nextModel = candidates[0].id;
+      setSelectedModel(nextModel);
+      persistBotConfigPatch(targetBot, { model_mode: "custom", model: nextModel }, rollback);
     }
   };
 
@@ -3513,9 +3778,9 @@ export function ChatPane({
                     <select
                       value={effectiveProvider}
                       onChange={(e) => handleProviderChange(e.target.value)}
-                      disabled={streaming || parsedModels.length === 0}
+                      disabled={isReadonly || streaming || parsedModels.length === 0 || !botConfigCanEdit || savingBotConfig}
                       aria-label="选择模型供应商"
-                      title="模型供应商"
+                      title={isReadonly ? "只读权限禁止修改默认模型" : "模型供应商（切换将同步至 TG 默认模型）"}
                       className="h-full bg-transparent px-1.5 text-xs text-slate-200 focus:outline-none min-w-0 max-w-36 disabled:opacity-50"
                     >
                       <option value={ALL_PROVIDERS_ID} className="bg-slate-950 text-slate-200">
@@ -3535,10 +3800,11 @@ export function ChatPane({
 
                   <select
                     value={selectedModel}
-                    onChange={(e) => setSelectedModel(e.target.value)}
-                    disabled={streaming}
+                    onChange={(e) => handleModelChange(e.target.value)}
+                    disabled={isReadonly || streaming || !botConfigCanEdit || savingBotConfig}
                     aria-label="选择模型"
-                    className="h-7 rounded-md bg-slate-950 border border-slate-800 px-2 text-xs text-slate-200 focus:outline-none focus:border-sky-500 max-w-48"
+                    title={isReadonly ? "只读权限禁止修改默认模型" : "切换将同步写入 TG 默认模型"}
+                    className="h-7 rounded-md bg-slate-950 border border-slate-800 px-2 text-xs text-slate-200 focus:outline-none focus:border-sky-500 max-w-48 disabled:opacity-50"
                   >
                     {(effectiveProvider === ALL_PROVIDERS_ID || !selectedModel) && (
                       <option value="">Bot 默认模型</option>
@@ -3555,10 +3821,11 @@ export function ChatPane({
 
                   <select
                     value={selectedEffort}
-                    onChange={(e) => setSelectedEffort(e.target.value)}
-                    disabled={streaming}
+                    onChange={(e) => handleEffortChange(e.target.value)}
+                    disabled={isReadonly || streaming || !botConfigCanEdit || savingBotConfig}
                     aria-label="思考强度"
-                    className="h-7 rounded-md bg-slate-950 border border-slate-800 px-2 text-xs text-slate-200 focus:outline-none focus:border-sky-500"
+                    title={isReadonly ? "只读权限禁止修改思考强度" : "切换将同步写入 TG 默认思考强度"}
+                    className="h-7 rounded-md bg-slate-950 border border-slate-800 px-2 text-xs text-slate-200 focus:outline-none focus:border-sky-500 disabled:opacity-50"
                   >
                     <option value="">默认强度</option>
                     {(meta?.efforts || ["low", "medium", "high", "xhigh", "max"]).map((ef) => (
@@ -4810,6 +5077,9 @@ export interface WorkspaceViewProps {
   sessionSyncEvent?: SessionUpdatedEvent | null;
   roomEvent?: RoomLiveEvent | null;
   roomEvents?: RoomLiveEvent[];
+  botsEventVer?: number;
+  gatewaysEventVer?: number;
+  workbenchStateEventVer?: number;
   jobsEventVer: number;
   attentionEventVer: number;
   onClaimBrowserOwner: (next: BrowserOwner) => void;
@@ -4827,6 +5097,9 @@ export function WorkspaceView({
   sessionSyncEvent,
   roomEvent,
   roomEvents,
+  botsEventVer = 0,
+  gatewaysEventVer = 0,
+  workbenchStateEventVer = 0,
   jobsEventVer,
   attentionEventVer,
   onClaimBrowserOwner,
@@ -4855,6 +5128,170 @@ export function WorkspaceView({
   const quoteCounterRef = useRef(0);
   const openSessionCounterRef = useRef(0);
   const mountedRef = useRef(true);
+  const layoutRef = useRef<StoredWorkbenchPrefs>(layout);
+  layoutRef.current = layout;
+
+  const workbenchServerVerRef = useRef<number>(0);
+  const workbenchFetchSeqRef = useRef<number>(0);
+  const workbenchInitialSyncDoneRef = useRef<boolean>(false);
+  const workbenchSyncInFlightRef = useRef<boolean>(false);
+  const workbenchPendingStateRef = useRef<WorkbenchSidebarState | null>(null);
+
+  const applyServerSidebarState = useCallback((remoteState: WorkbenchSidebarState) => {
+    const clean = sanitizeSidebarState(remoteState);
+    setLayout((prev) => ({
+      ...prev,
+      customProjects: clean.customProjects,
+      projectRenames: clean.projectRenames,
+      hiddenProjectIds: clean.hiddenProjectIds,
+      hiddenSessionCids: clean.hiddenSessionCids,
+      pinnedSessionCids: clean.pinnedSessionCids,
+      archivedSessionCids: clean.archivedSessionCids,
+      unreadSessionCids: clean.unreadSessionCids,
+      sessionRenames: clean.sessionRenames,
+      showArchived: clean.showArchived,
+    }));
+  }, []);
+
+  const flushSidebarSyncQueue = useCallback(async () => {
+    if (isReadonly || workbenchSyncInFlightRef.current) return;
+    workbenchSyncInFlightRef.current = true;
+    try {
+      while (mountedRef.current && workbenchPendingStateRef.current) {
+        const nextState = workbenchPendingStateRef.current;
+        workbenchPendingStateRef.current = null;
+        try {
+          const saved = await updateWorkbenchState({
+            expected_version: workbenchServerVerRef.current,
+            state: nextState,
+          });
+          if (!mountedRef.current) return;
+          workbenchServerVerRef.current = saved.version;
+          if (!workbenchPendingStateRef.current) {
+            applyServerSidebarState(saved.state);
+          }
+        } catch (err) {
+          if (!mountedRef.current) return;
+          if (err instanceof StudioApiError && err.status === 409) {
+            let latestVer =
+              typeof err.data?.version === "number" && Number.isFinite(err.data.version)
+                ? err.data.version
+                : workbenchServerVerRef.current;
+            let latestState = err.data?.state ? sanitizeSidebarState(err.data.state) : null;
+            if (!latestState) {
+              try {
+                const fetched = await fetchWorkbenchState();
+                latestVer = fetched.version;
+                latestState = sanitizeSidebarState(fetched.state);
+              } catch {
+                break;
+              }
+            }
+            if (!mountedRef.current) return;
+            workbenchServerVerRef.current = latestVer;
+            const localToMerge = workbenchPendingStateRef.current || nextState;
+            workbenchPendingStateRef.current = null;
+            const merged = mergeSidebarStates(latestState, localToMerge);
+            applyServerSidebarState(merged);
+            try {
+              const retried = await updateWorkbenchState({
+                expected_version: latestVer,
+                state: merged,
+              });
+              if (!mountedRef.current) return;
+              workbenchServerVerRef.current = retried.version;
+              if (!workbenchPendingStateRef.current) {
+                applyServerSidebarState(retried.state);
+              }
+            } catch (retryErr) {
+              if (
+                retryErr instanceof StudioApiError &&
+                (retryErr.status === 401 || retryErr.status === 403) &&
+                retryErr.source === "studio_auth"
+              ) {
+                onSessionRevoked(retryErr.message || "会话已失效，请重新登录");
+                return;
+              }
+              break;
+            }
+          } else {
+            if (
+              err instanceof StudioApiError &&
+              (err.status === 401 || err.status === 403) &&
+              err.source === "studio_auth"
+            ) {
+              onSessionRevoked(err.message || "会话已失效，请重新登录");
+              return;
+            }
+            break;
+          }
+        }
+      }
+    } finally {
+      workbenchSyncInFlightRef.current = false;
+    }
+  }, [applyServerSidebarState, isReadonly, onSessionRevoked]);
+
+  const updateSidebarAndSync = useCallback(
+    (updater: (prev: StoredWorkbenchPrefs) => StoredWorkbenchPrefs) => {
+      setLayout((prev) => {
+        const next = updater(prev);
+        if (next === prev) return prev;
+        if (!isReadonly) {
+          workbenchPendingStateRef.current = extractSidebarState(next);
+          void flushSidebarSyncQueue();
+        }
+        return next;
+      });
+    },
+    [flushSidebarSyncQueue, isReadonly],
+  );
+
+  // Initial server hydration + non-destructive localStorage migration + cross-device SSE refresh (C6)
+  useEffect(() => {
+    const seq = ++workbenchFetchSeqRef.current;
+    void fetchWorkbenchState()
+      .then((res) => {
+        if (!mountedRef.current || workbenchFetchSeqRef.current !== seq) return;
+        const serverState = sanitizeSidebarState(res.state);
+        if (res.version > 0) {
+          workbenchInitialSyncDoneRef.current = true;
+          const isNewer = res.version >= workbenchServerVerRef.current;
+          workbenchServerVerRef.current = Math.max(workbenchServerVerRef.current, res.version);
+          if (isNewer && !workbenchSyncInFlightRef.current && !workbenchPendingStateRef.current) {
+            applyServerSidebarState(serverState);
+          }
+          return;
+        }
+
+        // Server uninitialized (`version === 0`): only admin with non-empty local sidebar migrates once
+        workbenchServerVerRef.current = 0;
+        if (!workbenchInitialSyncDoneRef.current) {
+          workbenchInitialSyncDoneRef.current = true;
+          const localSidebar = extractSidebarState(layoutRef.current);
+          if (!isReadonly && res.can_edit && hasNonEmptySidebarState(localSidebar)) {
+            workbenchPendingStateRef.current = localSidebar;
+            void flushSidebarSyncQueue();
+          }
+        }
+      })
+      .catch((err) => {
+        if (!mountedRef.current || workbenchFetchSeqRef.current !== seq) return;
+        if (
+          err instanceof StudioApiError &&
+          (err.status === 401 || err.status === 403) &&
+          err.source === "studio_auth"
+        ) {
+          onSessionRevoked(err.message || "会话已失效，请重新登录");
+        }
+      });
+  }, [
+    workbenchStateEventVer,
+    applyServerSidebarState,
+    flushSidebarSyncQueue,
+    isReadonly,
+    onSessionRevoked,
+  ]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -4929,136 +5366,168 @@ export function WorkspaceView({
     [],
   );
 
-  const handleAddCustomProject = useCallback((project: CustomProjectItem) => {
-    setLayout((prev) => ({
-      ...prev,
-      customProjects: sanitizeCustomProjects([project, ...prev.customProjects]),
-    }));
-  }, []);
-
-  const handleRenameProject = useCallback((groupId: string, nextName: string | null) => {
-    setLayout((prev) => {
-      const nextMap = { ...prev.projectRenames };
-      if (!nextName) {
-        delete nextMap[groupId];
-      } else {
-        nextMap[groupId] = nextName;
-      }
-      return {
+  const handleAddCustomProject = useCallback(
+    (project: CustomProjectItem) => {
+      updateSidebarAndSync((prev) => ({
         ...prev,
-        projectRenames: sanitizeProjectRenames(nextMap),
-      };
-    });
-  }, []);
+        customProjects: sanitizeCustomProjects([project, ...prev.customProjects]),
+      }));
+    },
+    [updateSidebarAndSync],
+  );
 
-  const handleRemoveCustomProject = useCallback((projectId: string, sessionCids: string[]) => {
-    setLayout((prev) => {
-      const removedSet = new Set(sessionCids);
-      const nextProjectRenames = { ...prev.projectRenames };
-      delete nextProjectRenames[projectId];
-      const nextSessionRenames = { ...prev.sessionRenames };
-      for (const cid of sessionCids) delete nextSessionRenames[cid];
-      return {
-        ...prev,
-        customProjects: prev.customProjects.filter((p) => p.id !== projectId),
-        projectRenames: sanitizeProjectRenames(nextProjectRenames),
-        hiddenSessionCids: sanitizeSessionCidList(
-          [...sessionCids, ...prev.hiddenSessionCids],
-          MAX_HIDDEN_SESSION_CIDS,
-        ),
-        pinnedSessionCids: prev.pinnedSessionCids.filter((c) => !removedSet.has(c)),
-        archivedSessionCids: prev.archivedSessionCids.filter((c) => !removedSet.has(c)),
-        unreadSessionCids: prev.unreadSessionCids.filter((c) => !removedSet.has(c)),
-        sessionRenames: sanitizeSessionRenames(nextSessionRenames),
-      };
-    });
-  }, []);
+  const handleRenameProject = useCallback(
+    (groupId: string, nextName: string | null) => {
+      updateSidebarAndSync((prev) => {
+        const nextMap = { ...prev.projectRenames };
+        if (!nextName) {
+          delete nextMap[groupId];
+        } else {
+          nextMap[groupId] = nextName;
+        }
+        return {
+          ...prev,
+          projectRenames: sanitizeProjectRenames(nextMap),
+        };
+      });
+    },
+    [updateSidebarAndSync],
+  );
 
-  const handleHideProject = useCallback((projectId: string) => {
-    setLayout((prev) => {
-      const nextProjectRenames = { ...prev.projectRenames };
-      delete nextProjectRenames[projectId];
-      return {
-        ...prev,
-        hiddenProjectIds: sanitizeSlugList(
-          [projectId, ...prev.hiddenProjectIds],
-          MAX_HIDDEN_PROJECT_IDS,
-          64,
-        ),
-        projectRenames: sanitizeProjectRenames(nextProjectRenames),
-      };
-    });
-  }, []);
+  const handleRemoveCustomProject = useCallback(
+    (projectId: string, sessionCids: string[]) => {
+      updateSidebarAndSync((prev) => {
+        const removedSet = new Set(sessionCids);
+        const nextProjectRenames = { ...prev.projectRenames };
+        delete nextProjectRenames[projectId];
+        const nextSessionRenames = { ...prev.sessionRenames };
+        for (const cid of sessionCids) delete nextSessionRenames[cid];
+        return {
+          ...prev,
+          customProjects: prev.customProjects.filter((p) => p.id !== projectId),
+          projectRenames: sanitizeProjectRenames(nextProjectRenames),
+          hiddenSessionCids: sanitizeSessionCidList(
+            [...sessionCids, ...prev.hiddenSessionCids],
+            MAX_HIDDEN_SESSION_CIDS,
+          ),
+          pinnedSessionCids: prev.pinnedSessionCids.filter((c) => !removedSet.has(c)),
+          archivedSessionCids: prev.archivedSessionCids.filter((c) => !removedSet.has(c)),
+          unreadSessionCids: prev.unreadSessionCids.filter((c) => !removedSet.has(c)),
+          sessionRenames: sanitizeSessionRenames(nextSessionRenames),
+        };
+      });
+    },
+    [updateSidebarAndSync],
+  );
 
-  const handleHideSessions = useCallback((cids: string[]) => {
-    if (cids.length === 0) return;
-    setLayout((prev) => {
-      const removedSet = new Set(cids);
-      const nextSessionRenames = { ...prev.sessionRenames };
-      for (const cid of cids) delete nextSessionRenames[cid];
-      return {
-        ...prev,
-        hiddenSessionCids: sanitizeSessionCidList(
-          [...cids, ...prev.hiddenSessionCids],
-          MAX_HIDDEN_SESSION_CIDS,
-        ),
-        pinnedSessionCids: prev.pinnedSessionCids.filter((c) => !removedSet.has(c)),
-        archivedSessionCids: prev.archivedSessionCids.filter((c) => !removedSet.has(c)),
-        unreadSessionCids: prev.unreadSessionCids.filter((c) => !removedSet.has(c)),
-        sessionRenames: sanitizeSessionRenames(nextSessionRenames),
-      };
-    });
-  }, []);
+  const handleHideProject = useCallback(
+    (projectId: string) => {
+      updateSidebarAndSync((prev) => {
+        const nextProjectRenames = { ...prev.projectRenames };
+        delete nextProjectRenames[projectId];
+        return {
+          ...prev,
+          hiddenProjectIds: sanitizeSlugList(
+            [projectId, ...prev.hiddenProjectIds],
+            MAX_HIDDEN_PROJECT_IDS,
+            64,
+          ),
+          projectRenames: sanitizeProjectRenames(nextProjectRenames),
+        };
+      });
+    },
+    [updateSidebarAndSync],
+  );
 
-  const handleTogglePinSession = useCallback((cid: string) => {
-    setLayout((prev) => {
-      const exists = prev.pinnedSessionCids.includes(cid);
-      const nextPinned = exists
-        ? prev.pinnedSessionCids.filter((c) => c !== cid)
-        : sanitizeSessionCidList([cid, ...prev.pinnedSessionCids], MAX_PINNED_SESSION_CIDS);
-      return { ...prev, pinnedSessionCids: nextPinned };
-    });
-  }, []);
+  const handleHideSessions = useCallback(
+    (cids: string[]) => {
+      if (cids.length === 0) return;
+      updateSidebarAndSync((prev) => {
+        const removedSet = new Set(cids);
+        const nextSessionRenames = { ...prev.sessionRenames };
+        for (const cid of cids) delete nextSessionRenames[cid];
+        return {
+          ...prev,
+          hiddenSessionCids: sanitizeSessionCidList(
+            [...cids, ...prev.hiddenSessionCids],
+            MAX_HIDDEN_SESSION_CIDS,
+          ),
+          pinnedSessionCids: prev.pinnedSessionCids.filter((c) => !removedSet.has(c)),
+          archivedSessionCids: prev.archivedSessionCids.filter((c) => !removedSet.has(c)),
+          unreadSessionCids: prev.unreadSessionCids.filter((c) => !removedSet.has(c)),
+          sessionRenames: sanitizeSessionRenames(nextSessionRenames),
+        };
+      });
+    },
+    [updateSidebarAndSync],
+  );
 
-  const handleToggleArchiveSession = useCallback((cid: string) => {
-    setLayout((prev) => {
-      const exists = prev.archivedSessionCids.includes(cid);
-      const nextArchived = exists
-        ? prev.archivedSessionCids.filter((c) => c !== cid)
-        : sanitizeSessionCidList([cid, ...prev.archivedSessionCids], MAX_ARCHIVED_SESSION_CIDS);
-      return { ...prev, archivedSessionCids: nextArchived };
-    });
-  }, []);
+  const handleTogglePinSession = useCallback(
+    (cid: string) => {
+      updateSidebarAndSync((prev) => {
+        const exists = prev.pinnedSessionCids.includes(cid);
+        const nextPinned = exists
+          ? prev.pinnedSessionCids.filter((c) => c !== cid)
+          : sanitizeSessionCidList([cid, ...prev.pinnedSessionCids], MAX_PINNED_SESSION_CIDS);
+        return { ...prev, pinnedSessionCids: nextPinned };
+      });
+    },
+    [updateSidebarAndSync],
+  );
 
-  const handleSetSessionUnread = useCallback((cid: string, unread: boolean) => {
-    setLayout((prev) => {
-      const exists = prev.unreadSessionCids.includes(cid);
-      if (unread === exists) return prev;
-      const nextUnread = unread
-        ? sanitizeSessionCidList([cid, ...prev.unreadSessionCids], MAX_UNREAD_SESSION_CIDS)
-        : prev.unreadSessionCids.filter((c) => c !== cid);
-      return { ...prev, unreadSessionCids: nextUnread };
-    });
-  }, []);
+  const handleToggleArchiveSession = useCallback(
+    (cid: string) => {
+      updateSidebarAndSync((prev) => {
+        const exists = prev.archivedSessionCids.includes(cid);
+        const nextArchived = exists
+          ? prev.archivedSessionCids.filter((c) => c !== cid)
+          : sanitizeSessionCidList([cid, ...prev.archivedSessionCids], MAX_ARCHIVED_SESSION_CIDS);
+        return { ...prev, archivedSessionCids: nextArchived };
+      });
+    },
+    [updateSidebarAndSync],
+  );
 
-  const handleRenameSession = useCallback((cid: string, nextTitle: string | null) => {
-    setLayout((prev) => {
-      const nextMap = { ...prev.sessionRenames };
-      if (!nextTitle) {
-        delete nextMap[cid];
-      } else {
-        nextMap[cid] = nextTitle;
-      }
-      return {
-        ...prev,
-        sessionRenames: sanitizeSessionRenames(nextMap),
-      };
-    });
-  }, []);
+  const handleSetSessionUnread = useCallback(
+    (cid: string, unread: boolean) => {
+      updateSidebarAndSync((prev) => {
+        const exists = prev.unreadSessionCids.includes(cid);
+        if (unread === exists) return prev;
+        const nextUnread = unread
+          ? sanitizeSessionCidList([cid, ...prev.unreadSessionCids], MAX_UNREAD_SESSION_CIDS)
+          : prev.unreadSessionCids.filter((c) => c !== cid);
+        return { ...prev, unreadSessionCids: nextUnread };
+      });
+    },
+    [updateSidebarAndSync],
+  );
 
-  const handleSetShowArchived = useCallback((show: boolean) => {
-    setLayout((prev) => (prev.showArchived === show ? prev : { ...prev, showArchived: show }));
-  }, []);
+  const handleRenameSession = useCallback(
+    (cid: string, nextTitle: string | null) => {
+      updateSidebarAndSync((prev) => {
+        const nextMap = { ...prev.sessionRenames };
+        if (!nextTitle) {
+          delete nextMap[cid];
+        } else {
+          nextMap[cid] = nextTitle;
+        }
+        return {
+          ...prev,
+          sessionRenames: sanitizeSessionRenames(nextMap),
+        };
+      });
+    },
+    [updateSidebarAndSync],
+  );
+
+  const handleSetShowArchived = useCallback(
+    (show: boolean) => {
+      updateSidebarAndSync((prev) =>
+        prev.showArchived === show ? prev : { ...prev, showArchived: show },
+      );
+    },
+    [updateSidebarAndSync],
+  );
 
   const handlePaneActiveCidChange = useCallback((paneId: string, cid: string | null) => {
     setPaneActiveCids((prev) => (prev[paneId] === cid ? prev : { ...prev, [paneId]: cid }));
@@ -5265,6 +5734,8 @@ export function WorkspaceView({
               sessionSyncEvent={sessionSyncEvent}
               roomEvent={roomEvent}
               roomEvents={roomEvents}
+              botsEventVer={botsEventVer}
+              gatewaysEventVer={gatewaysEventVer}
               pendingQuote={quoteMap[primaryPane.id] || null}
               onQuoteConsumed={(qid) => handleQuoteConsumed(primaryPane.id, qid)}
               pendingOpenSession={openSessionMap[primaryPane.id] || null}
@@ -5425,6 +5896,8 @@ export function WorkspaceView({
                       sessionSyncEvent={sessionSyncEvent}
                       roomEvent={roomEvent}
                       roomEvents={roomEvents}
+                      botsEventVer={botsEventVer}
+                      gatewaysEventVer={gatewaysEventVer}
                       pendingQuote={quoteMap[pane.id] || null}
                       onQuoteConsumed={(qid) => handleQuoteConsumed(pane.id, qid)}
                       pendingOpenSession={openSessionMap[pane.id] || null}

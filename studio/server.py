@@ -31,8 +31,10 @@ from .chat_service import StudioChatService
 from .control_plane import StudioControlPlane
 from .data_sources import StudioDataSources
 from .event_hub import StudioEventHub
+from .gateway_service import GatewayService
 from .room_service import StudioRoomService
 from .secrets_config_service import SecretsConfigService
+from .workbench_state_service import WorkbenchStateService
 from .workspace_files import StudioWorkspaceFilesService
 
 AUTH_MGR_KEY: web.AppKey[StudioAuthManager] = web.AppKey("auth_mgr", StudioAuthManager)
@@ -49,6 +51,10 @@ BOT_CONTROL_KEY: web.AppKey[StudioBotControlService] = web.AppKey("bot_control",
 ROOM_SERVICE_KEY: web.AppKey[StudioRoomService] = web.AppKey("room_service", StudioRoomService)
 ATTENTION_SERVICE_KEY: web.AppKey[StudioAttentionService] = web.AppKey("attention_service", StudioAttentionService)
 SECRETS_CONFIG_KEY: web.AppKey[SecretsConfigService] = web.AppKey("secrets_config", SecretsConfigService)
+GATEWAY_SERVICE_KEY: web.AppKey[GatewayService] = web.AppKey("gateway_service", GatewayService)
+WORKBENCH_STATE_KEY: web.AppKey[WorkbenchStateService] = web.AppKey(
+    "workbench_state", WorkbenchStateService
+)
 STATIC_DIST_KEY: web.AppKey[Path] = web.AppKey("static_dist_dir", Path)
 
 logging.basicConfig(
@@ -199,6 +205,7 @@ def create_app(
     sse_keepalive_interval: float = 15.0,
     event_hub_max_events: int = 256,
     event_watcher_interval: float = 0.5,
+    workbench_state_path: Path | None = None,
 ) -> web.Application:
     public_url = os.environ.get("AGY_STUDIO_PUBLIC_URL", "").strip()
     auth = auth_mgr or StudioAuthManager(public_url=public_url)
@@ -260,6 +267,18 @@ def create_app(
         auth,
         chat_service.audit,
     )
+    gateway_service = GatewayService(
+        auth,
+        secrets_config,
+        chat_service.audit,
+        event_hub=event_hub,
+    )
+    workbench_state = WorkbenchStateService(
+        auth,
+        chat_service.audit,
+        event_hub=event_hub,
+        state_path=workbench_state_path,
+    )
     dist_dir = static_dist_dir or Path(
         os.environ.get("AGY_STUDIO_DIST_DIR", str(DEFAULT_STATIC_DIST_DIR))
     )
@@ -280,6 +299,8 @@ def create_app(
     app[ROOM_SERVICE_KEY] = room_service
     app[ATTENTION_SERVICE_KEY] = attention_service
     app[SECRETS_CONFIG_KEY] = secrets_config
+    app[GATEWAY_SERVICE_KEY] = gateway_service
+    app[WORKBENCH_STATE_KEY] = workbench_state
     app[STATIC_DIST_KEY] = dist_dir
 
     async def _on_startup(application: web.Application) -> None:
@@ -627,6 +648,19 @@ def create_app(
     app.router.add_get("/api/secrets/openbao", secrets_config.handle_get_openbao)
     app.router.add_put("/api/secrets/openbao", secrets_config.handle_put_openbao)
     app.router.add_post("/api/secrets/openbao/test", secrets_config.handle_test_openbao)
+
+    # External Model Gateways CRUD & Bounded /probe (SecretStore-backed)
+    app.router.add_get("/api/gateways", gateway_service.handle_list_gateways)
+    app.router.add_post("/api/gateways", gateway_service.handle_create_gateway)
+    app.router.add_post("/api/gateways/probe", gateway_service.handle_probe_gateway)
+    app.router.add_put("/api/gateways/{gateway_id}", gateway_service.handle_update_gateway)
+    app.router.add_patch("/api/gateways/{gateway_id}", gateway_service.handle_update_gateway)
+    app.router.add_delete("/api/gateways/{gateway_id}", gateway_service.handle_delete_gateway)
+    app.router.add_post("/api/gateways/{gateway_id}/probe", gateway_service.handle_probe_gateway)
+
+    # Workbench Sidebar State Server Sync (9 semantic fields; optimistic concurrency)
+    app.router.add_get("/api/workbench/state", workbench_state.handle_get_state)
+    app.router.add_put("/api/workbench/state", workbench_state.handle_put_state)
 
     app.router.add_get("/ws/browser", proxy.handle_ws_browser)
     app.router.add_post("/api/browser/upload", proxy.handle_upload)

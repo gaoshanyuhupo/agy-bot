@@ -47,6 +47,9 @@ DEFAULT_SECURITY_CARD_STATUS = "reserved"
 _VALID_AUTH_MODES = frozenset({"host_card", "token", "approle"})
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _KV_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+_GATEWAY_SECRET_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+_FORBIDDEN_SECRET_IDS = frozenset({"__proto__", "prototype", "constructor", "probe"})
+_KV_FIELD_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 _AUTH_LABEL_RE = re.compile(r"^[A-Za-z0-9 _.:/@-]{0,64}$")
 _CTRL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
 
@@ -55,6 +58,7 @@ _MAX_CRED_LEN = 1024
 _MAX_PROBE_BODY_BYTES = 64 * 1024
 _PROBE_TIMEOUT_SEC = 4.5
 _AUTH_PROBE_TIMEOUT_SEC = 3.0
+_KV_IO_TIMEOUT_SEC = 6.0
 
 
 def _contains_ctrl(value: str) -> bool:
@@ -158,6 +162,123 @@ def _validate_secret_input(raw: Any, field_name: str) -> tuple[bool, str, str]:
     return True, s, ""
 
 
+def _validate_gateway_secret_id(raw: Any) -> tuple[bool, str, str]:
+    if not isinstance(raw, str):
+        return False, "", "网关 ID 必须为字符串"
+    if raw != raw.strip() or _contains_ctrl(raw):
+        return False, "", "网关 ID 包含非法空白或控制字符"
+    if not raw or ".." in raw or "/" in raw or "\\" in raw:
+        return False, "", "网关 ID 包含非法路径字符"
+    if raw in _FORBIDDEN_SECRET_IDS or not _GATEWAY_SECRET_ID_RE.fullmatch(raw):
+        return False, "", "网关 ID 仅允许小写字母、数字、下划线与连字符（1-32 字符，须以字母或数字开头）"
+    return True, raw, ""
+
+
+def _validate_kv_path(raw: Any) -> tuple[bool, str, str]:
+    if not isinstance(raw, str):
+        return False, "", "KV 密钥路径必须为字符串"
+    s = raw.strip().strip("/")
+    if not s or _contains_ctrl(s):
+        return False, "", "KV 密钥路径无效"
+    parts = s.split("/")
+    if len(parts) > 8:
+        return False, "", "KV 密钥路径层级超出限制"
+    for seg in parts:
+        if seg in ("", ".", "..") or not _KV_SEGMENT_RE.fullmatch(seg):
+            return False, "", "KV 密钥路径包含非法分段"
+    return True, "/".join(parts), ""
+
+
+def _validate_kv_field(raw: Any) -> tuple[bool, str, str]:
+    if not isinstance(raw, str):
+        return False, "", "KV 字段名必须为字符串"
+    s = raw.strip()
+    if not s or _contains_ctrl(s) or not _KV_FIELD_RE.fullmatch(s):
+        return False, "", "KV 字段名无效"
+    return True, s, ""
+
+
+def _mask_secret_hint(secret: str) -> str:
+    """Return a non-reversible masked hint for display (never returns plaintext)."""
+    s = (secret or "").strip()
+    if not s:
+        return ""
+    if "••••" in s:
+        return s
+    if len(s) <= 6:
+        return "••••"
+    if len(s) <= 10:
+        return f"{s[:2]}••••{s[-2:]}"
+    prefix = "sk-" if s.startswith("sk-") else s[:3]
+    return f"{prefix}••••{s[-4:]}"
+
+
+def _ensure_secure_parent_dir(target_path: Path) -> Path:
+    parent = target_path.parent
+    if parent.is_symlink():
+        raise OSError("Refusing symlink config directory")
+    parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(parent, 0o700)
+    except OSError:
+        pass
+    return parent
+
+
+def _write_json_0600_atomic(target_path: Path, payload: dict[str, Any]) -> None:
+    """Atomically write JSON with `0700` dir, `0600` file, `O_NOFOLLOW`, and `flock`."""
+    parent = _ensure_secure_parent_dir(target_path)
+    if target_path.is_symlink():
+        raise OSError("Refusing to write symlink file")
+
+    lock_path = parent / f".{target_path.name}.lock"
+    if lock_path.is_symlink():
+        raise OSError("Refusing symlink lock file")
+
+    lock_flags = os.O_CREAT | os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        lock_flags |= os.O_NOFOLLOW
+    lock_fd = os.open(str(lock_path), lock_flags, 0o600)
+    try:
+        try:
+            os.chmod(lock_path, 0o600)
+        except OSError:
+            pass
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            if target_path.is_symlink():
+                raise OSError("Refusing to overwrite symlink file")
+            serialized = (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=f".{target_path.name}.tmp.",
+                dir=str(parent),
+            )
+            try:
+                os.fchmod(fd, 0o600)
+                os.write(fd, serialized)
+                os.fsync(fd)
+            except Exception:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+                raise
+            os.close(fd)
+            os.replace(tmp_name, str(target_path))
+            try:
+                os.chmod(target_path, 0o600)
+            except OSError:
+                pass
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    finally:
+        os.close(lock_fd)
+
+
 def _read_regular_json_no_symlink(path: Path, max_bytes: int = 128 * 1024) -> dict[str, Any] | None:
     """Safely read a regular JSON file refusing symlinks (`O_NOFOLLOW`)."""
     try:
@@ -212,8 +333,12 @@ def _read_regular_text_no_symlink(path: Path, max_bytes: int = 8192) -> str:
         return ""
 
 
+class SecretStoreError(RuntimeError):
+    """Sanitized SecretStore operation failure (never carries raw secret values)."""
+
+
 class SecretStoreBackend:
-    """Base descriptor for future unified SecretStore backends."""
+    """Base interface for unified pluggable SecretStore backends."""
 
     backend_id: str = "base"
     priority: int = 99
@@ -226,27 +351,494 @@ class SecretStoreBackend:
             "status": self.status,
         }
 
+    def is_available(self) -> bool:
+        return False
+
+    async def put_secret(
+        self,
+        gateway_id: str,
+        value: str,
+        *,
+        field: str = "api_key",
+    ) -> dict[str, Any]:
+        raise NotImplementedError(f"Secret backend {self.backend_id!r} does not support put_secret")
+
+    async def get_secret(self, ref: dict[str, Any]) -> str | None:
+        raise NotImplementedError(f"Secret backend {self.backend_id!r} does not support get_secret")
+
+    async def delete_secret(self, ref: dict[str, Any]) -> bool:
+        raise NotImplementedError(f"Secret backend {self.backend_id!r} does not support delete_secret")
+
 
 class OpenBaoSecretBackend(SecretStoreBackend):
+    """OpenBao / Vault KV v2 HTTP backend (zero shell/subprocess calls)."""
+
     backend_id = "openbao"
     priority = 1
     status = "configurable"
 
+    def __init__(self, config_service: SecretsConfigService | None = None) -> None:
+        self._cfg_svc = config_service
+        self._cached_approle_tok: tuple[str, float, str] | None = None  # (addr, expires_ts, token)
+
+    def is_available(self) -> bool:
+        if self._cfg_svc is None:
+            return False
+        rt = self._cfg_svc.resolve_openbao_runtime()
+        return bool(rt["enabled"] and rt["addr"] and rt["credential_configured"])
+
+    async def _resolve_client_token(
+        self,
+        cli: aiohttp.ClientSession,
+        rt: dict[str, Any],
+    ) -> str:
+        addr = str(rt["addr"] or "")
+        auth_mode = str(rt["auth_mode"] or "host_card")
+        if auth_mode == "token":
+            return str(rt.get("token") or "")
+
+        # host_card: prefer valid host cached token when targeting exact host addr
+        if auth_mode == "host_card" and rt.get("is_host_addr_match"):
+            cached_tok = str(rt.get("host_cached_token") or "")
+            if cached_tok:
+                return cached_tok
+
+        # In-memory AppRole token cache
+        now = time.time()
+        if (
+            self._cached_approle_tok is not None
+            and self._cached_approle_tok[0] == addr
+            and self._cached_approle_tok[1] > (now + 30.0)
+            and self._cached_approle_tok[2]
+        ):
+            return self._cached_approle_tok[2]
+
+        role_id = str(rt.get("role_id") or "")
+        secret_id = str(rt.get("secret_id") or "")
+        if not role_id or not secret_id:
+            return ""
+
+        login_url = f"{addr}/v1/auth/approle/login"
+        async with cli.post(
+            login_url,
+            json={"role_id": role_id, "secret_id": secret_id},
+            allow_redirects=False,
+            headers={"Accept": "application/json"},
+        ) as resp:
+            raw = await resp.content.read(_MAX_PROBE_BODY_BYTES + 1)
+            if resp.status != 200 or len(raw) > _MAX_PROBE_BODY_BYTES:
+                raise SecretStoreError(f"OpenBao AppRole 鉴权失败（HTTP {resp.status}）")
+            try:
+                data = json.loads(raw.decode("utf-8", errors="ignore"))
+            except Exception as exc:
+                raise SecretStoreError("OpenBao AppRole 响应解析失败") from exc
+            auth_obj = data.get("auth") if isinstance(data, dict) else None
+            tok = str((auth_obj or {}).get("client_token") or "").strip()
+            lease = (auth_obj or {}).get("lease_duration")
+            if not tok:
+                raise SecretStoreError("OpenBao AppRole 未返回有效 Token")
+            ttl = float(lease) if isinstance(lease, (int, float)) and lease > 60 else 1800.0
+            self._cached_approle_tok = (addr, now + ttl, tok)
+            return tok
+
+    async def put_secret(
+        self,
+        gateway_id: str,
+        value: str,
+        *,
+        field: str = "api_key",
+    ) -> dict[str, Any]:
+        if self._cfg_svc is None:
+            raise SecretStoreError("OpenBao 配置服务未初始化")
+        ok_id, norm_id, err_id = _validate_gateway_secret_id(gateway_id)
+        if not ok_id:
+            raise ValueError(err_id)
+        ok_f, norm_field, err_f = _validate_kv_field(field)
+        if not ok_f:
+            raise ValueError(err_f)
+
+        rt = self._cfg_svc.resolve_openbao_runtime()
+        if not rt["enabled"] or not rt["addr"]:
+            raise SecretStoreError("OpenBao 未启用或未配置有效地址")
+        ok_m, kv_mount, err_m = _validate_kv_mount(rt["kv_mount"])
+        if not ok_m:
+            raise ValueError(err_m)
+        ok_p, prefix, err_p = _validate_gateway_path_prefix(rt["gateway_path_prefix"])
+        if not ok_p:
+            raise ValueError(err_p)
+
+        secret_path = f"{prefix}/{norm_id}"
+        ok_fp, norm_path, err_fp = _validate_kv_path(secret_path)
+        if not ok_fp:
+            raise ValueError(err_fp)
+
+        url = f"{rt['addr']}/v1/{kv_mount}/data/{norm_path}"
+        now_ts = int(time.time())
+        timeout = aiohttp.ClientTimeout(total=_KV_IO_TIMEOUT_SEC, connect=3.0)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as cli:
+                token = await self._resolve_client_token(cli, rt)
+                if not token:
+                    raise SecretStoreError("OpenBao 缺少有效认证凭据")
+                async with cli.post(
+                    url,
+                    json={"data": {norm_field: value, "updated_at": now_ts}},
+                    headers={"X-Vault-Token": token, "Accept": "application/json"},
+                    allow_redirects=False,
+                ) as resp:
+                    raw = await resp.content.read(_MAX_PROBE_BODY_BYTES + 1)
+                    if 300 <= resp.status < 400:
+                        raise SecretStoreError(f"OpenBao 写入返回重定向（HTTP {resp.status}），已拒绝")
+                    if resp.status not in (200, 204):
+                        raise SecretStoreError(f"OpenBao KV 写入失败（HTTP {resp.status}）")
+                    ver = 1
+                    try:
+                        parsed = json.loads(raw.decode("utf-8", errors="ignore"))
+                        v = ((parsed.get("data") or {}) if isinstance(parsed, dict) else {}).get("version")
+                        if isinstance(v, int) and v > 0:
+                            ver = v
+                    except Exception:
+                        pass
+        except (ValueError, SecretStoreError):
+            raise
+        except Exception as exc:
+            raise SecretStoreError(f"OpenBao KV 写入网络异常（{type(exc).__name__}）") from exc
+
+        return {
+            "backend": self.backend_id,
+            "kv_mount": kv_mount,
+            "path": norm_path,
+            "field": norm_field,
+            "version": ver,
+            "updated_at": now_ts,
+        }
+
+    async def get_secret(self, ref: dict[str, Any]) -> str | None:
+        if self._cfg_svc is None or not isinstance(ref, dict):
+            return None
+        rt = self._cfg_svc.resolve_openbao_runtime()
+        if not rt["addr"]:
+            return None
+        ok_m, kv_mount, _ = _validate_kv_mount(ref.get("kv_mount") or rt["kv_mount"])
+        ok_p, norm_path, _ = _validate_kv_path(ref.get("path") or "")
+        ok_f, norm_field, _ = _validate_kv_field(ref.get("field") or "api_key")
+        if not (ok_m and ok_p and ok_f):
+            return None
+
+        url = f"{rt['addr']}/v1/{kv_mount}/data/{norm_path}"
+        timeout = aiohttp.ClientTimeout(total=_KV_IO_TIMEOUT_SEC, connect=3.0)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as cli:
+                token = await self._resolve_client_token(cli, rt)
+                if not token:
+                    return None
+                async with cli.get(
+                    url,
+                    headers={"X-Vault-Token": token, "Accept": "application/json"},
+                    allow_redirects=False,
+                ) as resp:
+                    raw = await resp.content.read(_MAX_PROBE_BODY_BYTES + 1)
+                    if resp.status != 200 or len(raw) > _MAX_PROBE_BODY_BYTES:
+                        return None
+                    parsed = json.loads(raw.decode("utf-8", errors="ignore"))
+                    inner = (
+                        ((parsed.get("data") or {}).get("data"))
+                        if isinstance(parsed, dict)
+                        else None
+                    )
+                    if isinstance(inner, dict):
+                        val = inner.get(norm_field)
+                        return str(val).strip() if isinstance(val, str) and val.strip() else None
+        except Exception as exc:
+            log.warning("OpenBao KV read failed: %s", type(exc).__name__)
+            return None
+        return None
+
+    async def delete_secret(self, ref: dict[str, Any]) -> bool:
+        if self._cfg_svc is None or not isinstance(ref, dict):
+            return False
+        rt = self._cfg_svc.resolve_openbao_runtime()
+        if not rt["addr"]:
+            return False
+        ok_m, kv_mount, _ = _validate_kv_mount(ref.get("kv_mount") or rt["kv_mount"])
+        ok_p, norm_path, _ = _validate_kv_path(ref.get("path") or "")
+        if not (ok_m and ok_p):
+            return False
+
+        meta_url = f"{rt['addr']}/v1/{kv_mount}/metadata/{norm_path}"
+        data_url = f"{rt['addr']}/v1/{kv_mount}/data/{norm_path}"
+        timeout = aiohttp.ClientTimeout(total=_KV_IO_TIMEOUT_SEC, connect=3.0)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as cli:
+                token = await self._resolve_client_token(cli, rt)
+                if not token:
+                    return False
+                async with cli.delete(
+                    meta_url,
+                    headers={"X-Vault-Token": token, "Accept": "application/json"},
+                    allow_redirects=False,
+                ) as resp:
+                    await resp.content.read(4096)
+                    if resp.status in (200, 204, 404):
+                        return True
+                async with cli.delete(
+                    data_url,
+                    headers={"X-Vault-Token": token, "Accept": "application/json"},
+                    allow_redirects=False,
+                ) as resp2:
+                    await resp2.content.read(4096)
+                    return resp2.status in (200, 204, 404)
+        except Exception as exc:
+            log.warning("OpenBao KV delete failed: %s", type(exc).__name__)
+            return False
+
 
 class SecurityCardSecretBackend(SecretStoreBackend):
+    """Reserved pluggable slot for future hardware/software security card integration."""
+
     backend_id = "security_card"
     priority = 2
     status = DEFAULT_SECURITY_CARD_STATUS
 
+    def is_available(self) -> bool:
+        return False
+
 
 class LocalFile0600SecretBackend(SecretStoreBackend):
+    """Managed local `0600` JSON secret store (`0700` dir, `O_NOFOLLOW`, `flock` atomic write)."""
+
     backend_id = "local_0600"
     priority = 3
     status = "fallback_ready"
 
+    def __init__(self, secrets_path: Path | None = None) -> None:
+        env_p = os.environ.get("AGY_STUDIO_GATEWAY_SECRETS_FILE", "").strip()
+        default_p = Path.home() / ".config" / "agy-tg-bridge" / "gateway_secrets.json"
+        self.secrets_path = Path(secrets_path) if secrets_path else Path(env_p or str(default_p))
+
+    def is_available(self) -> bool:
+        return True
+
+    def _load_slots(self) -> dict[str, Any]:
+        doc = _read_regular_json_no_symlink(self.secrets_path, max_bytes=512 * 1024)
+        if not isinstance(doc, dict):
+            return {}
+        slots = doc.get("slots")
+        return dict(slots) if isinstance(slots, dict) else {}
+
+    def _mutate_slots_atomic(self, mutator: Any) -> Any:
+        parent = _ensure_secure_parent_dir(self.secrets_path)
+        if self.secrets_path.is_symlink():
+            raise OSError("Refusing symlink gateway secrets file")
+        lock_path = parent / f".{self.secrets_path.name}.lock"
+        if lock_path.is_symlink():
+            raise OSError("Refusing symlink gateway secrets lock file")
+
+        lock_flags = os.O_CREAT | os.O_RDWR
+        if hasattr(os, "O_NOFOLLOW"):
+            lock_flags |= os.O_NOFOLLOW
+        lock_fd = os.open(str(lock_path), lock_flags, 0o600)
+        try:
+            try:
+                os.chmod(lock_path, 0o600)
+            except OSError:
+                pass
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            try:
+                if self.secrets_path.is_symlink():
+                    raise OSError("Refusing to overwrite symlink gateway secrets file")
+                slots = self._load_slots()
+                result = mutator(slots)
+                payload = {
+                    "version": 1,
+                    "updated_at": int(time.time()),
+                    "slots": slots,
+                }
+                serialized = (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+                fd, tmp_name = tempfile.mkstemp(
+                    prefix=f".{self.secrets_path.name}.tmp.",
+                    dir=str(parent),
+                )
+                try:
+                    os.fchmod(fd, 0o600)
+                    os.write(fd, serialized)
+                    os.fsync(fd)
+                except Exception:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    try:
+                        os.unlink(tmp_name)
+                    except OSError:
+                        pass
+                    raise
+                os.close(fd)
+                os.replace(tmp_name, str(self.secrets_path))
+                try:
+                    os.chmod(self.secrets_path, 0o600)
+                except OSError:
+                    pass
+                return result
+            finally:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+
+    async def put_secret(
+        self,
+        gateway_id: str,
+        value: str,
+        *,
+        field: str = "api_key",
+    ) -> dict[str, Any]:
+        ok_id, norm_id, err_id = _validate_gateway_secret_id(gateway_id)
+        if not ok_id:
+            raise ValueError(err_id)
+        ok_f, norm_field, err_f = _validate_kv_field(field)
+        if not ok_f:
+            raise ValueError(err_f)
+        now_ts = int(time.time())
+
+        def _write(slots: dict[str, Any]) -> None:
+            entry = dict(slots.get(norm_id)) if isinstance(slots.get(norm_id), dict) else {}
+            entry[norm_field] = value
+            entry["updated_at"] = now_ts
+            slots[norm_id] = entry
+
+        self._mutate_slots_atomic(_write)
+        return {
+            "backend": self.backend_id,
+            "slot": norm_id,
+            "field": norm_field,
+            "updated_at": now_ts,
+        }
+
+    async def get_secret(self, ref: dict[str, Any]) -> str | None:
+        if not isinstance(ref, dict):
+            return None
+        ok_id, norm_id, _ = _validate_gateway_secret_id(ref.get("slot") or "")
+        ok_f, norm_field, _ = _validate_kv_field(ref.get("field") or "api_key")
+        if not (ok_id and ok_f):
+            return None
+        slots = self._load_slots()
+        entry = slots.get(norm_id)
+        if not isinstance(entry, dict):
+            return None
+        val = entry.get(norm_field)
+        return str(val).strip() if isinstance(val, str) and val.strip() else None
+
+    async def delete_secret(self, ref: dict[str, Any]) -> bool:
+        if not isinstance(ref, dict):
+            return False
+        ok_id, norm_id, _ = _validate_gateway_secret_id(ref.get("slot") or "")
+        if not ok_id:
+            return False
+
+        def _remove(slots: dict[str, Any]) -> bool:
+            return slots.pop(norm_id, None) is not None
+
+        try:
+            return bool(self._mutate_slots_atomic(_remove))
+        except OSError as exc:
+            log.warning("Local 0600 secret delete failed: %s", type(exc).__name__)
+            return False
+
+
+class SecretStore:
+    """Unified SecretStore orchestrator: OpenBao (priority 1) -> SecurityCard (reserved) -> local_0600 (fallback)."""
+
+    def __init__(
+        self,
+        config_service: SecretsConfigService,
+        *,
+        local_secrets_path: Path | None = None,
+    ) -> None:
+        self.config_service = config_service
+        self.openbao = OpenBaoSecretBackend(config_service)
+        self.security_card = SecurityCardSecretBackend()
+        self.local_0600 = LocalFile0600SecretBackend(secrets_path=local_secrets_path)
+        self.backends: list[SecretStoreBackend] = [
+            self.openbao,
+            self.security_card,
+            self.local_0600,
+        ]
+
+    def active_default_backend(self) -> str:
+        return "openbao" if self.openbao.is_available() else "local_0600"
+
+    def describe_status(self) -> dict[str, Any]:
+        ob_ready = self.openbao.is_available()
+        return {
+            "active_backend": "openbao" if ob_ready else "local_0600",
+            "openbao_ready": ob_ready,
+            "fallback_mode": DEFAULT_FALLBACK_MODE,
+            "security_card_status": DEFAULT_SECURITY_CARD_STATUS,
+            "backends": [b.describe() for b in self.backends],
+        }
+
+    async def store_gateway_secret(
+        self,
+        gateway_id: str,
+        api_key: str,
+        *,
+        preferred_backend: str | None = None,
+    ) -> tuple[dict[str, Any], str, bool]:
+        """Store gateway API key in best available backend.
+
+        Returns `(secret_ref, backend_used, fallback_used)`.
+        Raises `ValueError` on invalid `gateway_id`/mount/prefix; raises `OSError` on local storage refusal.
+        """
+        ok_id, norm_id, err_id = _validate_gateway_secret_id(gateway_id)
+        if not ok_id:
+            raise ValueError(err_id)
+        ok_key, norm_key, err_key = _validate_secret_input(api_key, "API Key")
+        if not ok_key or not norm_key:
+            raise ValueError(err_key or "API Key 不能为空")
+
+        pref = (preferred_backend or "").strip().lower()
+        if pref == "security_card":
+            raise ValueError("安全卡（security_card）当前为预留后端，暂未开放写入")
+
+        if pref != "local_0600" and self.openbao.is_available():
+            try:
+                ref = await self.openbao.put_secret(norm_id, norm_key)
+                return ref, "openbao", False
+            except ValueError:
+                raise
+            except SecretStoreError as exc:
+                log.warning("OpenBao put_secret unavailable (%s); falling back to local_0600", exc)
+                ref = await self.local_0600.put_secret(norm_id, norm_key)
+                return ref, "local_0600", True
+
+        ref = await self.local_0600.put_secret(norm_id, norm_key)
+        return ref, "local_0600", False
+
+    async def resolve_gateway_secret(self, ref: dict[str, Any] | None) -> str:
+        if not isinstance(ref, dict):
+            return ""
+        backend = str(ref.get("backend") or "").strip().lower()
+        if backend == "openbao":
+            val = await self.openbao.get_secret(ref)
+            return val or ""
+        if backend == "local_0600":
+            val = await self.local_0600.get_secret(ref)
+            return val or ""
+        return ""
+
+    async def delete_gateway_secret(self, ref: dict[str, Any] | None) -> bool:
+        if not isinstance(ref, dict):
+            return False
+        backend = str(ref.get("backend") or "").strip().lower()
+        if backend == "openbao":
+            return await self.openbao.delete_secret(ref)
+        if backend == "local_0600":
+            return await self.local_0600.delete_secret(ref)
+        return False
+
 
 class SecretsConfigService:
-    """Manages OpenBao configuration, host runtime auto-detection, and connectivity tests."""
+    """Manages OpenBao configuration, host runtime auto-detection, SecretStore, and connectivity tests."""
 
     def __init__(
         self,
@@ -255,6 +847,7 @@ class SecretsConfigService:
         *,
         config_path: Path | None = None,
         host_openbao_dir: Path | None = None,
+        local_secrets_path: Path | None = None,
     ) -> None:
         self.auth_mgr = auth_mgr
         self.audit = audit
@@ -266,11 +859,8 @@ class SecretsConfigService:
             if host_openbao_dir
             else (Path.home() / ".config" / "openbao")
         )
-        self.backends: list[SecretStoreBackend] = [
-            OpenBaoSecretBackend(),
-            SecurityCardSecretBackend(),
-            LocalFile0600SecretBackend(),
-        ]
+        self.secret_store = SecretStore(self, local_secrets_path=local_secrets_path)
+        self.backends: list[SecretStoreBackend] = list(self.secret_store.backends)
 
     # ---------------------------------------------------------------- Storage (0700 / 0600 + flock)
     def _ensure_secure_parent(self) -> Path:
@@ -450,6 +1040,96 @@ class SecretsConfigService:
         if isinstance(expires_ms, (int, float)) and expires_ms <= (time.time() * 1000 + 30_000):
             return ""
         return tok
+
+    def _get_host_env_or_file_token(self) -> str:
+        env_tok = (os.environ.get("BAO_TOKEN") or os.environ.get("VAULT_TOKEN") or "").strip()
+        if env_tok:
+            return env_tok
+        for tok_file in (Path.home() / ".bao-token", Path.home() / ".vault-token"):
+            val = _read_regular_text_no_symlink(tok_file)
+            if val:
+                return val
+        return ""
+
+    def _get_host_card_approle(self) -> tuple[str, str]:
+        env_card = os.environ.get("OPENBAO_CONFIG_PATH", "").strip()
+        card_path = Path(env_card) if env_card else (self.host_openbao_dir / "card.json")
+        card_data = _read_regular_json_no_symlink(card_path)
+        if not card_data:
+            return "", ""
+        return (
+            str(card_data.get("role_id") or "").strip(),
+            str(card_data.get("secret_id") or "").strip(),
+        )
+
+    def resolve_openbao_runtime(self) -> dict[str, Any]:
+        """Resolve effective OpenBao runtime settings + internal auth creds for SecretStore.
+
+        Internal only: MUST NEVER be returned directly in any HTTP response.
+        """
+        saved = self._load_saved_config()
+        saved_ob = saved.get("openbao") if isinstance(saved.get("openbao"), dict) else {}
+        host = self._detect_host_openbao()
+        saved_mode = str(saved_ob.get("mode") or "").strip().lower()
+
+        if saved_mode == "custom":
+            enabled = bool(saved_ob.get("enabled", True))
+            ok_addr, addr, _ = _validate_openbao_addr(saved_ob.get("addr"), allow_empty=True)
+            addr = addr if ok_addr else ""
+            kv_mount = str(saved_ob.get("kv_mount") or DEFAULT_KV_MOUNT)
+            gateway_path_prefix = str(
+                saved_ob.get("gateway_path_prefix") or DEFAULT_GATEWAY_PATH_PREFIX
+            )
+            auth_mode = str(saved_ob.get("auth_mode") or "host_card").strip().lower()
+            if auth_mode not in _VALID_AUTH_MODES:
+                auth_mode = "host_card"
+            is_host_match = bool(host["detected"] and addr and addr == host["addr"])
+
+            token = ""
+            role_id = ""
+            secret_id = ""
+            host_cached_token = ""
+            if auth_mode == "token":
+                token = str(saved_ob.get("token") or "").strip()
+            elif auth_mode == "approle":
+                role_id = str(saved_ob.get("role_id") or "").strip()
+                secret_id = str(saved_ob.get("secret_id") or "").strip()
+            else:
+                if is_host_match:
+                    host_cached_token = self._get_host_cached_token_if_valid()
+                    role_id, secret_id = self._get_host_card_approle()
+        else:
+            kv_mount = str(saved_ob.get("kv_mount") or host["kv_mount"] or DEFAULT_KV_MOUNT)
+            gateway_path_prefix = str(
+                saved_ob.get("gateway_path_prefix")
+                or host["gateway_path_prefix"]
+                or DEFAULT_GATEWAY_PATH_PREFIX
+            )
+            enabled = bool(saved_ob.get("enabled", True)) if host["detected"] else False
+            addr = host["addr"] if host["detected"] else ""
+            auth_mode = host["auth_mode"] if host["detected"] else "host_card"
+            is_host_match = bool(host["detected"] and addr)
+
+            token = self._get_host_env_or_file_token() if auth_mode == "token" else ""
+            host_cached_token = self._get_host_cached_token_if_valid() if is_host_match else ""
+            role_id, secret_id = self._get_host_card_approle() if is_host_match else ("", "")
+
+        credential_configured = bool(
+            token or host_cached_token or (role_id and secret_id)
+        )
+        return {
+            "enabled": enabled,
+            "addr": addr,
+            "kv_mount": kv_mount,
+            "gateway_path_prefix": gateway_path_prefix,
+            "auth_mode": auth_mode,
+            "token": token,
+            "host_cached_token": host_cached_token,
+            "role_id": role_id,
+            "secret_id": secret_id,
+            "is_host_addr_match": is_host_match,
+            "credential_configured": credential_configured,
+        }
 
     def _build_effective_view(self, *, is_admin: bool) -> dict[str, Any]:
         saved = self._load_saved_config()

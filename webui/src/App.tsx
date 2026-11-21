@@ -150,6 +150,8 @@ export function App() {
   const [jobsEventVer, setJobsEventVer] = useState(0);
   const [schedulesEventVer, setSchedulesEventVer] = useState(0);
   const [botsEventVer, setBotsEventVer] = useState(0);
+  const [gatewaysEventVer, setGatewaysEventVer] = useState(0);
+  const [workbenchStateEventVer, setWorkbenchStateEventVer] = useState(0);
   const [overviewEventVer, setOverviewEventVer] = useState(0);
   const [attentionEventVer, setAttentionEventVer] = useState(0);
   const [pendingAttentionCount, setPendingAttentionCount] = useState(0);
@@ -440,6 +442,10 @@ export function App() {
             room_id: "lobby",
             ts: typeof d.ts === "number" ? d.ts : Math.floor(Date.now() / 1000),
           });
+        } else if (ev.type === "gateways_updated") {
+          setGatewaysEventVer((n) => n + 1);
+        } else if (ev.type === "workbench_state_updated") {
+          setWorkbenchStateEventVer((n) => n + 1);
         } else if (ev.type === "session_updated") {
           const d = ev.data || {};
           setSessionSyncEvent((prev) => ({
@@ -535,6 +541,8 @@ export function App() {
           setJobsEventVer((n) => n + 1);
           setSchedulesEventVer((n) => n + 1);
           setBotsEventVer((n) => n + 1);
+          setGatewaysEventVer((n) => n + 1);
+          setWorkbenchStateEventVer((n) => n + 1);
           setOverviewEventVer((n) => n + 1);
           setAttentionEventVer((n) => n + 1);
           pushRoomEvent({
@@ -756,6 +764,9 @@ export function App() {
               sessionSyncEvent={sessionSyncEvent}
               roomEvent={roomEvents[roomEvents.length - 1] || null}
               roomEvents={roomEvents}
+              botsEventVer={botsEventVer}
+              gatewaysEventVer={gatewaysEventVer}
+              workbenchStateEventVer={workbenchStateEventVer}
               jobsEventVer={jobsEventVer}
               attentionEventVer={attentionEventVer}
               onClaimBrowserOwner={setBrowserOwner}

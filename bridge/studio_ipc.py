@@ -1221,7 +1221,7 @@ class _StudioIPCHandler(http.server.BaseHTTPRequestHandler):
                 "prompt": prompt,
                 "cid": cid,
                 "project": str(body.get("project") or "").strip()[:128] or None,
-                "model": str(body.get("model") or "").strip()[:128] or None,
+                "model": str(body.get("model") or "").strip()[:160] or None,
                 "effort": str(body.get("effort") or "").strip().lower()[:16] or None,
                 "sync_tg": sync_tg,
                 "priority": priority_val,

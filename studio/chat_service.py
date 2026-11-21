@@ -25,6 +25,7 @@ from aiohttp import web
 
 from .auth import StudioAuthManager, studio_auth_error, upstream_error
 from .data_sources import (
+    MAX_MODEL_SLUG_LEN,
     StreamRedactor,
     StudioDataSources,
     _sanitize_slug,
@@ -507,16 +508,24 @@ class StudioChatService:
                 timeout_sec=5.0,
             )
             if sc == 200 and meta.get("ok"):
+                eff_val = str(meta.get("default_effort") or "").strip().lower()
+                if eff_val not in _VALID_EFFORTS:
+                    eff_val = ""
+                act_m = _sanitize_slug(meta.get("active_model") or "", max_len=MAX_MODEL_SLUG_LEN)
+                eff_m = _sanitize_slug(meta.get("effective_model") or act_m, max_len=MAX_MODEL_SLUG_LEN)
                 return web.json_response({
                     "ok": True,
                     "bot": _sanitize_slug(meta.get("handle") or bot_handle, max_len=64),
-                    "active_model": _sanitize_slug(meta.get("active_model") or "", max_len=96),
+                    "active_model": act_m,
+                    "effective_model": eff_m,
+                    "model_mode": _sanitize_slug(meta.get("model_mode") or "default", max_len=24),
+                    "default_effort": eff_val,
                     "default_project": _sanitize_slug(meta.get("default_project") or "", max_len=64),
                     "efforts": list(meta.get("efforts") or ["low", "medium", "high", "xhigh", "max"]),
                     "models": [
                         {
-                            "id": _sanitize_slug(m.get("id") or "", max_len=128),
-                            "label": redact_secrets_only(m.get("label") or m.get("id") or "", max_len=128),
+                            "id": _sanitize_slug(m.get("id") or "", max_len=MAX_MODEL_SLUG_LEN),
+                            "label": redact_secrets_only(m.get("label") or m.get("id") or "", max_len=160),
                         }
                         for m in (meta.get("models") or [])
                         if isinstance(m, dict) and m.get("id")
@@ -536,19 +545,37 @@ class StudioChatService:
         bots_data = self.data_sources.get_bots()
         fallback_models: list[dict[str, str]] = []
         seen_m: set[str] = set()
+        req_bot_norm = _sanitize_slug(str(req_bot or "").lstrip("@").lower(), max_len=64)
+        matched_bot: dict[str, Any] | None = None
         for b in bots_data.get("bots") or []:
+            if req_bot_norm and str(b.get("handle") or "").strip().lower() == req_bot_norm:
+                matched_bot = b
             em = str(b.get("effective_model") or "").strip()
-            if em and em not in seen_m:
+            if em and em != "default" and em not in seen_m:
                 seen_m.add(em)
                 fallback_models.append({"id": em, "label": em})
         fallback_projects = [
             {"id": p["id"], "name": p["name"]}
             for p in self.data_sources.get_allowed_projects()
         ]
+        fb_active = ""
+        fb_effort = ""
+        fb_mode = "default"
+        if matched_bot is not None:
+            em_val = str(matched_bot.get("effective_model") or "").strip()
+            fb_active = "" if em_val == "default" else em_val
+            eff_fb = str(matched_bot.get("default_effort") or "").strip().lower()
+            fb_effort = eff_fb if eff_fb in _VALID_EFFORTS else ""
+            fb_mode = str(matched_bot.get("model_mode") or "default").strip().lower() or "default"
+        elif fallback_models:
+            fb_active = fallback_models[0]["id"]
         return web.json_response({
             "ok": True,
             "bot": _sanitize_slug(req_bot or "", max_len=64),
-            "active_model": fallback_models[0]["id"] if fallback_models else "",
+            "active_model": fb_active,
+            "effective_model": fb_active,
+            "model_mode": fb_mode,
+            "default_effort": fb_effort,
             "default_project": fallback_projects[0]["id"] if fallback_projects else "",
             "efforts": ["low", "medium", "high", "xhigh", "max"],
             "models": fallback_models,

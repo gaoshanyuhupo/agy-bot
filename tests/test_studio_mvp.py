@@ -3102,17 +3102,13 @@ class TestStudioPasswordAuth(unittest.IsolatedAsyncioTestCase):
 
         # Frontend storage hygiene & autoComplete attributes
         # Zero sessionStorage everywhere; localStorage API calls are forbidden across all files
-        # EXCEPT the two non-secret UI state keys (`WORKBENCH_STORAGE_KEY` in `WorkspaceView.tsx`
-        # and redacted draft `PREVIEW_STORAGE_KEY` in `ExternalModelsView.tsx`).
+        # EXCEPT the single non-secret UI layout/cache key (`WORKBENCH_STORAGE_KEY` in `WorkspaceView.tsx`).
+        # `ExternalModelsView.tsx` is backed by `/api/gateways` + SecretStore with zero `localStorage` usage.
         webui_src = REPO_ROOT / "webui" / "src"
         ls_access_re = re.compile(r"\blocalStorage\s*(?:\.|\[)")
         allowed_ws_ls_re = re.compile(
             r"localStorage\.(?:getItem\(WORKBENCH_STORAGE_KEY\)"
             r"|setItem\(WORKBENCH_STORAGE_KEY,\s*[A-Za-z_][A-Za-z0-9_]*\))"
-        )
-        allowed_ext_ls_re = re.compile(
-            r"localStorage\.(?:getItem\(PREVIEW_STORAGE_KEY\)"
-            r"|setItem\(PREVIEW_STORAGE_KEY,\s*JSON\.stringify\(safeList\)\))"
         )
         for ts_file in webui_src.rglob("*.ts*"):
             txt = ts_file.read_text(encoding="utf-8")
@@ -3120,14 +3116,6 @@ class TestStudioPasswordAuth(unittest.IsolatedAsyncioTestCase):
             if ts_file.name == "WorkspaceView.tsx":
                 self.assertIn('const WORKBENCH_STORAGE_KEY = "agy_studio_workbench_v1";', txt)
                 scrubbed = allowed_ws_ls_re.sub("", txt)
-                self.assertIsNone(ls_access_re.search(scrubbed), str(ts_file))
-            elif ts_file.name == "ExternalModelsView.tsx":
-                self.assertIn(
-                    'const PREVIEW_STORAGE_KEY = "agy_studio_external_gateways_preview_v1";',
-                    txt,
-                )
-                self.assertIn("api_key_masked: g.api_key_masked ? maskApiKey(g.api_key_masked) : \"\"", txt)
-                scrubbed = allowed_ext_ls_re.sub("", txt)
                 self.assertIsNone(ls_access_re.search(scrubbed), str(ts_file))
             else:
                 self.assertIsNone(ls_access_re.search(txt), str(ts_file))

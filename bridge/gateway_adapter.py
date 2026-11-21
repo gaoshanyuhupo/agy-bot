@@ -155,6 +155,7 @@ class GatewayConfig:
     api_key: str = ""
     api_key_env: str = ""
     api_key_cmd: Any = None
+    secret_ref: Optional[Dict[str, Any]] = None
     enabled: bool = True
     include_models: Tuple[str, ...] = ()
     exclude_models: Tuple[str, ...] = ()
@@ -176,6 +177,7 @@ class GatewayConfig:
             "base_url": self.base_url,
             "dialect": self.dialect,
             "enabled": self.enabled,
+            "secret_ref": self.secret_ref,
             "max_tokens_cap": self.max_tokens_cap,
             "supports_reasoning_effort": self.supports_reasoning_effort,
             "effort_mode": self.effort_mode,
@@ -183,7 +185,7 @@ class GatewayConfig:
             "strip_stream_options": self.strip_stream_options,
             "max_tokens_field": self.max_tokens_field,
         }
-        return hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+        return hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:12]
 
     def __repr__(self) -> str:
         return (
@@ -297,6 +299,15 @@ def _normalize_gateway_entry(raw: Dict[str, Any], fallback_id: str = "") -> Gate
     timeout_raw = raw.get("timeout_s", 300.0)
     timeout_s = max(5.0, float(timeout_raw if timeout_raw is not None else 300.0))
 
+    raw_sref = raw.get("secret_ref")
+    secret_ref: Optional[Dict[str, Any]] = None
+    if isinstance(raw_sref, dict) and str(raw_sref.get("backend") or "").strip():
+        secret_ref = {
+            str(k): v
+            for k, v in raw_sref.items()
+            if isinstance(k, str) and k in ("backend", "kv_mount", "path", "slot", "field", "version", "updated_at")
+        }
+
     return GatewayConfig(
         id=gw_id,
         name=str(raw.get("name") or gw_id).strip() or gw_id,
@@ -305,6 +316,7 @@ def _normalize_gateway_entry(raw: Dict[str, Any], fallback_id: str = "") -> Gate
         api_key=str(raw.get("api_key") or "").strip(),
         api_key_env=str(raw.get("api_key_env") or "").strip(),
         api_key_cmd=raw.get("api_key_cmd"),
+        secret_ref=secret_ref,
         enabled=_as_bool(raw.get("enabled"), True),
         include_models=_as_str_tuple(raw.get("include_models")),
         exclude_models=_as_str_tuple(raw.get("exclude_models")),
@@ -1057,15 +1069,239 @@ def _build_api_key_cmd_env() -> Dict[str, str]:
     return env
 
 
+_KV_SEG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+_KV_FIELD_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+_OPENBAO_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _read_regular_json_nofollow(path: Path, max_bytes: int = 512 * 1024) -> Optional[Dict[str, Any]]:
+    """Read a regular JSON object file refusing symlinks (`O_NOFOLLOW`)."""
+    try:
+        if path.parent.is_symlink() or path.is_symlink():
+            logger.warning("Refusing symlink secret/config file: %s", path.name)
+            return None
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(str(path), flags)
+        try:
+            st = os.fstat(fd)
+            if not path.is_file() or st.st_size > max_bytes:
+                return None
+            chunks: List[bytes] = []
+            remaining = max_bytes + 1
+            while remaining > 0:
+                buf = os.read(fd, min(8192, remaining))
+                if not buf:
+                    break
+                chunks.append(buf)
+                remaining -= len(buf)
+            raw = b"".join(chunks)
+            if len(raw) > max_bytes:
+                return None
+            obj = json.loads(raw.decode("utf-8"))
+            return obj if isinstance(obj, dict) else None
+        finally:
+            os.close(fd)
+    except OSError:
+        return None
+    except Exception:
+        return None
+
+
+def _read_regular_text_nofollow(path: Path, max_bytes: int = 8192) -> str:
+    try:
+        if path.parent.is_symlink() or path.is_symlink():
+            return ""
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(str(path), flags)
+        try:
+            return os.read(fd, max_bytes).decode("utf-8", errors="ignore").strip()
+        finally:
+            os.close(fd)
+    except OSError:
+        return ""
+
+
+def _normalize_openbao_addr_safe(raw: Any) -> str:
+    if not isinstance(raw, str):
+        return ""
+    s = raw.strip()
+    if not s or any(ch.isspace() for ch in s):
+        return ""
+    parsed = urlparse(s)
+    scheme = (parsed.scheme or "").lower()
+    host = (parsed.hostname or "").lower()
+    if scheme not in ("https", "http") or not host:
+        return ""
+    if scheme == "http" and host not in _OPENBAO_LOOPBACK_HOSTS:
+        return ""
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        return ""
+    clean_path = (parsed.path or "").rstrip("/")
+    if ".." in clean_path.split("/"):
+        return ""
+    return f"{scheme}://{parsed.netloc}{clean_path}"
+
+
+def _resolve_local_0600_secret_ref(secret_ref: Dict[str, Any]) -> str:
+    slot = str(secret_ref.get("slot") or "").strip().lower()
+    field = str(secret_ref.get("field") or "api_key").strip()
+    if not slot or not _GW_ID_RE.fullmatch(slot) or not _KV_FIELD_RE.fullmatch(field):
+        return ""
+    env_p = os.environ.get("AGY_STUDIO_GATEWAY_SECRETS_FILE", "").strip()
+    secrets_path = (
+        Path(os.path.expandvars(os.path.expanduser(env_p)))
+        if env_p
+        else (Path.home() / ".config" / "agy-tg-bridge" / "gateway_secrets.json")
+    )
+    doc = _read_regular_json_nofollow(secrets_path, max_bytes=512 * 1024)
+    if not doc:
+        return ""
+    slots = doc.get("slots")
+    if not isinstance(slots, dict):
+        return ""
+    entry = slots.get(slot)
+    if not isinstance(entry, dict):
+        return ""
+    val = entry.get(field)
+    return str(val).strip() if isinstance(val, str) and val.strip() else ""
+
+
+def _resolve_openbao_secret_ref(secret_ref: Dict[str, Any]) -> str:
+    kv_mount = str(secret_ref.get("kv_mount") or "secret").strip().strip("/")
+    raw_path = str(secret_ref.get("path") or "").strip().strip("/")
+    field = str(secret_ref.get("field") or "api_key").strip()
+    if not kv_mount or ".." in kv_mount or not _KV_SEG_RE.fullmatch(kv_mount):
+        return ""
+    if not raw_path or not _KV_FIELD_RE.fullmatch(field):
+        return ""
+    parts = raw_path.split("/")
+    if len(parts) > 8 or any(seg in ("", ".", "..") or not _KV_SEG_RE.fullmatch(seg) for seg in parts):
+        return ""
+    norm_path = "/".join(parts)
+
+    # Load Studio OpenBao config + host OpenBao runtime (symlink-safe)
+    cfg_env = os.environ.get("AGY_STUDIO_SECRETS_CONFIG", "").strip()
+    cfg_path = (
+        Path(os.path.expandvars(os.path.expanduser(cfg_env)))
+        if cfg_env
+        else (Path.home() / ".config" / "agy-tg-bridge" / "studio_secrets.json")
+    )
+    saved_doc = _read_regular_json_nofollow(cfg_path, max_bytes=128 * 1024) or {}
+    saved_ob = saved_doc.get("openbao") if isinstance(saved_doc.get("openbao"), dict) else {}
+
+    host_dir = Path.home() / ".config" / "openbao"
+    env_card = os.environ.get("OPENBAO_CONFIG_PATH", "").strip()
+    card_path = Path(os.path.expandvars(os.path.expanduser(env_card))) if env_card else (host_dir / "card.json")
+    card_data = _read_regular_json_nofollow(card_path, max_bytes=64 * 1024) or {}
+    tok_cache = _read_regular_json_nofollow(host_dir / "token.json", max_bytes=64 * 1024) or {}
+
+    host_addr = _normalize_openbao_addr_safe(
+        card_data.get("base_url")
+        or card_data.get("bao_addr")
+        or card_data.get("addr")
+        or os.environ.get("BAO_ADDR")
+        or os.environ.get("VAULT_ADDR")
+        or ""
+    )
+
+    saved_mode = str(saved_ob.get("mode") or "").strip().lower()
+    if saved_mode == "custom":
+        if not bool(saved_ob.get("enabled", True)):
+            return ""
+        addr = _normalize_openbao_addr_safe(saved_ob.get("addr"))
+        auth_mode = str(saved_ob.get("auth_mode") or "host_card").strip().lower()
+    else:
+        addr = host_addr
+        auth_mode = "host_card" if (card_data.get("role_id") and card_data.get("secret_id")) else "token"
+
+    if not addr:
+        return ""
+
+    client_token = ""
+    role_id = ""
+    secret_id = ""
+    is_host_match = bool(host_addr and addr == host_addr)
+
+    if saved_mode == "custom" and auth_mode == "token":
+        client_token = str(saved_ob.get("token") or "").strip()
+    elif saved_mode == "custom" and auth_mode == "approle":
+        role_id = str(saved_ob.get("role_id") or "").strip()
+        secret_id = str(saved_ob.get("secret_id") or "").strip()
+    else:
+        if is_host_match:
+            cached = str(tok_cache.get("client_token") or "").strip()
+            exp = tok_cache.get("expires_at_approx")
+            if cached and (exp is None or (isinstance(exp, (int, float)) and exp > (time.time() * 1000 + 30_000))):
+                client_token = cached
+            role_id = str(card_data.get("role_id") or "").strip()
+            secret_id = str(card_data.get("secret_id") or "").strip()
+        if not client_token and auth_mode == "token":
+            client_token = (os.environ.get("BAO_TOKEN") or os.environ.get("VAULT_TOKEN") or "").strip()
+            if not client_token:
+                for tf in (Path.home() / ".bao-token", Path.home() / ".vault-token"):
+                    val = _read_regular_text_nofollow(tf)
+                    if val:
+                        client_token = val
+                        break
+
+    try:
+        if not client_token and role_id and secret_id:
+            login_resp = requests.post(
+                f"{addr}/v1/auth/approle/login",
+                json={"role_id": role_id, "secret_id": secret_id},
+                headers={"Accept": "application/json"},
+                allow_redirects=False,
+                timeout=5.0,
+            )
+            if login_resp.status_code == 200:
+                ldata = login_resp.json()
+                client_token = str(((ldata.get("auth") or {}) if isinstance(ldata, dict) else {}).get("client_token") or "").strip()
+        if not client_token:
+            return ""
+        resp = requests.get(
+            f"{addr}/v1/{kv_mount}/data/{norm_path}",
+            headers={"X-Vault-Token": client_token, "Accept": "application/json"},
+            allow_redirects=False,
+            timeout=5.0,
+        )
+        if resp.status_code != 200:
+            return ""
+        payload = resp.json()
+        inner = ((payload.get("data") or {}).get("data")) if isinstance(payload, dict) else None
+        if isinstance(inner, dict):
+            val = inner.get(field)
+            return str(val).strip() if isinstance(val, str) and val.strip() else ""
+    except Exception as exc:
+        logger.warning("OpenBao secret_ref resolution failed: %s", type(exc).__name__)
+        return ""
+    return ""
+
+
 def _gateway_runtime_fingerprint(gateway: GatewayConfig) -> str:
-    """Hash gateway endpoint, dialect, and auth source metadata (never plaintext secrets)."""
+    """Hash gateway endpoint, dialect, filters, and auth source metadata (never plaintext secrets)."""
+    extra_hdr_sha = (
+        hashlib.sha256(json.dumps(gateway.extra_headers, sort_keys=True).encode("utf-8")).hexdigest()
+        if gateway.extra_headers
+        else ""
+    )
     payload = {
         "id": gateway.id,
+        "name": gateway.name,
         "base_url": gateway.base_url,
         "dialect": gateway.dialect,
+        "enabled": gateway.enabled,
         "api_key_env": gateway.api_key_env,
         "api_key_cmd": gateway.api_key_cmd,
+        "secret_ref": gateway.secret_ref,
         "api_key_sha": hashlib.sha256(gateway.api_key.encode("utf-8")).hexdigest() if gateway.api_key else "",
+        "extra_headers_sha": extra_hdr_sha,
+        "include_models": list(gateway.include_models),
+        "exclude_models": list(gateway.exclude_models),
+        "models": list(gateway.models),
         "effort_mode": gateway.effort_mode,
         "flatten_system_content": gateway.flatten_system_content,
         "strip_stream_options": gateway.strip_stream_options,
@@ -1148,14 +1384,29 @@ class GatewayRuntimeState:
                 env_val = os.environ.get(gateway.api_key_env, "").strip()
                 if env_val:
                     return env_val
+            sref = gateway.secret_ref
             cmd = gateway.api_key_cmd
-            if not cmd:
+            if not sref and not cmd:
                 return ""
             cached = self._key_cache.get(gateway.id)
             if cached and (now - cached[0]) < self.key_ttl_s and cached[1]:
                 return cached[1]
 
         secret_val = ""
+        if isinstance(sref, dict) and sref.get("backend"):
+            backend = str(sref.get("backend") or "").strip().lower()
+            if backend == "local_0600":
+                secret_val = _resolve_local_0600_secret_ref(sref)
+            elif backend == "openbao":
+                secret_val = _resolve_openbao_secret_ref(sref)
+            if secret_val:
+                with self._lock:
+                    if self._config_hashes.get(gateway.id) == cfg_hash:
+                        self._key_cache[gateway.id] = (now, secret_val)
+                return secret_val
+            if not cmd:
+                return ""
+
         cmd_env = _build_api_key_cmd_env()
         try:
             if isinstance(cmd, (list, tuple)):

@@ -211,6 +211,8 @@ export type StudioEventType =
   | "job_updated"
   | "schedule_updated"
   | "bots_updated"
+  | "gateways_updated"
+  | "workbench_state_updated"
   | "session_updated"
   | "room_message"
   | "room_typing"
@@ -450,6 +452,148 @@ export interface OpenBaoTestResponse {
   message: string;
 }
 
+export type GatewayDialectId =
+  | "new_api"
+  | "cpa"
+  | "openrouter"
+  | "deepseek"
+  | "zhipu"
+  | "ark"
+  | "litellm"
+  | "openai_2api"
+  | "openai_strict";
+
+export type GatewayEffortMode = "body" | "model_paren" | "none";
+export type GatewayMaxTokensField = "max_completion_tokens" | "max_tokens" | "omit";
+export type GatewayCredentialKind = "api_key" | "api_key_env" | "server_cmd_readonly" | "none";
+export type GatewaySecretBackend =
+  | "openbao"
+  | "local_0600"
+  | "env"
+  | "host_cmd_readonly"
+  | "security_card"
+  | "legacy_plaintext"
+  | "none";
+
+export interface GatewaySecretRefSummary {
+  backend: string;
+  kv_mount?: string;
+  path?: string;
+  slot?: string;
+  version?: number | null;
+  status?: string;
+}
+
+export interface GatewayItem {
+  id: string;
+  name: string;
+  base_url: string;
+  dialect: GatewayDialectId;
+  enabled: boolean;
+  credential_kind: GatewayCredentialKind;
+  secret_backend: GatewaySecretBackend;
+  has_api_key: boolean;
+  api_key_hint: string;
+  api_key_env: string;
+  read_only_cmd: boolean;
+  secret_ref_summary: GatewaySecretRefSummary | null;
+  include_models: string[];
+  exclude_models: string[];
+  models: string[];
+  supports_reasoning_effort: boolean;
+  effort_mode: GatewayEffortMode;
+  flatten_system_content: boolean;
+  strip_stream_options: boolean;
+  max_tokens_field: GatewayMaxTokensField;
+  max_tokens_cap: number | null;
+  adaptive_400_fallback: boolean;
+  timeout_s: number;
+  extra_headers: Record<string, string>;
+  updated_at?: number | null;
+}
+
+export interface GatewaySecretStoreStatus {
+  active_backend: "openbao" | "local_0600" | string;
+  openbao_ready: boolean;
+  fallback_mode: string;
+  security_card_status: string;
+  backends: { backend_id: string; priority: number; status: string }[];
+}
+
+export interface GatewaysListResponse {
+  ok: boolean;
+  can_edit: boolean;
+  total: number;
+  gateways: GatewayItem[];
+  secret_store: GatewaySecretStoreStatus;
+}
+
+export interface GatewayMutationPayload {
+  id?: string;
+  name?: string;
+  base_url?: string;
+  dialect?: GatewayDialectId;
+  enabled?: boolean;
+  credential_kind?: "api_key" | "api_key_env" | "none";
+  api_key?: string;
+  api_key_env?: string;
+  clear_api_key?: boolean;
+  preferred_secret_backend?: "openbao" | "local_0600";
+  include_models?: string[];
+  exclude_models?: string[];
+  models?: string[];
+  supports_reasoning_effort?: boolean;
+  effort_mode?: GatewayEffortMode;
+  flatten_system_content?: boolean;
+  strip_stream_options?: boolean;
+  max_tokens_field?: GatewayMaxTokensField;
+  max_tokens_cap?: number | null;
+  adaptive_400_fallback?: boolean;
+  timeout_s?: number;
+  extra_headers?: Record<string, string>;
+}
+
+export interface GatewayMutationResponse {
+  ok: boolean;
+  gateway: GatewayItem;
+  secret_backend: string;
+  fallback_used?: boolean;
+}
+
+export interface GatewayDeleteResponse {
+  ok: boolean;
+  deleted: boolean;
+  id: string;
+  secret_deleted?: boolean;
+}
+
+export interface GatewayProbePayload {
+  gateway_id?: string;
+  base_url?: string;
+  dialect?: GatewayDialectId;
+  credential_kind?: "api_key" | "api_key_env" | "none";
+  api_key?: string;
+  api_key_env?: string;
+  include_models?: string[];
+  exclude_models?: string[];
+  models?: string[];
+  extra_headers?: Record<string, string>;
+}
+
+export interface GatewayProbeResponse {
+  ok: boolean;
+  reachable: boolean;
+  http_status: number | null;
+  latency_ms: number;
+  endpoint: string;
+  truncated?: boolean;
+  discovered_models: string[];
+  discovered_count: number;
+  exposed_models: string[];
+  exposed_count: number;
+  message: string;
+}
+
 export interface SessionSummaryItem {
   cid: string;
   title: string;
@@ -538,6 +682,9 @@ export interface ModelsResponse {
   ok: boolean;
   bot: string;
   active_model: string;
+  effective_model?: string;
+  model_mode?: string;
+  default_effort?: string;
   default_project: string;
   efforts: string[];
   models: ModelOption[];
@@ -939,6 +1086,37 @@ export interface WorkbenchLayoutPrefs {
   paneCount: 1 | 2 | 3 | 4;
   layoutMode: "1" | "2" | "3" | "4";
   panes: WorkbenchPaneConfig[];
+}
+
+export interface WorkbenchCustomProjectItem {
+  id: string;
+  name: string;
+  createdAt?: number;
+}
+
+export interface WorkbenchSidebarState {
+  customProjects: WorkbenchCustomProjectItem[];
+  projectRenames: Record<string, string>;
+  hiddenProjectIds: string[];
+  hiddenSessionCids: string[];
+  pinnedSessionCids: string[];
+  archivedSessionCids: string[];
+  unreadSessionCids: string[];
+  sessionRenames: Record<string, string>;
+  showArchived: boolean;
+}
+
+export interface WorkbenchStateResponse {
+  ok: boolean;
+  version: number;
+  updated_at: number | null;
+  state: WorkbenchSidebarState;
+  can_edit: boolean;
+}
+
+export interface WorkbenchStateUpdatePayload {
+  expected_version?: number;
+  state: WorkbenchSidebarState;
 }
 
 export type BrowserOwner = "none" | "tab" | "drawer" | `pane:${string}`;

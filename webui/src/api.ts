@@ -17,6 +17,12 @@ import type {
   FileContentResponse,
   FileDiffResponse,
   FileTreeResponse,
+  GatewayDeleteResponse,
+  GatewayMutationPayload,
+  GatewayMutationResponse,
+  GatewayProbePayload,
+  GatewayProbeResponse,
+  GatewaysListResponse,
   JobCancelResponse,
   JobDetailResponse,
   JobDispatchPayload,
@@ -49,6 +55,8 @@ import type {
   UndoActionResponse,
   UndoCheckpointsResponse,
   UploadAttachmentResponse,
+  WorkbenchStateResponse,
+  WorkbenchStateUpdatePayload,
 } from "./types";
 
 let csrfTokenMemory = "";
@@ -68,6 +76,7 @@ export class StudioApiError extends Error {
   retryAfter?: number;
   code?: string;
   conflicts?: string[];
+  data?: Record<string, unknown>;
   constructor(
     message: string,
     status: number,
@@ -76,6 +85,7 @@ export class StudioApiError extends Error {
     retryAfter?: number,
     code?: string,
     conflicts?: string[],
+    data?: Record<string, unknown>,
   ) {
     super(message);
     this.status = status;
@@ -84,6 +94,7 @@ export class StudioApiError extends Error {
     this.retryAfter = retryAfter;
     this.code = code;
     this.conflicts = conflicts;
+    this.data = data;
   }
 }
 
@@ -131,7 +142,7 @@ async function requestJson<T>(
     const conflicts = Array.isArray(payload.conflicts)
       ? payload.conflicts.filter((c): c is string => typeof c === "string")
       : undefined;
-    throw new StudioApiError(msg, resp.status, src, mode, retryAfter, code, conflicts);
+    throw new StudioApiError(msg, resp.status, src, mode, retryAfter, code, conflicts, payload);
   }
   return payload as unknown as T;
 }
@@ -388,6 +399,8 @@ export class StudioEventClient {
     bindType("job_updated");
     bindType("schedule_updated");
     bindType("bots_updated");
+    bindType("gateways_updated");
+    bindType("workbench_state_updated");
     bindType("session_updated");
     bindType("room_message");
     bindType("room_typing");
@@ -796,6 +809,121 @@ export async function testOpenBaoConnection(
     throw new StudioApiError(msg, resp.status, src);
   }
   return data as unknown as OpenBaoTestResponse;
+}
+
+// External Model Gateways CRUD & Bounded /probe
+export function fetchGateways(): Promise<GatewaysListResponse> {
+  return requestJson<GatewaysListResponse>("/api/gateways");
+}
+
+export function createGateway(payload: GatewayMutationPayload): Promise<GatewayMutationResponse> {
+  return requestJson<GatewayMutationResponse>(
+    "/api/gateways",
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+    true,
+  );
+}
+
+export function updateGateway(
+  gatewayId: string,
+  payload: GatewayMutationPayload,
+): Promise<GatewayMutationResponse> {
+  return requestJson<GatewayMutationResponse>(
+    `/api/gateways/${encodeURIComponent(gatewayId)}`,
+    {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    },
+    true,
+  );
+}
+
+export function patchGateway(
+  gatewayId: string,
+  payload: GatewayMutationPayload,
+): Promise<GatewayMutationResponse> {
+  return requestJson<GatewayMutationResponse>(
+    `/api/gateways/${encodeURIComponent(gatewayId)}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    },
+    true,
+  );
+}
+
+export function deleteGateway(gatewayId: string): Promise<GatewayDeleteResponse> {
+  return requestJson<GatewayDeleteResponse>(
+    `/api/gateways/${encodeURIComponent(gatewayId)}`,
+    {
+      method: "DELETE",
+      body: "{}",
+    },
+    true,
+  );
+}
+
+async function postGatewayProbe(
+  path: string,
+  payload?: GatewayProbePayload,
+): Promise<GatewayProbeResponse> {
+  const headers = new Headers({ "Content-Type": "application/json" });
+  if (csrfTokenMemory) {
+    headers.set("X-Studio-CSRF", csrfTokenMemory);
+  }
+  const resp = await fetch(path, {
+    method: "POST",
+    credentials: "same-origin",
+    headers,
+    body: JSON.stringify(payload || {}),
+  });
+  let data: Record<string, unknown> = {};
+  try {
+    data = (await resp.json()) as Record<string, unknown>;
+  } catch {
+    data = {};
+  }
+  if (!resp.ok) {
+    const msg =
+      (typeof data.error === "string" && data.error) ||
+      (typeof data.message === "string" && data.message) ||
+      `HTTP ${resp.status}`;
+    const src = typeof data.source === "string" ? data.source : "studio_api";
+    throw new StudioApiError(msg, resp.status, src);
+  }
+  return data as unknown as GatewayProbeResponse;
+}
+
+export function probeGatewayDraft(payload: GatewayProbePayload): Promise<GatewayProbeResponse> {
+  return postGatewayProbe("/api/gateways/probe", payload);
+}
+
+export function probeGatewayById(
+  gatewayId: string,
+  payload?: GatewayProbePayload,
+): Promise<GatewayProbeResponse> {
+  return postGatewayProbe(`/api/gateways/${encodeURIComponent(gatewayId)}/probe`, payload);
+}
+
+// Workbench Sidebar State Server Sync (9 semantic fields; optimistic concurrency)
+export function fetchWorkbenchState(): Promise<WorkbenchStateResponse> {
+  return requestJson<WorkbenchStateResponse>("/api/workbench/state");
+}
+
+export function updateWorkbenchState(
+  payload: WorkbenchStateUpdatePayload,
+): Promise<WorkbenchStateResponse> {
+  return requestJson<WorkbenchStateResponse>(
+    "/api/workbench/state",
+    {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    },
+    true,
+  );
 }
 
 export function formatTokens(n: number): string {
