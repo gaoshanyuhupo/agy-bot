@@ -482,6 +482,19 @@ class _JobQueue:
                 self._persist_locked()
             self._cond.notify()
 
+    def put_front(self, item, *, _persist=True, _enqueued_at=None, _qid=None):
+        """Atomically insert an urgent item at the head of the queue (ahead of all normal pending items)."""
+        entry = {
+            "qid": _qid or uuid.uuid4().hex[:12],
+            "enqueued_at": float(_enqueued_at if _enqueued_at is not None else time.time()),
+            "item": item,
+        }
+        with self._cond:
+            self._entries.appendleft(entry)
+            if _persist and not self._is_control_sentinel(item):
+                self._persist_locked()
+            self._cond.notify()
+
     def get(self):
         with self._cond:
             while not self._entries:
@@ -4382,8 +4395,21 @@ def _record_human_group_msg(msg, text_override=None):
         is_bot=False,
         text=txt,
         ts=msg.get("date"),
+        source="tg",
     )
     return bot_bus.mark_human_group_activity(int(chat_id), thread_id=thread_id, msg_id=msg_id) or ""
+
+
+def _extract_sent_mid(sent_ret):
+    """Extract a positive integer Telegram message_id from `send` or `send_rich` return value."""
+    raw = sent_ret[0] if isinstance(sent_ret, (tuple, list)) and sent_ret else sent_ret
+    if isinstance(raw, bool) or raw is None:
+        return None
+    try:
+        mid = int(raw)
+        return mid if mid > 0 else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _record_and_relay_bot_group_msg(
@@ -4417,6 +4443,7 @@ def _record_and_relay_bot_group_msg(
         sender_role=my_role,
         is_bot=True,
         text=body,
+        source="tg",
     )
     if relay_mentions:
         scan = mention_scan_text if mention_scan_text is not None else body
@@ -4630,12 +4657,26 @@ def _run_fast_group_reply(
             )
     except Exception as e:
         log("fast_group_reply error: %r" % e)
-        send(
-            chat_id,
-            f"⏳ 我手头正在跑 {busy_desc or '后台任务'}，刚才快答遇到小波动（{type(e).__name__}），请稍候或再 @ 我一次。",
-            thread_id=norm_tid,
-            reply_to_message_id=origin_msg_id or None,
+        fb_text = (
+            f"⏳ 我手头正在跑 {busy_desc or '后台任务'}，刚才快答遇到小波动（{type(e).__name__}），请稍候或再 @ 我一次。"
         )
+        fb_mid = _extract_sent_mid(
+            send(
+                chat_id,
+                fb_text,
+                thread_id=norm_tid,
+                reply_to_message_id=origin_msg_id or None,
+            )
+        )
+        if fb_mid and chat_id and int(chat_id) < 0:
+            _record_and_relay_bot_group_msg(
+                chat_id,
+                fb_mid,
+                norm_tid,
+                fb_text,
+                relay_mentions=False,
+                source_hop=mention_hop,
+            )
     finally:
         _fast_chat_sem.release()
 
@@ -5533,8 +5574,24 @@ def run_agy(
                 })
                 pending_chat_sync_status = "aborted"
                 if partial:
-                    send_rich(chat_id, partial + "\n\n*🛑 [已手动停止生成]*",
-                              reply_markup=retry_kb if not session_readonly else None, thread_id=norm_tid)
+                    cancel_text = partial + "\n\n*🛑 [已手动停止生成]*"
+                    c_mid = _extract_sent_mid(
+                        send_rich(
+                            chat_id,
+                            cancel_text,
+                            reply_markup=retry_kb if not session_readonly else None,
+                            thread_id=norm_tid,
+                        )
+                    )
+                    if c_mid and chat_id and int(chat_id) < 0:
+                        _record_and_relay_bot_group_msg(
+                            chat_id,
+                            c_mid,
+                            norm_tid,
+                            cancel_text,
+                            relay_mentions=False,
+                            source_hop=mention_hop,
+                        )
             elif sess and sess.proc.returncode in (-15, 143, -2, 130):
                 _emit_web("aborted", {
                     "conversation_id": conv,
@@ -5543,10 +5600,34 @@ def run_agy(
                 })
                 pending_chat_sync_status = "aborted"
                 if partial:
-                    send_rich(chat_id, partial + "\n\n*🛑 [任务已中断]*",
-                              reply_markup=retry_kb if not session_readonly else None, thread_id=norm_tid)
+                    int_text = partial + "\n\n*🛑 [任务已中断]*"
+                    i_mid = _extract_sent_mid(
+                        send_rich(
+                            chat_id,
+                            int_text,
+                            reply_markup=retry_kb if not session_readonly else None,
+                            thread_id=norm_tid,
+                        )
+                    )
                 else:
-                    send(chat_id, "🛑 Task cancelled.", reply_markup=retry_kb if not session_readonly else None, thread_id=norm_tid)
+                    int_text = "🛑 Task cancelled."
+                    i_mid = _extract_sent_mid(
+                        send(
+                            chat_id,
+                            int_text,
+                            reply_markup=retry_kb if not session_readonly else None,
+                            thread_id=norm_tid,
+                        )
+                    )
+                if i_mid and chat_id and int(chat_id) < 0:
+                    _record_and_relay_bot_group_msg(
+                        chat_id,
+                        i_mid,
+                        norm_tid,
+                        int_text,
+                        relay_mentions=False,
+                        source_hop=mention_hop,
+                    )
             else:
                 rc = sess.proc.returncode if sess else "?"
                 err = sess.get_stderr_text() if sess else ""
@@ -5560,7 +5641,23 @@ def run_agy(
                     "status": "ERROR",
                 })
                 pending_chat_sync_status = "error"
-                send(chat_id, msg_err, reply_markup=retry_kb if not session_readonly else None, thread_id=norm_tid)
+                e_mid = _extract_sent_mid(
+                    send(
+                        chat_id,
+                        msg_err,
+                        reply_markup=retry_kb if not session_readonly else None,
+                        thread_id=norm_tid,
+                    )
+                )
+                if e_mid and chat_id and int(chat_id) < 0:
+                    _record_and_relay_bot_group_msg(
+                        chat_id,
+                        e_mid,
+                        norm_tid,
+                        msg_err,
+                        relay_mentions=False,
+                        source_hop=mention_hop,
+                    )
             return
 
         res_cid = result.get("conversation_id")
@@ -5747,14 +5844,39 @@ def run_agy(
 
         elif status == "WAITING":
             if delivered_steps > 0:
-                send(chat_id, "⏸ agy 正在等待您的输入或确认 — 直接回复即可继续当前会话。", thread_id=norm_tid)
+                w_text = "⏸ agy 正在等待您的输入或确认 — 直接回复即可继续当前会话。"
+                w_mid = send(chat_id, w_text, thread_id=norm_tid)
             else:
-                send(chat_id, "⏸ agy is waiting on input/permission:\n" + (resp or "(no details)")
-                     + "\n\nReply directly — I'll continue the session with your reply.", thread_id=norm_tid)
+                w_text = (
+                    "⏸ agy is waiting on input/permission:\n" + (resp or "(no details)")
+                    + "\n\nReply directly — I'll continue the session with your reply."
+                )
+                w_mid = send(chat_id, w_text, thread_id=norm_tid)
+            if w_mid and chat_id and int(chat_id) < 0:
+                _record_and_relay_bot_group_msg(
+                    chat_id, w_mid, norm_tid, w_text, relay_mentions=False, source_hop=mention_hop,
+                )
         else:
             if finished_reason == "interrupted" or cancel_requested:
                 if not cancel_requested:
-                    send(chat_id, "🛑 Task cancelled.", reply_markup=retry_kb if not session_readonly else None, thread_id=norm_tid)
+                    int_text = "🛑 Task cancelled."
+                    i_mid = _extract_sent_mid(
+                        send(
+                            chat_id,
+                            int_text,
+                            reply_markup=retry_kb if not session_readonly else None,
+                            thread_id=norm_tid,
+                        )
+                    )
+                    if i_mid and chat_id and int(chat_id) < 0:
+                        _record_and_relay_bot_group_msg(
+                            chat_id,
+                            i_mid,
+                            norm_tid,
+                            int_text,
+                            relay_mentions=False,
+                            source_hop=mention_hop,
+                        )
             else:
                 if status == "ERROR" and len(attempted_models) > 1:
                     err_out = model_failover.format_failover_exhausted_error(
@@ -5762,8 +5884,12 @@ def run_agy(
                     )
                 else:
                     err_out = "⚠️ agy %s: %s" % (status, result.get("error") or resp or "(no details)")
-                send(chat_id, err_out,
+                e_mid = send(chat_id, err_out,
                      reply_markup=retry_kb if not session_readonly else None, thread_id=norm_tid)
+                if e_mid and chat_id and int(chat_id) < 0:
+                    _record_and_relay_bot_group_msg(
+                        chat_id, e_mid, norm_tid, err_out, relay_mentions=False, source_hop=mention_hop,
+                    )
 
         # Emit terminal live-stream event & sync status for non-web (TG) interactive turns
         dur_sec_tg = round(max(0.0, time.time() - started), 2)
@@ -7018,11 +7144,31 @@ def _execute_bus_job(job_id):
                             log("Bus job %s card edit failed: %s" % (job_id, _format_tg_err(r_ed)))
                         else:
                             delivered_to_group = True
+                            if int(mirror_chat) < 0:
+                                bot_bus.record_group_message(
+                                    int(mirror_chat),
+                                    msg_id=0,
+                                    thread_id=mirror_thread,
+                                    sender_handle=my_handle,
+                                    sender_role=_current_bot_role(),
+                                    is_bot=True,
+                                    text=f"{icon} [{final_status.upper()}] 【{label}】（单号 {job_id}）\n{body_raw}",
+                                    source="tg",
+                                )
                     else:
                         r_sd = tg_send_in_route("sendMessage", mirror_chat, thread_id=mirror_thread,
                                                 text=summary_html, parse_mode="HTML")
-                        if _extract_msg_id(r_sd):
+                        sd_mid = _extract_msg_id(r_sd)
+                        if sd_mid:
                             delivered_to_group = True
+                            if int(mirror_chat) < 0:
+                                _record_and_relay_bot_group_msg(
+                                    mirror_chat,
+                                    sd_mid,
+                                    mirror_thread,
+                                    f"{icon} [{final_status.upper()}] 【{label}】（单号 {job_id}）\n{body_raw}",
+                                    relay_mentions=False,
+                                )
 
                 img_paths = [p for p in artifacts if os.path.splitext(p)[1].lower() in IMAGE_EXTS and os.path.isfile(p)]
                 if img_paths:
@@ -7367,16 +7513,62 @@ def _studio_ipc_get_meta():
 
 
 def _studio_ipc_enqueue_turn(req):
+    global cancel_requested
     cid = req.get("cid")
     uid = int(req["user_id"])
+    priority = str(req.get("priority") or "normal").strip().lower()
+    if priority not in ("normal", "urgent"):
+        priority = "normal"
+    interrupt_current = req.get("interrupt_current") is True
+
+    # Snapshot running state safely without nesting job_q._cond and session_lock.
+    with session_lock:
+        cur_running = bool(turn_running)
+        cur_running_cid = turn_running_cid
+        cur_running_web_id = turn_running_web_id
+
+    target_abort_tid = None
+    should_interrupt_running = False
+    running_same_cid = bool(cid and cur_running and cur_running_cid == cid)
+
     if cid:
-        with session_lock:
-            if turn_running and turn_running_cid == cid:
+        active_tid = _studio_ipc_buffer.find_active_turn_for_cid(cid)
+        if active_tid:
+            active_info = _studio_ipc_buffer.get_turn_info(active_tid)
+            if active_info is not None and int(active_info["owner_user_id"]) != uid:
+                if interrupt_current:
+                    return 403, {"ok": False, "code": "forbidden", "error": "无权中止其他用户的对话轮次"}
+                return 409, {"ok": False, "code": "session_busy", "error": "会话已有排队或执行中的轮次（session_busy）"}
+            if not interrupt_current:
+                return 409, {"ok": False, "code": "session_busy", "error": "会话已有排队或执行中的轮次（session_busy）"}
+            target_abort_tid = active_tid
+
+        if running_same_cid:
+            if not interrupt_current:
                 return 409, {"ok": False, "code": "session_busy", "error": "会话正在执行中（session_busy）"}
-        if _studio_ipc_buffer.find_active_turn_for_cid(cid):
-            return 409, {"ok": False, "code": "session_busy", "error": "会话已有排队或执行中的轮次（session_busy）"}
-        if studio_ipc.is_conversation_locked(bot_bus.BUS_DIR, cid):
-            return 409, {"ok": False, "code": "session_busy", "error": "会话已被其他进程占用（session_busy）"}
+            # Confirm running turn belongs to `uid` (web turn or owner-matched TG turn).
+            if cur_running_web_id:
+                run_info = _studio_ipc_buffer.get_turn_info(cur_running_web_id)
+                if run_info is None or int(run_info["owner_user_id"]) != uid:
+                    return 403, {"ok": False, "code": "forbidden", "error": "无权中止其他用户的对话轮次"}
+                target_abort_tid = cur_running_web_id
+                should_interrupt_running = True
+            else:
+                owner_active = _studio_ipc_buffer.find_active_turn_for_cid_and_owner(cid, uid)
+                if owner_active is None:
+                    return 409, {"ok": False, "code": "session_busy", "error": "会话正在执行其他来源轮次（session_busy）"}
+                target_abort_tid = owner_active["turn_id"]
+                should_interrupt_running = True
+        else:
+            if studio_ipc.is_conversation_locked(bot_bus.BUS_DIR, cid):
+                return 409, {"ok": False, "code": "session_busy", "error": "会话已被其他进程占用（session_busy）"}
+    elif interrupt_current and cur_running and cur_running_web_id:
+        run_info = _studio_ipc_buffer.get_turn_info(cur_running_web_id)
+        if run_info is not None and int(run_info["owner_user_id"]) == uid:
+            target_abort_tid = cur_running_web_id
+            should_interrupt_running = True
+            if not cid and cur_running_cid:
+                cid = cur_running_cid
 
     turn_id = f"turn-{uuid.uuid4().hex[:16]}"
     scope_key = f"web:{uid}:{cid or turn_id}"
@@ -7402,14 +7594,53 @@ def _studio_ipc_enqueue_turn(req):
         "model": req.get("model"),
         "effort": req.get("effort"),
         "sync_tg": sync_tg,
+        "priority": priority,
     }
-    job_q.put((0, None, scope_key, ("__WEB_TURN__", web_req)))
+
+    # Put urgent/interrupt turn at the head of the queue BEFORE interrupting the running turn,
+    # so the worker picks up this turn immediately after the interrupted turn exits cleanly.
+    if priority == "urgent" or interrupt_current:
+        job_q.put_front((0, None, scope_key, ("__WEB_TURN__", web_req)))
+    else:
+        job_q.put((0, None, scope_key, ("__WEB_TURN__", web_req)))
+
+    interrupted_turn_id = None
+    if interrupt_current and target_abort_tid:
+        if job_q.cancel_web_turn(target_abort_tid):
+            interrupted_turn_id = target_abort_tid
+            _studio_ipc_buffer.mark_aborted(target_abort_tid)
+            _studio_ipc_buffer.append(
+                target_abort_tid,
+                "aborted",
+                {"conversation_id": cid, "partial_text": "", "reason": "preempted_by_urgent"},
+            )
+        elif should_interrupt_running:
+            to_kill = None
+            aborted_running = False
+            with session_lock:
+                if turn_running and (
+                    (turn_running_web_id == target_abort_tid)
+                    or (not turn_running_web_id and cid and turn_running_cid == cid)
+                ):
+                    cancel_requested = True
+                    target_sk = turn_running_scope
+                    if target_sk:
+                        to_kill = _session_pool.pop(target_sk, None)
+                    aborted_running = True
+            if aborted_running:
+                interrupted_turn_id = target_abort_tid
+                _studio_ipc_buffer.mark_aborted(target_abort_tid)
+                if to_kill is not None:
+                    close_session_async(to_kill, force=True)
+
     return 202, {
         "ok": True,
         "turn_id": turn_id,
         "bot": _current_bot_handle(),
         "cid": cid,
         "status": "queued",
+        "priority": priority,
+        "interrupted_turn_id": interrupted_turn_id,
     }
 
 
@@ -8222,11 +8453,166 @@ def _studio_ipc_attention_notify(req):
     }
 
 
+def _resolve_studio_mirror_target():
+    """Resolve server-side Telegram mirror `(chat_id, thread_id)` from env or `team_config.json`."""
+    raw_env = os.environ.get("AGY_STUDIO_MIRROR_CHAT_ID", "").strip()
+    if raw_env:
+        if raw_env.lower() in ("0", "off", "false", "none", "disabled"):
+            return 0, None
+        try:
+            env_cid = int(raw_env)
+        except ValueError:
+            return 0, None
+        if env_cid >= 0:
+            return 0, None
+        raw_tid = os.environ.get("AGY_STUDIO_MIRROR_THREAD_ID", "").strip()
+        return env_cid, _normalize_thread_id(raw_tid) if raw_tid else None
+
+    tm = bot_bus.get_team_mirror()
+    cid = int(tm.get("chat_id") or 0)
+    if cid >= 0:
+        return 0, None
+    return cid, _normalize_thread_id(tm.get("thread_id"))
+
+
+def _studio_ipc_tg_group_send(req):
+    """Mirror an authenticated Web admin message into the whitelisted TG group & enqueue real group turn."""
+    global cancel_requested
+    mirror_chat_id, mirror_thread_id = _resolve_studio_mirror_target()
+    if not mirror_chat_id or int(mirror_chat_id) >= 0:
+        return 400, {"ok": False, "error": "服务端未配置有效的 TG 镜像工作群"}
+    if int(mirror_chat_id) not in ALLOWED or not _is_authorized(int(mirror_chat_id)):
+        return 403, {"ok": False, "error": "TG 镜像工作群不在当前 Bot 的白名单内"}
+
+    uid = int(req["user_id"])
+    priority = str(req.get("priority") or "normal").strip().lower()
+    if priority not in ("normal", "urgent"):
+        priority = "normal"
+    interrupt_current = req.get("interrupt_current") is True
+    safe_content = studio_ipc.neutralize_control_tags(req.get("content") or "").strip()
+    if not safe_content:
+        return 400, {"ok": False, "error": "消息正文不能为空"}
+    if len(safe_content.encode("utf-8")) > studio_ipc.MAX_TG_GROUP_CONTENT_BYTES:
+        return 413, {"ok": False, "error": "消息正文超过 16 KiB 上限"}
+
+    raw_actor = re.sub(r"[\x00-\x1f\x7f\r\n]+", " ", str(req.get("actor_username") or "")).strip()
+    actor = studio_ipc.neutralize_control_tags(raw_actor)[:48] or f"uid:{uid}"
+
+    project = req.get("project")
+    override_project = None
+    override_workdir = None
+    if project:
+        proj_clean = str(project).strip()
+        for p in list_agy_projects():
+            if p.get("id") == proj_clean or p.get("name") == proj_clean:
+                override_project = p.get("id")
+                override_workdir = p.get("workdir")
+                break
+        if override_project is None:
+            return 400, {"ok": False, "error": "项目不在服务端白名单内"}
+
+    mirror_to_tg = bool(req.get("mirror_human_to_tg", True))
+    sent_mid = int(req.get("origin_msg_id") or 0)
+    recorded_entry = None
+    chain_id = ""
+
+    if mirror_to_tg:
+        sep = "\n" if "\n" in safe_content else " "
+        tg_text = f"💬 [Web · {actor}]{sep}{safe_content}"
+        sent_mid_raw = send(
+            int(mirror_chat_id),
+            tg_text,
+            thread_id=mirror_thread_id,
+            disable_web_page_preview=True,
+        )
+        sent_mid = int(sent_mid_raw or 0)
+        if sent_mid <= 0:
+            return 502, {"ok": False, "error": "向 Telegram 工作群发送镜像消息失败"}
+        recorded_entry = bot_bus.record_group_message(
+            int(mirror_chat_id),
+            msg_id=sent_mid,
+            thread_id=mirror_thread_id,
+            sender_handle=actor,
+            sender_role="human",
+            is_bot=False,
+            text=safe_content,
+            source="web",
+        )
+        chain_id = bot_bus.mark_human_group_activity(
+            int(mirror_chat_id),
+            thread_id=mirror_thread_id,
+            msg_id=sent_mid,
+        ) or ""
+
+    skey = scope_key_for(int(mirror_chat_id), mirror_thread_id)
+    item_payload = (
+        "__CHAT_TURN__",
+        {
+            "prompt": safe_content,
+            "origin_msg_id": int(sent_mid or 0),
+            "mention_hop": 0,
+            "chain_id": str(chain_id or ""),
+            "user_role": "admin",
+            "user_id": uid,
+            "override_project": override_project,
+            "override_workdir": override_workdir,
+        },
+    )
+    if priority == "urgent" or interrupt_current:
+        job_q.put_front((int(mirror_chat_id), mirror_thread_id, skey, item_payload))
+    else:
+        job_q.put((int(mirror_chat_id), mirror_thread_id, skey, item_payload))
+
+    interrupted_current = False
+    if interrupt_current:
+        to_kill = None
+        with session_lock:
+            # Only interrupt an active turn belonging to this exact whitelisted TG workgroup scope.
+            if turn_running and turn_running_scope == skey:
+                cancel_requested = True
+                to_kill = _session_pool.pop(skey, None)
+                interrupted_current = True
+        if to_kill is not None:
+            close_session_async(to_kill, force=True)
+
+    entry_payload = None
+    seq_val = 0
+    if isinstance(recorded_entry, dict):
+        seq_val = int(recorded_entry.get("seq") or 0)
+        entry_payload = {
+            "seq": seq_val,
+            "ts": float(recorded_entry.get("ts") or time.time()),
+            "sender_handle": str(recorded_entry.get("sender_handle") or actor),
+            "sender_role": str(recorded_entry.get("sender_role") or "human"),
+            "is_bot": False,
+            "full_text": str(recorded_entry.get("full_text") or safe_content),
+            "text_excerpt": str(recorded_entry.get("text_excerpt") or ""),
+            "truncated": bool(recorded_entry.get("truncated", False)),
+            "source": str(recorded_entry.get("source") or "web"),
+        }
+    return 202, {
+        "ok": True,
+        "queued": True,
+        "bot": _current_bot_handle(),
+        "mirrored_to_tg": bool(mirror_to_tg),
+        "origin_msg_id": int(sent_mid or 0),
+        "seq": seq_val,
+        "entry": entry_payload,
+        "priority": priority,
+        "interrupted_current": interrupted_current,
+    }
+
+
 def _studio_ipc_room_turn(req):
     """Execute a single isolated Web Room turn in `scope_key = room:<room_id>` (zero TG/chat_sync)."""
+    global cancel_requested
     room_id = str(req.get("room_id") or "").strip().lower()
     if not studio_ipc.is_valid_room_id(room_id):
         return 400, {"ok": False, "error": "非法的 room_id 格式"}
+    priority = str(req.get("priority") or "normal").strip().lower()
+    if priority not in ("normal", "urgent"):
+        priority = "normal"
+    interrupt_current = req.get("interrupt_current") is True
     turn_id = f"room-{uuid.uuid4().hex[:16]}"
     scope_key = f"room:{room_id}"
     done_ev = threading.Event()
@@ -8244,7 +8630,18 @@ def _studio_ipc_room_turn(req):
         "done_ev": done_ev,
         "result_box": result_box,
     }
-    job_q.put((0, None, scope_key, ("__ROOM_TURN__", room_req)))
+    if priority == "urgent" or interrupt_current:
+        job_q.put_front((0, None, scope_key, ("__ROOM_TURN__", room_req)))
+    else:
+        job_q.put((0, None, scope_key, ("__ROOM_TURN__", room_req)))
+    if interrupt_current:
+        to_kill = None
+        with session_lock:
+            if turn_running and turn_running_scope == scope_key:
+                cancel_requested = True
+                to_kill = _session_pool.pop(scope_key, None)
+        if to_kill is not None:
+            close_session_async(to_kill, force=True)
     if not done_ev.wait(timeout=120.0):
         return 504, {"ok": False, "error": "群聊室 Bot 回复超时", "bot": _current_bot_handle()}
     if result_box.get("status") != "done":
@@ -8398,6 +8795,7 @@ def _start_studio_ipc():
             reload_bot_fn=_studio_ipc_reload_bot,
             room_turn_fn=_studio_ipc_room_turn,
             attention_notify_fn=_studio_ipc_attention_notify,
+            tg_group_send_fn=_studio_ipc_tg_group_send,
             buffer=_studio_ipc_buffer,
             summaries_db=SUMMARIES_DB,
             meta_file=META_FILE,
@@ -8461,6 +8859,8 @@ def worker():
                     chain_id=str(meta.get("chain_id") or ""),
                     user_role=str(meta.get("user_role") or "admin"),
                     user_id=meta.get("user_id"),
+                    override_project=meta.get("override_project"),
+                    override_workdir=meta.get("override_workdir"),
                 )
             else:
                 run_agy(chat_id, prompt, thread_id=thread_id, scope_key=skey)
@@ -8473,7 +8873,25 @@ def worker():
                     {"error": f"bridge worker error: {type(e).__name__}", "status": "ERROR"},
                 )
             elif chat_id:
-                send(chat_id, "⚠️ bridge error: %r" % e, thread_id=thread_id)
+                err_text = "⚠️ bridge error: %r" % e
+                w_mid = _extract_sent_mid(send(chat_id, err_text, thread_id=thread_id))
+                if w_mid and int(chat_id) < 0:
+                    w_hop = 0
+                    if (
+                        isinstance(prompt, tuple)
+                        and len(prompt) == 2
+                        and prompt[0] == "__CHAT_TURN__"
+                        and isinstance(prompt[1], dict)
+                    ):
+                        w_hop = int(prompt[1].get("mention_hop") or 0)
+                    _record_and_relay_bot_group_msg(
+                        chat_id,
+                        w_mid,
+                        thread_id,
+                        err_text,
+                        relay_mentions=False,
+                        source_hop=w_hop,
+                    )
         finally:
             job_q.task_done()
             if os.path.exists(RELOAD_TRIGGER):

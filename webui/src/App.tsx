@@ -4,16 +4,18 @@ import {
   Bell,
   Bot,
   Clock,
+  CreditCard,
   DollarSign,
   FileCode,
   Globe,
   KeyRound,
+  Layers,
   LayoutDashboard,
   LogOut,
   MessageSquare,
   MoreHorizontal,
   Shield,
-  Users,
+  ShieldCheck,
 } from "lucide-react";
 import {
   StudioApiError,
@@ -35,13 +37,15 @@ import { BotsView } from "./components/BotsView";
 import { BrowserView } from "./components/BrowserView";
 import { ChangePasswordModal } from "./components/ChangePasswordModal";
 import { CostsView } from "./components/CostsView";
+import { ExternalModelsView } from "./components/ExternalModelsView";
 import { FilesDiffPanel } from "./components/FilesDiffPanel";
 import { JobsView } from "./components/JobsView";
 import { LoginView } from "./components/LoginView";
 import { MobileMoreSheet } from "./components/MobileMoreSheet";
+import { OpenBaoConfigView } from "./components/OpenBaoConfigView";
 import { OverviewView } from "./components/OverviewView";
-import { RoomPanel } from "./components/RoomPanel";
 import { SchedulesView } from "./components/SchedulesView";
+import { SecurityCardView } from "./components/SecurityCardView";
 import { WorkspaceView } from "./components/WorkspaceView";
 import type {
   AuthMode,
@@ -54,14 +58,21 @@ import type {
   StudioSession,
 } from "./types";
 
-const DESKTOP_NAV_ITEMS: { id: NavTab; label: string; icon: typeof LayoutDashboard }[] = [
+const DESKTOP_NAV_ITEMS: {
+  id: NavTab;
+  label: string;
+  icon: typeof LayoutDashboard;
+  badge?: string;
+}[] = [
   { id: "workspace", label: "工作台", icon: MessageSquare },
-  { id: "rooms", label: "群聊室", icon: Users },
   { id: "attention", label: "审批中心", icon: Bell },
   { id: "files", label: "文件审查", icon: FileCode },
   { id: "jobs", label: "派工流水", icon: Activity },
   { id: "schedules", label: "定时任务", icon: Clock },
   { id: "bots", label: "Bot 团队", icon: Bot },
+  { id: "models", label: "外部模型", icon: Layers },
+  { id: "openbao", label: "OpenBao", icon: ShieldCheck },
+  { id: "security-card", label: "安全卡", icon: CreditCard, badge: "预留" },
   { id: "costs", label: "用量账单", icon: DollarSign },
   { id: "overview", label: "总览", icon: LayoutDashboard },
 ];
@@ -75,14 +86,19 @@ const MOBILE_PRIMARY_TABS: { id: NavTab; label: string; icon: typeof MessageSqua
 
 function detectInitialTab(): NavTab {
   const path = window.location.pathname.replace(/^\/+|\/+$/g, "");
+  if (path === "rooms") {
+    return "workspace";
+  }
   if (
     path === "workspace" ||
-    path === "rooms" ||
     path === "attention" ||
     path === "files" ||
     path === "overview" ||
     path === "browser" ||
     path === "bots" ||
+    path === "models" ||
+    path === "openbao" ||
+    path === "security-card" ||
     path === "jobs" ||
     path === "schedules" ||
     path === "costs"
@@ -137,9 +153,15 @@ export function App() {
   const [overviewEventVer, setOverviewEventVer] = useState(0);
   const [attentionEventVer, setAttentionEventVer] = useState(0);
   const [pendingAttentionCount, setPendingAttentionCount] = useState(0);
-  const [roomEvent, setRoomEvent] = useState<RoomLiveEvent | null>(null);
+  const [roomEvents, setRoomEvents] = useState<RoomLiveEvent[]>([]);
+  const roomEventSeqRef = useRef(0);
   const [sessionSyncEvent, setSessionSyncEvent] = useState<SessionUpdatedEvent | null>(null);
   const passwordChangingRef = useRef(false);
+
+  const pushRoomEvent = useCallback((ev: Omit<RoomLiveEvent, "ver">) => {
+    const ver = ++roomEventSeqRef.current;
+    setRoomEvents((prev) => [...prev.slice(-23), { ...ev, ver }]);
+  }, []);
 
   const applySession = useCallback((sess: StudioSession) => {
     if (sess.auth_mode === "password" || sess.auth_mode === "legacy") {
@@ -391,14 +413,33 @@ export function App() {
       onStatus: (st) => setEventStatus(st),
       onEvent: (ev) => {
         if (ev.type === "job_updated") {
+          const d = ev.data || {};
           setJobsEventVer((n) => n + 1);
           setOverviewEventVer((n) => n + 1);
+          pushRoomEvent({
+            type: "job_updated",
+            room_id: "lobby",
+            job_id: typeof d.job_id === "string" ? d.job_id : undefined,
+            bot: typeof d.bot === "string" ? d.bot : undefined,
+            status: typeof d.status === "string" ? d.status : undefined,
+            label: typeof d.label === "string" ? d.label : undefined,
+            phase: typeof d.phase === "string" ? d.phase : undefined,
+            duration_s: typeof d.duration_s === "number" ? d.duration_s : null,
+            source: typeof d.source === "string" ? d.source : undefined,
+            ts: typeof d.ts === "number" ? d.ts : Math.floor(Date.now() / 1000),
+          });
         } else if (ev.type === "schedule_updated") {
           setSchedulesEventVer((n) => n + 1);
           setOverviewEventVer((n) => n + 1);
         } else if (ev.type === "bots_updated") {
+          const d = ev.data || {};
           setBotsEventVer((n) => n + 1);
           setOverviewEventVer((n) => n + 1);
+          pushRoomEvent({
+            type: "bots_updated",
+            room_id: "lobby",
+            ts: typeof d.ts === "number" ? d.ts : Math.floor(Date.now() / 1000),
+          });
         } else if (ev.type === "session_updated") {
           const d = ev.data || {};
           setSessionSyncEvent((prev) => ({
@@ -425,7 +466,17 @@ export function App() {
                       ? d.sender_type
                       : "system",
                   sender: typeof d.sender === "string" ? d.sender : "",
+                  sender_role: typeof d.sender_role === "string" ? d.sender_role : undefined,
+                  source: typeof d.source === "string" ? d.source : undefined,
+                  stage_tag: typeof d.stage_tag === "string" ? d.stage_tag : undefined,
+                  job_id: typeof d.job_id === "string" ? d.job_id : undefined,
                   content: typeof d.text === "string" ? d.text : "",
+                  attachments: Array.isArray(d.attachments)
+                    ? (d.attachments as RoomMessageItem["attachments"])
+                    : undefined,
+                  context_files: Array.isArray(d.context_files)
+                    ? d.context_files.filter((x): x is string => typeof x === "string")
+                    : undefined,
                   truncated: Boolean(d.truncated),
                   mentions: Array.isArray(d.mentions)
                     ? d.mentions.filter((x): x is string => typeof x === "string")
@@ -436,21 +487,44 @@ export function App() {
                   blocked_reason: typeof d.blocked_reason === "string" ? d.blocked_reason : "",
                 }
               : undefined;
-          setRoomEvent((prev) => ({
-            ver: (prev?.ver || 0) + 1,
+          pushRoomEvent({
             type: "room_message",
             room_id: typeof d.room_id === "string" ? d.room_id : undefined,
             message: msgObj,
-          }));
+          });
         } else if (ev.type === "room_typing") {
           const d = ev.data || {};
-          setRoomEvent((prev) => ({
-            ver: (prev?.ver || 0) + 1,
+          pushRoomEvent({
             type: "room_typing",
             room_id: typeof d.room_id === "string" ? d.room_id : undefined,
             bot: typeof d.bot === "string" ? d.bot : undefined,
             typing: Boolean(d.typing),
-          }));
+            ts: typeof d.ts === "number" ? d.ts : Math.floor(Date.now() / 1000),
+          });
+        } else if (ev.type === "room_activity") {
+          const d = ev.data || {};
+          pushRoomEvent({
+            type: "room_activity",
+            room_id: typeof d.room_id === "string" ? d.room_id : undefined,
+            bot: typeof d.bot === "string" ? d.bot : undefined,
+            from_bot: typeof d.from_bot === "string" ? d.from_bot : undefined,
+            display_name: typeof d.display_name === "string" ? d.display_name : undefined,
+            role: typeof d.role === "string" ? d.role : undefined,
+            busy: typeof d.busy === "boolean" ? d.busy : undefined,
+            phase: typeof d.phase === "string" ? d.phase : undefined,
+            target_bots: Array.isArray(d.target_bots)
+              ? d.target_bots.filter((x): x is string => typeof x === "string")
+              : undefined,
+            job_id: typeof d.job_id === "string" ? d.job_id : undefined,
+            group_id: typeof d.group_id === "string" ? d.group_id : undefined,
+            status: typeof d.status === "string" ? d.status : undefined,
+            label: typeof d.label === "string" ? d.label : undefined,
+            stage_label: typeof d.stage_label === "string" ? d.stage_label : undefined,
+            duration_s: typeof d.duration_s === "number" ? d.duration_s : null,
+            queue_depth: typeof d.queue_depth === "number" ? d.queue_depth : undefined,
+            source: typeof d.source === "string" ? d.source : undefined,
+            ts: typeof d.ts === "number" ? d.ts : Math.floor(Date.now() / 1000),
+          });
         } else if (ev.type === "attention_updated") {
           const d = ev.data || {};
           setAttentionEventVer((n) => n + 1);
@@ -463,10 +537,9 @@ export function App() {
           setBotsEventVer((n) => n + 1);
           setOverviewEventVer((n) => n + 1);
           setAttentionEventVer((n) => n + 1);
-          setRoomEvent((prev) => ({
-            ver: (prev?.ver || 0) + 1,
+          pushRoomEvent({
             type: "resync_required",
-          }));
+          });
           setSessionSyncEvent((prev) => ({
             ver: (prev?.ver || 0) + 1,
             type: "resync_required",
@@ -492,7 +565,7 @@ export function App() {
     return () => {
       client.stop();
     };
-  }, [sessionReady, wsSessionEpoch, applySession, handleSessionRevoked]);
+  }, [sessionReady, wsSessionEpoch, applySession, handleSessionRevoked, pushRoomEvent]);
 
   if (authLoading || !session) {
     return (
@@ -529,11 +602,13 @@ export function App() {
     ? session.username
     : `${session.bot} · #${session.user_id}`;
   const isMoreTabActive =
-    activeTab === "rooms" ||
     activeTab === "attention" ||
     activeTab === "files" ||
     activeTab === "overview" ||
     activeTab === "bots" ||
+    activeTab === "models" ||
+    activeTab === "openbao" ||
+    activeTab === "security-card" ||
     activeTab === "costs";
   const showDesktopBrowserDrawer =
     !compactMode && browserOwner === "drawer" && activeTab !== "browser";
@@ -599,6 +674,11 @@ export function App() {
                   {item.id === "attention" && pendingAttentionCount > 0 && (
                     <span className="ml-auto px-1.5 py-0.5 rounded-full bg-amber-500/20 text-amber-300 text-[10px] font-mono">
                       {pendingAttentionCount}
+                    </span>
+                  )}
+                  {item.badge && (
+                    <span className="ml-auto px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/25 text-[10px] font-medium">
+                      {item.badge}
                     </span>
                   )}
                 </button>
@@ -674,19 +754,14 @@ export function App() {
               browserOwner={browserOwner}
               wsSessionEpoch={wsSessionEpoch}
               sessionSyncEvent={sessionSyncEvent}
-              roomEvent={roomEvent}
+              roomEvent={roomEvents[roomEvents.length - 1] || null}
+              roomEvents={roomEvents}
               jobsEventVer={jobsEventVer}
               attentionEventVer={attentionEventVer}
               onClaimBrowserOwner={setBrowserOwner}
               onToggleBrowserDrawer={handleToggleBrowserDrawer}
               onPendingAttentionCount={setPendingAttentionCount}
               onRoleChanged={handleRoleChanged}
-              onSessionRevoked={handleSessionRevoked}
-            />
-          ) : activeTab === "rooms" ? (
-            <RoomPanel
-              session={session}
-              roomEvent={roomEvent}
               onSessionRevoked={handleSessionRevoked}
             />
           ) : activeTab === "attention" ? (
@@ -725,6 +800,23 @@ export function App() {
                   eventVersion={botsEventVer}
                   onSessionRevoked={handleSessionRevoked}
                 />
+              )}
+              {activeTab === "models" && (
+                <ExternalModelsView
+                  session={session}
+                  onNavigate={handleNavigate}
+                  onSessionRevoked={handleSessionRevoked}
+                />
+              )}
+              {activeTab === "openbao" && (
+                <OpenBaoConfigView
+                  session={session}
+                  onNavigate={handleNavigate}
+                  onSessionRevoked={handleSessionRevoked}
+                />
+              )}
+              {activeTab === "security-card" && (
+                <SecurityCardView onNavigate={handleNavigate} />
               )}
               {activeTab === "jobs" && (
                 <JobsView

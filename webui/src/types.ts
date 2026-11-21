@@ -214,6 +214,7 @@ export type StudioEventType =
   | "session_updated"
   | "room_message"
   | "room_typing"
+  | "room_activity"
   | "attention_updated"
   | "resync_required"
   | "auth_error";
@@ -386,15 +387,68 @@ export interface LiveBrowserState {
 
 export type NavTab =
   | "workspace"
-  | "rooms"
   | "attention"
   | "files"
   | "overview"
   | "browser"
   | "bots"
+  | "models"
+  | "openbao"
+  | "security-card"
   | "jobs"
   | "schedules"
   | "costs";
+
+export type OpenBaoSource = "host_auto" | "custom" | "unconfigured";
+export type OpenBaoAuthMode = "host_card" | "token" | "approle";
+
+export interface OpenBaoConfigResponse {
+  ok: boolean;
+  enabled: boolean;
+  source: OpenBaoSource;
+  addr: string;
+  kv_mount: string;
+  gateway_path_prefix: string;
+  auth_mode: OpenBaoAuthMode;
+  auth_label: string;
+  credential_configured: boolean;
+  credential_hint: string;
+  fallback_mode: "local_0600" | string;
+  security_card_status: "reserved" | string;
+  can_edit: boolean;
+  host_auto_available?: boolean;
+  bao_cli_available?: boolean;
+  updated_at?: number | null;
+}
+
+export interface OpenBaoConfigUpdatePayload {
+  enabled?: boolean;
+  addr?: string;
+  kv_mount?: string;
+  gateway_path_prefix?: string;
+  auth_mode?: OpenBaoAuthMode;
+  auth_label?: string;
+  token?: string;
+  role_id?: string;
+  secret_id?: string;
+  clear_credentials?: boolean;
+  reset_to_host_auto?: boolean;
+}
+
+export interface OpenBaoTestPayload {
+  addr?: string;
+  auth_mode?: OpenBaoAuthMode;
+}
+
+export interface OpenBaoTestResponse {
+  ok: boolean;
+  reachable: boolean;
+  initialized: boolean | null;
+  sealed: boolean | null;
+  latency_ms: number;
+  auth_verified?: boolean | null;
+  message: string;
+}
 
 export interface SessionSummaryItem {
   cid: string;
@@ -413,22 +467,52 @@ export interface SessionsResponse {
   sessions: SessionSummaryItem[];
 }
 
+export type AttachmentKind =
+  | "image"
+  | "pdf"
+  | "document"
+  | "code"
+  | "audio"
+  | "video"
+  | "archive";
+
+export interface ChatAttachmentItem {
+  id: string;
+  name: string;
+  kind: AttachmentKind | string;
+  mime?: string;
+  size?: number;
+  size_label?: string;
+  preview_url: string;
+}
+
+export interface UploadAttachmentResponse {
+  ok: boolean;
+  attachment: ChatAttachmentItem;
+}
+
 export interface ChatToolCall {
   name: string;
   duration_seconds?: number | null;
   active?: boolean;
 }
 
+export type ExecutionMode = "queue" | "interrupt";
+
 export interface ChatMessageItem {
   id: string;
   role: "user" | "assistant";
   content: string;
+  attachments?: ChatAttachmentItem[];
+  context_files?: string[];
   thinking?: string;
   tool_calls?: ChatToolCall[];
   status?: string;
   truncated?: boolean;
   created_at?: string;
   byte_offset?: number;
+  execution_mode?: ExecutionMode;
+  interrupted_prev?: boolean;
 }
 
 export interface SessionMessagesResponse {
@@ -469,6 +553,9 @@ export interface ChatSendPayload {
   model?: string | null;
   effort?: string | null;
   sync_tg?: boolean;
+  attachments?: string[];
+  context_files?: string[];
+  execution_mode?: ExecutionMode;
 }
 
 export interface ActiveSessionTurnResponse {
@@ -488,6 +575,11 @@ export interface ChatSendResponse {
   bot: string;
   cid: string | null;
   status: string;
+  display_prompt?: string;
+  attachments?: ChatAttachmentItem[];
+  context_files?: string[];
+  execution_mode?: ExecutionMode;
+  interrupted_turn_id?: string | null;
 }
 
 export interface ChatAbortResponse {
@@ -650,6 +742,9 @@ export interface RoomSummary {
   room_id: string;
   title: string;
   topic: string;
+  mode?: "tg_mirror" | "web_room";
+  mirror_bound?: boolean;
+  default_bot?: string;
   created_at: number;
   updated_at: number;
   last_seq: number;
@@ -663,6 +758,8 @@ export interface RoomsResponse {
   rooms: RoomSummary[];
 }
 
+export type RoomMessageStageTag = "ack" | "dispatch" | "delivery" | "error" | "reply";
+
 export interface RoomMessageItem {
   seq: number;
   msg_id: string;
@@ -670,13 +767,64 @@ export interface RoomMessageItem {
   ts: number;
   sender_type: "human" | "bot" | "system";
   sender: string;
+  sender_role?: string;
+  source?: "tg" | "web" | string;
+  stage_tag?: RoomMessageStageTag | string;
+  job_id?: string;
   content: string;
+  attachments?: ChatAttachmentItem[];
+  context_files?: string[];
   truncated?: boolean;
   mentions: string[];
   chain_id: string;
   hop: number;
   status: string;
   blocked_reason: string;
+}
+
+export interface RoomActivityBotItem {
+  handle: string;
+  display_name: string;
+  role: string;
+  state: "thinking" | "running" | "queued" | "idle" | string;
+  stage_label: string;
+  current_job_id: string | null;
+  current_job_label?: string;
+  queue_depth?: number;
+  started_at: number | null;
+  elapsed_s: number;
+}
+
+export interface RoomActivityJobItem {
+  job_id: string;
+  group_id: string;
+  bot: string;
+  from_bot: string;
+  label: string;
+  status: "queued" | "running" | "done" | "failed" | "cancelled" | string;
+  progress?: string;
+  created_at: number;
+  started_at: number | null;
+  finished_at: number | null;
+  duration_s: number | null;
+}
+
+export interface RoomActivityDispatchInfo {
+  phase: string;
+  target_bots: string[];
+  dispatched_at: number;
+  stage_label?: string;
+}
+
+export interface RoomActivityResponse {
+  ok: boolean;
+  room_id: string;
+  mode?: "tg_mirror" | "web_room" | string;
+  mirror_bound: boolean;
+  server_ts?: number;
+  active_bots: RoomActivityBotItem[];
+  recent_jobs: RoomActivityJobItem[];
+  recent_dispatch?: RoomActivityDispatchInfo | null;
 }
 
 export interface RoomMessagesResponse {
@@ -695,6 +843,7 @@ export interface RoomCreateResponse {
 
 export interface RoomSendResponse {
   ok: boolean;
+  execution_mode?: ExecutionMode;
   message: RoomMessageItem;
   dispatched_bots: string[];
   blocked_bots: string[];
@@ -703,10 +852,31 @@ export interface RoomSendResponse {
 
 export interface RoomLiveEvent {
   ver: number;
-  type: "room_message" | "room_typing" | "resync_required";
+  type:
+    | "room_message"
+    | "room_typing"
+    | "room_activity"
+    | "job_updated"
+    | "bots_updated"
+    | "resync_required";
   room_id?: string;
   bot?: string;
+  from_bot?: string;
+  display_name?: string;
+  role?: string;
   typing?: boolean;
+  busy?: boolean;
+  phase?: string;
+  target_bots?: string[];
+  job_id?: string;
+  group_id?: string;
+  status?: string;
+  label?: string;
+  stage_label?: string;
+  duration_s?: number | null;
+  queue_depth?: number;
+  source?: string;
+  ts?: number;
   message?: RoomMessageItem;
 }
 

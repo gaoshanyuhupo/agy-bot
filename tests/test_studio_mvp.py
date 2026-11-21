@@ -3101,25 +3101,36 @@ class TestStudioPasswordAuth(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Referer", all_logs)
 
         # Frontend storage hygiene & autoComplete attributes
-        # Zero sessionStorage everywhere; localStorage is forbidden across all files EXCEPT the
-        # two non-secret UI preferences (`SYNC_TG_STORAGE_KEY` & `WORKBENCH_STORAGE_KEY`)
-        # inside `WorkspaceView.tsx`.
+        # Zero sessionStorage everywhere; localStorage API calls are forbidden across all files
+        # EXCEPT the two non-secret UI state keys (`WORKBENCH_STORAGE_KEY` in `WorkspaceView.tsx`
+        # and redacted draft `PREVIEW_STORAGE_KEY` in `ExternalModelsView.tsx`).
         webui_src = REPO_ROOT / "webui" / "src"
-        allowed_ls_re = re.compile(
-            r'localStorage\.(?:getItem\((?:SYNC_TG_STORAGE_KEY|WORKBENCH_STORAGE_KEY)\)'
-            r'|setItem\(SYNC_TG_STORAGE_KEY,\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*\?\s*"true"\s*:\s*"false"|"(?:true|false)")\)'
-            r'|setItem\(WORKBENCH_STORAGE_KEY,\s*[A-Za-z_][A-Za-z0-9_]*\))'
+        ls_access_re = re.compile(r"\blocalStorage\s*(?:\.|\[)")
+        allowed_ws_ls_re = re.compile(
+            r"localStorage\.(?:getItem\(WORKBENCH_STORAGE_KEY\)"
+            r"|setItem\(WORKBENCH_STORAGE_KEY,\s*[A-Za-z_][A-Za-z0-9_]*\))"
+        )
+        allowed_ext_ls_re = re.compile(
+            r"localStorage\.(?:getItem\(PREVIEW_STORAGE_KEY\)"
+            r"|setItem\(PREVIEW_STORAGE_KEY,\s*JSON\.stringify\(safeList\)\))"
         )
         for ts_file in webui_src.rglob("*.ts*"):
             txt = ts_file.read_text(encoding="utf-8")
             self.assertNotIn("sessionStorage", txt, str(ts_file))
             if ts_file.name == "WorkspaceView.tsx":
-                self.assertIn('const SYNC_TG_STORAGE_KEY = "agy_studio_sync_tg";', txt)
                 self.assertIn('const WORKBENCH_STORAGE_KEY = "agy_studio_workbench_v1";', txt)
-                scrubbed = allowed_ls_re.sub("", txt)
-                self.assertNotIn("localStorage", scrubbed, str(ts_file))
+                scrubbed = allowed_ws_ls_re.sub("", txt)
+                self.assertIsNone(ls_access_re.search(scrubbed), str(ts_file))
+            elif ts_file.name == "ExternalModelsView.tsx":
+                self.assertIn(
+                    'const PREVIEW_STORAGE_KEY = "agy_studio_external_gateways_preview_v1";',
+                    txt,
+                )
+                self.assertIn("api_key_masked: g.api_key_masked ? maskApiKey(g.api_key_masked) : \"\"", txt)
+                scrubbed = allowed_ext_ls_re.sub("", txt)
+                self.assertIsNone(ls_access_re.search(scrubbed), str(ts_file))
             else:
-                self.assertNotIn("localStorage", txt, str(ts_file))
+                self.assertIsNone(ls_access_re.search(txt), str(ts_file))
         login_tsx = (webui_src / "components" / "LoginView.tsx").read_text(encoding="utf-8")
         chg_tsx = (webui_src / "components" / "ChangePasswordModal.tsx").read_text(encoding="utf-8")
         self.assertIn('autoComplete="username"', login_tsx)

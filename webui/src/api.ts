@@ -13,6 +13,7 @@ import type {
   ChatSendResponse,
   CostsResponse,
   EventStreamStatus,
+  ExecutionMode,
   FileContentResponse,
   FileDiffResponse,
   FileTreeResponse,
@@ -23,8 +24,13 @@ import type {
   JobRetryResponse,
   JobsResponse,
   ModelsResponse,
+  OpenBaoConfigResponse,
+  OpenBaoConfigUpdatePayload,
+  OpenBaoTestPayload,
+  OpenBaoTestResponse,
   OverviewResponse,
   ProjectsResponse,
+  RoomActivityResponse,
   RoomCreateResponse,
   RoomMessagesResponse,
   RoomSendResponse,
@@ -42,6 +48,7 @@ import type {
   StudioSession,
   UndoActionResponse,
   UndoCheckpointsResponse,
+  UploadAttachmentResponse,
 } from "./types";
 
 let csrfTokenMemory = "";
@@ -384,6 +391,7 @@ export class StudioEventClient {
     bindType("session_updated");
     bindType("room_message");
     bindType("room_typing");
+    bindType("room_activity");
     bindType("attention_updated");
     bindType("resync_required");
     bindType("auth_error");
@@ -483,6 +491,36 @@ export function fetchActiveSessionTurn(
 export function fetchModels(bot?: string): Promise<ModelsResponse> {
   const qs = bot ? `?bot=${encodeURIComponent(bot)}` : "";
   return requestJson<ModelsResponse>(`/api/models${qs}`);
+}
+
+export async function uploadChatAttachment(file: File): Promise<UploadAttachmentResponse> {
+  const form = new FormData();
+  form.append("file", file, file.name || "attachment");
+  const headers = new Headers();
+  if (csrfTokenMemory) {
+    headers.set("X-Studio-CSRF", csrfTokenMemory);
+  }
+  const resp = await fetch("/api/chat/attachments", {
+    method: "POST",
+    credentials: "same-origin",
+    headers,
+    body: form,
+  });
+  let payload: Record<string, unknown> = {};
+  try {
+    payload = (await resp.json()) as Record<string, unknown>;
+  } catch {
+    payload = {};
+  }
+  if (!resp.ok || payload.ok === false) {
+    const msg =
+      typeof payload.error === "string" && payload.error
+        ? payload.error
+        : `上传失败 (HTTP ${resp.status})`;
+    const src = typeof payload.source === "string" ? payload.source : "studio_api";
+    throw new StudioApiError(msg, resp.status, src);
+  }
+  return payload as unknown as UploadAttachmentResponse;
 }
 
 export function sendChatTurn(payload: ChatSendPayload): Promise<ChatSendResponse> {
@@ -666,9 +704,21 @@ export function fetchRoomMessages(
   );
 }
 
+export function fetchRoomActivity(roomId: string): Promise<RoomActivityResponse> {
+  return requestJson<RoomActivityResponse>(
+    `/api/rooms/${encodeURIComponent(roomId)}/activity`,
+  );
+}
+
 export function sendRoomMessage(
   roomId: string,
-  payload: { content: string; project?: string },
+  payload: {
+    content: string;
+    project?: string;
+    attachments?: string[];
+    context_files?: string[];
+    execution_mode?: ExecutionMode;
+  },
 ): Promise<RoomSendResponse> {
   return requestJson<RoomSendResponse>(
     `/api/rooms/${encodeURIComponent(roomId)}/messages`,
@@ -698,6 +748,54 @@ export function decideAttentionItem(
     },
     true,
   );
+}
+
+// Secrets Storage Configuration (OpenBao & Security Card)
+export function fetchOpenBaoConfig(): Promise<OpenBaoConfigResponse> {
+  return requestJson<OpenBaoConfigResponse>("/api/secrets/openbao");
+}
+
+export function updateOpenBaoConfig(
+  payload: OpenBaoConfigUpdatePayload,
+): Promise<OpenBaoConfigResponse> {
+  return requestJson<OpenBaoConfigResponse>(
+    "/api/secrets/openbao",
+    {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    },
+    true,
+  );
+}
+
+export async function testOpenBaoConnection(
+  payload?: OpenBaoTestPayload,
+): Promise<OpenBaoTestResponse> {
+  const headers = new Headers({ "Content-Type": "application/json" });
+  if (csrfTokenMemory) {
+    headers.set("X-Studio-CSRF", csrfTokenMemory);
+  }
+  const resp = await fetch("/api/secrets/openbao/test", {
+    method: "POST",
+    credentials: "same-origin",
+    headers,
+    body: JSON.stringify(payload || {}),
+  });
+  let data: Record<string, unknown> = {};
+  try {
+    data = (await resp.json()) as Record<string, unknown>;
+  } catch {
+    data = {};
+  }
+  if (!resp.ok) {
+    const msg =
+      (typeof data.error === "string" && data.error) ||
+      (typeof data.message === "string" && data.message) ||
+      `HTTP ${resp.status}`;
+    const src = typeof data.source === "string" ? data.source : "studio_auth";
+    throw new StudioApiError(msg, resp.status, src);
+  }
+  return data as unknown as OpenBaoTestResponse;
 }
 
 export function formatTokens(n: number): string {

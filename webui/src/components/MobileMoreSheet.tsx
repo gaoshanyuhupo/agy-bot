@@ -1,4 +1,16 @@
-import { Bell, Bot, DollarSign, FileCode, KeyRound, LayoutDashboard, LogOut, Users, X } from "lucide-react";
+import {
+  Bell,
+  Bot,
+  CreditCard,
+  DollarSign,
+  FileCode,
+  KeyRound,
+  Layers,
+  LayoutDashboard,
+  LogOut,
+  ShieldCheck,
+  X,
+} from "lucide-react";
 import type { NavTab, StudioSession } from "../types";
 
 interface MobileMoreSheetProps {
@@ -12,12 +24,26 @@ interface MobileMoreSheetProps {
   onLogout: () => void;
 }
 
-const SHEET_ITEMS: { id: NavTab; label: string; desc: string; icon: typeof LayoutDashboard }[] = [
-  { id: "rooms", label: "群聊室", desc: "Web 多 Bot 协作群聊与接力护栏", icon: Users },
+const SHEET_ITEMS: {
+  id: NavTab;
+  label: string;
+  desc: string;
+  icon: typeof LayoutDashboard;
+  badge?: string;
+}[] = [
   { id: "attention", label: "审批中心", desc: "统一审批队列与浏览器接管感知", icon: Bell },
   { id: "files", label: "文件审查", desc: "项目文件树、Git Diff 与撤回/重做", icon: FileCode },
   { id: "overview", label: "总览", desc: "多 Bot 状态与系统健康指标", icon: LayoutDashboard },
   { id: "bots", label: "Bot 团队", desc: "在线节点、专长与当前任务", icon: Bot },
+  { id: "models", label: "外部模型", desc: "中转站接入、方言适配与模型过滤", icon: Layers },
+  { id: "openbao", label: "OpenBao", desc: "中央密码库自动载入、连通性测试与路径配置", icon: ShieldCheck },
+  {
+    id: "security-card",
+    label: "安全卡",
+    desc: "无 OpenBao 用户的内置分级加密卡片存档",
+    icon: CreditCard,
+    badge: "预留",
+  },
   { id: "costs", label: "用量账单", desc: "Token 消耗、缓存命中与额度", icon: DollarSign },
 ];
 
@@ -69,7 +95,7 @@ export function MobileMoreSheet({
           </button>
         </div>
 
-        <div className="space-y-1.5">
+        <div className="space-y-1.5 max-h-[60vh] overflow-y-auto">
           {SHEET_ITEMS.map((item) => {
             const Icon = item.icon;
             const active = activeTab === item.id;
@@ -88,8 +114,15 @@ export function MobileMoreSheet({
                 }`}
               >
                 <Icon className="w-4 h-4 shrink-0" />
-                <div className="min-w-0">
-                  <div className="text-xs font-medium">{item.label}</div>
+                <div className="min-w-0 flex-1">
+                  <div className="text-xs font-medium flex items-center gap-1.5">
+                    <span>{item.label}</span>
+                    {item.badge && (
+                      <span className="px-1.5 py-0.2 rounded bg-amber-500/15 text-amber-300 border border-amber-500/25 text-[10px]">
+                        {item.badge}
+                      </span>
+                    )}
+                  </div>
                   <div className="text-[11px] text-slate-400 truncate">{item.desc}</div>
                 </div>
               </button>

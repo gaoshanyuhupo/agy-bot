@@ -303,6 +303,261 @@ def truncate_utf8_bytes(text: str, max_bytes: int) -> tuple[str, bool]:
     return cut.decode("utf-8", errors="ignore"), True
 
 
+_ATT_BLOCK_HEADER = "[已附加文件]"
+_CTX_BLOCK_HEADER = "[已引用工作区文件]"
+_ATT_LINE_RE = re.compile(
+    r"^-\s*\[(?P<kind>[a-z]+)\|(?P<id>att_[0-9]{10,16}_[a-f0-9]{12})(?:\|(?P<size>[^\]]+))?\]\s+"
+    r"(?P<name>(?:(?!文件位置:).)+?)(?:\s*\((?:项目:\s*[^,)]+,\s*)?文件位置:\s*.+\))?\s*$"
+)
+_CTX_LINE_RE = re.compile(
+    r"^-\s*@(?P<rel>(?:(?!文件位置:).)+?)(?:\s*\((?:项目:\s*[^,)]+,\s*)?文件位置:\s*.+\))?\s*$"
+)
+_HOST_LOC_TAIL_RE = re.compile(r"\s*\(?(?:项目:.*?)?文件位置:.*$")
+_ATT_HINT_PREFIXES = (
+    "提示：以上文件已由系统落盘",
+    "提示：请结合以上工作区文件",
+)
+_ALLOWED_ATTACHMENT_KINDS = frozenset(
+    {"image", "pdf", "document", "code", "audio", "video", "archive"}
+)
+
+
+def extract_message_attachments(
+    raw_text: str,
+) -> tuple[str, list[dict[str, Any]], list[str]]:
+    """Parse structured `[已附加文件]` / `[已引用工作区文件]` blocks and strip all host paths."""
+    text = str(raw_text or "")
+    if _ATT_BLOCK_HEADER not in text and _CTX_BLOCK_HEADER not in text:
+        return text, [], []
+
+    lines = text.splitlines()
+    out_lines: list[str] = []
+    attachments: list[dict[str, Any]] = []
+    context_files: list[str] = []
+    seen_att_ids: set[str] = set()
+    seen_ctx: set[str] = set()
+    mode: str | None = None
+
+    for ln in lines:
+        stripped = ln.strip()
+        if stripped == _ATT_BLOCK_HEADER:
+            mode = "att"
+            continue
+        if stripped == _CTX_BLOCK_HEADER:
+            mode = "ctx"
+            continue
+
+        if mode == "att":
+            if not stripped:
+                mode = None
+                continue
+            if any(stripped.startswith(p) for p in _ATT_HINT_PREFIXES):
+                continue
+            m = _ATT_LINE_RE.match(stripped)
+            if m:
+                att_id = m.group("id")
+                if att_id not in seen_att_ids and len(attachments) < 6:
+                    seen_att_ids.add(att_id)
+                    kind = m.group("kind").strip().lower()
+                    if kind not in _ALLOWED_ATTACHMENT_KINDS:
+                        kind = "document"
+                    raw_name = Path(m.group("name").strip().replace("\\", "/")).name or "attachment"
+                    attachments.append(
+                        {
+                            "id": att_id,
+                            "name": re.sub(r"[\x00-\x1f\x7f\r\n]+", "_", raw_name)[:160],
+                            "kind": kind,
+                            "size_label": (m.group("size") or "").strip()[:32],
+                            "preview_url": f"/api/chat/attachments/{att_id}",
+                        }
+                    )
+                continue
+            if "文件位置:" in ln:
+                cleaned_ln = _HOST_LOC_TAIL_RE.sub("", ln).rstrip()
+                cleaned_ln = _SENSITIVE_HOST_PATH_RE.sub("[REDACTED]", cleaned_ln)
+                if cleaned_ln.strip():
+                    out_lines.append(cleaned_ln)
+                continue
+            ln = _SENSITIVE_HOST_PATH_RE.sub("[REDACTED]", ln)
+            mode = None
+
+        if mode == "ctx":
+            if not stripped:
+                mode = None
+                continue
+            if any(stripped.startswith(p) for p in _ATT_HINT_PREFIXES):
+                continue
+            m = _CTX_LINE_RE.match(stripped)
+            if m:
+                rel = m.group("rel").strip()
+                if (
+                    rel
+                    and not rel.startswith("/")
+                    and ".." not in rel.split("/")
+                    and rel not in seen_ctx
+                    and len(context_files) < 10
+                ):
+                    seen_ctx.add(rel)
+                    context_files.append(rel)
+                continue
+            if "文件位置:" in ln:
+                cleaned_ln = _HOST_LOC_TAIL_RE.sub("", ln).rstrip()
+                cleaned_ln = _SENSITIVE_HOST_PATH_RE.sub("[REDACTED]", cleaned_ln)
+                if cleaned_ln.strip():
+                    out_lines.append(cleaned_ln)
+                continue
+            ln = _SENSITIVE_HOST_PATH_RE.sub("[REDACTED]", ln)
+            mode = None
+
+        out_lines.append(ln)
+
+    clean_text = "\n".join(out_lines).strip()
+    return clean_text, attachments, context_files
+
+
+_JOB_ID_IN_TEXT_RE = re.compile(r"\b(job-[a-zA-Z0-9_-]{4,24})\b")
+_STAGE_ACK_RE = re.compile(
+    r"(?:收到来自|我开始处理|开始处理|已接单|已收到派单|收到派单|开始执行)",
+    re.IGNORECASE,
+)
+_STAGE_DELIVERY_RE = re.compile(
+    r"(?:已验收通过|验收通过|已验收|已完成|任务完成|已交付|交付完成|上线预览|最终交付|本轮.*完成)",
+    re.IGNORECASE,
+)
+_STAGE_DISPATCH_RE = re.compile(
+    r"(?:已立刻排入|已排入|已派单|已派给|已分派|派单给|排入.{0,16}队列|单号\s*[`「【(（]?\s*job-)",
+    re.IGNORECASE,
+)
+_STAGE_ERROR_RE = re.compile(
+    r"(?:执行失败|任务失败|处理失败|已取消|异常中断|执行超时|❌)",
+    re.IGNORECASE,
+)
+_TOOL_PROGRESS_RE = re.compile(r"(?i)^(?:running\s+tool|tool)\s*[:：]\s*([A-Za-z0-9_.:/-]{1,48})")
+
+
+def classify_room_message_stage(sender_type: str, sender_role: str, text: str) -> str:
+    """Classify a bot group/room message into a lightweight stage tag for UI pipeline badges."""
+    if sender_type != "bot":
+        return ""
+    sample = str(text or "").strip()[:600]
+    if not sample:
+        return "reply"
+    # Check ack first because worker ack messages contain the word "派单"
+    if _STAGE_ACK_RE.search(sample):
+        return "ack"
+    if _STAGE_ERROR_RE.search(sample):
+        return "error"
+    if _STAGE_DELIVERY_RE.search(sample):
+        return "delivery"
+    if _STAGE_DISPATCH_RE.search(sample):
+        return "dispatch"
+    if sender_role == "coordinator" and _JOB_ID_IN_TEXT_RE.search(sample):
+        return "dispatch"
+    return "reply"
+
+
+def extract_job_id_from_text(text: str) -> str:
+    """Extract the first sanitized `job-...` identifier referenced in message text, if any."""
+    m = _JOB_ID_IN_TEXT_RE.search(str(text or "")[:800])
+    if not m:
+        return ""
+    return _sanitize_slug(m.group(1), max_len=32)
+
+
+def format_job_progress_label(raw_progress: Any, *, fallback: str = "") -> str:
+    """Format raw job progress into a strictly sanitized, human-readable short stage label."""
+    txt = str(raw_progress or "").strip()
+    if not txt:
+        return fallback
+    m_tool = _TOOL_PROGRESS_RE.match(txt)
+    if m_tool:
+        tname = _sanitize_slug(m_tool.group(1), max_len=40)
+        return f"正在调用工具 · {tname}" if tname else "正在调用工具"
+    low = txt.lower()
+    if "think" in low or "思考" in low:
+        return "正在思考推理"
+    if "queue" in low or "排队" in low:
+        return "排队等待执行"
+    clean = redact_sensitive_text(txt, max_len=64)
+    if clean:
+        clean = _SENSITIVE_HOST_PATH_RE.sub("[REDACTED]", clean)
+    return clean or fallback
+
+
+def map_group_history_entry_to_room_message(
+    entry: dict[str, Any],
+    *,
+    room_id: str = "lobby",
+    max_content_bytes: int = 16 * 1024,
+) -> dict[str, Any]:
+    """Map a `group_history/<chat_id>.json` ledger entry to a sanitized `RoomMessageItem` (zero raw IDs)."""
+    seq = max(0, int(entry.get("seq") or 0))
+    ts_raw = entry.get("ts")
+    try:
+        ts_val = round(float(ts_raw or 0.0), 3)
+    except (TypeError, ValueError):
+        ts_val = 0.0
+
+    is_bot = bool(entry.get("is_bot"))
+    sender_type = "bot" if is_bot else "human"
+    raw_sender = entry.get("sender_handle") or ("bot" if is_bot else "user")
+    sender = _sanitize_slug(raw_sender, max_len=64) or sender_type
+
+    raw_role = str(entry.get("sender_role") or "").strip().lower()
+    if is_bot:
+        sender_role = raw_role if raw_role in _ALLOWED_BOT_ROLES else "bot"
+    else:
+        sender_role = "human"
+
+    src_raw = str(entry.get("source") or "").strip().lower()
+    source = "web" if src_raw == "web" else "tg"
+
+    raw_full = entry.get("full_text")
+    if isinstance(raw_full, str) and raw_full.strip():
+        raw_text = raw_full
+    else:
+        raw_text = str(entry.get("text_excerpt") or "")
+
+    stripped_text, parsed_atts, parsed_ctx = extract_message_attachments(raw_text)
+    clean_text = studio_ipc.neutralize_control_tags(stripped_text)
+    clean_text = redact_secrets_only(clean_text)
+    if clean_text:
+        clean_text = _SENSITIVE_HOST_PATH_RE.sub("[REDACTED]", clean_text)
+    clean_content, trunc_now = truncate_utf8_bytes(clean_text, max_content_bytes)
+
+    raw_mentions = bot_bus.extract_at_mentions(clean_content)
+    mentions = [_sanitize_slug(m, max_len=64).lower() for m in raw_mentions[:4] if _sanitize_slug(m, max_len=64)]
+    stage_tag = classify_room_message_stage(sender_type, sender_role, clean_content)
+    job_id_ref = extract_job_id_from_text(clean_content) if is_bot else ""
+
+    out_msg: dict[str, Any] = {
+        "seq": seq,
+        "msg_id": f"tg-{seq}",
+        "room_id": room_id,
+        "ts": ts_val,
+        "sender_type": sender_type,
+        "sender": sender,
+        "sender_role": sender_role,
+        "source": source,
+        "content": clean_content,
+        "truncated": bool(entry.get("truncated")) or bool(trunc_now),
+        "mentions": mentions,
+        "chain_id": "",
+        "hop": 0,
+        "status": "done",
+        "blocked_reason": "",
+    }
+    if stage_tag:
+        out_msg["stage_tag"] = stage_tag
+    if job_id_ref:
+        out_msg["job_id"] = job_id_ref
+    if parsed_atts:
+        out_msg["attachments"] = parsed_atts
+    if parsed_ctx:
+        out_msg["context_files"] = parsed_ctx
+    return out_msg
+
+
 class StreamRedactor:
     """Cross-chunk streaming credential redactor with >=256-char sliding tail window,
     convergent cut-boundary stabilization, unclosed-prefix holding, and bounded swallow states."""
@@ -636,6 +891,72 @@ class StudioDataSources:
         except OSError:
             return ""
 
+    # ------------------------------------------------------------------ TG Mirror Binding (Internal Only)
+    def resolve_tg_mirror(self) -> dict[str, Any]:
+        """Resolve server-side TG mirror binding (`AGY_STUDIO_MIRROR_CHAT_ID` env -> `team_config.json`).
+
+        INTERNAL ONLY: callers MUST NEVER expose raw `chat_id` or `thread_id` in HTTP/SSE payloads.
+        """
+        raw_env = os.environ.get("AGY_STUDIO_MIRROR_CHAT_ID", "").strip()
+        if raw_env:
+            if raw_env.lower() in ("0", "off", "false", "none", "disabled"):
+                return {"bound": False, "chat_id": 0, "thread_id": None, "source": "env_disabled"}
+            try:
+                env_cid = int(raw_env)
+            except ValueError:
+                return {"bound": False, "chat_id": 0, "thread_id": None, "source": "invalid"}
+            if env_cid >= 0:
+                return {"bound": False, "chat_id": 0, "thread_id": None, "source": "invalid"}
+            raw_tid = os.environ.get("AGY_STUDIO_MIRROR_THREAD_ID", "").strip()
+            env_tid = bot_bus._norm_tid(raw_tid) if raw_tid else None
+            return {"bound": True, "chat_id": env_cid, "thread_id": env_tid, "source": "env"}
+
+        cfg_raw = _read_json_ro(self.bus_dir / "team_config.json", {})
+        tm = cfg_raw.get("mirror") if isinstance(cfg_raw, dict) and isinstance(cfg_raw.get("mirror"), dict) else {}
+        raw_cid = tm.get("chat_id")
+        if isinstance(raw_cid, bool):
+            cid = 0
+        else:
+            try:
+                cid = int(raw_cid or 0)
+            except (TypeError, ValueError):
+                cid = 0
+        if cid >= 0:
+            return {"bound": False, "chat_id": 0, "thread_id": None, "source": "none"}
+        tid = bot_bus._norm_tid(tm.get("thread_id"))
+        return {"bound": True, "chat_id": cid, "thread_id": tid, "source": "team_config"}
+
+    def read_tg_mirror_history(
+        self,
+        chat_id: int,
+        thread_id: int | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Read-only view of `BUS_DIR/group_history/<chat_id>.json` filtered strictly by `thread_id`."""
+        cid = int(chat_id or 0)
+        if cid >= 0:
+            return [], 0
+        norm_tid = bot_bus._norm_tid(thread_id)
+        hist_path = self.bus_dir / "group_history" / f"{cid}.json"
+        doc = _read_json_ro(hist_path, {})
+        if not isinstance(doc, dict):
+            return [], 0
+        raw_entries = doc.get("entries")
+        if not isinstance(raw_entries, list):
+            return [], 0
+        filtered: list[dict[str, Any]] = []
+        max_seq = 0
+        for e in raw_entries:
+            if not isinstance(e, dict):
+                continue
+            if bot_bus._norm_tid(e.get("thread_id")) != norm_tid:
+                continue
+            seq_val = int(e.get("seq") or 0)
+            if seq_val > max_seq:
+                max_seq = seq_val
+            filtered.append(e)
+        filtered.sort(key=lambda x: int(x.get("seq") or 0))
+        return filtered, max_seq
+
     # ------------------------------------------------------------------ Bots (Read-Only)
     def get_bots(self) -> dict[str, Any]:
         roster_raw = _read_json_ro(self.bus_dir / "roster.json", {"bots": {}})
@@ -763,6 +1084,115 @@ class StudioDataSources:
             "counts": counts,
             "jobs": items,
         }
+
+    def read_chat_sync_states(self, *, max_running_age_sec: float = 600.0) -> dict[str, dict[str, Any]]:
+        """Read-only sanitized per-bot `chat_sync/*.json` runtime status (never exposes cid or chat IDs)."""
+        sync_dir = self.bus_dir / "chat_sync"
+        out: dict[str, dict[str, Any]] = {}
+        if not sync_dir.is_dir():
+            return out
+        now = time.time()
+        try:
+            for ent in os.scandir(sync_dir):
+                name = ent.name
+                if name.startswith(".") or not name.endswith(".json") or name.endswith(".tmp"):
+                    continue
+                try:
+                    st = ent.stat()
+                    if not ent.is_file() or st.st_size > 16384:
+                        continue
+                    doc = _read_json_ro(Path(ent.path), None)
+                except OSError:
+                    continue
+                if not isinstance(doc, dict):
+                    continue
+                handle = _sanitize_slug(doc.get("bot") or Path(name).stem, max_len=64).lower()
+                if not handle:
+                    continue
+                status_raw = str(doc.get("status") or "").strip().lower()
+                if status_raw not in ("running", "done", "aborted", "error"):
+                    continue
+                src_raw = str(doc.get("source") or "tg").strip().lower()
+                source = "web" if src_raw == "web" else "tg"
+                try:
+                    updated_at = float(doc.get("updated_at") or 0.0)
+                except (TypeError, ValueError):
+                    updated_at = 0.0
+                if updated_at <= 0.0:
+                    updated_at = float(st.st_mtime)
+                is_running = status_raw == "running" and (now - updated_at) <= max_running_age_sec
+                out[handle] = {
+                    "bot": handle,
+                    "status": "running" if is_running else status_raw,
+                    "running": is_running,
+                    "source": source,
+                    "updated_at": round(updated_at, 3),
+                }
+        except OSError:
+            pass
+        return out
+
+    def get_jobs_activity(self, *, limit: int = 12) -> list[dict[str, Any]]:
+        """Read-only sanitized recent jobs with live progress label for room activity pipeline."""
+        jobs_dir = self.bus_dir / "jobs"
+        safe_limit = max(1, min(32, int(limit or 12)))
+        raw_jobs: list[dict[str, Any]] = []
+        if jobs_dir.is_dir():
+            try:
+                for entry in jobs_dir.iterdir():
+                    if not entry.is_file() or not entry.name.endswith(".json") or entry.name.endswith(".tmp"):
+                        continue
+                    data = _read_json_ro(entry, None)
+                    if isinstance(data, dict):
+                        raw_jobs.append(data)
+            except OSError:
+                pass
+
+        # Prioritize active (running/queued) jobs first, then newest by created_at
+        status_rank = {"running": 0, "queued": 1}
+        raw_jobs.sort(
+            key=lambda j: (
+                status_rank.get(str(j.get("status") or "").lower(), 2),
+                -float(j.get("created_at") or 0.0),
+            )
+        )
+        now = time.time()
+        items: list[dict[str, Any]] = []
+        for j in raw_jobs[:safe_limit]:
+            created = float(j.get("created_at") or 0.0)
+            started = float(j.get("started_at") or 0.0)
+            finished = float(j.get("finished_at") or 0.0)
+            raw_st = str(j.get("status") or "unknown").strip().lower()
+            if raw_st == "error":
+                st_norm = "failed"
+            elif raw_st in ("queued", "running", "done", "failed", "cancelled"):
+                st_norm = raw_st
+            else:
+                st_norm = "failed" if j.get("error") else "done"
+            dur: float | None = None
+            if started > 0 and finished >= started:
+                dur = round(finished - started, 1)
+            elif started > 0 and st_norm == "running":
+                dur = round(max(0.0, now - started), 1)
+            progress_lbl = (
+                format_job_progress_label(j.get("progress"), fallback="正在处理派单")
+                if st_norm == "running"
+                else ("排队等待执行" if st_norm == "queued" else "")
+            )
+            items.append({
+                "job_id": _sanitize_slug(j.get("job_id"), max_len=64),
+                "group_id": _sanitize_slug(j.get("group_id"), max_len=64),
+                "bot": _sanitize_slug(j.get("target_bot"), max_len=64),
+                "from_bot": _sanitize_slug(j.get("from_bot"), max_len=64),
+                "label": redact_sensitive_text(j.get("label"), max_len=80),
+                "status": st_norm,
+                "progress": progress_lbl,
+                "created_at": round(created, 3) if created > 0 else 0.0,
+                "started_at": round(started, 3) if started > 0 else None,
+                "finished_at": round(finished, 3) if finished > 0 else None,
+                "duration_s": dur,
+            })
+        return items
 
     def get_allowed_projects(self) -> list[dict[str, str]]:
         """Read server-side project whitelist from `projects_dir` (internal: includes `workdir`)."""
@@ -1472,9 +1902,17 @@ class StudioDataSources:
         step_type = str(obj.get("type") or "")
         if step_type == "USER_INPUT":
             raw_content = str(obj.get("content") or "")
-            redacted = redact_secrets_only(raw_content)
+            stripped_content, parsed_atts, parsed_ctx = extract_message_attachments(raw_content)
+            redacted = redact_secrets_only(stripped_content)
+            if (
+                parsed_atts
+                or parsed_ctx
+                or _ATT_BLOCK_HEADER in raw_content
+                or _CTX_BLOCK_HEADER in raw_content
+            ):
+                redacted = _SENSITIVE_HOST_PATH_RE.sub("[REDACTED]", redacted)
             content, truncated = truncate_utf8_bytes(redacted, MAX_MESSAGE_BYTES)
-            return {
+            out_u: dict[str, Any] = {
                 "id": f"step-{obj.get('step_index', byte_offset)}",
                 "role": "user",
                 "content": content,
@@ -1482,6 +1920,11 @@ class StudioDataSources:
                 "created_at": str(obj.get("created_at") or ""),
                 "byte_offset": byte_offset,
             }
+            if parsed_atts:
+                out_u["attachments"] = parsed_atts
+            if parsed_ctx:
+                out_u["context_files"] = parsed_ctx
+            return out_u
         if step_type == "PLANNER_RESPONSE":
             raw_content = str(obj.get("content") or "")
             raw_thinking = str(obj.get("thinking") or "")

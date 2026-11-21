@@ -22,6 +22,7 @@ from typing import Any
 import aiohttp
 from aiohttp import web, web_log
 
+from .attachment_service import StudioAttachmentService
 from .attention_service import StudioAttentionService
 from .auth import StudioAuthManager, studio_auth_error
 from .bot_control import StudioBotControlService
@@ -31,18 +32,23 @@ from .control_plane import StudioControlPlane
 from .data_sources import StudioDataSources
 from .event_hub import StudioEventHub
 from .room_service import StudioRoomService
+from .secrets_config_service import SecretsConfigService
 from .workspace_files import StudioWorkspaceFilesService
 
 AUTH_MGR_KEY: web.AppKey[StudioAuthManager] = web.AppKey("auth_mgr", StudioAuthManager)
 DATA_SOURCES_KEY: web.AppKey[StudioDataSources] = web.AppKey("data_sources", StudioDataSources)
 BROWSER_PROXY_KEY: web.AppKey[BrowserProxy] = web.AppKey("browser_proxy", BrowserProxy)
 CHAT_SERVICE_KEY: web.AppKey[StudioChatService] = web.AppKey("chat_service", StudioChatService)
+ATTACHMENT_SERVICE_KEY: web.AppKey[StudioAttachmentService] = web.AppKey(
+    "attachment_service", StudioAttachmentService
+)
 EVENT_HUB_KEY: web.AppKey[StudioEventHub] = web.AppKey("event_hub", StudioEventHub)
 CONTROL_PLANE_KEY: web.AppKey[StudioControlPlane] = web.AppKey("control_plane", StudioControlPlane)
 WORKSPACE_FILES_KEY: web.AppKey[StudioWorkspaceFilesService] = web.AppKey("workspace_files", StudioWorkspaceFilesService)
 BOT_CONTROL_KEY: web.AppKey[StudioBotControlService] = web.AppKey("bot_control", StudioBotControlService)
 ROOM_SERVICE_KEY: web.AppKey[StudioRoomService] = web.AppKey("room_service", StudioRoomService)
 ATTENTION_SERVICE_KEY: web.AppKey[StudioAttentionService] = web.AppKey("attention_service", StudioAttentionService)
+SECRETS_CONFIG_KEY: web.AppKey[SecretsConfigService] = web.AppKey("secrets_config", SecretsConfigService)
 STATIC_DIST_KEY: web.AppKey[Path] = web.AppKey("static_dist_dir", Path)
 
 logging.basicConfig(
@@ -148,7 +154,10 @@ async def security_headers_middleware(
     resp.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
     resp.headers.setdefault("Content-Security-Policy", csp_value)
     if request.path.startswith(("/api/", "/auth/", "/internal/")):
-        resp.headers["Cache-Control"] = "no-store, max-age=0"
+        if request.method == "GET" and request.path.startswith("/api/chat/attachments/"):
+            resp.headers.setdefault("Cache-Control", "private, max-age=3600")
+        else:
+            resp.headers["Cache-Control"] = "no-store, max-age=0"
     return resp
 
 
@@ -202,6 +211,12 @@ def create_app(
         revocation_check_interval=revocation_check_interval,
         keepalive_interval=sse_keepalive_interval,
     )
+    attachment_service = StudioAttachmentService(
+        auth,
+        sources,
+        chat_service.audit,
+    )
+    chat_service.attachment_service = attachment_service
     event_hub = StudioEventHub(
         auth,
         sources,
@@ -233,11 +248,16 @@ def create_app(
         sources,
         event_hub,
         chat_service.audit,
+        attachment_service=attachment_service,
     )
     attention_service = StudioAttentionService(
         auth,
         sources,
         event_hub,
+        chat_service.audit,
+    )
+    secrets_config = SecretsConfigService(
+        auth,
         chat_service.audit,
     )
     dist_dir = static_dist_dir or Path(
@@ -246,18 +266,20 @@ def create_app(
 
     app = web.Application(
         middlewares=[web.middleware(security_headers_middleware)],
-        client_max_size=26 * 1024 * 1024,
+        client_max_size=28 * 1024 * 1024,
     )
     app[AUTH_MGR_KEY] = auth
     app[DATA_SOURCES_KEY] = sources
     app[BROWSER_PROXY_KEY] = proxy
     app[CHAT_SERVICE_KEY] = chat_service
+    app[ATTACHMENT_SERVICE_KEY] = attachment_service
     app[EVENT_HUB_KEY] = event_hub
     app[CONTROL_PLANE_KEY] = control_plane
     app[WORKSPACE_FILES_KEY] = workspace_files
     app[BOT_CONTROL_KEY] = bot_control
     app[ROOM_SERVICE_KEY] = room_service
     app[ATTENTION_SERVICE_KEY] = attention_service
+    app[SECRETS_CONFIG_KEY] = secrets_config
     app[STATIC_DIST_KEY] = dist_dir
 
     async def _on_startup(application: web.Application) -> None:
@@ -557,6 +579,8 @@ def create_app(
     app.router.add_get("/api/sessions/{cid}/messages", chat_service.handle_get_session_messages)
     app.router.add_get("/api/sessions/{cid}/active-turn", chat_service.handle_get_session_active_turn)
     app.router.add_get("/api/models", chat_service.handle_get_models)
+    app.router.add_post("/api/chat/attachments", attachment_service.handle_upload)
+    app.router.add_get("/api/chat/attachments/{att_id}", attachment_service.handle_get_attachment)
     app.router.add_post("/api/chat/send", chat_service.handle_chat_send)
     app.router.add_post("/api/chat/abort", chat_service.handle_chat_abort)
     app.router.add_get("/api/chat/stream", chat_service.handle_chat_stream)
@@ -593,10 +617,16 @@ def create_app(
     app.router.add_post("/api/rooms", room_service.handle_create_room)
     app.router.add_get("/api/rooms/{room_id}/messages", room_service.handle_get_room_messages)
     app.router.add_post("/api/rooms/{room_id}/messages", room_service.handle_post_room_message)
+    app.router.add_get("/api/rooms/{room_id}/activity", room_service.handle_get_room_activity)
 
     app.router.add_get("/api/attention", attention_service.handle_get_attention)
     app.router.add_post("/api/attention", attention_service.handle_create_attention)
     app.router.add_post("/api/attention/{item_id}/decide", attention_service.handle_decide_attention)
+
+    # Secrets Config (OpenBao auto-detect/config & reserved Security Card foundation)
+    app.router.add_get("/api/secrets/openbao", secrets_config.handle_get_openbao)
+    app.router.add_put("/api/secrets/openbao", secrets_config.handle_put_openbao)
+    app.router.add_post("/api/secrets/openbao/test", secrets_config.handle_test_openbao)
 
     app.router.add_get("/ws/browser", proxy.handle_ws_browser)
     app.router.add_post("/api/browser/upload", proxy.handle_upload)
@@ -613,6 +643,9 @@ def create_app(
         "/workspace",
         "/overview",
         "/bots",
+        "/models",
+        "/openbao",
+        "/security-card",
         "/jobs",
         "/schedules",
         "/costs",

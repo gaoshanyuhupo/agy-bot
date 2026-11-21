@@ -49,6 +49,7 @@ JOB_RETENTION_LIMIT = 150
 GROUP_HISTORY_LIMIT = 40
 GROUP_HISTORY_INJECT_LIMIT = 15
 GROUP_HISTORY_MAX_CHARS = 2400
+GROUP_HISTORY_FULL_TEXT_MAX_BYTES = 12 * 1024
 HUMAN_CHAIN_TTL_SECONDS = 1800.0
 MENTION_WINDOW_SECONDS = 300.0
 MENTION_WINDOW_MAX = 6
@@ -216,6 +217,23 @@ def set_team_mirror(chat_id: int, thread_id: Optional[int] = None) -> Dict[str, 
             cfg["mirror"] = {"chat_id": int(chat_id), "thread_id": thread_id}
         _atomic_write_json(CONFIG_FILE, cfg)
         return dict(cfg["mirror"])
+
+
+def get_team_mirror() -> Dict[str, Any]:
+    """Return normalized team-wide Telegram mirror binding (`chat_id < 0` when active, else `0`)."""
+    cfg = load_team_config()
+    tm = cfg.get("mirror") if isinstance(cfg.get("mirror"), dict) else {}
+    raw_cid = tm.get("chat_id")
+    if isinstance(raw_cid, bool):
+        cid = 0
+    else:
+        try:
+            cid = int(raw_cid or 0)
+        except (TypeError, ValueError):
+            cid = 0
+    if cid >= 0:
+        return {"chat_id": 0, "thread_id": None}
+    return {"chat_id": cid, "thread_id": _norm_tid(tm.get("thread_id"))}
 
 
 def _update_bot_config_unlocked(norm: str, **updates: Any) -> Dict[str, Any]:
@@ -1436,6 +1454,64 @@ def _cursor_key(bot_handle: str, thread_id: Optional[int]) -> str:
     return f"{normalize_handle(bot_handle)}:{norm_tid if norm_tid is not None else 'main'}"
 
 
+_GH_PEM_DASH = "-" * 5
+_GH_PEM_TYPE = r"(?:[A-Z0-9-]{1,24}[ \t]+){0,4}"
+_GH_REDACT_PATTERNS: Tuple[re.Pattern[str], ...] = (
+    re.compile(
+        rf"{_GH_PEM_DASH}BEGIN[ \t]+{_GH_PEM_TYPE}PRIVATE[ \t]+KEY{_GH_PEM_DASH}"
+        rf"[\s\S]*?"
+        rf"{_GH_PEM_DASH}END[ \t]+{_GH_PEM_TYPE}PRIVATE[ \t]+KEY{_GH_PEM_DASH}"
+    ),
+    re.compile(rf"{_GH_PEM_DASH}(?:BEGIN|END)[ \t]+{_GH_PEM_TYPE}PRIVATE[ \t]+KEY{_GH_PEM_DASH}[^\r\n]*"),
+    re.compile(r"(?im)^(?:set-)?cookie\s*:\s*[^\r\n]+"),
+    re.compile(r"(?i)\bagy_studio_session\s*=\s*[^\s;,\"'`)\]}]+"),
+    re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{8,}\b"),
+    re.compile(r"\b\d{8,11}:[A-Za-z0-9_-]{24,45}\b"),
+    re.compile(r"\bAIza[0-9A-Za-z_-]{16,}\b"),
+    re.compile(r"\bsk-(?:proj-|ant-|svcacct-|admin-)?[A-Za-z0-9_-]{16,}\b"),
+    re.compile(r"\b(?:cfut|cfsd|cfat|ibk|ibssh|alt)_[A-Za-z0-9_-]{8,}\b"),
+    re.compile(r"\bhvs\.[A-Za-z0-9_-]{10,}\b"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{4,}\b"),
+    re.compile(r"\b(?:lv[12]|kv/data|secret/data)/[A-Za-z0-9_./*-]+\b"),
+    re.compile(r"(?i)\b(?:bearer|basic)\s+[^\s,;\"'`)\]}]+"),
+    re.compile(
+        r"""(?i)(?<![A-Za-z0-9_.-])(?:"|')?[A-Za-z0-9_.-]{0,40}"""
+        r"""(?:token|apikey|api_key|key|secret|password|passwd|pwd|cookie|session|authorization|credential)"""
+        r"""(?:"|')?\s*[:=]\s*(?:"(?:[^"\\]|\\.)+"|'(?:[^'\\]|\\.)+')"""
+    ),
+    re.compile(
+        r"""(?i)(?<![A-Za-z0-9_.-])(?:"|')?\b[A-Za-z0-9_.-]{0,40}"""
+        r"""(?:token|apikey|api_key|key|secret|password|passwd|pwd|cookie|session|authorization|credential)\b"""
+        r"""(?:"|')?\s*[:=]\s*[^\s,;\"'`&)\]}]+"""
+    ),
+    re.compile(
+        r"(?:(?<=^)|(?<=[\s(\[\{\"'`=:;,+\-]))"
+        r"(?:(?i:file):///(?:home|Users|root|etc|var|tmp|opt|srv|proc|run|mnt|media|data|private|secrets)/[^\s,'\"`<>)\]}]+"
+        r"|/(?:home|Users|root|etc|var|tmp|opt|srv|proc|run|mnt|media|data|private|secrets)/[^\s,'\"`<>)\]}]+"
+        r"|~/[^\s,'\"`<>)\]}]+"
+        r"|[A-Za-z]:[\\/][^\s,'\"`<>)\]}]+"
+        r"|[^\s(\[\{\"'`=:;,<>)\]}+\-]+\.sock\b)"
+    ),
+)
+
+
+def _sanitize_group_full_text(
+    raw: Any,
+    *,
+    max_bytes: int = GROUP_HISTORY_FULL_TEXT_MAX_BYTES,
+) -> Tuple[str, bool]:
+    """Preserve Markdown/newlines while redacting secrets/host-paths and bounding UTF-8 bytes."""
+    text = str(raw if raw is not None else "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return "", False
+    for pat in _GH_REDACT_PATTERNS:
+        text = pat.sub("[REDACTED]", text)
+    raw_bytes = text.encode("utf-8")
+    if len(raw_bytes) <= max_bytes:
+        return text, False
+    return raw_bytes[:max_bytes].decode("utf-8", errors="ignore"), True
+
+
 def record_group_message(
     chat_id: int,
     *,
@@ -1446,6 +1522,7 @@ def record_group_message(
     is_bot: bool = False,
     text: str = "",
     ts: Optional[float] = None,
+    source: str = "tg",
 ) -> Optional[Dict[str, Any]]:
     """Append a deduplicated group message to the per-chat ring ledger (`chat_id < 0` only)."""
     cid = int(chat_id or 0)
@@ -1454,6 +1531,11 @@ def record_group_message(
     excerpt = re.sub(r"\s+", " ", (text or "")).strip()[:500]
     if not excerpt:
         return None
+    full_text, full_truncated = _sanitize_group_full_text(
+        text,
+        max_bytes=GROUP_HISTORY_FULL_TEXT_MAX_BYTES,
+    )
+    src_norm = "web" if str(source or "").strip().lower() == "web" else "tg"
     norm_tid = _norm_tid(thread_id)
     mid = int(msg_id or 0)
     now = float(ts or time.time())
@@ -1490,6 +1572,9 @@ def record_group_message(
             "sender_role": role,
             "is_bot": bool(is_bot),
             "text_excerpt": excerpt,
+            "full_text": full_text,
+            "truncated": bool(full_truncated),
+            "source": src_norm,
             "fingerprint": fp,
         }
         entries.append(entry)

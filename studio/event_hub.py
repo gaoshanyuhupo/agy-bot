@@ -36,6 +36,7 @@ from .data_sources import (
     StudioDataSources,
     _SENSITIVE_HOST_PATH_RE,
     _sanitize_slug,
+    map_group_history_entry_to_room_message,
     redact_secrets_only,
     truncate_utf8_bytes,
 )
@@ -62,9 +63,12 @@ _FORBIDDEN_EVENT_KEYS = frozenset({
     "chat_id",
     "thread_id",
     "target_thread_id",
+    "mirror_chat_id",
+    "mirror_thread_id",
     "origin_chat_id",
     "origin_thread_id",
     "origin_msg_id",
+    "scope_key",
     "turn_id",
     "owner_user_id",
     "user_id",
@@ -142,6 +146,14 @@ class StudioEventHub:
         self._stopped: bool = False
         self._last_fp: tuple[Any, Any, Any, Any] | None = None
         self._last_chat_sync: dict[str, tuple[int, int, bytes]] | None = None
+        self._mirror_key: tuple[int, int | None] | None = None
+        self._mirror_file_fp: tuple[int, int, int] | None = None
+        self._mirror_last_seq: int = 0
+        self._mirror_published_order: deque[int] = deque()
+        self._mirror_published_set: set[int] = set()
+        self._mirror_bot_reply_seq: dict[str, int] = {}
+        self._last_jobs_snapshot: dict[str, tuple[str, str]] = {}
+        self._last_bots_busy: dict[str, tuple[bool, str, int]] = {}
 
         self.auth_mgr.add_revoke_listener(self._on_auth_revoked)
 
@@ -293,9 +305,6 @@ class StudioEventHub:
         cid = str(doc.get("cid") or "").strip()
         if not studio_ipc.is_valid_cid(cid):
             return
-        if self._is_excluded_sync_cid(cid):
-            return
-
         status_raw = str(doc.get("status") or "").strip().lower()
         if status_raw not in _VALID_CHAT_SYNC_STATUSES:
             return
@@ -312,6 +321,26 @@ class StudioEventHub:
         else:
             updated_at = round(time.time(), 3)
 
+        # Emit sanitized room_activity (ZERO cid/chat_id/paths) before session exclusion check
+        # so group/delegation turns still drive live Thinking/Running indicators in Team panel.
+        if bot_slug:
+            is_running = status_raw == "running"
+            self.publish(
+                "room_activity",
+                {
+                    "room_id": "lobby",
+                    "source": "chat_sync",
+                    "bot": bot_slug,
+                    "phase": "thinking" if is_running else "idle",
+                    "busy": is_running,
+                    "stage_label": "正在思考 / 调度" if is_running else "",
+                    "updated_at": updated_at,
+                },
+            )
+
+        if self._is_excluded_sync_cid(cid):
+            return
+
         # Strict allowlist payload only: NEVER forward chat_id, thread_id, turn_id, prompt, response, or paths
         self.publish(
             "session_updated",
@@ -324,6 +353,201 @@ class StudioEventHub:
                 "updated_at": updated_at,
             },
         )
+
+    @staticmethod
+    def _norm_mirror_key(chat_id: int, thread_id: int | None) -> tuple[int, int | None]:
+        cid = int(chat_id or 0)
+        if thread_id is None or isinstance(thread_id, bool):
+            tid: int | None = None
+        else:
+            try:
+                tv = int(thread_id)
+                tid = tv if tv > 0 else None
+            except (TypeError, ValueError):
+                tid = None
+        return (cid, tid)
+
+    @staticmethod
+    def _norm_mirror_bot(bot: str | None) -> str:
+        return str(bot or "").strip().lstrip("@").strip().lower()
+
+    def _reset_mirror_state(self) -> None:
+        self._mirror_key = None
+        self._mirror_file_fp = None
+        self._mirror_last_seq = 0
+        self._mirror_published_order.clear()
+        self._mirror_published_set.clear()
+        self._mirror_bot_reply_seq.clear()
+
+    def _record_mirror_published_seq(self, seq: int) -> None:
+        if seq <= 0 or seq in self._mirror_published_set:
+            return
+        self._mirror_published_set.add(seq)
+        self._mirror_published_order.append(seq)
+        while len(self._mirror_published_order) > 256:
+            old = self._mirror_published_order.popleft()
+            self._mirror_published_set.discard(old)
+
+    def ensure_mirror_baseline(self, chat_id: int, thread_id: int | None) -> int:
+        """Anchor `_mirror_key` & `_mirror_last_seq` to disk max_seq before IPC; never regress an existing anchor."""
+        mkey = self._norm_mirror_key(chat_id, thread_id)
+        cid, tid = mkey
+        if cid >= 0:
+            return 0
+        if self._mirror_key == mkey:
+            return self._mirror_last_seq
+        _entries, max_seq = self.data_sources.read_tg_mirror_history(cid, tid)
+        self._mirror_key = mkey
+        self._mirror_file_fp = None
+        self._mirror_last_seq = max_seq
+        self._mirror_published_order.clear()
+        self._mirror_published_set.clear()
+        self._mirror_bot_reply_seq.clear()
+        return max_seq
+
+    def note_mirror_seq_published(self, chat_id: int, thread_id: int | None, seq: int) -> bool:
+        """Atomically claim HTTP publication of a TG mirror `seq`; returns False if already emitted."""
+        mkey = self._norm_mirror_key(chat_id, thread_id)
+        cid = mkey[0]
+        seq_i = int(seq or 0)
+        if cid >= 0 or seq_i <= 0:
+            return False
+        if self._mirror_key != mkey:
+            self._mirror_key = mkey
+            self._mirror_file_fp = None
+            self._mirror_last_seq = max(0, seq_i - 1)
+            self._mirror_published_order.clear()
+            self._mirror_published_set.clear()
+            self._mirror_bot_reply_seq.clear()
+        if seq_i <= self._mirror_last_seq or seq_i in self._mirror_published_set:
+            return False
+        self._record_mirror_published_seq(seq_i)
+        return True
+
+    def has_mirror_bot_reply_after(
+        self,
+        chat_id: int,
+        thread_id: int | None,
+        bot: str,
+        seq: int,
+    ) -> bool:
+        """Return True if watcher already emitted a reply from `bot` with seq > `seq` on this mirror."""
+        mkey = self._norm_mirror_key(chat_id, thread_id)
+        seq_i = int(seq or 0)
+        if mkey[0] >= 0 or seq_i <= 0 or self._mirror_key != mkey:
+            return False
+        bot_key = self._norm_mirror_bot(bot)
+        if not bot_key:
+            return False
+        return self._mirror_bot_reply_seq.get(bot_key, 0) > seq_i
+
+    def _poll_tg_mirror_history(self, *, bootstrap: bool = False) -> None:
+        """Incrementally watch `group_history/<chat_id>.json` and emit `room_message` SSE events (strictly read-only)."""
+        mirror = self.data_sources.resolve_tg_mirror()
+        if not mirror.get("bound"):
+            self._reset_mirror_state()
+            return
+
+        mkey = self._norm_mirror_key(int(mirror["chat_id"]), mirror["thread_id"])
+        cid, tid = mkey
+        hist_path = self.data_sources.bus_dir / "group_history" / f"{cid}.json"
+        try:
+            st = hist_path.stat()
+            fp = (st.st_ino, st.st_mtime_ns, st.st_size)
+        except OSError:
+            fp = (0, 0, 0)
+
+        if self._mirror_key != mkey:
+            entries, max_seq = self.data_sources.read_tg_mirror_history(cid, tid)
+            self._mirror_key = mkey
+            self._mirror_file_fp = fp
+            self._mirror_last_seq = max_seq
+            self._mirror_published_order.clear()
+            self._mirror_published_set.clear()
+            self._mirror_bot_reply_seq.clear()
+            for e in entries[-64:]:
+                self._record_mirror_published_seq(int(e.get("seq") or 0))
+            return
+
+        if fp == self._mirror_file_fp:
+            return
+        self._mirror_file_fp = fp
+        if fp == (0, 0, 0):
+            return
+
+        entries, _max_seq = self.data_sources.read_tg_mirror_history(cid, tid)
+        for raw_entry in entries:
+            seq_val = int(raw_entry.get("seq") or 0)
+            if seq_val <= self._mirror_last_seq:
+                continue
+            self._mirror_last_seq = max(self._mirror_last_seq, seq_val)
+            if seq_val in self._mirror_published_set:
+                continue
+            self._record_mirror_published_seq(seq_val)
+            msg = map_group_history_entry_to_room_message(raw_entry, room_id="lobby")
+            ev_text, _ = truncate_utf8_bytes(str(msg.get("content") or ""), 12 * 1024)
+            ev_payload: dict[str, Any] = {
+                "room_id": "lobby",
+                "seq": msg["seq"],
+                "msg_id": msg["msg_id"],
+                "ts": msg["ts"],
+                "sender_type": msg["sender_type"],
+                "sender": msg["sender"],
+                "sender_role": msg["sender_role"],
+                "source": msg["source"],
+                "text": ev_text,
+                "truncated": bool(msg.get("truncated")),
+                "mentions": list(msg.get("mentions") or []),
+                "chain_id": "",
+                "hop": 0,
+                "status": "done",
+                "blocked_reason": "",
+            }
+            if msg.get("stage_tag"):
+                ev_payload["stage_tag"] = str(msg["stage_tag"])
+            if msg.get("job_id"):
+                ev_payload["job_id"] = str(msg["job_id"])
+            if msg.get("attachments"):
+                ev_payload["attachments"] = list(msg["attachments"])
+            if msg.get("context_files"):
+                ev_payload["context_files"] = list(msg["context_files"])
+            self.publish("room_message", ev_payload)
+            if msg["sender_type"] == "bot" and msg["sender"]:
+                bot_key = self._norm_mirror_bot(msg["sender"])
+                if bot_key and seq_val > self._mirror_bot_reply_seq.get(bot_key, 0):
+                    self._mirror_bot_reply_seq[bot_key] = seq_val
+                self.publish(
+                    "room_typing",
+                    {
+                        "room_id": "lobby",
+                        "bot": msg["sender"],
+                        "typing": False,
+                        "chain_id": "",
+                        "hop": 0,
+                    },
+                )
+                self.publish(
+                    "room_activity",
+                    {
+                        "room_id": "lobby",
+                        "source": "group_history",
+                        "bot": msg["sender"],
+                        "role": msg["sender_role"],
+                        "phase": str(msg.get("stage_tag") or "reply"),
+                        "job_id": str(msg.get("job_id") or ""),
+                    },
+                )
+            elif msg["sender_type"] == "human":
+                self.publish(
+                    "room_activity",
+                    {
+                        "room_id": "lobby",
+                        "source": msg["source"],
+                        "phase": "received",
+                        "target_bots": list(msg.get("mentions") or []),
+                        "stage_label": "收到用户指令，等待调度处理",
+                    },
+                )
 
     async def _watch_state_loop(self) -> None:
         last_warn_ts = 0.0
@@ -350,6 +574,34 @@ class StudioEventHub:
                     if self._last_fp is None:
                         self._last_fp = fp
                         self._last_chat_sync = cur_chat_sync
+                        try:
+                            b_init = self.data_sources.get_bots()
+                            self._last_bots_busy = {
+                                str(b.get("handle") or "").lower(): (
+                                    bool(b.get("busy")),
+                                    str(b.get("current_job") or ""),
+                                    int(b.get("queue_depth") or 0),
+                                )
+                                for b in (b_init.get("bots") or [])
+                                if b.get("handle")
+                            }
+                            j_init = self.data_sources.get_jobs_activity(limit=16)
+                            self._last_jobs_snapshot = {
+                                str(j.get("job_id") or ""): (
+                                    str(j.get("status") or ""),
+                                    str(j.get("progress") or ""),
+                                )
+                                for j in j_init
+                                if j.get("job_id")
+                            }
+                        except Exception:
+                            pass
+                        try:
+                            self._poll_tg_mirror_history(bootstrap=True)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            _warn_throttled("tg_mirror_bootstrap", exc)
                         continue
                     prev_bots, prev_jobs, prev_sched, prev_approvals = self._last_fp
                     cur_bots, cur_jobs, cur_sched, cur_approvals = fp
@@ -369,6 +621,47 @@ class StudioEventHub:
                                     "source": "watcher",
                                 },
                             )
+                            next_bots_busy: dict[str, tuple[bool, str, int]] = {}
+                            for b in binfo.get("bots") or []:
+                                h = str(b.get("handle") or "").lower()
+                                if not h:
+                                    continue
+                                tup = (
+                                    bool(b.get("busy")),
+                                    str(b.get("current_job") or ""),
+                                    int(b.get("queue_depth") or 0),
+                                )
+                                next_bots_busy[h] = tup
+                                if self._last_bots_busy.get(h) != tup:
+                                    b_busy, b_job, b_q = tup
+                                    b_role = str(b.get("role") or "worker")
+                                    if b_busy:
+                                        b_phase = "running" if b_job else "thinking"
+                                        b_stage = "正在处理派单" if b_job else (
+                                            "正在思考 / 调度" if b_role == "coordinator" else "正在执行任务"
+                                        )
+                                    elif b_q > 0:
+                                        b_phase = "queued"
+                                        b_stage = f"排队等待中（{b_q} 单）"
+                                    else:
+                                        b_phase = "idle"
+                                        b_stage = ""
+                                    self.publish(
+                                        "room_activity",
+                                        {
+                                            "room_id": "lobby",
+                                            "source": "bots_watcher",
+                                            "bot": h,
+                                            "display_name": str(b.get("display_name") or h),
+                                            "role": b_role,
+                                            "phase": b_phase,
+                                            "busy": b_busy,
+                                            "job_id": b_job,
+                                            "queue_depth": b_q,
+                                            "stage_label": b_stage,
+                                        },
+                                    )
+                            self._last_bots_busy = next_bots_busy
                         except asyncio.CancelledError:
                             raise
                         except Exception as exc:
@@ -376,14 +669,62 @@ class StudioEventHub:
                     if cur_jobs != prev_jobs:
                         try:
                             jinfo = self.data_sources.get_jobs(limit=1)
-                            self.publish(
-                                "job_updated",
-                                {
-                                    "total": int(jinfo.get("total") or 0),
-                                    "counts": dict(jinfo.get("counts") or {}),
-                                    "source": "watcher",
-                                },
-                            )
+                            jact = self.data_sources.get_jobs_activity(limit=16)
+                            changed_jobs: list[tuple[dict[str, Any], str]] = []
+                            next_jobs_snap: dict[str, tuple[str, str]] = {}
+                            for j in jact:
+                                jid = str(j.get("job_id") or "")
+                                if not jid:
+                                    continue
+                                st_s = str(j.get("status") or "")
+                                prog_s = str(j.get("progress") or "")
+                                tup = (st_s, prog_s)
+                                next_jobs_snap[jid] = tup
+                                prev_tup = self._last_jobs_snapshot.get(jid)
+                                if prev_tup != tup:
+                                    if prev_tup is not None and prev_tup[0] == "running" and st_s == "running" and prog_s != prev_tup[1]:
+                                        j_phase = "tool_use"
+                                    else:
+                                        j_phase = st_s or "updated"
+                                    changed_jobs.append((j, j_phase))
+                            self._last_jobs_snapshot = next_jobs_snap
+
+                            job_ev_payload: dict[str, Any] = {
+                                "total": int(jinfo.get("total") or 0),
+                                "counts": dict(jinfo.get("counts") or {}),
+                                "source": "watcher",
+                            }
+                            if changed_jobs:
+                                top_j, top_phase = changed_jobs[0]
+                                job_ev_payload.update(
+                                    {
+                                        "job_id": top_j.get("job_id") or "",
+                                        "bot": top_j.get("bot") or "",
+                                        "status": top_j.get("status") or "",
+                                        "label": top_j.get("label") or "",
+                                        "phase": top_phase,
+                                        "duration_s": top_j.get("duration_s"),
+                                    }
+                                )
+                            self.publish("job_updated", job_ev_payload)
+
+                            for cj, c_phase in changed_jobs[:6]:
+                                self.publish(
+                                    "room_activity",
+                                    {
+                                        "room_id": "lobby",
+                                        "source": "jobs_watcher",
+                                        "phase": c_phase,
+                                        "job_id": cj.get("job_id") or "",
+                                        "group_id": cj.get("group_id") or "",
+                                        "bot": cj.get("bot") or "",
+                                        "from_bot": cj.get("from_bot") or "",
+                                        "status": cj.get("status") or "",
+                                        "label": cj.get("label") or "",
+                                        "stage_label": cj.get("progress") or "",
+                                        "duration_s": cj.get("duration_s"),
+                                    },
+                                )
                         except asyncio.CancelledError:
                             raise
                         except Exception as exc:
@@ -427,6 +768,12 @@ class StudioEventHub:
                             raise
                         except Exception as exc:
                             _warn_throttled("chat_sync", exc)
+                    try:
+                        self._poll_tg_mirror_history(bootstrap=False)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        _warn_throttled("tg_mirror", exc)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -453,10 +800,19 @@ class StudioEventHub:
                 "msg_id",
                 "sender_type",
                 "sender",
+                "sender_role",
                 "chain_id",
                 "hop",
                 "blocked_reason",
                 "typing",
+                "stage_tag",
+                "phase",
+                "stage_label",
+                "duration_s",
+                "queue_depth",
+                "from_bot",
+                "display_name",
+                "role",
                 "item_id",
                 "kind",
                 "decision",

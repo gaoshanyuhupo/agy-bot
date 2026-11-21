@@ -37,6 +37,7 @@ CID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 TG_TURN_ID_RE = re.compile(r"^tg-[a-f0-9]{16}$")
 ENTITY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{1,63}$")
 MAX_PROMPT_BYTES = 32 * 1024
+MAX_TG_GROUP_CONTENT_BYTES = 16 * 1024
 MAX_IPC_BODY_BYTES = 64 * 1024
 
 DEFAULT_MAX_TURNS = 32
@@ -106,6 +107,35 @@ _FORBIDDEN_ATTENTION_IPC_KEYS = frozenset({
     "cmd",
     "shell",
 })
+_FORBIDDEN_TG_GROUP_IPC_KEYS = frozenset({
+    "role",
+    "chat_id",
+    "target_chat_id",
+    "thread_id",
+    "target_thread_id",
+    "mirror_chat_id",
+    "mirror_thread_id",
+    "scope_key",
+    "workdir",
+    "ipc_sock",
+    "script",
+    "precheck_cmd",
+    "reload_file",
+    "command",
+    "cmd",
+    "shell",
+})
+_ALLOWED_TG_GROUP_IPC_KEYS = frozenset({
+    "user_id",
+    "actor_username",
+    "content",
+    "project",
+    "mirror_human_to_tg",
+    "origin_msg_id",
+    "priority",
+    "interrupt_current",
+})
+_VALID_IPC_PRIORITIES = frozenset({"normal", "urgent"})
 UNDO_ENTRY_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 ROOM_ID_IPC_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,31}$")
 ATTENTION_ID_IPC_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{1,63}$")
@@ -186,7 +216,7 @@ def is_valid_undo_entry_id(raw: Any) -> bool:
 
 
 def _find_forbidden_ipc_key(obj: Any, forbidden: frozenset[str], *, depth: int = 0) -> str | None:
-    if depth > 12:
+    if depth > 16:
         return "max_depth_exceeded"
     if isinstance(obj, dict):
         for k, v in obj.items():
@@ -1062,14 +1092,80 @@ class _StudioIPCHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(sc_body, {"ok": False, "error": err_body})
             return
 
-        # Strip any caller-supplied untrusted routing/role fields so downstream handlers can never trust them
-        for bad_k in _UNTRUSTED_CLIENT_SEND_KEYS:
-            body.pop(bad_k, None)
-
+        # Recompute live admin RBAC from user_id BEFORE inspecting forbidden keys so
+        # readonly callers attempting spoofed `role:"admin"` always receive 403.
         ok_u, uid, err_u = self._authorize_admin_user(body.get("user_id"))
         if not ok_u or uid is None:
             self._send_json(403, {"ok": False, "error": err_u, "source": "bridge_ipc"})
             return
+
+        if path == "/ipc/tg_group/send":
+            # Strictly reject ANY client-supplied role/chat_id/thread_id/mirror_*/scope_key/shell keys recursively
+            bad_k = _find_forbidden_ipc_key(body, _FORBIDDEN_TG_GROUP_IPC_KEYS)
+            if bad_k is not None:
+                self._send_json(400, {"ok": False, "error": f"禁止传入受限字段: {bad_k}"})
+                return
+            unknown = set(body.keys()) - _ALLOWED_TG_GROUP_IPC_KEYS
+            if unknown:
+                self._send_json(400, {"ok": False, "error": f"不支持的字段: {sorted(unknown)[0]}"})
+                return
+            content = body.get("content")
+            if not isinstance(content, str) or not content.strip():
+                self._send_json(400, {"ok": False, "error": "content 不能为空"})
+                return
+            if len(content.encode("utf-8")) > MAX_TG_GROUP_CONTENT_BYTES:
+                self._send_json(413, {"ok": False, "error": "content 超过 16 KiB 上限"})
+                return
+            mirror_human = body.get("mirror_human_to_tg", True)
+            if not isinstance(mirror_human, bool):
+                self._send_json(400, {"ok": False, "error": "mirror_human_to_tg 必须为布尔值"})
+                return
+            raw_origin_mid = body.get("origin_msg_id", 0)
+            if isinstance(raw_origin_mid, bool) or not isinstance(raw_origin_mid, int) or raw_origin_mid < 0:
+                self._send_json(400, {"ok": False, "error": "origin_msg_id 必须为非负整数"})
+                return
+            raw_priority = body.get("priority", "normal")
+            if raw_priority is None:
+                priority_val = "normal"
+            elif not isinstance(raw_priority, str) or raw_priority.strip().lower() not in _VALID_IPC_PRIORITIES:
+                self._send_json(400, {"ok": False, "error": "priority 必须为 normal 或 urgent"})
+                return
+            else:
+                priority_val = raw_priority.strip().lower()
+            raw_interrupt = body.get("interrupt_current", False)
+            if not isinstance(raw_interrupt, bool):
+                self._send_json(400, {"ok": False, "error": "interrupt_current 必须为布尔值"})
+                return
+            safe_content = neutralize_control_tags(content).strip()
+            if not safe_content:
+                self._send_json(400, {"ok": False, "error": "content 不能为空"})
+                return
+            raw_actor = re.sub(r"[\x00-\x1f\x7f\r\n]+", " ", str(body.get("actor_username") or "")).strip()
+            safe_actor = neutralize_control_tags(raw_actor)[:64]
+            if self.ipc.tg_group_send_fn is None:
+                self._send_json(501, {"ok": False, "error": "tg_group_send 未启用"})
+                return
+            req_tg = {
+                "user_id": uid,
+                "actor_username": safe_actor,
+                "content": safe_content,
+                "project": str(body.get("project") or "").strip()[:128] or None,
+                "mirror_human_to_tg": mirror_human,
+                "origin_msg_id": int(raw_origin_mid),
+                "priority": priority_val,
+                "interrupt_current": raw_interrupt,
+            }
+            try:
+                status_code, resp_payload = self.ipc.tg_group_send_fn(req_tg)
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": f"tg_group_send failed: {type(exc).__name__}"})
+                return
+            self._send_json(int(status_code), resp_payload)
+            return
+
+        # Strip any caller-supplied untrusted routing/role fields so downstream handlers can never trust them
+        for bad_k in _UNTRUSTED_CLIENT_SEND_KEYS:
+            body.pop(bad_k, None)
 
         if path == "/ipc/chat/send":
             prompt = body.get("prompt")
@@ -1087,6 +1183,23 @@ class _StudioIPCHandler(http.server.BaseHTTPRequestHandler):
                     self._send_json(400, {"ok": False, "error": "sync_tg 必须为布尔值（true/false）"})
                     return
                 sync_tg = raw_sync
+
+            raw_priority = body.get("priority", "normal")
+            if raw_priority is None:
+                priority_val = "normal"
+            elif not isinstance(raw_priority, str) or raw_priority.strip().lower() not in _VALID_IPC_PRIORITIES:
+                self._send_json(400, {"ok": False, "error": "priority 必须为 normal 或 urgent"})
+                return
+            else:
+                priority_val = raw_priority.strip().lower()
+
+            interrupt_current = False
+            if "interrupt_current" in body:
+                raw_ic = body.get("interrupt_current")
+                if not isinstance(raw_ic, bool):
+                    self._send_json(400, {"ok": False, "error": "interrupt_current 必须为布尔值（true/false）"})
+                    return
+                interrupt_current = raw_ic
 
             raw_cid = body.get("cid")
             cid: str | None = None
@@ -1111,6 +1224,8 @@ class _StudioIPCHandler(http.server.BaseHTTPRequestHandler):
                 "model": str(body.get("model") or "").strip()[:128] or None,
                 "effort": str(body.get("effort") or "").strip().lower()[:16] or None,
                 "sync_tg": sync_tg,
+                "priority": priority_val,
+                "interrupt_current": interrupt_current,
             }
             try:
                 status_code, resp_payload = self.ipc.enqueue_turn_fn(req)
@@ -1274,6 +1389,18 @@ class _StudioIPCHandler(http.server.BaseHTTPRequestHandler):
             if isinstance(raw_hop, bool) or not isinstance(raw_hop, int) or raw_hop < 0 or raw_hop > 2:
                 self._send_json(400, {"ok": False, "error": "非法的 hop 值（须为 0..2 整数）"})
                 return
+            raw_room_prio = body.get("priority", "normal")
+            if raw_room_prio is None:
+                room_priority = "normal"
+            elif not isinstance(raw_room_prio, str) or raw_room_prio.strip().lower() not in _VALID_IPC_PRIORITIES:
+                self._send_json(400, {"ok": False, "error": "priority 必须为 normal 或 urgent"})
+                return
+            else:
+                room_priority = raw_room_prio.strip().lower()
+            raw_room_ic = body.get("interrupt_current", False)
+            if not isinstance(raw_room_ic, bool):
+                self._send_json(400, {"ok": False, "error": "interrupt_current 必须为布尔值"})
+                return
             if self.ipc.room_turn_fn is None:
                 self._send_json(501, {"ok": False, "error": "room_turn 未启用"})
                 return
@@ -1287,6 +1414,8 @@ class _StudioIPCHandler(http.server.BaseHTTPRequestHandler):
                 "chain_id": str(body.get("chain_id") or "").strip()[:64],
                 "hop": int(raw_hop),
                 "project": str(body.get("project") or "").strip()[:128] or None,
+                "priority": room_priority,
+                "interrupt_current": raw_room_ic,
             }
             try:
                 status_code, resp_payload = self.ipc.room_turn_fn(req_room)
@@ -1361,6 +1490,7 @@ class StudioIPCServer:
         reload_bot_fn: Callable[[int], tuple[int, dict[str, Any]]] | None = None,
         room_turn_fn: Callable[[dict[str, Any]], tuple[int, dict[str, Any]]] | None = None,
         attention_notify_fn: Callable[[dict[str, Any]], tuple[int, dict[str, Any]]] | None = None,
+        tg_group_send_fn: Callable[[dict[str, Any]], tuple[int, dict[str, Any]]] | None = None,
         buffer: TurnEventBuffer | None = None,
         summaries_db: str | Path | None = None,
         meta_file: str | Path | None = None,
@@ -1387,6 +1517,7 @@ class StudioIPCServer:
         self.reload_bot_fn = reload_bot_fn
         self.room_turn_fn = room_turn_fn
         self.attention_notify_fn = attention_notify_fn
+        self.tg_group_send_fn = tg_group_send_fn
         self.buffer = buffer or TurnEventBuffer()
         self.summaries_db = summaries_db
         self.meta_file = meta_file

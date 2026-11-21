@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""AGY Studio Phase B M2 — Isolated Web Multi-Bot Chat Rooms (`PB-C4`).
+"""AGY Studio Phase B M2 — Multi-Bot Chat Rooms & TG Workgroup Mirror (`PB-C4`).
 
-Security & Isolation Invariants:
-- Exclusive storage under `BUS_DIR/studio_rooms/` (`0700` dir, `0600` files,
-  `rooms.lock` cross-process `fcntl.flock` + atomic temp-file + `fsync` + `os.replace`).
-- STRICTLY NEVER touches `group_history`, `group_say`, `MENTION_CHAINS_FILE`,
-  `chat_sync/<handle>.json`, or any Telegram API.
+Modes:
+- Default `lobby` binds automatically to the server-whitelisted Telegram workgroup
+  (`AGY_STUDIO_MIRROR_CHAT_ID` env or `BUS_DIR/team_config.json` `mirror.chat_id < 0`)
+  in `mode="tg_mirror"` (read-only `group_history/<chat_id>.json` ledger + Bridge UDS
+  `/ipc/tg_group/send`, zero local second bot-relay, default coordinator routing).
+- Unbound `lobby` and all custom rooms run in `mode="web_room"` backed exclusively by
+  `BUS_DIR/studio_rooms/` (`0700` dir, `0600` files, `rooms.lock` cross-process `fcntl.flock`
+  + atomic temp-file + `fsync` + `os.replace`) with anti-loop Bot->Bot relay guardrails.
 - Four-layer Admin write gate on `POST /api/rooms` & `POST /api/rooms/{room_id}/messages`:
   1. Strict Same-Origin (`Origin` required & matched) -> 403
   2. Non-simple `Content-Type: application/json` -> 415
@@ -15,16 +18,8 @@ Security & Isolation Invariants:
   and message content cap <= 16 KiB -> 413.
 - Depth-16 fail-closed recursive forbidden-key scan -> 400.
 - Sliding-window rate limiting per session/room -> 429 + `Retry-After`.
-- Bot->Bot relay anti-loop guardrails (aligned with `bridge/bot_bus.py` `DEFAULT_MAX_HOPS = 2`):
-  1. Self-mention strictly rejected (`0` deliveries, `blocked_reason="self_mention"`).
-  2. Strict `hop < 2` cap (`blocked_reason="max_hops_exceeded"`).
-  3. Same `chain_id` bot replies `< 4` (`blocked_reason="chain_reply_limit_exceeded"`)
-     and no `A->B->A` ping-pong within the same `chain_id` (`blocked_reason="ping_pong_loop"`).
-  4. Per-room 5-minute sliding window bot turns `< 12` (`blocked_reason="room_bot_window_exceeded"`).
-  All guard trips emit a `system` message into the room ledger with explicit `blocked_reason`.
-- Protocol control-tag neutralization (`[ACB_TEAM_DELEGATION ...]`, `[ACB_SCHEDULED_TASK ...]`,
-  `[ACB_SCHEDULED_HANDOFF ...]`, `[UNTRUSTED_...]`, `[NO_HANDOFF_...]`) + secret & host-path
-  redaction on all stored messages and cross-bot context prompts.
+- Protocol control-tag neutralization + secret & host-path redaction on all stored/mirrored
+  messages and cross-bot context prompts. Raw TG `chat_id` / `thread_id` are NEVER exposed.
 """
 
 from __future__ import annotations
@@ -59,6 +54,9 @@ from .data_sources import (
     StudioDataSources,
     _SENSITIVE_HOST_PATH_RE,
     _sanitize_slug,
+    classify_room_message_stage,
+    extract_job_id_from_text,
+    map_group_history_entry_to_room_message,
     redact_secrets_only,
     truncate_utf8_bytes,
 )
@@ -67,6 +65,8 @@ from .event_hub import StudioEventHub
 log = logging.getLogger("agy-studio.rooms")
 
 ROOM_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,31}$")
+_FENCED_CODE_RE = re.compile(r"```[\s\S]*?```")
+_INLINE_CODE_RE = re.compile(r"(?<!`)(`+)(?!`)([^\n]*?)(?<!`)\1(?!`)")
 _AT_MENTION_RE = re.compile(r"(?<![A-Za-z0-9_.-])@([A-Za-z0-9][A-Za-z0-9_.-]{1,63})")
 _INVISIBLE_FORMAT_RE = re.compile(r"[\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]")
 _FULLWIDTH_TAG_TRANS = str.maketrans(
@@ -102,14 +102,22 @@ MAX_TRACKED_CHAINS = 64
 DEFAULT_RATE_LIMIT_MAX = 10
 DEFAULT_RATE_LIMIT_WINDOW_SEC = 60.0
 
+_DEFAULT_LOBBY_TITLE = "大厅 Lobby"
+_DEFAULT_LOBBY_WEB_TOPIC = "多 Bot 协作频道"
+_DEFAULT_LOBBY_MIRROR_TOPIC = "Telegram 工作群实时镜像 · 默认总指挥接单派活"
+
 _ALLOWED_CREATE_ROOM_KEYS = frozenset({"room_id", "title", "topic"})
-_ALLOWED_POST_MSG_KEYS = frozenset({"content", "project"})
+_ALLOWED_POST_MSG_KEYS = frozenset({"content", "project", "attachments", "context_files", "execution_mode"})
+_VALID_EXECUTION_MODES = frozenset({"queue", "interrupt"})
 _FORBIDDEN_ROOM_KEYS = frozenset({
     "chat_id",
     "target_chat_id",
     "thread_id",
     "target_thread_id",
+    "mirror_chat_id",
+    "mirror_thread_id",
     "role",
+    "scope_key",
     "workdir",
     "ipc_sock",
     "script",
@@ -119,6 +127,12 @@ _FORBIDDEN_ROOM_KEYS = frozenset({
     "cmd",
     "shell",
 })
+
+
+def _is_legacy_isolated_lobby_text(text: Any) -> bool:
+    """Detect legacy lobby isolation wording in persisted `index.json` for automatic migration."""
+    t = str(text or "")
+    return ("隔离" in t) and ("Telegram" in t or "大厅" in t or "完全" in t)
 
 
 def is_valid_room_id(raw: Any) -> bool:
@@ -154,10 +168,12 @@ def sanitize_room_text(raw: Any, *, max_bytes: int = MAX_ROOM_CONTENT_BYTES) -> 
 
 
 def extract_room_mentions(text: str) -> list[str]:
-    """Extract deduplicated lowercase bot handles mentioned as `@handle`."""
+    """Extract deduplicated lowercase bot handles mentioned as `@handle` outside code blocks."""
+    cleaned = _FENCED_CODE_RE.sub(" ", text or "")
+    cleaned = _INLINE_CODE_RE.sub(" ", cleaned)
     seen: set[str] = set()
     out: list[str] = []
-    for m in _AT_MENTION_RE.finditer(text or ""):
+    for m in _AT_MENTION_RE.finditer(cleaned):
         handle = m.group(1).strip().lower()
         if handle and handle not in seen:
             seen.add(handle)
@@ -211,6 +227,7 @@ class StudioRoomService:
         event_hub: StudioEventHub,
         audit: StudioAuditLogger,
         *,
+        attachment_service: Any | None = None,
         rate_limit_max: int = DEFAULT_RATE_LIMIT_MAX,
         global_rate_limit_max: int | None = None,
         rate_limit_window_sec: float = DEFAULT_RATE_LIMIT_WINDOW_SEC,
@@ -221,6 +238,7 @@ class StudioRoomService:
         self.data_sources = data_sources
         self.event_hub = event_hub
         self.audit = audit
+        self.attachment_service = attachment_service
         self.rate_limit_max = max(1, int(rate_limit_max))
         self.global_rate_limit_max = (
             max(1, int(global_rate_limit_max)) if global_rate_limit_max is not None else None
@@ -231,6 +249,8 @@ class StudioRoomService:
 
         self._rate_buckets: dict[str, deque[float]] = {}
         self._dispatch_tasks: set[asyncio.Task[Any]] = set()
+        self._recent_dispatches: dict[str, dict[str, Any]] = {}
+        self._active_web_room_turns: dict[tuple[str, str], dict[str, Any]] = {}
         self._closed = False
 
     def _rooms_dir(self) -> Path:
@@ -280,14 +300,22 @@ class StudioRoomService:
             now = float(self.clock_fn())
             rooms["lobby"] = {
                 "room_id": "lobby",
-                "title": "大厅 Lobby",
-                "topic": "Web 多 Bot 协作群聊室（与 Telegram 群聊完全隔离）",
+                "title": _DEFAULT_LOBBY_TITLE,
+                "topic": _DEFAULT_LOBBY_WEB_TOPIC,
                 "created_at": now,
                 "updated_at": now,
                 "last_seq": 0,
                 "message_count": 0,
             }
             changed = True
+        elif isinstance(rooms.get("lobby"), dict):
+            lobby_meta = rooms["lobby"]
+            if _is_legacy_isolated_lobby_text(lobby_meta.get("topic")):
+                lobby_meta["topic"] = _DEFAULT_LOBBY_WEB_TOPIC
+                changed = True
+            if _is_legacy_isolated_lobby_text(lobby_meta.get("title")):
+                lobby_meta["title"] = _DEFAULT_LOBBY_TITLE
+                changed = True
         doc = {"version": 1, "rooms": rooms}
         if changed:
             _atomic_write_json_0600(idx_p, doc)
@@ -337,6 +365,8 @@ class StudioRoomService:
         sender: str,
         content: str,
         mentions: list[str] | None = None,
+        attachments: list[dict[str, Any]] | None = None,
+        context_files: list[str] | None = None,
         chain_id: str = "",
         hop: int = 0,
         status: str = "done",
@@ -353,7 +383,7 @@ class StudioRoomService:
         msg_id = f"rm-{uuid.uuid4().hex[:12]}"
         clean_mentions = [_sanitize_slug(m, max_len=64).lower() for m in (mentions or []) if _sanitize_slug(m, max_len=64)]
 
-        msg = {
+        msg: dict[str, Any] = {
             "seq": seq,
             "msg_id": msg_id,
             "room_id": room_id,
@@ -368,6 +398,10 @@ class StudioRoomService:
             "status": _sanitize_slug(status, max_len=32) or "done",
             "blocked_reason": _sanitize_slug(blocked_reason, max_len=64),
         }
+        if attachments:
+            msg["attachments"] = [dict(a) for a in attachments[:6]]
+        if context_files:
+            msg["context_files"] = [str(c)[:256] for c in context_files[:10]]
 
         msgs = list(room_doc["messages"])
         msgs.append(msg)
@@ -411,29 +445,64 @@ class StudioRoomService:
         return msg
 
     def _publish_room_message_event(self, msg: dict[str, Any]) -> None:
+        if self.event_hub is None:
+            return
         # Use key "text" (never raw "content") so StudioEventHub's strict _FORBIDDEN_EVENT_KEYS
         # stays untouched while still running full secret & host-path redaction + <= 16 KiB framing.
         ev_text, _ = truncate_utf8_bytes(str(msg.get("content") or ""), MAX_ROOM_EVENT_TEXT_BYTES)
-        self.event_hub.publish(
-            "room_message",
-            {
-                "room_id": msg["room_id"],
-                "seq": msg["seq"],
-                "msg_id": msg["msg_id"],
-                "ts": msg["ts"],
-                "sender_type": msg["sender_type"],
-                "sender": msg["sender"],
-                "text": ev_text,
-                "truncated": bool(msg.get("truncated")),
-                "mentions": list(msg.get("mentions") or []),
-                "chain_id": msg.get("chain_id") or "",
-                "hop": int(msg.get("hop") or 0),
-                "status": msg.get("status") or "done",
-                "blocked_reason": msg.get("blocked_reason") or "",
-            },
-        )
+        payload: dict[str, Any] = {
+            "room_id": msg["room_id"],
+            "seq": msg["seq"],
+            "msg_id": msg["msg_id"],
+            "ts": msg["ts"],
+            "sender_type": msg["sender_type"],
+            "sender": msg["sender"],
+            "text": ev_text,
+            "truncated": bool(msg.get("truncated")),
+            "mentions": list(msg.get("mentions") or []),
+            "chain_id": msg.get("chain_id") or "",
+            "hop": int(msg.get("hop") or 0),
+            "status": msg.get("status") or "done",
+            "blocked_reason": msg.get("blocked_reason") or "",
+        }
+        if msg.get("sender_role"):
+            payload["sender_role"] = str(msg["sender_role"])
+        if msg.get("source"):
+            payload["source"] = str(msg["source"])
+        stage_tag = str(msg.get("stage_tag") or "").strip()
+        if not stage_tag and msg.get("sender_type") == "bot":
+            stage_tag = classify_room_message_stage(
+                "bot",
+                str(msg.get("sender_role") or ""),
+                str(msg.get("content") or ""),
+            )
+        if stage_tag:
+            payload["stage_tag"] = stage_tag
+        job_id_ref = str(msg.get("job_id") or "").strip()
+        if not job_id_ref and msg.get("sender_type") == "bot":
+            job_id_ref = extract_job_id_from_text(str(msg.get("content") or ""))
+        if job_id_ref:
+            payload["job_id"] = job_id_ref
+        if msg.get("attachments"):
+            payload["attachments"] = list(msg["attachments"])
+        if msg.get("context_files"):
+            payload["context_files"] = list(msg["context_files"])
+        self.event_hub.publish("room_message", payload)
 
     def _publish_room_typing(self, room_id: str, bot_handle: str, typing: bool, *, chain_id: str = "", hop: int = 0) -> None:
+        key = (room_id, bot_handle.strip().lower())
+        if typing:
+            self._active_web_room_turns[key] = {
+                "room_id": room_id,
+                "bot": key[1],
+                "started_at": float(self.clock_fn()),
+                "chain_id": chain_id,
+                "hop": int(hop),
+            }
+        else:
+            self._active_web_room_turns.pop(key, None)
+        if self.event_hub is None:
+            return
         self.event_hub.publish(
             "room_typing",
             {
@@ -444,6 +513,65 @@ class StudioRoomService:
                 "hop": int(hop),
             },
         )
+        self.event_hub.publish(
+            "room_activity",
+            {
+                "room_id": room_id,
+                "source": "room_typing",
+                "bot": bot_handle,
+                "phase": "thinking" if typing else "idle",
+                "busy": bool(typing),
+                "stage_label": "正在思考 / 生成回复" if typing else "",
+            },
+        )
+
+    def _record_recent_dispatch(
+        self,
+        room_id: str,
+        target_bots: list[str],
+        *,
+        source: str = "web_dispatch",
+        human_seq: int = 0,
+        urgent: bool = False,
+    ) -> None:
+        clean_targets = [_sanitize_slug(b, max_len=64).lower() for b in target_bots if _sanitize_slug(b, max_len=64)]
+        now = float(self.clock_fn())
+        phase = "urgent_dispatched" if urgent else "dispatched"
+        if clean_targets:
+            target_str = ", ".join(f"@{b}" for b in clean_targets[:4])
+            stage_label = (
+                f"⚡ 插队指令已发送至 {target_str}，优先调度处理"
+                if urgent
+                else f"已送达 {target_str}，等待接单处理"
+            )
+        else:
+            stage_label = "⚡ 插队指令已发送，优先调度处理" if urgent else "指令已送达，等待处理"
+        self._recent_dispatches[room_id] = {
+            "phase": phase,
+            "target_bots": clean_targets,
+            "dispatched_at": round(now, 3),
+            "human_seq": max(0, int(human_seq or 0)),
+            "stage_label": stage_label,
+        }
+        if len(self._recent_dispatches) > 32:
+            oldest = sorted(
+                self._recent_dispatches.items(),
+                key=lambda kv: float(kv[1].get("dispatched_at") or 0.0),
+            )
+            for old_k, _ in oldest[: len(self._recent_dispatches) - 32]:
+                self._recent_dispatches.pop(old_k, None)
+        if self.event_hub is not None:
+            self.event_hub.publish(
+                "room_activity",
+                {
+                    "room_id": room_id,
+                    "source": source,
+                    "phase": phase,
+                    "target_bots": clean_targets,
+                    "bot": clean_targets[0] if clean_targets else "",
+                    "stage_label": stage_label,
+                },
+            )
 
     # ------------------------------------------------------------------ Rate Limiting
     def _check_rate_limit_multi(self, checks: list[tuple[str, int]]) -> tuple[bool, int]:
@@ -589,6 +717,162 @@ class StudioRoomService:
                 handles.add(h)
         return handles
 
+    def _resolve_default_coordinator_handle(self, *, require_online_ipc: bool = False) -> str:
+        bots_info = self.data_sources.get_bots()
+        fallback = ""
+        for b in bots_info.get("bots") or []:
+            h = str(b.get("handle") or "").strip().lower()
+            if not h or str(b.get("role") or "").strip().lower() != "coordinator":
+                continue
+            if b.get("online") and self._resolve_online_bot_ipc(h) is not None:
+                return h
+            if not fallback:
+                fallback = h
+        return "" if require_online_ipc else fallback
+
+    def _resolve_mirror_dispatch_targets(self, raw_content: str) -> tuple[list[str], str | None]:
+        """Resolve target bots for a `tg_mirror` lobby message (explicit at-mention or default online coordinator)."""
+        bots_info = self.data_sources.get_bots()
+        online_ipc_handles: set[str] = set()
+        online_coordinators: list[str] = []
+        for b in bots_info.get("bots") or []:
+            h = str(b.get("handle") or "").strip().lower()
+            if not h or not b.get("online"):
+                continue
+            if self._resolve_online_bot_ipc(h) is not None:
+                online_ipc_handles.add(h)
+                if str(b.get("role") or "").strip().lower() == "coordinator":
+                    online_coordinators.append(h)
+
+        mentioned_all = extract_room_mentions(raw_content)
+        if mentioned_all:
+            online_hits = [h for h in mentioned_all if h in online_ipc_handles][:MAX_ROOM_MENTIONS]
+            if not online_hits:
+                offline_label = ", ".join(f"@{h}" for h in mentioned_all[:4])
+                return [], f"所点名的 Bot 离线或 IPC 不可达：{offline_label}"
+            return online_hits, None
+
+        if online_coordinators:
+            return [online_coordinators[0]], None
+        return [], "当前无在线总指挥（coordinator）或 IPC 不可达，无法接单派活"
+
+    def _decorate_room_meta(
+        self,
+        raw_meta: dict[str, Any],
+        *,
+        mirror: dict[str, Any] | None = None,
+        default_bot: str | None = None,
+        mirror_entries: list[dict[str, Any]] | None = None,
+        mirror_max_seq: int | None = None,
+    ) -> dict[str, Any]:
+        meta = dict(raw_meta)
+        rid = str(meta.get("room_id") or "")
+        m = mirror if mirror is not None else self.data_sources.resolve_tg_mirror()
+        is_bound = rid == "lobby" and bool(m.get("bound"))
+        if is_bound:
+            coord_h = (
+                default_bot
+                if default_bot is not None
+                else self._resolve_default_coordinator_handle(require_online_ipc=False)
+            )
+            meta["mode"] = "tg_mirror"
+            meta["mirror_bound"] = True
+            meta["default_bot"] = _sanitize_slug(coord_h, max_len=64).lower() if coord_h else ""
+            cur_topic = str(meta.get("topic") or "").strip()
+            if not cur_topic or cur_topic == _DEFAULT_LOBBY_WEB_TOPIC or _is_legacy_isolated_lobby_text(cur_topic):
+                meta["topic"] = _DEFAULT_LOBBY_MIRROR_TOPIC
+            if mirror_entries is None or mirror_max_seq is None:
+                entries, max_seq = self.data_sources.read_tg_mirror_history(
+                    int(m["chat_id"]), m["thread_id"]
+                )
+            else:
+                entries, max_seq = mirror_entries, mirror_max_seq
+            meta["last_seq"] = int(max_seq)
+            meta["message_count"] = len(entries)
+            if entries:
+                last_ts = float(entries[-1].get("ts") or 0.0)
+                if last_ts > float(meta.get("updated_at") or 0.0):
+                    meta["updated_at"] = round(last_ts, 3)
+        else:
+            meta["mode"] = "web_room"
+            meta["mirror_bound"] = False
+            meta["default_bot"] = ""
+            if rid == "lobby" and _is_legacy_isolated_lobby_text(meta.get("topic")):
+                meta["topic"] = _DEFAULT_LOBBY_WEB_TOPIC
+        # Defense-in-depth: guarantee raw TG IDs can NEVER appear in room metadata
+        for forbidden_k in ("chat_id", "thread_id", "mirror_chat_id", "mirror_thread_id", "scope_key"):
+            meta.pop(forbidden_k, None)
+        return meta
+
+    async def _call_bot_tg_group_send(
+        self,
+        *,
+        bot_handle: str,
+        user_id: int,
+        actor_username: str,
+        content: str,
+        project: str | None = None,
+        mirror_human_to_tg: bool = True,
+        origin_msg_id: int = 0,
+        priority: str = "normal",
+        interrupt_current: bool = False,
+    ) -> tuple[int, dict[str, Any]]:
+        resolved = self._resolve_online_bot_ipc(bot_handle)
+        if resolved is None:
+            return 503, {"ok": False, "error": f"Bot @{bot_handle} IPC 离线"}
+        sock_p, token = resolved
+        base_payload: dict[str, Any] = {
+            "user_id": int(user_id),
+            "actor_username": str(actor_username or "")[:64],
+            "content": content,
+            "mirror_human_to_tg": bool(mirror_human_to_tg),
+            "origin_msg_id": max(0, int(origin_msg_id or 0)),
+        }
+        if project:
+            base_payload["project"] = project
+
+        send_urgent_fields = priority == "urgent" or bool(interrupt_current)
+        payload = dict(base_payload)
+        if send_urgent_fields:
+            payload["priority"] = "urgent" if priority == "urgent" else "normal"
+            payload["interrupt_current"] = bool(interrupt_current)
+
+        async def _post_once(req_body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+            connector = aiohttp.UnixConnector(path=str(sock_p))
+            async with aiohttp.ClientSession(connector=connector) as cli:
+                async with cli.post(
+                    "http://localhost/ipc/tg_group/send",
+                    headers={
+                        "X-Bridge-IPC-Token": token,
+                        "Content-Type": "application/json",
+                    },
+                    json=req_body,
+                    timeout=aiohttp.ClientTimeout(total=25.0),
+                ) as resp:
+                    raw = await resp.text()
+                    try:
+                        data = json.loads(raw) if raw else {}
+                    except Exception:
+                        data = {"ok": False, "error": f"Bridge IPC HTTP {resp.status}"}
+                    if not isinstance(data, dict):
+                        data = {"ok": False, "error": f"Bridge IPC HTTP {resp.status}"}
+                    return resp.status, data
+
+        try:
+            sc, data = await _post_once(payload)
+            # Preview-period compatibility: older running Bridge instances reject unknown
+            # `priority`/`interrupt_current` keys on /ipc/tg_group/send with HTTP 400.
+            if (
+                send_urgent_fields
+                and sc == 400
+                and "不支持的字段" in str(data.get("error") or "")
+            ):
+                sc, data = await _post_once(base_payload)
+            return sc, data
+        except Exception as exc:
+            log.warning("TG mirror IPC send to @%s failed: %s", bot_handle, type(exc).__name__)
+            return 502, {"ok": False, "error": f"Bot @{bot_handle} IPC 调用失败"}
+
     async def _call_bot_room_turn(
         self,
         *,
@@ -600,6 +884,8 @@ class StudioRoomService:
         chain_id: str,
         hop: int,
         project: str | None = None,
+        priority: str = "normal",
+        interrupt_current: bool = False,
     ) -> tuple[int, dict[str, Any]]:
         resolved = self._resolve_online_bot_ipc(bot_handle)
         if resolved is None:
@@ -616,6 +902,9 @@ class StudioRoomService:
         }
         if project:
             payload["project"] = project
+        if priority == "urgent" or interrupt_current:
+            payload["priority"] = "urgent" if priority == "urgent" else "normal"
+            payload["interrupt_current"] = bool(interrupt_current)
         try:
             async with aiohttp.ClientSession(connector=connector) as cli:
                 async with cli.post(
@@ -646,6 +935,7 @@ class StudioRoomService:
         trigger_msg: dict[str, Any],
         recent_messages: list[dict[str, Any]],
         target_bot: str,
+        attachment_prompt_block: str = "",
     ) -> str:
         lines: list[str] = [
             f"[UNTRUSTED_WEB_ROOM_MESSAGE room={room_id} target=@{target_bot} "
@@ -660,6 +950,9 @@ class StudioRoomService:
             m_type = str(m.get("sender_type") or "human")
             m_text, _ = sanitize_room_text(m.get("content") or "", max_bytes=1200)
             lines.append(f"[{m_type}:{m_sender}] {m_text}")
+        if attachment_prompt_block.strip():
+            lines.append("")
+            lines.append(attachment_prompt_block.strip())
         footer = "[/UNTRUSTED_WEB_ROOM_MESSAGE]"
         body_text = "\n".join(lines)
         max_body_bytes = MAX_PROMPT_BODY_BYTES - 256 - len(footer.encode("utf-8")) - 2
@@ -775,6 +1068,8 @@ class StudioRoomService:
         chain_id: str,
         hop: int,
         project: str | None = None,
+        attachment_prompt_block: str = "",
+        execution_mode: str = "queue",
     ) -> None:
         if self._closed:
             return
@@ -787,10 +1082,12 @@ class StudioRoomService:
             trigger_msg=trigger_msg,
             recent_messages=recent_msgs,
             target_bot=target_bot,
+            attachment_prompt_block=attachment_prompt_block,
         )
 
         self._publish_room_typing(room_id, target_bot, True, chain_id=chain_id, hop=hop)
         try:
+            is_urgent = execution_mode == "interrupt" and hop == 0
             sc, resp_data = await self._call_bot_room_turn(
                 bot_handle=target_bot,
                 room_id=room_id,
@@ -800,6 +1097,8 @@ class StudioRoomService:
                 chain_id=chain_id,
                 hop=hop,
                 project=project,
+                priority="urgent" if is_urgent else "normal",
+                interrupt_current=is_urgent,
             )
         finally:
             self._publish_room_typing(room_id, target_bot, False, chain_id=chain_id, hop=hop)
@@ -932,8 +1231,14 @@ class StudioRoomService:
             return studio_auth_error(err, status=sc)
         with self._rooms_lock():
             idx = self._ensure_index_locked()
+        mirror = self.data_sources.resolve_tg_mirror()
+        default_bot = self._resolve_default_coordinator_handle(require_online_ipc=False) if mirror.get("bound") else ""
+        decorated = [
+            self._decorate_room_meta(r, mirror=mirror, default_bot=default_bot)
+            for r in idx["rooms"].values()
+        ]
         rooms_list = sorted(
-            idx["rooms"].values(),
+            decorated,
             key=lambda r: (0 if r.get("room_id") == "lobby" else 1, -float(r.get("updated_at") or 0.0)),
         )
         return web.json_response(
@@ -1081,7 +1386,7 @@ class StudioRoomService:
             target_id=room_id,
             sess=sess,
         )
-        return web.json_response({"ok": True, "room": meta}, status=201)
+        return web.json_response({"ok": True, "room": self._decorate_room_meta(meta)}, status=201)
 
     async def handle_get_room_messages(self, request: web.Request) -> web.Response:
         ok, sess, err, sc = await self.auth_mgr.authenticate_request(request)
@@ -1104,6 +1409,40 @@ class StudioRoomService:
         except ValueError:
             limit = 100
 
+        mirror = self.data_sources.resolve_tg_mirror()
+        if room_id == "lobby" and mirror.get("bound"):
+            with self._rooms_lock():
+                idx = self._ensure_index_locked()
+                raw_meta = idx["rooms"]["lobby"]
+            raw_entries, max_seq = self.data_sources.read_tg_mirror_history(
+                int(mirror["chat_id"]), mirror["thread_id"]
+            )
+            rmeta = self._decorate_room_meta(
+                raw_meta,
+                mirror=mirror,
+                mirror_entries=raw_entries,
+                mirror_max_seq=max_seq,
+            )
+            mapped = [
+                map_group_history_entry_to_room_message(
+                    e, room_id="lobby", max_content_bytes=MAX_ROOM_CONTENT_BYTES
+                )
+                for e in raw_entries
+                if int(e.get("seq") or 0) > after_seq
+            ]
+            if len(mapped) > limit:
+                mapped = mapped[-limit:]
+            return web.json_response(
+                {
+                    "ok": True,
+                    "room": rmeta,
+                    "room_id": "lobby",
+                    "latest_seq": int(max_seq),
+                    "total": len(mapped),
+                    "messages": mapped,
+                }
+            )
+
         with self._rooms_lock():
             idx = self._ensure_index_locked()
             if room_id not in idx["rooms"]:
@@ -1112,7 +1451,7 @@ class StudioRoomService:
                     status=404,
                 )
             room_doc = self._load_room_locked(room_id)
-            rmeta = idx["rooms"][room_id]
+            rmeta = self._decorate_room_meta(idx["rooms"][room_id], mirror=mirror)
 
         msgs = [m for m in room_doc["messages"] if int(m.get("seq") or 0) > after_seq]
         if len(msgs) > limit:
@@ -1126,6 +1465,212 @@ class StudioRoomService:
                 "latest_seq": latest_seq,
                 "total": len(msgs),
                 "messages": msgs,
+            }
+        )
+
+    async def handle_get_room_activity(self, request: web.Request) -> web.Response:
+        """Read-only sanitized live pipeline snapshot for a room (`GET /api/rooms/{room_id}/activity`)."""
+        ok, sess, err, sc = await self.auth_mgr.authenticate_request(request)
+        if not ok or not sess:
+            return studio_auth_error(err, status=sc)
+
+        room_id = str(request.match_info.get("room_id") or "").strip().lower()
+        if not is_valid_room_id(room_id):
+            return web.json_response(
+                {"ok": False, "source": "studio_api", "error": "非法的 room_id 格式"},
+                status=400,
+            )
+
+        mirror = self.data_sources.resolve_tg_mirror()
+        mirror_bound = room_id == "lobby" and bool(mirror.get("bound"))
+        if room_id != "lobby":
+            with self._rooms_lock():
+                idx = self._ensure_index_locked()
+                if room_id not in idx["rooms"]:
+                    return web.json_response(
+                        {"ok": False, "source": "studio_api", "error": "频道不存在"},
+                        status=404,
+                    )
+
+        now = float(self.clock_fn())
+        bots_info = self.data_sources.get_bots()
+        roster_bots = bots_info.get("bots") or []
+        roster_by_handle = {
+            str(b.get("handle") or "").strip().lower(): b
+            for b in roster_bots
+            if b.get("handle")
+        }
+
+        recent_jobs = self.data_sources.get_jobs_activity(limit=12) if (room_id == "lobby" or mirror_bound) else []
+        running_job_by_bot: dict[str, dict[str, Any]] = {}
+        queued_count_by_bot: dict[str, int] = {}
+        for j in recent_jobs:
+            jb = str(j.get("bot") or "").strip().lower()
+            jst = str(j.get("status") or "").strip().lower()
+            if not jb:
+                continue
+            if jst == "running" and jb not in running_job_by_bot:
+                running_job_by_bot[jb] = j
+            elif jst == "queued":
+                queued_count_by_bot[jb] = queued_count_by_bot.get(jb, 0) + 1
+
+        chat_sync_states = self.data_sources.read_chat_sync_states() if (room_id == "lobby" or mirror_bound) else {}
+
+        # Expire stale recent dispatch notices (or once target bot has replied after human_seq)
+        recent_dispatch = self._recent_dispatches.get(room_id)
+        if recent_dispatch is not None:
+            age_s = now - float(recent_dispatch.get("dispatched_at") or 0.0)
+            if age_s > 75.0:
+                self._recent_dispatches.pop(room_id, None)
+                recent_dispatch = None
+            elif mirror_bound and self.event_hub is not None:
+                h_seq = int(recent_dispatch.get("human_seq") or 0)
+                t_bots = list(recent_dispatch.get("target_bots") or [])
+                if h_seq > 0 and t_bots and all(
+                    self.event_hub.has_mirror_bot_reply_after(
+                        int(mirror["chat_id"]), mirror["thread_id"], tb, h_seq
+                    )
+                    for tb in t_bots
+                ):
+                    self._recent_dispatches.pop(room_id, None)
+                    recent_dispatch = None
+
+        # Also clean stale web_room turn trackers (> 180s)
+        for k_turn, v_turn in list(self._active_web_room_turns.items()):
+            if (now - float(v_turn.get("started_at") or 0.0)) > 180.0:
+                self._active_web_room_turns.pop(k_turn, None)
+
+        dispatch_targets: set[str] = set()
+        dispatch_started = 0.0
+        if recent_dispatch is not None:
+            dispatch_targets = {str(b).lower() for b in (recent_dispatch.get("target_bots") or []) if b}
+            dispatch_started = float(recent_dispatch.get("dispatched_at") or 0.0)
+
+        active_bots: list[dict[str, Any]] = []
+        seen_handles: set[str] = set()
+
+        for h, b in roster_by_handle.items():
+            seen_handles.add(h)
+            role = str(b.get("role") or "worker")
+            display_name = str(b.get("display_name") or h)
+            run_job = running_job_by_bot.get(h)
+            q_cnt = max(int(b.get("queue_depth") or 0), queued_count_by_bot.get(h, 0))
+            cs = chat_sync_states.get(h)
+            cs_running = bool(cs and cs.get("running"))
+            web_turn = self._active_web_room_turns.get((room_id, h))
+            in_dispatch = h in dispatch_targets
+
+            # In mirror mode, ignore stale web_turn if bot already replied after human_seq
+            if web_turn is not None and mirror_bound and self.event_hub is not None and recent_dispatch is None:
+                # Keep short grace only if actually still typing (<30s)
+                if (now - float(web_turn.get("started_at") or 0.0)) > 30.0:
+                    self._active_web_room_turns.pop((room_id, h), None)
+                    web_turn = None
+
+            state = "idle"
+            stage_label = ""
+            cur_job_id: str | None = None
+            cur_job_label = ""
+            started_at: float | None = None
+
+            if run_job is not None:
+                state = "running"
+                cur_job_id = str(run_job.get("job_id") or "") or None
+                cur_job_label = str(run_job.get("label") or "")
+                stage_label = str(run_job.get("progress") or "") or "正在处理派单"
+                started_at = float(run_job.get("started_at") or run_job.get("created_at") or now)
+            elif bool(b.get("busy")) and b.get("current_job") and (room_id == "lobby" or mirror_bound):
+                state = "running"
+                cur_job_id = str(b.get("current_job") or "") or None
+                stage_label = "正在处理派单"
+                started_at = float(b.get("last_seen") or now)
+            elif cs_running or web_turn is not None or (bool(b.get("busy")) and (room_id == "lobby" or mirror_bound)):
+                state = "thinking"
+                if role == "coordinator":
+                    stage_label = "正在思考 / 调度"
+                else:
+                    stage_label = "正在思考 / 生成回复"
+                if web_turn is not None:
+                    started_at = float(web_turn.get("started_at") or now)
+                elif cs_running and cs is not None:
+                    started_at = float(cs.get("updated_at") or now)
+                else:
+                    started_at = now
+            elif in_dispatch:
+                state = "thinking"
+                stage_label = "已收到指令，准备接单处理"
+                started_at = dispatch_started or now
+            elif q_cnt > 0 and (room_id == "lobby" or mirror_bound):
+                state = "queued"
+                stage_label = f"排队等待中（{q_cnt} 单）"
+                started_at = now
+
+            if state != "idle":
+                elapsed_s = round(max(0.0, now - started_at), 1) if started_at else 0.0
+                active_bots.append(
+                    {
+                        "handle": h,
+                        "display_name": display_name,
+                        "role": role,
+                        "state": state,
+                        "stage_label": stage_label,
+                        "current_job_id": cur_job_id,
+                        "current_job_label": cur_job_label,
+                        "queue_depth": q_cnt,
+                        "started_at": round(started_at, 3) if started_at else None,
+                        "elapsed_s": elapsed_s,
+                    }
+                )
+
+        # Include any active running job whose bot isn't in roster yet
+        for jb, rj in running_job_by_bot.items():
+            if jb in seen_handles:
+                continue
+            st_ts = float(rj.get("started_at") or rj.get("created_at") or now)
+            active_bots.append(
+                {
+                    "handle": jb,
+                    "display_name": jb,
+                    "role": "worker",
+                    "state": "running",
+                    "stage_label": str(rj.get("progress") or "正在处理派单"),
+                    "current_job_id": str(rj.get("job_id") or "") or None,
+                    "current_job_label": str(rj.get("label") or ""),
+                    "queue_depth": queued_count_by_bot.get(jb, 0),
+                    "started_at": round(st_ts, 3),
+                    "elapsed_s": round(max(0.0, now - st_ts), 1),
+                }
+            )
+
+        state_order = {"thinking": 0, "running": 1, "queued": 2, "idle": 3}
+        role_order = {"coordinator": 0, "peer": 1, "worker": 2}
+        active_bots.sort(
+            key=lambda x: (
+                state_order.get(str(x.get("state") or "idle"), 9),
+                role_order.get(str(x.get("role") or "worker"), 9),
+                str(x.get("handle") or ""),
+            )
+        )
+
+        safe_dispatch = None
+        if recent_dispatch is not None:
+            safe_dispatch = {
+                "phase": str(recent_dispatch.get("phase") or "dispatched"),
+                "target_bots": list(recent_dispatch.get("target_bots") or []),
+                "dispatched_at": float(recent_dispatch.get("dispatched_at") or 0.0),
+                "stage_label": str(recent_dispatch.get("stage_label") or ""),
+            }
+
+        return web.json_response(
+            {
+                "ok": True,
+                "room_id": room_id,
+                "mode": "tg_mirror" if mirror_bound else "web_room",
+                "mirror_bound": bool(mirror_bound),
+                "server_ts": round(now, 3),
+                "active_bots": active_bots,
+                "recent_jobs": recent_jobs,
+                "recent_dispatch": safe_dispatch,
             }
         )
 
@@ -1198,18 +1743,43 @@ class StudioRoomService:
                 status=400,
             )
 
-        raw_content = body.get("content")
-        if not isinstance(raw_content, str) or not raw_content.strip():
+        raw_exec_mode = body.get("execution_mode", "queue")
+        if raw_exec_mode is None:
+            execution_mode = "queue"
+        elif (
+            not isinstance(raw_exec_mode, str)
+            or raw_exec_mode.strip().lower() not in _VALID_EXECUTION_MODES
+        ):
             self.audit.record(
                 action=action,
                 status_code=400,
-                outcome="denied_empty_content",
+                outcome="denied_invalid_execution_mode",
                 client_ip=client_ip,
                 target_id=raw_room_id,
                 sess=sess,
             )
             return web.json_response(
-                {"ok": False, "source": "studio_api", "error": "消息内容不能为空"},
+                {"ok": False, "source": "studio_api", "error": "execution_mode 必须为 queue 或 interrupt"},
+                status=400,
+            )
+        else:
+            execution_mode = raw_exec_mode.strip().lower()
+        is_urgent_mode = execution_mode == "interrupt"
+
+        raw_content = body.get("content")
+        if raw_content is None:
+            raw_content = ""
+        if not isinstance(raw_content, str):
+            self.audit.record(
+                action=action,
+                status_code=400,
+                outcome="denied_invalid_content",
+                client_ip=client_ip,
+                target_id=raw_room_id,
+                sess=sess,
+            )
+            return web.json_response(
+                {"ok": False, "source": "studio_api", "error": "消息内容必须为字符串"},
                 status=400,
             )
         if len(raw_content.encode("utf-8")) > MAX_ROOM_CONTENT_BYTES:
@@ -1224,6 +1794,81 @@ class StudioRoomService:
             return web.json_response(
                 {"ok": False, "source": "studio_api", "error": "消息正文超过 16 KiB 上限"},
                 status=413,
+            )
+
+        project_arg: str | None = None
+        if body.get("project") is not None and str(body.get("project")).strip():
+            resolved_proj = self.data_sources.resolve_allowed_project(str(body.get("project")))
+            if resolved_proj is None:
+                self.audit.record(
+                    action=action,
+                    status_code=400,
+                    outcome="denied_invalid_project",
+                    client_ip=client_ip,
+                    target_id=raw_room_id,
+                    sess=sess,
+                )
+                return web.json_response(
+                    {"ok": False, "source": "studio_api", "error": "项目不在服务端白名单内"},
+                    status=400,
+                )
+            project_arg = resolved_proj["id"]
+
+        raw_attachments = body.get("attachments")
+        raw_context_files = body.get("context_files")
+        resolved_atts: list[dict[str, Any]] = []
+        resolved_ctx: list[dict[str, str]] = []
+        if raw_attachments is not None or raw_context_files is not None:
+            if self.attachment_service is None:
+                return web.json_response(
+                    {"ok": False, "source": "studio_api", "error": "附件服务未启用"},
+                    status=503,
+                )
+            ok_att, resolved_atts, sc_att, err_att = self.attachment_service.resolve_attachments(
+                raw_attachments
+            )
+            if not ok_att:
+                self.audit.record(
+                    action=action,
+                    status_code=sc_att,
+                    outcome="denied_invalid_attachments",
+                    client_ip=client_ip,
+                    target_id=raw_room_id,
+                    sess=sess,
+                )
+                return web.json_response(
+                    {"ok": False, "source": "studio_api", "error": err_att},
+                    status=sc_att,
+                )
+            ok_ctx, resolved_ctx, sc_ctx, err_ctx = self.attachment_service.resolve_context_files(
+                raw_context_files, project_arg
+            )
+            if not ok_ctx:
+                self.audit.record(
+                    action=action,
+                    status_code=sc_ctx,
+                    outcome="denied_invalid_context_files",
+                    client_ip=client_ip,
+                    target_id=raw_room_id,
+                    sess=sess,
+                )
+                return web.json_response(
+                    {"ok": False, "source": "studio_api", "error": err_ctx},
+                    status=sc_ctx,
+                )
+
+        if not raw_content.strip() and not resolved_atts and not resolved_ctx:
+            self.audit.record(
+                action=action,
+                status_code=400,
+                outcome="denied_empty_content",
+                client_ip=client_ip,
+                target_id=raw_room_id,
+                sess=sess,
+            )
+            return web.json_response(
+                {"ok": False, "source": "studio_api", "error": "消息内容不能为空"},
+                status=400,
             )
 
         # Rate limiting (per session+room and global per session)
@@ -1257,23 +1902,182 @@ class StudioRoomService:
                 headers={"Retry-After": str(retry_after)},
             )
 
-        project_arg: str | None = None
-        if body.get("project") is not None and str(body.get("project")).strip():
-            resolved_proj = self.data_sources.resolve_allowed_project(str(body.get("project")))
-            if resolved_proj is None:
+        if resolved_atts or resolved_ctx:
+            assert self.attachment_service is not None
+            display_content, cli_content = self.attachment_service.build_prompt_with_attachments(
+                raw_content,
+                resolved_atts,
+                resolved_ctx,
+                max_bytes=MAX_ROOM_CONTENT_BYTES,
+            )
+            public_atts = self.attachment_service.strip_internal_paths(resolved_atts)
+            ctx_rel_list = [c["rel_path"] for c in resolved_ctx]
+            att_prompt_block = self.attachment_service.build_attachment_prompt_block(
+                resolved_atts, resolved_ctx
+            )
+        else:
+            display_content = raw_content
+            cli_content = raw_content
+            public_atts = []
+            ctx_rel_list = []
+            att_prompt_block = ""
+
+        mirror = self.data_sources.resolve_tg_mirror()
+        if raw_room_id == "lobby" and mirror.get("bound"):
+            # TG workgroup mirror mode: ZERO local studio_rooms/lobby.json writes & ZERO /ipc/room/turn relay
+            targets, target_err = self._resolve_mirror_dispatch_targets(raw_content)
+            if target_err or not targets:
                 self.audit.record(
                     action=action,
-                    status_code=400,
-                    outcome="denied_invalid_project",
+                    status_code=503,
+                    outcome="denied_target_unavailable",
                     client_ip=client_ip,
                     target_id=raw_room_id,
                     sess=sess,
                 )
                 return web.json_response(
-                    {"ok": False, "source": "studio_api", "error": "项目不在服务端白名单内"},
+                    {"ok": False, "source": "studio_api", "error": target_err or "无可用在线 Bot"},
+                    status=503,
+                )
+
+            safe_to_send = neutralize_control_tags(cli_content).strip()
+            if not safe_to_send:
+                self.audit.record(
+                    action=action,
+                    status_code=400,
+                    outcome="denied_empty_content",
+                    client_ip=client_ip,
+                    target_id=raw_room_id,
+                    sess=sess,
+                )
+                return web.json_response(
+                    {"ok": False, "source": "studio_api", "error": "消息内容不能为空"},
                     status=400,
                 )
-            project_arg = resolved_proj["id"]
+
+            sender_name = str(sess.get("username") or f"uid:{sess['user_id']}")
+            mirror_cid = int(mirror["chat_id"])
+            mirror_tid = mirror["thread_id"]
+            if self.event_hub is not None:
+                self.event_hub.ensure_mirror_baseline(mirror_cid, mirror_tid)
+            primary_bot = targets[0]
+            sc_ipc, resp_ipc = await self._call_bot_tg_group_send(
+                bot_handle=primary_bot,
+                user_id=int(sess["user_id"]),
+                actor_username=sender_name,
+                content=safe_to_send,
+                project=project_arg,
+                mirror_human_to_tg=True,
+                origin_msg_id=0,
+                priority="urgent" if is_urgent_mode else "normal",
+                interrupt_current=is_urgent_mode,
+            )
+            if sc_ipc >= 400 or not resp_ipc.get("ok"):
+                err_code = sc_ipc if 400 <= sc_ipc < 600 else 502
+                err_msg, _ = sanitize_room_text(
+                    resp_ipc.get("error") or f"Bot @{primary_bot} TG 群镜像投递失败",
+                    max_bytes=256,
+                )
+                self.audit.record(
+                    action=action,
+                    status_code=err_code,
+                    outcome="ipc_error",
+                    client_ip=client_ip,
+                    target_id=raw_room_id,
+                    sess=sess,
+                )
+                return web.json_response(
+                    {"ok": False, "source": "studio_api", "error": err_msg},
+                    status=err_code,
+                )
+
+            raw_entry = resp_ipc.get("entry")
+            if isinstance(raw_entry, dict):
+                human_msg = map_group_history_entry_to_room_message(
+                    raw_entry, room_id="lobby", max_content_bytes=MAX_ROOM_CONTENT_BYTES
+                )
+            else:
+                seq_fb = max(0, int(resp_ipc.get("seq") or 0))
+                human_msg = map_group_history_entry_to_room_message(
+                    {
+                        "seq": seq_fb,
+                        "ts": float(self.clock_fn()),
+                        "sender_handle": sender_name,
+                        "sender_role": "human",
+                        "is_bot": False,
+                        "full_text": safe_to_send,
+                        "source": "web",
+                    },
+                    room_id="lobby",
+                    max_content_bytes=MAX_ROOM_CONTENT_BYTES,
+                )
+            if public_atts:
+                human_msg["attachments"] = public_atts
+            if ctx_rel_list:
+                human_msg["context_files"] = ctx_rel_list
+
+            human_seq = int(human_msg.get("seq") or 0)
+            should_publish_human = True
+            if self.event_hub is not None and human_seq > 0:
+                should_publish_human = self.event_hub.note_mirror_seq_published(
+                    mirror_cid, mirror_tid, human_seq
+                )
+            if should_publish_human:
+                self._publish_room_message_event(human_msg)
+            if self.event_hub is None or not self.event_hub.has_mirror_bot_reply_after(
+                mirror_cid, mirror_tid, primary_bot, human_seq
+            ):
+                self._publish_room_typing("lobby", primary_bot, True)
+
+            dispatched_ok = [primary_bot]
+            origin_mid = max(0, int(resp_ipc.get("origin_msg_id") or 0))
+            for sec_bot in targets[1:]:
+                sc_sec, resp_sec = await self._call_bot_tg_group_send(
+                    bot_handle=sec_bot,
+                    user_id=int(sess["user_id"]),
+                    actor_username=sender_name,
+                    content=safe_to_send,
+                    project=project_arg,
+                    mirror_human_to_tg=False,
+                    origin_msg_id=origin_mid,
+                    priority="urgent" if is_urgent_mode else "normal",
+                    interrupt_current=is_urgent_mode,
+                )
+                if sc_sec < 400 and resp_sec.get("ok"):
+                    dispatched_ok.append(sec_bot)
+                    if self.event_hub is None or not self.event_hub.has_mirror_bot_reply_after(
+                        mirror_cid, mirror_tid, sec_bot, human_seq
+                    ):
+                        self._publish_room_typing("lobby", sec_bot, True)
+
+            self._record_recent_dispatch(
+                "lobby",
+                dispatched_ok,
+                source="web_dispatch",
+                human_seq=human_seq,
+                urgent=is_urgent_mode,
+            )
+
+            self.audit.record(
+                action=action,
+                status_code=201,
+                outcome="ok_interrupt" if is_urgent_mode else "ok",
+                client_ip=client_ip,
+                target_id=raw_room_id,
+                sess=sess,
+            )
+            return web.json_response(
+                {
+                    "ok": True,
+                    "mode": "tg_mirror",
+                    "execution_mode": execution_mode,
+                    "message": human_msg,
+                    "dispatched_bots": dispatched_ok,
+                    "blocked_bots": [],
+                    "blocked_reason": "",
+                },
+                status=201,
+            )
 
         online_handles = self._online_roster_handles()
         mentioned_all = extract_room_mentions(raw_content)
@@ -1314,8 +2118,10 @@ class StudioRoomService:
                 raw_room_id,
                 sender_type="human",
                 sender=sender_name,
-                content=raw_content,
+                content=display_content,
                 mentions=dispatched_bots,
+                attachments=public_atts or None,
+                context_files=ctx_rel_list or None,
                 chain_id=chain_id,
                 hop=0,
                 status="delivered",
@@ -1343,6 +2149,14 @@ class StudioRoomService:
         self._publish_room_message_event(human_msg)
         if sys_blocked_msg is not None:
             self._publish_room_message_event(sys_blocked_msg)
+        if to_dispatch:
+            self._record_recent_dispatch(
+                raw_room_id,
+                to_dispatch,
+                source="web_room_dispatch",
+                human_seq=int(human_msg.get("seq") or 0),
+                urgent=is_urgent_mode,
+            )
 
         for bot_h in to_dispatch:
             self._spawn_dispatch(
@@ -1355,13 +2169,15 @@ class StudioRoomService:
                     chain_id=chain_id,
                     hop=0,
                     project=project_arg,
+                    attachment_prompt_block=att_prompt_block,
+                    execution_mode=execution_mode,
                 )
             )
 
         self.audit.record(
             action=action,
             status_code=201,
-            outcome="ok",
+            outcome="ok_interrupt" if is_urgent_mode else "ok",
             client_ip=client_ip,
             target_id=raw_room_id,
             sess=sess,
@@ -1369,6 +2185,7 @@ class StudioRoomService:
         return web.json_response(
             {
                 "ok": True,
+                "execution_mode": execution_mode,
                 "message": human_msg,
                 "dispatched_bots": to_dispatch,
                 "blocked_bots": dropped_by_window,

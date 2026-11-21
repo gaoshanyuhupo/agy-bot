@@ -43,6 +43,8 @@ DEFAULT_KEEPALIVE_SEC = 15.0
 MAX_TURN_OWNERS = 512
 
 _VALID_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
+_VALID_EXECUTION_MODES = frozenset({"queue", "interrupt"})
+INTERRUPT_WAIT_TIMEOUT_SEC = 2.5
 
 
 def _utc_iso_now() -> str:
@@ -181,6 +183,7 @@ class StudioChatService:
         data_sources: StudioDataSources,
         *,
         audit_log_path: Path | None = None,
+        attachment_service: Any | None = None,
         revocation_check_interval: float = 1.5,
         keepalive_interval: float = DEFAULT_KEEPALIVE_SEC,
         max_streams_per_session: int = MAX_STREAMS_PER_SESSION,
@@ -188,6 +191,7 @@ class StudioChatService:
     ) -> None:
         self.auth_mgr = auth_mgr
         self.data_sources = data_sources
+        self.attachment_service = attachment_service
         default_audit = Path(
             os.environ.get("AGY_STUDIO_AUDIT_LOG", str(self.auth_mgr.config_dir / "audit.jsonl"))
         )
@@ -577,20 +581,22 @@ class StudioChatService:
                 status=body_sc,
             )
 
-        prompt = body.get("prompt")
-        if not isinstance(prompt, str) or not prompt.strip():
+        raw_prompt = body.get("prompt")
+        if raw_prompt is None:
+            raw_prompt = ""
+        if not isinstance(raw_prompt, str):
             self.audit.record(
                 action="chat.send",
                 status_code=400,
-                outcome="denied_empty_prompt",
+                outcome="denied_invalid_prompt",
                 client_ip=client_ip,
                 sess=sess,
             )
             return web.json_response(
-                {"ok": False, "source": "studio_api", "error": "消息内容不能为空"},
+                {"ok": False, "source": "studio_api", "error": "prompt 必须为字符串"},
                 status=400,
             )
-        if len(prompt.encode("utf-8")) > MAX_PROMPT_BODY_BYTES:
+        if len(raw_prompt.encode("utf-8")) > MAX_PROMPT_BODY_BYTES:
             self.audit.record(
                 action="chat.send",
                 status_code=413,
@@ -602,6 +608,78 @@ class StudioChatService:
                 {"ok": False, "source": "studio_api", "error": "prompt 超过 32 KiB 上限"},
                 status=413,
             )
+
+        raw_attachments = body.get("attachments")
+        raw_context_files = body.get("context_files")
+        project_raw = str(body.get("project") or "").strip() or None
+
+        resolved_atts: list[dict[str, Any]] = []
+        resolved_ctx: list[dict[str, str]] = []
+        if raw_attachments is not None or raw_context_files is not None:
+            if self.attachment_service is None:
+                return web.json_response(
+                    {"ok": False, "source": "studio_api", "error": "附件服务未启用"},
+                    status=503,
+                )
+            ok_att, resolved_atts, sc_att, err_att = self.attachment_service.resolve_attachments(
+                raw_attachments
+            )
+            if not ok_att:
+                self.audit.record(
+                    action="chat.send",
+                    status_code=sc_att,
+                    outcome="denied_invalid_attachments",
+                    client_ip=client_ip,
+                    sess=sess,
+                )
+                return web.json_response(
+                    {"ok": False, "source": "studio_api", "error": err_att},
+                    status=sc_att,
+                )
+            ok_ctx, resolved_ctx, sc_ctx, err_ctx = self.attachment_service.resolve_context_files(
+                raw_context_files, project_raw
+            )
+            if not ok_ctx:
+                self.audit.record(
+                    action="chat.send",
+                    status_code=sc_ctx,
+                    outcome="denied_invalid_context_files",
+                    client_ip=client_ip,
+                    sess=sess,
+                )
+                return web.json_response(
+                    {"ok": False, "source": "studio_api", "error": err_ctx},
+                    status=sc_ctx,
+                )
+
+        if not raw_prompt.strip() and not resolved_atts and not resolved_ctx:
+            self.audit.record(
+                action="chat.send",
+                status_code=400,
+                outcome="denied_empty_prompt",
+                client_ip=client_ip,
+                sess=sess,
+            )
+            return web.json_response(
+                {"ok": False, "source": "studio_api", "error": "消息内容不能为空"},
+                status=400,
+            )
+
+        if resolved_atts or resolved_ctx:
+            assert self.attachment_service is not None
+            display_prompt, prompt = self.attachment_service.build_prompt_with_attachments(
+                raw_prompt,
+                resolved_atts,
+                resolved_ctx,
+                max_bytes=MAX_PROMPT_BODY_BYTES,
+            )
+            public_atts = self.attachment_service.strip_internal_paths(resolved_atts)
+            ctx_rel_list = [c["rel_path"] for c in resolved_ctx]
+        else:
+            display_prompt = raw_prompt
+            prompt = raw_prompt
+            public_atts = []
+            ctx_rel_list = []
 
         effort_raw = str(body.get("effort") or "").strip().lower()
         if effort_raw and effort_raw not in _VALID_EFFORTS:
@@ -634,6 +712,27 @@ class StudioChatService:
                 )
             sync_tg = raw_sync_tg
 
+        raw_exec_mode = body.get("execution_mode", "queue")
+        if raw_exec_mode is None:
+            execution_mode = "queue"
+        elif (
+            not isinstance(raw_exec_mode, str)
+            or raw_exec_mode.strip().lower() not in _VALID_EXECUTION_MODES
+        ):
+            self.audit.record(
+                action="chat.send",
+                status_code=400,
+                outcome="denied_invalid_execution_mode",
+                client_ip=client_ip,
+                sess=sess,
+            )
+            return web.json_response(
+                {"ok": False, "source": "studio_api", "error": "execution_mode 必须为 queue 或 interrupt"},
+                status=400,
+            )
+        else:
+            execution_mode = raw_exec_mode.strip().lower()
+
         req_bot = str(body.get("bot") or "").strip() or None
         resolved = self._resolve_ipc_endpoint(req_bot)
         if resolved is None:
@@ -649,15 +748,117 @@ class StudioChatService:
 
         bot_handle, sock_path, ipc_token = resolved
         cid_val = str(body.get("cid") or "").strip() or None
+        uid_int = int(sess["user_id"])
+        interrupted_turn_id: str | None = None
+        interrupt_deadline = time.monotonic() + INTERRUPT_WAIT_TIMEOUT_SEC
+
+        if execution_mode == "interrupt":
+            abort_target_tid: str | None = None
+            if cid_val:
+                qs_active = urllib.parse.urlencode({"cid": cid_val, "user_id": str(uid_int)})
+                sc_act, act_data = await self._ipc_request_json(
+                    sock_path=sock_path,
+                    token=ipc_token,
+                    method="GET",
+                    path=f"/ipc/chat/active?{qs_active}",
+                    timeout_sec=3.0,
+                )
+                if sc_act == 200 and act_data.get("ok") and act_data.get("active"):
+                    cand_tid = str(act_data.get("turn_id") or "").strip()
+                    if cand_tid:
+                        owner = self._turn_owners.get(cand_tid)
+                        if owner is not None and not self._is_turn_owner(owner, sess):
+                            self.audit.record(
+                                action="chat.send",
+                                status_code=403,
+                                outcome="denied_cross_tenant",
+                                client_ip=client_ip,
+                                target_id=cand_tid,
+                                sess=sess,
+                                bot_override=bot_handle,
+                            )
+                            return studio_auth_error("无权中止其他账号的对话轮次", status=403)
+                        abort_target_tid = cand_tid
+            else:
+                sc_meta, meta_data = await self._ipc_request_json(
+                    sock_path=sock_path,
+                    token=ipc_token,
+                    method="GET",
+                    path="/ipc/meta",
+                    timeout_sec=3.0,
+                )
+                if sc_meta == 200 and meta_data.get("ok") and meta_data.get("busy"):
+                    cand_tid = str(meta_data.get("active_turn_id") or "").strip()
+                    if cand_tid:
+                        owner = self._turn_owners.get(cand_tid)
+                        if owner is not None and self._is_turn_owner(owner, sess):
+                            abort_target_tid = cand_tid
+                            meta_cid = str(meta_data.get("active_cid") or "").strip()
+                            if meta_cid and not cid_val:
+                                cid_val = meta_cid
+
+            if abort_target_tid:
+                sc_ab, ab_data = await self._ipc_request_json(
+                    sock_path=sock_path,
+                    token=ipc_token,
+                    method="POST",
+                    path="/ipc/chat/abort",
+                    payload={"turn_id": abort_target_tid, "user_id": uid_int},
+                    timeout_sec=5.0,
+                )
+                self.audit.record(
+                    action="chat.interrupt_abort",
+                    status_code=sc_ab,
+                    outcome="allowed" if sc_ab < 400 else f"denied_ipc_{sc_ab}",
+                    client_ip=client_ip,
+                    target_id=abort_target_tid,
+                    sess=sess,
+                    bot_override=bot_handle,
+                )
+                if sc_ab == 403:
+                    safe_ab_err = redact_secrets_only(ab_data.get("error") or "无权中止当前轮次", max_len=200)
+                    return studio_auth_error(safe_ab_err, status=403)
+                if sc_ab < 400 and ab_data.get("ok") and ab_data.get("aborted"):
+                    interrupted_turn_id = abort_target_tid
+                    # Wait briefly (<= 2.5s) for the interrupted turn to release its conversation lease.
+                    while time.monotonic() < interrupt_deadline:
+                        if cid_val:
+                            qs_poll = urllib.parse.urlencode({"cid": cid_val, "user_id": str(uid_int)})
+                            sc_p, p_data = await self._ipc_request_json(
+                                sock_path=sock_path,
+                                token=ipc_token,
+                                method="GET",
+                                path=f"/ipc/chat/active?{qs_poll}",
+                                timeout_sec=2.0,
+                            )
+                            if sc_p == 200 and p_data.get("ok") and not p_data.get("active"):
+                                break
+                        else:
+                            sc_p, p_data = await self._ipc_request_json(
+                                sock_path=sock_path,
+                                token=ipc_token,
+                                method="GET",
+                                path="/ipc/meta",
+                                timeout_sec=2.0,
+                            )
+                            if sc_p == 200 and p_data.get("ok") and (
+                                not p_data.get("busy")
+                                or str(p_data.get("active_turn_id") or "") != abort_target_tid
+                            ):
+                                break
+                        await asyncio.sleep(0.15)
+
         ipc_payload: dict[str, Any] = {
-            "user_id": int(sess["user_id"]),
+            "user_id": uid_int,
             "actor_username": str(sess.get("username") or ""),
             "prompt": prompt,
             "cid": cid_val,
-            "project": str(body.get("project") or "").strip() or None,
+            "project": project_raw,
             "model": str(body.get("model") or "").strip() or None,
             "effort": effort_raw or None,
             "sync_tg": sync_tg,
+            "priority": "urgent" if execution_mode == "interrupt" else "normal",
+            "interrupt_current": execution_mode == "interrupt",
         }
         sc, resp_data = await self._ipc_request_json(
             sock_path=sock_path,
@@ -668,28 +869,54 @@ class StudioChatService:
             timeout_sec=15.0,
         )
 
+        # In preview compatibility mode (old Bridge without native interrupt_current), a brief
+        # conv_lease release race can still return 409 session_busy right after /ipc/chat/abort.
+        while (
+            execution_mode == "interrupt"
+            and sc == 409
+            and resp_data.get("code") == "session_busy"
+            and time.monotonic() < interrupt_deadline
+        ):
+            await asyncio.sleep(0.15)
+            sc, resp_data = await self._ipc_request_json(
+                sock_path=sock_path,
+                token=ipc_token,
+                method="POST",
+                path="/ipc/chat/send",
+                payload=ipc_payload,
+                timeout_sec=15.0,
+            )
+
+        if not interrupted_turn_id and resp_data.get("interrupted_turn_id"):
+            interrupted_turn_id = str(resp_data.get("interrupted_turn_id"))
+
         turn_id = str(resp_data.get("turn_id") or "")
         if sc in (200, 202) and resp_data.get("ok") and turn_id:
             self._record_turn_owner(turn_id, sess=sess, target_bot=bot_handle, cid=cid_val)
             self.audit.record(
                 action="chat.send",
                 status_code=sc,
-                outcome="allowed",
+                outcome="allowed_interrupt" if execution_mode == "interrupt" else "allowed",
                 client_ip=client_ip,
                 target_id=turn_id,
                 sess=sess,
                 bot_override=bot_handle,
             )
-            return web.json_response(
-                {
-                    "ok": True,
-                    "turn_id": turn_id,
-                    "bot": bot_handle,
-                    "cid": resp_data.get("cid") or cid_val,
-                    "status": str(resp_data.get("status") or "queued"),
-                },
-                status=sc,
-            )
+            resp_out: dict[str, Any] = {
+                "ok": True,
+                "turn_id": turn_id,
+                "bot": bot_handle,
+                "cid": resp_data.get("cid") or cid_val,
+                "status": str(resp_data.get("status") or "queued"),
+                "display_prompt": display_prompt,
+                "execution_mode": execution_mode,
+                "interrupted_turn_id": interrupted_turn_id,
+            }
+            if public_atts:
+                resp_out["attachments"] = public_atts
+            if ctx_rel_list:
+                resp_out["context_files"] = ctx_rel_list
+            return web.json_response(resp_out, status=sc)
 
         self.audit.record(
             action="chat.send",

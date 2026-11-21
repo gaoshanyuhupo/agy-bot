@@ -1247,20 +1247,19 @@ class TestPBC6FrontendSyncRaceAndDedup(unittest.TestCase):
         self.assertIn("sessionSyncEvent={sessionSyncEvent}", app_src)
 
         # 3. WorkspaceView.tsx guards:
-        # - Admin-only syncTg toggle default true, persisted in localStorage, invisible for readonly
-        self.assertIn("SYNC_TG_STORAGE_KEY", ws_src)
-        self.assertIn("localStorage.getItem(SYNC_TG_STORAGE_KEY)", ws_src)
-        self.assertIn("localStorage.setItem(SYNC_TG_STORAGE_KEY", ws_src)
-        self.assertIn("sync_tg: !isReadonly && syncTg", ws_src)
+        # - Admin turns automatically set sync_tg: !isReadonly; workbench layout persisted via WORKBENCH_STORAGE_KEY
+        self.assertIn("WORKBENCH_STORAGE_KEY", ws_src)
+        self.assertIn("localStorage.getItem(WORKBENCH_STORAGE_KEY)", ws_src)
+        self.assertIn("localStorage.setItem(WORKBENCH_STORAGE_KEY", ws_src)
+        self.assertIn("sync_tg: !isReadonly", ws_src)
         self.assertIn("{!isReadonly && (", ws_src)
-        self.assertIn("同步到 TG", ws_src)
 
         # - Readonly never probes active-turn or mounts /api/chat/stream
         self.assertIn("if (isReadonly || !cid || streamingRef.current) return;", ws_src)
         self.assertIn("if (!isReadonly && !streamingRef.current)", ws_src)
 
         # - Monotonic genRef + activeCidRef + streamingRef guards in loadSessionHistory,
-        #   probeAndAttachActiveTurn, handleSend & attachStream
+        #   probeAndAttachActiveTurn, dispatchChatTurn & attachStream
         self.assertIn(
             "genRef.current !== reqGen || activeCidRef.current !== cid || (!beforeCursor && streamingRef.current)",
             ws_src,
@@ -1268,11 +1267,11 @@ class TestPBC6FrontendSyncRaceAndDedup(unittest.TestCase):
         self.assertIn("genRef.current += 1", ws_src)
         self.assertRegex(
             ws_src,
-            r"const handleSend = async \(\) => \{[\s\S]*?genRef\.current \+= 1;\s*const sendGen = genRef\.current;[\s\S]*?attachStream\(res\.turn_id,\s*res\.bot \|\| selectedBot,\s*sendGen,\s*\"local\"\);",
+            r"const dispatchChatTurn = async \([\s\S]*?genRef\.current \+= 1;\s*const sendGen = genRef\.current;[\s\S]*?attachStream\(res\.turn_id,\s*res\.bot \|\| safeBotParam \|\| \"\",\s*sendGen,\s*\"local\"\);",
         )
         self.assertRegex(
             ws_src,
-            r"const probeAndAttachActiveTurn = useCallback\([\s\S]*?if \(!res\.active \|\| !res\.turn_id\)[\s\S]*?genRef\.current \+= 1;\s*const attachGen = genRef\.current;[\s\S]*?attachStream\(res\.turn_id,\s*res\.bot \|\| botHint \|\| selectedBot,\s*attachGen,\s*\"remote\"\);",
+            r"const probeAndAttachActiveTurn = useCallback\([\s\S]*?if \(!res\.active \|\| !res\.turn_id\)[\s\S]*?genRef\.current \+= 1;\s*const attachGen = genRef\.current;[\s\S]*?attachStream\(res\.turn_id,\s*res\.bot \|\| safeBotHint \|\| effectiveBot,\s*attachGen,\s*\"remote\"\);",
         )
         self.assertIn("TG 实时同步中", ws_src)
 

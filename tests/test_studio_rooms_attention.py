@@ -292,8 +292,10 @@ class TestPhaseBM2RoomsAttentionWorkbench(unittest.IsolatedAsyncioTestCase):
         # Start mock Bridge UDS IPC servers for all 4 bots
         self.ipc_servers: dict[str, studio_ipc.StudioIPCServer] = {}
         self.room_turn_calls: list[dict[str, object]] = []
+        self.tg_group_send_calls: list[dict[str, object]] = []
         self.attention_notify_calls: list[dict[str, object]] = []
         self.bot_reply_handlers: dict[str, object] = {}
+        self._tg_mock_mid = 1000
 
         def _make_ipc(handle: str) -> studio_ipc.StudioIPCServer:
             def _resolve_role(uid: int) -> str:
@@ -316,6 +318,57 @@ class TestPhaseBM2RoomsAttentionWorkbench(unittest.IsolatedAsyncioTestCase):
                     "room_id": req["room_id"],
                     "status": "done",
                     "reply": reply_text,
+                }
+
+            def _tg_group_send(req: dict[str, object]) -> tuple[int, dict[str, object]]:
+                self.tg_group_send_calls.append({"bot": handle, **req})
+                mirror = self.sources.resolve_tg_mirror()
+                if not mirror.get("bound"):
+                    return 400, {"ok": False, "error": "mirror not bound"}
+                cid = int(mirror["chat_id"])
+                tid = mirror["thread_id"]
+                mirror_to_tg = bool(req.get("mirror_human_to_tg", True))
+                origin_mid = int(req.get("origin_msg_id") or 0)
+                entry_payload = None
+                seq_val = 0
+                if mirror_to_tg:
+                    self._tg_mock_mid += 1
+                    origin_mid = self._tg_mock_mid
+                    hist_dir = self.bus_dir / "group_history"
+                    hist_dir.mkdir(parents=True, exist_ok=True)
+                    hist_p = hist_dir / f"{cid}.json"
+                    if hist_p.is_file():
+                        doc = json.loads(hist_p.read_text(encoding="utf-8"))
+                    else:
+                        doc = {"version": 1, "next_seq": 1, "entries": [], "cursors": {}}
+                    seq_val = int(doc.get("next_seq") or 1)
+                    now_ts = float(self.clock())
+                    actor = str(req.get("actor_username") or f"uid:{req['user_id']}")
+                    txt = str(req.get("content") or "")
+                    entry_payload = {
+                        "seq": seq_val,
+                        "msg_id": origin_mid,
+                        "ts": now_ts,
+                        "thread_id": tid,
+                        "sender_handle": actor,
+                        "sender_role": "human",
+                        "is_bot": False,
+                        "text_excerpt": " ".join(txt.split())[:500],
+                        "full_text": txt,
+                        "truncated": False,
+                        "source": "web",
+                    }
+                    doc["entries"].append(entry_payload)
+                    doc["next_seq"] = seq_val + 1
+                    hist_p.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+                return 202, {
+                    "ok": True,
+                    "queued": True,
+                    "bot": handle,
+                    "mirrored_to_tg": mirror_to_tg,
+                    "origin_msg_id": origin_mid,
+                    "seq": seq_val,
+                    "entry": entry_payload,
                 }
 
             def _attention_notify(req: dict[str, object]) -> tuple[int, dict[str, object]]:
@@ -344,6 +397,7 @@ class TestPhaseBM2RoomsAttentionWorkbench(unittest.IsolatedAsyncioTestCase):
                 abort_turn_fn=lambda tid, _uid: (200, {"ok": True, "aborted": True, "turn_id": tid}),
                 room_turn_fn=_room_turn,
                 attention_notify_fn=_attention_notify,
+                tg_group_send_fn=_tg_group_send,
             )
             srv.start()
             return srv
@@ -1359,6 +1413,639 @@ class TestPhaseBM2RoomsAttentionWorkbench(unittest.IsolatedAsyncioTestCase):
             self.assertFalse((adir / "att-cap-overflow-201.json").exists())
         finally:
             await admin_cli.close()
+
+    # ======================================================================
+    # TG Workgroup Mirror Lobby + Default Coordinator Routing + Legacy Migration (C1..C8)
+    # ======================================================================
+    async def test_tg_mirror_lobby_routing_security_dedup_topic_isolation_and_sse(self) -> None:
+        """Contracts C1, C3, C4, C5, C6: TG mirror binding, default coordinator, explicit @, offline 503, SSE."""
+        mirror_gid = -1001234567890
+        mirror_tid = 42
+        (self.bus_dir / "team_config.json").write_text(
+            json.dumps({
+                "version": 1,
+                "mirror": {"chat_id": mirror_gid, "thread_id": mirror_tid},
+                "bots": {
+                    "alpha_bot": {"role": "coordinator"},
+                    "beta_bot": {"role": "worker"},
+                    "gamma_bot": {"role": "worker"},
+                },
+            }),
+            encoding="utf-8",
+        )
+        self.app[ROOM_SERVICE_KEY].rate_limit_max = 50
+        hub = self.app[EVENT_HUB_KEY]
+        admin_cli, admin_csrf = await self._login("admin", TEST_PASS_ADMIN)
+        ro_cli, ro_csrf = await self._login("viewer", TEST_PASS_RO)
+        try:
+            # 1. GET /api/rooms shows lobby in tg_mirror mode with ZERO raw chat_id/thread_id leakage
+            r_rooms = await ro_cli.get("/api/rooms")
+            self.assertEqual(r_rooms.status, 200)
+            raw_rooms_text = await r_rooms.text()
+            self.assertNotIn(str(mirror_gid), raw_rooms_text)
+            self.assertNotIn("mirror_chat_id", raw_rooms_text)
+            self.assertNotIn("mirror_thread_id", raw_rooms_text)
+            d_rooms = json.loads(raw_rooms_text)
+            lobby = next(r for r in d_rooms["rooms"] if r["room_id"] == "lobby")
+            self.assertEqual(lobby["mode"], "tg_mirror")
+            self.assertTrue(lobby["mirror_bound"])
+            self.assertEqual(lobby["default_bot"], "alpha_bot")
+
+            # 2. C1a/C1b gates on tg_mirror lobby: missing Origin, wrong CT, readonly, nested depth-16 forbidden keys
+            r_ro = await ro_cli.post(
+                "/api/rooms/lobby/messages",
+                headers={"Origin": self.origin, "X-Studio-CSRF": ro_csrf},
+                json={"content": "readonly blocked"},
+            )
+            self.assertEqual(r_ro.status, 403)
+
+            for bad_k in ("chat_id", "target_chat_id", "thread_id", "mirror_chat_id", "mirror_thread_id", "role", "scope_key"):
+                nested_val: object = {bad_k: -1001234567890}
+                for _ in range(15):
+                    nested_val = {"n": nested_val}
+                r_bad = await admin_cli.post(
+                    "/api/rooms/lobby/messages",
+                    headers={"Origin": self.origin, "X-Studio-CSRF": admin_csrf},
+                    json={"content": "hi", "extra": nested_val},
+                )
+                self.assertEqual(r_bad.status, 400, f"expected 400 for nested {bad_k}")
+            self.assertEqual(self.tg_group_send_calls, [])
+
+            # 3. C6(a) + C3(a): Bare message (no @) routes to online coordinator, ZERO /ipc/room/turn calls
+            self.room_turn_calls.clear()
+            self.tg_group_send_calls.clear()
+            r_bare = await admin_cli.post(
+                "/api/rooms/lobby/messages",
+                headers={"Origin": self.origin, "X-Studio-CSRF": admin_csrf},
+                json={"content": "帮我统筹一下今天的回归测试计划"},
+            )
+            self.assertEqual(r_bare.status, 201)
+            raw_bare = await r_bare.text()
+            self.assertNotIn(str(mirror_gid), raw_bare)
+            self.assertNotIn("origin_msg_id", raw_bare)
+            d_bare = json.loads(raw_bare)
+            self.assertEqual(d_bare["mode"], "tg_mirror")
+            self.assertEqual(d_bare["dispatched_bots"], ["alpha_bot"])
+            self.assertEqual(d_bare["message"]["msg_id"], "tg-1")
+            self.assertEqual(d_bare["message"]["seq"], 1)
+            self.assertEqual(d_bare["message"]["source"], "web")
+            self.assertEqual(self.room_turn_calls, [])
+            self.assertEqual(len(self.tg_group_send_calls), 1)
+            self.assertEqual(self.tg_group_send_calls[0]["bot"], "alpha_bot")
+            self.assertTrue(self.tg_group_send_calls[0]["mirror_human_to_tg"])
+
+            # 4. C6(b): Explicit beta_bot mention routes ONLY to beta_bot (not hijacked by coordinator)
+            self.tg_group_send_calls.clear()
+            r_exp = await admin_cli.post(
+                "/api/rooms/lobby/messages",
+                headers={"Origin": self.origin, "X-Studio-CSRF": admin_csrf},
+                json={"content": f"{AT_BETA} 请检查一下日志"},
+            )
+            self.assertEqual(r_exp.status, 201)
+            d_exp = await r_exp.json()
+            self.assertEqual(d_exp["dispatched_bots"], ["beta_bot"])
+            self.assertEqual([c["bot"] for c in self.tg_group_send_calls], ["beta_bot"])
+
+            # Multi-mention (beta_bot + gamma_bot) mirrors human message to TG ONCE only
+            self.tg_group_send_calls.clear()
+            r_multi = await admin_cli.post(
+                "/api/rooms/lobby/messages",
+                headers={"Origin": self.origin, "X-Studio-CSRF": admin_csrf},
+                json={"content": f"{AT_BETA} {AT_GAMMA} 一起核对"},
+            )
+            self.assertEqual(r_multi.status, 201)
+            self.assertEqual([c["bot"] for c in self.tg_group_send_calls], ["beta_bot", "gamma_bot"])
+            self.assertTrue(self.tg_group_send_calls[0]["mirror_human_to_tg"])
+            self.assertFalse(self.tg_group_send_calls[1]["mirror_human_to_tg"])
+
+            # 5. C6(c): Explicit offline_bot mention -> fail-closed 503, 0 IPC calls, 0 fake ledger writes
+            self.tg_group_send_calls.clear()
+            at_offline = "@" + "offline_bot"
+            r_off = await admin_cli.post(
+                "/api/rooms/lobby/messages",
+                headers={"Origin": self.origin, "X-Studio-CSRF": admin_csrf},
+                json={"content": f"{at_offline} 跑一下检查"},
+            )
+            self.assertEqual(r_off.status, 503)
+            self.assertEqual(self.tg_group_send_calls, [])
+
+            # Coordinator offline -> bare message fail-closed 503
+            roster_p = self.bus_dir / "roster.json"
+            roster_doc = json.loads(roster_p.read_text(encoding="utf-8"))
+            roster_doc["bots"]["alpha_bot"]["last_seen"] = 0.0
+            roster_p.write_text(json.dumps(roster_doc), encoding="utf-8")
+            r_no_coord = await admin_cli.post(
+                "/api/rooms/lobby/messages",
+                headers={"Origin": self.origin, "X-Studio-CSRF": admin_csrf},
+                json={"content": "无在线总指挥的普通指令"},
+            )
+            self.assertEqual(r_no_coord.status, 503)
+            self.assertEqual(self.tg_group_send_calls, [])
+            # Restore coordinator online
+            roster_doc["bots"]["alpha_bot"]["last_seen"] = time.time()
+            roster_p.write_text(json.dumps(roster_doc), encoding="utf-8")
+
+            # 6. C3(b) + C4(a) + C5(b): Topic isolation, secret/path redaction, legacy fallback, & SSE dedup
+            hist_p = self.bus_dir / "group_history" / f"{mirror_gid}.json"
+            doc = json.loads(hist_p.read_text(encoding="utf-8"))
+            # Bootstrap watcher watermark at current state (seq 1..3 already published via POST)
+            hub._poll_tg_mirror_history(bootstrap=True)
+            events_before = len(hub._events)
+            # Re-poll without changes -> 0 duplicate SSE events
+            hub._poll_tg_mirror_history(bootstrap=False)
+            self.assertEqual(len(hub._events), events_before)
+
+            # Append: (1) other Topic thread_id=99, (2) main topic thread_id=None,
+            # (3) bound topic thread_id=42 with secrets/host path/>16KiB, (4) legacy entry without full_text
+            next_s = int(doc["next_seq"])
+            doc["entries"].extend([
+                {
+                    "seq": next_s,
+                    "msg_id": 2001,
+                    "ts": float(self.clock()) + 1,
+                    "thread_id": 99,
+                    "sender_handle": "other_topic_user",
+                    "sender_role": "human",
+                    "is_bot": False,
+                    "text_excerpt": "OTHER_TOPIC_LEAK_99",
+                    "full_text": "OTHER_TOPIC_LEAK_99",
+                    "source": "tg",
+                },
+                {
+                    "seq": next_s + 1,
+                    "msg_id": 2002,
+                    "ts": float(self.clock()) + 2,
+                    "thread_id": None,
+                    "sender_handle": "main_topic_user",
+                    "sender_role": "human",
+                    "is_bot": False,
+                    "text_excerpt": "MAIN_TOPIC_LEAK_NONE",
+                    "full_text": "MAIN_TOPIC_LEAK_NONE",
+                    "source": "tg",
+                },
+                {
+                    "seq": next_s + 2,
+                    "msg_id": 2003,
+                    "ts": float(self.clock()) + 3,
+                    "thread_id": mirror_tid,
+                    "sender_handle": "alpha_bot",
+                    "sender_role": "coordinator",
+                    "is_bot": True,
+                    "text_excerpt": "总指挥已派单",
+                    "full_text": (
+                        f"总指挥已派单\n秘密 {SYNTH_GH_TOK} {SYNTH_SK_SEC1}\n路径 {SYNTH_HOME_KEY}\n"
+                        + ("X" * 18000)
+                    ),
+                    "source": "tg",
+                },
+                {
+                    "seq": next_s + 3,
+                    "msg_id": 2004,
+                    "ts": float(self.clock()) + 4,
+                    "thread_id": mirror_tid,
+                    "sender_handle": "legacy_tg_user",
+                    "sender_role": "human",
+                    "is_bot": False,
+                    "text_excerpt": "legacy fallback ok",
+                },
+            ])
+            doc["next_seq"] = next_s + 4
+            hist_p.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+
+            # Watcher emits ONLY bound thread_id=42 entries (2 room_message + 1 room_typing=False)
+            hub._poll_tg_mirror_history(bootstrap=False)
+            new_evs = list(hub._events)[events_before:]
+            room_msg_evs = [ev for ev in new_evs if ev[1] == "room_message"]
+            self.assertEqual(len(room_msg_evs), 2)
+            self.assertEqual([ev[2]["seq"] for ev in room_msg_evs], [next_s + 2, next_s + 3])
+            self.assertEqual([ev[2]["msg_id"] for ev in room_msg_evs], [f"tg-{next_s + 2}", f"tg-{next_s + 3}"])
+            for _seq, ev_type, ev_data in room_msg_evs:
+                frame = hub._format_sse_frame(ev_type, ev_data, seq=_seq)
+                self.assertLessEqual(len(frame), 16 * 1024)
+                frame_txt = frame.decode("utf-8")
+                self.assertNotIn("OTHER_TOPIC_LEAK_99", frame_txt)
+                self.assertNotIn("MAIN_TOPIC_LEAK_NONE", frame_txt)
+                self.assertNotIn(str(mirror_gid), frame_txt)
+                self.assertNotIn(SYNTH_GH_TOK, frame_txt)
+                self.assertNotIn(SYNTH_SK_SEC1, frame_txt)
+                self.assertNotIn(SYNTH_HOME_KEY, frame_txt)
+            # Bot reply also cleared typing indicator
+            self.assertTrue(
+                any(ev[1] == "room_typing" and ev[2].get("bot") == "alpha_bot" and ev[2].get("typing") is False for ev in new_evs)
+            )
+
+            # GET /api/rooms/lobby/messages matches exact same seq/msg_id and excludes other topics
+            r_msgs = await ro_cli.get("/api/rooms/lobby/messages")
+            self.assertEqual(r_msgs.status, 200)
+            raw_msgs = await r_msgs.text()
+            self.assertNotIn("OTHER_TOPIC_LEAK_99", raw_msgs)
+            self.assertNotIn("MAIN_TOPIC_LEAK_NONE", raw_msgs)
+            self.assertNotIn(str(mirror_gid), raw_msgs)
+            self.assertNotIn(SYNTH_GH_TOK, raw_msgs)
+            self.assertNotIn(SYNTH_SK_SEC1, raw_msgs)
+            self.assertNotIn(SYNTH_HOME_KEY, raw_msgs)
+            d_msgs = json.loads(raw_msgs)
+            self.assertEqual(d_msgs["room"]["mode"], "tg_mirror")
+            legacy_loaded = [m for m in d_msgs["messages"] if m["seq"] == next_s + 3]
+            self.assertEqual(len(legacy_loaded), 1)
+            self.assertEqual(legacy_loaded[0]["content"], "legacy fallback ok")
+
+            # 7. C6(d): AGY_STUDIO_MIRROR_CHAT_ID="0" disables mirror and falls back cleanly to web_room
+            with mock.patch.dict(os.environ, {"AGY_STUDIO_MIRROR_CHAT_ID": "0"}, clear=False):
+                r_off_env = await ro_cli.get("/api/rooms")
+                d_off_env = await r_off_env.json()
+                lobby_off = next(r for r in d_off_env["rooms"] if r["room_id"] == "lobby")
+                self.assertEqual(lobby_off["mode"], "web_room")
+                self.assertFalse(lobby_off["mirror_bound"])
+        finally:
+            await admin_cli.close()
+            await ro_cli.close()
+
+    async def test_tg_mirror_c7_legacy_lobby_index_migration_and_frontend_clean_copy(self) -> None:
+        """Contract C7: Legacy `index.json` auto-migration and zero isolation wording in backend/frontend."""
+        rooms_dir = self.bus_dir / "studio_rooms"
+        rooms_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(rooms_dir, 0o700)
+        idx_p = rooms_dir / "index.json"
+        legacy_phrase = "Web 多 Bot 协作群聊室（与 Telegram 群聊" + "完全隔离）"
+        idx_p.write_text(
+            json.dumps({
+                "version": 1,
+                "rooms": {
+                    "lobby": {
+                        "room_id": "lobby",
+                        "title": "大厅" + "隔离 Lobby",
+                        "topic": legacy_phrase,
+                        "created_at": 1700000000.0,
+                        "updated_at": 1700000000.0,
+                        "last_seq": 0,
+                        "message_count": 0,
+                    }
+                },
+            }, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        os.chmod(idx_p, 0o600)
+
+        ro_cli, _ = await self._login("viewer", TEST_PASS_RO)
+        try:
+            r_list = await ro_cli.get("/api/rooms")
+            self.assertEqual(r_list.status, 200)
+            d_list = await r_list.json()
+            lobby = next(r for r in d_list["rooms"] if r["room_id"] == "lobby")
+            self.assertNotIn("完全" + "隔离", lobby["topic"])
+            self.assertNotIn("大厅" + "隔离", lobby["title"])
+            # Persisted index.json was auto-migrated in place with 0600 permissions
+            persisted = json.loads(idx_p.read_text(encoding="utf-8"))
+            self.assertNotIn("完全" + "隔离", persisted["rooms"]["lobby"]["topic"])
+            self.assertNotIn("大厅" + "隔离", persisted["rooms"]["lobby"]["title"])
+            self.assertEqual(stat.S_IMODE(idx_p.stat().st_mode), 0o600)
+        finally:
+            await ro_cli.close()
+
+        # Source scan: zero legacy isolation wording across backend & frontend room components
+        forbidden_phrases = ("完全" + "隔离", "大厅" + "隔离", "必须 @")
+        for rel in (
+            "studio/room_service.py",
+            "webui/src/components/RoomPanel.tsx",
+            "webui/src/components/MobileMoreSheet.tsx",
+        ):
+            src = (REPO_ROOT / rel).read_text(encoding="utf-8")
+            for phrase in forbidden_phrases:
+                self.assertNotIn(phrase, src, f"stale isolation phrase {phrase!r} found in {rel}")
+
+        room_tsx = (REPO_ROOT / "webui/src/components/RoomPanel.tsx").read_text(encoding="utf-8")
+        self.assertIn("TG 工作群镜像", room_tsx)
+        self.assertIn("总指挥", room_tsx)
+        self.assertIn("SafeMarkdown", room_tsx)
+
+    async def test_tg_mirror_block1_cold_start_bootstrap_preserves_concurrent_bot_reply(self) -> None:
+        """BLOCK-1: Cold-start `_poll_tg_mirror_history(bootstrap=True)` must not swallow replies after baseline anchor."""
+        mirror_gid = -1001234567890
+        mirror_tid = 42
+        (self.bus_dir / "team_config.json").write_text(
+            json.dumps({
+                "version": 1,
+                "mirror": {"chat_id": mirror_gid, "thread_id": mirror_tid},
+                "bots": {"alpha_bot": {"role": "coordinator"}},
+            }),
+            encoding="utf-8",
+        )
+        hub = self.app[EVENT_HUB_KEY]
+        self.assertIsNone(hub._last_fp)
+        self.assertIsNone(hub._mirror_key)
+
+        # HTTP POST anchored mirror baseline & claimed seq=1 before watcher's first bootstrap tick
+        self.assertEqual(hub.ensure_mirror_baseline(mirror_gid, mirror_tid), 0)
+        self.assertTrue(hub.note_mirror_seq_published(mirror_gid, mirror_tid, 1))
+
+        # Disk receives seq=1 (human) and concurrent seq=2 (coordinator bot reply)
+        hist_dir = self.bus_dir / "group_history"
+        hist_dir.mkdir(parents=True, exist_ok=True)
+        hist_p = hist_dir / f"{mirror_gid}.json"
+        hist_p.write_text(
+            json.dumps({
+                "version": 1,
+                "next_seq": 3,
+                "entries": [
+                    {
+                        "seq": 1,
+                        "msg_id": 3001,
+                        "ts": float(self.clock()),
+                        "thread_id": mirror_tid,
+                        "sender_handle": "admin",
+                        "sender_role": "human",
+                        "is_bot": False,
+                        "text_excerpt": "冷启动提问",
+                        "full_text": "冷启动提问",
+                        "source": "web",
+                    },
+                    {
+                        "seq": 2,
+                        "msg_id": 3002,
+                        "ts": float(self.clock()) + 1.0,
+                        "thread_id": mirror_tid,
+                        "sender_handle": "alpha_bot",
+                        "sender_role": "coordinator",
+                        "is_bot": True,
+                        "text_excerpt": "总指挥秒回",
+                        "full_text": "总指挥秒回",
+                        "source": "tg",
+                    },
+                ],
+                "cursors": {},
+            }, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        before = len(hub._events)
+        hub._poll_tg_mirror_history(bootstrap=True)
+        new_evs = list(hub._events)[before:]
+
+        msg_evs = [ev for ev in new_evs if ev[1] == "room_message"]
+        self.assertEqual([ev[2]["seq"] for ev in msg_evs], [2])
+        self.assertEqual(msg_evs[0][2]["sender"], "alpha_bot")
+        self.assertEqual(msg_evs[0][2]["sender_type"], "bot")
+        typing_evs = [ev for ev in new_evs if ev[1] == "room_typing"]
+        self.assertTrue(
+            any(ev[2].get("bot") == "alpha_bot" and ev[2].get("typing") is False for ev in typing_evs),
+            f"expected room_typing(alpha_bot, False), got {typing_evs}",
+        )
+
+    async def test_tg_mirror_block2_hot_await_race_no_duplicate_and_no_typing_inversion(self) -> None:
+        """BLOCK-2: Watcher running during IPC await causes 0 duplicate human msgs and 0 typing=True inversion."""
+        mirror_gid = -1001234567890
+        mirror_tid = 42
+        (self.bus_dir / "team_config.json").write_text(
+            json.dumps({
+                "version": 1,
+                "mirror": {"chat_id": mirror_gid, "thread_id": mirror_tid},
+                "bots": {
+                    "alpha_bot": {"role": "coordinator"},
+                    "beta_bot": {"role": "worker"},
+                    "gamma_bot": {"role": "worker"},
+                },
+            }),
+            encoding="utf-8",
+        )
+        hist_dir = self.bus_dir / "group_history"
+        hist_dir.mkdir(parents=True, exist_ok=True)
+        hist_p = hist_dir / f"{mirror_gid}.json"
+        hist_p.write_text(
+            json.dumps({
+                "version": 1,
+                "next_seq": 2,
+                "entries": [
+                    {
+                        "seq": 1,
+                        "msg_id": 4001,
+                        "ts": float(self.clock()),
+                        "thread_id": mirror_tid,
+                        "sender_handle": "admin",
+                        "sender_role": "human",
+                        "is_bot": False,
+                        "text_excerpt": "历史消息",
+                        "full_text": "历史消息",
+                        "source": "tg",
+                    }
+                ],
+                "cursors": {},
+            }, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        hub = self.app[EVENT_HUB_KEY]
+        room_svc = self.app[ROOM_SERVICE_KEY]
+        room_svc.rate_limit_max = 50
+        hub._poll_tg_mirror_history(bootstrap=True)
+
+        orig_ipc = room_svc._call_bot_tg_group_send
+
+        async def _racing_ipc(*args, **kwargs):
+            sc, resp = await orig_ipc(*args, **kwargs)
+            bot_h = str(kwargs.get("bot_handle") or "")
+            if sc < 400 and resp.get("ok"):
+                doc = json.loads(hist_p.read_text(encoding="utf-8"))
+                nxt = int(doc.get("next_seq") or 1)
+                doc["entries"].append({
+                    "seq": nxt,
+                    "msg_id": 4100 + nxt,
+                    "ts": float(self.clock()) + nxt,
+                    "thread_id": mirror_tid,
+                    "sender_handle": bot_h,
+                    "sender_role": "worker",
+                    "is_bot": True,
+                    "text_excerpt": f"{bot_h} 快速回复",
+                    "full_text": f"{bot_h} 快速回复",
+                    "source": "tg",
+                })
+                doc["next_seq"] = nxt + 1
+                hist_p.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+                # Watcher polls BEFORE POST resumes after await
+                hub._poll_tg_mirror_history(bootstrap=False)
+            return sc, resp
+
+        admin_cli, admin_csrf = await self._login("admin", TEST_PASS_ADMIN)
+        try:
+            events_before = len(hub._events)
+            with mock.patch.object(room_svc, "_call_bot_tg_group_send", side_effect=_racing_ipc):
+                r_post = await admin_cli.post(
+                    "/api/rooms/lobby/messages",
+                    headers={"Origin": self.origin, "X-Studio-CSRF": admin_csrf},
+                    json={"content": f"{AT_BETA} {AT_GAMMA} 并发核对"},
+                )
+            self.assertEqual(r_post.status, 201)
+            d_post = await r_post.json()
+            self.assertEqual(d_post["dispatched_bots"], ["beta_bot", "gamma_bot"])
+            self.assertEqual(d_post["message"]["seq"], 2)
+
+            new_evs = list(hub._events)[events_before:]
+            msg_seqs = [ev[2]["seq"] for ev in new_evs if ev[1] == "room_message"]
+            self.assertEqual(msg_seqs.count(2), 1, f"human seq=2 duplicated: {msg_seqs}")
+            self.assertEqual(msg_seqs, [2, 3, 4])
+
+            for b in ("beta_bot", "gamma_bot"):
+                b_typing = [ev[2]["typing"] for ev in new_evs if ev[1] == "room_typing" and ev[2].get("bot") == b]
+                self.assertIn(False, b_typing, f"missing typing=False for {b}: {b_typing}")
+                self.assertEqual(b_typing[-1], False, f"typing inversion (ended True) for {b}: {b_typing}")
+                self.assertNotIn(True, b_typing, f"stale typing=True emitted after reply for {b}: {b_typing}")
+        finally:
+            await admin_cli.close()
+
+    async def test_tg_mirror_block2_concurrent_tg_msg_not_skipped_by_web_seq_note(self) -> None:
+        """BLOCK-2: `note_mirror_seq_published(..., 3)` must not jump `_mirror_last_seq` over unseen TG seq=2."""
+        mirror_gid = -1001234567890
+        mirror_tid = 42
+        (self.bus_dir / "team_config.json").write_text(
+            json.dumps({
+                "version": 1,
+                "mirror": {"chat_id": mirror_gid, "thread_id": mirror_tid},
+                "bots": {"alpha_bot": {"role": "coordinator"}},
+            }),
+            encoding="utf-8",
+        )
+        hist_dir = self.bus_dir / "group_history"
+        hist_dir.mkdir(parents=True, exist_ok=True)
+        hist_p = hist_dir / f"{mirror_gid}.json"
+        doc = {
+            "version": 1,
+            "next_seq": 2,
+            "entries": [
+                {
+                    "seq": 1,
+                    "msg_id": 5001,
+                    "ts": float(self.clock()),
+                    "thread_id": mirror_tid,
+                    "sender_handle": "alice",
+                    "sender_role": "human",
+                    "is_bot": False,
+                    "text_excerpt": "基线消息",
+                    "full_text": "基线消息",
+                    "source": "tg",
+                }
+            ],
+            "cursors": {},
+        }
+        hist_p.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+
+        hub = self.app[EVENT_HUB_KEY]
+        self.assertIsNone(hub._mirror_key)
+        self.assertEqual(hub.ensure_mirror_baseline(mirror_gid, mirror_tid), 1)
+
+        # During await: concurrent TG msg gets seq=2, Web msg gets seq=3
+        doc["entries"].extend([
+            {
+                "seq": 2,
+                "msg_id": 5002,
+                "ts": float(self.clock()) + 1.0,
+                "thread_id": mirror_tid,
+                "sender_handle": "tg_user",
+                "sender_role": "human",
+                "is_bot": False,
+                "text_excerpt": "并发 TG 消息",
+                "full_text": "并发 TG 消息",
+                "source": "tg",
+            },
+            {
+                "seq": 3,
+                "msg_id": 5003,
+                "ts": float(self.clock()) + 2.0,
+                "thread_id": mirror_tid,
+                "sender_handle": "admin",
+                "sender_role": "human",
+                "is_bot": False,
+                "text_excerpt": "Web 消息",
+                "full_text": "Web 消息",
+                "source": "web",
+            },
+        ])
+        doc["next_seq"] = 4
+        hist_p.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+
+        # HTTP POST claims seq=3 first without jumping `_mirror_last_seq` past seq=2
+        self.assertTrue(hub.note_mirror_seq_published(mirror_gid, mirror_tid, 3))
+        self.assertEqual(hub._mirror_last_seq, 1)
+
+        before = len(hub._events)
+        hub._poll_tg_mirror_history(bootstrap=False)
+        new_evs = list(hub._events)[before:]
+        msg_evs = [ev for ev in new_evs if ev[1] == "room_message"]
+        self.assertEqual([ev[2]["seq"] for ev in msg_evs], [2])
+        self.assertEqual(msg_evs[0][2]["text"], "并发 TG 消息")
+        self.assertEqual(hub._mirror_last_seq, 3)
+
+    async def test_tg_mirror_block2_inode_change_detected_with_same_mtime_and_size(self) -> None:
+        """BLOCK-2: File replacement with identical `(st_mtime_ns, st_size)` but new `st_ino` triggers poll."""
+        mirror_gid = -1001234567890
+        mirror_tid = 42
+        (self.bus_dir / "team_config.json").write_text(
+            json.dumps({
+                "version": 1,
+                "mirror": {"chat_id": mirror_gid, "thread_id": mirror_tid},
+                "bots": {"alpha_bot": {"role": "coordinator"}},
+            }),
+            encoding="utf-8",
+        )
+        hist_dir = self.bus_dir / "group_history"
+        hist_dir.mkdir(parents=True, exist_ok=True)
+        hist_p = hist_dir / f"{mirror_gid}.json"
+        payload1 = json.dumps({
+            "version": 1,
+            "next_seq": 2,
+            "entries": [{
+                "seq": 1,
+                "msg_id": 6001,
+                "ts": 1800000000.0,
+                "thread_id": mirror_tid,
+                "sender_handle": "alpha_bot",
+                "sender_role": "coordinator",
+                "is_bot": True,
+                "text_excerpt": "MSG_AAAA",
+                "full_text": "MSG_AAAA",
+                "source": "tg",
+            }],
+            "cursors": {},
+        }, ensure_ascii=False)
+        hist_p.write_text(payload1, encoding="utf-8")
+
+        hub = self.app[EVENT_HUB_KEY]
+        hub._poll_tg_mirror_history(bootstrap=True)
+        old_st = hist_p.stat()
+
+        # Atomic replace via a brand-new inode with exact same byte size & mtime_ns
+        payload2 = json.dumps({
+            "version": 1,
+            "next_seq": 3,
+            "entries": [{
+                "seq": 2,
+                "msg_id": 6002,
+                "ts": 1800000001.0,
+                "thread_id": mirror_tid,
+                "sender_handle": "alpha_bot",
+                "sender_role": "coordinator",
+                "is_bot": True,
+                "text_excerpt": "MSG_BBBB",
+                "full_text": "MSG_BBBB",
+                "source": "tg",
+            }],
+            "cursors": {},
+        }, ensure_ascii=False)
+        self.assertEqual(len(payload1.encode("utf-8")), len(payload2.encode("utf-8")))
+        tmp_p = hist_dir / f"{mirror_gid}.json.ino_tmp"
+        tmp_p.write_text(payload2, encoding="utf-8")
+        os.utime(tmp_p, ns=(old_st.st_atime_ns, old_st.st_mtime_ns))
+        os.replace(tmp_p, hist_p)
+        new_st = hist_p.stat()
+        self.assertNotEqual(new_st.st_ino, old_st.st_ino)
+        self.assertEqual(new_st.st_mtime_ns, old_st.st_mtime_ns)
+        self.assertEqual(new_st.st_size, old_st.st_size)
+
+        before = len(hub._events)
+        hub._poll_tg_mirror_history(bootstrap=False)
+        new_evs = list(hub._events)[before:]
+        msg_evs = [ev for ev in new_evs if ev[1] == "room_message"]
+        self.assertEqual([ev[2]["seq"] for ev in msg_evs], [2])
+        self.assertEqual(msg_evs[0][2]["text"], "MSG_BBBB")
 
 
 if __name__ == "__main__":
