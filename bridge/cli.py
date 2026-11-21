@@ -79,6 +79,8 @@ AGY_TG_BOT_TOKEN=1234567890:REPLACE_WITH_TELEGRAM_BOT_TOKEN
 AGY_TG_ALLOWED_CHATS=123456789
 AGY_TG_WORKDIR=$HOME/agy-workspace
 AGY_TG_AGY_BIN=$HOME/.local/bin/agy
+# Disable silent Antigravity CLI auto-updates by default (set to 0 to re-enable auto-updates)
+AGY_CLI_DISABLE_AUTO_UPDATE=1
 AGY_TG_STATE_FILE=$HOME/.agy-tg-bridge-state.json
 AGY_TG_RELOAD_FILE=/tmp/agy_bridge_reload
 AGY_TG_PRINT_TIMEOUT=30m
@@ -700,6 +702,7 @@ def _render_systemd_unit(
         "[Service]\n"
         "Type=simple\n"
         f"Environment=AGY_TG_ENV_FILE={env_path}\n"
+        "Environment=AGY_CLI_DISABLE_AUTO_UPDATE=1\n"
         f"EnvironmentFile={env_path}\n"
         f"WorkingDirectory={dest_dir}\n"
         f"ExecStart={python_bin} {bridge_script}\n"

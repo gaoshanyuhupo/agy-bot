@@ -107,6 +107,7 @@ ALLOWED_USERS = access_control.parse_uid_set(os.environ.get("AGY_TG_ALLOWED_USER
 ADMIN_USERS = access_control.parse_uid_set(os.environ.get("AGY_TG_ADMIN_USERS", ""))
 READONLY_USERS = access_control.parse_uid_set(os.environ.get("AGY_TG_READONLY_USERS", ""))
 ALLOW_GROUP_READONLY = access_control.parse_bool_flag(os.environ.get("AGY_TG_ALLOW_GROUP_READONLY", "0"), default=False)
+DISABLE_AGY_AUTO_UPDATE = access_control.parse_bool_flag(os.environ.get("AGY_CLI_DISABLE_AUTO_UPDATE", "1"), default=True)
 FALLBACK_MODELS_RAW = os.environ.get("AGY_TG_FALLBACK_MODELS", "").strip()
 FALLBACK_MODELS = model_failover.parse_fallback_models(FALLBACK_MODELS_RAW)
 WORKDIR = os.path.realpath(os.environ.get("AGY_TG_WORKDIR", os.path.join(HOME, "agy-workspace")))
@@ -2073,7 +2074,29 @@ def _apply_exec_env(env, exec_plan):
     _strip_gateway_env(env)
     env_set = (exec_plan or {}).get("env_set") or {}
     if env_set:
-        env.update(env_set)
+        for k, v in env_set.items():
+            if k == "AGY_CLI_DISABLE_AUTO_UPDATE":
+                continue
+            env[k] = v
+    return env
+
+
+def _apply_agy_auto_update_env(env):
+    """Apply `AGY_CLI_DISABLE_AUTO_UPDATE` guard to a child `agy` subprocess environment.
+
+    - Unset or blank -> follow `DISABLE_AGY_AUTO_UPDATE` (default True -> `"1"`).
+    - Explicit truthy (`1`/`true`/`yes`/`on`) -> `"1"`.
+    - Explicit falsy (`0`/`false`/`no`/`off`, case/whitespace-insensitive) -> pop key completely.
+    """
+    raw = env.get("AGY_CLI_DISABLE_AUTO_UPDATE")
+    if raw is None or not str(raw).strip():
+        disabled = DISABLE_AGY_AUTO_UPDATE
+    else:
+        disabled = access_control.parse_bool_flag(raw, default=DISABLE_AGY_AUTO_UPDATE)
+    if disabled:
+        env["AGY_CLI_DISABLE_AUTO_UPDATE"] = "1"
+    else:
+        env.pop("AGY_CLI_DISABLE_AUTO_UPDATE", None)
     return env
 
 
@@ -2130,6 +2153,7 @@ class AgySession:
 
         env = dict(os.environ)
         _apply_exec_env(env, exec_plan)
+        _apply_agy_auto_update_env(env)
         env["PATH"] = os.path.join(HOME, ".local/bin") + ":" + env.get("PATH", "")
         env.setdefault("HOME", HOME)
         env["AGY_OUTBOX_DIR"] = BOT_OUTBOX_DIR
@@ -4595,6 +4619,7 @@ def _run_fast_group_reply(
 
         env = dict(os.environ)
         _apply_exec_env(env, exec_plan)
+        _apply_agy_auto_update_env(env)
         env["PATH"] = os.path.join(HOME, ".local/bin") + ":" + env.get("PATH", "")
         env.setdefault("HOME", HOME)
         env["AGY_BOT_BUS_ENABLE"] = "0"
@@ -6493,6 +6518,7 @@ def execute_scheduled_task(task):
 
             env = dict(os.environ)
             _apply_exec_env(env, exec_plan)
+            _apply_agy_auto_update_env(env)
             env["PATH"] = os.path.join(HOME, ".local/bin") + ":" + env.get("PATH", "")
             env.setdefault("HOME", HOME)
             env["AGY_OUTBOX_DIR"] = BOT_OUTBOX_DIR
@@ -6885,6 +6911,7 @@ def _execute_bus_job(job_id):
 
         env = dict(os.environ)
         _apply_exec_env(env, exec_plan)
+        _apply_agy_auto_update_env(env)
         env["PATH"] = os.path.join(HOME, ".local/bin") + ":" + env.get("PATH", "")
         env.setdefault("HOME", HOME)
         env["AGY_OUTBOX_DIR"] = BOT_OUTBOX_DIR
@@ -8989,6 +9016,7 @@ def agy_native_models(use_cache=True):
                 return list(cached)
     env = dict(os.environ)
     _strip_gateway_env(env)
+    _apply_agy_auto_update_env(env)
     env["PATH"] = os.path.join(HOME, ".local/bin") + ":" + env.get("PATH", "")
     try:
         r = subprocess.run([AGY_BIN, "models"], capture_output=True, text=True,
@@ -10097,6 +10125,7 @@ def fetch_plan_quota_data(force_live=True):
 
         env = dict(os.environ)
         _strip_gateway_env(env)
+        _apply_agy_auto_update_env(env)
         env["AGY_INTERNAL_OBSERVER"] = "1"
         env["PATH"] = os.path.join(HOME, ".local/bin") + ":" + env.get("PATH", "")
         env.setdefault("HOME", HOME)

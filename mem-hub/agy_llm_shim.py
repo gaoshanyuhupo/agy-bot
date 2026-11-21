@@ -34,6 +34,38 @@ DEFAULT_MODEL = os.environ.get("AGY_SHIM_MODEL", "gemini-3.8-flash-low")
 ALLOW_CALLER_MODEL = os.environ.get("AGY_SHIM_ALLOW_CALLER_MODEL", "0") == "1"
 AGY_BIN = os.environ.get("AGY_BIN", str(Path.home() / ".local/bin/agy"))
 
+
+def _parse_bool_flag(raw: Optional[str], default: bool = True) -> bool:
+    if raw is None:
+        return default
+    s = str(raw).strip().lower()
+    if not s:
+        return default
+    if s in ("1", "true", "yes", "on"):
+        return True
+    if s in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
+DISABLE_AGY_AUTO_UPDATE = _parse_bool_flag(
+    os.environ.get("AGY_CLI_DISABLE_AUTO_UPDATE", "1"), default=True
+)
+
+
+def _apply_agy_auto_update_env(env: dict[str, str]) -> dict[str, str]:
+    """Enforce `AGY_CLI_DISABLE_AUTO_UPDATE` on warm observer `agy` child env."""
+    raw = env.get("AGY_CLI_DISABLE_AUTO_UPDATE")
+    if raw is None or not str(raw).strip():
+        disabled = DISABLE_AGY_AUTO_UPDATE
+    else:
+        disabled = _parse_bool_flag(raw, default=DISABLE_AGY_AUTO_UPDATE)
+    if disabled:
+        env["AGY_CLI_DISABLE_AUTO_UPDATE"] = "1"
+    else:
+        env.pop("AGY_CLI_DISABLE_AUTO_UPDATE", None)
+    return env
+
 BASE_DIR = Path(os.environ.get("AGY_MEM_HUB_DIR", str(Path.home() / "agy-mem-hub")))
 SANDBOX_DIR = BASE_DIR / "observer-sandbox"
 STATE_DIR = BASE_DIR / "state"
@@ -278,6 +310,7 @@ class AgyObserverPool:
         env = os.environ.copy()
         env["AGY_INTERNAL_OBSERVER"] = "1"
         env["ECC_SKIP_OBSERVE"] = "1"
+        _apply_agy_auto_update_env(env)
         local_bin = str(Path.home() / ".local/bin")
         env["PATH"] = f"{local_bin}:{env.get('PATH', '')}"
 
