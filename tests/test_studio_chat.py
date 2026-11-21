@@ -501,11 +501,27 @@ class TestPAC1SingleWriterIPCAndBridgeHooks(unittest.TestCase):
                 elif isinstance(node, ast.ImportFrom):
                     self.assertNotEqual(node.module, "subprocess", f"Forbidden subprocess import in {py_file.name}")
                 elif isinstance(node, ast.Attribute):
+                    forbidden_attrs = (
+                        ("create_subprocess_shell", "Popen")
+                        if py_file.name == "workspace_files.py"
+                        else ("create_subprocess_exec", "create_subprocess_shell", "Popen")
+                    )
                     self.assertNotIn(
                         node.attr,
-                        ("create_subprocess_exec", "create_subprocess_shell", "Popen"),
+                        forbidden_attrs,
                         f"Forbidden process spawn attribute {node.attr} in {py_file.name}",
                     )
+                elif (
+                    py_file.name == "workspace_files.py"
+                    and isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "create_subprocess_exec"
+                ):
+                    # Phase B M1: workspace_files.py may ONLY invoke read-only `git` via create_subprocess_exec
+                    self.assertTrue(node.args, "create_subprocess_exec must have literal 'git' executable")
+                    first_arg = node.args[0]
+                    self.assertIsInstance(first_arg, ast.Constant)
+                    self.assertEqual(first_arg.value, "git")
             # Zero `readlines()` in studio/data_sources.py (bounded reverse seek required)
             if py_file.name == "data_sources.py":
                 self.assertNotIn(".readlines(", src)

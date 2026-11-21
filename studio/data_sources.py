@@ -116,11 +116,12 @@ _CONTROLLED_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,47}$")
 _ALLOWED_JOB_STATUSES = frozenset({"queued", "running", "done", "error", "failed", "cancelled", "unknown"})
 _ALLOWED_BOT_ROLES = frozenset({"coordinator", "peer", "worker"})
 _SENSITIVE_HOST_PATH_RE = re.compile(
-    r"(?:(?<=^)|(?<=[\s(\[\{\"'`=:;,]))"
-    r"(?:/(?:home|Users|root|etc|var|tmp|opt|srv|proc|run|mnt|media|data|private|secrets)/[^\s,'\"`<>)\]}]+"
+    r"(?:(?<=^)|(?<=[\s(\[\{\"'`=:;,+\-]))"
+    r"(?:(?i:file):///(?:home|Users|root|etc|var|tmp|opt|srv|proc|run|mnt|media|data|private|secrets)/[^\s,'\"`<>)\]}]+"
+    r"|/(?:home|Users|root|etc|var|tmp|opt|srv|proc|run|mnt|media|data|private|secrets)/[^\s,'\"`<>)\]}]+"
     r"|~/[^\s,'\"`<>)\]}]+"
     r"|[A-Za-z]:[\\/][^\s,'\"`<>)\]}]+"
-    r"|[^\s(\[\{\"'`=:;,<>)\]}]+\.sock\b)"
+    r"|[^\s(\[\{\"'`=:;,<>)\]}+\-]+\.sock\b)"
 )
 
 
@@ -667,6 +668,7 @@ class StudioDataSources:
                 "model_mode": _sanitize_slug(merged.get("model_mode"), max_len=32),
                 "effective_model": _sanitize_slug(merged.get("effective_model") or merged.get("active_model") or "default", max_len=64),
                 "active_model": _sanitize_slug(merged.get("active_model") or "", max_len=64),
+                "default_effort": _sanitize_slug(merged.get("default_effort") or "", max_len=16),
                 "default_project": _sanitize_slug(merged.get("default_project") or "", max_len=64),
                 "last_seen": float(merged["last_seen"] or 0.0),
             })
@@ -1220,6 +1222,7 @@ class StudioDataSources:
             "egress": "" if restricted else _sanitize_slug(data.get("egress") or "direct", max_len=32),
             "os": "" if restricted else _sanitize_slug(data.get("os") or "", max_len=32),
             "takeover": False if restricted else bool(data.get("takeover")),
+            "takeover_reason": "" if restricted else redact_sensitive_text(data.get("takeover_reason") or "", max_len=160),
             "ai_busy": False if restricted else bool(data.get("ai_busy")),
             "url": safe_url,
             "title": safe_title,

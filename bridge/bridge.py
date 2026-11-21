@@ -1526,6 +1526,7 @@ def _current_bot_cfg():
         _current_bot_handle(),
         env_role=ENV_BOT_ROLE,
         env_model=ENV_BOT_MODEL,
+        env_effort=ENV_BOT_EFFORT or "",
         env_project=ENV_BOT_PROJECT or sc.get("project") or "",
         env_specialty=ENV_BOT_SPECIALTY,
         fallback_workdir=sc.get("workdir") or WORKDIR,
@@ -1537,6 +1538,8 @@ def _current_bot_role():
 
 
 def _desired_bus_enable(scope_key=None):
+    if str(scope_key or "").startswith("room:"):
+        return False
     role = _current_bot_role()
     if role in ("coordinator", "peer"):
         return True
@@ -3680,6 +3683,23 @@ _UNDO_MAX_FILE_BYTES = 2 * 1024 * 1024
 _UNDO_MAX_TOTAL_BYTES = 60 * 1024 * 1024
 _UNDO_MAX_FILES = 3000
 _UNDO_STACK_LIMIT = 10
+_PENDING_UNDO_NOTICES_MAX = 64
+
+
+def _record_pending_undo_notice_by_cid_locked(entry_cid: str, notice: str) -> None:
+    """Record a per-conversation undo notice in bounded LRU order (max `_PENDING_UNDO_NOTICES_MAX`)."""
+    cid_s = str(entry_cid or "").strip()
+    if not cid_s:
+        return
+    by_cid_notices = state.get("pending_undo_notices_by_cid")
+    if not isinstance(by_cid_notices, dict):
+        by_cid_notices = {}
+        state["pending_undo_notices_by_cid"] = by_cid_notices
+    by_cid_notices.pop(cid_s, None)
+    by_cid_notices[cid_s] = notice
+    while len(by_cid_notices) > _PENDING_UNDO_NOTICES_MAX:
+        oldest_key = next(iter(by_cid_notices))
+        by_cid_notices.pop(oldest_key, None)
 _UNDO_STAT_CACHE = {}  # (realpath, mtime_ns, size) -> sha1_hex
 
 
@@ -3837,17 +3857,43 @@ def finalize_turn_undo(scope_key, wdir, pre_manifest, prompt_preview, conv):
 
 
 def _safe_under_workdir(wdir, rel_path):
-    if not wdir or not rel_path or os.path.isabs(rel_path):
+    if not wdir or not isinstance(rel_path, str) or not rel_path:
         return None
+    if "\x00" in rel_path or "\\" in rel_path or os.path.isabs(rel_path):
+        return None
+    if rel_path.startswith("/") or rel_path.endswith("/"):
+        return None
+    parts = rel_path.split("/")
+    for part in parts:
+        if not part or part in (".", ".."):
+            return None
+        if any(ord(c) < 32 or ord(c) == 127 for c in part):
+            return None
     rw = os.path.realpath(wdir)
-    target = os.path.realpath(os.path.join(rw, rel_path))
+    if not rw or not os.path.isdir(rw):
+        return None
+    # Walk every intermediate directory component AND the final target component to reject
+    # any symlink (including dangling symlinks) BEFORE realpath resolution or disk writes.
+    cur = rw
+    for part in parts:
+        cur = os.path.join(cur, part)
+        if os.path.islink(cur):
+            return None
+    target = os.path.realpath(cur)
     if not target.startswith(rw + os.sep):
         return None
     return target
 
 
-def _write_blob_atomic(dest, sha1_hex, mode=None):
+def _write_blob_atomic(dest, sha1_hex, mode=None, *, workdir=None):
     raw = _undo_read_blob(sha1_hex)
+    if workdir:
+        rw = os.path.realpath(workdir)
+        rel_check = os.path.relpath(dest, rw).replace(os.sep, "/")
+        if _safe_under_workdir(rw, rel_check) != dest:
+            raise OSError("unsafe symlink or path escape detected")
+    if os.path.islink(dest):
+        raise OSError("refusing to overwrite symlink target")
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     tmp = dest + f".acbundo.{os.getpid()}"
     with open(tmp, "wb") as f:
@@ -3860,22 +3906,29 @@ def _write_blob_atomic(dest, sha1_hex, mode=None):
     os.replace(tmp, dest)
 
 
-def _apply_checkpoint_changes(entry, reverse=False, force=False):
+def _apply_checkpoint_changes_detailed(entry, reverse=False, force=False):
     """Apply an undo (reverse=False) or redo (reverse=True) checkpoint.
-    Returns `(ok, applied_items, conflicts, prepared_reverse_changes)`.
+
+    Strictly separates illegal path / symlink escape violations (`path_errors`) from
+    external-modification conflicts (`conflicts`). Even when `force=True`, ANY path or
+    symlink violation fails closed across the entire batch with ZERO disk mutations.
+
+    Returns `(ok, applied_items, conflicts, path_errors, prepared_reverse_changes)`.
     """
     wdir = entry.get("workdir")
     changes = entry.get("changes") or []
     if not wdir or not os.path.isdir(wdir):
-        return False, [], [f"(工作目录不存在: {wdir})"], []
+        return False, [], [f"(工作目录不存在: {wdir})"], [], []
 
+    rw = os.path.realpath(wdir)
+    path_errors = []
     conflicts = []
     targets = []
     for ch in changes:
         rel = ch.get("path")
-        dest = _safe_under_workdir(wdir, rel)
+        dest = _safe_under_workdir(rw, rel)
         if not dest:
-            conflicts.append(f"{rel} (非法路径)")
+            path_errors.append(f"{rel} (非法路径或符号链接逃逸)")
             continue
         act = ch.get("action")
         if reverse:
@@ -3898,23 +3951,32 @@ def _apply_checkpoint_changes(entry, reverse=False, force=False):
 
         targets.append((rel, dest, act, desired_sha1, desired_mode, cur_sha1))
 
+    # Security invariant (PB-C2): path/symlink escape MUST fail closed unconditionally,
+    # even when `force=True`, BEFORE any write or delete occurs.
+    if path_errors:
+        return False, [], path_errors, path_errors, []
+
     if conflicts and not force:
-        return False, [], conflicts, []
+        return False, [], conflicts, [], []
 
     # Verify all required blobs exist before mutating disk
     for rel, _dest, _act, desired_sha1, _dmode, _csha1 in targets:
         if desired_sha1 and not os.path.isfile(_undo_blob_path(desired_sha1)):
-            return False, [], [f"{rel} (缺失历史备份块 {desired_sha1[:8]})"], []
+            return False, [], [f"{rel} (缺失历史备份块 {desired_sha1[:8]})"], [], []
 
     applied = []
     for rel, dest, act, desired_sha1, desired_mode, _csha1 in targets:
+        # TOCTOU re-check right before mutating disk
+        if _safe_under_workdir(rw, rel) != dest or os.path.islink(dest):
+            return False, applied, [f"{rel} (非法路径或符号链接逃逸)"], [f"{rel} (非法路径或符号链接逃逸)"], []
         if desired_sha1 is None:
             if os.path.exists(dest):
                 try:
                     os.remove(dest)
                     parent = os.path.dirname(dest)
-                    rw = os.path.realpath(wdir)
                     while parent and parent.startswith(rw + os.sep):
+                        if os.path.islink(parent):
+                            break
                         try:
                             os.rmdir(parent)
                         except OSError:
@@ -3922,13 +3984,23 @@ def _apply_checkpoint_changes(entry, reverse=False, force=False):
                         parent = os.path.dirname(parent)
                     applied.append(("deleted", rel))
                 except OSError as e:
-                    return False, applied, [f"{rel}: {e}"], []
+                    return False, applied, [f"{rel}: {e}"], [], []
         else:
             existed_before = os.path.exists(dest)
-            _write_blob_atomic(dest, desired_sha1, mode=desired_mode)
+            _write_blob_atomic(dest, desired_sha1, mode=desired_mode, workdir=rw)
             applied.append(("restored" if existed_before else "recreated", rel))
 
-    return True, applied, [], changes
+    return True, applied, [], [], changes
+
+
+def _apply_checkpoint_changes(entry, reverse=False, force=False):
+    """Apply an undo (reverse=False) or redo (reverse=True) checkpoint.
+    Returns `(ok, applied_items, conflicts, prepared_reverse_changes)`.
+    """
+    ok, applied, conflicts, _path_errors, changes = _apply_checkpoint_changes_detailed(
+        entry, reverse=reverse, force=force
+    )
+    return ok, applied, conflicts, changes
 
 
 # ---------------------------------------------------------------- core execution
@@ -4616,9 +4688,9 @@ def _make_prompt_preview(raw_prompt, max_len=240):
 
 
 def _is_internal_turn_for_sync(scope_key_val, prompt_text, cid_val=None, workdir_val=None):
-    """Return True if a turn belongs to internal/observer/pure-llm/scheduled/delegation lanes."""
+    """Return True if a turn belongs to internal/observer/pure-llm/scheduled/delegation/room lanes."""
     sk = str(scope_key_val or "")
-    if sk.startswith("bus:"):
+    if sk.startswith("bus:") or sk.startswith("room:"):
         return True
     pt = str(prompt_text or "")
     if "[ACB_SCHEDULED_TASK" in pt or "[ACB_TEAM_DELEGATION" in pt:
@@ -4799,9 +4871,30 @@ def run_agy(
             undo_notice = None
         else:
             conv = override_cid if override_cid is not None else sc.get("conversation_id")
-            undo_notice = None if is_web_turn else sc.get("pending_undo_notice")
-            if not is_web_turn:
-                sc["pending_undo_notice"] = None
+            by_cid_notices = state.get("pending_undo_notices_by_cid")
+            if is_web_turn:
+                undo_notice = None
+                if conv:
+                    if isinstance(by_cid_notices, dict) and conv in by_cid_notices:
+                        undo_notice = by_cid_notices.pop(conv, None)
+                    sc_notice = sc.get("pending_undo_notice")
+                    sc_notice_cid = sc.get("pending_undo_notice_cid")
+                    if sc_notice and (sc_notice_cid == conv or (not sc_notice_cid and skey.endswith(f":{conv}"))):
+                        if not undo_notice:
+                            undo_notice = sc_notice
+                        sc["pending_undo_notice"] = None
+                        sc.pop("pending_undo_notice_cid", None)
+            else:
+                undo_notice = None
+                if conv and isinstance(by_cid_notices, dict) and conv in by_cid_notices:
+                    undo_notice = by_cid_notices.pop(conv, None)
+                sc_notice = sc.get("pending_undo_notice")
+                sc_notice_cid = sc.get("pending_undo_notice_cid")
+                if sc_notice and (not sc_notice_cid or sc_notice_cid == conv):
+                    if not undo_notice:
+                        undo_notice = sc_notice
+                    sc["pending_undo_notice"] = None
+                    sc.pop("pending_undo_notice_cid", None)
 
     model = override_model or _resolve_effective_model(skey)
     workdir = WORKDIR
@@ -6987,6 +7080,7 @@ def _publish_bot_heartbeat():
             "env_default_model": ENV_BOT_MODEL or "",
             "model_mode": cfg.get("model_mode") or bot_bus.MODEL_MODE_DEFAULT,
             "configured_model": cfg.get("configured_model") or "",
+            "default_effort": (sc.get("effort") or cfg.get("default_effort") or ENV_BOT_EFFORT or ""),
             "model_rev": int(cfg.get("model_rev") or 0),
             "workdir": sc.get("workdir") or WORKDIR,
             "project": current_project(PRIMARY_SCOPE_KEY) or "",
@@ -7471,6 +7565,765 @@ def _studio_ipc_run_schedule(schedule_id, user_id):
     }
 
 
+_undo_apply_lock = threading.Lock()
+MCP_CONFIG_FILE = os.path.join(HOME, ".gemini", "config", "mcp_config.json")
+SKILLS_SEARCH_DIRS = None  # Optional override list of `(scope, dir_path)` for tests
+
+_IPC_SECRET_PATTERNS = (
+    re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{8,}\b"),
+    re.compile(r"\b\d{8,11}:[A-Za-z0-9_-]{24,45}\b"),
+    re.compile(r"\bAIza[0-9A-Za-z_-]{16,}\b"),
+    re.compile(r"\bsk-(?:proj-|ant-|svcacct-|admin-)?[A-Za-z0-9_-]{16,}\b"),
+    re.compile(r"\b(?:cfut|cfsd|cfat|ibk|ibssh|alt)_[A-Za-z0-9_-]{8,}\b"),
+    re.compile(r"\bhvs\.[A-Za-z0-9_-]{10,}\b"),
+    re.compile(r"\b(?:lv[12]|kv/data|secret/data)/[A-Za-z0-9_./*-]+\b"),
+    re.compile(r"(?i)\b(?:bearer|basic)\s+[^\s,;\"'`)\]}]+"),
+    re.compile(
+        r"""(?i)(?<![A-Za-z0-9_.-])(?:token|apikey|api_key|key|secret|password|passwd|pwd|cookie|authorization|credential)\s*[:=]\s*[^\s,;\"'`&)\]}]+"""
+    ),
+)
+_IPC_HOST_PATH_RE = re.compile(
+    r"(?:(?<=^)|(?<=[\s(\[\{\"'`=:;,+\-]))"
+    r"(?:(?i:file):///(?:home|Users|root|etc|var|tmp|opt|srv|proc|run|mnt|media|data|private|secrets)/[^\s,'\"`<>)\]}]+"
+    r"|/(?:home|Users|root|etc|var|tmp|opt|srv|proc|run|mnt|media|data|private|secrets)/[^\s,'\"`<>)\]}]+"
+    r"|~/[^\s,'\"`<>)\]}]+"
+    r"|[A-Za-z]:[\\/][^\s,'\"`<>)\]}]+"
+    r"|[^\s(\[\{\"'`=:;,<>)\]}+\-]+\.sock\b)"
+)
+_IPC_SLUG_CLEAN_RE = re.compile(r"[^A-Za-z0-9._:@/-]+")
+
+
+def _redact_ipc_text(raw, max_len=160):
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    for pat in _IPC_SECRET_PATTERNS:
+        text = pat.sub("[REDACTED]", text)
+    text = _IPC_HOST_PATH_RE.sub("[REDACTED]", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if max_len and len(text) > max_len:
+        text = text[: max_len - 1].rstrip() + "…"
+    return text
+
+
+def _sanitize_ipc_slug(raw, max_len=64):
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    if text.startswith(("/", "~")):
+        text = os.path.basename(text)
+    text = _redact_ipc_text(text, max_len=max_len)
+    if "[REDACTED]" in text:
+        return "[REDACTED]"
+    return _IPC_SLUG_CLEAN_RE.sub("_", text)[:max_len]
+
+
+def _parse_skill_frontmatter(skill_md_path):
+    """Parse ONLY `name` and `description` from a SKILL.md YAML frontmatter block."""
+    name = ""
+    desc = ""
+    try:
+        with open(skill_md_path, "r", encoding="utf-8", errors="replace") as fh:
+            head = fh.read(4096)
+    except OSError:
+        return "", ""
+    lines = head.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return "", ""
+    for line in lines[1:40]:
+        s = line.strip()
+        if s == "---":
+            break
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        kl = k.strip().lower()
+        val = v.strip().strip("'\"")
+        if kl == "name" and val:
+            name = val
+        elif kl == "description" and val:
+            desc = val
+    return name, desc
+
+
+def _collect_sanitized_mcp_list():
+    """Return strictly allowlisted MCP metadata: `{name, transport, enabled}` ONLY.
+
+    NEVER exposes `env`, `headers`, `command`, `args`, `url`, `lv1/...`, tokens, or host paths.
+    """
+    cfg_path = MCP_CONFIG_FILE
+    if not cfg_path or not os.path.isfile(cfg_path):
+        return []
+    try:
+        with open(cfg_path, "r", encoding="utf-8", errors="replace") as fh:
+            doc = json.load(fh)
+    except Exception:
+        return []
+    servers = doc.get("mcpServers") if isinstance(doc, dict) else None
+    if not isinstance(servers, dict):
+        return []
+    out = []
+    for raw_name, srv_cfg in sorted(servers.items()):
+        if not isinstance(srv_cfg, dict):
+            continue
+        safe_name = _sanitize_ipc_slug(raw_name, max_len=64)
+        if not safe_name:
+            continue
+        raw_type = str(srv_cfg.get("type") or srv_cfg.get("transport") or "").strip().lower()
+        if raw_type in ("sse", "http", "streamable-http", "stdio"):
+            transport = raw_type
+        elif srv_cfg.get("url") or srv_cfg.get("serverUrl"):
+            transport = "http"
+        elif srv_cfg.get("command"):
+            transport = "stdio"
+        else:
+            transport = "unknown"
+        enabled = not bool(srv_cfg.get("disabled", False))
+        out.append({
+            "name": safe_name,
+            "transport": transport,
+            "enabled": enabled,
+        })
+    return out[:64]
+
+
+def _collect_sanitized_skills_list():
+    """Return strictly allowlisted Skills metadata: `{name, scope, description (<=160)}` ONLY."""
+    if SKILLS_SEARCH_DIRS is not None:
+        roots = list(SKILLS_SEARCH_DIRS)
+    else:
+        roots = [
+            ("workspace", os.path.join(WORKDIR, ".agents", "skills")),
+            ("builtin", os.path.join(HOME, ".gemini", "antigravity-cli", "builtin", "skills")),
+        ]
+        plugins_dir = os.path.join(HOME, ".gemini", "config", "plugins")
+        if os.path.isdir(plugins_dir):
+            try:
+                for p_ent in sorted(os.scandir(plugins_dir), key=lambda e: e.name):
+                    if p_ent.is_dir(follow_symlinks=False):
+                        sk_d = os.path.join(p_ent.path, "skills")
+                        if os.path.isdir(sk_d):
+                            roots.append(("plugin", sk_d))
+            except OSError:
+                pass
+
+    items = []
+    seen = set()
+    for scope, root_dir in roots:
+        if not root_dir or not os.path.isdir(root_dir):
+            continue
+        try:
+            entries = sorted(os.scandir(root_dir), key=lambda e: e.name)
+        except OSError:
+            continue
+        for ent in entries:
+            if not ent.is_dir(follow_symlinks=False):
+                continue
+            md_path = os.path.join(ent.path, "SKILL.md")
+            if os.path.islink(md_path) or not os.path.isfile(md_path):
+                continue
+            parsed_name, parsed_desc = _parse_skill_frontmatter(md_path)
+            safe_name = _sanitize_ipc_slug(parsed_name or ent.name, max_len=64)
+            if not safe_name:
+                continue
+            key = (str(scope), safe_name)
+            if key in seen:
+                continue
+            seen.add(key)
+            safe_desc = _redact_ipc_text(parsed_desc, max_len=160)
+            items.append({
+                "name": safe_name,
+                "scope": _sanitize_ipc_slug(scope, max_len=24) or "workspace",
+                "description": safe_desc,
+            })
+            if len(items) >= 120:
+                return items
+    return items
+
+
+def _resolve_project_by_id_or_workdir():
+    """Return `(by_id, by_realpath)` maps built from `list_agy_projects()`."""
+    by_id = {}
+    by_real = {}
+    try:
+        projs = list_agy_projects()
+    except Exception:
+        projs = []
+    for p in projs:
+        pid = str(p.get("id") or "").strip()
+        wdir = str(p.get("workdir") or "").strip()
+        if pid:
+            by_id[pid] = p
+        if wdir:
+            by_real[os.path.realpath(wdir)] = pid
+    return by_id, by_real
+
+
+def _sanitize_undo_entry_for_ipc(entry, *, by_real, is_top):
+    wdir = str(entry.get("workdir") or "").strip()
+    rw = os.path.realpath(wdir) if wdir else ""
+    pid = by_real.get(rw, "")
+    raw_changes = entry.get("changes") or []
+    safe_changes = []
+    for ch in raw_changes[:50]:
+        if not isinstance(ch, dict):
+            continue
+        rel = _redact_ipc_text(str(ch.get("path") or ""), max_len=200)
+        act = _sanitize_ipc_slug(ch.get("action") or "modified", max_len=24)
+        safe_changes.append({"path": rel, "action": act})
+    return {
+        "entry_id": _sanitize_ipc_slug(entry.get("id") or "", max_len=64),
+        "ts": int(entry.get("ts") or 0),
+        "cid": str(entry.get("conv") or ""),
+        "project_id": _sanitize_ipc_slug(pid, max_len=64),
+        "prompt": _redact_ipc_text(entry.get("prompt") or "", max_len=120),
+        "truncated": bool(entry.get("truncated", False)),
+        "changes_count": len(raw_changes),
+        "changes": safe_changes,
+        "is_top": bool(is_top),
+    }
+
+
+def _studio_ipc_list_undo(user_id, cid=None, project_id=None):
+    by_id, by_real = _resolve_project_by_id_or_workdir()
+    target_rw = None
+    if project_id:
+        proj = by_id.get(project_id)
+        if not proj:
+            return 404, {"ok": False, "error": "未找到对应的白名单项目"}
+        target_rw = os.path.realpath(str(proj.get("workdir") or ""))
+
+    undo_out = []
+    redo_out = []
+    with state_lock:
+        scopes = state.get("scopes") or {}
+        for _skey, sc in scopes.items():
+            if not isinstance(sc, dict):
+                continue
+            for stack_name, bucket in (("undo_stack", undo_out), ("redo_stack", redo_out)):
+                stk = sc.get(stack_name) or []
+                if not isinstance(stk, list):
+                    continue
+                top_idx = len(stk) - 1
+                for idx, ent in enumerate(stk):
+                    if not isinstance(ent, dict):
+                        continue
+                    ent_cid = str(ent.get("conv") or "")
+                    if cid and ent_cid != cid:
+                        continue
+                    ent_wdir = str(ent.get("workdir") or "").strip()
+                    ent_rw = os.path.realpath(ent_wdir) if ent_wdir else ""
+                    if target_rw and ent_rw != target_rw:
+                        continue
+                    bucket.append(
+                        _sanitize_undo_entry_for_ipc(ent, by_real=by_real, is_top=(idx == top_idx))
+                    )
+
+    undo_out.sort(key=lambda x: (not x["is_top"], -int(x["ts"])))
+    redo_out.sort(key=lambda x: (not x["is_top"], -int(x["ts"])))
+    return 200, {
+        "ok": True,
+        "bot": _current_bot_handle(),
+        "undo_stack": undo_out[:30],
+        "redo_stack": redo_out[:30],
+    }
+
+
+def _studio_ipc_apply_checkpoint(req, *, reverse=False):
+    entry_id = str(req.get("entry_id") or "").strip()
+    req_cid = req.get("cid")
+    req_pid = req.get("project_id")
+    force = bool(req.get("force", False))
+    stack_key = "redo_stack" if reverse else "undo_stack"
+    other_key = "undo_stack" if reverse else "redo_stack"
+
+    by_id, by_real = _resolve_project_by_id_or_workdir()
+    target_rw = None
+    if req_pid:
+        proj = by_id.get(req_pid)
+        if not proj:
+            return 404, {"ok": False, "code": "project_not_found", "error": "未找到对应的白名单项目"}
+        target_rw = os.path.realpath(str(proj.get("workdir") or ""))
+
+    with _undo_apply_lock:
+        # 1. Locate checkpoint under state_lock
+        matched_skey = None
+        matched_entry = None
+        found_non_top = False
+        found_consumed = False
+        with state_lock:
+            scopes = state.get("scopes") or {}
+            for skey, sc in scopes.items():
+                if not isinstance(sc, dict):
+                    continue
+                stk = sc.get(stack_key) or []
+                for idx, ent in enumerate(stk):
+                    if isinstance(ent, dict) and str(ent.get("id") or "") == entry_id:
+                        if idx == len(stk) - 1:
+                            matched_skey = skey
+                            matched_entry = dict(ent)
+                        else:
+                            found_non_top = True
+                        break
+                if matched_entry is not None:
+                    break
+                other_stk = sc.get(other_key) or []
+                for ent in other_stk:
+                    if isinstance(ent, dict) and str(ent.get("id") or "") == entry_id:
+                        found_consumed = True
+                        break
+
+        if matched_entry is None:
+            if found_non_top:
+                return 409, {"ok": False, "code": "not_stack_top", "error": "仅允许操作当前栈顶检查点"}
+            if found_consumed:
+                return 409, {"ok": False, "code": "already_consumed", "error": "该检查点已被消费或已变更"}
+            return 404, {"ok": False, "code": "not_found", "error": "未找到对应的检查点"}
+
+        entry_cid = str(matched_entry.get("conv") or "").strip()
+        if req_cid and entry_cid != req_cid:
+            return 403, {"ok": False, "code": "cid_mismatch", "error": "检查点不属于指定会话"}
+        entry_wdir = str(matched_entry.get("workdir") or "").strip()
+        entry_rw = os.path.realpath(entry_wdir) if entry_wdir else ""
+        if target_rw and entry_rw != target_rw:
+            return 403, {"ok": False, "code": "project_mismatch", "error": "检查点不属于指定项目"}
+        if entry_rw and entry_rw not in by_real and entry_rw != os.path.realpath(WORKDIR):
+            return 403, {"ok": False, "code": "workdir_not_allowed", "error": "检查点工作目录不在白名单内"}
+
+        # 2. Check active session lock & non-blocking ConversationLease
+        with session_lock:
+            busy_now = bool(
+                turn_running
+                and (
+                    turn_running_scope == matched_skey
+                    or (entry_cid and turn_running_cid == entry_cid)
+                )
+            )
+        if busy_now or (entry_cid and _studio_ipc_buffer.find_active_turn_for_cid(entry_cid)):
+            return 409, {"ok": False, "code": "session_busy", "error": "会话正在执行中，暂不可回滚/重做（session_busy）"}
+
+        conv_lease = None
+        if entry_cid and studio_ipc.is_valid_cid(entry_cid):
+            conv_lease = studio_ipc.ConversationLease.try_acquire(bot_bus.BUS_DIR, entry_cid)
+            if conv_lease is None:
+                return 409, {"ok": False, "code": "session_busy", "error": "会话已被其他进程占用（session_busy）"}
+
+        try:
+            # Re-verify session_lock after acquiring cross-process lease
+            with session_lock:
+                if turn_running and (
+                    turn_running_scope == matched_skey
+                    or (entry_cid and turn_running_cid == entry_cid)
+                ):
+                    return 409, {"ok": False, "code": "session_busy", "error": "会话正在执行中（session_busy）"}
+
+            with state_lock:
+                sc_live = _ensure_scope_locked(matched_skey)
+                live_stk = list(sc_live.get(stack_key) or [])
+                if not live_stk or str(live_stk[-1].get("id") or "") != entry_id:
+                    return 409, {"ok": False, "code": "already_consumed", "error": "检查点栈顶状态已变化"}
+                live_entry = dict(live_stk[-1])
+
+                ok_apply, applied, conflicts, path_errors, _ = _apply_checkpoint_changes_detailed(
+                    live_entry, reverse=reverse, force=force
+                )
+                if path_errors:
+                    safe_errs = [_redact_ipc_text(c, max_len=160) for c in path_errors[:10]]
+                    return 403, {
+                        "ok": False,
+                        "code": "unsafe_path",
+                        "error": "安全拦截：检查点包含非法路径或符号链接逃逸，已拒绝执行",
+                        "conflicts": safe_errs,
+                    }
+                if not ok_apply:
+                    safe_conf = [_redact_ipc_text(c, max_len=160) for c in conflicts[:10]]
+                    return 409, {
+                        "ok": False,
+                        "code": "conflict",
+                        "error": "检测到文件在检查点之后被外部修改，默认拒绝覆盖（确认后可使用 force 强制执行）",
+                        "conflicts": safe_conf,
+                    }
+
+                popped = live_stk.pop()
+                other_stk = list(sc_live.get(other_key) or [])
+                other_stk.append(popped)
+                sc_live[stack_key] = live_stk
+                sc_live[other_key] = other_stk[-_UNDO_STACK_LIMIT:]
+
+                if not reverse:
+                    reverted_paths = [rel for _act, rel in applied]
+                    ts_str = datetime.datetime.now().strftime("%H:%M:%S")
+                    notice = (
+                        f"[系统提示：用户在 {ts_str} 执行了 /undo，已将工作区文件回滚恢复到改动前状态"
+                        f"（涉及：{', '.join(reverted_paths[:10])}{' 等' if len(reverted_paths) > 10 else ''}）。"
+                        f"请以当前磁盘上真实文件内容为准，勿假设上一轮的编辑仍然存在。]"
+                    )
+                    sc_live["pending_undo_notice"] = notice
+                    if entry_cid:
+                        sc_live["pending_undo_notice_cid"] = entry_cid
+                        _record_pending_undo_notice_by_cid_locked(entry_cid, notice)
+                    else:
+                        sc_live.pop("pending_undo_notice_cid", None)
+                else:
+                    sc_live["pending_undo_notice"] = None
+                    sc_live.pop("pending_undo_notice_cid", None)
+                    by_cid_notices = state.get("pending_undo_notices_by_cid")
+                    if entry_cid and isinstance(by_cid_notices, dict):
+                        by_cid_notices.pop(entry_cid, None)
+
+                _sync_top_level_mirrors_locked()
+                rem_undo = len(sc_live.get("undo_stack") or [])
+                rem_redo = len(sc_live.get("redo_stack") or [])
+            save_state()
+
+            return 200, {
+                "ok": True,
+                "action": "redo" if reverse else "undo",
+                "bot": _current_bot_handle(),
+                "entry_id": entry_id,
+                "cid": entry_cid,
+                "project_id": _sanitize_ipc_slug(by_real.get(entry_rw, ""), max_len=64),
+                "applied": [
+                    {"action": _sanitize_ipc_slug(a, max_len=24), "path": _redact_ipc_text(p, max_len=200)}
+                    for a, p in applied
+                ],
+                "remaining_undo": rem_undo,
+                "remaining_redo": rem_redo,
+            }
+        finally:
+            if conv_lease is not None:
+                conv_lease.release()
+
+
+def _studio_ipc_apply_undo(req):
+    return _studio_ipc_apply_checkpoint(req, reverse=False)
+
+
+def _studio_ipc_apply_redo(req):
+    return _studio_ipc_apply_checkpoint(req, reverse=True)
+
+
+def _studio_ipc_get_bot_config():
+    cfg = _current_bot_cfg()
+    sc = get_scope_state(PRIMARY_SCOPE_KEY)
+    try:
+        models_raw = agy_models(include_gateways=True, force_refresh=False)
+    except Exception:
+        models_raw = []
+    models_out = [{"id": str(slug), "label": str(desc)} for slug, desc in models_raw[:120]]
+    try:
+        projs_raw = list_agy_projects()
+    except Exception:
+        projs_raw = []
+    projects_out = [
+        {"id": _sanitize_ipc_slug(p.get("id") or "", max_len=64), "name": _redact_ipc_text(p.get("name") or "", max_len=80)}
+        for p in projs_raw
+        if p.get("id")
+    ]
+    model_mode = str(cfg.get("model_mode") or bot_bus.MODEL_MODE_DEFAULT)
+    configured_model = str(cfg.get("configured_model") or "")
+    dm_eff = _resolve_dm_effective_model() or ""
+    if model_mode == bot_bus.MODEL_MODE_CUSTOM:
+        effective_model = configured_model or dm_eff
+    elif model_mode == bot_bus.MODEL_MODE_FOLLOW:
+        effective_model = dm_eff
+    else:
+        effective_model = ENV_BOT_MODEL or dm_eff
+
+    default_effort = str(sc.get("effort") or cfg.get("default_effort") or ENV_BOT_EFFORT or "").strip().lower()
+    with session_lock:
+        busy = bool(turn_running)
+    return {
+        "handle": _current_bot_handle(),
+        "display_name": _redact_ipc_text(BOT_META.get("first_name") or _current_bot_handle(), max_len=64),
+        "role": _sanitize_ipc_slug(cfg.get("role") or "peer", max_len=24),
+        "specialty": _redact_ipc_text(cfg.get("specialty") or "", max_len=160),
+        "model_mode": model_mode,
+        "configured_model": _sanitize_ipc_slug(configured_model, max_len=80),
+        "effective_model": _sanitize_ipc_slug(effective_model, max_len=80),
+        "dm_model": _sanitize_ipc_slug(_resolve_dm_raw_model() or "", max_len=80),
+        "env_default_model": _sanitize_ipc_slug(ENV_BOT_MODEL or "", max_len=80),
+        "default_effort": default_effort if default_effort in ("", "low", "medium", "high", "xhigh", "max") else "",
+        "default_project": _sanitize_ipc_slug(current_project(PRIMARY_SCOPE_KEY) or cfg.get("default_project") or "", max_len=64),
+        "efforts": list(EFFORTS),
+        "models": models_out,
+        "projects": projects_out,
+        "skills": _collect_sanitized_skills_list(),
+        "mcp_servers": _collect_sanitized_mcp_list(),
+        "busy": busy,
+        "queue_depth": job_q.qsize(),
+    }
+
+
+def _studio_ipc_update_bot_config(req):
+    allowed_fields = {"user_id", "actor_username", "model_mode", "model", "default_effort", "default_project"}
+    extra = set(req.keys()) - allowed_fields
+    if extra:
+        return 400, {"ok": False, "error": f"存在未允许的配置字段: {sorted(extra)[0]}"}
+
+    has_model_mode = "model_mode" in req
+    has_model = "model" in req
+    has_effort = "default_effort" in req
+    has_project = "default_project" in req
+    if not (has_model_mode or has_model or has_effort or has_project):
+        return 400, {"ok": False, "error": "至少需要提供一个可更新配置字段"}
+
+    norm_mode = None
+    clean_model = ""
+    if has_model_mode or has_model:
+        if not has_model_mode:
+            return 400, {"ok": False, "error": "修改模型时必须显式提供 model_mode"}
+        raw_mode = req.get("model_mode")
+        if not isinstance(raw_mode, str):
+            return 400, {"ok": False, "error": "model_mode 必须为字符串"}
+        norm_mode = raw_mode.strip().lower()
+        if norm_mode not in ("default", "follow", "custom"):
+            return 400, {"ok": False, "error": "model_mode 仅允许 default / follow / custom"}
+        raw_m = req.get("model")
+        if norm_mode == "custom":
+            if not isinstance(raw_m, str) or not raw_m.strip():
+                return 400, {"ok": False, "error": "custom 模式必须指定具体模型 slug"}
+            clean_model = raw_m.strip()
+            try:
+                allowed_models = {str(slug) for slug, _ in (agy_models(include_gateways=True, force_refresh=False) or [])}
+            except Exception:
+                allowed_models = set()
+            if clean_model not in allowed_models:
+                return 400, {"ok": False, "error": "指定模型不在可用模型白名单内"}
+        else:
+            if raw_m is not None and str(raw_m).strip() != "":
+                return 400, {"ok": False, "error": "非 custom 模式不允许指定 model 参数"}
+
+    norm_effort = None
+    if has_effort:
+        raw_ef = req.get("default_effort")
+        if raw_ef is None:
+            norm_effort = ""
+        elif isinstance(raw_ef, str):
+            norm_effort = raw_ef.strip().lower()
+        else:
+            return 400, {"ok": False, "error": "default_effort 必须为字符串"}
+        if norm_effort not in ("", "low", "medium", "high", "xhigh", "max"):
+            return 400, {"ok": False, "error": "default_effort 仅允许空值或 low/medium/high/xhigh/max"}
+
+    resolved_proj_id = None
+    resolved_proj_wdir = None
+    if has_project:
+        raw_p = req.get("default_project")
+        if raw_p is None:
+            resolved_proj_id = ""
+            resolved_proj_wdir = WORKDIR
+        elif isinstance(raw_p, str):
+            p_str = raw_p.strip()
+            if p_str == "":
+                resolved_proj_id = ""
+                resolved_proj_wdir = WORKDIR
+            else:
+                by_id, _ = _resolve_project_by_id_or_workdir()
+                matched = by_id.get(p_str)
+                if not matched:
+                    return 400, {"ok": False, "error": "default_project 不在项目白名单内"}
+                resolved_proj_id = str(matched["id"])
+                resolved_proj_wdir = str(matched.get("workdir") or WORKDIR)
+        else:
+            return 400, {"ok": False, "error": "default_project 必须为字符串"}
+
+    me = _current_bot_handle()
+    if norm_mode is not None:
+        _set_team_bot_model(me, norm_mode, clean_model)
+        if norm_mode == "custom":
+            update_scope_state(PRIMARY_SCOPE_KEY, model=clean_model)
+        elif norm_mode == "default":
+            update_scope_state(PRIMARY_SCOPE_KEY, model=None)
+
+    cfg_updates = {}
+    scope_updates = {}
+    if norm_effort is not None:
+        cfg_updates["default_effort"] = norm_effort
+        scope_updates["effort"] = norm_effort or None
+    if resolved_proj_id is not None:
+        cfg_updates["default_project"] = resolved_proj_id
+        scope_updates["project"] = resolved_proj_id or None
+        scope_updates["workdir"] = resolved_proj_wdir
+    if cfg_updates:
+        bot_bus.update_bot_config(me, **cfg_updates)
+    if scope_updates:
+        update_scope_state(PRIMARY_SCOPE_KEY, **scope_updates)
+
+    save_state()
+    invalidate_session("studio_bot_config", scope_key=PRIMARY_SCOPE_KEY)
+    _publish_bot_heartbeat()
+    return 200, {"ok": True, **_studio_ipc_get_bot_config()}
+
+
+def _schedule_ipc_hot_reload(delay_sec=0.25):
+    """Trigger graceful hot reload via Bridge's own fixed `RELOAD_TRIGGER` & `job_q` after `delay_sec`."""
+    def _emit():
+        try:
+            with open(RELOAD_TRIGGER, "w", encoding="utf-8") as fh:
+                fh.write(f"studio-ipc {int(time.time())}\n")
+        except OSError as exc:
+            log("Failed to touch RELOAD_TRIGGER: %r" % exc)
+        try:
+            job_q.put((0, None, PRIMARY_SCOPE_KEY, "__RELOAD__"))
+        except Exception as exc:
+            log("Failed to enqueue __RELOAD__: %r" % exc)
+
+    t = threading.Timer(max(0.05, float(delay_sec)), _emit)
+    t.daemon = True
+    t.name = "studio-ipc-reload"
+    t.start()
+    return t
+
+
+def _studio_ipc_reload_bot(user_id):
+    """Run synchronous `_pre_reload_self_check()` and schedule zero-downtime reload if healthy."""
+    ok_chk, detail = _pre_reload_self_check()
+    if not ok_chk:
+        return 422, {
+            "ok": False,
+            "code": "self_check_failed",
+            "error": f"热重载前置自检失败，已中止重启: {_redact_ipc_text(detail, max_len=240)}",
+        }
+    _schedule_ipc_hot_reload(delay_sec=0.25)
+    return 202, {
+        "ok": True,
+        "bot": _current_bot_handle(),
+        "scheduled": True,
+        "self_check": "passed",
+        "delay_ms": 250,
+    }
+
+
+_studio_attention_receipts = collections.deque(maxlen=128)
+
+
+def _studio_ipc_attention_notify(req):
+    """Record a Studio Attention Queue approval/rejection receipt (no TG delivery, no chat_sync)."""
+    rec = {
+        "ts": round(time.time(), 3),
+        "item_id": _sanitize_ipc_slug(req.get("item_id") or "", max_len=64),
+        "kind": _sanitize_ipc_slug(req.get("kind") or "action", max_len=32),
+        "decision": _sanitize_ipc_slug(req.get("decision") or "", max_len=16),
+        "user_id": int(req.get("user_id") or 0),
+        "actor_username": _sanitize_ipc_slug(req.get("actor_username") or "", max_len=64),
+    }
+    _studio_attention_receipts.append(rec)
+    log(
+        "Studio attention notify: item=%s kind=%s decision=%s"
+        % (rec["item_id"], rec["kind"], rec["decision"])
+    )
+    return 200, {
+        "ok": True,
+        "accepted": True,
+        "bot": _current_bot_handle(),
+        "item_id": rec["item_id"],
+        "decision": rec["decision"],
+    }
+
+
+def _studio_ipc_room_turn(req):
+    """Execute a single isolated Web Room turn in `scope_key = room:<room_id>` (zero TG/chat_sync)."""
+    room_id = str(req.get("room_id") or "").strip().lower()
+    if not studio_ipc.is_valid_room_id(room_id):
+        return 400, {"ok": False, "error": "非法的 room_id 格式"}
+    turn_id = f"room-{uuid.uuid4().hex[:16]}"
+    scope_key = f"room:{room_id}"
+    done_ev = threading.Event()
+    result_box = {"status": "error", "reply": "", "error": ""}
+    room_req = {
+        "turn_id": turn_id,
+        "user_id": int(req["user_id"]),
+        "actor_username": str(req.get("actor_username") or ""),
+        "room_id": room_id,
+        "scope_key": scope_key,
+        "prompt": str(req["prompt"]),
+        "chain_id": str(req.get("chain_id") or ""),
+        "hop": int(req.get("hop") or 0),
+        "project": req.get("project"),
+        "done_ev": done_ev,
+        "result_box": result_box,
+    }
+    job_q.put((0, None, scope_key, ("__ROOM_TURN__", room_req)))
+    if not done_ev.wait(timeout=120.0):
+        return 504, {"ok": False, "error": "群聊室 Bot 回复超时", "bot": _current_bot_handle()}
+    if result_box.get("status") != "done":
+        return 500, {
+            "ok": False,
+            "bot": _current_bot_handle(),
+            "room_id": room_id,
+            "error": _redact_ipc_text(result_box.get("error") or "room turn failed", max_len=240),
+        }
+    return 200, {
+        "ok": True,
+        "bot": _current_bot_handle(),
+        "room_id": room_id,
+        "turn_id": turn_id,
+        "status": "done",
+        "reply": str(result_box.get("reply") or ""),
+    }
+
+
+def _execute_room_turn(room_req):
+    turn_id = room_req["turn_id"]
+    uid = int(room_req["user_id"])
+    scope_key = room_req["scope_key"]
+    project = room_req.get("project")
+    done_ev = room_req["done_ev"]
+    result_box = room_req["result_box"]
+
+    override_workdir = None
+    if project:
+        for p in list_agy_projects():
+            if p.get("id") == project or p.get("name") == project:
+                override_workdir = p.get("workdir")
+                project = p.get("id")
+                break
+
+    deltas = []
+    final_resp = {"text": "", "status": "done", "error": ""}
+
+    def _room_sink(ev_type, payload):
+        data = payload if isinstance(payload, dict) else {}
+        if ev_type == "text_delta":
+            d = data.get("delta")
+            if isinstance(d, str) and d:
+                deltas.append(d)
+        elif ev_type == "done":
+            resp = data.get("response")
+            if isinstance(resp, str) and resp:
+                final_resp["text"] = resp
+            final_resp["status"] = "done"
+        elif ev_type in ("error", "aborted"):
+            final_resp["status"] = ev_type
+            final_resp["error"] = str(data.get("error") or ev_type)
+
+    try:
+        run_agy(
+            0,
+            room_req["prompt"],
+            thread_id=None,
+            scope_key=scope_key,
+            user_role="admin",
+            user_id=uid,
+            event_sink=_room_sink,
+            web_turn_id=turn_id,
+            override_project=project,
+            override_workdir=override_workdir,
+            sync_tg=False,
+        )
+        reply_text = "".join(deltas).strip() or final_resp["text"].strip()
+        result_box["status"] = final_resp["status"]
+        result_box["reply"] = reply_text
+        result_box["error"] = final_resp["error"]
+    except Exception as exc:
+        log("room turn %s failed: %r" % (turn_id, exc))
+        result_box["status"] = "error"
+        result_box["error"] = f"bridge room execution error: {type(exc).__name__}"
+    finally:
+        done_ev.set()
+
+
 def _execute_web_turn(web_req):
     turn_id = web_req["turn_id"]
     uid = int(web_req["user_id"])
@@ -7537,6 +8390,14 @@ def _start_studio_ipc():
             abort_turn_fn=_studio_ipc_abort_turn,
             cancel_job_fn=_studio_ipc_cancel_job,
             run_schedule_fn=_studio_ipc_run_schedule,
+            list_undo_fn=_studio_ipc_list_undo,
+            apply_undo_fn=_studio_ipc_apply_undo,
+            apply_redo_fn=_studio_ipc_apply_redo,
+            get_bot_config_fn=_studio_ipc_get_bot_config,
+            update_bot_config_fn=_studio_ipc_update_bot_config,
+            reload_bot_fn=_studio_ipc_reload_bot,
+            room_turn_fn=_studio_ipc_room_turn,
+            attention_notify_fn=_studio_ipc_attention_notify,
             buffer=_studio_ipc_buffer,
             summaries_db=SUMMARIES_DB,
             meta_file=META_FILE,
@@ -7586,6 +8447,8 @@ def worker():
                 _execute_bus_job(prompt[1])
             elif is_web_item:
                 _execute_web_turn(prompt[1])
+            elif isinstance(prompt, tuple) and len(prompt) == 2 and prompt[0] == "__ROOM_TURN__":
+                _execute_room_turn(prompt[1])
             elif isinstance(prompt, tuple) and len(prompt) == 2 and prompt[0] == "__CHAT_TURN__":
                 meta = prompt[1]
                 run_agy(
@@ -9270,6 +10133,12 @@ def cmd_undo(chat_id, raw_rest="", thread_id=None, scope_key=None):
         sc_w["undo_stack"] = st_list
         sc_w["redo_stack"] = rd_list[-_UNDO_STACK_LIMIT:]
         sc_w["pending_undo_notice"] = notice
+        entry_cid = str(popped.get("conv") or "").strip()
+        if entry_cid:
+            sc_w["pending_undo_notice_cid"] = entry_cid
+            _record_pending_undo_notice_by_cid_locked(entry_cid, notice)
+        else:
+            sc_w.pop("pending_undo_notice_cid", None)
         _sync_top_level_mirrors_locked()
     save_state()
 
@@ -9318,6 +10187,11 @@ def cmd_redo(chat_id, thread_id=None, scope_key=None):
         sc_w["redo_stack"] = rd_list
         sc_w["undo_stack"] = st_list[-_UNDO_STACK_LIMIT:]
         sc_w["pending_undo_notice"] = None
+        sc_w.pop("pending_undo_notice_cid", None)
+        entry_cid = str(popped.get("conv") or "").strip()
+        by_cid_notices = state.get("pending_undo_notices_by_cid")
+        if entry_cid and isinstance(by_cid_notices, dict):
+            by_cid_notices.pop(entry_cid, None)
         _sync_top_level_mirrors_locked()
     save_state()
 

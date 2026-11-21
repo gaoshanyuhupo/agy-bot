@@ -1186,11 +1186,12 @@ class TestStudioMvp(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(fake_chooser.files), 1)
             self.assertTrue(fake_chooser.files[0].endswith("note.txt"))
 
-            # --- Scenario A: Two admin WS tabs -> close 1 -> takeover PRESERVED; close last -> takeover RELEASED & AI resumed! ---
+            # --- Scenario A: Two admin WS sessions -> close 1 -> takeover PRESERVED; close last -> takeover RELEASED & AI resumed! ---
+            _, _, sid_adm2 = await self._login_magic("main", ADMIN_UID)
             async with self.client.ws_connect(
                 "/ws/browser", headers={"Origin": self._origin(), **self._cookie_hdr(sid_adm)}
             ) as cws1, self.client.ws_connect(
-                "/ws/browser", headers={"Origin": self._origin(), **self._cookie_hdr(sid_adm)}
+                "/ws/browser", headers={"Origin": self._origin(), **self._cookie_hdr(sid_adm2)}
             ) as cws2:
                 # Drain initial auth_ok + state + jpeg on both
                 for w in (cws1, cws2):
@@ -3101,18 +3102,20 @@ class TestStudioPasswordAuth(unittest.IsolatedAsyncioTestCase):
 
         # Frontend storage hygiene & autoComplete attributes
         # Zero sessionStorage everywhere; localStorage is forbidden across all files EXCEPT the
-        # single non-secret boolean UI preference `SYNC_TG_STORAGE_KEY` ("agy_studio_sync_tg")
+        # two non-secret UI preferences (`SYNC_TG_STORAGE_KEY` & `WORKBENCH_STORAGE_KEY`)
         # inside `WorkspaceView.tsx`.
         webui_src = REPO_ROOT / "webui" / "src"
         allowed_ls_re = re.compile(
-            r'localStorage\.(?:getItem\(SYNC_TG_STORAGE_KEY\)'
-            r'|setItem\(SYNC_TG_STORAGE_KEY,\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*\?\s*"true"\s*:\s*"false"|"(?:true|false)")\))'
+            r'localStorage\.(?:getItem\((?:SYNC_TG_STORAGE_KEY|WORKBENCH_STORAGE_KEY)\)'
+            r'|setItem\(SYNC_TG_STORAGE_KEY,\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*\?\s*"true"\s*:\s*"false"|"(?:true|false)")\)'
+            r'|setItem\(WORKBENCH_STORAGE_KEY,\s*[A-Za-z_][A-Za-z0-9_]*\))'
         )
         for ts_file in webui_src.rglob("*.ts*"):
             txt = ts_file.read_text(encoding="utf-8")
             self.assertNotIn("sessionStorage", txt, str(ts_file))
             if ts_file.name == "WorkspaceView.tsx":
                 self.assertIn('const SYNC_TG_STORAGE_KEY = "agy_studio_sync_tg";', txt)
+                self.assertIn('const WORKBENCH_STORAGE_KEY = "agy_studio_workbench_v1";', txt)
                 scrubbed = allowed_ls_re.sub("", txt)
                 self.assertNotIn("localStorage", scrubbed, str(ts_file))
             else:

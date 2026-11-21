@@ -49,6 +49,159 @@ CHAT_SYNC_ALLOWED_KEYS = frozenset({"bot", "cid", "source", "status", "updated_a
 _CHAT_SYNC_SOURCES = frozenset({"web", "tg"})
 _CHAT_SYNC_STATUSES = frozenset({"running", "done", "aborted", "error"})
 _UNTRUSTED_CLIENT_SEND_KEYS = ("role", "chat_id", "target_chat_id", "thread_id", "target_thread_id")
+_FORBIDDEN_UNDO_IPC_KEYS = frozenset({
+    "workdir",
+    "changes",
+    "sha1",
+    "pre_sha1",
+    "post_sha1",
+    "ipc_sock",
+    "path",
+    "files",
+})
+_FORBIDDEN_BOT_CONFIG_IPC_KEYS = frozenset({
+    "workdir",
+    "default_workdir",
+    "ipc_sock",
+    "env",
+    "headers",
+    "command",
+    "args",
+    "url",
+    "reload_file",
+    "allowed_chats",
+    "mirror_chat_id",
+    "mirror_thread_id",
+    "token",
+    "secret",
+    "password",
+})
+_FORBIDDEN_RELOAD_IPC_KEYS = frozenset({
+    "reload_file",
+    "cmd",
+    "command",
+    "shell",
+    "script",
+    "workdir",
+    "ipc_sock",
+    "env",
+})
+_FORBIDDEN_ROOM_IPC_KEYS = frozenset({
+    "workdir",
+    "ipc_sock",
+    "script",
+    "precheck_cmd",
+    "reload_file",
+    "command",
+    "cmd",
+    "shell",
+})
+_FORBIDDEN_ATTENTION_IPC_KEYS = frozenset({
+    "workdir",
+    "ipc_sock",
+    "script",
+    "precheck_cmd",
+    "reload_file",
+    "command",
+    "cmd",
+    "shell",
+})
+UNDO_ENTRY_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+ROOM_ID_IPC_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,31}$")
+ATTENTION_ID_IPC_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{1,63}$")
+_IPC_INVISIBLE_FORMAT_RE = re.compile(r"[\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]")
+_IPC_FULLWIDTH_TAG_TRANS = str.maketrans(
+    {
+        "\uff3b": "[",  # ［
+        "\uff3d": "]",  # ］
+        "\u3010": "[",  # 【
+        "\u3011": "]",  # 】
+        "\uff0f": "/",  # ／
+        "\uff3f": "_",  # ＿
+        "\uff0d": "-",  # －
+        **{chr(c): chr(c - 0xFEE0) for c in range(0xFF10, 0xFF1A)},  # ０-９
+        **{chr(c): chr(c - 0xFEE0) for c in range(0xFF21, 0xFF3B)},  # Ａ-Ｚ
+        **{chr(c): chr(c - 0xFEE0) for c in range(0xFF41, 0xFF5B)},  # ａ-ｚ
+    }
+)
+_IPC_FORGED_TAG_RE = re.compile(
+    r"\[(?=\s*/?\s*(?:ACB_|REPO_WATCH_|BENCHMARK_|UNTRUSTED_|SILENT\b|NO_HANDOFF_|AGY_MEMORY_READONLY))",
+    re.IGNORECASE,
+)
+_IPC_ROOM_ENVELOPE_HEADER_RE = re.compile(r"^\[UNTRUSTED_WEB_ROOM_MESSAGE [^\[\]\r\n]+\]$")
+_IPC_ROOM_ENVELOPE_FOOTER = "[/UNTRUSTED_WEB_ROOM_MESSAGE]"
+
+
+def neutralize_control_tags(raw: Any) -> str:
+    """Strip invisible format chars, normalize fullwidth tag chars, and neutralize forged bracket tags to a fixed point."""
+    if raw is None:
+        return ""
+    text = str(raw)
+    for _ in range(8):
+        nxt = _IPC_INVISIBLE_FORMAT_RE.sub("", text)
+        nxt = nxt.translate(_IPC_FULLWIDTH_TAG_TRANS)
+        nxt = _IPC_FORGED_TAG_RE.sub("(", nxt)
+        if nxt == text:
+            break
+        text = nxt
+    return text
+
+
+def _neutralize_room_ipc_prompt(prompt: str) -> str:
+    """Neutralize all forged tags inside a room turn prompt while preserving a valid outer Studio untrusted envelope."""
+    lines = str(prompt or "").splitlines()
+    if (
+        len(lines) >= 2
+        and _IPC_ROOM_ENVELOPE_HEADER_RE.fullmatch(lines[0].strip())
+        and lines[-1].strip() == _IPC_ROOM_ENVELOPE_FOOTER
+    ):
+        clean_header = _IPC_INVISIBLE_FORMAT_RE.sub("", lines[0].strip()).translate(_IPC_FULLWIDTH_TAG_TRANS)
+        if _IPC_ROOM_ENVELOPE_HEADER_RE.fullmatch(clean_header):
+            inner = "\n".join(lines[1:-1])
+            return f"{clean_header}\n{neutralize_control_tags(inner)}\n{_IPC_ROOM_ENVELOPE_FOOTER}"
+    return neutralize_control_tags(prompt)
+
+
+def is_valid_room_id(raw: Any) -> bool:
+    if not isinstance(raw, str):
+        return False
+    if ".." in raw or "/" in raw or "\\" in raw or "\x00" in raw:
+        return False
+    return bool(ROOM_ID_IPC_RE.fullmatch(raw))
+
+
+def is_valid_attention_id(raw: Any) -> bool:
+    if not isinstance(raw, str):
+        return False
+    if ".." in raw or "/" in raw or "\\" in raw or "\x00" in raw:
+        return False
+    return bool(ATTENTION_ID_IPC_RE.fullmatch(raw))
+
+
+def is_valid_undo_entry_id(raw: Any) -> bool:
+    """Strictly validate an undo/redo checkpoint entry_id."""
+    if not isinstance(raw, str):
+        return False
+    return bool(UNDO_ENTRY_ID_RE.fullmatch(raw))
+
+
+def _find_forbidden_ipc_key(obj: Any, forbidden: frozenset[str], *, depth: int = 0) -> str | None:
+    if depth > 12:
+        return "max_depth_exceeded"
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            kl = str(k).strip().lower()
+            if kl in forbidden:
+                return kl
+            found = _find_forbidden_ipc_key(v, forbidden, depth=depth + 1)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = _find_forbidden_ipc_key(item, forbidden, depth=depth + 1)
+            if found:
+                return found
+    return None
 
 _chat_sync_seq_lock = threading.Lock()
 _chat_sync_seq = 0
@@ -769,6 +922,43 @@ class _StudioIPCHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(200, {"ok": True, **(meta if isinstance(meta, dict) else {})})
             return
 
+        if path == "/ipc/bot/config":
+            if self.ipc.get_bot_config_fn is None:
+                self._send_json(501, {"ok": False, "error": "bot_config 未启用"})
+                return
+            try:
+                cfg_payload = self.ipc.get_bot_config_fn()
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": f"bot_config failed: {type(exc).__name__}"})
+                return
+            self._send_json(200, {"ok": True, **(cfg_payload if isinstance(cfg_payload, dict) else {})})
+            return
+
+        if path == "/ipc/undo/list":
+            raw_uid = (qs.get("user_id") or [self.headers.get("X-Bridge-User-Id") or ""])[0]
+            ok_u, uid, err_u = self._authorize_admin_user(raw_uid)
+            if not ok_u or uid is None:
+                self._send_json(403, {"ok": False, "error": err_u, "source": "bridge_ipc"})
+                return
+            if self.ipc.list_undo_fn is None:
+                self._send_json(501, {"ok": False, "error": "undo_list 未启用"})
+                return
+            raw_cid = ((qs.get("cid") or [""])[0]).strip()
+            cid_arg: str | None = None
+            if raw_cid:
+                if not is_valid_cid(raw_cid):
+                    self._send_json(400, {"ok": False, "error": "无效的会话 ID 格式"})
+                    return
+                cid_arg = raw_cid
+            raw_pid = ((qs.get("project_id") or [""])[0]).strip()[:128] or None
+            try:
+                sc_u, resp_u = self.ipc.list_undo_fn(uid, cid_arg, raw_pid)
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": f"undo_list failed: {type(exc).__name__}"})
+                return
+            self._send_json(int(sc_u), resp_u)
+            return
+
         if path == "/ipc/chat/active":
             raw_uid = (qs.get("user_id") or [self.headers.get("X-Bridge-User-Id") or ""])[0]
             ok_u, uid, err_u = self._authorize_admin_user(raw_uid)
@@ -982,6 +1172,170 @@ class _StudioIPCHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(int(status_code), resp_payload)
             return
 
+        if path in ("/ipc/undo/apply", "/ipc/undo/redo"):
+            bad_k = _find_forbidden_ipc_key(body, _FORBIDDEN_UNDO_IPC_KEYS)
+            if bad_k is not None:
+                self._send_json(400, {"ok": False, "error": f"禁止传入受限字段: {bad_k}"})
+                return
+            entry_id = str(body.get("entry_id") or "").strip()
+            if not is_valid_undo_entry_id(entry_id):
+                self._send_json(400, {"ok": False, "error": "无效的检查点 entry_id"})
+                return
+            raw_cid = body.get("cid")
+            cid_val: str | None = None
+            if raw_cid is not None and str(raw_cid).strip() != "":
+                cid_s = str(raw_cid).strip()
+                if not is_valid_cid(cid_s):
+                    self._send_json(400, {"ok": False, "error": "无效的会话 ID 格式"})
+                    return
+                cid_val = cid_s
+            raw_force = body.get("force", False)
+            if not isinstance(raw_force, bool):
+                self._send_json(400, {"ok": False, "error": "force 必须为布尔值"})
+                return
+            raw_pid = body.get("project_id")
+            pid_val = str(raw_pid).strip()[:128] if raw_pid is not None and str(raw_pid).strip() else None
+            fn = self.ipc.apply_undo_fn if path == "/ipc/undo/apply" else self.ipc.apply_redo_fn
+            if fn is None:
+                self._send_json(501, {"ok": False, "error": "undo/redo 未启用"})
+                return
+            req_undo = {
+                "user_id": uid,
+                "actor_username": str(body.get("actor_username") or "")[:64],
+                "entry_id": entry_id,
+                "cid": cid_val,
+                "project_id": pid_val,
+                "force": raw_force,
+            }
+            try:
+                status_code, resp_payload = fn(req_undo)
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": f"undo failed: {type(exc).__name__}"})
+                return
+            self._send_json(int(status_code), resp_payload)
+            return
+
+        if path == "/ipc/bot/config":
+            bad_k = _find_forbidden_ipc_key(body, _FORBIDDEN_BOT_CONFIG_IPC_KEYS)
+            if bad_k is not None:
+                self._send_json(400, {"ok": False, "error": f"禁止传入受限字段: {bad_k}"})
+                return
+            if self.ipc.update_bot_config_fn is None:
+                self._send_json(501, {"ok": False, "error": "bot_config 写接口未启用"})
+                return
+            req_cfg = dict(body)
+            req_cfg["user_id"] = uid
+            req_cfg["actor_username"] = str(body.get("actor_username") or "")[:64]
+            try:
+                status_code, resp_payload = self.ipc.update_bot_config_fn(req_cfg)
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": f"bot_config update failed: {type(exc).__name__}"})
+                return
+            self._send_json(int(status_code), resp_payload)
+            return
+
+        if path == "/ipc/bot/reload":
+            bad_k = _find_forbidden_ipc_key(body, _FORBIDDEN_RELOAD_IPC_KEYS)
+            if bad_k is not None:
+                self._send_json(400, {"ok": False, "error": f"禁止传入受限字段: {bad_k}"})
+                return
+            extra_keys = set(body.keys()) - {"user_id", "actor_username"}
+            if extra_keys:
+                self._send_json(400, {"ok": False, "error": "热重载接口不接受额外参数"})
+                return
+            if self.ipc.reload_bot_fn is None:
+                self._send_json(501, {"ok": False, "error": "bot_reload 未启用"})
+                return
+            try:
+                status_code, resp_payload = self.ipc.reload_bot_fn(uid)
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": f"bot_reload failed: {type(exc).__name__}"})
+                return
+            self._send_json(int(status_code), resp_payload)
+            return
+
+        if path == "/ipc/room/turn":
+            bad_k = _find_forbidden_ipc_key(body, _FORBIDDEN_ROOM_IPC_KEYS)
+            if bad_k is not None:
+                self._send_json(400, {"ok": False, "error": f"禁止传入受限字段: {bad_k}"})
+                return
+            room_id = str(body.get("room_id") or "").strip().lower()
+            if not is_valid_room_id(room_id):
+                self._send_json(400, {"ok": False, "error": "非法的 room_id 格式"})
+                return
+            prompt = body.get("prompt")
+            if not isinstance(prompt, str) or not prompt.strip():
+                self._send_json(400, {"ok": False, "error": "prompt 不能为空"})
+                return
+            if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
+                self._send_json(413, {"ok": False, "error": "prompt 超过 32 KiB 上限"})
+                return
+            raw_hop = body.get("hop", 0)
+            if isinstance(raw_hop, bool) or not isinstance(raw_hop, int) or raw_hop < 0 or raw_hop > 2:
+                self._send_json(400, {"ok": False, "error": "非法的 hop 值（须为 0..2 整数）"})
+                return
+            if self.ipc.room_turn_fn is None:
+                self._send_json(501, {"ok": False, "error": "room_turn 未启用"})
+                return
+            # Defense-in-depth neutralization of forged control tags on Bridge side
+            safe_prompt = _neutralize_room_ipc_prompt(prompt)
+            req_room = {
+                "user_id": uid,
+                "actor_username": str(body.get("actor_username") or "")[:64],
+                "room_id": room_id,
+                "prompt": safe_prompt,
+                "chain_id": str(body.get("chain_id") or "").strip()[:64],
+                "hop": int(raw_hop),
+                "project": str(body.get("project") or "").strip()[:128] or None,
+            }
+            try:
+                status_code, resp_payload = self.ipc.room_turn_fn(req_room)
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": f"room_turn failed: {type(exc).__name__}"})
+                return
+            self._send_json(int(status_code), resp_payload)
+            return
+
+        if path == "/ipc/attention/notify":
+            bad_k = _find_forbidden_ipc_key(body, _FORBIDDEN_ATTENTION_IPC_KEYS)
+            if bad_k is not None:
+                self._send_json(400, {"ok": False, "error": f"禁止传入受限字段: {bad_k}"})
+                return
+            item_id = str(body.get("item_id") or "").strip()
+            if not is_valid_attention_id(item_id):
+                self._send_json(400, {"ok": False, "error": "非法的 item_id 格式"})
+                return
+            decision = str(body.get("decision") or "").strip().lower()
+            if decision not in ("approved", "rejected"):
+                self._send_json(400, {"ok": False, "error": "decision 必须为 approved 或 rejected"})
+                return
+            kind = str(body.get("kind") or "action").strip().lower()
+            if kind not in ("plan", "action", "undo_force"):
+                self._send_json(400, {"ok": False, "error": "非法的 kind 类型"})
+                return
+            note = str(body.get("note") or "")
+            if len(note.encode("utf-8")) > 2048:
+                self._send_json(413, {"ok": False, "error": "note 超过 2 KiB 上限"})
+                return
+            if self.ipc.attention_notify_fn is None:
+                self._send_json(501, {"ok": False, "error": "attention_notify 未启用"})
+                return
+            req_att = {
+                "user_id": uid,
+                "actor_username": str(body.get("actor_username") or "")[:64],
+                "item_id": item_id,
+                "kind": kind,
+                "decision": decision,
+                "note": neutralize_control_tags(note),
+            }
+            try:
+                status_code, resp_payload = self.ipc.attention_notify_fn(req_att)
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": f"attention_notify failed: {type(exc).__name__}"})
+                return
+            self._send_json(int(status_code), resp_payload)
+            return
+
         self._send_json(404, {"ok": False, "error": "IPC endpoint not found"})
 
 
@@ -999,6 +1353,14 @@ class StudioIPCServer:
         abort_turn_fn: Callable[[str, int], tuple[int, dict[str, Any]]],
         cancel_job_fn: Callable[[str, int], tuple[int, dict[str, Any]]] | None = None,
         run_schedule_fn: Callable[[str, int], tuple[int, dict[str, Any]]] | None = None,
+        list_undo_fn: Callable[[int, str | None, str | None], tuple[int, dict[str, Any]]] | None = None,
+        apply_undo_fn: Callable[[dict[str, Any]], tuple[int, dict[str, Any]]] | None = None,
+        apply_redo_fn: Callable[[dict[str, Any]], tuple[int, dict[str, Any]]] | None = None,
+        get_bot_config_fn: Callable[[], dict[str, Any]] | None = None,
+        update_bot_config_fn: Callable[[dict[str, Any]], tuple[int, dict[str, Any]]] | None = None,
+        reload_bot_fn: Callable[[int], tuple[int, dict[str, Any]]] | None = None,
+        room_turn_fn: Callable[[dict[str, Any]], tuple[int, dict[str, Any]]] | None = None,
+        attention_notify_fn: Callable[[dict[str, Any]], tuple[int, dict[str, Any]]] | None = None,
         buffer: TurnEventBuffer | None = None,
         summaries_db: str | Path | None = None,
         meta_file: str | Path | None = None,
@@ -1017,6 +1379,14 @@ class StudioIPCServer:
         self.abort_turn_fn = abort_turn_fn
         self.cancel_job_fn = cancel_job_fn
         self.run_schedule_fn = run_schedule_fn
+        self.list_undo_fn = list_undo_fn
+        self.apply_undo_fn = apply_undo_fn
+        self.apply_redo_fn = apply_redo_fn
+        self.get_bot_config_fn = get_bot_config_fn
+        self.update_bot_config_fn = update_bot_config_fn
+        self.reload_bot_fn = reload_bot_fn
+        self.room_turn_fn = room_turn_fn
+        self.attention_notify_fn = attention_notify_fn
         self.buffer = buffer or TurnEventBuffer()
         self.summaries_db = summaries_db
         self.meta_file = meta_file

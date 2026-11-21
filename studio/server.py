@@ -22,12 +22,16 @@ from typing import Any
 import aiohttp
 from aiohttp import web, web_log
 
+from .attention_service import StudioAttentionService
 from .auth import StudioAuthManager, studio_auth_error
+from .bot_control import StudioBotControlService
 from .browser_proxy import BrowserProxy, HTTP_SESSION_KEY
 from .chat_service import StudioChatService
 from .control_plane import StudioControlPlane
 from .data_sources import StudioDataSources
 from .event_hub import StudioEventHub
+from .room_service import StudioRoomService
+from .workspace_files import StudioWorkspaceFilesService
 
 AUTH_MGR_KEY: web.AppKey[StudioAuthManager] = web.AppKey("auth_mgr", StudioAuthManager)
 DATA_SOURCES_KEY: web.AppKey[StudioDataSources] = web.AppKey("data_sources", StudioDataSources)
@@ -35,6 +39,10 @@ BROWSER_PROXY_KEY: web.AppKey[BrowserProxy] = web.AppKey("browser_proxy", Browse
 CHAT_SERVICE_KEY: web.AppKey[StudioChatService] = web.AppKey("chat_service", StudioChatService)
 EVENT_HUB_KEY: web.AppKey[StudioEventHub] = web.AppKey("event_hub", StudioEventHub)
 CONTROL_PLANE_KEY: web.AppKey[StudioControlPlane] = web.AppKey("control_plane", StudioControlPlane)
+WORKSPACE_FILES_KEY: web.AppKey[StudioWorkspaceFilesService] = web.AppKey("workspace_files", StudioWorkspaceFilesService)
+BOT_CONTROL_KEY: web.AppKey[StudioBotControlService] = web.AppKey("bot_control", StudioBotControlService)
+ROOM_SERVICE_KEY: web.AppKey[StudioRoomService] = web.AppKey("room_service", StudioRoomService)
+ATTENTION_SERVICE_KEY: web.AppKey[StudioAttentionService] = web.AppKey("attention_service", StudioAttentionService)
 STATIC_DIST_KEY: web.AppKey[Path] = web.AppKey("static_dist_dir", Path)
 
 logging.basicConfig(
@@ -208,6 +216,30 @@ def create_app(
         event_hub,
         chat_service.audit,
     )
+    workspace_files = StudioWorkspaceFilesService(
+        auth,
+        sources,
+        event_hub,
+        chat_service.audit,
+    )
+    bot_control = StudioBotControlService(
+        auth,
+        sources,
+        event_hub,
+        chat_service.audit,
+    )
+    room_service = StudioRoomService(
+        auth,
+        sources,
+        event_hub,
+        chat_service.audit,
+    )
+    attention_service = StudioAttentionService(
+        auth,
+        sources,
+        event_hub,
+        chat_service.audit,
+    )
     dist_dir = static_dist_dir or Path(
         os.environ.get("AGY_STUDIO_DIST_DIR", str(DEFAULT_STATIC_DIST_DIR))
     )
@@ -222,6 +254,10 @@ def create_app(
     app[CHAT_SERVICE_KEY] = chat_service
     app[EVENT_HUB_KEY] = event_hub
     app[CONTROL_PLANE_KEY] = control_plane
+    app[WORKSPACE_FILES_KEY] = workspace_files
+    app[BOT_CONTROL_KEY] = bot_control
+    app[ROOM_SERVICE_KEY] = room_service
+    app[ATTENTION_SERVICE_KEY] = attention_service
     app[STATIC_DIST_KEY] = dist_dir
 
     async def _on_startup(application: web.Application) -> None:
@@ -229,6 +265,7 @@ def create_app(
         event_hub.start_watcher()
 
     async def _on_cleanup(application: web.Application) -> None:
+        await room_service.close_all()
         await event_hub.close_all()
         await chat_service.close_all()
         await proxy.close_all()
@@ -537,6 +574,30 @@ def create_app(
 
     app.router.add_get("/api/events", event_hub.handle_events)
 
+    # Phase B M1: Sandboxed Workspace Files, Git Diff & Single-Writer Undo/Redo
+    app.router.add_get("/api/projects", workspace_files.handle_get_projects)
+    app.router.add_get("/api/files/tree", workspace_files.handle_get_tree)
+    app.router.add_get("/api/files/content", workspace_files.handle_get_content)
+    app.router.add_get("/api/files/diff", workspace_files.handle_get_diff)
+    app.router.add_get("/api/undo/checkpoints", workspace_files.handle_get_undo_checkpoints)
+    app.router.add_post("/api/undo/apply", workspace_files.handle_apply_undo)
+    app.router.add_post("/api/undo/redo", workspace_files.handle_apply_redo)
+
+    # Phase B M1: Bot Team Control Plane (Config, Skills/MCP View & Safe Hot-Reload)
+    app.router.add_get("/api/bots/{handle}/config", bot_control.handle_get_bot_config)
+    app.router.add_patch("/api/bots/{handle}/config", bot_control.handle_patch_bot_config)
+    app.router.add_post("/api/bots/{handle}/reload", bot_control.handle_reload_bot)
+
+    # Phase B M2: Web Multi-Bot Chat Rooms & Unified Attention Queue
+    app.router.add_get("/api/rooms", room_service.handle_get_rooms)
+    app.router.add_post("/api/rooms", room_service.handle_create_room)
+    app.router.add_get("/api/rooms/{room_id}/messages", room_service.handle_get_room_messages)
+    app.router.add_post("/api/rooms/{room_id}/messages", room_service.handle_post_room_message)
+
+    app.router.add_get("/api/attention", attention_service.handle_get_attention)
+    app.router.add_post("/api/attention", attention_service.handle_create_attention)
+    app.router.add_post("/api/attention/{item_id}/decide", attention_service.handle_decide_attention)
+
     app.router.add_get("/ws/browser", proxy.handle_ws_browser)
     app.router.add_post("/api/browser/upload", proxy.handle_upload)
     app.router.add_get("/api/browser/download/{download_id}", proxy.handle_download)
@@ -548,7 +609,18 @@ def create_app(
     app.router.add_get("/assets/{asset_path:.*}", handle_static_asset)
     app.router.add_get("/", handle_spa_shell)
     app.router.add_get("/auth/magic", handle_spa_shell)
-    for spa_route in ("/workspace", "/overview", "/bots", "/jobs", "/schedules", "/costs", "/browser"):
+    for spa_route in (
+        "/workspace",
+        "/overview",
+        "/bots",
+        "/jobs",
+        "/schedules",
+        "/costs",
+        "/browser",
+        "/rooms",
+        "/attention",
+        "/files",
+    ):
         app.router.add_get(spa_route, handle_spa_shell)
 
     return app

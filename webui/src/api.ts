@@ -1,6 +1,11 @@
 import type {
   ActiveSessionTurnResponse,
+  AttentionDecideResponse,
+  AttentionResponse,
   AuthMode,
+  BotConfigPatchPayload,
+  BotConfigResponse,
+  BotReloadResponse,
   BotsResponse,
   BrowserStatusResponse,
   ChatAbortResponse,
@@ -8,6 +13,9 @@ import type {
   ChatSendResponse,
   CostsResponse,
   EventStreamStatus,
+  FileContentResponse,
+  FileDiffResponse,
+  FileTreeResponse,
   JobCancelResponse,
   JobDetailResponse,
   JobDispatchPayload,
@@ -16,6 +24,11 @@ import type {
   JobsResponse,
   ModelsResponse,
   OverviewResponse,
+  ProjectsResponse,
+  RoomCreateResponse,
+  RoomMessagesResponse,
+  RoomSendResponse,
+  RoomsResponse,
   ScheduleCreatePayload,
   ScheduleDeleteResponse,
   ScheduleMutationResponse,
@@ -27,6 +40,8 @@ import type {
   StudioEventEnvelope,
   StudioEventType,
   StudioSession,
+  UndoActionResponse,
+  UndoCheckpointsResponse,
 } from "./types";
 
 let csrfTokenMemory = "";
@@ -44,18 +59,24 @@ export class StudioApiError extends Error {
   source: string;
   authMode?: AuthMode;
   retryAfter?: number;
+  code?: string;
+  conflicts?: string[];
   constructor(
     message: string,
     status: number,
     source = "studio_auth",
     authMode?: AuthMode,
     retryAfter?: number,
+    code?: string,
+    conflicts?: string[],
   ) {
     super(message);
     this.status = status;
     this.source = source;
     this.authMode = authMode;
     this.retryAfter = retryAfter;
+    this.code = code;
+    this.conflicts = conflicts;
   }
 }
 
@@ -99,7 +120,11 @@ async function requestJson<T>(
       typeof payload.retry_after === "number" && Number.isFinite(payload.retry_after)
         ? payload.retry_after
         : undefined;
-    throw new StudioApiError(msg, resp.status, src, mode, retryAfter);
+    const code = typeof payload.code === "string" && payload.code ? payload.code : undefined;
+    const conflicts = Array.isArray(payload.conflicts)
+      ? payload.conflicts.filter((c): c is string => typeof c === "string")
+      : undefined;
+    throw new StudioApiError(msg, resp.status, src, mode, retryAfter, code, conflicts);
   }
   return payload as unknown as T;
 }
@@ -357,6 +382,9 @@ export class StudioEventClient {
     bindType("schedule_updated");
     bindType("bots_updated");
     bindType("session_updated");
+    bindType("room_message");
+    bindType("room_typing");
+    bindType("attention_updated");
     bindType("resync_required");
     bindType("auth_error");
 
@@ -474,6 +502,199 @@ export function abortChatTurn(turnId: string, bot?: string): Promise<ChatAbortRe
     {
       method: "POST",
       body: JSON.stringify({ turn_id: turnId, bot: bot || undefined }),
+    },
+    true,
+  );
+}
+
+// Phase B M1: Workspace Files, Git Diff & Undo/Redo
+export function fetchProjects(): Promise<ProjectsResponse> {
+  return requestJson<ProjectsResponse>("/api/projects");
+}
+
+export function fetchFileTree(params: {
+  project_id: string;
+  dir?: string;
+  depth?: number;
+}): Promise<FileTreeResponse> {
+  const q = new URLSearchParams({ project_id: params.project_id });
+  if (params.dir) q.set("dir", params.dir);
+  if (params.depth) q.set("depth", String(params.depth));
+  return requestJson<FileTreeResponse>(`/api/files/tree?${q.toString()}`);
+}
+
+export function fetchFileContent(
+  projectId: string,
+  path: string,
+): Promise<FileContentResponse> {
+  const q = new URLSearchParams({ project_id: projectId, path });
+  return requestJson<FileContentResponse>(`/api/files/content?${q.toString()}`);
+}
+
+export function fetchFileDiff(params: {
+  project_id: string;
+  scope?: "all" | "staged" | "unstaged";
+  path?: string;
+}): Promise<FileDiffResponse> {
+  const q = new URLSearchParams({
+    project_id: params.project_id,
+    scope: params.scope || "all",
+  });
+  if (params.path) q.set("path", params.path);
+  return requestJson<FileDiffResponse>(`/api/files/diff?${q.toString()}`);
+}
+
+export function fetchUndoCheckpoints(params?: {
+  bot?: string;
+  cid?: string | null;
+  project_id?: string;
+}): Promise<UndoCheckpointsResponse> {
+  const q = new URLSearchParams();
+  if (params?.bot) q.set("bot", params.bot);
+  if (params?.cid) q.set("cid", params.cid);
+  if (params?.project_id) q.set("project_id", params.project_id);
+  const qs = q.toString();
+  return requestJson<UndoCheckpointsResponse>(`/api/undo/checkpoints${qs ? `?${qs}` : ""}`);
+}
+
+export function applyUndoCheckpoint(payload: {
+  entry_id: string;
+  bot?: string;
+  cid?: string | null;
+  project_id?: string;
+  force?: boolean;
+}): Promise<UndoActionResponse> {
+  return requestJson<UndoActionResponse>(
+    "/api/undo/apply",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        entry_id: payload.entry_id,
+        bot: payload.bot || undefined,
+        cid: payload.cid || undefined,
+        project_id: payload.project_id || undefined,
+        force: Boolean(payload.force),
+      }),
+    },
+    true,
+  );
+}
+
+export function redoUndoCheckpoint(payload: {
+  entry_id: string;
+  bot?: string;
+  cid?: string | null;
+  project_id?: string;
+  force?: boolean;
+}): Promise<UndoActionResponse> {
+  return requestJson<UndoActionResponse>(
+    "/api/undo/redo",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        entry_id: payload.entry_id,
+        bot: payload.bot || undefined,
+        cid: payload.cid || undefined,
+        project_id: payload.project_id || undefined,
+        force: Boolean(payload.force),
+      }),
+    },
+    true,
+  );
+}
+
+// Phase B M1: Bot Team Control Plane
+export function fetchBotConfig(handle: string): Promise<BotConfigResponse> {
+  return requestJson<BotConfigResponse>(`/api/bots/${encodeURIComponent(handle)}/config`);
+}
+
+export function updateBotConfig(
+  handle: string,
+  payload: BotConfigPatchPayload,
+): Promise<BotConfigResponse> {
+  return requestJson<BotConfigResponse>(
+    `/api/bots/${encodeURIComponent(handle)}/config`,
+    {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    },
+    true,
+  );
+}
+
+export function reloadBot(handle: string): Promise<BotReloadResponse> {
+  return requestJson<BotReloadResponse>(
+    `/api/bots/${encodeURIComponent(handle)}/reload`,
+    {
+      method: "POST",
+      body: "{}",
+    },
+    true,
+  );
+}
+
+// Phase B M2: Web Multi-Bot Chat Rooms
+export function fetchRooms(): Promise<RoomsResponse> {
+  return requestJson<RoomsResponse>("/api/rooms");
+}
+
+export function createRoom(payload: {
+  room_id: string;
+  title?: string;
+  topic?: string;
+}): Promise<RoomCreateResponse> {
+  return requestJson<RoomCreateResponse>(
+    "/api/rooms",
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+    true,
+  );
+}
+
+export function fetchRoomMessages(
+  roomId: string,
+  params?: { after_seq?: number; limit?: number },
+): Promise<RoomMessagesResponse> {
+  const q = new URLSearchParams();
+  if (params?.after_seq && params.after_seq > 0) q.set("after_seq", String(params.after_seq));
+  if (params?.limit) q.set("limit", String(params.limit));
+  const qs = q.toString();
+  return requestJson<RoomMessagesResponse>(
+    `/api/rooms/${encodeURIComponent(roomId)}/messages${qs ? `?${qs}` : ""}`,
+  );
+}
+
+export function sendRoomMessage(
+  roomId: string,
+  payload: { content: string; project?: string },
+): Promise<RoomSendResponse> {
+  return requestJson<RoomSendResponse>(
+    `/api/rooms/${encodeURIComponent(roomId)}/messages`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+    true,
+  );
+}
+
+// Phase B M2: Unified Attention Queue
+export function fetchAttention(status?: "all" | "pending" | "resolved"): Promise<AttentionResponse> {
+  const qs = status && status !== "all" ? `?status=${encodeURIComponent(status)}` : "";
+  return requestJson<AttentionResponse>(`/api/attention${qs}`);
+}
+
+export function decideAttentionItem(
+  itemId: string,
+  payload: { decision: "approved" | "rejected"; note?: string },
+): Promise<AttentionDecideResponse> {
+  return requestJson<AttentionDecideResponse>(
+    `/api/attention/${encodeURIComponent(itemId)}/decide`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
     },
     true,
   );

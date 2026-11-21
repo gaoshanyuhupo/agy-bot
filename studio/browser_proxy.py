@@ -73,6 +73,7 @@ class BrowserProxy:
         self.data_sources = data_sources
         self.revocation_check_interval = max(0.05, float(revocation_check_interval))
         self._active_sockets: dict[int, dict[str, Any]] = {}
+        self._session_ws_owners: dict[str, int] = {}
         self.auth_mgr.add_revoke_listener(self._on_auth_revoked)
 
     @staticmethod
@@ -235,6 +236,7 @@ class BrowserProxy:
             return_exceptions=True,
         )
         self._active_sockets.clear()
+        self._session_ws_owners.clear()
 
     async def handle_ws_browser(self, request: web.Request) -> web.StreamResponse:
         # 1. Strict Origin check (anti-CSWSH: rejects missing or cross-site Origin)
@@ -247,78 +249,110 @@ class BrowserProxy:
         if not ok_auth or not sess:
             return studio_auth_error(err_auth, status=status_code)
 
-        # 3. Read live-browser local token
-        live_token = self.data_sources.read_live_browser_token()
-        if not live_token:
-            return upstream_error("Live-Browser 本地令牌不可读或服务未初始化", status=503)
-
-        http_session = request.app[HTTP_SESSION_KEY]
-        upstream_ws_url = _http_to_ws_url(self.data_sources.live_browser_url, "/ws")
-        try:
-            upstream_ws = await http_session.ws_connect(
-                upstream_ws_url,
-                headers={"X-Internal-Token": live_token},
-                heartbeat=25.0,
-                max_msg_size=4 * 1024 * 1024,
-                timeout=aiohttp.ClientWSTimeout(ws_close=6.0),
+        # 2b. Zero-TOCTOU synchronous single-session single-instance reservation BEFORE any await
+        session_hash = str(sess["session_hash"])
+        if session_hash in self._session_ws_owners:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "source": "studio_api",
+                    "code": "browser_ws_conflict",
+                    "error": "当前会话已有活跃的实时浏览器连接（单实例互斥），请先关闭其他分栏或标签页中的浏览器视图",
+                },
+                status=409,
             )
-        except Exception as exc:
-            log.warning("Upstream live-browser WS connect failed: %s", exc)
-            return upstream_error("Live-Browser 实时流服务暂不可达", status=502)
 
-        # 4. Perform loopback delegated handshake with upstream (never send role!)
-        try:
-            await upstream_ws.send_str(
-                json.dumps(
-                    {
-                        "type": "internal_auth",
-                        "bot": sess["bot"],
-                        "user_id": int(sess["user_id"]),
-                    }
-                )
-            )
-            first = await asyncio.wait_for(upstream_ws.receive(), timeout=5.0)
-        except Exception:
-            await upstream_ws.close()
-            return upstream_error("Live-Browser 上游鉴权握手超时", status=502)
-
-        if first.type != WSMsgType.TEXT:
-            await upstream_ws.close()
-            return upstream_error("Live-Browser 上游拒绝连接", status=403)
-
-        try:
-            up_auth = json.loads(first.data)
-        except Exception:
-            await upstream_ws.close()
-            return upstream_error("Live-Browser 上游返回无效鉴权响应", status=502)
-
-        if up_auth.get("type") != "auth_ok":
-            err_msg = str(up_auth.get("error") or "Live-Browser 上游鉴权未通过")
-            await upstream_ws.close()
-            return upstream_error(err_msg, status=403)
-
-        # Enforce least-privilege role between Studio & upstream
-        up_role = str(up_auth.get("role") or "readonly")
-        eff_role = "admin" if (sess["role"] == "admin" and up_role == "admin") else "readonly"
-
-        client_ws = web.WebSocketResponse(heartbeat=25.0, max_msg_size=4 * 1024 * 1024)
-        await client_ws.prepare(request)
-
-        entry_key = id(client_ws)
-        entry = {
-            "client_ws": client_ws,
-            "upstream_ws": upstream_ws,
-            "session_hash": sess["session_hash"],
+        entry: dict[str, Any] = {
+            "client_ws": None,
+            "upstream_ws": None,
+            "session_hash": session_hash,
             "username_key": sess.get("username_key"),
             "bot": sess["bot"],
             "user_id": int(sess["user_id"]),
-            "role": eff_role,
-            "up_role": up_role,
+            "role": str(sess["role"]),
+            "up_role": "readonly",
             "closing": False,
         }
+        entry_key = id(entry)
+        self._session_ws_owners[session_hash] = entry_key
         self._active_sockets[entry_key] = entry
 
+        upstream_ws: aiohttp.ClientWebSocketResponse | None = None
+        client_ws: web.WebSocketResponse | None = None
         try:
+            # 3. Read live-browser local token
+            live_token = self.data_sources.read_live_browser_token()
+            if not live_token:
+                return upstream_error("Live-Browser 本地令牌不可读或服务未初始化", status=503)
+
+            http_session = request.app[HTTP_SESSION_KEY]
+            upstream_ws_url = _http_to_ws_url(self.data_sources.live_browser_url, "/ws")
+            try:
+                upstream_ws = await http_session.ws_connect(
+                    upstream_ws_url,
+                    headers={"X-Internal-Token": live_token},
+                    heartbeat=25.0,
+                    max_msg_size=4 * 1024 * 1024,
+                    timeout=aiohttp.ClientWSTimeout(ws_close=6.0),
+                )
+            except Exception as exc:
+                log.warning("Upstream live-browser WS connect failed: %s", exc)
+                return upstream_error("Live-Browser 实时流服务暂不可达", status=502)
+
+            entry["upstream_ws"] = upstream_ws
+            if entry.get("closing"):
+                return studio_auth_error("访问权限已被撤销", status=403)
+
+            # 4. Perform loopback delegated handshake with upstream (never send role!)
+            try:
+                await upstream_ws.send_str(
+                    json.dumps(
+                        {
+                            "type": "internal_auth",
+                            "bot": sess["bot"],
+                            "user_id": int(sess["user_id"]),
+                        }
+                    )
+                )
+                first = await asyncio.wait_for(upstream_ws.receive(), timeout=5.0)
+            except Exception:
+                return upstream_error("Live-Browser 上游鉴权握手超时", status=502)
+
+            if entry.get("closing"):
+                return studio_auth_error("访问权限已被撤销", status=403)
+
+            if first.type != WSMsgType.TEXT:
+                return upstream_error("Live-Browser 上游拒绝连接", status=403)
+
+            try:
+                up_auth = json.loads(first.data)
+            except Exception:
+                return upstream_error("Live-Browser 上游返回无效鉴权响应", status=502)
+
+            if up_auth.get("type") != "auth_ok":
+                err_msg = str(up_auth.get("error") or "Live-Browser 上游鉴权未通过")
+                return upstream_error(err_msg, status=403)
+
+            # Enforce least-privilege role between Studio & upstream
+            up_role = str(up_auth.get("role") or "readonly")
+            eff_role = "admin" if (sess["role"] == "admin" and up_role == "admin") else "readonly"
+            entry["role"] = eff_role
+            entry["up_role"] = up_role
+
+            # Re-verify live auth right before upgrading downstream WS
+            ok_pre, live_pre, err_pre, _sc_pre = await self.auth_mgr.authenticate_session_hash(session_hash)
+            if entry.get("closing") or not ok_pre or not live_pre:
+                reason = "password_change_required" if err_pre == "password_change_required" else "访问权限已被撤销"
+                return studio_auth_error(reason, status=403)
+
+            client_ws = web.WebSocketResponse(heartbeat=25.0, max_msg_size=4 * 1024 * 1024)
+            await client_ws.prepare(request)
+            entry["client_ws"] = client_ws
+
+            if entry.get("closing"):
+                await self._close_downstream_bounded(entry, timeout_sec=0.8)
+                return client_ws
+
             await client_ws.send_str(
                 json.dumps(
                     {
@@ -375,6 +409,7 @@ class BrowserProxy:
                 return "ok", eff_live
 
             async def _pump_client_to_upstream() -> None:
+                assert client_ws is not None and upstream_ws is not None
                 async for msg in client_ws:
                     if msg.type in (WSMsgType.TEXT, WSMsgType.BINARY):
                         st_live, eff_live = await _reverify_live()
@@ -424,6 +459,7 @@ class BrowserProxy:
                         break
 
             async def _pump_upstream_to_client() -> None:
+                assert client_ws is not None and upstream_ws is not None
                 async for msg in upstream_ws:
                     if client_ws.closed or entry.get("closing"):
                         return
@@ -441,6 +477,7 @@ class BrowserProxy:
                         break
 
             async def _revocation_watchdog() -> None:
+                assert client_ws is not None and upstream_ws is not None
                 while not client_ws.closed and not upstream_ws.closed and not entry.get("closing"):
                     await asyncio.sleep(self.revocation_check_interval)
                     st_live, _eff_live = await _reverify_live()
@@ -463,11 +500,15 @@ class BrowserProxy:
                     pass
                 except Exception:
                     pass
+            return client_ws
         finally:
             self._active_sockets.pop(entry_key, None)
+            if self._session_ws_owners.get(session_hash) == entry_key:
+                self._session_ws_owners.pop(session_hash, None)
             entry["closing"] = True
-            await self._close_upstream(upstream_ws, timeout_sec=1.0)
-            if not client_ws.closed:
+            if upstream_ws is not None:
+                await self._close_upstream(upstream_ws, timeout_sec=1.0)
+            if client_ws is not None and not client_ws.closed:
                 if entry.get("close_code") is not None:
                     await self._close_downstream_bounded(entry, timeout_sec=0.8)
                 else:
@@ -475,7 +516,6 @@ class BrowserProxy:
                         await asyncio.wait_for(client_ws.close(), timeout=0.8)
                     except Exception:
                         pass
-        return client_ws
 
     async def handle_upload(self, request: web.Request) -> web.Response:
         ok_orig, err_orig = self.auth_mgr.check_same_origin(request, require_origin=True)

@@ -140,7 +140,7 @@ class StudioEventHub:
         self._active_streams: dict[int, dict[str, Any]] = {}
         self._watcher_task: asyncio.Task[Any] | None = None
         self._stopped: bool = False
-        self._last_fp: tuple[Any, Any, Any] | None = None
+        self._last_fp: tuple[Any, Any, Any, Any] | None = None
         self._last_chat_sync: dict[str, tuple[int, int, bytes]] | None = None
 
         self.auth_mgr.add_revoke_listener(self._on_auth_revoked)
@@ -152,7 +152,7 @@ class StudioEventHub:
         if self._watcher_task is None or self._watcher_task.done():
             self._watcher_task = asyncio.create_task(self._watch_state_loop())
 
-    def _compute_fingerprints(self) -> tuple[Any, Any, Any]:
+    def _compute_fingerprints(self) -> tuple[Any, Any, Any, Any]:
         bus_dir = self.data_sources.bus_dir
         bots_fp: list[tuple[str, int, int]] = []
         for fn in ("roster.json", "team_config.json"):
@@ -190,7 +190,27 @@ class StudioEventHub:
         except OSError:
             sched_fp = (0, 0)
 
-        return (tuple(bots_fp), jobs_fp, sched_fp)
+        approvals_dir = bus_dir / "studio_approvals"
+        att_count = 0
+        att_max_mt = 0
+        att_sum_sz = 0
+        try:
+            if approvals_dir.is_dir():
+                for ent in os.scandir(approvals_dir):
+                    if ent.name.endswith(".json") and not ent.name.endswith(".tmp") and not ent.name.startswith("."):
+                        try:
+                            st = ent.stat()
+                            att_count += 1
+                            if st.st_mtime_ns > att_max_mt:
+                                att_max_mt = st.st_mtime_ns
+                            att_sum_sz += st.st_size
+                        except OSError:
+                            continue
+        except OSError:
+            pass
+        approvals_fp = (att_count, att_max_mt, att_sum_sz)
+
+        return (tuple(bots_fp), jobs_fp, sched_fp, approvals_fp)
 
     def _read_chat_sync_snapshot(self) -> dict[str, tuple[int, int, bytes]]:
         """Read bounded raw snapshots of `BUS_DIR/chat_sync/*.json` for change detection."""
@@ -331,8 +351,8 @@ class StudioEventHub:
                         self._last_fp = fp
                         self._last_chat_sync = cur_chat_sync
                         continue
-                    prev_bots, prev_jobs, prev_sched = self._last_fp
-                    cur_bots, cur_jobs, cur_sched = fp
+                    prev_bots, prev_jobs, prev_sched, prev_approvals = self._last_fp
+                    cur_bots, cur_jobs, cur_sched, cur_approvals = fp
                     prev_chat_sync = self._last_chat_sync or {}
                     self._last_fp = fp
                     self._last_chat_sync = cur_chat_sync
@@ -384,6 +404,20 @@ class StudioEventHub:
                             raise
                         except Exception as exc:
                             _warn_throttled("schedules", exc)
+                    if cur_approvals != prev_approvals:
+                        try:
+                            self.publish(
+                                "attention_updated",
+                                {
+                                    "action": "watcher",
+                                    "total_files": int(cur_approvals[0]),
+                                    "source": "watcher",
+                                },
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            _warn_throttled("approvals", exc)
                     if cur_chat_sync != prev_chat_sync:
                         try:
                             for fname, entry in sorted(cur_chat_sync.items()):
@@ -414,6 +448,19 @@ class StudioEventHub:
                 "job_id",
                 "group_id",
                 "schedule_id",
+                "room_id",
+                "seq",
+                "msg_id",
+                "sender_type",
+                "sender",
+                "chain_id",
+                "hop",
+                "blocked_reason",
+                "typing",
+                "item_id",
+                "kind",
+                "decision",
+                "pending_count",
                 "status",
                 "count",
                 "total",
@@ -428,7 +475,7 @@ class StudioEventHub:
             ):
                 if k in data:
                     compact[k] = data[k]
-            for text_k in ("message", "error", "label", "summary"):
+            for text_k in ("message", "error", "label", "summary", "text"):
                 if text_k in data and isinstance(data[text_k], str):
                     clipped, _ = truncate_utf8_bytes(data[text_k], MAX_SSE_EVENT_BYTES - 512)
                     compact[text_k] = clipped

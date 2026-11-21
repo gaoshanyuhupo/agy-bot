@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Activity,
+  Bell,
   Bot,
   Clock,
   DollarSign,
+  FileCode,
   Globe,
   KeyRound,
   LayoutDashboard,
@@ -11,6 +13,7 @@ import {
   MessageSquare,
   MoreHorizontal,
   Shield,
+  Users,
 } from "lucide-react";
 import {
   StudioApiError,
@@ -27,26 +30,35 @@ import {
   hasTelegramWebViewHint,
   loadTelegramSdkOnce,
 } from "./bootstrapAuth";
+import { AttentionPanel } from "./components/AttentionPanel";
 import { BotsView } from "./components/BotsView";
 import { BrowserView } from "./components/BrowserView";
 import { ChangePasswordModal } from "./components/ChangePasswordModal";
 import { CostsView } from "./components/CostsView";
+import { FilesDiffPanel } from "./components/FilesDiffPanel";
 import { JobsView } from "./components/JobsView";
 import { LoginView } from "./components/LoginView";
 import { MobileMoreSheet } from "./components/MobileMoreSheet";
 import { OverviewView } from "./components/OverviewView";
+import { RoomPanel } from "./components/RoomPanel";
 import { SchedulesView } from "./components/SchedulesView";
 import { WorkspaceView } from "./components/WorkspaceView";
 import type {
   AuthMode,
+  BrowserOwner,
   EventStreamStatus,
   NavTab,
+  RoomLiveEvent,
+  RoomMessageItem,
   SessionUpdatedEvent,
   StudioSession,
 } from "./types";
 
 const DESKTOP_NAV_ITEMS: { id: NavTab; label: string; icon: typeof LayoutDashboard }[] = [
-  { id: "workspace", label: "对话", icon: MessageSquare },
+  { id: "workspace", label: "工作台", icon: MessageSquare },
+  { id: "rooms", label: "群聊室", icon: Users },
+  { id: "attention", label: "审批中心", icon: Bell },
+  { id: "files", label: "文件审查", icon: FileCode },
   { id: "jobs", label: "派工流水", icon: Activity },
   { id: "schedules", label: "定时任务", icon: Clock },
   { id: "bots", label: "Bot 团队", icon: Bot },
@@ -65,6 +77,9 @@ function detectInitialTab(): NavTab {
   const path = window.location.pathname.replace(/^\/+|\/+$/g, "");
   if (
     path === "workspace" ||
+    path === "rooms" ||
+    path === "attention" ||
+    path === "files" ||
     path === "overview" ||
     path === "browser" ||
     path === "bots" ||
@@ -110,7 +125,9 @@ export function App() {
   const [activeTab, setActiveTab] = useState<NavTab>(detectInitialTab);
   const [isTelegramEnv, setIsTelegramEnv] = useState(false);
   const [passwordModalOpen, setPasswordModalOpen] = useState(false);
-  const [browserDrawerOpen, setBrowserDrawerOpen] = useState(false);
+  const [browserOwner, setBrowserOwner] = useState<BrowserOwner>(() =>
+    detectInitialTab() === "browser" ? "tab" : "none",
+  );
   const [moreSheetOpen, setMoreSheetOpen] = useState(false);
   const [wsSessionEpoch, setWsSessionEpoch] = useState(0);
   const [eventStatus, setEventStatus] = useState<EventStreamStatus>("disconnected");
@@ -118,6 +135,9 @@ export function App() {
   const [schedulesEventVer, setSchedulesEventVer] = useState(0);
   const [botsEventVer, setBotsEventVer] = useState(0);
   const [overviewEventVer, setOverviewEventVer] = useState(0);
+  const [attentionEventVer, setAttentionEventVer] = useState(0);
+  const [pendingAttentionCount, setPendingAttentionCount] = useState(0);
+  const [roomEvent, setRoomEvent] = useState<RoomLiveEvent | null>(null);
   const [sessionSyncEvent, setSessionSyncEvent] = useState<SessionUpdatedEvent | null>(null);
   const passwordChangingRef = useRef(false);
 
@@ -267,12 +287,18 @@ export function App() {
   const handleNavigate = (tab: NavTab) => {
     setActiveTab(tab);
     if (tab === "browser") {
-      setBrowserDrawerOpen(false);
+      setBrowserOwner("tab");
+    } else if (browserOwner === "tab") {
+      setBrowserOwner("none");
     }
     if (window.location.pathname !== `/${tab}`) {
       window.history.replaceState({}, "", `/${tab}`);
     }
   };
+
+  const handleToggleBrowserDrawer = useCallback(() => {
+    setBrowserOwner((cur) => (cur === "drawer" ? "none" : "drawer"));
+  }, []);
 
   const handleLogout = async () => {
     try {
@@ -281,7 +307,7 @@ export function App() {
       // Ignore network errors on logout
     }
     setPasswordModalOpen(false);
-    setBrowserDrawerOpen(false);
+    setBrowserOwner("none");
     setMoreSheetOpen(false);
     setCsrfToken("");
     setSession(null);
@@ -306,7 +332,7 @@ export function App() {
         return;
       }
       setPasswordModalOpen(false);
-      setBrowserDrawerOpen(false);
+      setBrowserOwner("none");
       setMoreSheetOpen(false);
       setCsrfToken("");
       setSession(null);
@@ -385,11 +411,62 @@ export function App() {
             busy: typeof d.busy === "boolean" ? d.busy : undefined,
             updated_at: typeof d.updated_at === "number" ? d.updated_at : undefined,
           }));
+        } else if (ev.type === "room_message") {
+          const d = ev.data || {};
+          const msgObj: RoomMessageItem | undefined =
+            typeof d.room_id === "string" && typeof d.msg_id === "string"
+              ? {
+                  seq: typeof d.seq === "number" ? d.seq : 0,
+                  msg_id: d.msg_id,
+                  room_id: d.room_id,
+                  ts: typeof d.ts === "number" ? d.ts : Math.floor(Date.now() / 1000),
+                  sender_type:
+                    d.sender_type === "human" || d.sender_type === "bot" || d.sender_type === "system"
+                      ? d.sender_type
+                      : "system",
+                  sender: typeof d.sender === "string" ? d.sender : "",
+                  content: typeof d.text === "string" ? d.text : "",
+                  truncated: Boolean(d.truncated),
+                  mentions: Array.isArray(d.mentions)
+                    ? d.mentions.filter((x): x is string => typeof x === "string")
+                    : [],
+                  chain_id: typeof d.chain_id === "string" ? d.chain_id : "",
+                  hop: typeof d.hop === "number" ? d.hop : 0,
+                  status: typeof d.status === "string" ? d.status : "done",
+                  blocked_reason: typeof d.blocked_reason === "string" ? d.blocked_reason : "",
+                }
+              : undefined;
+          setRoomEvent((prev) => ({
+            ver: (prev?.ver || 0) + 1,
+            type: "room_message",
+            room_id: typeof d.room_id === "string" ? d.room_id : undefined,
+            message: msgObj,
+          }));
+        } else if (ev.type === "room_typing") {
+          const d = ev.data || {};
+          setRoomEvent((prev) => ({
+            ver: (prev?.ver || 0) + 1,
+            type: "room_typing",
+            room_id: typeof d.room_id === "string" ? d.room_id : undefined,
+            bot: typeof d.bot === "string" ? d.bot : undefined,
+            typing: Boolean(d.typing),
+          }));
+        } else if (ev.type === "attention_updated") {
+          const d = ev.data || {};
+          setAttentionEventVer((n) => n + 1);
+          if (typeof d.pending_count === "number" && Number.isFinite(d.pending_count)) {
+            setPendingAttentionCount(Math.max(0, Math.floor(d.pending_count)));
+          }
         } else if (ev.type === "resync_required") {
           setJobsEventVer((n) => n + 1);
           setSchedulesEventVer((n) => n + 1);
           setBotsEventVer((n) => n + 1);
           setOverviewEventVer((n) => n + 1);
+          setAttentionEventVer((n) => n + 1);
+          setRoomEvent((prev) => ({
+            ver: (prev?.ver || 0) + 1,
+            type: "resync_required",
+          }));
           setSessionSyncEvent((prev) => ({
             ver: (prev?.ver || 0) + 1,
             type: "resync_required",
@@ -452,9 +529,14 @@ export function App() {
     ? session.username
     : `${session.bot} · #${session.user_id}`;
   const isMoreTabActive =
-    activeTab === "overview" || activeTab === "bots" || activeTab === "costs";
+    activeTab === "rooms" ||
+    activeTab === "attention" ||
+    activeTab === "files" ||
+    activeTab === "overview" ||
+    activeTab === "bots" ||
+    activeTab === "costs";
   const showDesktopBrowserDrawer =
-    !compactMode && browserDrawerOpen && activeTab !== "browser";
+    !compactMode && browserOwner === "drawer" && activeTab !== "browser";
 
   return (
     <div className="h-screen w-screen overflow-hidden bg-slate-950 text-slate-100 flex flex-col md:flex-row">
@@ -514,6 +596,11 @@ export function App() {
                 >
                   <Icon className="w-4 h-4 shrink-0" />
                   <span>{item.label}</span>
+                  {item.id === "attention" && pendingAttentionCount > 0 && (
+                    <span className="ml-auto px-1.5 py-0.5 rounded-full bg-amber-500/20 text-amber-300 text-[10px] font-mono">
+                      {pendingAttentionCount}
+                    </span>
+                  )}
                 </button>
               );
             })}
@@ -525,11 +612,11 @@ export function App() {
                   if (activeTab === "browser") {
                     handleNavigate("workspace");
                   } else {
-                    setBrowserDrawerOpen((v) => !v);
+                    handleToggleBrowserDrawer();
                   }
                 }}
                 className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer ${
-                  activeTab === "browser" || browserDrawerOpen
+                  activeTab === "browser" || browserOwner === "drawer"
                     ? "bg-sky-500/15 text-sky-300 border border-sky-500/30"
                     : "text-slate-400 hover:text-slate-100 hover:bg-slate-800/60"
                 }`}
@@ -583,9 +670,36 @@ export function App() {
           {activeTab === "workspace" ? (
             <WorkspaceView
               session={session}
-              browserDrawerOpen={browserDrawerOpen}
+              compactMode={compactMode}
+              browserOwner={browserOwner}
+              wsSessionEpoch={wsSessionEpoch}
               sessionSyncEvent={sessionSyncEvent}
-              onToggleBrowserDrawer={() => setBrowserDrawerOpen((v) => !v)}
+              roomEvent={roomEvent}
+              jobsEventVer={jobsEventVer}
+              attentionEventVer={attentionEventVer}
+              onClaimBrowserOwner={setBrowserOwner}
+              onToggleBrowserDrawer={handleToggleBrowserDrawer}
+              onPendingAttentionCount={setPendingAttentionCount}
+              onRoleChanged={handleRoleChanged}
+              onSessionRevoked={handleSessionRevoked}
+            />
+          ) : activeTab === "rooms" ? (
+            <RoomPanel
+              session={session}
+              roomEvent={roomEvent}
+              onSessionRevoked={handleSessionRevoked}
+            />
+          ) : activeTab === "attention" ? (
+            <AttentionPanel
+              session={session}
+              eventVersion={attentionEventVer}
+              onOpenBrowser={() => handleNavigate("browser")}
+              onPendingCountChange={setPendingAttentionCount}
+              onSessionRevoked={handleSessionRevoked}
+            />
+          ) : activeTab === "files" ? (
+            <FilesDiffPanel
+              session={session}
               onSessionRevoked={handleSessionRevoked}
             />
           ) : activeTab === "browser" ? (
@@ -605,7 +719,13 @@ export function App() {
                   eventVersion={overviewEventVer}
                 />
               )}
-              {activeTab === "bots" && <BotsView eventVersion={botsEventVer} />}
+              {activeTab === "bots" && (
+                <BotsView
+                  session={session}
+                  eventVersion={botsEventVer}
+                  onSessionRevoked={handleSessionRevoked}
+                />
+              )}
               {activeTab === "jobs" && (
                 <JobsView
                   session={session}
@@ -634,10 +754,9 @@ export function App() {
               compact={false}
               variant="drawer"
               onExpandFull={() => {
-                setBrowserDrawerOpen(false);
                 handleNavigate("browser");
               }}
-              onCloseDrawer={() => setBrowserDrawerOpen(false)}
+              onCloseDrawer={() => setBrowserOwner("none")}
               onSessionRevoked={handleSessionRevoked}
               onRoleChanged={handleRoleChanged}
             />

@@ -56,6 +56,10 @@ def _extract_media_type(request: web.Request) -> str:
     return raw.split(";", 1)[0].strip().lower()
 
 
+def _reject_non_finite_json(token: str) -> Any:
+    raise ValueError(f"Non-finite JSON constant not allowed: {token}")
+
+
 async def _read_bounded_json_body(
     request: web.Request,
     *,
@@ -105,7 +109,7 @@ async def _read_bounded_json_body(
         return True, {}, 200, "ok", ""
 
     try:
-        body = json.loads(raw_body.decode("utf-8"))
+        body = json.loads(raw_body.decode("utf-8"), parse_constant=_reject_non_finite_json)
     except Exception:
         return False, None, 400, "denied_invalid_json", "请求体必须为有效 JSON"
 

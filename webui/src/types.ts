@@ -40,6 +40,7 @@ export interface BotRosterItem {
   model_mode: string;
   effective_model: string;
   active_model: string;
+  default_effort?: string;
   default_project: string;
   last_seen: number;
 }
@@ -211,6 +212,9 @@ export type StudioEventType =
   | "schedule_updated"
   | "bots_updated"
   | "session_updated"
+  | "room_message"
+  | "room_typing"
+  | "attention_updated"
   | "resync_required"
   | "auth_error";
 
@@ -382,6 +386,9 @@ export interface LiveBrowserState {
 
 export type NavTab =
   | "workspace"
+  | "rooms"
+  | "attention"
+  | "files"
   | "overview"
   | "browser"
   | "bots"
@@ -489,6 +496,282 @@ export interface ChatAbortResponse {
   aborted: boolean;
   bot: string;
 }
+
+// Phase B M1: Workspace Files, Git Diff & Undo/Redo
+export interface WorkspaceProjectItem {
+  id: string;
+  name: string;
+  is_git: boolean;
+}
+
+export interface ProjectsResponse {
+  ok: boolean;
+  projects: WorkspaceProjectItem[];
+}
+
+export interface FileTreeNode {
+  name: string;
+  path: string;
+  type: "dir" | "file";
+  size: number | null;
+  has_children?: boolean;
+  children?: FileTreeNode[];
+}
+
+export interface FileTreeResponse {
+  ok: boolean;
+  project_id: string;
+  dir: string;
+  truncated: boolean;
+  total: number;
+  entries: FileTreeNode[];
+}
+
+export interface FileContentResponse {
+  ok: boolean;
+  project_id: string;
+  path: string;
+  is_binary: boolean;
+  size: number;
+  language: string;
+  content: string;
+  lines: number;
+  truncated: boolean;
+}
+
+export interface GitDiffFileEntry {
+  path: string;
+  status: string;
+  staged: string;
+}
+
+export interface FileDiffResponse {
+  ok: boolean;
+  project_id: string;
+  is_git: boolean;
+  scope: "all" | "staged" | "unstaged";
+  path: string;
+  files: GitDiffFileEntry[];
+  diff: string;
+  truncated: boolean;
+}
+
+export interface UndoCheckpointChange {
+  path: string;
+  action: string;
+}
+
+export interface UndoCheckpointItem {
+  entry_id: string;
+  ts: number;
+  cid: string;
+  project_id: string;
+  prompt: string;
+  truncated: boolean;
+  changes_count: number;
+  changes: UndoCheckpointChange[];
+  is_top: boolean;
+}
+
+export interface UndoCheckpointsResponse {
+  ok: boolean;
+  ipc_online: boolean;
+  bot: string;
+  undo_stack: UndoCheckpointItem[];
+  redo_stack: UndoCheckpointItem[];
+}
+
+export interface UndoActionResponse {
+  ok: boolean;
+  action: "undo" | "redo";
+  bot: string;
+  entry_id: string;
+  cid: string;
+  project_id: string;
+  applied: UndoCheckpointChange[];
+  remaining_undo: number;
+  remaining_redo: number;
+}
+
+// Phase B M1: Bot Team Control Plane
+export interface BotSkillItem {
+  name: string;
+  scope: string;
+  description: string;
+}
+
+export interface BotMcpServerItem {
+  name: string;
+  transport: string;
+  enabled: boolean;
+}
+
+export interface BotConfigResponse {
+  ok: boolean;
+  ipc_online: boolean;
+  can_edit: boolean;
+  handle: string;
+  display_name: string;
+  role: string;
+  specialty: string;
+  model_mode: "default" | "follow" | "custom";
+  configured_model: string;
+  effective_model: string;
+  dm_model: string;
+  env_default_model: string;
+  default_effort: string;
+  default_project: string;
+  efforts: string[];
+  models: ModelOption[];
+  projects: ProjectOption[];
+  skills: BotSkillItem[];
+  mcp_servers: BotMcpServerItem[];
+  busy: boolean;
+  queue_depth: number;
+}
+
+export interface BotConfigPatchPayload {
+  model_mode?: "default" | "follow" | "custom";
+  model?: string;
+  default_effort?: string;
+  default_project?: string;
+}
+
+export interface BotReloadResponse {
+  ok: boolean;
+  bot: string;
+  scheduled: boolean;
+  self_check: string;
+  cooldown_sec?: number;
+}
+
+// Phase B M2: Web Multi-Bot Chat Rooms, Unified Attention Queue & Multi-Pane Workbench
+export interface RoomSummary {
+  room_id: string;
+  title: string;
+  topic: string;
+  created_at: number;
+  updated_at: number;
+  last_seq: number;
+  message_count: number;
+}
+
+export interface RoomsResponse {
+  ok: boolean;
+  total: number;
+  max_rooms: number;
+  rooms: RoomSummary[];
+}
+
+export interface RoomMessageItem {
+  seq: number;
+  msg_id: string;
+  room_id: string;
+  ts: number;
+  sender_type: "human" | "bot" | "system";
+  sender: string;
+  content: string;
+  truncated?: boolean;
+  mentions: string[];
+  chain_id: string;
+  hop: number;
+  status: string;
+  blocked_reason: string;
+}
+
+export interface RoomMessagesResponse {
+  ok: boolean;
+  room: RoomSummary;
+  room_id: string;
+  latest_seq: number;
+  total: number;
+  messages: RoomMessageItem[];
+}
+
+export interface RoomCreateResponse {
+  ok: boolean;
+  room: RoomSummary;
+}
+
+export interface RoomSendResponse {
+  ok: boolean;
+  message: RoomMessageItem;
+  dispatched_bots: string[];
+  blocked_bots: string[];
+  blocked_reason: string;
+}
+
+export interface RoomLiveEvent {
+  ver: number;
+  type: "room_message" | "room_typing" | "resync_required";
+  room_id?: string;
+  bot?: string;
+  typing?: boolean;
+  message?: RoomMessageItem;
+}
+
+export type AttentionKind = "plan" | "action" | "undo_force" | "browser_takeover";
+export type AttentionRiskLevel = "medium" | "high";
+export type AttentionStatus = "pending" | "approved" | "rejected" | "expired";
+
+export interface AttentionItem {
+  item_id: string;
+  kind: AttentionKind;
+  risk_level: AttentionRiskLevel;
+  status: AttentionStatus;
+  readonly_signal?: boolean;
+  title: string;
+  summary: string;
+  origin?: string;
+  page_title?: string;
+  takeover_reason?: string;
+  bot: string;
+  cid: string;
+  project_id: string;
+  room_id: string;
+  created_at: number;
+  expires_at: number | null;
+  decided_at: number | null;
+  decided_by: string | null;
+  decision_note?: string;
+}
+
+export interface AttentionResponse {
+  ok: boolean;
+  total: number;
+  pending_count: number;
+  has_browser_takeover: boolean;
+  items: AttentionItem[];
+}
+
+export interface AttentionDecideResponse {
+  ok: boolean;
+  item: AttentionItem;
+  decision: "approved" | "rejected";
+  notify?: {
+    notified: boolean;
+    bot?: string;
+    reason?: string;
+  };
+}
+
+export type PaneKind = "chat" | "room" | "jobs_attention" | "files" | "browser";
+
+export interface WorkbenchPaneConfig {
+  id: string;
+  kind: PaneKind;
+  bot?: string;
+  project?: string;
+  roomId?: string;
+}
+
+export interface WorkbenchLayoutPrefs {
+  paneCount: 1 | 2 | 3 | 4;
+  layoutMode: "1" | "2" | "3" | "4";
+  panes: WorkbenchPaneConfig[];
+}
+
+export type BrowserOwner = "none" | "tab" | "drawer" | `pane:${string}`;
 
 declare global {
   interface Window {

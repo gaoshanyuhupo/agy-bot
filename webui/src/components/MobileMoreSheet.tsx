@@ -1,4 +1,4 @@
-import { Bot, DollarSign, KeyRound, LayoutDashboard, LogOut, X } from "lucide-react";
+import { Bell, Bot, DollarSign, FileCode, KeyRound, LayoutDashboard, LogOut, Users, X } from "lucide-react";
 import type { NavTab, StudioSession } from "../types";
 
 interface MobileMoreSheetProps {
@@ -13,6 +13,9 @@ interface MobileMoreSheetProps {
 }
 
 const SHEET_ITEMS: { id: NavTab; label: string; desc: string; icon: typeof LayoutDashboard }[] = [
+  { id: "rooms", label: "群聊室", desc: "Web 多 Bot 协作群聊与接力护栏", icon: Users },
+  { id: "attention", label: "审批中心", desc: "统一审批队列与浏览器接管感知", icon: Bell },
+  { id: "files", label: "文件审查", desc: "项目文件树、Git Diff 与撤回/重做", icon: FileCode },
   { id: "overview", label: "总览", desc: "多 Bot 状态与系统健康指标", icon: LayoutDashboard },
   { id: "bots", label: "Bot 团队", desc: "在线节点、专长与当前任务", icon: Bot },
   { id: "costs", label: "用量账单", desc: "Token 消耗、缓存命中与额度", icon: DollarSign },

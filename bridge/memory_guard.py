@@ -33,6 +33,7 @@ UNTRUSTED_SOURCE_MARKERS: Tuple[str, ...] = (
     "不可信外部数据",
     "[EXTERNAL_UNTRUSTED",
     "[ACB_READONLY_GUEST",
+    "[UNTRUSTED_WEB_ROOM_MESSAGE",
 )
 
 # (rule_id, compiled_pattern)
