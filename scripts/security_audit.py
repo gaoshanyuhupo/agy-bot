@@ -208,6 +208,8 @@ SAFE_PUBLIC_HOSTS: Set[str] = {
     "generativelanguage.googleapis.com",
     "pypi.python.org",
     "systemd.io",
+    "aibigbigworld.com",
+    "www.aibigbigworld.com",
 }
 
 # Verified funding metadata hosts permitted ONLY inside validated npm `package-lock.json` `funding` fields

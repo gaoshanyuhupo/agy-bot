@@ -6,6 +6,7 @@
 
 - **开源协议**：[MIT](./LICENSE)
 - **代码仓库**：[gaoshanyuhupo/agy-bot](https://github.com/gaoshanyuhupo/agy-bot)
+- **项目展示页**：[aibigbigworld.com/agy-bot](https://aibigbigworld.com/agy-bot/)
 - **社区交流**：[LINUX.DO](https://linux.do/)
 - **安全与贡献**：[SECURITY.md](./SECURITY.md) · [CONTRIBUTING.md](./CONTRIBUTING.md)
 

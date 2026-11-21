@@ -6,6 +6,7 @@ An open-source AI collaborative workbench and multi-platform companion suite bui
 
 - **License**: [MIT](./LICENSE)
 - **Repository**: [gaoshanyuhupo/agy-bot](https://github.com/gaoshanyuhupo/agy-bot)
+- **Showcase Site**: [aibigbigworld.com/agy-bot](https://aibigbigworld.com/agy-bot/)
 - **Community**: [LINUX.DO](https://linux.do/)
 - **Security & Contributing**: [SECURITY.md](./SECURITY.md) · [CONTRIBUTING.md](./CONTRIBUTING.md)
 
