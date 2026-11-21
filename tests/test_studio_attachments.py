@@ -51,7 +51,7 @@ from studio.data_sources import (  # noqa: E402
     extract_message_attachments,
     map_group_history_entry_to_room_message,
 )
-from studio.server import ATTACHMENT_SERVICE_KEY, CHAT_SERVICE_KEY, ROOM_SERVICE_KEY, create_app  # noqa: E402
+from studio.server import ATTACHMENT_SERVICE_KEY, create_app  # noqa: E402
 
 ADMIN_UID = 111111111
 READONLY_UID = 222222222

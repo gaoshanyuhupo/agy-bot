@@ -40,7 +40,6 @@ from studio.auth import (  # noqa: E402
     hash_password_scrypt,
     save_users_file_atomic,
 )
-from studio.chat_service import StudioAuditLogger  # noqa: E402
 from studio.data_sources import StudioDataSources  # noqa: E402
 from studio.secrets_config_service import (  # noqa: E402
     DEFAULT_GATEWAY_PATH_PREFIX,

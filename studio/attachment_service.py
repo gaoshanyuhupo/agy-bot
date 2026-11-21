@@ -39,7 +39,6 @@ from .auth import StudioAuthManager, studio_auth_error
 from .data_sources import (
     StudioDataSources,
     _sanitize_slug,
-    extract_message_attachments,
     truncate_utf8_bytes,
 )
 from .workspace_files import _resolve_sandboxed_path

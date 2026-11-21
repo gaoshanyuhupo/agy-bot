@@ -27,7 +27,6 @@ import unittest
 from unittest import mock
 
 import aiohttp
-from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -54,7 +53,7 @@ from studio.data_sources import (  # noqa: E402
     map_group_history_entry_to_room_message,
 )
 from studio.event_hub import StudioEventHub  # noqa: E402
-from studio.server import CHAT_SERVICE_KEY, EVENT_HUB_KEY, ROOM_SERVICE_KEY, create_app  # noqa: E402
+from studio.server import CHAT_SERVICE_KEY, EVENT_HUB_KEY, create_app  # noqa: E402
 
 ADMIN_UID_A = 111111111
 ADMIN_UID_B = 987654321
