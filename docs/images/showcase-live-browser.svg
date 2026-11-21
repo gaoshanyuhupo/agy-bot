@@ -1,0 +1,211 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 720" width="1200" height="720" role="img" aria-label="Multi-Fingerprint Multi-Egress Camoufox Browser and Telegram Mini App Takeover">
+  <defs>
+    <linearGradient id="lbBg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#070c17"/>
+      <stop offset="50%" stop-color="#0d1527"/>
+      <stop offset="100%" stop-color="#080f1d"/>
+    </linearGradient>
+    <radialGradient id="lbGlowL" cx="0.22" cy="0.20" r="0.45">
+      <stop offset="0%" stop-color="#06b6d4" stop-opacity="0.16"/>
+      <stop offset="100%" stop-color="#06b6d4" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="lbGlowR" cx="0.80" cy="0.78" r="0.48">
+      <stop offset="0%" stop-color="#10b981" stop-opacity="0.14"/>
+      <stop offset="100%" stop-color="#10b981" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="btnBlue" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#0284c7"/>
+      <stop offset="100%" stop-color="#2563eb"/>
+    </linearGradient>
+    <linearGradient id="btnGreen" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#059669"/>
+      <stop offset="100%" stop-color="#10b981"/>
+    </linearGradient>
+    <marker id="lbArrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#38bdf8"/>
+    </marker>
+    <style>
+      .f { font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+      .t-title { font-size: 19px; font-weight: 700; fill: #f8fafc; }
+      .t-sub { font-size: 12.5px; font-weight: 400; fill: #94a3b8; }
+      .t-card { font-size: 14px; font-weight: 700; fill: #f1f5f9; }
+      .t-body { font-size: 12px; font-weight: 400; fill: #cbd5e1; }
+      .t-sec { font-size: 11px; font-weight: 700; fill: #64748b; letter-spacing: 0.5px; }
+    </style>
+  </defs>
+
+  <!-- Canvas Background -->
+  <rect x="0" y="0" width="1200" height="720" rx="20" fill="url(#lbBg)"/>
+  <rect x="0" y="0" width="1200" height="720" rx="20" fill="url(#lbGlowL)"/>
+  <rect x="0" y="0" width="1200" height="720" rx="20" fill="url(#lbGlowR)"/>
+  <rect x="1" y="1" width="1198" height="718" rx="19" fill="none" stroke="#1e293b" stroke-width="1.5"/>
+
+  <!-- Top Header -->
+  <text x="32" y="42" class="f t-title">多指纹多 IP 出口 Camoufox 浏览器 · Telegram Mini App 一键人工接管</text>
+  <text x="32" y="66" class="f t-sub">解决多账号风控隔离、人机验证/验证码，以及远端云浏览器不方便输入账号与 API Key 等高频痛点</text>
+  <rect x="1008" y="24" width="164" height="28" rx="14" fill="#0c2444" stroke="#38bdf8" stroke-opacity="0.55"/>
+  <text x="1090" y="42" text-anchor="middle" class="f" font-size="11.5" font-weight="600" fill="#bae6fd">实时同步 · 一键交还 AI</text>
+
+  <!-- LEFT PANEL: Telegram /browser Live Card + Multi-Fingerprint Switcher (x=24..574, y=86..696) -->
+  <rect x="24" y="86" width="550" height="610" rx="16" fill="#0e1629" fill-opacity="0.92" stroke="#1e2d4a" stroke-width="1.2"/>
+
+  <!-- Left Panel Header -->
+  <rect x="25" y="87" width="548" height="46" rx="15" fill="#111c33"/>
+  <line x1="25" y1="133" x2="573" y2="133" stroke="#1e293b"/>
+  <circle cx="48" cy="110" r="10" fill="#0284c7" fill-opacity="0.35" stroke="#38bdf8"/>
+  <text x="48" y="114" text-anchor="middle" class="f" font-size="10.5" font-weight="700" fill="#bae6fd">TG</text>
+  <text x="68" y="114" class="f t-card">Telegram /browser 实况卡片</text>
+  <rect x="444" y="98" width="114" height="24" rx="12" fill="#064e3b" fill-opacity="0.7" stroke="#10b981" stroke-opacity="0.5"/>
+  <circle cx="458" cy="110" r="3.5" fill="#34d399"/>
+  <text x="468" y="114" class="f" font-size="11" font-weight="600" fill="#a7f3d0">画面实时刷新</text>
+
+  <!-- Live Browser Preview Card inside Telegram -->
+  <rect x="44" y="148" width="510" height="248" rx="12" fill="#09101f" stroke="#26385a" stroke-width="1.2"/>
+  <!-- Browser Address Bar -->
+  <rect x="45" y="149" width="508" height="34" rx="11" fill="#131e36"/>
+  <circle cx="62" cy="166" r="4" fill="#ef4444" fill-opacity="0.75"/>
+  <circle cx="76" cy="166" r="4" fill="#f59e0b" fill-opacity="0.75"/>
+  <circle cx="90" cy="166" r="4" fill="#22c55e" fill-opacity="0.75"/>
+  <rect x="108" y="156" width="268" height="20" rx="6" fill="#0a1222" stroke="#253657"/>
+  <text x="120" y="170" class="mono" font-size="10.5" fill="#94a3b8">https://portal.example.com/verify</text>
+  <rect x="386" y="156" width="156" height="20" rx="6" fill="#0c2a42" stroke="#38bdf8" stroke-opacity="0.5"/>
+  <text x="464" y="170" text-anchor="middle" class="f" font-size="10.5" font-weight="600" fill="#7dd3fc">macOS · 独立代理出口</text>
+
+  <!-- Simulated Webpage with Captcha Challenge -->
+  <rect x="92" y="204" width="414" height="168" rx="12" fill="#111b31" stroke="#334155"/>
+  <text x="116" y="232" class="f" font-size="14" font-weight="700" fill="#f8fafc">安全验证检查 · Security Check</text>
+  <text x="116" y="254" class="f" font-size="11.5" fill="#94a3b8">检测到敏感操作，请完成人机验证后再继续访问控制台</text>
+
+  <!-- Captcha Box -->
+  <rect x="116" y="270" width="366" height="48" rx="9" fill="#0a1222" stroke="#475569"/>
+  <rect x="132" y="282" width="24" height="24" rx="5" fill="#172554" stroke="#60a5fa" stroke-width="1.6"/>
+  <text x="168" y="299" class="f" font-size="12.5" font-weight="600" fill="#e2e8f0">点击确认您是真人操作</text>
+  <rect x="388" y="282" width="80" height="24" rx="6" fill="#1e293b"/>
+  <text x="428" y="298" text-anchor="middle" class="f" font-size="10.5" fill="#94a3b8">人机校验</text>
+
+  <!-- AI Paused Banner -->
+  <rect x="116" y="330" width="366" height="28" rx="7" fill="#451a03" fill-opacity="0.7" stroke="#f59e0b" stroke-opacity="0.55"/>
+  <text x="299" y="348" text-anchor="middle" class="f" font-size="11.5" font-weight="600" fill="#fde68a">⏸ AI 识别到验证挑战，已自动暂停并等待人工接管</text>
+
+  <!-- Multi-Fingerprint & Multi-Egress Switcher -->
+  <text x="46" y="422" class="f t-sec">多指纹 &amp; 多 IP 出口快速切换（环境风控隔离）</text>
+
+  <!-- Profile 1: Windows Direct -->
+  <rect x="44" y="434" width="162" height="106" rx="10" fill="#111b30" stroke="#334155"/>
+  <text x="58" y="458" class="f" font-size="12.5" font-weight="700" fill="#f1f5f9">🔒 Windows</text>
+  <rect x="58" y="468" width="94" height="20" rx="6" fill="#1e293b"/>
+  <text x="105" y="482" text-anchor="middle" class="f" font-size="10.5" font-weight="600" fill="#cbd5e1">宿主机直连 IP</text>
+  <text x="58" y="508" class="f" font-size="10.5" fill="#94a3b8">核心账号硬锁定</text>
+  <text x="58" y="526" class="f" font-size="10.5" fill="#94a3b8">持久指纹防异地风控</text>
+
+  <!-- Profile 2: macOS Proxy (Active) -->
+  <rect x="218" y="434" width="162" height="106" rx="10" fill="#0d2540" stroke="#38bdf8" stroke-width="1.6"/>
+  <text x="232" y="458" class="f" font-size="12.5" font-weight="700" fill="#e0f2fe">🌐 macOS</text>
+  <rect x="232" y="468" width="96" height="20" rx="6" fill="#0369a1"/>
+  <text x="280" y="482" text-anchor="middle" class="f" font-size="10.5" font-weight="700" fill="#ffffff">独立代理 · 当前</text>
+  <text x="232" y="508" class="f" font-size="10.5" fill="#bae6fd">独立 WebGL / GeoIP</text>
+  <text x="232" y="526" class="f" font-size="10.5" fill="#bae6fd">代理凭据内存注入</text>
+
+  <!-- Profile 3: Linux Ephemeral -->
+  <rect x="392" y="434" width="162" height="106" rx="10" fill="#111b30" stroke="#334155"/>
+  <text x="406" y="458" class="f" font-size="12.5" font-weight="700" fill="#f1f5f9">🧪 Linux 临时</text>
+  <rect x="406" y="468" width="96" height="20" rx="6" fill="#1e293b"/>
+  <text x="454" y="482" text-anchor="middle" class="f" font-size="10.5" font-weight="600" fill="#cbd5e1">按需切换出口</text>
+  <text x="406" y="508" class="f" font-size="10.5" fill="#94a3b8">临时会话零残留</text>
+  <text x="406" y="526" class="f" font-size="10.5" fill="#94a3b8">适合匿名调研测试</text>
+
+  <!-- Telegram Inline Keyboard Buttons -->
+  <text x="46" y="566" class="f t-sec">Telegram 内联快捷操作</text>
+  <rect x="44" y="576" width="332" height="44" rx="10" fill="url(#btnBlue)"/>
+  <text x="210" y="603" text-anchor="middle" class="f" font-size="13.5" font-weight="700" fill="#ffffff">📱 打开 Mini App 一键人工接管</text>
+
+  <rect x="386" y="576" width="168" height="44" rx="10" fill="#1e293b" stroke="#334155"/>
+  <text x="470" y="603" text-anchor="middle" class="f" font-size="12.5" font-weight="600" fill="#e2e8f0">🔄 刷新实时画面</text>
+
+  <rect x="44" y="630" width="164" height="44" rx="10" fill="#131e36" stroke="#2d3c59"/>
+  <text x="126" y="657" text-anchor="middle" class="f" font-size="12" font-weight="600" fill="#cbd5e1">⏸ 暂停 AI</text>
+  <rect x="218" y="630" width="164" height="44" rx="10" fill="#131e36" stroke="#2d3c59"/>
+  <text x="300" y="657" text-anchor="middle" class="f" font-size="12" font-weight="600" fill="#cbd5e1">🔀 切换指纹环境</text>
+  <rect x="392" y="630" width="162" height="44" rx="10" fill="#131e36" stroke="#2d3c59"/>
+  <text x="473" y="657" text-anchor="middle" class="f" font-size="12" font-weight="600" fill="#cbd5e1">⏹ 安全关闭</text>
+
+  <!-- CENTER CONNECTOR ARROW -->
+  <line x1="582" y1="392" x2="622" y2="392" stroke="#38bdf8" stroke-width="2.2" marker-end="url(#lbArrow)" marker-start="url(#lbArrow)"/>
+  <rect x="577" y="348" width="50" height="24" rx="8" fill="#0c2444" stroke="#38bdf8" stroke-opacity="0.6"/>
+  <text x="602" y="364" text-anchor="middle" class="f" font-size="10.5" font-weight="700" fill="#bae6fd">实时流</text>
+
+  <!-- RIGHT PANEL: Mobile Telegram Mini App Human Takeover Panel (x=630..1176, y=86..696) -->
+  <rect x="630" y="86" width="546" height="610" rx="26" fill="#0a1120" stroke="#334155" stroke-width="2"/>
+  <rect x="642" y="98" width="522" height="586" rx="18" fill="#0e1629" stroke="#1e2d4a"/>
+
+  <!-- Mini App Header -->
+  <rect x="643" y="99" width="520" height="44" rx="17" fill="#111c33"/>
+  <line x1="643" y1="143" x2="1163" y2="143" stroke="#1e293b"/>
+  <text x="662" y="125" class="f" font-size="13" font-weight="700" fill="#94a3b8">✕</text>
+  <text x="690" y="125" class="f" font-size="13.5" font-weight="700" fill="#f8fafc">Telegram Mini App · 人工接管面板</text>
+  <rect x="1044" y="110" width="104" height="22" rx="11" fill="#172554" stroke="#38bdf8" stroke-opacity="0.5"/>
+  <text x="1096" y="125" text-anchor="middle" class="f" font-size="10.5" font-weight="600" fill="#bae6fd">低延迟实时流</text>
+
+  <!-- Control Arbitration Status Bar -->
+  <rect x="660" y="156" width="486" height="50" rx="11" fill="#2b1b0a" stroke="#f59e0b" stroke-opacity="0.6" stroke-width="1.3"/>
+  <circle cx="678" cy="181" r="5" fill="#fbbf24"/>
+  <text x="692" y="177" class="f" font-size="12.5" font-weight="700" fill="#fef3c7">当前控制权：人工接管中</text>
+  <text x="692" y="195" class="f" font-size="11" fill="#fcd34d">AI 已安全暂停 · 你的触控直达远端浏览器</text>
+  <rect x="1014" y="165" width="120" height="32" rx="8" fill="url(#btnGreen)"/>
+  <text x="1074" y="185" text-anchor="middle" class="f" font-size="12" font-weight="700" fill="#ffffff">▶ 一键交还 AI</text>
+
+  <!-- Interactive Touch Canvas Area -->
+  <rect x="660" y="218" width="486" height="224" rx="12" fill="#09101f" stroke="#26385a"/>
+  <!-- Mini Webpage Canvas -->
+  <rect x="684" y="236" width="438" height="186" rx="10" fill="#111b31" stroke="#334155"/>
+  <text x="704" y="262" class="f" font-size="13.5" font-weight="700" fill="#f8fafc">人机验证已通过 · 请完成账号 / API Key 确认</text>
+
+  <!-- Verified Checkbox with Touch Ripple -->
+  <rect x="704" y="276" width="398" height="44" rx="8" fill="#064e3b" fill-opacity="0.32" stroke="#10b981" stroke-opacity="0.65"/>
+  <circle cx="732" cy="298" r="16" fill="#34d399" fill-opacity="0.18"/>
+  <rect x="721" y="287" width="22" height="22" rx="5" fill="#10b981"/>
+  <text x="732" y="303" text-anchor="middle" class="f" font-size="13" font-weight="700" fill="#ffffff">✓</text>
+  <text x="756" y="303" class="f" font-size="12.5" font-weight="600" fill="#a7f3d0">人机验证已完成（人工轻点确认）</text>
+
+  <!-- Focused Credential Input Box -->
+  <text x="704" y="344" class="f" font-size="11.5" font-weight="600" fill="#93c5fd">远端页面焦点输入框（API Key / 令牌）</text>
+  <rect x="704" y="354" width="398" height="36" rx="8" fill="#0a1222" stroke="#38bdf8" stroke-width="1.6"/>
+  <text x="718" y="376" class="mono" font-size="12" fill="#e0f2fe">&lt;VAULT_INJECTED_KEY&gt;</text>
+  <rect x="898" y="363" width="2" height="17" fill="#38bdf8"/>
+  <rect x="984" y="361" width="108" height="22" rx="6" fill="#172554"/>
+  <text x="1038" y="376" text-anchor="middle" class="f" font-size="10.5" font-weight="600" fill="#93c5fd">已自动聚焦</text>
+
+  <text x="704" y="409" class="f" font-size="10.5" fill="#94a3b8">👆 支持触控点击、滚轮滑动与逐字拖拽选字</text>
+
+  <!-- Remote Clipboard & Safe Input Helper Bar -->
+  <rect x="660" y="454" width="486" height="128" rx="12" fill="#101c33" stroke="#3b82f6" stroke-opacity="0.55" stroke-width="1.2"/>
+  <text x="678" y="478" class="f" font-size="12.5" font-weight="700" fill="#dbeafe">📋 远端剪贴板与安全输入辅助栏</text>
+  <text x="678" y="497" class="f" font-size="11" fill="#94a3b8">告别云浏览器里难以复制粘贴、中文输入法失效与输 Key 繁琐等痛点</text>
+
+  <!-- Local IME / Paste Input -->
+  <rect x="678" y="509" width="332" height="32" rx="8" fill="#09101f" stroke="#334155"/>
+  <text x="692" y="529" class="f" font-size="11.5" fill="#cbd5e1">在手机本地粘贴账号 / 验证码或中文文本...</text>
+  <rect x="1018" y="509" width="110" height="32" rx="8" fill="#2563eb"/>
+  <text x="1073" y="529" text-anchor="middle" class="f" font-size="11.5" font-weight="700" fill="#ffffff">安全注入远端</text>
+
+  <!-- Helper Chips -->
+  <rect x="678" y="549" width="144" height="24" rx="7" fill="#172554" stroke="#38bdf8" stroke-opacity="0.4"/>
+  <text x="750" y="565" text-anchor="middle" class="f" font-size="10.5" font-weight="600" fill="#bae6fd">⌨️ 中文输入法适配</text>
+  <rect x="832" y="549" width="144" height="24" rx="7" fill="#064e3b" fill-opacity="0.65" stroke="#10b981" stroke-opacity="0.45"/>
+  <text x="904" y="565" text-anchor="middle" class="f" font-size="10.5" font-weight="600" fill="#a7f3d0">🔐 远端剪贴板同步</text>
+  <rect x="986" y="549" width="142" height="24" rx="7" fill="#1e293b" stroke="#475569"/>
+  <text x="1057" y="565" text-anchor="middle" class="f" font-size="10.5" font-weight="600" fill="#e2e8f0">⚡ 快捷退格/回车</text>
+
+  <!-- Bottom 3-Step Handover Flow -->
+  <rect x="660" y="596" width="486" height="74" rx="11" fill="#0b1222" stroke="#1e2d4a"/>
+  <text x="678" y="618" class="f t-sec">人机协同闭环流程</text>
+  <rect x="678" y="628" width="136" height="30" rx="8" fill="#1e293b"/>
+  <text x="746" y="647" text-anchor="middle" class="f" font-size="11.5" font-weight="600" fill="#fde68a">① 遇风控/验证码</text>
+  <text x="824" y="647" class="f" font-size="13" fill="#64748b">→</text>
+  <rect x="840" y="628" width="140" height="30" rx="8" fill="#172554"/>
+  <text x="910" y="647" text-anchor="middle" class="f" font-size="11.5" font-weight="600" fill="#bae6fd">② 人工接管处理</text>
+  <text x="990" y="647" class="f" font-size="13" fill="#64748b">→</text>
+  <rect x="1006" y="628" width="124" height="30" rx="8" fill="#064e3b" fill-opacity="0.8"/>
+  <text x="1068" y="647" text-anchor="middle" class="f" font-size="11.5" font-weight="700" fill="#a7f3d0">③ 交还 AI 续跑</text>
+</svg>

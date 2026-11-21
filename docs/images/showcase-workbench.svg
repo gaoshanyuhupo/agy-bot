@@ -1,0 +1,288 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 720" width="1200" height="720" role="img" aria-label="AGY Studio Desktop-Style Workbench Preview">
+  <defs>
+    <linearGradient id="wbBg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#070b16"/>
+      <stop offset="55%" stop-color="#0c1324"/>
+      <stop offset="100%" stop-color="#090f1d"/>
+    </linearGradient>
+    <radialGradient id="glowTL" cx="0.12" cy="0.10" r="0.45">
+      <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.16"/>
+      <stop offset="100%" stop-color="#38bdf8" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glowBR" cx="0.88" cy="0.90" r="0.48">
+      <stop offset="0%" stop-color="#818cf8" stop-opacity="0.15"/>
+      <stop offset="100%" stop-color="#818cf8" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="ctaGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#2563eb"/>
+      <stop offset="100%" stop-color="#4f46e5"/>
+    </linearGradient>
+    <linearGradient id="nowGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#f59e0b"/>
+      <stop offset="100%" stop-color="#ea580c"/>
+    </linearGradient>
+    <linearGradient id="teamPillGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#312e81" stop-opacity="0.72"/>
+      <stop offset="100%" stop-color="#1e1b4b" stop-opacity="0.55"/>
+    </linearGradient>
+    <linearGradient id="userBubble" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1d4ed8" stop-opacity="0.42"/>
+      <stop offset="100%" stop-color="#3730a3" stop-opacity="0.34"/>
+    </linearGradient>
+    <filter id="softShadow" x="-8%" y="-8%" width="116%" height="120%">
+      <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#020617" flood-opacity="0.45"/>
+    </filter>
+    <style>
+      .f { font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+      .t-title { font-size: 13.5px; font-weight: 700; fill: #f1f5f9; }
+      .t-sec { font-size: 11px; font-weight: 700; fill: #64748b; letter-spacing: 0.6px; }
+      .t-item { font-size: 13px; font-weight: 600; fill: #e2e8f0; }
+      .t-sub { font-size: 11.5px; font-weight: 400; fill: #94a3b8; }
+      .t-body { font-size: 13px; font-weight: 400; fill: #e2e8f0; }
+      .t-pill { font-size: 11.5px; font-weight: 600; fill: #f8fafc; }
+      .t-code { font-size: 11.5px; font-weight: 500; fill: #cbd5e1; }
+    </style>
+  </defs>
+
+  <!-- Outer Desktop App Shell -->
+  <rect x="0" y="0" width="1200" height="720" rx="20" fill="url(#wbBg)"/>
+  <rect x="0" y="0" width="1200" height="720" rx="20" fill="url(#glowTL)"/>
+  <rect x="0" y="0" width="1200" height="720" rx="20" fill="url(#glowBR)"/>
+  <rect x="1" y="1" width="1198" height="718" rx="19" fill="none" stroke="#1e293b" stroke-width="1.5"/>
+
+  <!-- Top Window Chrome Bar -->
+  <path d="M 1 20 Q 1 1 20 1 L 1180 1 Q 1199 1 1199 20 L 1199 48 L 1 48 Z" fill="#0b1120" fill-opacity="0.92"/>
+  <line x1="1" y1="48" x2="1199" y2="48" stroke="#1e293b" stroke-width="1"/>
+  <circle cx="26" cy="24" r="5.5" fill="#ef4444" fill-opacity="0.85"/>
+  <circle cx="46" cy="24" r="5.5" fill="#f59e0b" fill-opacity="0.85"/>
+  <circle cx="66" cy="24" r="5.5" fill="#22c55e" fill-opacity="0.85"/>
+  <text x="92" y="29" class="f t-title">AGY Studio · 模拟桌面版反重力工作台</text>
+  <rect x="922" y="12" width="122" height="24" rx="12" fill="#064e3b" fill-opacity="0.7" stroke="#10b981" stroke-opacity="0.5"/>
+  <circle cx="937" cy="24" r="4" fill="#34d399"/>
+  <text x="948" y="28" class="f" font-size="11.5" font-weight="600" fill="#a7f3d0">三端实时同步</text>
+  <rect x="1054" y="12" width="128" height="24" rx="12" fill="#1e293b" stroke="#334155"/>
+  <text x="1068" y="28" class="f" font-size="11.5" font-weight="600" fill="#cbd5e1">桌面 · 移动 · TG</text>
+
+  <!-- LEFT SIDEBAR (x=16..268, y=60..704) -->
+  <rect x="16" y="60" width="252" height="644" rx="14" fill="#0e1629" fill-opacity="0.86" stroke="#1e2d4a" stroke-width="1"/>
+
+  <!-- New Conversation CTA -->
+  <rect x="30" y="76" width="224" height="38" rx="10" fill="url(#ctaGrad)" filter="url(#softShadow)"/>
+  <text x="142" y="100" text-anchor="middle" class="f" font-size="13.5" font-weight="700" fill="#ffffff">+ 新建对话</text>
+
+  <!-- Team Entry Card -->
+  <rect x="30" y="126" width="224" height="54" rx="10" fill="url(#teamPillGrad)" stroke="#6366f1" stroke-opacity="0.55" stroke-width="1.2"/>
+  <text x="44" y="148" class="f" font-size="13.5" font-weight="700" fill="#e0e7ff">✦ Team 群组协同</text>
+  <text x="44" y="168" class="f" font-size="11" fill="#a5b4fc">3 Bots 在线 · 与 TG 群组互通</text>
+  <rect x="216" y="138" width="28" height="18" rx="9" fill="#4f46e5"/>
+  <text x="230" y="151" text-anchor="middle" class="f" font-size="10.5" font-weight="700" fill="#ffffff">3</text>
+
+  <!-- Pinned Section -->
+  <text x="34" y="206" class="f t-sec">置顶项目 · PINNED</text>
+
+  <!-- Active Pinned Item -->
+  <rect x="30" y="216" width="224" height="54" rx="10" fill="#172554" fill-opacity="0.65" stroke="#38bdf8" stroke-opacity="0.55" stroke-width="1.2"/>
+  <rect x="30" y="226" width="3.5" height="34" rx="2" fill="#38bdf8"/>
+  <text x="44" y="239" class="f" font-size="13" font-weight="700" fill="#f8fafc">📌 agy-bot-core</text>
+  <text x="44" y="258" class="f" font-size="11" fill="#93c5fd">当前会话 · 模型设置同步中</text>
+
+  <!-- Second Pinned Item -->
+  <rect x="30" y="278" width="224" height="48" rx="10" fill="#131c31" fill-opacity="0.65" stroke="#1e293b"/>
+  <text x="44" y="299" class="f t-item">📌 gateway-router</text>
+  <text x="44" y="317" class="f t-sub">已同步 Telegram 话题会话</text>
+
+  <!-- Regular Projects Section -->
+  <text x="34" y="352" class="f t-sec">工作区项目 · PROJECTS</text>
+
+  <rect x="30" y="362" width="224" height="46" rx="9" fill="#0f172a" fill-opacity="0.7" stroke="#1e293b"/>
+  <text x="44" y="383" class="f t-item">📁 browser-profiles</text>
+  <text x="44" y="399" class="f t-sub">多指纹配置 · 10 分钟前</text>
+
+  <rect x="30" y="416" width="224" height="46" rx="9" fill="#0f172a" fill-opacity="0.7" stroke="#1e293b"/>
+  <text x="44" y="437" class="f t-item">📁 release-notes</text>
+  <text x="44" y="453" class="f t-sub">双语文档修订 · 1 小时前</text>
+
+  <!-- Archived Collapsible -->
+  <rect x="30" y="476" width="224" height="34" rx="8" fill="#0b1220" stroke="#1e293b" stroke-dasharray="3 3"/>
+  <text x="44" y="497" class="f" font-size="12" font-weight="600" fill="#94a3b8">▸ 已归档会话 (6)</text>
+
+  <!-- Sidebar Management Views Footer -->
+  <line x1="30" y1="532" x2="254" y2="532" stroke="#1e293b" stroke-width="1"/>
+  <text x="34" y="554" class="f t-sec">控制面板导航</text>
+  <rect x="30" y="564" width="108" height="32" rx="8" fill="#1e293b" stroke="#38bdf8" stroke-opacity="0.5"/>
+  <text x="84" y="584" text-anchor="middle" class="f" font-size="12" font-weight="600" fill="#e0f2fe">💬 工作台</text>
+  <rect x="146" y="564" width="108" height="32" rx="8" fill="#131c31" stroke="#26334d"/>
+  <text x="200" y="584" text-anchor="middle" class="f" font-size="12" font-weight="600" fill="#cbd5e1">🌐 外部模型</text>
+  <rect x="30" y="604" width="108" height="32" rx="8" fill="#131c31" stroke="#26334d"/>
+  <text x="84" y="624" text-anchor="middle" class="f" font-size="12" font-weight="600" fill="#cbd5e1">🔐 OpenBao</text>
+  <rect x="146" y="604" width="108" height="32" rx="8" fill="#131c31" stroke="#26334d"/>
+  <text x="200" y="624" text-anchor="middle" class="f" font-size="12" font-weight="600" fill="#cbd5e1">🧭 实时浏览器</text>
+
+  <rect x="30" y="650" width="224" height="38" rx="9" fill="#0b1220" stroke="#1e293b"/>
+  <circle cx="48" cy="669" r="5" fill="#22c55e"/>
+  <text x="61" y="673" class="f" font-size="11.5" font-weight="600" fill="#cbd5e1">本地常驻会话池 · 延迟低</text>
+
+  <!-- CENTER WORKSPACE PANE (x=280..916, y=60..704) -->
+  <rect x="280" y="60" width="636" height="644" rx="14" fill="#0d1527" fill-opacity="0.88" stroke="#1e2d4a" stroke-width="1"/>
+
+  <!-- Top Controls Bar inside Center Pane -->
+  <rect x="281" y="61" width="634" height="56" rx="13" fill="#111b31" fill-opacity="0.9"/>
+  <line x1="281" y1="117" x2="915" y2="117" stroke="#1e293b" stroke-width="1"/>
+
+  <!-- Bot Selector -->
+  <rect x="296" y="73" width="118" height="32" rx="8" fill="#1e293b" stroke="#334155"/>
+  <circle cx="312" cy="89" r="5" fill="#38bdf8"/>
+  <text x="324" y="93" class="f" font-size="12.5" font-weight="700" fill="#f1f5f9">Dev Bot ▾</text>
+
+  <!-- Model & Effort Selector -->
+  <rect x="424" y="73" width="234" height="32" rx="8" fill="#172554" fill-opacity="0.7" stroke="#3b82f6" stroke-opacity="0.55"/>
+  <text x="438" y="93" class="f" font-size="12" font-weight="600" fill="#dbeafe">官方 / 外部模型 ▾  ·  Effort: High</text>
+
+  <!-- Sync to TG Default Badge -->
+  <rect x="668" y="73" width="122" height="32" rx="8" fill="#064e3b" fill-opacity="0.65" stroke="#10b981" stroke-opacity="0.55"/>
+  <text x="729" y="93" text-anchor="middle" class="f" font-size="11.5" font-weight="700" fill="#a7f3d0">🔄 同步 TG 默认</text>
+
+  <!-- Session Mode Pill -->
+  <rect x="800" y="73" width="100" height="32" rx="8" fill="#1e293b" stroke="#334155"/>
+  <text x="850" y="93" text-anchor="middle" class="f" font-size="11.5" font-weight="600" fill="#cbd5e1">流式会话中</text>
+
+  <!-- User Message Bubble (Right-aligned) -->
+  <rect x="386" y="132" width="512" height="82" rx="13" fill="url(#userBubble)" stroke="#60a5fa" stroke-opacity="0.45"/>
+  <text x="404" y="156" class="f" font-size="13" font-weight="500" fill="#f8fafc">检查外部模型网关配置的超时与回退校验，顺便补全单元测试并确认</text>
+  <text x="404" y="177" class="f" font-size="13" font-weight="500" fill="#f8fafc">OpenBao 托管后不会把任何密钥写进聊天记录。</text>
+  <!-- Attached chips inside user message -->
+  <rect x="404" y="187" width="114" height="20" rx="6" fill="#0f172a" fill-opacity="0.75" stroke="#3b82f6" stroke-opacity="0.5"/>
+  <text x="414" y="201" class="mono" font-size="10.5" fill="#93c5fd">@</text>
+  <text x="426" y="201" class="mono" font-size="10.5" fill="#e0f2fe">models.py</text>
+  <rect x="526" y="187" width="116" height="20" rx="6" fill="#0f172a" fill-opacity="0.75" stroke="#818cf8" stroke-opacity="0.5"/>
+  <text x="536" y="201" class="f" font-size="10.5" fill="#c7d2fe">🖼 ui-mockup.png</text>
+
+  <!-- Live Processing Stage Stepper Bar -->
+  <rect x="298" y="228" width="600" height="50" rx="11" fill="#0b1222" stroke="#253657" stroke-width="1.2"/>
+  <text x="314" y="247" class="f" font-size="10.5" font-weight="700" fill="#64748b">实时处理环节</text>
+  <!-- Step 1: Receive -->
+  <rect x="314" y="253" width="74" height="19" rx="9" fill="#064e3b" fill-opacity="0.75"/>
+  <text x="351" y="266" text-anchor="middle" class="f" font-size="10.5" font-weight="600" fill="#6ee7b7">✓ 收件</text>
+  <line x1="392" y1="262" x2="416" y2="262" stroke="#10b981" stroke-width="1.5"/>
+  <!-- Step 2: Think -->
+  <rect x="420" y="253" width="78" height="19" rx="9" fill="#064e3b" fill-opacity="0.75"/>
+  <text x="459" y="266" text-anchor="middle" class="f" font-size="10.5" font-weight="600" fill="#6ee7b7">✓ 思考</text>
+  <line x1="502" y1="262" x2="526" y2="262" stroke="#10b981" stroke-width="1.5"/>
+  <!-- Step 3: Tools -->
+  <rect x="530" y="253" width="166" height="19" rx="9" fill="#172554" stroke="#38bdf8" stroke-opacity="0.7"/>
+  <text x="613" y="266" text-anchor="middle" class="f" font-size="10.5" font-weight="600" fill="#bae6fd">⚙ 工具 · 读码与单测</text>
+  <line x1="700" y1="262" x2="724" y2="262" stroke="#38bdf8" stroke-width="1.5" stroke-dasharray="3 2"/>
+  <!-- Step 4: Respond -->
+  <rect x="728" y="253" width="154" height="19" rx="9" fill="#312e81" stroke="#818cf8" stroke-opacity="0.7"/>
+  <circle cx="742" cy="262.5" r="3.5" fill="#a5b4fc"/>
+  <text x="752" y="266" class="f" font-size="10.5" font-weight="600" fill="#e0e7ff">流式应答中 (2.4s)</text>
+
+  <!-- Assistant Reply Card -->
+  <rect x="298" y="292" width="584" height="238" rx="13" fill="#111b30" stroke="#26385a" stroke-width="1.2"/>
+  <circle cx="322" cy="316" r="11" fill="#0ea5e9" fill-opacity="0.22" stroke="#38bdf8"/>
+  <text x="322" y="320" text-anchor="middle" class="f" font-size="11" font-weight="700" fill="#7dd3fc">D</text>
+  <text x="342" y="319" class="f" font-size="13" font-weight="700" fill="#f1f5f9">Dev Bot</text>
+  <rect x="404" y="306" width="124" height="19" rx="9" fill="#1e293b"/>
+  <text x="466" y="319" text-anchor="middle" class="f" font-size="10.5" fill="#94a3b8">官方主力 · High</text>
+  <rect x="758" y="306" width="108" height="19" rx="9" fill="#064e3b" fill-opacity="0.75"/>
+  <text x="812" y="319" text-anchor="middle" class="f" font-size="10.5" font-weight="600" fill="#6ee7b7">✓ 14/14 通过</text>
+
+  <text x="316" y="352" class="f t-body">已完成网关超时校验与回归单测，关键核验如下：</text>
+  <text x="324" y="378" class="f" font-size="12.5" fill="#cbd5e1">1. 网关探测超时默认收敛至 15s，异常自动保留原可用模型配置</text>
+  <text x="324" y="402" class="f" font-size="12.5" fill="#cbd5e1">2. 凭据读取严格走 OpenBao 内存注入（无 OpenBao 时降级本机 0600）</text>
+  <text x="324" y="426" class="f" font-size="12.5" fill="#cbd5e1">3. 响应体与错误日志均已屏蔽凭据字段，聊天上下文全程零明文</text>
+
+  <!-- Compact Verification Box inside Reply -->
+  <rect x="316" y="444" width="546" height="40" rx="8" fill="#09101f" stroke="#1e3a5f"/>
+  <text x="330" y="469" class="mono" font-size="11.5" fill="#34d399">PASS</text>
+  <text x="372" y="469" class="f" font-size="12" fill="#cbd5e1">单测 14/14 绿灯 · 脱敏审计 0 命中 · 已同步写入工作区差异视图</text>
+
+  <!-- Sync Footer inside Assistant Reply -->
+  <text x="316" y="514" class="f" font-size="11" fill="#64748b">🔄 本条回复已实时推送至 Telegram 对应会话与移动端 WebUI</text>
+
+  <!-- Bottom Composer Box (y=546..690) -->
+  <rect x="296" y="546" width="604" height="144" rx="13" fill="#0a1120" stroke="#334155" stroke-width="1.3"/>
+
+  <!-- Attachment & Workspace File Reference Bar -->
+  <rect x="310" y="558" width="96" height="24" rx="7" fill="#172033" stroke="#2d3c59"/>
+  <text x="358" y="574" text-anchor="middle" class="f" font-size="11" font-weight="600" fill="#cbd5e1">📎 图片/附件</text>
+  <rect x="414" y="558" width="118" height="24" rx="7" fill="#172554" fill-opacity="0.7" stroke="#3b82f6" stroke-opacity="0.55"/>
+  <text x="473" y="574" text-anchor="middle" class="f" font-size="11" font-weight="600" fill="#bfdbfe">@ 引用工作区文件</text>
+  <rect x="540" y="558" width="112" height="24" rx="7" fill="#131c31" stroke="#334155"/>
+  <text x="596" y="574" text-anchor="middle" class="mono" font-size="10.5" fill="#93c5fd">models.py  ×</text>
+  <rect x="660" y="558" width="112" height="24" rx="7" fill="#131c31" stroke="#334155"/>
+  <text x="716" y="574" text-anchor="middle" class="f" font-size="10.5" fill="#a5b4fc">截图已粘贴  ×</text>
+
+  <!-- Input Textarea Placeholder -->
+  <text x="314" y="616" class="f" font-size="13" fill="#94a3b8">继续输入指令、粘贴截图，或键入 @ 精准引用工作区源码文件...</text>
+  <rect x="676" y="603" width="2" height="16" fill="#38bdf8"/>
+
+  <!-- Bottom Action Row: Queue vs Immediate Run -->
+  <line x1="310" y1="636" x2="886" y2="636" stroke="#1e293b" stroke-width="1"/>
+  <text x="314" y="668" class="f" font-size="11.5" fill="#64748b">当前任务运行中：可加入队列，或紧急插队马上执行</text>
+
+  <rect x="664" y="647" width="96" height="32" rx="8" fill="#1e293b" stroke="#475569"/>
+  <text x="712" y="667" text-anchor="middle" class="f" font-size="12" font-weight="600" fill="#e2e8f0">⏳ 排队发送</text>
+
+  <rect x="768" y="647" width="118" height="32" rx="8" fill="url(#nowGrad)"/>
+  <text x="827" y="667" text-anchor="middle" class="f" font-size="12.5" font-weight="700" fill="#ffffff">⚡ 马上执行</text>
+
+  <!-- RIGHT INSPECTOR PANEL (x=928..1184, y=60..704) -->
+  <rect x="928" y="60" width="256" height="644" rx="14" fill="#0e1629" fill-opacity="0.86" stroke="#1e2d4a" stroke-width="1"/>
+
+  <!-- Inspector Header Tabs -->
+  <rect x="942" y="74" width="110" height="30" rx="8" fill="#172554" stroke="#38bdf8" stroke-opacity="0.5"/>
+  <text x="997" y="93" text-anchor="middle" class="f" font-size="12" font-weight="700" fill="#e0f2fe">变更文件</text>
+  <rect x="1060" y="74" width="110" height="30" rx="8" fill="#131c31" stroke="#1e293b"/>
+  <text x="1115" y="93" text-anchor="middle" class="f" font-size="12" font-weight="600" fill="#94a3b8">团队动态</text>
+
+  <!-- Changed Files List -->
+  <text x="944" y="130" class="f t-sec">工作区差异 · 2 FILES</text>
+  <rect x="942" y="140" width="228" height="44" rx="9" fill="#111b30" stroke="#1e2d4a"/>
+  <text x="954" y="159" class="mono" font-size="11.5" font-weight="700" fill="#fbbf24">M</text>
+  <text x="972" y="159" class="mono" font-size="11.5" fill="#e2e8f0">studio/models.py</text>
+  <text x="972" y="175" class="mono" font-size="10.5" fill="#34d399">+28</text>
+  <text x="1002" y="175" class="mono" font-size="10.5" fill="#f87171">-4</text>
+
+  <rect x="942" y="192" width="228" height="44" rx="9" fill="#111b30" stroke="#1e2d4a"/>
+  <text x="954" y="211" class="mono" font-size="11.5" font-weight="700" fill="#34d399">A</text>
+  <text x="972" y="211" class="mono" font-size="11.5" fill="#e2e8f0">tests/test_models.py</text>
+  <text x="972" y="227" class="mono" font-size="10.5" fill="#34d399">+64</text>
+
+  <!-- 3-Platform Sync Status Card -->
+  <line x1="942" y1="258" x2="1170" y2="258" stroke="#1e293b" stroke-width="1"/>
+  <text x="944" y="280" class="f t-sec">三端互通状态</text>
+
+  <rect x="942" y="292" width="228" height="148" rx="11" fill="#0b1222" stroke="#1e3a5f"/>
+  <!-- Row 1 -->
+  <circle cx="960" cy="318" r="5" fill="#38bdf8"/>
+  <text x="974" y="322" class="f" font-size="12.5" font-weight="600" fill="#f1f5f9">桌面 WebUI</text>
+  <text x="1156" y="322" text-anchor="end" class="f" font-size="11" fill="#38bdf8">当前在线</text>
+  <!-- Row 2 -->
+  <circle cx="960" cy="356" r="5" fill="#34d399"/>
+  <text x="974" y="360" class="f" font-size="12.5" font-weight="600" fill="#f1f5f9">Telegram 端</text>
+  <text x="1156" y="360" text-anchor="end" class="f" font-size="11" fill="#34d399">消息/模型同步</text>
+  <!-- Row 3 -->
+  <circle cx="960" cy="394" r="5" fill="#a78bfa"/>
+  <text x="974" y="398" class="f" font-size="12.5" font-weight="600" fill="#f1f5f9">移动端 WebUI</text>
+  <text x="1156" y="398" text-anchor="end" class="f" font-size="11" fill="#c4b5fd">自适应就绪</text>
+  <line x1="956" y1="414" x2="1156" y2="414" stroke="#1e293b"/>
+  <text x="1056" y="431" text-anchor="middle" class="f" font-size="10.5" fill="#94a3b8">对话 · 侧栏 · 默认模型三端一致</text>
+
+  <!-- Security & Vault Summary Card -->
+  <text x="944" y="468" class="f t-sec">安全与托管状态</text>
+  <rect x="942" y="480" width="228" height="104" rx="11" fill="#064e3b" fill-opacity="0.22" stroke="#10b981" stroke-opacity="0.45"/>
+  <text x="956" y="504" class="f" font-size="12.5" font-weight="700" fill="#a7f3d0">🔐 OpenBao 托管已连接</text>
+  <text x="956" y="527" class="f" font-size="11.5" fill="#cbd5e1">• 外部模型 Key 运行时注入</text>
+  <text x="956" y="547" class="f" font-size="11.5" fill="#cbd5e1">• 聊天上下文零明文密钥</text>
+  <text x="956" y="567" class="f" font-size="11.5" fill="#cbd5e1">• 未部署时自动降级 0600</text>
+
+  <!-- Quick Action Footer -->
+  <rect x="942" y="602" width="228" height="86" rx="11" fill="#111b30" stroke="#1e2d4a"/>
+  <text x="956" y="625" class="f" font-size="12" font-weight="700" fill="#e2e8f0">✨ 快捷能力</text>
+  <rect x="956" y="638" width="94" height="32" rx="7" fill="#1e293b" stroke="#334155"/>
+  <text x="1003" y="658" text-anchor="middle" class="f" font-size="11.5" fill="#cbd5e1">↩ 一键撤销</text>
+  <rect x="1062" y="638" width="94" height="32" rx="7" fill="#1e293b" stroke="#334155"/>
+  <text x="1109" y="658" text-anchor="middle" class="f" font-size="11.5" fill="#cbd5e1">📊 用量统计</text>
+</svg>

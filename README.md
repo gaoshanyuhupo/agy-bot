@@ -1,112 +1,110 @@
 # agy-bot
 
-[English](./README.md) | [简体中文](./README.zh-CN.md)
+**简体中文** | [English](./README.en.md)
 
-Open-source companion stack built natively on the **official Google Antigravity CLI (`agy`)**—connecting directly to local persistent `agy` `stream-json` sessions (avoiding third-party reverse-proxy ban risks):
-- **Telegram Group Multi-Bot Team Collaboration & RBAC**: `sendMessageDraft` real-time streaming, group anti-429 adaptive fallback, `acb-team` async delegation, optional Git Worktree (`worktree: true`) concurrent isolation, and group/user RBAC (`AGY_TG_ADMIN_USERS` / `AGY_TG_READONLY_USERS`).
-- **Multi-Fingerprint, Multi-Egress Camoufox Browser & Telegram Mini App Takeover**: Named profiles with per-profile OS, viewport, WebGL, WebRTC/GeoIP, and proxy egress switching to isolate tasks and handle strict anti-bot checks (such as Cloudflare challenges), while supporting locked persistent fingerprints + direct host egress for core accounts; visual in-app profile switcher drawer + Telegram `/browser` inline control panel and 1-click Mini App human takeover let you resolve interactive challenges and hand control back to AI.
-- **Cross-Session Anti-Forgetting, Memory Guard, `/dream` & Self-Healing Ops**: Lossless `/compact` transcript rehydration, stateless local observer LLM shim, 3-layer anti-poisoning memory guard (`bridge/memory_guard.py` + Hook Gate + Instinct Daemon full-step audit), `/dream` periodic instinct consolidation & `observations.jsonl` gzip archival, Continuous-Learning v2, `mem-search`, `/undo`/`/redo`, `/schedule`/`/cron`, `/project`, `/usage`/`/cost`, pre-output model failover (`AGY_TG_FALLBACK_MODELS` / `/model fallback`), `agy-bot setup` (`--bots ... --systemd-out ...`) / `doctor --fix`, Docker deployment ([`Dockerfile`](./Dockerfile), [`docker-compose.example.yml`](./docker-compose.example.yml), [AI-INSTALL Guide](./docs/AI-INSTALL.md)), atomic `_JobQueue` restart recovery, and pre-checked zero-downtime hot reload with LKG auto-rollback.
-- **AGY Studio WebUI Control Plane (`studio/` + `webui/`)**: Password-authenticated (`AGY_STUDIO_AUTH_MODE=password`, scrypt + `HttpOnly`/`SameSite` cookies + CSRF + sanitized access logging) React + aiohttp sidecar providing real-time Workspace streaming chat via single-writer IPC (`bridge/studio_ipc.py`), Jobs dispatch/cancel/retry control plane, safe Schedules management, global SSE (`/api/events`), and a same-origin Live-Browser takeover drawer—all MIT-licensed clean-room code.
-- **Zero-Trace OpenBao Secret Ops & Automated Desensitization Gate**: Sanitized [OpenBao Zero-Trace Secret Ops Guide](./docs/OPENBAO_SECRETOPS_GUIDE.md) paired with structural working-tree + Git history auditing and a Python 3.11–3.14 + Node 22 CI matrix.
+基于官方 **Google Antigravity CLI (`agy`)** 原生构建的开源 AI 协作工作台与多端助手套件——直连本地官方 `agy` 会话，不走第三方反代链路，让你在 **Telegram、桌面 WebUI、移动 WebUI** 三端无缝指挥自己的 AI 工程团队。
 
-- **License**: [MIT](./LICENSE)
-- **Repository**: `https://github.com/gaoshanyuhupo/agy-bot`
-- **Community**: [LINUX.DO](https://linux.do/)
-- **Security Policy**: [SECURITY.md](./SECURITY.md) · **Contributing**: [CONTRIBUTING.md](./CONTRIBUTING.md)
-
-![agy-bot System Architecture](./docs/images/architecture.svg)
+- **开源协议**：[MIT](./LICENSE)
+- **代码仓库**：[gaoshanyuhupo/agy-bot](https://github.com/gaoshanyuhupo/agy-bot)
+- **社区交流**：[LINUX.DO](https://linux.do/)
+- **安全与贡献**：[SECURITY.md](./SECURITY.md) · [CONTRIBUTING.md](./CONTRIBUTING.md)
 
 ---
 
-## Architecture & Core Components
+## 核心能力一览
 
-### 1. `bridge/` — Real-Time Multi-Bot Telegram Bridge v3 (`bridge.py`, `cli.py`)
-- **Native `sendMessageDraft` Streaming + Group Anti-429 Fallback**: Instant *"Thinking…"* bubble, native Telegram Stop button support, event-driven tool/thought updates, animated token streaming, and adaptive backoff + final coalesced fallback for group chats.
-- **Warm Persistent `stream-json` Session Pool**: Maintains persistent `agy --input-format stream-json --output-format stream-json` processes with idle TTL reaping and instant cancellation.
-- **Project & Workspace Switcher (`/project`)**: Switches cleanly between registered Antigravity CLI projects (`~/.gemini/config/projects/*.json`) with automatic session resume.
-- **Usage & Cost Telemetry (`/usage`, `/cost`)**: Splits cloud quota monitoring (`/usage`) from local transcript token, prefix-cache hit rate, and API USD accounting (`/cost`).
-- **Scheduled Tasks Engine (`/schedule` / `/cron`)**: Supports 5-field cron expressions and relative timers (`in 30m` / `10分钟`) with shell/script/agent/keepalive job types and Telegram inline controls.
-- **Content-Addressed Workspace Undo/Redo (`/undo`, `/redo`)**: Captures pre/post turn workspace snapshots with external-edit conflict protection and atomic rollback/replay.
-- **Smart Auto-Compact & Recovery**: Configurable auto-compaction (`/compact`, `/context`) plus automatic retry/recovery on transient errors.
-- **Multi-Bot Concurrency & Coordinator Bus (`bot_bus.py`, `bot_bus_mcp.py`)**: Per-instance media outbox isolation, `fcntl.flock` atomic media claim locking + per-bot poller `flock` (`FD_CLOEXEC`) across concurrent bots (`@bot_one`, `@bot_two`), stdio MCP delegation tools (`acb-team`), and optional `worktree: true` Git worktree isolation on `team_dispatch` (`<repo>/.worktrees/<job_id>` on branch `agy-team/<job_id>`, `.git/info/exclude` zero-pollution exclusion, auto-pruning clean no-op worktrees, and post-review cleanup via `team_job(action="cleanup_worktree")`).
-- **Model Failover & Group RBAC (`model_failover.py`, `access_control.py`)**: Automatic pre-output model fallback across `AGY_TG_FALLBACK_MODELS` (or `/model fallback`) on `429`/`5xx` errors before any tool or user-visible output occurs, paired with `admin`/`readonly` group RBAC isolation (`AGY_TG_ADMIN_USERS`, `AGY_TG_READONLY_USERS`) and separate warm pools.
-- **Telegram `/browser` Inline Control Panel**: Inspect live browser status, switch fingerprints (`browser:switch:*`) or start/stop safely from Telegram, with private-chat-only Mini App `web_app` button enforcement and `readonly` write protection.
-- **Setup, Diagnostics & Docker (`agy-bot setup` / `agy-bot doctor`, `Dockerfile`)**: PEP 621 packaged CLI (`pyproject.toml`) supporting single-bot and multi-bot team bootstrapping (`agy-bot setup --bots ... --systemd-out ...`), offline/online `doctor` checks, and non-root container templates ([`Dockerfile`](./Dockerfile), [`docker-compose.example.yml`](./docker-compose.example.yml), [docs/AI-INSTALL.md](./docs/AI-INSTALL.md)).
-- **Fail-Closed GitHub Webhook Receiver (`bridge/github_webhook.py`)**: Zero-dependency HMAC-SHA256 (`X-Hub-Signature-256`) webhook listener (`127.0.0.1:18798`) with OpenBao/file/env secret resolution, bounded `Content-Length` & `X-GitHub-Delivery` replay dedup, prompt-injection sanitization, and sanitized unit template ([`systemd/examples/agy-github-webhook.service.example`](./systemd/examples/agy-github-webhook.service.example)).
-- **Atomic `_JobQueue` Restart Recovery**: Persists pending/in-flight queued turns atomically to `QUEUE_FILE` and restores them in FIFO order on restart with configurable TTL expiry (`AGY_TG_QUEUE_TTL_SEC`, default `3600`s) and route/in-flight deduplication (`restore_persisted_queue`).
-- **Zero-Downtime Hot Reload, Pre-Exec Self-Check & LKG Auto-Rollback**: Sentinel-file triggered (`AGY_TG_RELOAD_FILE`, e.g. `/tmp/agy_bridge_reload`) graceful `os.execv` reload protected by pre-exec `py_compile` + `bridge.py --self-check`, Last-Known-Good (`.rollback/lkg`) snapshot & startup breadcrumb (`reload_pending.json`) automatic rollback on startup crash, and operator deploy snapshot rollback (`sync_live.py rollback`).
-- **3-Layer Anti-Poisoning Memory Guard & `/dream` (`bridge/memory_guard.py`)**: Sticky taint registry + injection pattern guard shared across Bridge (tainting untrusted/readonly turns, recycling clean warm sessions, and setting `AGY_UNTRUSTED_SESSION=1` / `AGY_MEMORY_READONLY=1`), Hook Gate, and Instinct Daemon, plus Telegram `/dream` status & background consolidation trigger.
-
-### 2. `.agents/skills/live-browser/` — Multi-Fingerprint Live Browser & Telegram Takeover
-- **Dual-Mode Live Mirroring & In-App Profile Switcher**: In-chat `editMessageMedia` single-photo Live Card + `/browser` control panel, plus a low-latency binary JPEG WebSocket stream and visual profile switcher drawer inside the Telegram Mini App (`https://live.your-domain.com` behind Cloudflare Tunnel).
-- **Multi-Fingerprint & Multi-Egress Profiles (`--profile`, `--os`, `--proxy-bao`)**: Manage isolated named profiles in `~/.config/agy-live-browser/profiles.json` (`0600`) with independent `os` (`windows`/`macos`/`linux`), `locale`, `window`, `webgl_config`, `block_webrtc`, `geoip`, `--ephemeral` temp contexts, and per-profile `--proxy` or memory-only OpenBao `--proxy-bao` egress—masking credentials (`socks5://***@example.com:1080`) in all status/card outputs.
-- **Pinned Persistent Profile Hard-Lock**: When a host-pinned profile module is installed, `default` stays fail-closed locked to its persistent fingerprint (`os="windows"`, `headless="virtual"`) and direct host egress (`network.proxy.type=0`), rejecting any proxy or fingerprint override.
-- **3-State Control Arbitration**: Switch cleanly between AI observation, 1-click human takeover (pausing AI via `ai_allowed_event` to resolve interactive verifications or Cloudflare challenges), and handing control back to AI from the updated DOM state.
-- **Mobile/Desktop Input & X11 Clipboard Sync**: Auto-popping `visualViewport`-safe CJK/IME input sheet for focused inputs, external `xclip` clipboard reading, and character-exact finger drag-to-select (`document.caretPositionFromPoint`).
-- **Quick CLI**:
-  ```bash
-  live-browser profile create us-work --os macos --locale en-US --window 1440x900 --block-webrtc --geoip --proxy-bao kv/proxies/us-west
-  live-browser start --profile us-work --restart --url "https://example.com"
-  ```
-- Full operator & mobile guide: [docs/TELEGRAM_LIVE_BROWSER_GUIDE.md](./docs/TELEGRAM_LIVE_BROWSER_GUIDE.md).
-
-### 3. `hooks/` — Lossless Post-Compact Rehydration & Lifecycle Hooks
-- **`rehydrate_after_compact.py` (`PreInvocation`)**: Detects `/compact` checkpoints in `transcript_full.jsonl` (including `/fork` ancestry) and restores a concise verbatim request timeline, recent dialogue, and a path+size `read_file` index.
-- **`claude_mem_hook_gate.py` & `hooks.json`**: Unified lifecycle hook gate (`SessionStart`, `PreInvocation`, `Stop`) guarded by `AGY_INTERNAL_OBSERVER=1` to short-circuit observer recursion, slash commands, and trivial zero-tool steps, while enforcing `memory_guard` taint checks & full-step payload/transcript inspection to block `session-init` / `summarize` memory writes on tainted sessions.
-
-### 4. `mem-hub/` — Local Observer LLM Shim & Continuous-Learning v2 Daemon
-- **`agy_llm_shim.py`**: Local OpenAI/Anthropic-compatible HTTP shim backed by an isolated tool-free `pure-llm` agent (`mem-hub/observer-sandbox/`) with clean stateless session rotation.
-- **`agy_instinct_daemon.py`**: Extracts session instincts with confidence scoring, audits every harvested transcript step and LLM instinct candidate via `memory_guard`, updates `.agents/rules/ecc-active-instincts.md`, evolves non-redundant instincts into capped reusable skills, and runs periodic `/dream` (`dream`) memory consolidation (quarantining unsafe instincts, time-decay archival, similarity deduplication/merging, and rolling gzip archival of `observations.jsonl` with exact offset recalculation).
-
-### 5. `studio/` & `webui/` — AGY Studio Phase A (Workspace Chat, Control Plane & Browser Drawer)
-- **Workspace Streaming Chat & Single-Writer IPC (`studio/chat_service.py`, `bridge/studio_ipc.py`)**: Real-time SSE token streaming, session history & model catalog inspection, abort controls, and pure-React safe Markdown rendering (`SafeMarkdown.tsx`, zero raw HTML injection).
-- **Jobs Control Plane & Safe Schedules (`studio/control_plane.py`, `studio/event_hub.py`)**: Dispatch, inspect, cancel, and retry `acb-team` jobs; create, toggle, run, or delete schedules under strict command/interval guardrails; and receive live global SSE updates (`/api/events`).
-- **Same-Origin Live-Browser Drawer (`studio/browser_proxy.py`)**: Authenticated WebSocket & file-transfer proxy to the local `live-browser` daemon without exposing upstream ports directly.
-- **Zero-Trust Password Authentication (`studio/auth.py`)**: Defaults to `AGY_STUDIO_AUTH_MODE=password` backed by an external `0600` `users.json` scrypt store (provision via `python3 -m studio.auth set-user`), enforcing `must_change_password`, CSRF/Same-Origin checks, live RBAC downgrade/eviction, and query/header-sanitized access logs. Sanitized service template: [`systemd/examples/agy-studio.service.example`](./systemd/examples/agy-studio.service.example).
-
-### 6. `scripts/`, `tests/` & `docs/OPENBAO_SECRETOPS_GUIDE.md` — Zero-Trace Secret Ops, Desensitization Gate & Cost Accounting
-- **Self-Hosted OpenBao Zero-Trace Secret Guide**: Fully sanitized patterns for `0600` local Vault credentials, ephemeral CLI env injection, in-memory Python helpers, and disk-free `live-browser --proxy-bao` egress in [docs/OPENBAO_SECRETOPS_GUIDE.md](./docs/OPENBAO_SECRETOPS_GUIDE.md).
-- **`scripts/security_audit.py`**: Zero-leak structural scanner covering raw API keys/tokens, half-masked prefixes, credentialed URLs, unallowlisted external endpoints/domains, numeric/hex/UUID IDs, emails/`@handles`, hardcoded `/home/<user>` or `User=` paths, non-doc IPs, forbidden runtime files, and Git commit history (`--check-history`). Supports optional external blocklists (`--blocklist-file` / `~/.config/agy-audit-blocklist.txt`).
-- **`tests/`**: Automated `unittest` suite covering desensitization boundaries (`test_desensitization.py`), P0 hardening (`test_bridge_p0.py`), core bridge subsystems (`test_bridge_core.py`), group RBAC (`test_access_control.py`), model failover (`test_model_failover.py`), cron scheduler (`test_scheduler.py`), CLI diagnostics (`test_cli_doctor.py`), Mini App & `/browser` panel (`test_browser_panel.py`), live-browser multi-fingerprint/pinned-profile isolation (`test_live_browser_profiles.py`), GitHub webhook security (`test_github_webhook.py`), weekly benchmark digest (`test_benchmark_digest.py`), 3-layer memory poisoning guard & `/dream` consolidation (`test_memory_guard_and_dream.py`), atomic `_JobQueue` recovery & LKG hot-reload rollback (`test_queue_persistence_and_rollback.py`), and multi-bot team bus & worktree isolation (`test_bot_bus.py`, `test_bot_bus_worktree.py`, `test_group_chat_bus.py`).
-- **`scripts/benchmark_digest.py`**: Pure-stdlib weekly upstream benchmark radar tracking configurable GitHub repositories (`--repos-file`) for non-draft releases, merged PRs, and default-branch commits with `0600` state dedup, `[SILENT]` no-op output, and prompt-injection neutralization.
-- **`scripts/calc_cycle_cost.py`**: Standalone CLI calculator reading `~/.gemini/antigravity-cli/brain/*/logs/transcript.jsonl` to report token totals, cache hit rate, and estimated API USD savings.
+| 核心模块 | 解决什么痛点 |
+| :--- | :--- |
+| **1. Telegram 群组多 Bot 团队协作** | 把单人问答升级为「协调 + 开发 + 只读质检」多角色团队协同，派单、开发、验收在群里一站闭环 |
+| **2. 多指纹多 IP 浏览器 + Mini App 人工接管** | 隔离账号环境防风控；遇到人机验证、验证码或远端输 Key/粘贴难题，手机一键暂停 AI 接管，处理完一键交还 |
+| **3. 跨会话防遗忘（记忆管理）** | 长对话压缩后平滑衔接、跨会话经验检索与防投毒护栏（已搭建完整能力，持续观察打磨中） |
+| **4. 自部署 OpenBao 密钥统一托管** | API Key、代理凭据集中托管按需注入，彻底告别把密钥明文贴进聊天上下文的风险 |
+| **5. 外部第三方模型自由接入与混搭** | 除官方模型外，兼容主流 OpenAI / Anthropic / Gemini 中转与本地 Ollama/vLLM，一键测速、按 Bot 自由搭配 |
+| **6. 模拟桌面版反重力工作台（三端互通）** | 贴近桌面 IDE 的 Web 工作台，与 Telegram、移动端 WebUI 实现消息、团队视图、侧栏状态与默认模型三端同步 |
 
 ---
 
-## Repository Layout
+## 六大核心功能
 
-```text
-agy-bot/
-├── .agents/                  # Shared skills (live-browser, continuous-learning-v2, altare, mem-search) & workflows
-├── .github/                  # CI workflows, Issue forms, and PR desensitization checklist
-├── bridge/                   # Telegram Bridge v3 (bridge.py, studio_ipc.py, memory_guard.py, github_webhook.py, access_control.py, model_failover.py, scheduler.py, bot_bus*.py, cli.py, .env.example)
-├── config/                   # Sanitized MCP configuration template (mcp_config.example.json)
-├── docs/                     # AI-INSTALL guide, architecture diagram, Live Browser guide & OpenBao zero-trace secret guide
-├── hooks/                    # hooks.json + lossless rehydrate_after_compact.py + hook gate
-├── legacy/sdk-bridge/        # Historical SDK bridge v1 reference
-├── mem-hub/                  # agy_llm_shim.py, agy_instinct_daemon.py, and isolated observer-sandbox/
-├── scripts/                  # security_audit.py, verify_gate.py, benchmark_digest.py, and standalone calc_cycle_cost.py
-├── studio/                   # AGY Studio aiohttp sidecar (server.py, auth.py, chat_service.py, control_plane.py, event_hub.py, data_sources.py, browser_proxy.py, requirements.txt)
-├── systemd/examples/         # Generic systemd unit templates (including agy-studio.service.example & agy-github-webhook.service.example, YOUR_USER placeholders)
-├── tests/                    # Automated desensitization, Studio/WebUI, RBAC, failover, bridge, scheduler, CLI, browser panel & team-bus tests
-├── webui/                    # React + Vite + Tailwind WebUI source for AGY Studio (build `webui/dist` via `npm ci && npm run build`)
-├── workspace/                # Shared workspace agent delivery guidelines (AGENTS.md)
-├── Dockerfile                # Non-root container image built from pyproject.toml
-├── docker-compose.example.yml # Sanitized Coordinator + Worker Docker Compose template
-├── .dockerignore             # Docker build context exclusions
-├── pyproject.toml            # PEP 621 package metadata, `agy-bot` CLI script & Ruff lint config
-├── README.md / README.zh-CN.md
-├── SECURITY.md / CONTRIBUTING.md
-└── LICENSE
-```
+### 1. Telegram 群组多 Bot 团队协作
+
+告别「一个机器人从头干到尾、自己写完自己吹」的单兵模式。`agy-bot` 支持在同一个 Telegram 群组或话题中组建多个各司其职的 AI Bot 角色——例如 **主控协调（Coordinator）** 负责拆解需求和派单汇总、**核心开发（Dev）** 负责改代码与跑测试、**只读质检（QA）** 负责先立验收红线并独立审查把关。
+
+- **自然群聊协作**：你在群里提一个需求，协调 Bot 自动分工派单、实时播报进度，开发完成后移交只读 QA 独立审查，最终由协调 Bot 汇总结果形成闭环。
+- **权限边界清晰**：支持群内管理员与只读角色隔离，质检 Bot 可严格锁定只读，不越权改动源码或重启线上服务。
+- **真实自驱迭代**：**本项目近期的功能迭代与发布，正是靠这套多 Bot 团队自己协作开发并验收完成的。**
+
+![Telegram 群组多 Bot 团队协作闭环](./docs/images/showcase-tg-team.svg)
 
 ---
 
-## Quickstart
+### 2. 多指纹多 IP 出口 Camoufox 浏览器 + Telegram Mini App 人工接管
 
-> For zero-guesswork single/multi-bot installation (`agy-bot setup --bots ... --systemd-out ...`) or Docker / Compose deployment ([`Dockerfile`](./Dockerfile), [`docker-compose.example.yml`](./docker-compose.example.yml)), see **[docs/AI-INSTALL.md](./docs/AI-INSTALL.md)**.
+用 AI 操作远端云浏览器时，最头疼的往往不是脚本怎么写，而是**账号风控关联、突然弹出的人机验证/验证码，以及在无头云浏览器里极不方便复制粘贴账号密码或 API Key**。
 
-### 1. Clone, Install CLI & Bootstrap Runtime Directory
+- **多指纹 + 多出口环境隔离**：基于 Camoufox 为不同任务维护独立的浏览器指纹环境（Windows / macOS / Linux、视口、时区、WebGL/GeoIP 等），并支持按配置自由切换独立代理出口或宿主机直连 IP；核心主力账号可硬锁定持久化指纹与直连出口，临时调研任务则用完即焚。
+- **Telegram 实时查看与一键人工接管**：在 Telegram 中发送 `/browser` 即可看到实时画面与快捷切换按钮；遇到登录二次确认或验证码时，点开 Telegram Mini App 一键暂停 AI 进入人工接管，直接触控点击页面。
+- **解决远端输入与粘贴痛点**：Mini App 内置远端剪贴板同步与移动端中文输入辅助栏，把手机上复制的账号、验证码或 Key 安全送入远端焦点输入框，处理完成后**一键交还 AI**，AI 会沿着当前页面状态无损继续执行。
+
+> 详细配置与移动端使用指南见 [docs/TELEGRAM_LIVE_BROWSER_GUIDE.md](./docs/TELEGRAM_LIVE_BROWSER_GUIDE.md)。
+
+![多指纹多出口 Camoufox 浏览器与 Telegram Mini App 人工接管](./docs/images/showcase-live-browser.svg)
+
+---
+
+### 3. 跨会话防遗忘（记忆管理）
+
+针对长对话容易「聊着聊着忘了前面约定」、换一个会话就得把项目背景重新解释一遍的问题，项目内置了一整套跨会话记忆管理与防遗忘机制：
+
+- **长对话压缩无损衔接**：触发上下文压缩后，自动还原关键指令时间线、近期对话脉络与文件读取索引，避免压缩后「失忆」。
+- **跨会话经验检索与沉淀**：支持跨会话检索历史决策与已解决的问题，并将高价值习惯逐步整理为可复用规则。
+- **防投毒与定期整理**：内置记忆安全守卫，过滤外部不可信文本中的恶意提示注入，避免污染长期记忆。
+
+> **坦诚说明**：这套跨会话记忆管理能力目前已经完整搭建好，不过自从拉起多 Bot 群组后一直忙着高强度迭代开发，日常其它场景下的实际长期效果还在持续观察和打磨中，也欢迎社区一起试用反馈。
+
+---
+
+### 4. 接入自部署 OpenBao 密钥统一托管
+
+用 AI 协助运维和开发时，最容易踩的安全坑就是把 API Key、代理账号或服务 Token 直接粘进聊天框——一旦进入对话上下文、日志或代码仓库，泄露风险极高。
+
+- **OpenBao 统一托管，零明文进上下文**：支持自动识别并对接你自部署的 OpenBao 密钥库；外部模型 API Key、浏览器代理凭据与各类服务令牌统一集中管理，运行时按需在内存中安全注入，**彻底告别把 Key 明文贴进聊天上下文的风险**。
+- **零门槛自动降级**：如果本机尚未部署 OpenBao，系统会自动平滑降级至当前用户私有、权限受保护的本机 `0600` 密钥存储，开箱即用不卡上手门槛。
+- **预留安全卡扩展位**：控制面板已预留安全卡扩展入口，方便后续按需升级更细粒度的分级权限与只读/读写隔离策略。
+
+> 自部署配置与无痕用密实战参考见 [docs/OPENBAO_SECRETOPS_GUIDE.md](./docs/OPENBAO_SECRETOPS_GUIDE.md)。
+
+---
+
+### 5. 支持接入外部第三方模型
+
+除了原生直连官方模型外，`agy-bot` 现已全面支持接入外部第三方模型网关，让你可以按任务性价比与角色特长自由选型：
+
+- **广泛协议兼容**：支持对接主流 OpenAI / Anthropic / Gemini 兼容中转网关，以及局域网或本机部署的 Ollama / vLLM 等私有模型服务。
+- **一键测速与模型拉取**：在 WebUI 的「外部模型」管理页配置好网关与托管凭据后，可一键检测连通性与延迟并自动拉取可用模型列表。
+- **按 Bot 自由切换与混搭**：不同角色的 Bot 可以分别绑定不同模型——**例如本次功能升级的质量检验环节，便是通过 CPA 兼容网关接入的 `6.2sol` 等外部模型协助完成的**，既保证了独立审查视角，也降低了高频验收成本。
+
+![外部模型接入、OpenBao 托管与三端互通全景](./docs/images/showcase-models-openbao.svg)
+
+---
+
+### 6. 模拟桌面版的反重力工作台（AGY Studio WebUI），实现三端打通
+
+在手机上用 Telegram 随时发指令很顺手，但在电脑前深度看代码、切项目、传文件、管配置时，一个像桌面应用一样顺手的工作台体验会好得多。**AGY Studio WebUI** 为此而生，并与 Telegram 深度打通：
+
+- **桌面端交互体验**：提供三栏桌面工作台布局——左侧支持项目列表、置顶、归档、新建会话以及 `✦ Team` 群组协同视图；右侧可查看工作区变更与状态；内置外部模型与 OpenBao 可视化管理页。
+- **顺手的多模态与任务调度**：支持直接拖入或粘贴图片/附件、键入 `@` 快速引用工作区文件；对话中实时呈现「收件 → 思考 → 工具调用 → 应答」处理环节；当上一条任务还在运行时，既可以按顺序**排队发送**，也能一键点击 **「⚡ 马上执行」** 紧急插队。
+- **三端无缝互通**：**Telegram、桌面 WebUI、移动 WebUI** 全面打通——你在桌面工作台里切换某个 Bot 的默认模型或 Effort、发出的对话消息、群组 Team 协作动态以及侧栏项目状态，都会实时同步到 Telegram 与移动端，换设备接着干活零割裂感。
+
+![AGY Studio 模拟桌面版反重力工作台](./docs/images/showcase-workbench.svg)
+
+---
+
+## 快速开始
+
+> 完整的单 Bot / 多 Bot 一键初始化向导与 Docker Compose 编排说明，请参阅 **[docs/AI-INSTALL.md](./docs/AI-INSTALL.md)**（可直接交给你的 AI 助手按步骤引导安装）。
+
+### 1. 克隆项目并初始化 Telegram 桥接
 
 ```bash
 git clone https://github.com/gaoshanyuhupo/agy-bot.git
@@ -115,97 +113,84 @@ cd agy-bot
 python3 -m venv "$HOME/agy-tg-bridge/venv"
 "$HOME/agy-tg-bridge/venv/bin/pip" install -e .
 
-# Bootstrap runtime files & .env (chmod 0600, never overwrites an existing .env without --force):
+# 一键初始化运行时目录与权限为 0600 的 .env（绝不覆盖已有配置）
 "$HOME/agy-tg-bridge/venv/bin/agy-bot" setup --target-dir "$HOME/agy-tg-bridge"
+
+# 运行环境体检（可追加 --fix 自动修复权限，或 --online 验证 Telegram 连通性）
+"$HOME/agy-tg-bridge/venv/bin/agy-bot" doctor --env-file "$HOME/agy-tg-bridge/.env"
 ```
 
-Or copy the runtime files manually outside the git working tree (`chmod 600` for `.env`):
+<details>
+<summary>展开查看：手工复制运行文件与 MCP / Systemd 模板</summary>
 
 ```bash
 mkdir -p "$HOME/agy-tg-bridge"
 cp bridge/bridge.py bridge/scheduler.py bridge/bot_bus.py bridge/bot_bus_mcp.py "$HOME/agy-tg-bridge/"
 cp bridge/.env.example "$HOME/agy-tg-bridge/.env"
 chmod 600 "$HOME/agy-tg-bridge/.env"
-# Edit $HOME/agy-tg-bridge/.env with your Telegram BotFather token and allowed chat ID(s)
 ```
 
-Copy & adapt [config/mcp_config.example.json](./config/mcp_config.example.json) to `~/.gemini/antigravity-cli/mcp_config.json`, replacing `YOUR_USER` and placeholder tokens.
+- MCP 配置模板：[config/mcp_config.example.json](./config/mcp_config.example.json)
+- Systemd 托管模板：[systemd/examples/](./systemd/examples)（含 [`agy-studio.service.example`](./systemd/examples/agy-studio.service.example)）
 
-### 2. Run Environment Health Checks & Launch
+</details>
 
-```bash
-# Offline read-only diagnostics (add --fix to tighten .env to 0600 & create missing dirs, or --online to verify Telegram getMe):
-"$HOME/agy-tg-bridge/venv/bin/agy-bot" doctor --env-file "$HOME/agy-tg-bridge/.env"
-
-# Launch manually for foreground verification (or manage via systemd in Step 3):
-# AGY_TG_ENV_FILE="$HOME/agy-tg-bridge/.env" "$HOME/agy-tg-bridge/venv/bin/python" "$HOME/agy-tg-bridge/bridge.py"
-```
-
-If using `.agents/skills/live-browser/`, set your tunnel token outside git (never commit secrets):
+### 2. 启动 AGY Studio WebUI（桌面/移动工作台）
 
 ```bash
-mkdir -p "$HOME/.config/agy-live-browser"
-chmod 700 "$HOME/.config/agy-live-browser"
-cat <<'EOF' > "$HOME/.config/agy-live-browser/tunnel.env"
-CLOUDFLARE_TUNNEL_TOKEN=REPLACE_WITH_YOUR_TUNNEL_TOKEN
-EOF
-chmod 600 "$HOME/.config/agy-live-browser/tunnel.env"
-```
-
-### 3. AGY Studio WebUI (Optional)
-
-```bash
-# Install Studio backend dependencies and build the React WebUI bundle
+# 安装 Studio 后端依赖并构建前端页面
 python3 -m pip install -r studio/requirements.txt
 (cd webui && npm ci && npm run build)
 
-# Provision an initial password-mode user in ~/.config/agy-studio/users.json (0600)
+# 创建管理员登录账号（密码安全保存在 ~/.config/agy-studio/users.json，权限 0600）
 python3 -m studio.auth set-user --username admin --bot main --user-id 123456789 --role admin
 
-# Start the loopback sidecar (127.0.0.1:18796)
+# 启动本地工作台服务（默认监听 127.0.0.1:18796）
 python3 -m studio.server
 ```
 
-### 4. Systemd Deployment (Optional)
+### 3. Docker / Compose 容器化部署（可选）
 
-Generic unit templates are in [`systemd/examples/`](./systemd/examples) (including [`agy-studio.service.example`](./systemd/examples/agy-studio.service.example)) with `KillMode=mixed` for bridges. Replace `YOUR_USER` and `/path/to/agy-bot` before installing into `/etc/systemd/system/` or `~/.config/systemd/user/`.
+仓库提供开箱可用的非 root 容器构建模板 [`Dockerfile`](./Dockerfile) 与多 Bot 编排示例 [`docker-compose.example.yml`](./docker-compose.example.yml)，按需复制配置即可一键拉起。
 
-### 5. Run Desensitization Audit, Lint & Tests
+### 4. 提交前安全自检与测试
 
 ```bash
-# Strict audit across working tree + full Git history
+# 严格脱敏与密钥防泄漏扫描
 python3 scripts/security_audit.py --mode public-release --check-history
 
-# Lint check (optional dev dependency: pip install -e ".[dev]")
-ruff check .
-
-# Run full desensitization, Bridge & Studio test suite
-python3 -m pip install -r bridge/requirements.txt -r studio/requirements.txt
+# 运行回归测试套件
 python3 -m unittest discover -s tests -v
 ```
 
 ---
 
-## Acknowledgements & Design References
+## 致谢与设计参考
 
-`agy-bot` builds upon and draws architectural inspiration from several outstanding open-source projects:
+`agy-bot` 的演进借鉴并致敬了以下优秀开源项目：
 
-### Memory Management & Continuous Learning
-- [`thedotmack/claude-mem`](https://github.com/thedotmack/claude-mem): Cross-session persistent memory and the 3-step `mem-search` retrieval workflow (`search → timeline → get_observations`); `hooks/claude_mem_hook_gate.py`, `hooks/hooks.json`, and `mem-hub/agy_llm_shim.py` implement recursion-free `agy` adaptation for its lifecycle and observer pipeline.
-- [`affaan-m/ECC`](https://github.com/affaan-m/ECC) (Everything Claude Code, and the *Homunculus* architecture it references): `.agents/skills/continuous-learning-v2/` (`origin: ECC`) and `mem-hub/agy_instinct_daemon.py` draw on its atomic instinct observation, confidence scoring, project-scoped isolation, and skill evolution pipeline.
-- [`NousResearch/hermes-agent`](https://github.com/NousResearch/hermes-agent) & [`HKUDS/nanobot`](https://github.com/HKUDS/nanobot): Inspired prefix-cache-friendly frozen ruleset boundaries (avoiding dynamic injection that busts prompt prefix caches), on-demand/background memory consolidation ideas, and multi-agent collaborative workspace isolation.
-
-### Telegram Bridge, HITL & Ops
-- [`banteg/takopi`](https://github.com/banteg/takopi): Single-instance `flock` anti-`409` conflict guard, `pyproject.toml` + `setup`/`doctor` CLI onboarding wizard, offline mock-Telegram unit testing pattern, and Python 3.11–3.14 + `ruff` CI matrix design.
-- [`overwirehq/claude-code-telegram`](https://github.com/overwirehq/claude-code-telegram): Reference comparison for `sendMessageDraft` streaming boundaries, `SECURITY.md`, and community security governance practices.
-- [`grinev/opencode-telegram-bot`](https://github.com/grinev/opencode-telegram-bot): Reference for Telegram HTML chunking with robust code-block fence re-closing and human-in-the-loop tool-approval UI planning.
-- [`openclaw/openclaw`](https://github.com/openclaw/openclaw): Multimodal routing patterns for video/sticker/media-group messages and long-polling backoff self-healing discipline.
-- [`chenhg5/cc-connect`](https://github.com/chenhg5/cc-connect): Lightweight quickstart documentation structure, multi-channel bridging ideas, and on-demand task scheduling references.
-- [`emreturkmencom/antigravity-telegram-suite`](https://github.com/emreturkmencom/antigravity-telegram-suite) & [`pavel-molyanov/telegram-ai-agent`](https://github.com/pavel-molyanov/telegram-ai-agent): Pioneering Antigravity / AI CLI Telegram bridge projects in the same domain.
+- **记忆管理与持续学习**：
+  - [`thedotmack/claude-mem`](https://github.com/thedotmack/claude-mem) — 跨会话持久化记忆与三步检索思路
+  - [`affaan-m/ECC`](https://github.com/affaan-m/ECC) — 原子级经验观察、置信度评分与技能演化架构
+  - [`NousResearch/hermes-agent`](https://github.com/NousResearch/hermes-agent) & [`HKUDS/nanobot`](https://github.com/HKUDS/nanobot) — 提示词缓存友好边界、后台记忆整理与多 Agent 协作启发
+- **Telegram 桥接、人机协同与工程实践**：
+  - [`banteg/takopi`](https://github.com/banteg/takopi) — CLI 初始化与体检体验、单实例防冲突与离线测试范式
+  - [`overwirehq/claude-code-telegram`](https://github.com/overwirehq/claude-code-telegram) — 流式回复体验与开源安全治理参考
+  - [`grinev/opencode-telegram-bot`](https://github.com/grinev/opencode-telegram-bot) — Telegram 长消息代码块分片与人机确认交互启发
+  - [`openclaw/openclaw`](https://github.com/openclaw/openclaw) — 多模态媒体消息处理与长轮询自愈实践
+  - [`chenhg5/cc-connect`](https://github.com/chenhg5/cc-connect) — 轻量上手文档组织、多渠道桥接与定时任务参考
+  - [`emreturkmencom/antigravity-telegram-suite`](https://github.com/emreturkmencom/antigravity-telegram-suite) & [`pavel-molyanov/telegram-ai-agent`](https://github.com/pavel-molyanov/telegram-ai-agent) — 同领域 Antigravity / AI CLI Telegram 桥接先驱项目
 
 ---
 
-## Community & Friendly Links
+## 社区与友情链接
 
-- **[LINUX.DO](https://linux.do/)** — Friendly community link for engineering discussions, technical exchange, and open-source tool sharing.
+- **[LINUX.DO](https://linux.do/)** —— 友情社区入口，欢迎前往交流 AI 工程实践、自动化工具与开源项目心得。
 
+---
+
+## 安全策略、贡献与协议
+
+- 发现安全问题请查阅 [SECURITY.md](./SECURITY.md) 按规范私密反馈。
+- 欢迎通过 Issue / PR 参与改进，提交前请阅读 [CONTRIBUTING.md](./CONTRIBUTING.md)。
+- 本项目基于 [MIT License](./LICENSE) 开源。

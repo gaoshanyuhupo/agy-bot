@@ -1,0 +1,172 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 720" width="1200" height="720" role="img" aria-label="External Third-Party Models, OpenBao Secret Vault, and Cross-Platform Sync">
+  <defs>
+    <linearGradient id="moBg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#070b16"/>
+      <stop offset="55%" stop-color="#0c1426"/>
+      <stop offset="100%" stop-color="#080e1c"/>
+    </linearGradient>
+    <radialGradient id="moGlow1" cx="0.18" cy="0.16" r="0.45">
+      <stop offset="0%" stop-color="#6366f1" stop-opacity="0.16"/>
+      <stop offset="100%" stop-color="#6366f1" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="moGlow2" cx="0.84" cy="0.22" r="0.42">
+      <stop offset="0%" stop-color="#10b981" stop-opacity="0.15"/>
+      <stop offset="100%" stop-color="#10b981" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="moGlow3" cx="0.50" cy="0.88" r="0.48">
+      <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.14"/>
+      <stop offset="100%" stop-color="#38bdf8" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="probeBtn" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#2563eb"/>
+      <stop offset="100%" stop-color="#4f46e5"/>
+    </linearGradient>
+    <marker id="syncArrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#38bdf8"/>
+    </marker>
+    <style>
+      .f { font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+      .t-title { font-size: 19px; font-weight: 700; fill: #f8fafc; }
+      .t-sub { font-size: 12.5px; font-weight: 400; fill: #94a3b8; }
+      .t-h { font-size: 14.5px; font-weight: 700; fill: #f8fafc; }
+      .t-sec { font-size: 11px; font-weight: 700; fill: #64748b; letter-spacing: 0.5px; }
+      .t-body { font-size: 12px; font-weight: 400; fill: #cbd5e1; }
+    </style>
+  </defs>
+
+  <!-- Canvas Background -->
+  <rect x="0" y="0" width="1200" height="720" rx="20" fill="url(#moBg)"/>
+  <rect x="0" y="0" width="1200" height="720" rx="20" fill="url(#moGlow1)"/>
+  <rect x="0" y="0" width="1200" height="720" rx="20" fill="url(#moGlow2)"/>
+  <rect x="0" y="0" width="1200" height="720" rx="20" fill="url(#moGlow3)"/>
+  <rect x="1" y="1" width="1198" height="718" rx="19" fill="none" stroke="#1e293b" stroke-width="1.5"/>
+
+  <!-- Top Header -->
+  <text x="32" y="42" class="f t-title">外部第三方模型混搭 · OpenBao 零明文密钥托管 · 三端配置与消息互通</text>
+  <text x="32" y="66" class="f t-sub">官方模型与第三方网关自由搭配，凭据集中托管不进聊天上下文，一次配置即刻同步全端</text>
+
+  <!-- TOP-LEFT CARD: External Third-Party Models Gateway (x=24..632, y=88..444) -->
+  <rect x="24" y="88" width="608" height="356" rx="16" fill="#0e1629" fill-opacity="0.92" stroke="#253657" stroke-width="1.2"/>
+
+  <!-- Card Header -->
+  <text x="46" y="120" class="f t-h">🌐 外部第三方模型网关</text>
+  <text x="46" y="140" class="f" font-size="11.5" fill="#94a3b8">兼容 OpenAI / Anthropic / Gemini 中转与本地 Ollama · vLLM</text>
+  <rect x="462" y="104" width="150" height="32" rx="9" fill="url(#probeBtn)"/>
+  <text x="537" y="124" text-anchor="middle" class="f" font-size="12" font-weight="700" fill="#ffffff">⚡ 一键测速拉取</text>
+
+  <!-- Gateway Row 1: Official Base -->
+  <rect x="44" y="156" width="568" height="64" rx="11" fill="#111d36" stroke="#3b82f6" stroke-opacity="0.5"/>
+  <circle cx="68" cy="188" r="12" fill="#1d4ed8" fill-opacity="0.35" stroke="#60a5fa"/>
+  <text x="68" y="192" text-anchor="middle" class="f" font-size="11" font-weight="700" fill="#bfdbfe">官</text>
+  <text x="92" y="182" class="f" font-size="13" font-weight="700" fill="#f8fafc">官方模型基座（Antigravity CLI）</text>
+  <text x="92" y="203" class="f" font-size="11.5" fill="#94a3b8">本地常驻会话直连 · 适合主力架构与重度开发</text>
+  <rect x="498" y="175" width="98" height="24" rx="12" fill="#172554" stroke="#60a5fa" stroke-opacity="0.5"/>
+  <text x="547" y="191" text-anchor="middle" class="f" font-size="11" font-weight="600" fill="#bfdbfe">官方直连</text>
+
+  <!-- Gateway Row 2: CPA / OpenAI-Compatible External Relay -->
+  <rect x="44" y="230" width="568" height="64" rx="11" fill="#0f232c" stroke="#10b981" stroke-opacity="0.55"/>
+  <circle cx="68" cy="262" r="12" fill="#059669" fill-opacity="0.35" stroke="#34d399"/>
+  <text x="68" y="266" text-anchor="middle" class="f" font-size="11" font-weight="700" fill="#a7f3d0">外</text>
+  <text x="92" y="256" class="f" font-size="13" font-weight="700" fill="#f8fafc">CPA / OpenAI 兼容外部网关</text>
+  <text x="92" y="277" class="mono" font-size="11" fill="#6ee7b7">https://api.example.com/v1  ·  模型：6.2sol 等</text>
+  <rect x="482" y="249" width="114" height="24" rx="12" fill="#064e3b" fill-opacity="0.8" stroke="#34d399" stroke-opacity="0.55"/>
+  <text x="539" y="265" text-anchor="middle" class="f" font-size="11" font-weight="600" fill="#a7f3d0">✓ 180ms · 在线</text>
+
+  <!-- Gateway Row 3: Local Ollama / vLLM -->
+  <rect x="44" y="304" width="568" height="60" rx="11" fill="#171631" stroke="#818cf8" stroke-opacity="0.45"/>
+  <circle cx="68" cy="334" r="12" fill="#6366f1" fill-opacity="0.3" stroke="#a5b4fc"/>
+  <text x="68" y="338" text-anchor="middle" class="f" font-size="11" font-weight="700" fill="#e0e7ff">本</text>
+  <text x="92" y="328" class="f" font-size="13" font-weight="700" fill="#f8fafc">Anthropic / 本地 Ollama · vLLM</text>
+  <text x="92" y="348" class="mono" font-size="11" fill="#a5b4fc">http://127.0.0.1:11434  ·  私有部署零出网</text>
+  <rect x="498" y="321" width="98" height="24" rx="12" fill="#312e81" fill-opacity="0.8"/>
+  <text x="547" y="337" text-anchor="middle" class="f" font-size="11" font-weight="600" fill="#e0e7ff">按需接入</text>
+
+  <!-- Per-Bot Free Mixing Strip -->
+  <rect x="44" y="376" width="568" height="52" rx="10" fill="#0a1120" stroke="#1e2d4a"/>
+  <text x="60" y="406" class="f" font-size="12" font-weight="700" fill="#cbd5e1">按 Bot 自由混搭：</text>
+  <rect x="166" y="388" width="132" height="28" rx="8" fill="#1e1b4b" stroke="#8b5cf6" stroke-opacity="0.5"/>
+  <text x="232" y="406" text-anchor="middle" class="f" font-size="11.5" font-weight="600" fill="#e9d5ff">Coord · 官方主力</text>
+  <rect x="308" y="388" width="128" height="28" rx="8" fill="#0c2444" stroke="#38bdf8" stroke-opacity="0.5"/>
+  <text x="372" y="406" text-anchor="middle" class="f" font-size="11.5" font-weight="600" fill="#bae6fd">Dev · 官方高配</text>
+  <rect x="446" y="388" width="152" height="28" rx="8" fill="#2d1b0c" stroke="#f59e0b" stroke-opacity="0.55"/>
+  <text x="522" y="406" text-anchor="middle" class="f" font-size="11.5" font-weight="600" fill="#fde68a">QA · 外部 6.2sol</text>
+
+  <!-- TOP-RIGHT CARD: OpenBao Secret Custody & Fallback (x=652..1176, y=88..444) -->
+  <rect x="652" y="88" width="524" height="356" rx="16" fill="#0e1629" fill-opacity="0.92" stroke="#10b981" stroke-opacity="0.45" stroke-width="1.2"/>
+
+  <!-- Header -->
+  <text x="674" y="120" class="f t-h">🔐 OpenBao 密钥统一托管</text>
+  <rect x="996" y="102" width="160" height="26" rx="13" fill="#064e3b" fill-opacity="0.8" stroke="#34d399" stroke-opacity="0.55"/>
+  <text x="1076" y="119" text-anchor="middle" class="f" font-size="11" font-weight="700" fill="#a7f3d0">✓ 零明文进聊天上下文</text>
+  <text x="674" y="140" class="f" font-size="11.5" fill="#94a3b8">API Key · 代理凭据 · 服务令牌统一托管，运行时按需安全注入</text>
+
+  <!-- Tier 1: Self-hosted OpenBao -->
+  <rect x="672" y="156" width="484" height="78" rx="11" fill="#092620" stroke="#10b981" stroke-opacity="0.65" stroke-width="1.3"/>
+  <rect x="688" y="168" width="70" height="20" rx="10" fill="#059669"/>
+  <text x="723" y="182" text-anchor="middle" class="f" font-size="10.5" font-weight="700" fill="#ffffff">推荐首选</text>
+  <text x="768" y="183" class="f" font-size="13" font-weight="700" fill="#ecfdf5">自部署 OpenBao 集中托管</text>
+  <text x="688" y="206" class="f" font-size="11.5" fill="#cbd5e1">自动识别并引导配置；调用外部模型或代理时仅在内存中动态注入，</text>
+  <text x="688" y="223" class="f" font-size="11.5" fill="#a7f3d0">无需在聊天框或仓库里粘贴任何明文 Key。</text>
+
+  <!-- Tier 2: Local 0600 Fallback -->
+  <rect x="672" y="244" width="484" height="62" rx="11" fill="#111c33" stroke="#3b82f6" stroke-opacity="0.48"/>
+  <rect x="688" y="256" width="70" height="20" rx="10" fill="#1d4ed8"/>
+  <text x="723" y="270" text-anchor="middle" class="f" font-size="10.5" font-weight="700" fill="#eff6ff">自动降级</text>
+  <text x="768" y="271" class="f" font-size="13" font-weight="700" fill="#f1f5f9">本机 0600 受保护密钥存储</text>
+  <text x="688" y="294" class="f" font-size="11.5" fill="#94a3b8">未部署 OpenBao 时平滑降级为仅当前用户可读的本地存储，开箱即用。</text>
+
+  <!-- Tier 3: Security Card Extension -->
+  <rect x="672" y="316" width="484" height="54" rx="11" fill="#141830" stroke="#818cf8" stroke-opacity="0.45" stroke-dasharray="4 3"/>
+  <rect x="688" y="332" width="70" height="20" rx="10" fill="#4f46e5"/>
+  <text x="723" y="346" text-anchor="middle" class="f" font-size="10.5" font-weight="700" fill="#eef2ff">扩展预留</text>
+  <text x="768" y="347" class="f" font-size="13" font-weight="700" fill="#e0e7ff">安全卡权限扩展位（只读 / 分级用密）</text>
+
+  <!-- Bottom Security Guarantee Bar -->
+  <rect x="672" y="382" width="484" height="46" rx="10" fill="#091120" stroke="#1e3a5f"/>
+  <text x="914" y="410" text-anchor="middle" class="f" font-size="12" font-weight="600" fill="#6ee7b7">🛡 全链路防护：聊天上下文 · 模型日志 · 仓库代码均不留明文凭据</text>
+
+  <!-- BOTTOM FULL-WIDTH ZONE: 3-Platform Sync Panorama (x=24..1176, y=466..696) -->
+  <rect x="24" y="466" width="1152" height="230" rx="16" fill="#0e1629" fill-opacity="0.92" stroke="#1e3a5f" stroke-width="1.2"/>
+
+  <text x="48" y="498" class="f t-h">🔄 Telegram ↔ 桌面 WebUI ↔ 移动 WebUI 三端打通</text>
+  <text x="478" y="498" class="f" font-size="12" fill="#94a3b8">对话消息 · ✦ Team 群组协作 · 侧栏项目状态 · Bot 默认模型配置实时互通</text>
+
+  <!-- Platform 1: Telegram -->
+  <rect x="48" y="518" width="316" height="156" rx="13" fill="#101d35" stroke="#38bdf8" stroke-opacity="0.55" stroke-width="1.2"/>
+  <rect x="66" y="534" width="34" height="34" rx="10" fill="#0284c7" fill-opacity="0.3" stroke="#38bdf8"/>
+  <text x="83" y="556" text-anchor="middle" class="f" font-size="14" font-weight="700" fill="#7dd3fc">TG</text>
+  <text x="112" y="549" class="f" font-size="14" font-weight="700" fill="#f8fafc">Telegram 群组与私聊</text>
+  <text x="112" y="567" class="f" font-size="11" fill="#7dd3fc">随时随地发指令与团队协作</text>
+  <text x="66" y="600" class="f t-body">• 多 Bot 群组协同派单与验收汇报</text>
+  <text x="66" y="623" class="f t-body">• /model · /browser 快捷切换生效</text>
+  <text x="66" y="646" class="f t-body">• 实时推送进度与浏览器实况卡片</text>
+
+  <!-- Connector 1 <-> 2 -->
+  <line x1="374" y1="596" x2="432" y2="596" stroke="#38bdf8" stroke-width="2.2" marker-end="url(#syncArrow)" marker-start="url(#syncArrow)"/>
+  <text x="403" y="582" text-anchor="middle" class="f" font-size="10.5" font-weight="700" fill="#7dd3fc">实时同步</text>
+
+  <!-- Platform 2: Desktop WebUI -->
+  <rect x="442" y="518" width="316" height="156" rx="13" fill="#131c38" stroke="#818cf8" stroke-opacity="0.6" stroke-width="1.3"/>
+  <rect x="460" y="534" width="34" height="34" rx="10" fill="#4f46e5" fill-opacity="0.32" stroke="#818cf8"/>
+  <text x="477" y="556" text-anchor="middle" class="f" font-size="14" font-weight="700" fill="#c7d2fe">PC</text>
+  <text x="506" y="549" class="f" font-size="14" font-weight="700" fill="#f8fafc">桌面端 AGY Studio WebUI</text>
+  <text x="506" y="567" class="f" font-size="11" fill="#a5b4fc">沉浸式桌面工作台与配置中心</text>
+  <text x="460" y="600" class="f t-body">• 项目置顶/归档 · 文件差异与 @ 引用</text>
+  <text x="460" y="623" class="f t-body">• 外部模型网关与 OpenBao 统一管理</text>
+  <text x="460" y="646" class="f t-body">• 排队与「⚡ 马上执行」灵活调度</text>
+
+  <!-- Connector 2 <-> 3 -->
+  <line x1="768" y1="596" x2="826" y2="596" stroke="#38bdf8" stroke-width="2.2" marker-end="url(#syncArrow)" marker-start="url(#syncArrow)"/>
+  <text x="797" y="582" text-anchor="middle" class="f" font-size="10.5" font-weight="700" fill="#7dd3fc">实时同步</text>
+
+  <!-- Platform 3: Mobile WebUI & Mini App -->
+  <rect x="836" y="518" width="316" height="156" rx="13" fill="#0d2229" stroke="#34d399" stroke-opacity="0.55" stroke-width="1.2"/>
+  <rect x="854" y="534" width="34" height="34" rx="10" fill="#059669" fill-opacity="0.32" stroke="#34d399"/>
+  <text x="871" y="556" text-anchor="middle" class="f" font-size="14" font-weight="700" fill="#a7f3d0">M</text>
+  <text x="900" y="549" class="f" font-size="14" font-weight="700" fill="#f8fafc">移动端 WebUI &amp; Mini App</text>
+  <text x="900" y="567" class="f" font-size="11" fill="#6ee7b7">外出掌上协同与浏览器接管</text>
+  <text x="854" y="600" class="f t-body">• 自适应手机端对话与 Team 视图</text>
+  <text x="854" y="623" class="f t-body">• 1 键接管云浏览器处理人机验证</text>
+  <text x="854" y="646" class="f t-body">• 切换默认模型立即回写至全端</text>
+</svg>

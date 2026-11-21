@@ -1,0 +1,194 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 720" width="1200" height="720" role="img" aria-label="Telegram Multi-Bot Team Collaboration Workflow">
+  <defs>
+    <linearGradient id="tgBg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#070c17"/>
+      <stop offset="55%" stop-color="#0d1628"/>
+      <stop offset="100%" stop-color="#080e1b"/>
+    </linearGradient>
+    <radialGradient id="tgGlow1" cx="0.82" cy="0.14" r="0.45">
+      <stop offset="0%" stop-color="#0ea5e9" stop-opacity="0.16"/>
+      <stop offset="100%" stop-color="#0ea5e9" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="tgGlow2" cx="0.18" cy="0.88" r="0.42">
+      <stop offset="0%" stop-color="#8b5cf6" stop-opacity="0.15"/>
+      <stop offset="100%" stop-color="#8b5cf6" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="humanMsg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1d4ed8" stop-opacity="0.52"/>
+      <stop offset="100%" stop-color="#2563eb" stop-opacity="0.38"/>
+    </linearGradient>
+    <style>
+      .f { font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; }
+      .t-h { font-size: 14px; font-weight: 700; fill: #f8fafc; }
+      .t-sec { font-size: 11px; font-weight: 700; fill: #64748b; letter-spacing: 0.5px; }
+      .t-msg { font-size: 12.5px; font-weight: 400; fill: #e2e8f0; }
+      .t-mut { font-size: 11px; font-weight: 400; fill: #94a3b8; }
+      .t-name { font-size: 12.5px; font-weight: 700; }
+    </style>
+  </defs>
+
+  <!-- Outer Telegram Desktop Window -->
+  <rect x="0" y="0" width="1200" height="720" rx="20" fill="url(#tgBg)"/>
+  <rect x="0" y="0" width="1200" height="720" rx="20" fill="url(#tgGlow1)"/>
+  <rect x="0" y="0" width="1200" height="720" rx="20" fill="url(#tgGlow2)"/>
+  <rect x="1" y="1" width="1198" height="718" rx="19" fill="none" stroke="#1e293b" stroke-width="1.5"/>
+
+  <!-- Top Bar -->
+  <path d="M 1 20 Q 1 1 20 1 L 1180 1 Q 1199 1 1199 20 L 1199 48 L 1 48 Z" fill="#0b1222" fill-opacity="0.94"/>
+  <line x1="1" y1="48" x2="1199" y2="48" stroke="#1e293b" stroke-width="1"/>
+  <circle cx="26" cy="24" r="5.5" fill="#ef4444" fill-opacity="0.85"/>
+  <circle cx="46" cy="24" r="5.5" fill="#f59e0b" fill-opacity="0.85"/>
+  <circle cx="66" cy="24" r="5.5" fill="#22c55e" fill-opacity="0.85"/>
+  <text x="92" y="29" class="f t-h">Telegram 群组多 Bot 团队协作 · 真实迭代闭环示例</text>
+  <rect x="920" y="12" width="262" height="24" rx="12" fill="#312e81" fill-opacity="0.65" stroke="#818cf8" stroke-opacity="0.5"/>
+  <text x="1051" y="28" text-anchor="middle" class="f" font-size="11.5" font-weight="600" fill="#e0e7ff">✨ 本项目近期迭代由该团队自驱完成</text>
+
+  <!-- LEFT SIDEBAR: Group Topics & Bot Roster (x=16..272, y=60..704) -->
+  <rect x="16" y="60" width="256" height="644" rx="14" fill="#0e1629" fill-opacity="0.9" stroke="#1e2d4a"/>
+
+  <!-- Group Card Header -->
+  <circle cx="48" cy="96" r="18" fill="#1d4ed8" fill-opacity="0.3" stroke="#38bdf8" stroke-width="1.5"/>
+  <text x="48" y="101" text-anchor="middle" class="f" font-size="14" font-weight="700" fill="#7dd3fc">AT</text>
+  <text x="76" y="92" class="f" font-size="13.5" font-weight="700" fill="#f8fafc">AGY 研发协同群</text>
+  <text x="76" y="110" class="f t-mut">4 位成员 · 3 Bots 协同</text>
+
+  <line x1="30" y1="128" x2="258" y2="128" stroke="#1e293b"/>
+
+  <!-- Forum Topics -->
+  <text x="34" y="150" class="f t-sec">群组话题 · TOPICS</text>
+
+  <rect x="30" y="160" width="228" height="44" rx="9" fill="#172554" fill-opacity="0.72" stroke="#38bdf8" stroke-opacity="0.55"/>
+  <text x="44" y="180" class="f" font-size="12.5" font-weight="700" fill="#f8fafc"># 功能迭代与验收</text>
+  <text x="44" y="196" class="f" font-size="10.5" fill="#93c5fd">当前话题 · 闭环进行中</text>
+
+  <rect x="30" y="212" width="228" height="40" rx="9" fill="#111b30" stroke="#1e293b"/>
+  <text x="44" y="236" class="f" font-size="12.5" fill="#cbd5e1"># 浏览器值守与接管</text>
+
+  <rect x="30" y="260" width="228" height="40" rx="9" fill="#111b30" stroke="#1e293b"/>
+  <text x="44" y="284" class="f" font-size="12.5" fill="#cbd5e1"># 定时巡检与周报</text>
+
+  <!-- Role Division Roster -->
+  <line x1="30" y1="320" x2="258" y2="320" stroke="#1e293b"/>
+  <text x="34" y="344" class="f t-sec">角色分工 · ROLE ROSTER</text>
+
+  <!-- Coord Bot Card -->
+  <rect x="30" y="356" width="228" height="74" rx="10" fill="#1e1b4b" fill-opacity="0.55" stroke="#8b5cf6" stroke-opacity="0.5"/>
+  <circle cx="52" cy="382" r="12" fill="#7c3aed" fill-opacity="0.35" stroke="#a78bfa"/>
+  <text x="52" y="386" text-anchor="middle" class="f" font-size="11" font-weight="700" fill="#ddd6fe">C</text>
+  <text x="72" y="381" class="f t-name" fill="#e9d5ff">Coord Bot</text>
+  <rect x="150" y="368" width="96" height="18" rx="9" fill="#5b21b6" fill-opacity="0.7"/>
+  <text x="198" y="381" text-anchor="middle" class="f" font-size="10" font-weight="600" fill="#ede9fe">主控协调</text>
+  <text x="44" y="414" class="f" font-size="11" fill="#cbd5e1">拆解需求 · 派发工单 · 验收汇总</text>
+
+  <!-- Dev Bot Card -->
+  <rect x="30" y="440" width="228" height="74" rx="10" fill="#0c2444" fill-opacity="0.6" stroke="#38bdf8" stroke-opacity="0.5"/>
+  <circle cx="52" cy="466" r="12" fill="#0284c7" fill-opacity="0.35" stroke="#38bdf8"/>
+  <text x="52" y="470" text-anchor="middle" class="f" font-size="11" font-weight="700" fill="#bae6fd">D</text>
+  <text x="72" y="465" class="f t-name" fill="#bae6fd">Dev Bot</text>
+  <rect x="150" y="452" width="96" height="18" rx="9" fill="#0369a1" fill-opacity="0.7"/>
+  <text x="198" y="465" text-anchor="middle" class="f" font-size="10" font-weight="600" fill="#e0f2fe">核心开发</text>
+  <text x="44" y="498" class="f" font-size="11" fill="#cbd5e1">编码实现 · 自测回归 · 安全审计</text>
+
+  <!-- QA Bot Card -->
+  <rect x="30" y="524" width="228" height="74" rx="10" fill="#2d1b0c" fill-opacity="0.65" stroke="#f59e0b" stroke-opacity="0.55"/>
+  <circle cx="52" cy="550" r="12" fill="#d97706" fill-opacity="0.35" stroke="#fbbf24"/>
+  <text x="52" y="554" text-anchor="middle" class="f" font-size="11" font-weight="700" fill="#fef3c7">Q</text>
+  <text x="72" y="549" class="f t-name" fill="#fde68a">QA Bot</text>
+  <rect x="136" y="536" width="110" height="18" rx="9" fill="#b45309" fill-opacity="0.75"/>
+  <text x="191" y="549" text-anchor="middle" class="f" font-size="10" font-weight="600" fill="#fef3c7">外部模型 · 只读</text>
+  <text x="44" y="582" class="f" font-size="11" fill="#cbd5e1">前置红线契约 · 独立审查 · GO/NO-GO</text>
+
+  <!-- Bottom Sync Tag -->
+  <rect x="30" y="616" width="228" height="72" rx="10" fill="#091120" stroke="#1e2d4a"/>
+  <text x="44" y="639" class="f" font-size="11.5" font-weight="700" fill="#34d399">🛡 安全与权限边界</text>
+  <text x="44" y="659" class="f" font-size="11" fill="#94a3b8">• QA 严格只读，不改源码不重启</text>
+  <text x="44" y="677" class="f" font-size="11" fill="#94a3b8">• 群聊与 WebUI Team 视图同步</text>
+
+  <!-- MAIN CHAT STREAM (x=286..1184, y=60..704) -->
+  <rect x="286" y="60" width="898" height="644" rx="14" fill="#0c1426" fill-opacity="0.88" stroke="#1e2d4a"/>
+
+  <!-- Chat Header -->
+  <rect x="287" y="61" width="896" height="50" rx="13" fill="#111b31" fill-opacity="0.92"/>
+  <line x1="287" y1="111" x2="1183" y2="111" stroke="#1e293b"/>
+  <text x="308" y="91" class="f" font-size="14" font-weight="700" fill="#f8fafc"># 功能迭代与验收</text>
+  <text x="456" y="91" class="f" font-size="12" fill="#94a3b8">Coord Bot · Dev Bot · QA Bot 协作流水线</text>
+  <rect x="1032" y="74" width="136" height="24" rx="12" fill="#064e3b" fill-opacity="0.7" stroke="#10b981" stroke-opacity="0.5"/>
+  <text x="1100" y="90" text-anchor="middle" class="f" font-size="11" font-weight="600" fill="#a7f3d0">● 流式输出 &amp; 防限流</text>
+
+  <!-- STEP 1: Human User Message (Right-aligned) -->
+  <rect x="596" y="124" width="568" height="66" rx="12" fill="url(#humanMsg)" stroke="#60a5fa" stroke-opacity="0.45"/>
+  <rect x="610" y="135" width="44" height="18" rx="9" fill="#1e3a8a"/>
+  <text x="632" y="148" text-anchor="middle" class="f" font-size="10" font-weight="700" fill="#bfdbfe">Step 1</text>
+  <text x="662" y="148" class="f" font-size="12" font-weight="700" fill="#dbeafe">你（项目负责人）</text>
+  <text x="1150" y="148" text-anchor="end" class="f" font-size="10.5" fill="#93c5fd">14:02</text>
+  <text x="610" y="174" class="f t-msg">帮我把外部第三方模型网关接入做好，支持一键测速和按 Bot 混搭，走完研发+质检闭环。</text>
+
+  <!-- STEP 2: Coord Bot Dispatch (Left) -->
+  <circle cx="320" cy="222" r="15" fill="#7c3aed" fill-opacity="0.32" stroke="#a78bfa" stroke-width="1.3"/>
+  <text x="320" y="227" text-anchor="middle" class="f" font-size="12" font-weight="700" fill="#ede9fe">C</text>
+  <rect x="346" y="202" width="690" height="72" rx="12" fill="#161835" stroke="#8b5cf6" stroke-opacity="0.48"/>
+  <rect x="360" y="213" width="44" height="18" rx="9" fill="#5b21b6"/>
+  <text x="382" y="226" text-anchor="middle" class="f" font-size="10" font-weight="700" fill="#f5f3ff">Step 2</text>
+  <text x="412" y="226" class="f t-name" fill="#ddd6fe">Coord Bot</text>
+  <rect x="484" y="213" width="76" height="18" rx="9" fill="#4c1d95" fill-opacity="0.85"/>
+  <text x="522" y="226" text-anchor="middle" class="f" font-size="10" font-weight="600" fill="#e9d5ff">协调 · 派单</text>
+  <text x="1020" y="226" text-anchor="end" class="f t-mut">14:02</text>
+  <text x="360" y="254" class="f t-msg">收到！已启动前置质检闭环：先派单 QA Bot 输出安全与边界验收红线，随后由 Dev Bot 按契约编码交付。</text>
+
+  <!-- STEP 3: QA Bot Pre-Flight Contract (Left) -->
+  <circle cx="320" cy="312" r="15" fill="#d97706" fill-opacity="0.32" stroke="#fbbf24" stroke-width="1.3"/>
+  <text x="320" y="317" text-anchor="middle" class="f" font-size="12" font-weight="700" fill="#fef3c7">Q</text>
+  <rect x="346" y="286" width="746" height="86" rx="12" fill="#1f1912" stroke="#f59e0b" stroke-opacity="0.52"/>
+  <rect x="360" y="297" width="44" height="18" rx="9" fill="#b45309"/>
+  <text x="382" y="310" text-anchor="middle" class="f" font-size="10" font-weight="700" fill="#fef3c7">Step 3</text>
+  <text x="412" y="310" class="f t-name" fill="#fde68a">QA Bot</text>
+  <rect x="466" y="297" width="154" height="18" rx="9" fill="#92400e" fill-opacity="0.85"/>
+  <text x="543" y="310" text-anchor="middle" class="f" font-size="10" font-weight="600" fill="#fef3c7">外部模型 6.2sol · 只读验收</text>
+  <text x="1076" y="310" text-anchor="end" class="f t-mut">14:04</text>
+  <text x="360" y="336" class="f t-msg">【前置验收契约】已锁定 6 项必过红线：API Key 禁止明文回显与入库、非法 URL/超时须安全降级、</text>
+  <text x="360" y="357" class="f t-msg">非管理员写入必拦截、WebUI 切模型须实时同步至 Telegram 默认配置。</text>
+
+  <!-- STEP 4: Dev Bot Implementation & Self-Test (Left) -->
+  <circle cx="320" cy="410" r="15" fill="#0284c7" fill-opacity="0.35" stroke="#38bdf8" stroke-width="1.3"/>
+  <text x="320" y="415" text-anchor="middle" class="f" font-size="12" font-weight="700" fill="#e0f2fe">D</text>
+  <rect x="346" y="384" width="760" height="86" rx="12" fill="#0f1f38" stroke="#38bdf8" stroke-opacity="0.5"/>
+  <rect x="360" y="395" width="44" height="18" rx="9" fill="#0369a1"/>
+  <text x="382" y="408" text-anchor="middle" class="f" font-size="10" font-weight="700" fill="#e0f2fe">Step 4</text>
+  <text x="412" y="408" class="f t-name" fill="#7dd3fc">Dev Bot</text>
+  <rect x="470" y="395" width="96" height="18" rx="9" fill="#075985"/>
+  <text x="518" y="408" text-anchor="middle" class="f" font-size="10" font-weight="600" fill="#bae6fd">开发 · 自测交付</text>
+  <text x="1090" y="408" text-anchor="end" class="f t-mut">14:15</text>
+  <text x="360" y="434" class="f t-msg">开发交付完成：已接入 OpenAI/Anthropic/Gemini 兼容网关与一键测速，密钥全部走 OpenBao 托管。</text>
+  <text x="360" y="455" class="f" font-size="12" fill="#93c5fd">自检回执：单元测试 100% 通过 · 脱敏审计 0 命中 · 已移交 QA Bot 独立复检。</text>
+
+  <!-- STEP 5: QA Bot Final GO Verdict (Left) -->
+  <circle cx="320" cy="508" r="15" fill="#059669" fill-opacity="0.32" stroke="#34d399" stroke-width="1.3"/>
+  <text x="320" y="513" text-anchor="middle" class="f" font-size="12" font-weight="700" fill="#d1fae5">Q</text>
+  <rect x="346" y="482" width="746" height="82" rx="12" fill="#0a2420" stroke="#10b981" stroke-opacity="0.58"/>
+  <rect x="360" y="493" width="44" height="18" rx="9" fill="#047857"/>
+  <text x="382" y="506" text-anchor="middle" class="f" font-size="10" font-weight="700" fill="#d1fae5">Step 5</text>
+  <text x="412" y="506" class="f t-name" fill="#6ee7b7">QA Bot</text>
+  <rect x="466" y="493" width="112" height="18" rx="9" fill="#065f46"/>
+  <text x="522" y="506" text-anchor="middle" class="f" font-size="10" font-weight="700" fill="#a7f3d0">✓ 终审结论：GO</text>
+  <text x="1076" y="506" text-anchor="end" class="f t-mut">14:19</text>
+  <text x="360" y="532" class="f t-msg">【独立复检通过 · GO】逐项验证 6/6 红线契约全绿：无密钥回显、无越权风险、三端切换生效正常，</text>
+  <text x="360" y="553" class="f t-msg">符合发布标准，准予合版上线。</text>
+
+  <!-- STEP 6: Coord Bot Closure Summary (Left) -->
+  <circle cx="320" cy="604" r="15" fill="#7c3aed" fill-opacity="0.32" stroke="#a78bfa" stroke-width="1.3"/>
+  <text x="320" y="609" text-anchor="middle" class="f" font-size="12" font-weight="700" fill="#ede9fe">C</text>
+  <rect x="346" y="576" width="760" height="70" rx="12" fill="#171936" stroke="#818cf8" stroke-opacity="0.55"/>
+  <rect x="360" y="587" width="44" height="18" rx="9" fill="#4f46e5"/>
+  <text x="382" y="600" text-anchor="middle" class="f" font-size="10" font-weight="700" fill="#eef2ff">Step 6</text>
+  <text x="412" y="600" class="f t-name" fill="#e0e7ff">Coord Bot</text>
+  <rect x="484" y="587" width="84" height="18" rx="9" fill="#065f46"/>
+  <text x="526" y="600" text-anchor="middle" class="f" font-size="10" font-weight="700" fill="#a7f3d0">✅ 闭环汇总</text>
+  <text x="1090" y="600" text-anchor="end" class="f t-mut">14:20</text>
+  <text x="360" y="627" class="f t-msg">本轮研发与质检已全部闭环！变更摘要与验收报告已同步至 AGY Studio 工作台，随时可确认推送发布。</text>
+
+  <!-- Bottom Chat Input Bar -->
+  <rect x="304" y="658" width="862" height="34" rx="10" fill="#09101f" stroke="#1e293b"/>
+  <text x="322" y="679" class="f" font-size="12" fill="#64748b">在群组里像管理真实团队一样发需求，多 Bot 自动分工、汇报进度并验收闭环...</text>
+  <rect x="1084" y="663" width="74" height="24" rx="7" fill="#2563eb"/>
+  <text x="1121" y="679" text-anchor="middle" class="f" font-size="11.5" font-weight="700" fill="#ffffff">发送</text>
+</svg>
