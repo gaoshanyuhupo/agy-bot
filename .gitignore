@@ -20,6 +20,7 @@ node_modules/
 dist/
 webui/node_modules/
 webui/dist/
+webui/dist-demo/
 build/
 .ruff_cache/
 *.egg-info/

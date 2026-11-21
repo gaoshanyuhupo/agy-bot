@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
-"""Pure-stdlib static security, offline CSP, and structural tests for `docs/demo/index.html`.
+"""Pure-stdlib static structural, API parity, and desensitization tests for the v2 AGY Studio Demo.
 
-Covers Shift-Left QA Pre-Flight Contract D1, D2, D3, D4, and D8 without external
-dependencies or real browser automation imports.
+Validates:
+1. Required demo source & build files exist under `webui/` and legacy hand-written `docs/demo/index.html` is removed.
+2. `webui/src/demo/mockApi.ts` exports 100% of the symbols exported by `webui/src/api.ts`.
+3. `webui/src/demo/mockBootstrapAuth.ts` exports 100% of the symbols exported by `webui/src/bootstrapAuth.ts`
+   and never injects third-party Telegram SDK URLs.
+4. Every demo file passes strict `security_audit.scan_text(..., strict=True)` with ZERO hits.
+5. Production manifests (`webui/package.json`, `webui/vite.config.ts`, `webui/index.html`) remain unpolluted,
+   and `.gitignore` excludes `webui/dist-demo/`.
 """
 
 from __future__ import annotations
 
-from html.parser import HTMLParser
 from pathlib import Path
 import re
-import shutil
-import subprocess
 import sys
-import tempfile
 import unittest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -24,222 +26,116 @@ if str(SCRIPTS_DIR) not in sys.path:
 import security_audit  # noqa: E402
 
 
-DEMO_HTML_PATH = REPO_ROOT / "docs" / "demo" / "index.html"
-EXPECTED_CSP = (
-    "default-src 'none'; "
-    "style-src 'unsafe-inline'; "
-    "script-src 'unsafe-inline'; "
-    "img-src data: blob:; "
-    "font-src data:; "
-    "connect-src 'none';"
+WEBUI_DIR = REPO_ROOT / "webui"
+DEMO_SRC_DIR = WEBUI_DIR / "src" / "demo"
+DEMO_FILES = (
+    WEBUI_DIR / "demo.html",
+    WEBUI_DIR / "vite.demo.config.ts",
+    DEMO_SRC_DIR / "main.demo.tsx",
+    DEMO_SRC_DIR / "demoRuntime.ts",
+    DEMO_SRC_DIR / "mockApi.ts",
+    DEMO_SRC_DIR / "mockBootstrapAuth.ts",
+    DEMO_SRC_DIR / "mockEventBus.ts",
+)
+
+EXPORT_SYMBOL_RE = re.compile(
+    r"^export\s+(?:async\s+)?(?:function|class|const|let|var)\s+([A-Za-z0-9_]+)\b",
+    re.MULTILINE,
 )
 
 
-class _DemoHTMLInspector(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.csp_values: list[str] = []
-        self.external_asset_refs: list[tuple[str, str, str]] = []
-        self.root_relative_refs: list[tuple[str, str, str]] = []
-        self.links: list[str] = []
-        self.inline_event_attrs: list[tuple[str, str]] = []
-        self.scripts: list[str] = []
-        self.styles: list[str] = []
-        self._in_script = False
-        self._in_style = False
-        self._buf: list[str] = []
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        t = tag.lower()
-        attr_map = {k.lower(): (v or "") for k, v in attrs}
-
-        for k, _v in attrs:
-            if k.lower().startswith("on"):
-                self.inline_event_attrs.append((t, k.lower()))
-
-        if t == "meta" and attr_map.get("http-equiv", "").lower() == "content-security-policy":
-            self.csp_values.append(attr_map.get("content", "").strip())
-
-        if t == "script":
-            src = attr_map.get("src", "").strip()
-            if src:
-                if re.match(r"^(?:https?:)?//", src, re.IGNORECASE):
-                    self.external_asset_refs.append((t, "src", src))
-                if src.startswith("/") and not src.startswith("//"):
-                    self.root_relative_refs.append((t, "src", src))
-            else:
-                self._in_script = True
-                self._buf = []
-        elif t == "style":
-            self._in_style = True
-            self._buf = []
-        elif t == "link":
-            href = attr_map.get("href", "").strip()
-            if href:
-                if re.match(r"^(?:https?:)?//", href, re.IGNORECASE):
-                    self.external_asset_refs.append((t, "href", href))
-                if href.startswith("/") and not href.startswith("//"):
-                    self.root_relative_refs.append((t, "href", href))
-        elif t in ("img", "iframe", "source", "video", "audio"):
-            src = attr_map.get("src", "").strip()
-            if src:
-                if re.match(r"^(?:https?:)?//", src, re.IGNORECASE):
-                    self.external_asset_refs.append((t, "src", src))
-                if src.startswith("/") and not src.startswith("//"):
-                    self.root_relative_refs.append((t, "src", src))
-        elif t == "a":
-            href = attr_map.get("href", "").strip()
-            if href:
-                self.links.append(href)
-                if href.startswith("/") and not href.startswith("//"):
-                    self.root_relative_refs.append((t, "href", href))
-
-    def handle_data(self, data: str) -> None:
-        if self._in_script or self._in_style:
-            self._buf.append(data)
-
-    def handle_endtag(self, tag: str) -> None:
-        t = tag.lower()
-        if t == "script" and self._in_script:
-            self.scripts.append("".join(self._buf))
-            self._in_script = False
-            self._buf = []
-        elif t == "style" and self._in_style:
-            self.styles.append("".join(self._buf))
-            self._in_style = False
-            self._buf = []
+def _extract_exported_symbols(path: Path) -> set[str]:
+    text = path.read_text(encoding="utf-8")
+    return set(EXPORT_SYMBOL_RE.findall(text))
 
 
 class TestDemoStatic(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls) -> None:
-        if not DEMO_HTML_PATH.is_file():
-            raise AssertionError(f"Missing standalone demo file: {DEMO_HTML_PATH}")
-        cls.html = DEMO_HTML_PATH.read_text(encoding="utf-8")
-        cls.inspector = _DemoHTMLInspector()
-        cls.inspector.feed(cls.html)
-        cls.combined_js = "\n".join(cls.inspector.scripts)
-        cls.combined_css = "\n".join(cls.inspector.styles)
-
-    def test_d1_strict_security_audit_zero_hits(self) -> None:
-        hits = security_audit.scan_text(self.html, "docs/demo/index.html", strict=True)
-        self.assertEqual(
-            hits,
-            [],
-            f"Expected 0 strict security_audit hits in docs/demo/index.html, got: {hits[:8]}",
+    def test_required_demo_files_exist_and_legacy_demo_removed(self) -> None:
+        for fp in DEMO_FILES:
+            self.assertTrue(fp.is_file(), f"Missing required demo file: {fp}")
+        legacy_demo = REPO_ROOT / "docs" / "demo" / "index.html"
+        self.assertFalse(
+            legacy_demo.exists(),
+            f"Legacy hand-written static demo must be removed: {legacy_demo}",
         )
 
-    def test_d2_no_dangerous_js_apis_or_inline_handlers(self) -> None:
+    def test_mock_api_covers_all_production_api_exports(self) -> None:
+        prod_exports = _extract_exported_symbols(WEBUI_DIR / "src" / "api.ts")
+        mock_exports = _extract_exported_symbols(DEMO_SRC_DIR / "mockApi.ts")
+        self.assertGreaterEqual(len(prod_exports), 50, "Expected full production api.ts export set")
+        missing = sorted(prod_exports - mock_exports)
         self.assertEqual(
-            self.inspector.inline_event_attrs,
+            missing,
             [],
-            f"Inline event handlers must be avoided for strict XSS hygiene: {self.inspector.inline_event_attrs}",
+            f"mockApi.ts is missing production api.ts exports: {missing}",
         )
-        forbidden_patterns = (
-            (r"\beval\s*\(", "eval()"),
-            (r"\bnew\s+Function\s*\(", "new Function()"),
-            (r"\bdocument\.write(?:ln)?\s*\(", "document.write()"),
-            (r"\.innerHTML\s*=", "innerHTML assignment"),
-            (r"\.outerHTML\s*=", "outerHTML assignment"),
-            (r"\binsertAdjacentHTML\s*\(", "insertAdjacentHTML()"),
-        )
-        for rx, label in forbidden_patterns:
-            self.assertIsNone(
-                re.search(rx, self.combined_js),
-                f"Forbidden dangerous JS API detected: {label}",
-            )
-        # Ensure URL protocol guard is present
-        self.assertIn("javascript:", self.combined_js)
-        self.assertIn("data:", self.combined_js)
-        self.assertIn("vbscript:", self.combined_js)
-        self.assertIn("isSafeHref", self.combined_js)
 
-    def test_d3_strict_offline_csp_and_zero_external_network(self) -> None:
-        self.assertIn(
-            EXPECTED_CSP,
-            self.inspector.csp_values,
-            f"Missing exact offline CSP meta tag; found: {self.inspector.csp_values}",
-        )
+    def test_mock_bootstrap_auth_parity_and_zero_external_sdk(self) -> None:
+        prod_exports = _extract_exported_symbols(WEBUI_DIR / "src" / "bootstrapAuth.ts")
+        mock_exports = _extract_exported_symbols(DEMO_SRC_DIR / "mockBootstrapAuth.ts")
+        missing = sorted(prod_exports - mock_exports)
         self.assertEqual(
-            self.inspector.external_asset_refs,
+            missing,
             [],
-            f"External CDN/asset references forbidden: {self.inspector.external_asset_refs}",
+            f"mockBootstrapAuth.ts is missing bootstrapAuth.ts exports: {missing}",
         )
-        self.assertIsNone(
-            re.search(r"@import\s+url\s*\(\s*['\"]?https?:", self.combined_css, re.IGNORECASE),
-            "External CSS @import forbidden",
-        )
-        network_apis = (
-            (r"\bfetch\s*\(", "fetch()"),
-            (r"\bXMLHttpRequest\b", "XMLHttpRequest"),
-            (r"\bWebSocket\b", "WebSocket"),
-            (r"\bEventSource\b", "EventSource"),
-            (r"\bsendBeacon\s*\(", "sendBeacon()"),
-        )
-        for rx, label in network_apis:
-            self.assertIsNone(
-                re.search(rx, self.combined_js),
-                f"Real outbound network API forbidden in offline demo: {label}",
+        mock_text = (DEMO_SRC_DIR / "mockBootstrapAuth.ts").read_text(encoding="utf-8")
+        self.assertNotIn("telegram.org", mock_text.lower())
+        self.assertNotIn("createElement", mock_text)
+
+    def test_all_demo_files_pass_strict_security_audit(self) -> None:
+        for fp in DEMO_FILES:
+            rel = str(fp.relative_to(REPO_ROOT)).replace("\\", "/")
+            text = fp.read_text(encoding="utf-8")
+            hits = security_audit.scan_text(text, rel, strict=True)
+            self.assertEqual(
+                hits,
+                [],
+                f"Expected 0 strict security_audit hits in {rel}, got: {hits[:8]}",
             )
 
-    def test_d4_dual_hosting_paths_and_storage_resilience(self) -> None:
-        self.assertEqual(
-            self.inspector.root_relative_refs,
-            [],
-            f"Root-relative asset/link refs break subpath & file:// hosting: {self.inspector.root_relative_refs}",
-        )
-        self.assertIsNone(
-            re.search(r"\bhistory\.(?:pushState|replaceState)\s*\(", self.combined_js),
-            "history.pushState/replaceState breaks file:// and subpath hosting",
-        )
-        self.assertNotIn("github.io", self.html.lower())
-        # Verify links strictly point to allowlisted showcase & open-source repo
-        self.assertIn("https://aibigbigworld.com/agy-bot/", self.inspector.links)
-        self.assertIn("https://github.com/gaoshanyuhupo/agy-bot", self.inspector.links)
-        # Ensure storage access is wrapped in try/catch fallback
-        self.assertIn("safeReadPref", self.combined_js)
-        self.assertIn("safeWritePref", self.combined_js)
-        self.assertRegex(self.combined_js, r"try\s*\{[\s\S]{0,240}localStorage[\s\S]{0,240}\}\s*catch")
+    def test_demo_runtime_interceptors_and_subpath_guards_present(self) -> None:
+        runtime_text = (DEMO_SRC_DIR / "demoRuntime.ts").read_text(encoding="utf-8")
+        self.assertIn("replaceState", runtime_text)
+        self.assertIn("pushState", runtime_text)
+        self.assertIn("/api/chat/stream", runtime_text)
+        self.assertIn("/ws/browser", runtime_text)
+        self.assertIn("DemoEventSource", runtime_text)
+        self.assertIn("DemoWebSocket", runtime_text)
+        self.assertIn("installFailClosedFetch", runtime_text)
 
-    def test_d8_inline_script_syntax_and_six_module_completeness(self) -> None:
-        self.assertGreaterEqual(len(self.inspector.scripts), 1, "Expected inline <script> block")
-        self.assertGreater(len(self.combined_js.strip()), 2000, "Inline script unexpectedly short")
+        vite_demo = (WEBUI_DIR / "vite.demo.config.ts").read_text(encoding="utf-8")
+        self.assertIn('base: "./"', vite_demo)
+        self.assertIn('outDir: "dist-demo"', vite_demo)
+        self.assertIn('format: "iife"', vite_demo)
+        self.assertIn("inlineDynamicImports: true", vite_demo)
+        self.assertIn("src/demo/mockApi.ts", vite_demo)
+        self.assertIn("src/demo/mockBootstrapAuth.ts", vite_demo)
 
-        required_markers = (
-            "workbench",
-            "team",
-            "camoufox",
-            "models",
-            "openbao",
-            "memory",
-            "kv/data/example/gateway-key",
-            "policy-card-example",
-            "AGY_MEMORY_READONLY=1",
-            "198.51.100.42",
-            "gw:cpa:6.2sol",
-            "482910",
-            "@example_main_bot",
-            "@your_bot_1",
-            "@your_bot_2",
-        )
-        for marker in required_markers:
-            self.assertIn(marker, self.html, f"Expected demo structural marker missing: {marker}")
+        mock_api_text = (DEMO_SRC_DIR / "mockApi.ts").read_text(encoding="utf-8")
+        self.assertIn('room_id: "lobby"', mock_api_text)
+        self.assertIn('role: "coordinator"', mock_api_text)
+        self.assertIn("gw:", mock_api_text)
+        self.assertIn("daily_14d", mock_api_text)
 
-        node_bin = shutil.which("node")
-        if node_bin:
-            with tempfile.NamedTemporaryFile("w", suffix=".js", encoding="utf-8", delete=True) as tmp:
-                tmp.write(self.combined_js)
-                tmp.flush()
-                res = subprocess.run(
-                    [node_bin, "--check", tmp.name],
-                    capture_output=True,
-                    text=True,
-                )
-                self.assertEqual(
-                    res.returncode,
-                    0,
-                    f"node --check failed on inline JS: {res.stderr or res.stdout}",
-                )
+    def test_production_configs_unpolluted_and_gitignore_configured(self) -> None:
+        pkg_text = (WEBUI_DIR / "package.json").read_text(encoding="utf-8")
+        self.assertNotIn("demo", pkg_text.lower())
+
+        prod_vite = (WEBUI_DIR / "vite.config.ts").read_text(encoding="utf-8")
+        self.assertNotIn("dist-demo", prod_vite)
+        self.assertNotIn("mockApi", prod_vite)
+
+        prod_html = (WEBUI_DIR / "index.html").read_text(encoding="utf-8")
+        self.assertIn("/src/main.tsx", prod_html)
+        self.assertNotIn("main.demo", prod_html)
+
+        gitignore_text = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
+        self.assertIn("webui/dist-demo/", gitignore_text)
+
+        export_pub = REPO_ROOT / "scripts" / "export_public.py"
+        if export_pub.is_file():
+            self.assertIn('"dist-demo"', export_pub.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
