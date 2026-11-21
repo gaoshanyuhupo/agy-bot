@@ -6,6 +6,7 @@ Wants=network-online.target
 [Service]
 User=YOUR_USER
 Environment=AGY_TG_ENV_FILE=/home/YOUR_USER/agy-tg-bridge/.env
+Environment=AGY_CLI_DISABLE_AUTO_UPDATE=1
 EnvironmentFile=/home/YOUR_USER/agy-tg-bridge/.env
 ExecStart=/home/YOUR_USER/agy-tg-bridge/venv/bin/python /home/YOUR_USER/agy-tg-bridge/bridge.py
 Restart=on-failure

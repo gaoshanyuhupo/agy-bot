@@ -206,6 +206,7 @@ SAFE_PUBLIC_HOSTS: Set[str] = {
     "api.openai.com",
     "api.anthropic.com",
     "generativelanguage.googleapis.com",
+    "antigravity-cli-auto-updater-974169037036.us-central1.run.app",
     "pypi.python.org",
     "systemd.io",
     "aibigbigworld.com",

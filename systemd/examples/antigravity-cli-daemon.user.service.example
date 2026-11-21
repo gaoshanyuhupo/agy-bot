@@ -5,6 +5,7 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+Environment=AGY_CLI_DISABLE_AUTO_UPDATE=1
 ExecStart=/home/YOUR_USER/.local/bin/agy remote-control serve
 Restart=on-failure
 RestartSec=10s

@@ -10,6 +10,7 @@ Environment=PATH=/home/YOUR_USER/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/
 Environment=AGY_SHIM_MODEL=gemini-3.8-flash-low
 Environment=AGY_INTERNAL_OBSERVER=1
 Environment=ECC_SKIP_OBSERVE=1
+Environment=AGY_CLI_DISABLE_AUTO_UPDATE=1
 ExecStart=/home/YOUR_USER/agy-tg-bridge/venv/bin/python /home/YOUR_USER/agy-mem-hub/agy_llm_shim.py
 Restart=always
 RestartSec=3
