@@ -32,6 +32,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
 import time
@@ -3099,11 +3100,23 @@ class TestStudioPasswordAuth(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Referer", all_logs)
 
         # Frontend storage hygiene & autoComplete attributes
+        # Zero sessionStorage everywhere; localStorage is forbidden across all files EXCEPT the
+        # single non-secret boolean UI preference `SYNC_TG_STORAGE_KEY` ("agy_studio_sync_tg")
+        # inside `WorkspaceView.tsx`.
         webui_src = REPO_ROOT / "webui" / "src"
+        allowed_ls_re = re.compile(
+            r'localStorage\.(?:getItem\(SYNC_TG_STORAGE_KEY\)'
+            r'|setItem\(SYNC_TG_STORAGE_KEY,\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*\?\s*"true"\s*:\s*"false"|"(?:true|false)")\))'
+        )
         for ts_file in webui_src.rglob("*.ts*"):
             txt = ts_file.read_text(encoding="utf-8")
-            self.assertNotIn("localStorage", txt, str(ts_file))
             self.assertNotIn("sessionStorage", txt, str(ts_file))
+            if ts_file.name == "WorkspaceView.tsx":
+                self.assertIn('const SYNC_TG_STORAGE_KEY = "agy_studio_sync_tg";', txt)
+                scrubbed = allowed_ls_re.sub("", txt)
+                self.assertNotIn("localStorage", scrubbed, str(ts_file))
+            else:
+                self.assertNotIn("localStorage", txt, str(ts_file))
         login_tsx = (webui_src / "components" / "LoginView.tsx").read_text(encoding="utf-8")
         chg_tsx = (webui_src / "components" / "ChangePasswordModal.tsx").read_text(encoding="utf-8")
         self.assertIn('autoComplete="username"', login_tsx)

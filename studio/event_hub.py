@@ -22,7 +22,10 @@ import asyncio
 from collections import deque
 import json
 import logging
+import math
 import os
+from pathlib import Path
+import sqlite3
 import time
 from typing import Any
 
@@ -32,9 +35,11 @@ from .auth import StudioAuthManager, studio_auth_error
 from .data_sources import (
     StudioDataSources,
     _SENSITIVE_HOST_PATH_RE,
+    _sanitize_slug,
     redact_secrets_only,
     truncate_utf8_bytes,
 )
+import studio_ipc
 
 log = logging.getLogger("agy-studio.events")
 
@@ -43,7 +48,7 @@ MAX_SSE_EVENT_BYTES = 16 * 1024
 MAX_STREAMS_PER_SESSION = 4
 MAX_STREAMS_GLOBAL = 32
 DEFAULT_KEEPALIVE_SEC = 15.0
-DEFAULT_WATCHER_INTERVAL_SEC = 2.0
+DEFAULT_WATCHER_INTERVAL_SEC = 0.5
 
 _FORBIDDEN_EVENT_KEYS = frozenset({
     "ipc_sock",
@@ -60,6 +65,13 @@ _FORBIDDEN_EVENT_KEYS = frozenset({
     "origin_chat_id",
     "origin_thread_id",
     "origin_msg_id",
+    "turn_id",
+    "owner_user_id",
+    "user_id",
+    "prompt",
+    "response",
+    "content",
+    "thinking",
     "password",
     "password_hash",
     "csrf_token",
@@ -69,6 +81,9 @@ _FORBIDDEN_EVENT_KEYS = frozenset({
     "api_key",
     "authorization",
 })
+
+_VALID_CHAT_SYNC_SOURCES = frozenset({"web", "tg"})
+_VALID_CHAT_SYNC_STATUSES = frozenset({"running", "done", "aborted", "error"})
 
 
 def _sanitize_event_value(val: Any, *, depth: int = 0) -> Any:
@@ -126,6 +141,7 @@ class StudioEventHub:
         self._watcher_task: asyncio.Task[Any] | None = None
         self._stopped: bool = False
         self._last_fp: tuple[Any, Any, Any] | None = None
+        self._last_chat_sync: dict[str, tuple[int, int, bytes]] | None = None
 
         self.auth_mgr.add_revoke_listener(self._on_auth_revoked)
 
@@ -176,6 +192,119 @@ class StudioEventHub:
 
         return (tuple(bots_fp), jobs_fp, sched_fp)
 
+    def _read_chat_sync_snapshot(self) -> dict[str, tuple[int, int, bytes]]:
+        """Read bounded raw snapshots of `BUS_DIR/chat_sync/*.json` for change detection."""
+        sync_dir = self.data_sources.bus_dir / "chat_sync"
+        snap: dict[str, tuple[int, int, bytes]] = {}
+        try:
+            if not sync_dir.is_dir():
+                return snap
+            for ent in os.scandir(sync_dir):
+                name = ent.name
+                if name.startswith(".") or not name.endswith(".json") or name.endswith(".tmp"):
+                    continue
+                try:
+                    st = ent.stat()
+                    if not ent.is_file() or st.st_size > 16384:
+                        continue
+                    with open(ent.path, "rb") as fh:
+                        raw = fh.read(8192)
+                    snap[name] = (st.st_mtime_ns, st.st_size, raw)
+                except OSError:
+                    continue
+        except OSError:
+            pass
+        return snap
+
+    def _is_excluded_sync_cid(self, cid: str) -> bool:
+        """Return True if `cid` is invalid, internal, observer-sandbox, pure-llm, scheduled, or delegation."""
+        ok_cid, _err, _sc = studio_ipc.validate_resume_cid(
+            cid,
+            summaries_db=self.data_sources.summaries_db,
+            meta_file=self.data_sources.meta_file,
+        )
+        if not ok_cid:
+            return True
+
+        if self.data_sources.summaries_db.is_file():
+            try:
+                conn = sqlite3.connect(
+                    f"file:{self.data_sources.summaries_db}?mode=ro", uri=True, timeout=1.5
+                )
+                try:
+                    row = conn.execute(
+                        "SELECT preview FROM conversation_summaries WHERE conversation_id = ?",
+                        (cid,),
+                    ).fetchone()
+                finally:
+                    conn.close()
+                if row is not None:
+                    prev_s = str(row[0] or "")
+                    if "[ACB_SCHEDULED_TASK" in prev_s or "[ACB_TEAM_DELEGATION" in prev_s:
+                        return True
+            except Exception:
+                pass
+
+        if self.data_sources.meta_file.is_file():
+            try:
+                raw_meta = self.data_sources.meta_file.read_text(encoding="utf-8", errors="replace")
+                meta_doc = json.loads(raw_meta)
+                convs = meta_doc.get("conversations") if isinstance(meta_doc, dict) else {}
+                entry = convs.get(cid) if isinstance(convs, dict) else None
+                if isinstance(entry, dict):
+                    s = entry.get("summary") if isinstance(entry.get("summary"), dict) else {}
+                    prev_s = str(s.get("Preview") or "")
+                    if "[ACB_SCHEDULED_TASK" in prev_s or "[ACB_TEAM_DELEGATION" in prev_s:
+                        return True
+            except Exception:
+                pass
+
+        return False
+
+    def _publish_chat_sync_doc(self, fname: str, raw_bytes: bytes) -> None:
+        """Parse a `chat_sync/*.json` signal and emit a strictly allowlisted `session_updated` event."""
+        try:
+            doc = json.loads(raw_bytes.decode("utf-8"))
+        except Exception:
+            return
+        if not isinstance(doc, dict):
+            return
+
+        cid = str(doc.get("cid") or "").strip()
+        if not studio_ipc.is_valid_cid(cid):
+            return
+        if self._is_excluded_sync_cid(cid):
+            return
+
+        status_raw = str(doc.get("status") or "").strip().lower()
+        if status_raw not in _VALID_CHAT_SYNC_STATUSES:
+            return
+
+        source_raw = str(doc.get("source") or "").strip().lower()
+        source = source_raw if source_raw in _VALID_CHAT_SYNC_SOURCES else "tg"
+
+        bot_raw = doc.get("bot") or Path(fname).stem
+        bot_slug = _sanitize_slug(str(bot_raw), max_len=64)
+
+        upd_raw = doc.get("updated_at")
+        if isinstance(upd_raw, (int, float)) and not isinstance(upd_raw, bool) and math.isfinite(float(upd_raw)):
+            updated_at = round(float(upd_raw), 3)
+        else:
+            updated_at = round(time.time(), 3)
+
+        # Strict allowlist payload only: NEVER forward chat_id, thread_id, turn_id, prompt, response, or paths
+        self.publish(
+            "session_updated",
+            {
+                "cid": cid,
+                "bot": bot_slug,
+                "source": source,
+                "status": status_raw,
+                "busy": status_raw == "running",
+                "updated_at": updated_at,
+            },
+        )
+
     async def _watch_state_loop(self) -> None:
         last_warn_ts = 0.0
 
@@ -197,12 +326,16 @@ class StudioEventHub:
                     continue
                 try:
                     fp = self._compute_fingerprints()
+                    cur_chat_sync = self._read_chat_sync_snapshot()
                     if self._last_fp is None:
                         self._last_fp = fp
+                        self._last_chat_sync = cur_chat_sync
                         continue
                     prev_bots, prev_jobs, prev_sched = self._last_fp
                     cur_bots, cur_jobs, cur_sched = fp
+                    prev_chat_sync = self._last_chat_sync or {}
                     self._last_fp = fp
+                    self._last_chat_sync = cur_chat_sync
 
                     if cur_bots != prev_bots:
                         try:
@@ -251,6 +384,15 @@ class StudioEventHub:
                             raise
                         except Exception as exc:
                             _warn_throttled("schedules", exc)
+                    if cur_chat_sync != prev_chat_sync:
+                        try:
+                            for fname, entry in sorted(cur_chat_sync.items()):
+                                if entry != prev_chat_sync.get(fname):
+                                    self._publish_chat_sync_doc(fname, entry[2])
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            _warn_throttled("chat_sync", exc)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -267,6 +409,8 @@ class StudioEventHub:
             compact: dict[str, Any] = {"truncated": True}
             for k in (
                 "action",
+                "cid",
+                "bot",
                 "job_id",
                 "group_id",
                 "schedule_id",
@@ -277,6 +421,7 @@ class StudioEventHub:
                 "busy",
                 "active",
                 "paused",
+                "updated_at",
                 "reason",
                 "code",
                 "source",

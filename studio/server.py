@@ -181,7 +181,7 @@ def create_app(
     audit_log_path: Path | None = None,
     sse_keepalive_interval: float = 15.0,
     event_hub_max_events: int = 256,
-    event_watcher_interval: float = 2.0,
+    event_watcher_interval: float = 0.5,
 ) -> web.Application:
     public_url = os.environ.get("AGY_STUDIO_PUBLIC_URL", "").strip()
     auth = auth_mgr or StudioAuthManager(public_url=public_url)
@@ -518,6 +518,7 @@ def create_app(
     # Phase A M1: Single-Writer Chat, Sessions & Models APIs
     app.router.add_get("/api/sessions", chat_service.handle_get_sessions)
     app.router.add_get("/api/sessions/{cid}/messages", chat_service.handle_get_session_messages)
+    app.router.add_get("/api/sessions/{cid}/active-turn", chat_service.handle_get_session_active_turn)
     app.router.add_get("/api/models", chat_service.handle_get_models)
     app.router.add_post("/api/chat/send", chat_service.handle_chat_send)
     app.router.add_post("/api/chat/abort", chat_service.handle_chat_abort)

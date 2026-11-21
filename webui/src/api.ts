@@ -1,4 +1,5 @@
 import type {
+  ActiveSessionTurnResponse,
   AuthMode,
   BotsResponse,
   BrowserStatusResponse,
@@ -355,6 +356,7 @@ export class StudioEventClient {
     bindType("job_updated");
     bindType("schedule_updated");
     bindType("bots_updated");
+    bindType("session_updated");
     bindType("resync_required");
     bindType("auth_error");
 
@@ -437,6 +439,16 @@ export function fetchSessionMessages(
   const qs = q.toString();
   return requestJson<SessionMessagesResponse>(
     `/api/sessions/${encodeURIComponent(cid)}/messages${qs ? `?${qs}` : ""}`,
+  );
+}
+
+export function fetchActiveSessionTurn(
+  cid: string,
+  bot?: string,
+): Promise<ActiveSessionTurnResponse> {
+  const qs = bot ? `?bot=${encodeURIComponent(bot)}` : "";
+  return requestJson<ActiveSessionTurnResponse>(
+    `/api/sessions/${encodeURIComponent(cid)}/active-turn${qs}`,
   );
 }
 

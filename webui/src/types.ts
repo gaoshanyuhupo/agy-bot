@@ -210,8 +210,20 @@ export type StudioEventType =
   | "job_updated"
   | "schedule_updated"
   | "bots_updated"
+  | "session_updated"
   | "resync_required"
   | "auth_error";
+
+export interface SessionUpdatedEvent {
+  ver: number;
+  type: "session_updated" | "resync_required";
+  cid?: string;
+  bot?: string;
+  source?: string;
+  status?: string;
+  busy?: boolean;
+  updated_at?: number;
+}
 
 export interface StudioEventEnvelope {
   type: StudioEventType;
@@ -449,6 +461,18 @@ export interface ChatSendPayload {
   project?: string | null;
   model?: string | null;
   effort?: string | null;
+  sync_tg?: boolean;
+}
+
+export interface ActiveSessionTurnResponse {
+  ok: boolean;
+  active: boolean;
+  cid: string;
+  bot?: string;
+  turn_id?: string;
+  source?: "tg" | "web" | string;
+  status?: string;
+  prompt_preview?: string;
 }
 
 export interface ChatSendResponse {

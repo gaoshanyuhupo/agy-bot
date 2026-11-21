@@ -4608,6 +4608,122 @@ class _NoOpStreamer:
         self.start_line = start_line
 
 
+def _make_prompt_preview(raw_prompt, max_len=240):
+    text = " ".join(str(raw_prompt or "").split())
+    if len(text) > max_len:
+        return text[: max_len - 1] + "…"
+    return text
+
+
+def _is_internal_turn_for_sync(scope_key_val, prompt_text, cid_val=None, workdir_val=None):
+    """Return True if a turn belongs to internal/observer/pure-llm/scheduled/delegation lanes."""
+    sk = str(scope_key_val or "")
+    if sk.startswith("bus:"):
+        return True
+    pt = str(prompt_text or "")
+    if "[ACB_SCHEDULED_TASK" in pt or "[ACB_TEAM_DELEGATION" in pt:
+        return True
+    if workdir_val and "observer-sandbox" in str(workdir_val).lower():
+        return True
+    if cid_val and studio_ipc.is_valid_cid(cid_val):
+        ok_v, _err_v, sc_v = studio_ipc.validate_resume_cid(
+            cid_val, summaries_db=SUMMARIES_DB, meta_file=META_FILE
+        )
+        if not ok_v and sc_v == 403:
+            return True
+    return False
+
+
+def _can_mirror_web_to_tg_dm(uid):
+    """Fail-closed server-side verification that `uid` is an authenticated ALLOWED admin DM."""
+    parsed_uid = studio_ipc.parse_strict_user_id(uid)
+    if parsed_uid is None or parsed_uid <= 0:
+        return False
+    if parsed_uid not in ALLOWED:
+        return False
+    return _get_user_role(parsed_uid, from_user={"id": parsed_uid}, allow_uid_fallback=True) == "admin"
+
+
+def _mirror_web_prompt_to_tg(uid, prompt_text):
+    """Mirror a Web Studio user prompt to the admin's own TG DM (non-fatal on any TG error)."""
+    if not _can_mirror_web_to_tg_dm(uid):
+        return False
+    target_uid = int(studio_ipc.parse_strict_user_id(uid))
+    clean = (str(prompt_text or "")).strip()
+    if len(clean) > 3000:
+        clean = clean[:2997] + "..."
+    escaped = html_mod.escape(clean or "(空消息)")
+    try:
+        send(
+            target_uid,
+            f"💻 <b>[Web Studio]</b>\n{escaped}",
+            parse_mode="HTML",
+            thread_id=None,
+            disable_web_page_preview=True,
+            _max_429_wait=5,
+        )
+        return True
+    except Exception as exc:
+        log("Web->TG prompt mirror failed (non-fatal): %r" % exc)
+        return False
+
+
+def _mirror_web_result_to_tg(uid, kind, text, *, status=None, cid=None):
+    """Mirror a Web Studio turn result to the admin's own TG DM via `send_rich` (non-fatal)."""
+    if not _can_mirror_web_to_tg_dm(uid):
+        return False
+    target_uid = int(studio_ipc.parse_strict_user_id(uid))
+    raw_text = (str(text or "")).strip()
+    if kind == "done":
+        if status == "WAITING":
+            body = f"⏸ agy 正在等待输入或确认：\n{raw_text or '(no details)'}"
+        else:
+            body = raw_text or "(无文本输出)"
+    elif kind == "aborted":
+        body = (raw_text + "\n\n*🛑 [Web Studio 已停止生成]*") if raw_text else "🛑 [Web Studio 已停止生成]"
+    else:
+        body = f"⚠️ {raw_text or '对话执行出错'}"
+    footer_str = f"💻 Web → TG · {cid[:8]}" if (cid and isinstance(cid, str)) else "💻 Web → TG"
+    try:
+        send_rich(
+            target_uid,
+            body,
+            header_html="💻 <b>[Web → TG]</b>\n",
+            footer_str=footer_str,
+            thread_id=None,
+        )
+        return True
+    except Exception as exc:
+        log("Web->TG result mirror failed (non-fatal): %r" % exc)
+        return False
+
+
+def _align_dm_scope_after_web_turn(uid, res_cid):
+    """Align admin's TG DM active `conversation_id` to `res_cid` and safely recycle idle stale warm session."""
+    if not studio_ipc.is_valid_cid(res_cid):
+        return False
+    if not _can_mirror_web_to_tg_dm(uid):
+        return False
+    parsed_uid = int(studio_ipc.parse_strict_user_id(uid))
+    dm_skey = scope_key_for(parsed_uid, None)
+    with state_lock:
+        dm_sc = _ensure_scope_locked(dm_skey)
+        dm_sc["conversation_id"] = res_cid
+        _sync_top_level_mirrors_locked()
+    save_state()
+
+    stale_warm = None
+    with session_lock:
+        dm_is_running = bool(turn_running and turn_running_scope == dm_skey)
+        if not dm_is_running:
+            existing_warm = _session_pool.get(dm_skey)
+            if existing_warm is not None and getattr(existing_warm, "cid", None) != res_cid:
+                stale_warm = _session_pool.pop(dm_skey, None)
+    if stale_warm is not None:
+        close_session_async(stale_warm, force=False)
+    return True
+
+
 def run_agy(
     chat_id,
     prompt,
@@ -4625,17 +4741,33 @@ def run_agy(
     override_effort=None,
     override_project=None,
     override_workdir=None,
+    sync_tg=False,
 ):
     global turn_running, turn_running_scope, turn_running_chat, turn_running_web_id, turn_running_cid, cancel_requested
 
     is_web_turn = event_sink is not None
+    sync_tg_enabled = bool(is_web_turn and sync_tg is True)
+    tg_turn_id = None
+    stream_terminal_emitted = False
+    pending_chat_sync_status = None
+    chat_sync_running_cid = None
 
     def _emit_web(ev_type, payload=None):
+        nonlocal stream_terminal_emitted, pending_chat_sync_status
+        ev_payload = payload or {}
+        if ev_type in ("done", "aborted", "error"):
+            stream_terminal_emitted = True
+            pending_chat_sync_status = ev_type
         if event_sink is not None:
             try:
-                event_sink(ev_type, payload or {})
+                event_sink(ev_type, ev_payload)
             except Exception as sink_err:
                 log("web event_sink error (%s): %r" % (ev_type, sink_err))
+        elif tg_turn_id is not None:
+            try:
+                _studio_ipc_buffer.append(tg_turn_id, ev_type, ev_payload)
+            except Exception as buf_err:
+                log("tg stream buffer error (%s): %r" % (ev_type, buf_err))
 
     norm_tid = _normalize_thread_id(thread_id)
     skey = scope_key or scope_key_for(chat_id, norm_tid)
@@ -4787,23 +4919,52 @@ def run_agy(
     )
     save_state()
 
+    is_internal_sync = _is_internal_turn_for_sync(
+        exec_skey, base_prompt, cid_val=conv, workdir_val=workdir
+    )
+
+    def _write_chat_sync_safe(cid_val, status_val):
+        nonlocal chat_sync_running_cid
+        if session_readonly or is_internal_sync:
+            return
+        if not cid_val or not studio_ipc.is_valid_cid(cid_val):
+            return
+        if _is_internal_turn_for_sync(
+            exec_skey, base_prompt, cid_val=cid_val, workdir_val=workdir
+        ):
+            return
+        src = "web" if is_web_turn else "tg"
+        try:
+            written = studio_ipc.write_chat_sync_atomic(
+                bot_bus.BUS_DIR,
+                _current_bot_handle(),
+                cid=cid_val,
+                source=src,
+                status=status_val,
+            )
+            if written is not None and status_val == "running":
+                chat_sync_running_cid = cid_val
+        except Exception as sync_err:
+            log("chat_sync write error (%s): %r" % (status_val, sync_err))
+
+    parsed_chat_id = studio_ipc.parse_strict_user_id(chat_id)
+    parsed_uid = studio_ipc.parse_strict_user_id(user_id)
+    is_tg_dm_admin_turn = (
+        (not is_web_turn)
+        and (not session_readonly)
+        and (not is_internal_sync)
+        and (parsed_chat_id is not None and parsed_chat_id > 0)
+        and (parsed_uid is not None and parsed_uid == parsed_chat_id)
+        and (_get_user_role(parsed_chat_id, from_user={"id": parsed_uid}, allow_uid_fallback=True) == "admin")
+    )
+
     if is_web_turn:
         streamer = _NoOpStreamer(cid=conv, start_line=segment_start_line)
-        _emit_web("turn_start", {
-            "turn_id": web_turn_id,
-            "conversation_id": conv,
-            "model": candidates[0] if candidates else model,
-            "effort": effort,
-            "project": project,
-            "untrusted": bool(turn_untrusted),
-        })
     else:
-        # Start instant native sendMessageDraft ("Thinking…" at t=0.00s!) BEFORE even spawning/writing to agy!
         streamer = LiveDraftStreamer(
             chat_id, started, cid=conv, start_line=segment_start_line,
             enabled=(mode == "auto"), thread_id=norm_tid,
         )
-        streamer.start()
 
     sent_images = {}  # realpath -> last_sent_mtime
     turn_start_line = segment_start_line
@@ -4825,6 +4986,48 @@ def run_agy(
     attempted_models = []
 
     try:
+        if is_tg_dm_admin_turn:
+            tg_turn_id = f"tg-{uuid.uuid4().hex[:16]}"
+            _studio_ipc_buffer.create_turn(
+                tg_turn_id,
+                owner_user_id=parsed_uid,
+                actor_username="",
+                bot_handle=_current_bot_handle(),
+                scope_key=exec_skey,
+                cid=conv,
+                source="tg",
+                prompt_preview=_make_prompt_preview(base_prompt),
+            )
+
+        if is_web_turn:
+            _emit_web("turn_start", {
+                "turn_id": web_turn_id,
+                "conversation_id": conv,
+                "model": candidates[0] if candidates else model,
+                "effort": effort,
+                "project": project,
+                "untrusted": bool(turn_untrusted),
+            })
+            if conv:
+                _write_chat_sync_safe(conv, "running")
+            if sync_tg_enabled:
+                _mirror_web_prompt_to_tg(user_id, base_prompt)
+        else:
+            if tg_turn_id is not None:
+                _emit_web("turn_start", {
+                    "turn_id": tg_turn_id,
+                    "conversation_id": conv,
+                    "source": "tg",
+                    "model": candidates[0] if candidates else model,
+                    "effort": effort,
+                    "project": project,
+                    "untrusted": bool(turn_untrusted),
+                })
+            if conv:
+                _write_chat_sync_safe(conv, "running")
+            # Start instant native sendMessageDraft ("Thinking…" at t=0.00s!) BEFORE even spawning/writing to agy!
+            streamer.start()
+
         # Pre-turn guard: if resuming a heavy session already >= auto_compact_tokens, compact cleanly first!
         if conv and not session_readonly:
             pre_need, pre_stats = should_auto_compact(conv, scope_key=skey)
@@ -4922,6 +5125,9 @@ def run_agy(
                         save_state()
                         streamer.set_cid(cid)
                         _emit_web("init", {"conversation_id": cid})
+                        _write_chat_sync_safe(cid, "running")
+                        if sync_tg_enabled:
+                            _align_dm_scope_after_web_turn(user_id, cid)
                     continue
 
                 got_turn_event = True
@@ -5209,6 +5415,8 @@ def run_agy(
                         "partial_text": partial,
                         "reason": "cancelled" if cancel_requested else "interrupted",
                     })
+                    if sync_tg_enabled:
+                        _mirror_web_result_to_tg(user_id, "aborted", partial, cid=conv)
                 else:
                     rc = sess.proc.returncode if sess else "?"
                     err = sess.get_stderr_text() if sess else ""
@@ -5221,12 +5429,26 @@ def run_agy(
                         "error": msg_err.strip(),
                         "status": "ERROR",
                     })
+                    if sync_tg_enabled:
+                        _mirror_web_result_to_tg(user_id, "error", msg_err.strip(), status="ERROR", cid=conv)
                 return
             if cancel_requested:
+                _emit_web("aborted", {
+                    "conversation_id": conv,
+                    "partial_text": partial,
+                    "reason": "cancelled",
+                })
+                pending_chat_sync_status = "aborted"
                 if partial:
                     send_rich(chat_id, partial + "\n\n*🛑 [已手动停止生成]*",
                               reply_markup=retry_kb if not session_readonly else None, thread_id=norm_tid)
             elif sess and sess.proc.returncode in (-15, 143, -2, 130):
+                _emit_web("aborted", {
+                    "conversation_id": conv,
+                    "partial_text": partial,
+                    "reason": "interrupted",
+                })
+                pending_chat_sync_status = "aborted"
                 if partial:
                     send_rich(chat_id, partial + "\n\n*🛑 [任务已中断]*",
                               reply_markup=retry_kb if not session_readonly else None, thread_id=norm_tid)
@@ -5239,6 +5461,12 @@ def run_agy(
                     msg_err = model_failover.format_failover_exhausted_error(attempted_models, f"exit {rc}: {err}".strip())
                 else:
                     msg_err = "⚠️ agy produced no result (exit %s)\n%s" % (rc, err)
+                _emit_web("error", {
+                    "conversation_id": conv,
+                    "error": msg_err.strip(),
+                    "status": "ERROR",
+                })
+                pending_chat_sync_status = "error"
                 send(chat_id, msg_err, reply_markup=retry_kb if not session_readonly else None, thread_id=norm_tid)
             return
 
@@ -5247,6 +5475,8 @@ def run_agy(
             conv = res_cid
             if sess:
                 sess.cid = res_cid
+            if tg_turn_id is not None:
+                _studio_ipc_buffer.set_cid(tg_turn_id, res_cid)
             if turn_untrusted:
                 memory_guard.mark_tainted(
                     res_cid,
@@ -5260,6 +5490,8 @@ def run_agy(
                 if isinstance(sc_w.get("last_turn"), dict):
                     sc_w["last_turn"]["conv"] = res_cid
             save_state()
+            if sync_tg_enabled:
+                _align_dm_scope_after_web_turn(user_id, res_cid)
 
         # If final step + footer + images were already delivered atomically via 65ms lookahead, check post-turn auto-compact!
         if coalesced_final_delivered:
@@ -5267,6 +5499,17 @@ def run_agy(
                 sc_w = _ensure_scope_locked(exec_skey)
                 if isinstance(sc_w.get("last_turn"), dict):
                     sc_w["last_turn"]["status"] = "SUCCESS"
+            coalesced_resp = (result.get("response") or "").strip() or _latest_step_buffer_text(step_buffers)
+            _emit_web("done", {
+                "conversation_id": conv,
+                "response": coalesced_resp,
+                "status": "SUCCESS",
+                "model": active_model,
+                "effort": effort,
+                "usage": result.get("usage") or {},
+                "duration_seconds": round(max(0.0, time.time() - started), 2),
+            })
+            pending_chat_sync_status = "done"
             push_step_images(
                 chat_id, "", conv, started, before_files, sent_images,
                 turn_tool_texts=turn_tool_texts, turn_start_line=turn_start_line,
@@ -5317,12 +5560,18 @@ def run_agy(
                     "usage": result.get("usage") or {},
                     "duration_seconds": dur_sec,
                 })
+                if sync_tg_enabled:
+                    if conv:
+                        _align_dm_scope_after_web_turn(user_id, conv)
+                    _mirror_web_result_to_tg(user_id, "done", resp, status=status, cid=conv)
             elif finished_reason == "interrupted" or cancel_requested:
                 _emit_web("aborted", {
                     "conversation_id": conv,
                     "partial_text": resp,
                     "reason": "interrupted",
                 })
+                if sync_tg_enabled:
+                    _mirror_web_result_to_tg(user_id, "aborted", resp, cid=conv)
             else:
                 if status == "ERROR" and len(attempted_models) > 1:
                     err_out = model_failover.format_failover_exhausted_error(
@@ -5335,6 +5584,8 @@ def run_agy(
                     "error": err_out,
                     "status": status or "ERROR",
                 })
+                if sync_tg_enabled:
+                    _mirror_web_result_to_tg(user_id, "error", err_out, status=status or "ERROR", cid=conv)
             return
 
         fb_from = (primary_model_label or "default") if candidate_idx > 0 else None
@@ -5421,8 +5672,52 @@ def run_agy(
                 send(chat_id, err_out,
                      reply_markup=retry_kb if not session_readonly else None, thread_id=norm_tid)
 
+        # Emit terminal live-stream event & sync status for non-web (TG) interactive turns
+        dur_sec_tg = round(max(0.0, time.time() - started), 2)
+        if status in ("SUCCESS", "WAITING"):
+            _emit_web("done", {
+                "conversation_id": conv,
+                "response": resp,
+                "status": status,
+                "model": active_model,
+                "effort": effort,
+                "usage": result.get("usage") or {},
+                "duration_seconds": dur_sec_tg,
+            })
+            pending_chat_sync_status = "done"
+        elif finished_reason == "interrupted" or cancel_requested:
+            _emit_web("aborted", {
+                "conversation_id": conv,
+                "partial_text": resp,
+                "reason": "cancelled" if cancel_requested else "interrupted",
+            })
+            pending_chat_sync_status = "aborted"
+        else:
+            err_tg = str(result.get("error") or resp or f"agy {status}")
+            _emit_web("error", {
+                "conversation_id": conv,
+                "error": err_tg,
+                "status": status or "ERROR",
+            })
+            pending_chat_sync_status = "error"
+
     finally:
         streamer.stop()
+        if tg_turn_id is not None and not stream_terminal_emitted:
+            info_tg = _studio_ipc_buffer.get_turn_info(tg_turn_id)
+            if info_tg is not None and not info_tg.get("finished"):
+                if cancel_requested:
+                    _emit_web("aborted", {
+                        "conversation_id": conv,
+                        "partial_text": "",
+                        "reason": "cancelled",
+                    })
+                else:
+                    _emit_web("error", {
+                        "conversation_id": conv,
+                        "error": "turn ended unexpectedly",
+                        "status": "ERROR",
+                    })
         if not session_readonly and undo_manifest is not None:
             try:
                 changed_cnt = finalize_turn_undo(exec_skey, workdir, undo_manifest, base_prompt, conv)
@@ -5442,6 +5737,10 @@ def run_agy(
                 session_dirty_scopes.discard(exec_skey)
         if conv_lease is not None:
             conv_lease.release()
+        final_sync_cid = conv or chat_sync_running_cid
+        if final_sync_cid:
+            final_sync_status = pending_chat_sync_status or ("aborted" if cancel_requested else "error")
+            _write_chat_sync_safe(final_sync_cid, final_sync_status)
         if recycle is not None:
             close_session_async(recycle, force=False)
         update_scope_state(exec_skey, in_flight=None)
@@ -6987,6 +7286,7 @@ def _studio_ipc_enqueue_turn(req):
 
     turn_id = f"turn-{uuid.uuid4().hex[:16]}"
     scope_key = f"web:{uid}:{cid or turn_id}"
+    sync_tg = req.get("sync_tg") is True
     _studio_ipc_buffer.create_turn(
         turn_id,
         owner_user_id=uid,
@@ -6994,6 +7294,8 @@ def _studio_ipc_enqueue_turn(req):
         bot_handle=_current_bot_handle(),
         scope_key=scope_key,
         cid=cid,
+        source="web",
+        prompt_preview=_make_prompt_preview(req["prompt"]),
     )
     web_req = {
         "turn_id": turn_id,
@@ -7005,6 +7307,7 @@ def _studio_ipc_enqueue_turn(req):
         "project": req.get("project"),
         "model": req.get("model"),
         "effort": req.get("effort"),
+        "sync_tg": sync_tg,
     }
     job_q.put((0, None, scope_key, ("__WEB_TURN__", web_req)))
     return 202, {
@@ -7199,6 +7502,7 @@ def _execute_web_turn(web_req):
             override_effort=web_req.get("effort"),
             override_project=project,
             override_workdir=override_workdir,
+            sync_tg=(web_req.get("sync_tg") is True),
         )
     except Exception as exc:
         log("web turn %s failed: %r" % (turn_id, exc))

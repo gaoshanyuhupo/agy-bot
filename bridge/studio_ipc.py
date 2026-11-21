@@ -34,6 +34,7 @@ from typing import Any, Callable, Iterator
 import urllib.parse
 
 CID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+TG_TURN_ID_RE = re.compile(r"^tg-[a-f0-9]{16}$")
 ENTITY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{1,63}$")
 MAX_PROMPT_BYTES = 32 * 1024
 MAX_IPC_BODY_BYTES = 64 * 1024
@@ -44,6 +45,13 @@ DEFAULT_MAX_BYTES_PER_TURN = 2 * 1024 * 1024
 
 _FORBIDDEN_PROXY_HEADERS = frozenset({"x-forwarded-for", "cf-connecting-ip", "x-real-ip"})
 _TERMINAL_EVENTS = frozenset({"done", "aborted", "error"})
+CHAT_SYNC_ALLOWED_KEYS = frozenset({"bot", "cid", "source", "status", "updated_at", "seq"})
+_CHAT_SYNC_SOURCES = frozenset({"web", "tg"})
+_CHAT_SYNC_STATUSES = frozenset({"running", "done", "aborted", "error"})
+_UNTRUSTED_CLIENT_SEND_KEYS = ("role", "chat_id", "target_chat_id", "thread_id", "target_thread_id")
+
+_chat_sync_seq_lock = threading.Lock()
+_chat_sync_seq = 0
 
 
 def normalize_ipc_handle(raw: str) -> str:
@@ -58,6 +66,74 @@ def is_valid_cid(raw: Any) -> bool:
     if not isinstance(raw, str):
         return False
     return bool(CID_RE.fullmatch(raw))
+
+
+def is_valid_tg_turn_id(raw: Any) -> bool:
+    """Strictly validate a Telegram DM live-stream turn ID (`^tg-[a-f0-9]{16}$`)."""
+    if not isinstance(raw, str):
+        return False
+    return bool(TG_TURN_ID_RE.fullmatch(raw))
+
+
+def write_chat_sync_atomic(
+    bus_dir: str | Path,
+    bot_handle: str,
+    *,
+    cid: str,
+    source: str,
+    status: str,
+) -> Path | None:
+    """Atomically write a strictly allowlisted `BUS_DIR/chat_sync/<handle>.json` signal file.
+
+    Directory is enforced to `0700` and file is written via tmp + `fsync` + `0600` + `os.replace`.
+    Only allowlisted metadata keys (`bot`, `cid`, `source`, `status`, `updated_at`, `seq`) are ever written.
+    """
+    global _chat_sync_seq
+    if not is_valid_cid(cid):
+        return None
+    src = str(source or "").strip().lower()
+    if src not in _CHAT_SYNC_SOURCES:
+        return None
+    st = str(status or "").strip().lower()
+    if st not in _CHAT_SYNC_STATUSES:
+        return None
+
+    handle = normalize_ipc_handle(bot_handle)
+    with _chat_sync_seq_lock:
+        _chat_sync_seq += 1
+        seq_val = _chat_sync_seq
+
+    payload = {
+        "bot": handle,
+        "cid": str(cid),
+        "source": src,
+        "status": st,
+        "updated_at": round(time.time(), 3),
+        "seq": seq_val,
+    }
+    raw_bytes = (json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+
+    sync_dir = Path(bus_dir) / "chat_sync"
+    sync_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(sync_dir, 0o700)
+
+    target_path = sync_dir / f"{handle}.json"
+    tmp_path = sync_dir / f".{handle}.json.tmp.{os.getpid()}.{secrets.token_hex(6)}"
+    fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(raw_bytes)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, target_path)
+        return target_path
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def is_valid_entity_id(raw: Any) -> bool:
@@ -267,6 +343,8 @@ class _TurnRecord:
         "bot_handle",
         "scope_key",
         "cid",
+        "source",
+        "prompt_preview",
         "status",
         "created_at",
         "finished_at",
@@ -289,6 +367,8 @@ class _TurnRecord:
         bot_handle: str,
         scope_key: str,
         cid: str | None,
+        source: str,
+        prompt_preview: str,
         max_events: int,
         max_bytes: int,
     ) -> None:
@@ -298,6 +378,9 @@ class _TurnRecord:
         self.bot_handle = str(bot_handle or "")
         self.scope_key = str(scope_key or "")
         self.cid = cid
+        src_clean = str(source or "web").strip().lower()
+        self.source = "tg" if src_clean == "tg" else "web"
+        self.prompt_preview = " ".join(str(prompt_preview or "").split())[:240]
         self.status = "queued"
         self.created_at = time.time()
         self.finished_at: float | None = None
@@ -336,6 +419,8 @@ class TurnEventBuffer:
         bot_handle: str = "",
         scope_key: str = "",
         cid: str | None = None,
+        source: str = "web",
+        prompt_preview: str = "",
     ) -> _TurnRecord:
         with self._cond:
             rec = _TurnRecord(
@@ -345,6 +430,8 @@ class TurnEventBuffer:
                 bot_handle=bot_handle,
                 scope_key=scope_key,
                 cid=cid,
+                source=source,
+                prompt_preview=prompt_preview,
                 max_events=self.max_events_per_turn,
                 max_bytes=self.max_bytes_per_turn,
             )
@@ -376,6 +463,8 @@ class TurnEventBuffer:
                 "bot_handle": rec.bot_handle,
                 "scope_key": rec.scope_key,
                 "cid": rec.cid,
+                "source": rec.source,
+                "prompt_preview": rec.prompt_preview,
                 "status": rec.status,
                 "finished": rec.finished,
                 "aborted": rec.aborted,
@@ -407,6 +496,30 @@ class TurnEventBuffer:
             for tid, rec in self._turns.items():
                 if not rec.finished and rec.cid == cid:
                     return tid
+            return None
+
+    def find_active_turn_for_cid_and_owner(
+        self,
+        cid: str,
+        owner_user_id: int,
+    ) -> dict[str, Any] | None:
+        """Find the active unfinished turn matching both `cid` and `owner_user_id`."""
+        if not cid:
+            return None
+        uid = parse_strict_user_id(owner_user_id)
+        if uid is None:
+            return None
+        with self._cond:
+            for rec in reversed(list(self._turns.values())):
+                if not rec.finished and rec.cid == cid and rec.owner_user_id == uid:
+                    return {
+                        "turn_id": rec.turn_id,
+                        "cid": rec.cid,
+                        "source": rec.source,
+                        "status": rec.status,
+                        "prompt_preview": rec.prompt_preview,
+                        "bot_handle": rec.bot_handle,
+                    }
             return None
 
     def append(self, turn_id: str, event_type: str, payload: dict[str, Any] | None = None) -> int:
@@ -656,6 +769,42 @@ class _StudioIPCHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(200, {"ok": True, **(meta if isinstance(meta, dict) else {})})
             return
 
+        if path == "/ipc/chat/active":
+            raw_uid = (qs.get("user_id") or [self.headers.get("X-Bridge-User-Id") or ""])[0]
+            ok_u, uid, err_u = self._authorize_admin_user(raw_uid)
+            if not ok_u or uid is None:
+                self._send_json(403, {"ok": False, "error": err_u, "source": "bridge_ipc"})
+                return
+
+            raw_cid = ((qs.get("cid") or [""])[0]).strip()
+            ok_cid, err_cid, sc_cid = validate_resume_cid(
+                raw_cid,
+                summaries_db=self.ipc.summaries_db,
+                meta_file=self.ipc.meta_file,
+            )
+            if not ok_cid:
+                self._send_json(sc_cid, {"ok": False, "error": err_cid})
+                return
+
+            active = self.ipc.buffer.find_active_turn_for_cid_and_owner(raw_cid, uid)
+            if active is None:
+                self._send_json(200, {"ok": True, "active": False, "cid": raw_cid})
+                return
+
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "active": True,
+                    "turn_id": active["turn_id"],
+                    "cid": active["cid"] or raw_cid,
+                    "source": active["source"],
+                    "status": active["status"],
+                    "prompt_preview": active["prompt_preview"],
+                },
+            )
+            return
+
         if path == "/ipc/chat/stream":
             raw_uid = (qs.get("user_id") or [self.headers.get("X-Bridge-User-Id") or ""])[0]
             ok_u, uid, err_u = self._authorize_admin_user(raw_uid)
@@ -723,8 +872,9 @@ class _StudioIPCHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(sc_body, {"ok": False, "error": err_body})
             return
 
-        # Strip any caller-supplied `role` field so downstream handlers can never accidentally trust it
-        body.pop("role", None)
+        # Strip any caller-supplied untrusted routing/role fields so downstream handlers can never trust them
+        for bad_k in _UNTRUSTED_CLIENT_SEND_KEYS:
+            body.pop(bad_k, None)
 
         ok_u, uid, err_u = self._authorize_admin_user(body.get("user_id"))
         if not ok_u or uid is None:
@@ -739,6 +889,14 @@ class _StudioIPCHandler(http.server.BaseHTTPRequestHandler):
             if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
                 self._send_json(413, {"ok": False, "error": "prompt 超过 32 KiB 上限"})
                 return
+
+            sync_tg = False
+            if "sync_tg" in body:
+                raw_sync = body.get("sync_tg")
+                if not isinstance(raw_sync, bool):
+                    self._send_json(400, {"ok": False, "error": "sync_tg 必须为布尔值（true/false）"})
+                    return
+                sync_tg = raw_sync
 
             raw_cid = body.get("cid")
             cid: str | None = None
@@ -762,6 +920,7 @@ class _StudioIPCHandler(http.server.BaseHTTPRequestHandler):
                 "project": str(body.get("project") or "").strip()[:128] or None,
                 "model": str(body.get("model") or "").strip()[:128] or None,
                 "effort": str(body.get("effort") or "").strip().lower()[:16] or None,
+                "sync_tg": sync_tg,
             }
             try:
                 status_code, resp_payload = self.ipc.enqueue_turn_fn(req)

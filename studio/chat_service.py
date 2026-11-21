@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import time
 from typing import Any
+import urllib.parse
 
 import aiohttp
 from aiohttp import web
@@ -30,6 +31,7 @@ from .data_sources import (
     redact_secrets_only,
     truncate_utf8_bytes,
 )
+import studio_ipc
 
 log = logging.getLogger("agy-studio.chat")
 
@@ -199,11 +201,11 @@ class StudioChatService:
     def _ipc_dir(self) -> Path:
         return (self.data_sources.bus_dir / "ipc").resolve()
 
-    def _resolve_ipc_endpoint(self, requested_bot: str | None = None) -> tuple[str, Path, str] | None:
-        """Resolve `(bot_handle, sock_path, ipc_token)` strictly inside `BUS_DIR/ipc/`."""
+    def _iter_ipc_endpoints(self, requested_bot: str | None = None) -> list[tuple[str, Path, str]]:
+        """Enumerate valid `(bot_handle, sock_path, ipc_token)` endpoints strictly inside `BUS_DIR/ipc/`."""
         ipc_dir = self._ipc_dir()
         if not ipc_dir.is_dir():
-            return None
+            return []
 
         candidates: list[str] = []
         if requested_bot:
@@ -223,6 +225,7 @@ class StudioChatService:
             except OSError:
                 pass
 
+        found: list[tuple[str, Path, str]] = []
         for handle in candidates:
             safe_h = handle.lstrip("@").lower()
             if not safe_h or "/" in safe_h or ".." in safe_h:
@@ -241,8 +244,13 @@ class StudioChatService:
             except OSError:
                 continue
             if token:
-                return safe_h, sock_p, token
-        return None
+                found.append((safe_h, sock_p, token))
+        return found
+
+    def _resolve_ipc_endpoint(self, requested_bot: str | None = None) -> tuple[str, Path, str] | None:
+        """Resolve `(bot_handle, sock_path, ipc_token)` strictly inside `BUS_DIR/ipc/`."""
+        eps = self._iter_ipc_endpoints(requested_bot)
+        return eps[0] if eps else None
 
     async def _ipc_request_json(
         self,
@@ -421,6 +429,59 @@ class StudioChatService:
         sc, payload = self.data_sources.get_session_messages(cid, limit=limit, before=before_val)
         return web.json_response(payload, status=sc)
 
+    async def handle_get_session_active_turn(self, request: web.Request) -> web.Response:
+        # Strictly admin-only + must_change_password=False; fail closed before any IPC call
+        ok, sess, err, status_code = await self.auth_mgr.authenticate_request(request)
+        if not ok or not sess:
+            return studio_auth_error(err, status=status_code)
+        if sess.get("role") != "admin":
+            return studio_auth_error("只读权限（readonly）不可查询活跃实时轮次", status=403)
+
+        cid = str(request.match_info.get("cid") or "").strip()
+        ok_cid, err_cid, sc_cid = studio_ipc.validate_resume_cid(
+            cid,
+            summaries_db=self.data_sources.summaries_db,
+            meta_file=self.data_sources.meta_file,
+        )
+        if not ok_cid:
+            return web.json_response(
+                {"ok": False, "source": "studio_api", "error": err_cid},
+                status=sc_cid,
+            )
+
+        req_bot = str(request.query.get("bot") or "").strip() or None
+        endpoints = self._iter_ipc_endpoints(req_bot)
+        uid = int(sess["user_id"])
+        qs = urllib.parse.urlencode({"cid": cid, "user_id": str(uid)})
+
+        for bot_handle, sock_path, ipc_token in endpoints:
+            sc, data = await self._ipc_request_json(
+                sock_path=sock_path,
+                token=ipc_token,
+                method="GET",
+                path=f"/ipc/chat/active?{qs}",
+                timeout_sec=5.0,
+            )
+            if sc == 200 and data.get("ok") and data.get("active"):
+                turn_id = str(data.get("turn_id") or "").strip()
+                if not turn_id:
+                    continue
+                preview = redact_secrets_only(str(data.get("prompt_preview") or ""), max_len=240)
+                return web.json_response(
+                    {
+                        "ok": True,
+                        "active": True,
+                        "bot": bot_handle,
+                        "cid": str(data.get("cid") or cid),
+                        "turn_id": turn_id,
+                        "source": _sanitize_slug(str(data.get("source") or "tg"), max_len=16) or "tg",
+                        "status": _sanitize_slug(str(data.get("status") or "running"), max_len=24) or "running",
+                        "prompt_preview": preview,
+                    }
+                )
+
+        return web.json_response({"ok": True, "active": False, "cid": cid})
+
     async def handle_get_models(self, request: web.Request) -> web.Response:
         ok, sess, err, status_code = await self.auth_mgr.authenticate_request(request)
         if not ok or not sess:
@@ -552,6 +613,23 @@ class StudioChatService:
                 status=400,
             )
 
+        sync_tg = False
+        if "sync_tg" in body:
+            raw_sync_tg = body.get("sync_tg")
+            if not isinstance(raw_sync_tg, bool):
+                self.audit.record(
+                    action="chat.send",
+                    status_code=400,
+                    outcome="denied_invalid_sync_tg",
+                    client_ip=client_ip,
+                    sess=sess,
+                )
+                return web.json_response(
+                    {"ok": False, "source": "studio_api", "error": "sync_tg 必须为布尔值（true/false）"},
+                    status=400,
+                )
+            sync_tg = raw_sync_tg
+
         req_bot = str(body.get("bot") or "").strip() or None
         resolved = self._resolve_ipc_endpoint(req_bot)
         if resolved is None:
@@ -575,6 +653,7 @@ class StudioChatService:
             "project": str(body.get("project") or "").strip() or None,
             "model": str(body.get("model") or "").strip() or None,
             "effort": effort_raw or None,
+            "sync_tg": sync_tg,
         }
         sc, resp_data = await self._ipc_request_json(
             sock_path=sock_path,
@@ -902,10 +981,19 @@ class StudioChatService:
 
         # 2. Strict tenant ownership enforcement
         owner = self._turn_owners.get(turn_id)
-        if owner is None:
+        req_bot = str(request.query.get("bot") or "").strip() or None
+        if owner is not None:
+            if not self._is_turn_owner(owner, sess):
+                return studio_auth_error("无权订阅其他用户的对话流", status=403)
+            target_bot: str | None = owner.get("target_bot") or req_bot
+        elif studio_ipc.is_valid_tg_turn_id(turn_id):
+            # Allow `tg-<16hex>` live DM turns only when pointing to a valid online IPC endpoint;
+            # Bridge `/ipc/chat/stream` strictly re-verifies live admin RBAC and `owner_user_id == sess["user_id"]`.
+            if self._resolve_ipc_endpoint(req_bot) is None:
+                return studio_auth_error("未找到对应的对话流或目标 Bot 离线", status=403)
+            target_bot = req_bot
+        else:
             return studio_auth_error("未找到对应的对话流或无权访问", status=403)
-        if not self._is_turn_owner(owner, sess):
-            return studio_auth_error("无权订阅其他用户的对话流", status=403)
 
         # 3. Concurrency limits (per-session <= 4, global <= 32 -> 429) with atomic synchronous reservation
         session_hash = str(sess["session_hash"])
@@ -943,7 +1031,6 @@ class StudioChatService:
 
         try:
             # 4. Resolve upstream Bridge UDS endpoint
-            target_bot = owner.get("target_bot") or str(request.query.get("bot") or "").strip() or None
             resolved = self._resolve_ipc_endpoint(target_bot)
             if resolved is None:
                 return upstream_error("Bridge IPC 服务暂不可达", status=503)

@@ -19,6 +19,7 @@ import {
 import {
   StudioApiError,
   abortChatTurn,
+  fetchActiveSessionTurn,
   fetchBots,
   fetchModels,
   fetchSessionMessages,
@@ -31,13 +32,17 @@ import type {
   ChatToolCall,
   ModelsResponse,
   SessionSummaryItem,
+  SessionUpdatedEvent,
   StudioSession,
 } from "../types";
 import { SafeMarkdown } from "./SafeMarkdown";
 
+const SYNC_TG_STORAGE_KEY = "agy_studio_sync_tg";
+
 interface WorkspaceViewProps {
   session: StudioSession;
   browserDrawerOpen: boolean;
+  sessionSyncEvent?: SessionUpdatedEvent | null;
   onToggleBrowserDrawer: () => void;
   onSessionRevoked: (reason: string) => void;
 }
@@ -45,6 +50,7 @@ interface WorkspaceViewProps {
 export function WorkspaceView({
   session,
   browserDrawerOpen,
+  sessionSyncEvent,
   onToggleBrowserDrawer,
   onSessionRevoked,
 }: WorkspaceViewProps) {
@@ -66,6 +72,18 @@ export function WorkspaceView({
   const [selectedModel, setSelectedModel] = useState<string>("");
   const [selectedEffort, setSelectedEffort] = useState<string>("");
 
+  // Admin-only Web -> TG DM mirror toggle (browser-persisted, default true)
+  const [syncTg, setSyncTg] = useState<boolean>(() => {
+    try {
+      const saved = window.localStorage.getItem(SYNC_TG_STORAGE_KEY);
+      if (saved === "false") return false;
+      if (saved === "true") return true;
+    } catch {
+      // Ignore storage access failures
+    }
+    return true;
+  });
+
   // Active conversation & timeline
   const [activeCid, setActiveCid] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChatMessageItem[]>([]);
@@ -78,6 +96,7 @@ export function WorkspaceView({
   const [draft, setDraft] = useState("");
   const [activeTurnId, setActiveTurnId] = useState<string | null>(null);
   const [streaming, setStreaming] = useState(false);
+  const [remoteSyncSource, setRemoteSyncSource] = useState<string | null>(null);
   const [statusNotice, setStatusNotice] = useState<string | null>(null);
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
   const [resyncNeeded, setResyncNeeded] = useState(false);
@@ -85,6 +104,33 @@ export function WorkspaceView({
   const esRef = useRef<EventSource | null>(null);
   const timelineEndRef = useRef<HTMLDivElement | null>(null);
   const activeAssistantIdRef = useRef<string | null>(null);
+  // Monotonic generation & live ref guards to drop stale async responses across session switches
+  const genRef = useRef<number>(0);
+  const activeCidRef = useRef<string | null>(null);
+  const streamingRef = useRef<boolean>(false);
+  const streamingSourceRef = useRef<"local" | "remote" | null>(null);
+  const activeTurnIdRef = useRef<string | null>(null);
+  const attachInFlightRef = useRef<string | null>(null);
+  const lastSyncVerRef = useRef<number>(0);
+  const historyLoadSeqRef = useRef<number>(0);
+
+  const setActiveCidSynced = useCallback((cid: string | null) => {
+    activeCidRef.current = cid;
+    setActiveCid(cid);
+  }, []);
+
+  const handleToggleSyncTg = () => {
+    if (isReadonly) return;
+    setSyncTg((prev) => {
+      const next = !prev;
+      try {
+        window.localStorage.setItem(SYNC_TG_STORAGE_KEY, next ? "true" : "false");
+      } catch {
+        // Ignore storage errors
+      }
+      return next;
+    });
+  };
 
   const closeEventSource = useCallback(() => {
     if (esRef.current) {
@@ -92,6 +138,16 @@ export function WorkspaceView({
       esRef.current = null;
     }
   }, []);
+
+  const resetStreamState = useCallback(() => {
+    closeEventSource();
+    streamingRef.current = false;
+    streamingSourceRef.current = null;
+    activeTurnIdRef.current = null;
+    setStreaming(false);
+    setActiveTurnId(null);
+    setRemoteSyncSource(null);
+  }, [closeEventSource]);
 
   useEffect(() => {
     return () => {
@@ -178,15 +234,29 @@ export function WorkspaceView({
   }, [loadSessions]);
 
   const loadSessionHistory = useCallback(
-    async (cid: string, beforeCursor?: number | null) => {
-      setHistoryLoading(true);
-      setErrorBanner(null);
-      setResyncNeeded(false);
+    async (
+      cid: string,
+      beforeCursor?: number | null,
+      opts?: { expectedGen?: number; silent?: boolean },
+    ) => {
+      const reqGen = opts?.expectedGen ?? genRef.current;
+      let loadSeq = 0;
+      if (!opts?.silent) {
+        historyLoadSeqRef.current += 1;
+        loadSeq = historyLoadSeqRef.current;
+        setHistoryLoading(true);
+        setErrorBanner(null);
+        setResyncNeeded(false);
+      }
       try {
         const res = await fetchSessionMessages(cid, {
           limit: 40,
           before: beforeCursor ?? undefined,
         });
+        // Discard stale response if user switched session, started a new chat, or began streaming in-flight
+        if (genRef.current !== reqGen || activeCidRef.current !== cid || (!beforeCursor && streamingRef.current)) {
+          return;
+        }
         setHasMoreHistory(Boolean(res.has_more));
         setNextBefore(res.next_before ?? null);
         if (beforeCursor) {
@@ -194,40 +264,26 @@ export function WorkspaceView({
         } else {
           setMessages(res.messages || []);
           window.setTimeout(() => {
-            timelineEndRef.current?.scrollIntoView({ behavior: "smooth" });
+            if (genRef.current === reqGen && activeCidRef.current === cid && !streamingRef.current) {
+              timelineEndRef.current?.scrollIntoView({ behavior: "smooth" });
+            }
           }, 40);
         }
       } catch (err) {
-        if (!handleApiAuthError(err)) {
+        if (genRef.current !== reqGen || activeCidRef.current !== cid) {
+          return;
+        }
+        if (!handleApiAuthError(err) && !opts?.silent) {
           setErrorBanner(err instanceof Error ? err.message : "加载历史消息失败");
         }
       } finally {
-        setHistoryLoading(false);
+        if (!opts?.silent && historyLoadSeqRef.current === loadSeq) {
+          setHistoryLoading(false);
+        }
       }
     },
     [handleApiAuthError],
   );
-
-  const handleSelectSession = (item: SessionSummaryItem) => {
-    if (streaming) return;
-    closeEventSource();
-    setActiveCid(item.cid);
-    setStatusNotice(null);
-    setErrorBanner(null);
-    void loadSessionHistory(item.cid);
-  };
-
-  const handleNewChat = () => {
-    if (streaming) return;
-    closeEventSource();
-    setActiveCid(null);
-    setMessages([]);
-    setHasMoreHistory(false);
-    setNextBefore(null);
-    setStatusNotice(null);
-    setErrorBanner(null);
-    setResyncNeeded(false);
-  };
 
   const updateAssistantBubble = useCallback(
     (updater: (msg: ChatMessageItem) => ChatMessageItem) => {
@@ -241,12 +297,14 @@ export function WorkspaceView({
   );
 
   const attachStream = useCallback(
-    (turnId: string, botHandle: string) => {
+    (turnId: string, botHandle: string, streamGen: number, mode: "local" | "remote") => {
       closeEventSource();
       const qs = new URLSearchParams({ turn_id: turnId });
       if (botHandle) qs.set("bot", botHandle);
       const es = new EventSource(`/api/chat/stream?${qs.toString()}`);
       esRef.current = es;
+
+      const isStale = () => genRef.current !== streamGen || esRef.current !== es;
 
       const parseData = (ev: MessageEvent): Record<string, unknown> => {
         try {
@@ -256,22 +314,35 @@ export function WorkspaceView({
         }
       };
 
+      const finishAndAlign = (cidHint?: string | null) => {
+        resetStreamState();
+        setStatusNotice(null);
+        void loadSessions();
+        const alignCid = cidHint || activeCidRef.current;
+        if (mode === "remote" && alignCid && genRef.current === streamGen) {
+          void loadSessionHistory(alignCid, null, { expectedGen: streamGen, silent: true });
+        }
+      };
+
       es.addEventListener("turn_start", (ev) => {
+        if (isStale()) return;
         const d = parseData(ev as MessageEvent);
         if (typeof d.conversation_id === "string" && d.conversation_id) {
-          setActiveCid(d.conversation_id);
+          setActiveCidSynced(d.conversation_id);
         }
-        setStatusNotice("正在思考与执行…");
+        setStatusNotice(mode === "remote" ? "TG 实时同步中…" : "正在思考与执行…");
       });
 
       es.addEventListener("init", (ev) => {
+        if (isStale()) return;
         const d = parseData(ev as MessageEvent);
         if (typeof d.conversation_id === "string" && d.conversation_id) {
-          setActiveCid(d.conversation_id);
+          setActiveCidSynced(d.conversation_id);
         }
       });
 
       es.addEventListener("status", (ev) => {
+        if (isStale()) return;
         const d = parseData(ev as MessageEvent);
         if (typeof d.message === "string" && d.message) {
           setStatusNotice(d.message);
@@ -279,6 +350,7 @@ export function WorkspaceView({
       });
 
       es.addEventListener("thinking", (ev) => {
+        if (isStale()) return;
         const d = parseData(ev as MessageEvent);
         const delta = typeof d.delta === "string" ? d.delta : "";
         if (!delta) return;
@@ -289,9 +361,10 @@ export function WorkspaceView({
       });
 
       es.addEventListener("tool_use", (ev) => {
+        if (isStale()) return;
         const d = parseData(ev as MessageEvent);
         const tname = typeof d.tool_name === "string" ? d.tool_name : "tool";
-        setStatusNotice(`执行工具：${tname}`);
+        setStatusNotice(mode === "remote" ? `TG 同步 · 执行工具：${tname}` : `执行工具：${tname}`);
         updateAssistantBubble((m) => {
           const prevTools: ChatToolCall[] = [...(m.tool_calls || [])];
           prevTools.push({ name: tname, active: true });
@@ -300,6 +373,7 @@ export function WorkspaceView({
       });
 
       es.addEventListener("tool_result", (ev) => {
+        if (isStale()) return;
         const d = parseData(ev as MessageEvent);
         const tname = typeof d.tool_name === "string" ? d.tool_name : "tool";
         const dur = typeof d.duration_seconds === "number" ? d.duration_seconds : null;
@@ -312,10 +386,13 @@ export function WorkspaceView({
       });
 
       es.addEventListener("text_delta", (ev) => {
+        if (isStale()) return;
         const d = parseData(ev as MessageEvent);
         const delta = typeof d.delta === "string" ? d.delta : "";
         if (!delta) return;
-        setStatusNotice(null);
+        if (mode !== "remote") {
+          setStatusNotice(null);
+        }
         updateAssistantBubble((m) => ({
           ...m,
           content: (m.content || "") + delta,
@@ -324,9 +401,12 @@ export function WorkspaceView({
       });
 
       es.addEventListener("done", (ev) => {
+        if (isStale()) return;
         const d = parseData(ev as MessageEvent);
-        if (typeof d.conversation_id === "string" && d.conversation_id) {
-          setActiveCid(d.conversation_id);
+        const resolvedCid =
+          typeof d.conversation_id === "string" && d.conversation_id ? d.conversation_id : null;
+        if (resolvedCid) {
+          setActiveCidSynced(resolvedCid);
         }
         const finalResp = typeof d.response === "string" ? d.response : "";
         updateAssistantBubble((m) => ({
@@ -334,70 +414,248 @@ export function WorkspaceView({
           content: m.content.trim() ? m.content : finalResp || "(无文本输出)",
           status: typeof d.status === "string" ? d.status : "DONE",
         }));
-        setStreaming(false);
-        setActiveTurnId(null);
-        setStatusNotice(null);
-        closeEventSource();
-        void loadSessions();
+        finishAndAlign(resolvedCid);
       });
 
       es.addEventListener("aborted", (ev) => {
+        if (isStale()) return;
         const d = parseData(ev as MessageEvent);
         const partial = typeof d.partial_text === "string" ? d.partial_text : "";
+        const resolvedCid =
+          typeof d.conversation_id === "string" && d.conversation_id ? d.conversation_id : null;
         updateAssistantBubble((m) => ({
           ...m,
           content: (m.content || partial) + "\n\n*[已停止生成]*",
           status: "ABORTED",
         }));
-        setStreaming(false);
-        setActiveTurnId(null);
-        setStatusNotice(null);
-        closeEventSource();
-        void loadSessions();
+        finishAndAlign(resolvedCid);
       });
 
       es.addEventListener("error", (ev) => {
+        if (isStale()) return;
         const mev = ev as MessageEvent;
         if (typeof mev.data === "string" && mev.data) {
           const d = parseData(mev);
           const msg = typeof d.error === "string" ? d.error : "对话执行出错";
+          const resolvedCid =
+            typeof d.conversation_id === "string" && d.conversation_id ? d.conversation_id : null;
           setErrorBanner(msg);
           updateAssistantBubble((m) => ({
             ...m,
             content: m.content || `⚠️ ${msg}`,
             status: "ERROR",
           }));
-          setStreaming(false);
-          setActiveTurnId(null);
-          setStatusNotice(null);
-          closeEventSource();
+          finishAndAlign(resolvedCid);
+        } else if (mode === "remote") {
+          finishAndAlign(activeCidRef.current);
         }
       });
 
       es.addEventListener("resync_required", () => {
-        setResyncNeeded(true);
-        setStreaming(false);
-        setActiveTurnId(null);
-        setStatusNotice("事件流超出缓冲窗口，请重新同步历史记录。");
-        closeEventSource();
+        if (isStale()) return;
+        resetStreamState();
+        const curCid = activeCidRef.current;
+        if (curCid) {
+          setStatusNotice(null);
+          void loadSessionHistory(curCid, null, { expectedGen: streamGen, silent: true });
+        } else {
+          setResyncNeeded(true);
+          setStatusNotice("事件流超出缓冲窗口，请重新同步历史记录。");
+        }
       });
 
       es.addEventListener("auth_error", (ev) => {
+        if (isStale()) return;
         const d = parseData(ev as MessageEvent);
         const reason = typeof d.error === "string" ? d.error : "会话鉴权已失效";
-        setStreaming(false);
-        setActiveTurnId(null);
-        closeEventSource();
+        resetStreamState();
         onSessionRevoked(reason);
       });
     },
-    [closeEventSource, loadSessions, onSessionRevoked, updateAssistantBubble],
+    [
+      closeEventSource,
+      loadSessionHistory,
+      loadSessions,
+      onSessionRevoked,
+      resetStreamState,
+      setActiveCidSynced,
+      updateAssistantBubble,
+    ],
   );
+
+  const probeAndAttachActiveTurn = useCallback(
+    async (cid: string, botHint?: string) => {
+      // Strictly admin-only; readonly NEVER calls active-turn or /api/chat/stream
+      if (isReadonly || !cid || streamingRef.current) return;
+      if (attachInFlightRef.current === cid) return;
+      const reqGen = genRef.current;
+      let expectedGen = reqGen;
+      attachInFlightRef.current = cid;
+      try {
+        const res = await fetchActiveSessionTurn(cid, botHint || undefined);
+        if (
+          genRef.current !== reqGen ||
+          activeCidRef.current !== cid ||
+          streamingRef.current
+        ) {
+          return;
+        }
+        if (!res.active || !res.turn_id) {
+          return;
+        }
+        if (activeTurnIdRef.current === res.turn_id) {
+          return;
+        }
+        genRef.current += 1;
+        const attachGen = genRef.current;
+        expectedGen = attachGen;
+        const src = res.source || "tg";
+        const assistantMsgId = `remote-a-${res.turn_id}`;
+        const userMsgId = `remote-u-${res.turn_id}`;
+        activeAssistantIdRef.current = assistantMsgId;
+        activeTurnIdRef.current = res.turn_id;
+        streamingRef.current = true;
+        streamingSourceRef.current = "remote";
+        setActiveTurnId(res.turn_id);
+        setStreaming(true);
+        setRemoteSyncSource(src);
+        setStatusNotice(src === "tg" ? "TG 实时同步中…" : "多端实时同步中…");
+
+        const promptPreview = (res.prompt_preview || "").trim();
+        setMessages((prev) => {
+          const filtered = prev.filter(
+            (m) => m.id !== assistantMsgId && m.id !== userMsgId,
+          );
+          const lastMsg = filtered[filtered.length - 1];
+          const needUserBubble =
+            Boolean(promptPreview) &&
+            !(
+              lastMsg &&
+              lastMsg.role === "user" &&
+              lastMsg.content.trim().startsWith(promptPreview.slice(0, 60))
+            );
+          const next: ChatMessageItem[] = [...filtered];
+          if (needUserBubble) {
+            next.push({ id: userMsgId, role: "user", content: promptPreview });
+          }
+          next.push({
+            id: assistantMsgId,
+            role: "assistant",
+            content: "",
+            thinking: "",
+            tool_calls: [],
+          });
+          return next;
+        });
+
+        attachStream(res.turn_id, res.bot || botHint || selectedBot, attachGen, "remote");
+      } catch (err) {
+        if (genRef.current !== expectedGen) return;
+        handleApiAuthError(err);
+      } finally {
+        if (attachInFlightRef.current === cid) {
+          attachInFlightRef.current = null;
+        }
+      }
+    },
+    [attachStream, handleApiAuthError, isReadonly, selectedBot],
+  );
+
+  // React to global `session_updated` / `resync_required` SSE signals from App
+  useEffect(() => {
+    if (!sessionSyncEvent || sessionSyncEvent.ver === lastSyncVerRef.current) {
+      return;
+    }
+    lastSyncVerRef.current = sessionSyncEvent.ver;
+    void loadSessions();
+
+    const curCid = activeCidRef.current;
+    if (!curCid) return;
+
+    if (sessionSyncEvent.type === "resync_required") {
+      if (!streamingRef.current) {
+        const curGen = genRef.current;
+        void loadSessionHistory(curCid, null, { expectedGen: curGen, silent: true }).then(() => {
+          if (!isReadonly && genRef.current === curGen && activeCidRef.current === curCid && !streamingRef.current) {
+            void probeAndAttachActiveTurn(curCid, selectedBot || undefined);
+          }
+        });
+      }
+      return;
+    }
+
+    if (sessionSyncEvent.cid !== curCid) return;
+
+    if (sessionSyncEvent.status === "running") {
+      if (!isReadonly && !streamingRef.current) {
+        void probeAndAttachActiveTurn(curCid, sessionSyncEvent.bot || undefined);
+      }
+    } else if (
+      sessionSyncEvent.status === "done" ||
+      sessionSyncEvent.status === "aborted" ||
+      sessionSyncEvent.status === "error"
+    ) {
+      if (!streamingRef.current || streamingSourceRef.current === "remote") {
+        if (streamingSourceRef.current === "remote") {
+          resetStreamState();
+          setStatusNotice(null);
+        }
+        void loadSessionHistory(curCid, null, { expectedGen: genRef.current, silent: true });
+      }
+    }
+  }, [
+    isReadonly,
+    loadSessionHistory,
+    loadSessions,
+    probeAndAttachActiveTurn,
+    resetStreamState,
+    selectedBot,
+    sessionSyncEvent,
+  ]);
+
+  const handleSelectSession = (item: SessionSummaryItem) => {
+    if (streamingRef.current && streamingSourceRef.current === "local") return;
+    genRef.current += 1;
+    const nextGen = genRef.current;
+    attachInFlightRef.current = null;
+    resetStreamState();
+    setActiveCidSynced(item.cid);
+    setStatusNotice(null);
+    setErrorBanner(null);
+    void loadSessionHistory(item.cid, null, { expectedGen: nextGen }).then(() => {
+      if (
+        !isReadonly &&
+        item.busy &&
+        genRef.current === nextGen &&
+        activeCidRef.current === item.cid &&
+        !streamingRef.current
+      ) {
+        void probeAndAttachActiveTurn(item.cid, item.bot || undefined);
+      }
+    });
+  };
+
+  const handleNewChat = () => {
+    if (streamingRef.current && streamingSourceRef.current === "local") return;
+    genRef.current += 1;
+    attachInFlightRef.current = null;
+    resetStreamState();
+    setActiveCidSynced(null);
+    setMessages([]);
+    setHasMoreHistory(false);
+    setNextBefore(null);
+    setStatusNotice(null);
+    setErrorBanner(null);
+    setResyncNeeded(false);
+  };
 
   const handleSend = async () => {
     const text = draft.trim();
-    if (!text || streaming || isReadonly) return;
+    if (!text || streamingRef.current || isReadonly) return;
 
+    genRef.current += 1;
+    const sendGen = genRef.current;
+    attachInFlightRef.current = null;
     setErrorBanner(null);
     setResyncNeeded(false);
     setDraft("");
@@ -405,6 +663,8 @@ export function WorkspaceView({
     const userMsgId = `u-${Date.now()}`;
     const assistantMsgId = `a-${Date.now() + 1}`;
     activeAssistantIdRef.current = assistantMsgId;
+    streamingRef.current = true;
+    streamingSourceRef.current = "local";
 
     setMessages((prev) => [
       ...prev,
@@ -412,23 +672,32 @@ export function WorkspaceView({
       { id: assistantMsgId, role: "assistant", content: "", thinking: "", tool_calls: [] },
     ]);
     setStreaming(true);
+    setRemoteSyncSource(null);
     setStatusNotice("正在提交至 Bridge 队列…");
 
     try {
       const res = await sendChatTurn({
         bot: selectedBot || undefined,
         prompt: text,
-        cid: activeCid || undefined,
+        cid: activeCidRef.current || undefined,
         project: selectedProject || undefined,
         model: selectedModel || undefined,
         effort: selectedEffort || undefined,
+        sync_tg: !isReadonly && syncTg,
       });
+      if (genRef.current !== sendGen) {
+        resetStreamState();
+        return;
+      }
+      activeTurnIdRef.current = res.turn_id;
       setActiveTurnId(res.turn_id);
-      if (res.cid) setActiveCid(res.cid);
-      attachStream(res.turn_id, res.bot || selectedBot);
+      if (res.cid) setActiveCidSynced(res.cid);
+      attachStream(res.turn_id, res.bot || selectedBot, sendGen, "local");
     } catch (err) {
-      setStreaming(false);
-      setActiveTurnId(null);
+      if (genRef.current !== sendGen) {
+        return;
+      }
+      resetStreamState();
       setStatusNotice(null);
       if (handleApiAuthError(err)) return;
       const errMsg =
@@ -454,6 +723,8 @@ export function WorkspaceView({
     }
   };
 
+  const isLocalStreaming = streaming && !remoteSyncSource;
+
   return (
     <div className="flex-1 min-h-0 flex overflow-hidden bg-slate-950">
       {/* Left Collapsible Sessions Sidebar */}
@@ -463,7 +734,7 @@ export function WorkspaceView({
             <div className="flex items-center gap-1.5">
               <button
                 type="button"
-                disabled={streaming}
+                disabled={isLocalStreaming}
                 onClick={handleNewChat}
                 className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 disabled:opacity-40 text-white text-xs font-medium py-1.5 px-2.5 transition-colors cursor-pointer"
               >
@@ -640,6 +911,30 @@ export function WorkspaceView({
               ))}
             </select>
           </div>
+
+          {/* Admin-only Web -> TG DM Mirror Toggle */}
+          {!isReadonly && (
+            <button
+              type="button"
+              role="switch"
+              aria-checked={syncTg}
+              aria-label="同步到 TG"
+              onClick={handleToggleSyncTg}
+              title="将 Web Studio 对话同步镜像到你的 Telegram 私聊并对齐活跃会话"
+              className={`inline-flex items-center gap-1.5 h-7 px-2.5 rounded-md text-xs font-medium border transition-colors cursor-pointer shrink-0 ${
+                syncTg
+                  ? "bg-emerald-500/15 border-emerald-500/40 text-emerald-300"
+                  : "bg-slate-950/70 border-slate-800 text-slate-400 hover:bg-slate-800 hover:text-slate-200"
+              }`}
+            >
+              <span
+                className={`w-1.5 h-1.5 rounded-full ${
+                  syncTg ? "bg-emerald-400" : "bg-slate-500"
+                }`}
+              />
+              <span>同步到 TG</span>
+            </button>
+          )}
 
           {/* Desktop Right-side Live-Browser Drawer Switch */}
           <button
@@ -824,10 +1119,15 @@ export function WorkspaceView({
 
         {/* Multi-line Composer */}
         <footer className="shrink-0 border-t border-slate-800/90 bg-slate-900/70 p-3">
-          {statusNotice && streaming && (
-            <div className="mb-2 flex items-center gap-1.5 text-[11px] text-sky-300">
-              <Loader2 className="w-3 h-3 animate-spin" />
-              <span>{statusNotice}</span>
+          {streaming && (remoteSyncSource || statusNotice) && (
+            <div className="mb-2 flex items-center gap-2 text-[11px] text-sky-300">
+              <Loader2 className="w-3 h-3 animate-spin shrink-0" />
+              {remoteSyncSource === "tg" && (
+                <span className="px-1.5 py-0.5 rounded bg-emerald-500/15 border border-emerald-500/35 text-emerald-300 text-[10px] font-medium shrink-0">
+                  TG 实时同步中
+                </span>
+              )}
+              <span>{statusNotice || "正在实时同步…"}</span>
             </div>
           )}
           <div className="flex items-end gap-2">
@@ -845,11 +1145,13 @@ export function WorkspaceView({
               placeholder={
                 isReadonly
                   ? "只读角色已禁用输入"
-                  : "输入指令或问题…（Enter 发送，Shift+Enter 换行）"
+                  : remoteSyncSource === "tg"
+                    ? "TG 私聊实时同步中，完成后可继续输入…"
+                    : "输入指令或问题…（Enter 发送，Shift+Enter 换行）"
               }
               className="flex-1 resize-none rounded-xl bg-slate-950 border border-slate-800 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-sky-500 disabled:opacity-50"
             />
-            {streaming ? (
+            {isLocalStreaming ? (
               <button
                 type="button"
                 onClick={() => void handleAbort()}
@@ -861,7 +1163,7 @@ export function WorkspaceView({
             ) : (
               <button
                 type="button"
-                disabled={isReadonly || !draft.trim()}
+                disabled={isReadonly || streaming || !draft.trim()}
                 onClick={() => void handleSend()}
                 className="h-10 px-3.5 rounded-xl bg-sky-600 hover:bg-sky-500 disabled:opacity-40 text-white text-xs font-medium inline-flex items-center gap-1.5 shrink-0 cursor-pointer"
               >

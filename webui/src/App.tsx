@@ -37,7 +37,13 @@ import { MobileMoreSheet } from "./components/MobileMoreSheet";
 import { OverviewView } from "./components/OverviewView";
 import { SchedulesView } from "./components/SchedulesView";
 import { WorkspaceView } from "./components/WorkspaceView";
-import type { AuthMode, EventStreamStatus, NavTab, StudioSession } from "./types";
+import type {
+  AuthMode,
+  EventStreamStatus,
+  NavTab,
+  SessionUpdatedEvent,
+  StudioSession,
+} from "./types";
 
 const DESKTOP_NAV_ITEMS: { id: NavTab; label: string; icon: typeof LayoutDashboard }[] = [
   { id: "workspace", label: "对话", icon: MessageSquare },
@@ -112,6 +118,7 @@ export function App() {
   const [schedulesEventVer, setSchedulesEventVer] = useState(0);
   const [botsEventVer, setBotsEventVer] = useState(0);
   const [overviewEventVer, setOverviewEventVer] = useState(0);
+  const [sessionSyncEvent, setSessionSyncEvent] = useState<SessionUpdatedEvent | null>(null);
   const passwordChangingRef = useRef(false);
 
   const applySession = useCallback((sess: StudioSession) => {
@@ -366,11 +373,27 @@ export function App() {
         } else if (ev.type === "bots_updated") {
           setBotsEventVer((n) => n + 1);
           setOverviewEventVer((n) => n + 1);
+        } else if (ev.type === "session_updated") {
+          const d = ev.data || {};
+          setSessionSyncEvent((prev) => ({
+            ver: (prev?.ver || 0) + 1,
+            type: "session_updated",
+            cid: typeof d.cid === "string" ? d.cid : undefined,
+            bot: typeof d.bot === "string" ? d.bot : undefined,
+            source: typeof d.source === "string" ? d.source : undefined,
+            status: typeof d.status === "string" ? d.status : undefined,
+            busy: typeof d.busy === "boolean" ? d.busy : undefined,
+            updated_at: typeof d.updated_at === "number" ? d.updated_at : undefined,
+          }));
         } else if (ev.type === "resync_required") {
           setJobsEventVer((n) => n + 1);
           setSchedulesEventVer((n) => n + 1);
           setBotsEventVer((n) => n + 1);
           setOverviewEventVer((n) => n + 1);
+          setSessionSyncEvent((prev) => ({
+            ver: (prev?.ver || 0) + 1,
+            type: "resync_required",
+          }));
         }
       },
       onAuthError: (reason, code) => {
@@ -561,6 +584,7 @@ export function App() {
             <WorkspaceView
               session={session}
               browserDrawerOpen={browserDrawerOpen}
+              sessionSyncEvent={sessionSyncEvent}
               onToggleBrowserDrawer={() => setBrowserDrawerOpen((v) => !v)}
               onSessionRevoked={handleSessionRevoked}
             />
