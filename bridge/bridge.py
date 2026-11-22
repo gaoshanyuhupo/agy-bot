@@ -107,7 +107,12 @@ if os.path.isfile(_env_file):
 
 HOME = os.path.expanduser("~")
 BOT_TOKEN = os.environ.get("AGY_TG_BOT_TOKEN", "")
-ALLOWED = {int(x) for x in os.environ.get("AGY_TG_ALLOWED_CHATS", "").split(",") if x.strip()}
+_RAW_ALLOWED_CHATS = access_control.parse_uid_set(os.environ.get("AGY_TG_ALLOWED_CHATS", ""))
+_ENV_GROUP_CHATS = {c for c in access_control.parse_uid_set(os.environ.get("AGY_TG_GROUP_CHATS", "")) if c < 0}
+ALLOWED_PRIVATE = {c for c in _RAW_ALLOWED_CHATS if c > 0}
+CONFIGURED_GROUP_CHATS = {c for c in _RAW_ALLOWED_CHATS if c < 0} | _ENV_GROUP_CHATS
+ALLOW_GROUPS_DEFAULT = access_control.parse_bool_flag(os.environ.get("AGY_TG_ALLOW_GROUPS", "1"), default=True)
+ALLOWED = set(ALLOWED_PRIVATE | (CONFIGURED_GROUP_CHATS if ALLOW_GROUPS_DEFAULT else set()))
 ALLOWED_USERS = access_control.parse_uid_set(os.environ.get("AGY_TG_ALLOWED_USERS", ""))
 ADMIN_USERS = access_control.parse_uid_set(os.environ.get("AGY_TG_ADMIN_USERS", ""))
 READONLY_USERS = access_control.parse_uid_set(os.environ.get("AGY_TG_READONLY_USERS", ""))
@@ -936,9 +941,49 @@ state = {
     "auto_compact_tokens": DEFAULT_AUTO_COMPACT_TOKENS,
     "auto_compact_v2_migrated": True,
     "in_flight": None,
+    "groups_enabled": None,
+    "extra_group_chats": [],
     "primary_scope": PRIMARY_SCOPE_KEY,
     "scopes": {PRIMARY_SCOPE_KEY: _default_scope_state()},
 }
+
+
+def _sanitize_group_chat_ids(items):
+    out = []
+    for item in (items or ()):
+        if isinstance(item, bool):
+            continue
+        try:
+            iv = int(item)
+        except (TypeError, ValueError):
+            continue
+        if iv < 0 and iv not in out:
+            out.append(iv)
+    return sorted(out)
+
+
+def _is_groups_enabled():
+    with state_lock:
+        override = state.get("groups_enabled")
+    if isinstance(override, bool):
+        return override
+    return bool(ALLOW_GROUPS_DEFAULT)
+
+
+def _configured_group_chats():
+    with state_lock:
+        extra = list(state.get("extra_group_chats") or ())
+    return set(CONFIGURED_GROUP_CHATS) | set(_sanitize_group_chat_ids(extra))
+
+
+def _recompute_allowed_chats():
+    """Atomically recompute effective `ALLOWED` chat IDs from private allowlist + on-demand group switch."""
+    global ALLOWED
+    new_allowed = set(ALLOWED_PRIVATE)
+    if _is_groups_enabled():
+        new_allowed.update(_configured_group_chats())
+    ALLOWED = new_allowed
+    return new_allowed
 
 
 def _sync_top_level_mirrors_locked():
@@ -1332,8 +1377,13 @@ if os.path.exists(STATE_FILE):
                         sc["auto_compact_tokens"] = DEFAULT_AUTO_COMPACT_TOKENS
                     sc["auto_compact_v2_migrated"] = True
                 state["scopes"] = {PRIMARY_SCOPE_KEY: sc}
+            if isinstance(loaded.get("groups_enabled"), bool):
+                state["groups_enabled"] = loaded["groups_enabled"]
+            if isinstance(loaded.get("extra_group_chats"), list):
+                state["extra_group_chats"] = _sanitize_group_chat_ids(loaded["extra_group_chats"])
             with state_lock:
                 _sync_top_level_mirrors_locked()
+            _recompute_allowed_chats()
     except Exception:
         pass
 
@@ -1763,6 +1813,7 @@ _PRIVATE_COMMANDS = [
     {"command": "retry", "description": "Re-run the previous prompt in this chat/topic"},
     {"command": "undo", "description": "Undo workspace file edits from the last turn"},
     {"command": "team", "description": "Multi-bot Coordinator Bus roster, roles & jobs"},
+    {"command": "group", "description": "Toggle on-demand group chat access (on/off)"},
     {"command": "delegate", "description": "Directly assign a task to a sibling bot (/delegate @bot task)"},
     {"command": "usage", "description": "Overall Antigravity plan quota & reset time"},
     {"command": "accounts", "description": "Manage Google accounts & multi-plan quotas"},
@@ -1801,23 +1852,61 @@ _GROUP_TEAM_COMMANDS = [
 
 _cmd_reg_lock = threading.Lock()
 _LAST_REGISTERED_CMD_ROLE = None
+_LAST_REGISTERED_CMD_GROUPS = None
+_cmd_reg_fail_streak = 0
+_cmd_reg_next_retry_ts = 0.0
+_UNJOINED_GROUP_ERR_MARKERS = (
+    "chat not found",
+    "bot was kicked",
+    "bot is not a member",
+    "chat was deactivated",
+    "group chat was upgraded",
+    "forbidden",
+)
+
+
+def _is_unjoined_group_cleanup_error(resp):
+    """Return True only when Telegram explicitly reports the bot is not in / cannot access a group chat."""
+    if resp is None:
+        return False
+    status_code = getattr(resp, "status_code", None)
+    data = _tg_json(resp)
+    desc = str(data.get("description") or "").strip().lower()
+    if status_code == 403:
+        return True
+    if status_code == 400 and desc and any(marker in desc for marker in _UNJOINED_GROUP_ERR_MARKERS):
+        return True
+    return False
 
 
 def register_bot_commands(force=False):
     """Register scoped Telegram command menus: full menu in DMs, clean team-only menu in groups."""
-    global _LAST_REGISTERED_CMD_ROLE
+    global _LAST_REGISTERED_CMD_ROLE, _LAST_REGISTERED_CMD_GROUPS
+    global _cmd_reg_fail_streak, _cmd_reg_next_retry_ts
     role = _current_bot_role()
+    groups_enabled = _is_groups_enabled()
     with _cmd_reg_lock:
-        if not force and _LAST_REGISTERED_CMD_ROLE == role:
+        if not force and _LAST_REGISTERED_CMD_ROLE == role and _LAST_REGISTERED_CMD_GROUPS == groups_enabled:
             return True
-        # Invalidate any prior cached role before calling Telegram APIs so a failed/aborted
+        # Invalidate any prior cached state before calling Telegram APIs so a failed/aborted
         # forced refresh always triggers a real retry on the next non-forced call.
         _LAST_REGISTERED_CMD_ROLE = None
+        _LAST_REGISTERED_CMD_GROUPS = None
+        max_retry_after = 0
+
+        def _track_429(resp):
+            nonlocal max_retry_after
+            ra = _tg_retry_after(resp)
+            if ra:
+                max_retry_after = max(max_retry_after, int(ra))
+            return resp
+
         try:
             # Clear broad/legacy fallback scopes & per-chat overrides (both group & private)
             # so stale per-chat menus never shadow `all_private_chats` or `all_group_chats`.
-            ok_def = _tg_ok(tg("deleteMyCommands", _timeout=15, scope={"type": "default"}))
-            _tg_ok(tg("deleteMyCommands", _timeout=15, scope={"type": "all_chat_administrators"}))
+            res_def = _track_429(tg("deleteMyCommands", _timeout=15, scope={"type": "default"}))
+            ok_def = _tg_ok(res_def)
+            _track_429(tg("deleteMyCommands", _timeout=15, scope={"type": "all_chat_administrators"}))
             ok_cleanup = True
             for cid in sorted(ALLOWED):
                 try:
@@ -1825,45 +1914,68 @@ def register_bot_commands(force=False):
                 except Exception:
                     continue
                 if cid_int != 0:
-                    if not _tg_ok(tg("deleteMyCommands", _timeout=15, scope={"type": "chat", "chat_id": cid_int})):
+                    res_chat = _track_429(tg("deleteMyCommands", _timeout=15, scope={"type": "chat", "chat_id": cid_int}))
+                    if not _tg_ok(res_chat):
+                        if cid_int < 0 and _is_unjoined_group_cleanup_error(res_chat):
+                            log("register_bot_commands skipping cleanup for unjoined group %s (%s)"
+                                % (cid_int, _format_tg_err(res_chat)))
+                            continue
                         ok_cleanup = False
-                    res_admin = tg("deleteMyCommands", _timeout=15, scope={"type": "chat_administrators", "chat_id": cid_int})
+                    res_admin = _track_429(tg("deleteMyCommands", _timeout=15, scope={"type": "chat_administrators", "chat_id": cid_int}))
                     if cid_int < 0 and not _tg_ok(res_admin):
-                        ok_cleanup = False
+                        if _is_unjoined_group_cleanup_error(res_admin):
+                            log("register_bot_commands skipping admin cleanup for unjoined group %s (%s)"
+                                % (cid_int, _format_tg_err(res_admin)))
+                        else:
+                            ok_cleanup = False
 
-            ok_priv = _tg_ok(tg(
+            res_priv = _track_429(tg(
                 "setMyCommands",
                 _timeout=15,
                 commands=_PRIVATE_COMMANDS,
                 scope={"type": "all_private_chats"},
             ))
-            if role in ("coordinator", "peer"):
-                ok_grp = _tg_ok(tg(
+            ok_priv = _tg_ok(res_priv)
+            if groups_enabled and role in ("coordinator", "peer"):
+                res_grp = _track_429(tg(
                     "setMyCommands",
                     _timeout=15,
                     commands=_GROUP_TEAM_COMMANDS,
                     scope={"type": "all_group_chats"},
                 ))
+                ok_grp = _tg_ok(res_grp)
                 grp_cnt = len(_GROUP_TEAM_COMMANDS)
             else:
-                ok_grp = _tg_ok(tg(
+                res_grp = _track_429(tg(
                     "deleteMyCommands",
                     _timeout=15,
                     scope={"type": "all_group_chats"},
                 ))
+                ok_grp = _tg_ok(res_grp)
                 grp_cnt = 0
 
             if ok_def and ok_cleanup and ok_priv and ok_grp:
                 _LAST_REGISTERED_CMD_ROLE = role
-                log("Bot commands registered (role=%s, dm=%d, group=%d)" % (role, len(_PRIVATE_COMMANDS), grp_cnt))
+                _LAST_REGISTERED_CMD_GROUPS = groups_enabled
+                _cmd_reg_fail_streak = 0
+                _cmd_reg_next_retry_ts = 0.0
+                log("Bot commands registered (role=%s, groups=%s, dm=%d, group=%d)"
+                    % (role, "on" if groups_enabled else "off", len(_PRIVATE_COMMANDS), grp_cnt))
                 return True
+            _cmd_reg_fail_streak += 1
+            backoff_s = min(300.0, 30.0 * (2 ** min(_cmd_reg_fail_streak - 1, 4)))
+            wait_s = max(backoff_s, float(max_retry_after + 2) if max_retry_after else 0.0)
+            _cmd_reg_next_retry_ts = time.time() + wait_s
             log(
-                "register_bot_commands incomplete (role=%s, def=%s, cleanup=%s, priv=%s, grp=%s)"
-                % (role, ok_def, ok_cleanup, ok_priv, ok_grp)
+                "register_bot_commands incomplete (role=%s, groups=%s, def=%s, cleanup=%s, priv=%s, grp=%s, retry_in=%ds)"
+                % (role, "on" if groups_enabled else "off", ok_def, ok_cleanup, ok_priv, ok_grp, int(wait_s))
             )
             return False
         except Exception as e:
-            log("register_bot_commands failed: %s" % e)
+            _cmd_reg_fail_streak += 1
+            backoff_s = min(300.0, 30.0 * (2 ** min(_cmd_reg_fail_streak - 1, 4)))
+            _cmd_reg_next_retry_ts = time.time() + backoff_s
+            log("register_bot_commands failed: %s (retry_in=%ds)" % (e, int(backoff_s)))
             return False
 
 
@@ -7988,7 +8100,14 @@ def _bot_bus_loop():
         if (now - last_hb) >= 6.0:
             last_hb = now
             _publish_bot_heartbeat()
-            if BOT_META.get("resolved") and _current_bot_role() != _LAST_REGISTERED_CMD_ROLE:
+            if (
+                BOT_META.get("resolved")
+                and (
+                    _current_bot_role() != _LAST_REGISTERED_CMD_ROLE
+                    or _is_groups_enabled() != _LAST_REGISTERED_CMD_GROUPS
+                )
+                and now >= _cmd_reg_next_retry_ts
+            ):
                 register_bot_commands()
 
         try:
@@ -12027,6 +12146,357 @@ def cmd_team(chat_id, raw_rest="", thread_id=None, scope_key=None, edit_msg_id=N
         send(chat_id, text, parse_mode="HTML", reply_markup=kb, thread_id=norm_tid)
 
 
+def _parse_negative_group_id(tok):
+    """Parse a strict negative Telegram group/supergroup chat ID (`< 0`), or return None."""
+    if tok is None or isinstance(tok, bool):
+        return None
+    s = str(tok).strip()
+    if not s:
+        return None
+    try:
+        val = int(s)
+    except ValueError:
+        return None
+    return val if val < 0 else None
+
+
+def _evict_group_sessions(reason="cmd_group_off", group_ids=None):
+    """Recycle warm sessions belonging to negative group scopes (optionally filtered to specific group IDs)."""
+    target_ids = None
+    if group_ids is not None:
+        target_ids = set()
+        for gid in group_ids:
+            try:
+                val = int(gid)
+            except (TypeError, ValueError):
+                continue
+            if val < 0:
+                target_ids.add(val)
+        if not target_ids:
+            return
+    with session_lock:
+        pool_keys = list(_session_pool.keys())
+    group_skeys = []
+    for sk in pool_keys:
+        if not _is_group_scope_key(sk):
+            continue
+        if target_ids is not None:
+            cid, _ = parse_scope_key(sk)
+            if cid not in target_ids:
+                continue
+        group_skeys.append(sk)
+    for gsk in group_skeys:
+        invalidate_session(reason, scope_key=gsk)
+
+
+def build_group_panel():
+    """Render admin-only DM control panel for on-demand group chat access."""
+    enabled = _is_groups_enabled()
+    with state_lock:
+        override = state.get("groups_enabled")
+        extra_groups = _sanitize_group_chat_ids(state.get("extra_group_chats") or ())
+    env_groups = sorted(CONFIGURED_GROUP_CHATS)
+    all_groups = sorted(set(env_groups) | set(extra_groups))
+    active_groups = sorted(int(c) for c in ALLOWED if int(c) < 0)
+
+    status_badge = "🟢 已开启（按需生效）" if enabled else "⚪ 已关闭（仅私聊模式）"
+    env_default_str = "开启 (AGY_TG_ALLOW_GROUPS=1)" if ALLOW_GROUPS_DEFAULT else "关闭 (AGY_TG_ALLOW_GROUPS=0)"
+    src_note = (
+        f"运行时覆盖: <code>{'on' if override else 'off'}</code>（.env 默认: {env_default_str}）"
+        if isinstance(override, bool)
+        else f"跟随 .env 默认: <code>{env_default_str}</code>"
+    )
+    lines = [
+        "<b>👥 群聊按需开关 (On-Demand Group Access)</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"• <b>当前状态</b>: {status_badge}",
+        f"• <b>生效来源</b>: {src_note}",
+        f"• <b>已激活群数</b>: <code>{len(active_groups)}</code> / 备用群数: <code>{len(all_groups)}</code>",
+    ]
+    if all_groups:
+        grp_lines = []
+        for gid in all_groups:
+            origin = "env" if gid in CONFIGURED_GROUP_CHATS else "runtime"
+            act = "🟢" if gid in active_groups else "⚪"
+            grp_lines.append(f"  {act} <code>{gid}</code> ({origin})")
+        lines.append("• <b>已配置群列表</b>:\n" + "\n".join(grp_lines))
+    else:
+        lines.append("• <b>已配置群列表</b>: <i>（空 — 可用 <code>/group on -100xxxxxxxxxx</code> 添加并开启）</i>")
+
+    lines.append(
+        "\n<b>用法</b>:\n"
+        "• <code>/group on</code> — 按需开启已配置的群聊白名单\n"
+        "• <code>/group on -100xxxx</code> — 添加新群并立即开启\n"
+        "• <code>/group off</code> — 立即关闭群聊访问（切回仅私聊）\n"
+        "• <code>/group remove -100xxxx</code> — 移除运行时添加的群\n"
+        "• <code>/group reset</code> — 恢复跟随 <code>.env</code> 默认开关"
+    )
+    row1 = []
+    if enabled:
+        row1.append({"text": "🔇 关闭群聊（仅私聊）", "callback_data": "group:off"})
+    else:
+        row1.append({"text": "🟢 按需开启群聊", "callback_data": "group:on"})
+    row1.append({"text": "🔄 刷新", "callback_data": "group:refresh"})
+    kb_rows = [row1]
+    if isinstance(override, bool):
+        kb_rows.append([{"text": "↩️ 恢复 .env 默认", "callback_data": "group:reset"}])
+    return "\n".join(lines), {"inline_keyboard": kb_rows}
+
+
+def _set_group_access_runtime(enabled, *, add_ids=(), remove_ids=(), reset_override=False):
+    """Apply runtime group-access mutation atomically, persist state, and notify bus/commands."""
+    added = []
+    removed = []
+    static_protected = []
+    with state_lock:
+        extra = set(_sanitize_group_chat_ids(state.get("extra_group_chats") or ()))
+        for gid in add_ids:
+            if gid not in CONFIGURED_GROUP_CHATS and gid not in extra:
+                extra.add(gid)
+                added.append(gid)
+        for gid in remove_ids:
+            if gid in extra:
+                extra.discard(gid)
+                removed.append(gid)
+            elif gid in CONFIGURED_GROUP_CHATS:
+                static_protected.append(gid)
+        state["extra_group_chats"] = sorted(extra)
+        if reset_override:
+            state["groups_enabled"] = None
+        elif enabled is not None:
+            state["groups_enabled"] = bool(enabled)
+        elif not (CONFIGURED_GROUP_CHATS | extra) and state.get("groups_enabled") is True:
+            state["groups_enabled"] = False
+    save_state()
+    _recompute_allowed_chats()
+    now_enabled = _is_groups_enabled()
+    if not now_enabled:
+        _evict_group_sessions("cmd_group_off")
+    elif removed:
+        _evict_group_sessions("cmd_group_remove", group_ids=removed)
+    _publish_bot_heartbeat()
+    register_bot_commands_async(force=True)
+    return {
+        "enabled": now_enabled,
+        "added": added,
+        "removed": removed,
+        "static_protected": static_protected,
+        "active_groups": sorted(int(c) for c in ALLOWED if int(c) < 0),
+        "configured_groups": sorted(_configured_group_chats()),
+    }
+
+
+def cmd_group(chat_id, raw_rest="", thread_id=None, scope_key=None, from_user=None, edit_msg_id=None):
+    """Admin-only DM command to toggle on-demand group chat access (`/group [on|off|add|remove|reset|status]`)."""
+    norm_tid = _normalize_thread_id(thread_id)
+    strict_role = _get_user_role(chat_id, from_user=from_user, allow_uid_fallback=False)
+    if strict_role != "admin":
+        send(chat_id, access_control.format_rbac_denied_message("/group"), parse_mode="HTML", thread_id=norm_tid)
+        return
+
+    try:
+        is_dm = bool(chat_id is not None and int(chat_id) > 0)
+    except (TypeError, ValueError):
+        is_dm = False
+
+    raw = (raw_rest or "").strip()
+    parts = raw.split() if raw else []
+    sub = parts[0].lower() if parts else "status"
+
+    if not is_dm:
+        if sub in ("", "status", "info"):
+            send(
+                chat_id,
+                "👥 当前群聊访问已开启。如需开关群聊或管理群白名单，请在私聊中向我发送 <code>/group</code>。",
+                parse_mode="HTML",
+                thread_id=norm_tid,
+            )
+        else:
+            send(
+                chat_id,
+                "🔒 群聊开关与群白名单变更仅限管理员私聊执行，请在私聊中发送 <code>/group</code>。",
+                parse_mode="HTML",
+                thread_id=norm_tid,
+            )
+        return
+
+    if sub in ("", "status", "info", "panel"):
+        text, kb = build_group_panel()
+        if edit_msg_id:
+            r_ed = tg("editMessageText", chat_id=chat_id, message_id=edit_msg_id, text=text, parse_mode="HTML", reply_markup=kb)
+            if not _tg_ok(r_ed):
+                tg("editMessageReplyMarkup", chat_id=chat_id, message_id=edit_msg_id, reply_markup=kb)
+        else:
+            send(chat_id, text, parse_mode="HTML", reply_markup=kb, thread_id=norm_tid)
+        return
+
+    if sub in ("on", "enable", "open"):
+        parsed_ids = []
+        for tok in parts[1:]:
+            gid = _parse_negative_group_id(tok)
+            if gid is None:
+                send(
+                    chat_id,
+                    f"⚠️ 无效群 ID <code>{html_mod.escape(tok)}</code>：群聊 ID 必须为负整数（如 <code>-100xxxxxxxxxx</code>）。",
+                    parse_mode="HTML",
+                    thread_id=norm_tid,
+                )
+                return
+            if gid not in parsed_ids:
+                parsed_ids.append(gid)
+        if not parsed_ids and not _configured_group_chats():
+            send(
+                chat_id,
+                "⚠️ 尚未配置任何备用群 ID。\n请先执行 <code>/group on -100xxxxxxxxxx</code> 指定目标群，或在 <code>.env</code> 中配置 <code>AGY_TG_GROUP_CHATS</code>。",
+                parse_mode="HTML",
+                thread_id=norm_tid,
+            )
+            return
+        res = _set_group_access_runtime(True, add_ids=parsed_ids)
+        send(
+            chat_id,
+            f"🟢 <b>已按需开启群聊访问</b>（已激活 <code>{len(res['active_groups'])}</code> 个群）。\n"
+            "若尚未将该 Bot 拉入群组，现在将其加入群即可生效；用完可随时发送 <code>/group off</code> 关闭。",
+            parse_mode="HTML",
+            thread_id=norm_tid,
+        )
+        return
+
+    if sub in ("off", "disable", "close"):
+        _set_group_access_runtime(False)
+        send(
+            chat_id,
+            "🔇 <b>已关闭群聊访问</b>（已切回仅私聊模式，群内消息与回调均立即拒绝；私聊不受影响）。\n"
+            "需要时可随时发送 <code>/group on</code> 重新开启。",
+            parse_mode="HTML",
+            thread_id=norm_tid,
+        )
+        return
+
+    if sub == "add":
+        if len(parts) < 2:
+            send(chat_id, "用法：<code>/group add -100xxxxxxxxxx</code>", parse_mode="HTML", thread_id=norm_tid)
+            return
+        parsed_ids = []
+        for tok in parts[1:]:
+            gid = _parse_negative_group_id(tok)
+            if gid is None:
+                send(
+                    chat_id,
+                    f"⚠️ 无效群 ID <code>{html_mod.escape(tok)}</code>：群聊 ID 必须为负整数。",
+                    parse_mode="HTML",
+                    thread_id=norm_tid,
+                )
+                return
+            if gid not in parsed_ids:
+                parsed_ids.append(gid)
+        res = _set_group_access_runtime(None, add_ids=parsed_ids)
+        st_note = "已立即生效" if res["enabled"] else "当前为关闭状态，发送 <code>/group on</code> 即可启用"
+        send(
+            chat_id,
+            f"✅ 已将群 ID 加入备用列表（共 <code>{len(res['configured_groups'])}</code> 个群；{st_note}）。",
+            parse_mode="HTML",
+            thread_id=norm_tid,
+        )
+        return
+
+    if sub in ("remove", "del", "rm"):
+        if len(parts) < 2:
+            send(chat_id, "用法：<code>/group remove -100xxxxxxxxxx</code>", parse_mode="HTML", thread_id=norm_tid)
+            return
+        parsed_ids = []
+        for tok in parts[1:]:
+            gid = _parse_negative_group_id(tok)
+            if gid is None:
+                send(
+                    chat_id,
+                    f"⚠️ 无效群 ID <code>{html_mod.escape(tok)}</code>：群聊 ID 必须为负整数。",
+                    parse_mode="HTML",
+                    thread_id=norm_tid,
+                )
+                return
+            if gid not in parsed_ids:
+                parsed_ids.append(gid)
+        res = _set_group_access_runtime(None, remove_ids=parsed_ids)
+        notes = []
+        if res["removed"]:
+            notes.append(f"已移除 <code>{len(res['removed'])}</code> 个运行时群 ID")
+        if res["static_protected"]:
+            notes.append("部分群 ID 来自 <code>.env</code> 静态配置，可使用 <code>/group off</code> 关闭或编辑 <code>.env</code>")
+        if not notes:
+            notes.append("未找到匹配的运行时群 ID")
+        send(chat_id, "ℹ️ " + "；".join(notes) + "。", parse_mode="HTML", thread_id=norm_tid)
+        return
+
+    if sub == "reset":
+        res = _set_group_access_runtime(None, reset_override=True)
+        st_txt = "🟢 开启" if res["enabled"] else "⚪ 关闭（仅私聊）"
+        send(
+            chat_id,
+            f"↩️ 已清除运行时群聊开关覆盖，恢复跟随 <code>.env</code> 默认：<b>{st_txt}</b>（激活群数 <code>{len(res['active_groups'])}</code>）。",
+            parse_mode="HTML",
+            thread_id=norm_tid,
+        )
+        return
+
+    send(
+        chat_id,
+        "用法：<code>/group [status|on|off|add &lt;id&gt;|remove &lt;id&gt;|reset]</code>",
+        parse_mode="HTML",
+        thread_id=norm_tid,
+    )
+
+
+def _handle_group_callback(cb_id, chat_id, thread_id, skey, msg_id, data, from_user=None):
+    strict_role = _get_user_role(chat_id, from_user=from_user, allow_uid_fallback=False)
+    try:
+        is_dm = bool(chat_id is not None and int(chat_id) > 0)
+    except (TypeError, ValueError):
+        is_dm = False
+    if strict_role != "admin" or not is_dm:
+        tg(
+            "answerCallbackQuery",
+            callback_query_id=cb_id,
+            text="🔒 群聊按需开关仅限管理员私聊操作",
+            show_alert=True,
+        )
+        return
+
+    sub = data[6:]
+    if sub == "refresh":
+        tg("answerCallbackQuery", callback_query_id=cb_id, text="群聊状态已刷新")
+    elif sub == "on":
+        if not _configured_group_chats():
+            tg(
+                "answerCallbackQuery",
+                callback_query_id=cb_id,
+                text="尚未配置群 ID，请发送 /group on -100xxxx",
+                show_alert=True,
+            )
+            return
+        res = _set_group_access_runtime(True)
+        tg("answerCallbackQuery", callback_query_id=cb_id, text=f"🟢 群聊已开启 ({len(res['active_groups'])} 群)")
+    elif sub == "off":
+        _set_group_access_runtime(False)
+        tg("answerCallbackQuery", callback_query_id=cb_id, text="🔇 群聊已关闭（仅私聊）")
+    elif sub == "reset":
+        res = _set_group_access_runtime(None, reset_override=True)
+        tg(
+            "answerCallbackQuery",
+            callback_query_id=cb_id,
+            text="↩️ 已恢复默认：" + ("开启" if res["enabled"] else "仅私聊"),
+        )
+    else:
+        tg("answerCallbackQuery", callback_query_id=cb_id)
+        return
+
+    if msg_id:
+        text, kb = build_group_panel()
+        r_ed = tg("editMessageText", chat_id=chat_id, message_id=msg_id, text=text, parse_mode="HTML", reply_markup=kb)
+        if not _tg_ok(r_ed):
+            tg("editMessageReplyMarkup", chat_id=chat_id, message_id=msg_id, reply_markup=kb)
+
+
 def cmd_delegate(chat_id, raw_rest="", thread_id=None, scope_key=None, origin_msg_id=None):
     """Directly dispatch `/delegate @bot1[,@bot2] <task>` over Bot Bus without waking Coordinator LLM first."""
     norm_tid = _normalize_thread_id(thread_id)
@@ -12189,10 +12659,19 @@ def cmd_status(chat_id, thread_id=None, scope_key=None):
     else:
         model_display = base_model_display
 
+    grp_status_line = ""
+    if not is_group_view:
+        cfg_grps = _configured_group_chats()
+        act_grps = [c for c in ALLOWED if int(c) < 0]
+        if cfg_grps or not _is_groups_enabled():
+            grp_badge = f"enabled ({len(act_grps)} active)" if _is_groups_enabled() else f"off (DM-only · {len(cfg_grps)} standby · /group on)"
+            grp_status_line = f"• <b>Group Access:</b> <code>{grp_badge}</code>\n"
+
     text = (f"<b>🤖 Antigravity Bridge v3.2 (Scoped Topics &amp; Bot Bus)</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"• <b>Team Role:</b> <code>@{html_mod.escape(_current_bot_handle())}</code> · {_role_badge(team_role)} ({roster_online} online)\n"
             f"• <b>Scope:</b> <code>{html_mod.escape(scope_label)}</code> ({scope_total} isolated scopes)\n"
+            f"{grp_status_line}"
             f"• <b>Project:</b> <code>{html_mod.escape(proj_label)}</code> (<code>{html_mod.escape(wdir_short)}</code>)\n"
             f"• <b>Mode:</b> <code>{mode}</code>\n"
             f"• <b>Model:</b> {model_display}\n"
@@ -12816,7 +13295,12 @@ def handle_callback(cb):
     skey = scope_key_for(chat_id, thread_id)
     msg_id = msg.get("message_id")
 
-    role = _get_user_role(chat_id, from_user=from_user, allow_uid_fallback=True)
+    is_group_cb = False
+    try:
+        is_group_cb = bool(chat_id is not None and int(chat_id) < 0)
+    except (TypeError, ValueError):
+        is_group_cb = False
+    role = _get_user_role(chat_id, from_user=from_user, allow_uid_fallback=(not is_group_cb))
     if role == "denied":
         tg("answerCallbackQuery", callback_query_id=cb_id, text="Unauthorized", show_alert=True)
         return
@@ -13213,6 +13697,9 @@ def handle_callback(cb):
 
     elif data.startswith("team:"):
         _handle_team_callback(cb_id, chat_id, thread_id, skey, msg_id, data)
+
+    elif data.startswith("group:"):
+        _handle_group_callback(cb_id, chat_id, thread_id, skey, msg_id, data, from_user=from_user)
 
     elif data == "action:cancel":
         if role != "admin":
@@ -13871,6 +14358,10 @@ def _flush_album(akey):
     items = entry["items"]
     errors = entry["errors"]
 
+    if not _is_authorized(chat_id):
+        log("Dropping buffered album for unauthorized/revoked chat %s (scope=%s)" % (chat_id, skey))
+        return
+
     if not items:
         if errors:
             send(chat_id, "⚠️ 相册文件下载失败：" + "; ".join(errors[:3]), thread_id=thread_id)
@@ -14007,6 +14498,7 @@ _KNOWN_BRIDGE_COMMANDS = frozenset({
     "/retry",
     "/undo", "/redo",
     "/team", "/bots",
+    "/group", "/groups",
     "/delegate", "/ask",
     "/compact", "/context",
     "/dream",
@@ -14142,6 +14634,8 @@ def handle_message(msg):
             cmd_redo(chat_id, thread_id=thread_id, scope_key=skey)
         elif cmd in ("/team", "/bots"):
             cmd_team(chat_id, raw_rest, thread_id=thread_id, scope_key=skey)
+        elif cmd in ("/group", "/groups"):
+            cmd_group(chat_id, raw_rest, thread_id=thread_id, scope_key=skey, from_user=from_user)
         elif cmd in ("/delegate", "/ask"):
             cmd_delegate(chat_id, raw_rest, thread_id=thread_id, scope_key=skey, origin_msg_id=msg_id or None)
         elif cmd == "/compact":
@@ -14260,6 +14754,7 @@ def handle_message(msg):
                  "/retry [note] — re-run last turn in current scope\n"
                  "/undo [preview|force] · /redo — revert or replay workspace edits\n"
                  "/team — multi-bot team roster, coordinator/worker roles &amp; jobs\n"
+                 "/group [on|off|status] — toggle on-demand group chat access (DM admin only)\n"
                  "/delegate @bot task — directly dispatch work to a sibling bot (0 Coordinator LLM)\n"
                  "/usage — overall Antigravity subscription plan live quota &amp; reset time\n"
                  "/cost — my local daily/weekly/monthly M-tokens, cache rate &amp; USD bill\n"

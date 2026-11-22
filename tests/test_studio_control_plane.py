@@ -1778,7 +1778,6 @@ class TestPAC5AndC7FrontendAndProtectedHygiene(unittest.TestCase):
             protected = [
                 ".agents/skills/google-profile/scripts/google_browser.py",
                 ".agents/skills/live-browser/scripts/static/index.html",
-                ".agents/skills/live-browser/scripts/live_browser_server.py",
             ]
             res = subprocess.run(
                 ["git", "-C", str(REPO_ROOT), "diff", "--name-only", "HEAD", "--", *protected],

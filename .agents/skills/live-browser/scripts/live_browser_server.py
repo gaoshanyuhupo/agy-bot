@@ -116,8 +116,47 @@ PINNED_FORBIDDEN_OVERRIDES = frozenset(
         "persistent_context",
         "persistent",
         "ephemeral",
+        "pinned",
+        "allow_google",
+        "account",
     }
 )
+DEDICATED_GOOGLE_IMMUTABLE_KEYS = frozenset(
+    {
+        "user_data_dir",
+        "persistent_context",
+        "persistent",
+        "ephemeral",
+        "pinned",
+        "allow_google",
+        "account",
+        "headless",
+    }
+)
+DEDICATED_GOOGLE_DRIFT_KEYS = frozenset(
+    {
+        "proxy",
+        "proxy_bao_ref",
+        "os",
+        "locale",
+        "window",
+        "mobile",
+        "webgl_config",
+        "block_webrtc",
+        "geoip",
+    }
+)
+_FORBIDDEN_PROFILE_SECRET_KEYS = frozenset(
+    {
+        "password",
+        "passwd",
+        "secret",
+        "google_password",
+        "account_password",
+        "token",
+    }
+)
+_ACCOUNT_MAX_LEN = 128
 
 MOBILE_WINDOW_PRESET: list[int] = [430, 932]
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MiB max total file payload per upload
@@ -253,6 +292,33 @@ def _parse_env_bool(raw: str | None) -> bool:
     return str(raw or "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def is_dedicated_google_profiles_enabled() -> bool:
+    """Return True only when host switch AGY_LIVE_BROWSER_ALLOW_DEDICATED_GOOGLE_PROFILES is explicitly enabled."""
+    return _parse_env_bool(os.environ.get("AGY_LIVE_BROWSER_ALLOW_DEDICATED_GOOGLE_PROFILES"))
+
+
+def _validate_strict_bool(val: Any, field_name: str) -> bool:
+    """Validate that `val` is a strict Python bool (rejects strings like 'true'/'false' and ints like 1/0)."""
+    if not isinstance(val, bool):
+        raise ValueError(f"'{field_name}' must be a strict boolean (true/false), got {type(val).__name__}")
+    return val
+
+
+def _validate_account_label(raw: Any) -> str | None:
+    """Validate optional profile account label (strict str, 1..128 chars, no whitespace/control chars; '' -> None)."""
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise ValueError("'account' must be a string")
+    if raw == "":
+        return None
+    if len(raw) > _ACCOUNT_MAX_LEN:
+        raise ValueError(f"'account' length must be between 1 and {_ACCOUNT_MAX_LEN} characters")
+    if any(ch.isspace() for ch in raw) or _CONTROL_CHAR_RE.search(raw):
+        raise ValueError("'account' must not contain whitespace or control characters")
+    return raw
+
+
 def _get_google_skill_scripts_dir() -> Path:
     raw = os.environ.get("AGY_GOOGLE_SKILL_SCRIPTS")
     if raw is not None:
@@ -358,16 +424,143 @@ def is_google_destination_url(url: str | None) -> bool:
     return bool(_GOOGLE_HOST_RE.match(host))
 
 
+def _validate_configured_profile_dir(
+    profile_name: str,
+    profile_dir: Path | str,
+    *,
+    profiles_data_dir: Path | None = None,
+    host_pinned: dict[str, Any] | None = None,
+    require_exists: bool = False,
+) -> Path:
+    """Fail-closed containment & anti-symlink check for a configured persistent profile directory.
+
+    Rejects:
+      - Symlinks at `profile_dir` or `PROFILES_DATA_DIR/<name>`
+      - Any `'..'` path component or resolved parent != `PROFILES_DATA_DIR.resolve()`
+      - Non-directory existing file/FIFO at `profile_dir` (or missing dir when `require_exists=True`)
+      - Any collision with `host_pinned['profile_dir']`
+    """
+    clean_name = validate_profile_name(profile_name)
+    raw_dir = Path(profile_dir)
+    if ".." in raw_dir.parts:
+        raise ValueError(f"Profile directory path traversal rejected for '{clean_name}'")
+    base_dir = profiles_data_dir or PROFILES_DATA_DIR
+    expected_direct = base_dir / clean_name
+    if raw_dir.is_symlink() or expected_direct.is_symlink():
+        raise ValueError(f"Symlink profile directory rejected (fail-closed) for '{clean_name}'")
+    try:
+        base_resolved = base_dir.resolve()
+        resolved_dir = raw_dir.resolve()
+    except OSError as exc:
+        raise ValueError(f"Failed resolving profile directory for '{clean_name}': {exc}") from exc
+    if resolved_dir.parent != base_resolved or resolved_dir.name != clean_name:
+        raise ValueError(f"Profile directory escapes PROFILES_DATA_DIR containment for '{clean_name}'")
+    expected_resolved_child = base_resolved / clean_name
+    if expected_resolved_child.is_symlink():
+        raise ValueError(f"Symlink profile directory rejected (fail-closed) for '{clean_name}'")
+    if resolved_dir.exists() and not resolved_dir.is_dir():
+        raise ValueError(f"Profile path is not a directory for '{clean_name}'")
+    if require_exists and not resolved_dir.is_dir():
+        raise ValueError(f"Profile directory does not exist for '{clean_name}'")
+    if host_pinned is not None:
+        try:
+            pinned_resolved = Path(host_pinned["profile_dir"]).resolve()
+        except OSError as exc:
+            raise ValueError(f"Failed resolving host pinned directory: {exc}") from exc
+        if resolved_dir == pinned_resolved:
+            raise ValueError(f"Configured profile directory '{clean_name}' collides with host-pinned profile directory")
+    return resolved_dir
+
+
+def verify_dedicated_google_profile(
+    profile_dir: Path | str | None,
+    *,
+    profile_name: str | None = None,
+    profiles_file: Path | None = None,
+    profiles_data_dir: Path | None = None,
+    require_dir_exists: bool = True,
+    host_pinned: dict[str, Any] | None = None,
+) -> tuple[bool, str | None]:
+    """Fail-closed verification that `profile_dir` belongs to an authorized dedicated Google profile.
+
+    Never trusts a bare `allow_google=True` flag. Requires:
+      1. Host switch `AGY_LIVE_BROWSER_ALLOW_DEDICATED_GOOGLE_PROFILES` enabled;
+      2. Non-symlink `profile_dir` strictly contained under `PROFILES_DATA_DIR.resolve()`
+         (existing directory when `require_dir_exists=True`) and distinct from host pinned dir;
+      3. Authentic entry in `profiles.json` with `pinned is not True`, strict `persistent is True`,
+         not ephemeral, and strict `allow_google is True`.
+    """
+    if not is_dedicated_google_profiles_enabled():
+        return False, None
+    if profile_dir is None or str(profile_dir).strip() == "":
+        return False, None
+    raw_dir = Path(profile_dir)
+    if ".." in raw_dir.parts or raw_dir.is_symlink():
+        return False, None
+    derived_name = raw_dir.name
+    try:
+        clean_name = validate_profile_name(derived_name)
+    except ValueError:
+        return False, None
+    if profile_name is not None and profile_name != clean_name:
+        return False, None
+
+    eff_host_pinned = host_pinned
+    if eff_host_pinned is None:
+        try:
+            eff_host_pinned = discover_pinned_host_profile()
+        except Exception:
+            return False, None
+    if eff_host_pinned is not None and clean_name in ("default", eff_host_pinned["name"]):
+        return False, None
+
+    try:
+        _validate_configured_profile_dir(
+            clean_name,
+            raw_dir,
+            profiles_data_dir=profiles_data_dir,
+            host_pinned=eff_host_pinned,
+            require_exists=require_dir_exists,
+        )
+    except ValueError:
+        return False, None
+
+    configured = load_profiles(profiles_file=profiles_file)
+    entry = configured.get(clean_name)
+    if not isinstance(entry, dict):
+        return False, None
+    if entry.get("pinned"):
+        return False, None
+    if entry.get("allow_google") is not True:
+        return False, None
+    if entry.get("persistent") is not True or bool(entry.get("ephemeral", False)):
+        return False, None
+    try:
+        validated = validate_profile_payload(entry, allow_pinned=False)
+    except ValueError:
+        return False, None
+    if validated.get("allow_google") is not True or validated.get("persistent") is not True:
+        return False, None
+    return True, clean_name
+
+
 def enforce_google_profile_policy(
     url: str | None,
     *,
     is_pinned: bool,
     profile_dir: Path | None = None,
     host_has_pinned: bool | None = None,
+    allow_google: bool = False,
+    profile_name: str | None = None,
+    profiles_file: Path | None = None,
+    profiles_data_dir: Path | None = None,
+    require_dir_exists: bool = True,
 ) -> None:
-    """Fail-closed guard: disallow non-pinned (or unverified pinned) profiles from Google domains on pinned hosts.
+    """Fail-closed guard: disallow unauthorized profiles from Google domains on pinned hosts.
 
-    Never trusts a bare `is_pinned=True` boolean without a matching canonical host pinned directory.
+    Never trusts bare `is_pinned=True` or bare `allow_google=True` booleans without verifying
+    either the canonical host pinned directory or a host-enabled, registry-backed, containment-verified
+    dedicated persistent Google profile.
     """
     if not url:
         return
@@ -376,16 +569,27 @@ def enforce_google_profile_policy(
     if not has_pinned:
         return
     effective_pinned = False
-    if is_pinned and profile_dir is not None and host_pinned is not None:
+    if is_pinned is True and profile_dir is not None and host_pinned is not None:
         try:
             p_resolved = Path(profile_dir).resolve()
             h_resolved = Path(host_pinned["profile_dir"]).resolve()
             effective_pinned = (p_resolved == h_resolved) and p_resolved.is_dir()
         except OSError:
             effective_pinned = False
-    if not effective_pinned and is_google_destination_url(url):
+    effective_dedicated = False
+    if not effective_pinned and allow_google is True:
+        ok_ded, _ = verify_dedicated_google_profile(
+            profile_dir,
+            profile_name=profile_name,
+            profiles_file=profiles_file,
+            profiles_data_dir=profiles_data_dir,
+            require_dir_exists=require_dir_exists,
+            host_pinned=host_pinned,
+        )
+        effective_dedicated = ok_ded
+    if not (effective_pinned or effective_dedicated) and is_google_destination_url(url):
         raise ValueError(
-            "安全策略拦截：此主机已锁定 Pinned Google Profile，禁止非 Pinned Profile 访问 Google/Gmail/YouTube 域。"
+            "安全策略拦截：此主机仅允许主 Pinned Profile 或已启用并登记的专用持久化 Google Profile 访问 Google/Gmail/YouTube 域。"
         )
 
 
@@ -615,11 +819,26 @@ def validate_profile_payload(data: dict[str, Any], *, allow_pinned: bool = False
     if not isinstance(data, dict):
         raise ValueError("Profile config must be a JSON object")
 
-    pinned = bool(data.get("pinned", False))
+    for raw_k in data.keys():
+        if str(raw_k).strip().lower() in _FORBIDDEN_PROFILE_SECRET_KEYS:
+            raise ValueError(f"Profile config must not contain secret/password field {raw_k!r}")
+
+    if "pinned" in data and data["pinned"] is not None:
+        pinned = _validate_strict_bool(data["pinned"], "pinned")
+    else:
+        pinned = False
     if pinned and not allow_pinned:
         raise ValueError(
             "Cannot set pinned=True on a user-configured profile; pinned identity is strictly derived from host google-profile."
         )
+
+    if "allow_google" in data and data["allow_google"] is not None:
+        allow_google_val = _validate_strict_bool(data["allow_google"], "allow_google")
+    else:
+        allow_google_val = False
+
+    account_val = _validate_account_label(data.get("account"))
+
     os_val = data.get("os")
     if os_val is not None:
         os_val = str(os_val).strip().lower()
@@ -638,9 +857,21 @@ def validate_profile_payload(data: dict[str, Any], *, allow_pinned: bool = False
     block_webrtc_val = bool(data["block_webrtc"]) if data.get("block_webrtc") is not None else None
     geoip_val = _normalize_geoip(data["geoip"]) if data.get("geoip") is not None else None
 
-    persistent_val = True if data.get("persistent") is None else bool(data["persistent"])
-    if data.get("ephemeral"):
+    if "persistent" in data and data["persistent"] is not None:
+        persistent_val = _validate_strict_bool(data["persistent"], "persistent")
+    else:
+        persistent_val = True
+    if "ephemeral" in data and data["ephemeral"] is not None:
+        ephemeral_val = _validate_strict_bool(data["ephemeral"], "ephemeral")
+    else:
+        ephemeral_val = False
+    if ephemeral_val:
         persistent_val = False
+
+    if allow_google_val and (ephemeral_val or not persistent_val):
+        raise ValueError(
+            "Dedicated Google profile (allow_google=True) must be persistent (persistent=True and ephemeral=False)"
+        )
 
     proxy_val = normalize_proxy_config(data.get("proxy")) if data.get("proxy") is not None else None
     bao_ref_raw = data.get("proxy_bao_ref")
@@ -660,6 +891,7 @@ def validate_profile_payload(data: dict[str, Any], *, allow_pinned: bool = False
         if os_val is not None and os_val != "windows":
             raise ValueError("Pinned profile must use os='windows'")
         os_val = "windows"
+        allow_google_val = True
     elif mobile_val and window_val is None:
         window_val = list(MOBILE_WINDOW_PRESET)
 
@@ -667,7 +899,10 @@ def validate_profile_payload(data: dict[str, Any], *, allow_pinned: bool = False
         "pinned": pinned,
         "os": os_val or "windows",
         "persistent": persistent_val,
+        "allow_google": allow_google_val,
     }
+    if account_val is not None:
+        out["account"] = account_val
     if locale_val is not None:
         out["locale"] = locale_val
     if window_val is not None:
@@ -687,16 +922,29 @@ def validate_profile_payload(data: dict[str, Any], *, allow_pinned: bool = False
     return out
 
 
-def sanitize_profile_for_output(name: str, entry: dict[str, Any], *, active: bool = False, source: str = "configured") -> dict[str, Any]:
+def sanitize_profile_for_output(
+    name: str,
+    entry: dict[str, Any],
+    *,
+    active: bool = False,
+    source: str = "configured",
+    include_account: bool = True,
+) -> dict[str, Any]:
     """Return a safe public representation of a profile with proxy credentials masked."""
     proxy_raw = entry.get("proxy")
     bao_ref = entry.get("proxy_bao_ref")
     egress = mask_proxy_display(proxy_raw, bao_ref=bao_ref)
+    is_pinned = bool(entry.get("pinned", False))
+    is_persistent = entry.get("persistent") is True if "persistent" in entry else True
+    allow_google = True if is_pinned else (
+        (entry.get("allow_google") is True) and is_persistent and not bool(entry.get("ephemeral", False))
+    )
     out: dict[str, Any] = {
         "name": name,
-        "pinned": bool(entry.get("pinned", False)),
+        "pinned": is_pinned,
         "os": entry.get("os") or "windows",
-        "persistent": bool(entry.get("persistent", True)),
+        "persistent": is_persistent,
+        "allow_google": allow_google,
         "egress": egress,
         "egress_display": egress,
         "has_proxy": bool(proxy_raw or bao_ref),
@@ -704,6 +952,13 @@ def sanitize_profile_for_output(name: str, entry: dict[str, Any], *, active: boo
         "active": active,
         "source": source,
     }
+    if include_account and "account" in entry and entry["account"] is not None:
+        try:
+            acct_clean = _validate_account_label(entry["account"])
+        except ValueError:
+            acct_clean = None
+        if acct_clean is not None:
+            out["account"] = acct_clean
     for key in ("locale", "window", "mobile", "webgl_config", "block_webrtc", "geoip", "proxy_bao_ref"):
         if key in entry and entry[key] is not None:
             out[key] = entry[key]
@@ -744,6 +999,7 @@ def list_profiles(
     *,
     active_profile: str = "",
     profiles_file: Path | None = None,
+    include_account: bool = True,
 ) -> list[dict[str, Any]]:
     """List host-pinned (if present) and configured profiles with masked proxy credentials."""
     items: list[dict[str, Any]] = []
@@ -754,9 +1010,10 @@ def list_profiles(
         items.append(
             sanitize_profile_for_output(
                 p_name,
-                {"pinned": True, "os": "windows", "persistent": True},
+                {"pinned": True, "os": "windows", "persistent": True, "allow_google": True},
                 active=(active_profile == p_name),
                 source="host_pinned",
+                include_account=include_account,
             )
         )
         seen.add(p_name)
@@ -767,13 +1024,24 @@ def list_profiles(
             continue
         # Never allow user-configured entries in profiles.json to impersonate host-pinned identity
         sanitized_entry = dict(configured[name])
-        sanitized_entry["pinned"] = False
+        if sanitized_entry.get("pinned"):
+            sanitized_entry["pinned"] = False
+            sanitized_entry["allow_google"] = False
+        else:
+            sanitized_entry["pinned"] = False
+        if (
+            sanitized_entry.get("allow_google") is not True
+            or sanitized_entry.get("persistent") is not True
+            or bool(sanitized_entry.get("ephemeral", False))
+        ):
+            sanitized_entry["allow_google"] = False
         items.append(
             sanitize_profile_for_output(
                 name,
                 sanitized_entry,
                 active=(active_profile == name),
                 source="configured",
+                include_account=include_account,
             )
         )
         seen.add(name)
@@ -783,9 +1051,10 @@ def list_profiles(
             0,
             sanitize_profile_for_output(
                 "default",
-                {"pinned": False, "os": "windows", "persistent": True},
+                {"pinned": False, "os": "windows", "persistent": True, "allow_google": False},
                 active=(active_profile == "default"),
                 source="builtin_default",
+                include_account=include_account,
             ),
         )
     return items
@@ -796,17 +1065,21 @@ def create_profile(
     config: dict[str, Any],
     *,
     overwrite: bool = False,
+    active_profile: str = "",
     profiles_file: Path | None = None,
 ) -> dict[str, Any]:
-    """Create (or optionally update) a named browser profile in `profiles.json`."""
+    """Create (or optionally update while idle) a named browser profile in `profiles.json`."""
+    overwrite_bool = _validate_strict_bool(overwrite, "overwrite")
     clean_name = validate_profile_name(name)
     host_pinned = discover_pinned_host_profile()
     if host_pinned is not None and clean_name in ("default", host_pinned["name"]):
         raise ValueError(f"Cannot create or overwrite host-pinned profile '{clean_name}'")
 
     profiles = load_profiles(profiles_file=profiles_file)
-    if clean_name in profiles and not overwrite:
+    if clean_name in profiles and not overwrite_bool:
         raise ValueError(f"Profile '{clean_name}' already exists")
+    if active_profile and active_profile == clean_name:
+        raise RuntimeError(f"Cannot overwrite running profile '{clean_name}'; stop browser first")
 
     validated = validate_profile_payload(config)
     profiles[clean_name] = validated
@@ -839,37 +1112,125 @@ def delete_profile(
     return {"ok": True, "deleted": clean_name}
 
 
-def _check_pinned_overrides(profile_name: str, overrides: dict[str, Any] | None) -> None:
-    if not overrides:
-        return
+def _check_pinned_overrides(
+    profile_name: str,
+    overrides: dict[str, Any] | None,
+    *,
+    allow_override: bool = False,
+) -> None:
     bad: list[str] = []
-    for key in PINNED_FORBIDDEN_OVERRIDES:
-        if key not in overrides:
-            continue
-        val = overrides[key]
-        if key in ("ephemeral", "mobile"):
-            if val:
+    if allow_override:
+        bad.append("allow_override")
+    if overrides:
+        for key in PINNED_FORBIDDEN_OVERRIDES:
+            if key not in overrides:
+                continue
+            val = overrides[key]
+            if key in ("ephemeral", "mobile"):
+                if val:
+                    bad.append(key)
+            elif key == "persistent":
+                if val is not None:
+                    bad.append(key)
+            elif val is not None:
                 bad.append(key)
-        elif key == "persistent":
-            if val is not None:
-                bad.append(key)
-        elif val is not None:
-            bad.append(key)
-    custom_env = overrides.get("env")
-    if isinstance(custom_env, dict):
-        for env_key in PROXY_ENV_KEYS:
-            if env_key in custom_env:
-                if env_key.lower() == "no_proxy" and custom_env[env_key] == "*":
-                    continue
-                if custom_env[env_key]:
-                    bad.append(f"env:{env_key}")
-    custom_prefs = overrides.get("firefox_user_prefs")
-    if isinstance(custom_prefs, dict) and "network.proxy.type" in custom_prefs:
-        if custom_prefs["network.proxy.type"] != 0:
-            bad.append("firefox_user_prefs:network.proxy.type")
+        if "env" in overrides and overrides["env"] is not None:
+            custom_env = overrides["env"]
+            if not isinstance(custom_env, dict):
+                bad.append("env")
+            else:
+                for env_key in PROXY_ENV_KEYS:
+                    if env_key in custom_env:
+                        if env_key.lower() == "no_proxy" and custom_env[env_key] == "*":
+                            continue
+                        if custom_env[env_key]:
+                            bad.append(f"env:{env_key}")
+        if "firefox_user_prefs" in overrides and overrides["firefox_user_prefs"] is not None:
+            custom_prefs = overrides["firefox_user_prefs"]
+            if not isinstance(custom_prefs, dict):
+                bad.append("firefox_user_prefs")
+            else:
+                for pref_k, pref_v in custom_prefs.items():
+                    low_k = str(pref_k).strip().lower()
+                    if low_k == "network.proxy.type":
+                        if isinstance(pref_v, bool) or pref_v != 0:
+                            bad.append(f"firefox_user_prefs:{pref_k}")
+                    elif low_k == "network.proxy" or low_k.startswith("network.proxy."):
+                        bad.append(f"firefox_user_prefs:{pref_k}")
     if bad:
         raise ValueError(
             f"Pinned profile '{profile_name}' forbids overrides: {', '.join(sorted(set(bad)))}"
+        )
+
+
+def _check_dedicated_google_overrides(
+    profile_name: str,
+    overrides: dict[str, Any] | None,
+    *,
+    allow_override: bool = False,
+) -> None:
+    """Enforce security boundary & drift rules for dedicated persistent Google profiles.
+
+    - Security boundary keys (`DEDICATED_GOOGLE_IMMUTABLE_KEYS`) are NEVER overridable even when `allow_override=True`.
+    - Fingerprint & egress drift keys (including proxy env & any `network.proxy.*` prefs) are blocked by default
+      (`allow_override=False`) to prevent silent drift, and permitted when strict `allow_override=True` is passed
+      after explicit user consent (without mutating `profiles.json`).
+    """
+    if not overrides:
+        return
+
+    immutable_bad: list[str] = []
+    for key in DEDICATED_GOOGLE_IMMUTABLE_KEYS:
+        if key in overrides and overrides[key] is not None:
+            immutable_bad.append(key)
+    if immutable_bad:
+        raise ValueError(
+            f"Dedicated Google profile '{profile_name}' permanently forbids overriding security boundary keys: "
+            f"{', '.join(sorted(set(immutable_bad)))}"
+        )
+
+    if "env" in overrides and overrides["env"] is not None and not isinstance(overrides["env"], dict):
+        raise ValueError("'env' override must be a JSON object")
+    if (
+        "firefox_user_prefs" in overrides
+        and overrides["firefox_user_prefs"] is not None
+        and not isinstance(overrides["firefox_user_prefs"], dict)
+    ):
+        raise ValueError("'firefox_user_prefs' override must be a JSON object")
+
+    if allow_override:
+        return
+
+    drift_bad: list[str] = []
+    for key in DEDICATED_GOOGLE_DRIFT_KEYS:
+        if key not in overrides:
+            continue
+        val = overrides[key]
+        if key == "mobile":
+            if val:
+                drift_bad.append(key)
+        elif val is not None:
+            drift_bad.append(key)
+
+    custom_env = overrides.get("env")
+    if isinstance(custom_env, dict):
+        proxy_env_low = {k.lower() for k in PROXY_ENV_KEYS}
+        for env_k in custom_env.keys():
+            if str(env_k).strip().lower() in proxy_env_low:
+                drift_bad.append(f"env:{env_k}")
+
+    custom_prefs = overrides.get("firefox_user_prefs")
+    if isinstance(custom_prefs, dict):
+        for pref_k in custom_prefs.keys():
+            low_k = str(pref_k).strip().lower()
+            if low_k == "network.proxy" or low_k.startswith("network.proxy."):
+                drift_bad.append(f"firefox_user_prefs:{pref_k}")
+
+    if drift_bad:
+        raise ValueError(
+            f"专用 Google Profile '{profile_name}' 默认禁止启动时覆盖指纹/出口参数（{', '.join(sorted(set(drift_bad)))}），"
+            "以防止未经同意的静默漂移；经用户同意后可使用 `live-browser profile create --overwrite`（idle 时持久化更新）"
+            "或 `live-browser start --confirm-override`（HTTP `allow_override=true` 启动时显式覆盖）。"
         )
 
 
@@ -877,22 +1238,38 @@ def resolve_launch_spec(
     profile_name: str | None = None,
     overrides: dict[str, Any] | None = None,
     *,
+    allow_override: Any = False,
     profiles_file: Path | None = None,
     profiles_data_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Resolve a profile name + optional overrides into a validated launch specification."""
+    if allow_override is None:
+        eff_allow_override = False
+    else:
+        eff_allow_override = _validate_strict_bool(allow_override, "allow_override")
+
+    if overrides is not None:
+        if not isinstance(overrides, dict):
+            raise ValueError("overrides must be a dict")
+        if "allow_override" in overrides and overrides["allow_override"] is not None:
+            ov_ao = _validate_strict_bool(overrides["allow_override"], "allow_override")
+            eff_allow_override = eff_allow_override or ov_ao
+
     req_name = (profile_name or "").strip()
     data_dir = profiles_data_dir or PROFILES_DATA_DIR
     host_pinned = discover_pinned_host_profile()
 
     if host_pinned is not None and (not req_name or req_name in ("default", host_pinned["name"])):
         p_name = host_pinned["name"]
-        _check_pinned_overrides(p_name, overrides)
+        _check_pinned_overrides(p_name, overrides, allow_override=eff_allow_override)
         return {
             "name": p_name,
             "pinned": True,
             "pinned_verified": True,
             "persistent": True,
+            "allow_google": True,
+            "allow_google_verified": False,
+            "account": None,
             "profile_dir": Path(host_pinned["profile_dir"]),
             "lock_path": Path(host_pinned["lock_path"]),
             "os": str(host_pinned["fingerprint"].get("os", "windows")),
@@ -909,23 +1286,71 @@ def resolve_launch_spec(
 
     target_name = validate_profile_name(req_name or "default")
     configured = load_profiles(profiles_file=profiles_file)
-    if target_name in configured:
+    is_registered = target_name in configured
+    if is_registered:
         entry = dict(configured[target_name])
     elif target_name == "default":
-        entry = {"pinned": False, "os": "windows", "persistent": True}
+        entry = {"pinned": False, "os": "windows", "persistent": True, "allow_google": False}
     else:
         raise KeyError(
             f"Profile '{target_name}' not found. Create it with `live-browser profile create {target_name}`."
         )
 
-    # Strip any forged `pinned: true` from user-configured profiles.json entries
-    if entry.get("pinned"):
+    # Strip any forged `pinned: true` or invalid/non-persistent `allow_google` from disk entries
+    raw_pinned = bool(entry.get("pinned", False))
+    if raw_pinned:
         log.warning("Stripping forged pinned=True on configured profile '%s'", target_name)
         entry["pinned"] = False
+        entry["allow_google"] = False
 
-    ov = overrides or {}
+    raw_allow_google = entry.get("allow_google", False)
+    raw_persistent = entry.get("persistent", True)
+    raw_ephemeral = bool(entry.get("ephemeral", False))
+    entry_is_dedicated_google = (
+        is_registered
+        and (not raw_pinned)
+        and (raw_allow_google is True)
+        and (raw_persistent is True)
+        and (not raw_ephemeral)
+    )
+    if not entry_is_dedicated_google:
+        if "allow_google" in entry and entry["allow_google"] is not False:
+            log.warning(
+                "Stripping invalid/non-persistent allow_google=%r on configured profile '%s'",
+                raw_allow_google,
+                target_name,
+            )
+        entry["allow_google"] = False
+    if "account" in entry and entry["account"] is not None:
+        try:
+            entry["account"] = _validate_account_label(entry["account"])
+        except ValueError:
+            entry.pop("account", None)
+
+    ov = {k: v for k, v in (overrides or {}).items() if k != "allow_override"}
+    if entry_is_dedicated_google:
+        _check_dedicated_google_overrides(target_name, ov, allow_override=eff_allow_override)
+    else:
+        if ov.get("pinned") is not None:
+            _validate_strict_bool(ov["pinned"], "pinned")
+            if ov["pinned"] is True:
+                raise ValueError("Cannot override pinned=True on a non-pinned profile")
+        if "allow_google" in ov and ov["allow_google"] is not None:
+            raise ValueError("Cannot override 'allow_google' at launch time; configure via `profile create --allow-google`")
+        if "account" in ov and ov["account"] is not None:
+            raise ValueError("Cannot override 'account' at launch time; configure via `profile create --account`")
+        if "env" in ov and ov["env"] is not None and not isinstance(ov["env"], dict):
+            raise ValueError("'env' override must be a JSON object")
+        if (
+            "firefox_user_prefs" in ov
+            and ov["firefox_user_prefs"] is not None
+            and not isinstance(ov["firefox_user_prefs"], dict)
+        ):
+            raise ValueError("'firefox_user_prefs' override must be a JSON object")
+
     merged: dict[str, Any] = dict(entry)
     merged["pinned"] = False
+    merged["allow_google"] = entry_is_dedicated_google
     for field in ("os", "locale", "window", "webgl_config", "block_webrtc", "geoip", "persistent"):
         if ov.get(field) is not None:
             merged[field] = ov[field]
@@ -936,20 +1361,63 @@ def resolve_launch_spec(
     if ov.get("ephemeral"):
         merged["persistent"] = False
 
-    if ov.get("proxy") is not None:
-        merged["proxy"] = ov["proxy"]
+    raw_ov_proxy = ov.get("proxy")
+    raw_ov_bao = ov.get("proxy_bao_ref")
+    has_ov_proxy = (
+        "proxy" in ov
+        and raw_ov_proxy is not None
+        and raw_ov_proxy != ""
+        and raw_ov_proxy != {}
+        and not (isinstance(raw_ov_proxy, str) and not raw_ov_proxy.strip())
+    )
+    ov_bao_str = str(raw_ov_bao).strip() if ("proxy_bao_ref" in ov and raw_ov_bao is not None) else ""
+    has_ov_bao = bool(ov_bao_str)
+    if has_ov_proxy and has_ov_bao:
+        raise ValueError("Cannot specify both 'proxy' and 'proxy_bao_ref'")
+
+    if has_ov_proxy:
+        merged["proxy"] = raw_ov_proxy
         merged.pop("proxy_bao_ref", None)
-    elif ov.get("proxy_bao_ref") is not None and str(ov["proxy_bao_ref"]).strip():
-        merged["proxy_bao_ref"] = str(ov["proxy_bao_ref"]).strip()
+    elif has_ov_bao:
+        merged["proxy_bao_ref"] = ov_bao_str
         merged.pop("proxy", None)
+    elif ("proxy" in ov and raw_ov_proxy is not None) or ("proxy_bao_ref" in ov and raw_ov_bao is not None):
+        merged.pop("proxy", None)
+        merged.pop("proxy_bao_ref", None)
 
     validated = validate_profile_payload(merged, allow_pinned=False)
-    return {
+    profile_dir_path = data_dir / target_name
+    if validated["persistent"]:
+        _validate_configured_profile_dir(
+            target_name,
+            profile_dir_path,
+            profiles_data_dir=data_dir,
+            host_pinned=host_pinned,
+            require_exists=False,
+        )
+
+    allow_google_flag = bool(validated.get("allow_google", False))
+    allow_google_verified = False
+    if allow_google_flag and is_registered:
+        ok_ded, _ = verify_dedicated_google_profile(
+            profile_dir_path,
+            profile_name=target_name,
+            profiles_file=profiles_file,
+            profiles_data_dir=data_dir,
+            require_dir_exists=False,
+            host_pinned=host_pinned,
+        )
+        allow_google_verified = ok_ded
+
+    spec_out: dict[str, Any] = {
         "name": target_name,
         "pinned": False,
         "pinned_verified": False,
         "persistent": bool(validated["persistent"]),
-        "profile_dir": data_dir / target_name,
+        "allow_google": allow_google_flag,
+        "allow_google_verified": allow_google_verified,
+        "account": validated.get("account"),
+        "profile_dir": profile_dir_path,
         "lock_path": data_dir / f"{target_name}.lock",
         "os": validated["os"],
         "fingerprint": {
@@ -968,6 +1436,11 @@ def resolve_launch_spec(
         "block_webrtc": validated.get("block_webrtc"),
         "geoip": validated.get("geoip"),
     }
+    if isinstance(ov.get("env"), dict) and ov["env"]:
+        spec_out["env"] = dict(ov["env"])
+    if isinstance(ov.get("firefox_user_prefs"), dict) and ov["firefox_user_prefs"]:
+        spec_out["firefox_user_prefs"] = dict(ov["firefox_user_prefs"])
+    return spec_out
 
 
 def build_camoufox_kwargs(spec: dict[str, Any], user_data_dir: Path) -> tuple[dict[str, Any], str]:
@@ -1019,12 +1492,27 @@ def build_camoufox_kwargs(spec: dict[str, Any], user_data_dir: Path) -> tuple[di
 
     if proxy_dict:
         kwargs["proxy"] = proxy_dict
-        kwargs["env"] = _clean_proxy_env(direct=False)
+        env_out = _clean_proxy_env(direct=False)
         egress_summary = mask_proxy_display(proxy_dict)
     else:
-        kwargs["env"] = _clean_proxy_env(direct=True)
+        env_out = _clean_proxy_env(direct=True)
         kwargs["firefox_user_prefs"] = {"network.proxy.type": 0}
         egress_summary = "direct"
+
+    custom_env = spec.get("env")
+    if isinstance(custom_env, dict):
+        for ek, ev in custom_env.items():
+            if ev is None:
+                env_out.pop(str(ek), None)
+            else:
+                env_out[str(ek)] = str(ev)
+    kwargs["env"] = env_out
+
+    custom_prefs = spec.get("firefox_user_prefs")
+    if isinstance(custom_prefs, dict) and custom_prefs:
+        merged_prefs = dict(kwargs.get("firefox_user_prefs") or {})
+        merged_prefs.update(custom_prefs)
+        kwargs["firefox_user_prefs"] = merged_prefs
 
     return kwargs, egress_summary
 
@@ -2673,6 +3161,8 @@ class LiveBrowserHub:
         self._ephemeral_dir: Path | None = None
         self.active_pinned: bool = False
         self.active_pinned_verified: bool = False
+        self.active_allow_google: bool = False
+        self.active_allow_google_verified: bool = False
         self.active_egress: str = "direct"
         self.active_os: str = ""
         self.active_fingerprint: dict[str, Any] = {}
@@ -3019,7 +3509,29 @@ class LiveBrowserHub:
         except OSError:
             return False
 
-    def state_dict(self) -> dict[str, Any]:
+    def _is_active_dedicated_google_verified(self) -> bool:
+        """Verify active profile is a host-enabled, registry-backed, containment-verified dedicated Google profile."""
+        if not (self.active_allow_google and self.active_allow_google_verified):
+            return False
+        if self.active_profile_dir is None:
+            return False
+        ok_ded, _ = verify_dedicated_google_profile(
+            self.active_profile_dir,
+            profile_name=self.active_profile or None,
+            require_dir_exists=True,
+        )
+        return ok_ded
+
+    def _is_active_google_allowed(self) -> bool:
+        """Return True iff the active session is verified as either host-pinned or dedicated Google."""
+        return self._is_active_pinned_verified() or self._is_active_dedicated_google_verified()
+
+    def state_dict(
+        self,
+        *,
+        include_profiles: bool = True,
+        include_account: bool = True,
+    ) -> dict[str, Any]:
         return {
             "type": "state",
             "running": self.engine_mode != "idle",
@@ -3028,6 +3540,7 @@ class LiveBrowserHub:
             "takeover_gen": self.takeover_gen,
             "profile": self.active_profile or None,
             "pinned": self.active_pinned,
+            "allow_google": bool(self.active_pinned or self.active_allow_google),
             "egress": self.active_egress or "direct",
             "os": self.active_os or "",
             "fingerprint": dict(self.active_fingerprint),
@@ -3046,7 +3559,11 @@ class LiveBrowserHub:
             "public_url": self.config.get("public_url") or "",
             "direct_app_url": self.config.get("direct_app_url") or "",
             "viewers": len(self.viewers),
-            "profiles": list_profiles(active_profile=self.active_profile),
+            "profiles": (
+                list_profiles(active_profile=self.active_profile, include_account=include_account)
+                if include_profiles
+                else []
+            ),
         }
 
     def _redacted_state_dict(self) -> dict[str, Any]:
@@ -3060,6 +3577,7 @@ class LiveBrowserHub:
             "takeover_gen": 0,
             "profile": None,
             "pinned": False,
+            "allow_google": False,
             "egress": "",
             "os": "",
             "fingerprint": {},
@@ -3080,6 +3598,16 @@ class LiveBrowserHub:
             "profiles": [],
         }
 
+    def _sanitize_state_for_readonly(self, st: dict[str, Any]) -> dict[str, Any]:
+        """Strip profile catalog, active profile name, account metadata & egress for readonly viewers."""
+        out = dict(st)
+        out["profiles"] = []
+        out["profile"] = None
+        out["pinned"] = False
+        out["allow_google"] = False
+        out["egress"] = ""
+        return out
+
     def state_dict_for_viewer(
         self,
         bot_key: str,
@@ -3088,9 +3616,12 @@ class LiveBrowserHub:
         *,
         viewer_frame_seq: int | None = None,
     ) -> dict[str, Any]:
-        """Return full state for authorized session readers, or redacted placeholder for isolated viewers."""
+        """Return full state for authorized admin readers, sanitized state for readonly, or redacted placeholder for isolated viewers."""
         if self.engine_mode == "idle" or self._viewer_can_read_session(bot_key, user_id, role):
-            st = self.state_dict()
+            is_admin = role == "admin"
+            st = self.state_dict(include_profiles=is_admin, include_account=is_admin)
+            if not is_admin:
+                st = self._sanitize_state_for_readonly(st)
             if self.engine_mode != "idle" and viewer_frame_seq is not None:
                 st["rendered_tab_cmds"] = [
                     cid for cid, req_seq in self._rendered_tab_cmd_ids.items() if viewer_frame_seq >= req_seq
@@ -3199,8 +3730,9 @@ class LiveBrowserHub:
         snap_owner = self.session_owner
         snap_mode = self.engine_mode
         base_full_state = self.state_dict()
+        base_readonly_state = self._sanitize_state_for_readonly(base_full_state)
         rendered_snapshot = list(self._rendered_tab_cmd_ids.items())
-        full_payload_cache: dict[tuple[str, ...], str] = {}
+        full_payload_cache: dict[tuple[bool, tuple[str, ...]], str] = {}
         redacted_payload = json.dumps(self._redacted_state_dict(), ensure_ascii=False)
         stale: list[web.WebSocketResponse] = []
         for ws in list(self.viewers):
@@ -3228,12 +3760,14 @@ class LiveBrowserHub:
                 else:
                     v_seq = int(meta.get("last_frame_seq", 0))
                     filtered_cmds = tuple(cid for cid, req_seq in rendered_snapshot if v_seq >= req_seq)
-                out_str = full_payload_cache.get(filtered_cmds)
+                is_admin = live_role == "admin"
+                cache_key = (is_admin, filtered_cmds)
+                out_str = full_payload_cache.get(cache_key)
                 if out_str is None:
-                    st_copy = dict(base_full_state)
+                    st_copy = dict(base_full_state if is_admin else base_readonly_state)
                     st_copy["rendered_tab_cmds"] = list(filtered_cmds)
                     out_str = json.dumps(st_copy, ensure_ascii=False)
-                    full_payload_cache[filtered_cmds] = out_str
+                    full_payload_cache[cache_key] = out_str
             else:
                 out_str = redacted_payload
             try:
@@ -3824,7 +4358,7 @@ class LiveBrowserHub:
         owner_uid: int | None = None,
     ) -> None:
         msg = (
-            "安全策略拦截：此主机已锁定 Pinned Google Profile，禁止非 Pinned Profile 访问 Google/Gmail/YouTube 域。"
+            "安全策略拦截：此主机仅允许主 Pinned Profile 或已启用并登记的专用持久化 Google Profile 访问 Google/Gmail/YouTube 域。"
         )
         try:
             loop = asyncio.get_running_loop()
@@ -3877,13 +4411,19 @@ class LiveBrowserHub:
         ctx: Any,
         *,
         is_pinned_verified: bool | None = None,
+        is_google_allowed: bool | None = None,
     ) -> None:
-        """Install context-level Playwright route interceptor blocking Google navigations on non-pinned contexts.
+        """Install context-level Playwright route interceptor blocking Google navigations on unauthorized contexts.
 
         Fail-closed: raises RuntimeError if host has a pinned profile and context route interception cannot be installed.
         """
-        pinned_ok = self._is_active_pinned_verified() if is_pinned_verified is None else bool(is_pinned_verified)
-        if pinned_ok:
+        if is_google_allowed is not None:
+            google_ok = bool(is_google_allowed)
+        elif is_pinned_verified is not None:
+            google_ok = bool(is_pinned_verified)
+        else:
+            google_ok = self._is_active_google_allowed()
+        if google_ok:
             return
         try:
             has_pinned = discover_pinned_host_profile() is not None
@@ -3893,7 +4433,7 @@ class LiveBrowserHub:
             return
         route_fn = getattr(ctx, "route", None)
         if not callable(route_fn):
-            raise RuntimeError("非 Pinned 浏览器上下文不支持 ctx.route 导航拦截，已拒绝启动（fail-closed）")
+            raise RuntimeError("非授权 Google 浏览器上下文不支持 ctx.route 导航拦截，已拒绝启动（fail-closed）")
 
         async def _route_google_guard(route: Any, request: Any | None = None) -> None:
             origin_gen = self.session_gen
@@ -3904,7 +4444,7 @@ class LiveBrowserHub:
             is_nav = bool(is_nav_attr()) if callable(is_nav_attr) else bool(is_nav_attr)
             res_type = str(getattr(req, "resource_type", "") or "").lower()
             if (is_nav or res_type == "document") and is_google_destination_url(url):
-                log.warning("Blocked non-pinned navigation via ctx.route to Google domain: %s", url[:120])
+                log.warning("Blocked unauthorized navigation via ctx.route to Google domain: %s", url[:120])
                 try:
                     await route.abort("blockedbyclient")
                 except TypeError:
@@ -3921,7 +4461,7 @@ class LiveBrowserHub:
         try:
             await route_fn("**/*", _route_google_guard)
         except Exception as exc:
-            raise RuntimeError(f"非 Pinned 导航防护安装失败，已中止启动（fail-closed）: {exc}") from exc
+            raise RuntimeError(f"非授权 Google 导航防护安装失败，已中止启动（fail-closed）: {exc}") from exc
 
     def _attach_page_listeners(self, page: Any, *, require_nav_guard: bool = False) -> None:
         """Attach native Playwright listeners for metadata dirtying, Google guard, dialog, filechooser & download."""
@@ -3929,7 +4469,7 @@ class LiveBrowserHub:
         if pid in self._attached_pages:
             return
         strict_guard = bool(require_nav_guard)
-        if not strict_guard and self.engine_mode == "async_hosted" and not self._is_active_pinned_verified():
+        if not strict_guard and self.engine_mode == "async_hosted" and not self._is_active_google_allowed():
             try:
                 strict_guard = discover_pinned_host_profile() is not None
             except Exception:
@@ -3938,7 +4478,7 @@ class LiveBrowserHub:
         on_fn = getattr(page, "on", None)
         if not callable(on_fn):
             if strict_guard:
-                raise RuntimeError("非 Pinned 浏览器页面不支持 page.on('framenavigated') 监听，已拒绝启动（fail-closed）")
+                raise RuntimeError("非授权 Google 浏览器页面不支持 page.on('framenavigated') 监听，已拒绝启动（fail-closed）")
             return
         self._attached_pages.add(pid)
 
@@ -3951,7 +4491,7 @@ class LiveBrowserHub:
             origin_owner_bot, origin_owner_uid = self._effective_resource_owner()
             self._tab_select_rev += 1
             self.mark_active(mark_tabs_dirty=True)
-            if self._is_active_pinned_verified():
+            if self._is_active_google_allowed():
                 return
             frame_url = str(getattr(frame, "url", None) or getattr(page, "url", "") or "")
             if frame_url and is_google_destination_url(frame_url):
@@ -4653,6 +5193,8 @@ class LiveBrowserHub:
         self.active_profile_dir = None
         self.active_pinned = False
         self.active_pinned_verified = False
+        self.active_allow_google = False
+        self.active_allow_google_verified = False
         self.active_egress = "direct"
         self.active_os = ""
         self.active_fingerprint = {}
@@ -4757,6 +5299,7 @@ class LiveBrowserHub:
         restart: bool = False,
         preferred_user_id: int | None = None,
         *,
+        allow_override: Any = False,
         actor: tuple[str, int] | None = None,
         source: str = "cli",
         expected_session_gen: int | None = None,
@@ -4790,18 +5333,25 @@ class LiveBrowserHub:
             if self.engine_mode == "sync_external":
                 raise RuntimeError("当前已有外部同步脚本持有浏览器会话。")
 
-            spec = resolve_launch_spec(profile_name=profile, overrides=overrides)
+            spec = resolve_launch_spec(
+                profile_name=profile,
+                overrides=overrides,
+                allow_override=allow_override,
+            )
             # Fail-closed Google destination enforcement BEFORE launching or switching
             enforce_google_profile_policy(
                 initial_url,
                 is_pinned=bool(spec.get("pinned_verified")),
+                allow_google=bool(spec.get("allow_google_verified")),
+                profile_name=spec.get("name"),
                 profile_dir=Path(spec["profile_dir"]) if spec.get("profile_dir") else None,
+                require_dir_exists=bool(spec.get("pinned_verified")),
             )
 
             has_explicit_overrides = bool(
                 overrides
                 and any(
-                    v is not None and not (k in ("ephemeral", "mobile") and v is False)
+                    v is not None and not (k in ("ephemeral", "mobile", "allow_override") and v is False)
                     for k, v in overrides.items()
                 )
             )
@@ -4831,12 +5381,39 @@ class LiveBrowserHub:
                         if not user_data_dir.is_dir():
                             raise FileNotFoundError(f"Pinned profile missing: {user_data_dir}")
                     else:
+                        # Fail-closed containment & anti-symlink check strictly BEFORE mkdir/chmod!
+                        _validate_configured_profile_dir(
+                            spec["name"],
+                            user_data_dir,
+                            host_pinned=discover_pinned_host_profile(),
+                            require_exists=False,
+                        )
                         user_data_dir.mkdir(parents=True, exist_ok=True)
                         os.chmod(user_data_dir, 0o700)
                 else:
                     ephemeral_dir = Path(tempfile.mkdtemp(prefix=f"agy-live-{spec['name']}-"))
                     os.chmod(ephemeral_dir, 0o700)
                     user_data_dir = ephemeral_dir
+
+                # Re-verify dedicated Google profile now that persistent dir exists on disk
+                pinned_verified_flag = bool(spec.get("pinned_verified"))
+                allow_google_verified_flag = False
+                if (not pinned_verified_flag) and bool(spec.get("allow_google_verified")):
+                    ok_ded_now, _ = verify_dedicated_google_profile(
+                        user_data_dir,
+                        profile_name=spec["name"],
+                        require_dir_exists=True,
+                    )
+                    allow_google_verified_flag = ok_ded_now
+                google_allowed_flag = pinned_verified_flag or allow_google_verified_flag
+                enforce_google_profile_policy(
+                    initial_url,
+                    is_pinned=pinned_verified_flag,
+                    allow_google=allow_google_verified_flag,
+                    profile_name=spec.get("name"),
+                    profile_dir=user_data_dir,
+                    require_dir_exists=True,
+                )
 
                 lock_path = Path(spec["lock_path"])
                 lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -4848,12 +5425,11 @@ class LiveBrowserHub:
                 ctx: Any = None
                 published = False
                 startup_guard_failed = False
-                pinned_verified_flag = bool(spec.get("pinned_verified"))
                 try:
                     host_has_pinned = discover_pinned_host_profile() is not None
                 except Exception:
                     host_has_pinned = True  # fail-closed
-                require_non_pinned_guard = (not pinned_verified_flag) and host_has_pinned
+                require_non_pinned_guard = (not google_allowed_flag) and host_has_pinned
 
                 def _on_new_page(new_page: Any) -> None:
                     nonlocal startup_guard_failed
@@ -4910,7 +5486,9 @@ class LiveBrowserHub:
                     # Fail-closed: install non-pinned Google navigation guard + page listeners BEFORE
                     # activating the session or navigating any page!
                     await self._install_non_pinned_google_guard(
-                        ctx, is_pinned_verified=pinned_verified_flag
+                        ctx,
+                        is_pinned_verified=pinned_verified_flag,
+                        is_google_allowed=google_allowed_flag,
                     )
                     ctx_on = getattr(ctx, "on", None)
                     if callable(ctx_on):
@@ -4981,6 +5559,8 @@ class LiveBrowserHub:
                 self._ephemeral_dir = ephemeral_dir
                 self.active_pinned = pinned_verified_flag
                 self.active_pinned_verified = pinned_verified_flag
+                self.active_allow_google = allow_google_verified_flag
+                self.active_allow_google_verified = allow_google_verified_flag
                 self.active_egress = egress_summary
                 self.active_os = str(spec.get("os") or "windows")
                 fp_summary: dict[str, Any] = {"os": self.active_os, "persistent": bool(spec["persistent"])}
@@ -6299,6 +6879,8 @@ class LiveBrowserHub:
                         enforce_google_profile_policy(
                             url,
                             is_pinned=self._is_active_pinned_verified(),
+                            allow_google=self._is_active_dedicated_google_verified(),
+                            profile_name=self.active_profile or None,
                             profile_dir=self.active_profile_dir,
                         )
                     except ValueError as exc:
@@ -6404,7 +6986,7 @@ class LiveBrowserHub:
                             )
                         else:
                             new_tab_url = (
-                                "https://www.google.com" if self._is_active_pinned_verified() else "about:blank"
+                                "https://www.google.com" if self._is_active_google_allowed() else "about:blank"
                             )
                             try:
                                 await np.goto(new_tab_url, wait_until="domcontentloaded", timeout=30000)
@@ -6718,6 +7300,8 @@ class LiveBrowserHub:
                             enforce_google_profile_policy(
                                 url,
                                 is_pinned=self._is_active_pinned_verified(),
+                                allow_google=self._is_active_dedicated_google_verified(),
+                                profile_name=self.active_profile or None,
                                 profile_dir=self.active_profile_dir,
                             )
                             self.ai_status = f"正在打开: {url[:60]}"
@@ -7102,6 +7686,7 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                 cid for cid, req_seq in hub._rendered_tab_cmd_ids.items() if 0 >= req_seq
             ]
         snap_state_full = json.dumps(snap_state_dict, ensure_ascii=False)
+        snap_state_readonly = json.dumps(hub._sanitize_state_for_readonly(snap_state_dict), ensure_ascii=False)
         snap_state_redacted = json.dumps(hub._redacted_state_dict(), ensure_ascii=False)
         snap_jpeg = hub.latest_jpeg
         snap_dialogs = [
@@ -7131,7 +7716,12 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
             return ws
         if _snap_still_current():
             can_read_snap = (snap_mode == "idle") or hub._viewer_can_read_session(bot_key, user_id, role)
-            await ws.send_str(snap_state_full if can_read_snap else snap_state_redacted)
+            if not can_read_snap:
+                await ws.send_str(snap_state_redacted)
+            elif role == "admin":
+                await ws.send_str(snap_state_full)
+            else:
+                await ws.send_str(snap_state_readonly)
         else:
             # Session transitioned during auth_ok send; send fresh state bound to live auth/owner
             if not await _require_live_auth():
@@ -7206,8 +7796,23 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                 if not await _require_live_auth():
                     break
                 can_read = hub._viewer_can_read_session(bot_key, user_id, role)
+                can_see_profiles = can_read and (role == "admin")
+                if not can_see_profiles:
+                    await _ws_send_json(
+                        ws,
+                        {
+                            "type": "profiles_list",
+                            "active_profile": None,
+                            "pinned": False,
+                            "running": (hub.engine_mode != "idle") if can_read else False,
+                            "ai_busy": (hub.ai_busy_count > 0) if can_read else False,
+                            "takeover": hub.takeover if can_read else False,
+                            "profiles": [],
+                        },
+                    )
+                    continue
                 try:
-                    prof_list = list_profiles(active_profile=(hub.active_profile if can_read else ""))
+                    prof_list = list_profiles(active_profile=hub.active_profile, include_account=True)
                 except RuntimeError as exc:
                     await _ws_send_json(ws, {"type": "toast", "message": f"❌ {exc}"})
                     continue
@@ -7215,11 +7820,11 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                     ws,
                     {
                         "type": "profiles_list",
-                        "active_profile": (hub.active_profile or None) if can_read else None,
-                        "pinned": hub.active_pinned if can_read else False,
-                        "running": (hub.engine_mode != "idle") if can_read else False,
-                        "ai_busy": (hub.ai_busy_count > 0) if can_read else False,
-                        "takeover": hub.takeover if can_read else False,
+                        "active_profile": hub.active_profile or None,
+                        "pinned": hub.active_pinned,
+                        "running": hub.engine_mode != "idle",
+                        "ai_busy": hub.ai_busy_count > 0,
+                        "takeover": hub.takeover,
                         "profiles": prof_list,
                     },
                 )
@@ -7435,11 +8040,15 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                     raw_url = str(data.get("url") or "").strip()
                     try:
                         spec = resolve_launch_spec(profile_name=req_profile)
-                        req_url = raw_url or ("https://www.google.com" if spec.get("pinned_verified") else "about:blank")
+                        google_ok = bool(spec.get("pinned_verified")) or bool(spec.get("allow_google_verified"))
+                        req_url = raw_url or ("https://www.google.com" if google_ok else "about:blank")
                         enforce_google_profile_policy(
                             req_url,
                             is_pinned=bool(spec.get("pinned_verified")),
+                            allow_google=bool(spec.get("allow_google_verified")),
+                            profile_name=spec.get("name"),
                             profile_dir=Path(spec["profile_dir"]) if spec.get("profile_dir") else None,
+                            require_dir_exists=bool(spec.get("pinned_verified")),
                         )
                     except (ValueError, KeyError, FileNotFoundError, RuntimeError) as exc:
                         await _ws_send_json(ws, {"type": "toast", "message": f"❌ {exc}"})
@@ -7481,13 +8090,17 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                     continue
                 try:
                     spec = resolve_launch_spec(profile_name=target_profile)
+                    google_ok = bool(spec.get("pinned_verified")) or bool(spec.get("allow_google_verified"))
                     req_url = raw_url
                     if not req_url:
-                        req_url = "https://www.google.com" if spec.get("pinned_verified") else "about:blank"
+                        req_url = "https://www.google.com" if google_ok else "about:blank"
                     enforce_google_profile_policy(
                         req_url,
                         is_pinned=bool(spec.get("pinned_verified")),
+                        allow_google=bool(spec.get("allow_google_verified")),
+                        profile_name=spec.get("name"),
                         profile_dir=Path(spec["profile_dir"]) if spec.get("profile_dir") else None,
+                        require_dir_exists=bool(spec.get("pinned_verified")),
                     )
                 except (ValueError, KeyError, FileNotFoundError, RuntimeError) as exc:
                     await _ws_send_json(ws, {"type": "toast", "message": f"❌ Profile 无效: {exc}"})
@@ -8207,14 +8820,14 @@ async def handle_api_download(request: web.Request) -> web.StreamResponse:
 # ---------------- Localhost Internal IPC Endpoints ----------------
 
 
-def _resolve_internal_tg_reader(
+def _resolve_internal_tg_reader_info(
     hub: LiveBrowserHub, query: Any
-) -> tuple[bool, bool]:
-    """Inspect internal GET query params for Telegram caller context & delivery scope.
+) -> tuple[bool, bool, str | None]:
+    """Inspect internal GET query params for Telegram caller context, delivery scope & live RBAC role.
 
-    Returns `(is_tg_caller, can_read_active_session)`.
-    Localhost CLI queries without `source=tg_*`, `chat_scope`, or `user_id`/`chat_id` return `(False, True)`.
-    Group/shared chat deliveries (`chat_scope=group` or non-positive `chat_id`) ALWAYS return `(True, False)`
+    Returns `(is_tg_caller, can_read_active_session, live_role)`.
+    Localhost CLI queries without `source=tg_*`, `chat_scope`, or `user_id`/`chat_id` return `(False, True, None)`.
+    Group/shared chat deliveries (`chat_scope=group` or non-positive `chat_id`) ALWAYS return `(True, False, None)`
     while a session is active, even if the triggering `user_id` is the session owner.
     """
     raw_source = str(query.get("source") or "").strip().lower()
@@ -8229,31 +8842,54 @@ def _resolve_internal_tg_reader(
         or raw_cid is not None
     )
     if not is_tg:
-        return False, True
-    if hub.engine_mode == "idle":
-        return True, True
-    # Group / non-private delivery scope MUST ALWAYS be redacted regardless of triggering user!
-    if raw_scope in ("group", "supergroup", "channel"):
-        return True, False
+        return False, True, None
+
+    is_group = raw_scope in ("group", "supergroup", "channel")
+    cid_val: int | None = None
     if raw_cid is not None:
         cid_val = _parse_positive_int(raw_cid)
         if cid_val is None:
-            return True, False
-    else:
-        cid_val = None
+            is_group = True
+
+    live_role: str = "denied"
+    target_bot: str | None = None
+    uid_val: int | None = None
+    if raw_bot is not None and str(raw_bot).strip():
+        target_bot = hub.resolve_bot_key(str(raw_bot))
+        uid_val = _parse_positive_int(raw_uid if raw_uid is not None else raw_cid)
+        if target_bot and uid_val:
+            live_role = _check_live_user_role(target_bot, uid_val)
+
+    if hub.engine_mode == "idle":
+        if is_group:
+            return True, True, live_role
+        if not target_bot or not uid_val:
+            return True, False, "denied"
+        if cid_val is not None and cid_val != uid_val:
+            return True, False, "denied"
+        if live_role not in ("admin", "readonly"):
+            return True, False, live_role
+        return True, True, live_role
+
+    # Active session: group / non-private delivery scope MUST ALWAYS be redacted regardless of triggering user!
+    if is_group:
+        return True, False, live_role
     # Fail-closed: Telegram status queries require explicit resolvable bot + positive user_id
-    if raw_bot is None or not str(raw_bot).strip():
-        return True, False
-    target_bot = hub.resolve_bot_key(str(raw_bot))
-    uid_val = _parse_positive_int(raw_uid if raw_uid is not None else raw_cid)
     if not target_bot or not uid_val:
-        return True, False
+        return True, False, "denied"
     if cid_val is not None and cid_val != uid_val:
-        return True, False
-    live_role = _check_live_user_role(target_bot, uid_val)
+        return True, False, "denied"
     if live_role not in ("admin", "readonly"):
-        return True, False
-    return True, hub._viewer_can_read_session(target_bot, uid_val, live_role)
+        return True, False, live_role
+    return True, hub._viewer_can_read_session(target_bot, uid_val, live_role), live_role
+
+
+def _resolve_internal_tg_reader(
+    hub: LiveBrowserHub, query: Any
+) -> tuple[bool, bool]:
+    """Compatibility wrapper returning `(is_tg_caller, can_read_active_session)`."""
+    is_tg, can_read, _ = _resolve_internal_tg_reader_info(hub, query)
+    return is_tg, can_read
 
 
 def _is_group_internal_scope(mapping: Any) -> bool:
@@ -8273,12 +8909,15 @@ async def internal_status(request: web.Request) -> web.Response:
     hub: LiveBrowserHub = request.app["hub"]
     check_local_auth(request, hub)
     query = getattr(request, "query", {}) or {}
-    is_tg, can_read = _resolve_internal_tg_reader(hub, query)
+    is_tg, can_read, live_role = _resolve_internal_tg_reader_info(hub, query)
     if is_tg and not can_read:
         return web.json_response({"ok": True, **hub._redacted_state_dict()})
-    state = hub.state_dict()
-    if _is_group_internal_scope(query):
-        state = {**state, "profiles": []}
+    is_group = _is_group_internal_scope(query)
+    if is_group or (is_tg and live_role != "admin"):
+        state = hub.state_dict(include_profiles=False, include_account=False)
+        state = hub._sanitize_state_for_readonly(state)
+        return web.json_response({"ok": True, **state})
+    state = hub.state_dict(include_profiles=True, include_account=True)
     return web.json_response({"ok": True, **state})
 
 
@@ -8468,9 +9107,17 @@ async def internal_start(request: web.Request) -> web.Response:
         "headless",
         "user_data_dir",
         "persistent_context",
+        "env",
+        "firefox_user_prefs",
+        "allow_google",
+        "account",
+        "pinned",
     ):
         if key in body and body[key] is not None:
             overrides[key] = body[key]
+    raw_allow_override: Any = False
+    if "allow_override" in body and body["allow_override"] is not None:
+        raw_allow_override = body["allow_override"]
     pref_uid = _parse_positive_int(body.get("user_id"))
     actor_arg = (auth_ctx["bot_key"], auth_ctx["chat_id"]) if auth_ctx.get("is_tg") else None
     source_arg = str(auth_ctx.get("source") or "tg_cmd") if auth_ctx.get("is_tg") else "cli"
@@ -8485,6 +9132,7 @@ async def internal_start(request: web.Request) -> web.Response:
             overrides=overrides or None,
             restart=bool(body.get("restart", False)),
             preferred_user_id=pref_uid,
+            allow_override=raw_allow_override,
             actor=actor_arg,
             source=source_arg,
             expected_session_gen=exp_gen,
@@ -8511,8 +9159,8 @@ async def internal_profiles_list(request: web.Request) -> web.Response:
     hub: LiveBrowserHub = request.app["hub"]
     check_local_auth(request, hub)
     query = getattr(request, "query", {}) or {}
-    is_tg, can_read = _resolve_internal_tg_reader(hub, query)
-    if (is_tg and not can_read) or _is_group_internal_scope(query):
+    is_tg, can_read, live_role = _resolve_internal_tg_reader_info(hub, query)
+    if (is_tg and (not can_read or live_role != "admin")) or _is_group_internal_scope(query):
         return web.json_response(
             {
                 "ok": True,
@@ -8522,7 +9170,7 @@ async def internal_profiles_list(request: web.Request) -> web.Response:
         )
     visible_active = hub.active_profile
     try:
-        profs = list_profiles(active_profile=visible_active)
+        profs = list_profiles(active_profile=visible_active, include_account=True)
     except RuntimeError as exc:
         return web.json_response({"ok": False, "error": str(exc)}, status=500)
     return web.json_response(
@@ -8537,34 +9185,94 @@ async def internal_profiles_list(request: web.Request) -> web.Response:
 async def internal_profiles_create(request: web.Request) -> web.Response:
     hub: LiveBrowserHub = request.app["hub"]
     check_local_auth(request, hub)
-    body = await request.json()
-    name = body.get("name", "")
-    overwrite = bool(body.get("overwrite", False))
-    cfg = {k: v for k, v in body.items() if k not in ("name", "overwrite")}
     try:
-        prof = create_profile(name, cfg, overwrite=overwrite)
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "Invalid JSON body"}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response({"ok": False, "error": "Request body must be a JSON object"}, status=400)
+    is_group_scope = _is_group_internal_scope(body)
+    ok_ctrl, err_ctrl, _, auth_ctx = _verify_internal_caller_control(hub, body, require_running=False)
+    if not ok_ctrl:
+        err_msg = "当前操作未获授权，请前往私聊查看与操作" if is_group_scope else err_ctrl
+        return web.json_response({"ok": False, "error": err_msg}, status=403)
+    name = body.get("name", "")
+    raw_overwrite: Any = False
+    if "overwrite" in body and body["overwrite"] is not None:
+        raw_overwrite = body["overwrite"]
+    cfg = {
+        k: v
+        for k, v in body.items()
+        if k
+        not in (
+            "name",
+            "overwrite",
+            "bot",
+            "user_id",
+            "chat_id",
+            "message_id",
+            "source",
+            "chat_scope",
+            "from_card",
+            "expected_session_gen",
+        )
+    }
+    try:
+        async with hub._engine_lock:
+            if auth_ctx.get("is_tg"):
+                ok_ctrl2, err_ctrl2, _, _ = _verify_internal_caller_control(hub, body, require_running=False)
+                if not ok_ctrl2:
+                    err_msg = "当前操作未获授权，请前往私聊查看与操作" if is_group_scope else err_ctrl2
+                    return web.json_response({"ok": False, "error": err_msg}, status=403)
+            prof = create_profile(
+                name,
+                cfg,
+                overwrite=raw_overwrite,
+                active_profile=hub.active_profile,
+            )
         return web.json_response({"ok": True, "profile": prof})
     except ValueError as exc:
-        return web.json_response({"ok": False, "error": str(exc)}, status=400)
+        err_msg = "请求参数无效，请前往私聊检查" if is_group_scope else str(exc)
+        return web.json_response({"ok": False, "error": err_msg}, status=400)
+    except RuntimeError as exc:
+        err_msg = "当前浏览器会话冲突或正忙，请前往私聊查看与操作" if is_group_scope else str(exc)
+        return web.json_response({"ok": False, "error": err_msg}, status=409)
     except Exception as exc:
-        return web.json_response({"ok": False, "error": str(exc)}, status=500)
+        err_msg = "浏览器服务暂不可用，请前往私聊重试" if is_group_scope else str(exc)
+        return web.json_response({"ok": False, "error": err_msg}, status=500)
 
 
 async def internal_profiles_delete(request: web.Request) -> web.Response:
     hub: LiveBrowserHub = request.app["hub"]
     check_local_auth(request, hub)
+    query = dict(getattr(request, "query", {}) or {})
+    is_group_scope = _is_group_internal_scope(query)
+    ok_ctrl, err_ctrl, _, auth_ctx = _verify_internal_caller_control(hub, query, require_running=False)
+    if not ok_ctrl:
+        err_msg = "当前操作未获授权，请前往私聊查看与操作" if is_group_scope else err_ctrl
+        return web.json_response({"ok": False, "error": err_msg}, status=403)
     name = request.match_info.get("name", "")
     try:
-        res = delete_profile(name, active_profile=hub.active_profile)
+        async with hub._engine_lock:
+            if auth_ctx.get("is_tg"):
+                ok_ctrl2, err_ctrl2, _, _ = _verify_internal_caller_control(hub, query, require_running=False)
+                if not ok_ctrl2:
+                    err_msg = "当前操作未获授权，请前往私聊查看与操作" if is_group_scope else err_ctrl2
+                    return web.json_response({"ok": False, "error": err_msg}, status=403)
+            res = delete_profile(name, active_profile=hub.active_profile)
         return web.json_response(res)
     except KeyError as exc:
-        return web.json_response({"ok": False, "error": str(exc)}, status=404)
+        err_msg = "请求的浏览器配置不可用，请前往私聊检查" if is_group_scope else str(exc)
+        return web.json_response({"ok": False, "error": err_msg}, status=404)
     except ValueError as exc:
-        return web.json_response({"ok": False, "error": str(exc)}, status=400)
+        err_msg = "请求参数无效，请前往私聊检查" if is_group_scope else str(exc)
+        return web.json_response({"ok": False, "error": err_msg}, status=400)
     except RuntimeError as exc:
-        return web.json_response({"ok": False, "error": str(exc)}, status=409)
+        err_msg = "当前浏览器会话冲突或正忙，请前往私聊查看与操作" if is_group_scope else str(exc)
+        return web.json_response({"ok": False, "error": err_msg}, status=409)
     except Exception as exc:
-        return web.json_response({"ok": False, "error": str(exc)}, status=500)
+        err_msg = "浏览器服务暂不可用，请前往私聊重试" if is_group_scope else str(exc)
+        return web.json_response({"ok": False, "error": err_msg}, status=500)
 
 
 async def internal_profiles_switch(request: web.Request) -> web.Response:
@@ -9040,11 +9748,16 @@ async def internal_sync_start(request: web.Request) -> web.Response:
         hub._sync_lease_id = lease_id
         hub.session_owner = (bot_key, pref_uid) if bot_key is not None else None
 
-        # Never infer producer `pinned=True` from host discovery alone!
-        # Only verify pinned when the Sync launch explicitly passes a matching canonical pinned `profile_dir`.
+        # Never infer producer `pinned=True` or `allow_google=True` from bare flags alone!
+        # Verify either:
+        #   1) canonical host pinned `profile_dir` + `pinned_launch=True`, OR
+        #   2) host-enabled, registry-backed, containment-verified dedicated Google `profile_dir` + `allow_google=True`.
         raw_pdir = str(body.get("profile_dir") or "").strip()
         pinned_claim = body.get("pinned_launch") is True
+        allow_google_claim = body.get("allow_google") is True
         pinned_verified = False
+        allow_google_verified = False
+        ded_name: str | None = None
         host_pinned = None
         if raw_pdir and pinned_claim:
             try:
@@ -9059,20 +9772,44 @@ async def internal_sync_start(request: web.Request) -> web.Response:
                         pinned_verified = True
                 except OSError:
                     pinned_verified = False
+        elif raw_pdir and allow_google_claim:
+            req_prof_name = str(body.get("profile") or "").strip() or None
+            ok_ded, verified_ded_name = verify_dedicated_google_profile(
+                raw_pdir,
+                profile_name=req_prof_name,
+                require_dir_exists=True,
+            )
+            if ok_ded and verified_ded_name:
+                allow_google_verified = True
+                ded_name = verified_ded_name
 
         if pinned_verified and host_pinned is not None:
             hub.active_profile = host_pinned["name"]
             hub.active_profile_dir = Path(host_pinned["profile_dir"])
             hub.active_pinned = True
             hub.active_pinned_verified = True
+            hub.active_allow_google = False
+            hub.active_allow_google_verified = False
             hub.active_egress = "direct"
             hub.active_os = str(host_pinned["fingerprint"].get("os", "windows"))
             hub.active_fingerprint = {"os": hub.active_os, "persistent": True}
+        elif allow_google_verified and ded_name is not None:
+            hub.active_profile = ded_name
+            hub.active_profile_dir = Path(raw_pdir).resolve()
+            hub.active_pinned = False
+            hub.active_pinned_verified = False
+            hub.active_allow_google = True
+            hub.active_allow_google_verified = True
+            hub.active_egress = "direct"
+            hub.active_os = str(body.get("os") or "")
+            hub.active_fingerprint = {"persistent": True}
         else:
             hub.active_profile = str(body.get("profile") or "").strip()
             hub.active_profile_dir = None
             hub.active_pinned = False
             hub.active_pinned_verified = False
+            hub.active_allow_google = False
+            hub.active_allow_google_verified = False
             hub.active_egress = "direct"
             hub.active_os = str(body.get("os") or "")
             hub.active_fingerprint = {}
@@ -9092,6 +9829,9 @@ async def internal_sync_start(request: web.Request) -> web.Response:
             "sync_lease_id": lease_id,
             "pinned": hub.active_pinned,
             "pinned_verified": hub.active_pinned_verified,
+            "allow_google": hub.active_allow_google,
+            "allow_google_verified": hub.active_allow_google_verified,
+            "google_allowed": hub.active_pinned_verified or hub.active_allow_google_verified,
         }
 
     if prev_sync_retire is not None:

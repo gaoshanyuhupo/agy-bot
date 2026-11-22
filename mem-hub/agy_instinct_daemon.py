@@ -86,6 +86,7 @@ BRIDGE_RELOAD_FILES = [
     Path("/tmp/agy_bridge_reload"),
     Path("/tmp/agy_bridge_sg_reload"),
     Path("/tmp/agy_bridge_jeff_reload"),
+    Path("/tmp/agy_bridge_sgcli_reload"),
 ]
 
 

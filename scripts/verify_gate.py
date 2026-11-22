@@ -51,6 +51,7 @@ BRIDGE_TEST_FILES: Tuple[str, ...] = (
     "tests/test_bot_bus.py",
     "tests/test_google_accounts.py",
     "tests/test_group_chat_bus.py",
+    "tests/test_group_on_demand.py",
     "tests/test_model_failover.py",
     "tests/test_queue_persistence_and_rollback.py",
     "tests/test_scheduler.py",

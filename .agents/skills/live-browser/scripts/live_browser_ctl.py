@@ -163,19 +163,95 @@ def resolve_tg_identity(
     }
 
 
-def _detect_current_bot_hint() -> str:
-    """Detect which Telegram bot spawned the current agent process without exposing tokens."""
-    tok = os.environ.get("AGY_TG_BOT_TOKEN", "")
+_IGNORED_BOT_ENV_KEYS = frozenset(
+    {"bak", "tmp", "example", "sample", "orig", "old", "swp", "dist", "disabled"}
+)
+_BOT_ENV_KEY_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
+
+
+def _parse_env_file_bot_key(raw_env_file: Any) -> str | None:
+    """Extract canonical bridge bot key from `AGY_TG_ENV_FILE` (`.env` -> `main`, `.env.<k>` -> `<k>`)."""
+    if raw_env_file is None:
+        return None
+    raw = str(raw_env_file)
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in raw):
+        return None
+    val = raw.strip()
+    if not val or val.endswith("/") or val.endswith("\\"):
+        return None
+    p = Path(val)
+    if ".." in p.parts or any(seg == ".." for seg in re.split(r"[/\\]", val)):
+        return None
+    name = p.name
+    if name == ".env":
+        return "main"
+    if name.startswith(".env.") and len(name) > 5:
+        key = name[5:]
+        if (
+            "." not in key
+            and key.lower() not in _IGNORED_BOT_ENV_KEYS
+            and _BOT_ENV_KEY_RE.fullmatch(key)
+        ):
+            return key
+    return None
+
+
+def _detect_ambient_bot_identity(env: Mapping[str, str] | None = None) -> tuple[str | None, str | None]:
+    """Return `(bot_key, bot_id)` of the spawning Telegram bridge process without exposing tokens."""
+    e = os.environ if env is None else env
+    bot_key = _parse_env_file_bot_key(e.get("AGY_TG_ENV_FILE"))
+    bot_id: str | None = None
+    tok = str(e.get("AGY_TG_BOT_TOKEN") or "").strip()
     if ":" in tok:
-        return tok.split(":", 1)[0]
-    env_file = os.environ.get("AGY_TG_ENV_FILE", "")
-    if env_file:
-        name = Path(env_file).name
-        if name == ".env":
-            return "main"
-        if name.startswith(".env.") and len(name) > 5:
-            return name[5:]
+        prefix = tok.split(":", 1)[0].strip()
+        if prefix.isascii() and prefix.isdigit():
+            bot_id = prefix
+    return bot_key, bot_id
+
+
+def _detect_current_bot_hint(env: Mapping[str, str] | None = None) -> str:
+    """Detect which Telegram bot spawned the current agent process without exposing tokens."""
+    bot_key, bot_id = _detect_ambient_bot_identity(env=env)
+    if bot_key:
+        return bot_key
+    if bot_id:
+        return bot_id
     return "sg"
+
+
+def resolve_bot_target(
+    explicit_bot: Any = None,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> str:
+    """Resolve target bot key/ID and fail closed on cross-bot overrides inside a Telegram bridge turn.
+
+    - None / "" / "auto": auto-detects the spawning bot (`AGY_TG_ENV_FILE` > `AGY_TG_BOT_TOKEN` > `"sg"`).
+    - Inside an active Telegram bridge turn (`AGY_BOT_CHAT_ID` or `AGY_BOT_HANDLE` set alongside
+      `AGY_TG_ENV_FILE` / `AGY_TG_BOT_TOKEN`), refuses explicit `--bot <other>` overrides targeting
+      a different bot so one bot can never misroute Live Cards or sessions into another bot's DM.
+    - Outside Telegram bridge turns (standalone CLI/cron), explicit `--bot <key>` remains permitted.
+    """
+    e = os.environ if env is None else env
+    env_key, env_id = _detect_ambient_bot_identity(env=e)
+    req = "" if explicit_bot is None else str(explicit_bot).strip()
+    if not req or req.lower() == "auto":
+        return _detect_current_bot_hint(env=e)
+
+    in_tg_turn = bool(env_key or env_id) and bool(
+        str(e.get("AGY_BOT_CHAT_ID") or "").strip()
+        or str(e.get("AGY_BOT_HANDLE") or "").strip()
+    )
+    if in_tg_turn:
+        allowed_aliases = {a.lower() for a in (env_key, env_id) if a}
+        req_low = req.lower()
+        if req_low not in allowed_aliases:
+            owner_desc = f"机器人 '{env_key}'" if env_key is not None else f"机器人 ID '{env_id}'"
+            raise ValueError(
+                f"安全隔离拦截：当前 Telegram 会话归属{owner_desc}，"
+                f"禁止通过 --bot '{req}' 跨机器人拉起或操控浏览器；请省略 --bot（默认 auto 自动绑定当前机器人）。"
+            )
+    return req
 
 
 def _load_hub_conn() -> tuple[str, str]:
@@ -203,7 +279,7 @@ class LiveBrowserClient:
         chat_id: int | str | None = None,
     ) -> None:
         self.base_url, self.token = _load_hub_conn()
-        self.bot = bot if (bot and bot != "auto") else _detect_current_bot_hint()
+        self.bot = resolve_bot_target(bot)
         self._explicit_user_id: Any = None
         self._explicit_chat_id: Any = None
         if user_id is not None or chat_id is not None:
@@ -283,6 +359,7 @@ class LiveBrowserClient:
         proxy_bao_ref: str | None = None,
         ephemeral: bool = False,
         restart: bool = False,
+        allow_override: Any = False,
         user_id: Any = None,
         chat_id: Any = None,
         expected_session_gen: int | None = None,
@@ -315,6 +392,8 @@ class LiveBrowserClient:
             payload["ephemeral"] = True
         if restart:
             payload["restart"] = True
+        if allow_override is not False:
+            payload["allow_override"] = allow_override
         r = self.session.post(
             f"{self.base_url}/internal/start",
             headers=self._headers(),
@@ -324,13 +403,40 @@ class LiveBrowserClient:
         return r.json()
 
     def list_profiles(self) -> dict[str, Any]:
+        ident = self._identity_payload()
         if self.is_alive() and self.token:
-            ident = self._identity_payload()
             kwargs: dict[str, Any] = {"headers": self._headers(), "timeout": 5.0}
             if ident:
                 kwargs["params"] = {"bot": self.bot, **ident}
             r = self.session.get(f"{self.base_url}/internal/profiles", **kwargs)
             return r.json()
+        raw_env_scope = (
+            str(os.environ.get("AGY_BOT_CHAT_SCOPE") or os.environ.get("AGY_CHAT_SCOPE") or "").strip().lower()
+        )
+        raw_ident_scope = str(ident.get("chat_scope") or "").strip().lower()
+        raw_env_cid = os.environ.get("AGY_BOT_CHAT_ID")
+        has_env_non_dm_cid = (
+            raw_env_cid is not None
+            and raw_env_cid != ""
+            and _parse_strict_positive_int(raw_env_cid) is None
+        )
+        is_group_or_non_dm = (
+            raw_env_scope in ("group", "supergroup", "channel")
+            or raw_ident_scope in ("group", "supergroup", "channel")
+            or has_env_non_dm_cid
+            or (
+                bool(ident)
+                and (
+                    _parse_strict_positive_int(ident.get("user_id")) is None
+                    or (
+                        ident.get("chat_id") is not None
+                        and _parse_strict_positive_int(ident.get("chat_id")) is None
+                    )
+                )
+            )
+        )
+        if is_group_or_non_dm:
+            return {"ok": True, "active_profile": None, "profiles": []}
         srv = _import_server_module()
 
         return {"ok": True, "active_profile": None, "profiles": srv.list_profiles()}
@@ -436,6 +542,8 @@ class SyncLiveBridge:
         profile_dir: str | Path | None = None,
         pinned_launch: bool = False,
         chat_id: int | None = None,
+        allow_google: bool = False,
+        profile_name: str | None = None,
     ) -> None:
         self.raw_ctx = raw_ctx
         self.client = LiveBrowserClient(bot=bot_hint, user_id=user_id, chat_id=chat_id)
@@ -447,6 +555,8 @@ class SyncLiveBridge:
         self._acked_tab_cmds: list[str] = []
         self._rejected_tab_cmds: list[str] = []
         self._pinned_verified: bool = False
+        self._allow_google_verified: bool = False
+        self._profile_name: str | None = str(profile_name).strip() if profile_name else None
         self._profile_dir: Path | None = Path(profile_dir) if profile_dir is not None else None
         self._sync_lease_id: str | None = None
         self._sync_session_gen: int | None = None
@@ -465,8 +575,12 @@ class SyncLiveBridge:
                     self.notify = False
                 if profile_dir is not None:
                     start_body["profile_dir"] = str(profile_dir)
+                if self._profile_name:
+                    start_body["profile"] = self._profile_name
                 if pinned_launch:
                     start_body["pinned_launch"] = True
+                if allow_google is True:
+                    start_body["allow_google"] = True
                 resp = self.client.session.post(
                     f"{self.client.base_url}/internal/sync/start",
                     headers=self.client._headers(),
@@ -481,6 +595,7 @@ class SyncLiveBridge:
                     self._sync_lease_id = start_data.get("sync_lease_id")
                     self._sync_session_gen = start_data.get("session_gen")
                     self._pinned_verified = bool(start_data.get("pinned_verified"))
+                    self._allow_google_verified = bool(start_data.get("allow_google_verified"))
             except Exception:
                 self.enabled = False
 
@@ -829,7 +944,7 @@ class SyncLiveBridge:
         return bool(fn) if fn is not None else False
 
     def _is_sync_google_nav_blocked(self, url: str) -> bool:
-        """Enforce non-pinned Google domain navigation block matching hosted policy."""
+        """Enforce non-pinned / unauthorized Google domain navigation block matching hosted policy."""
         if getattr(self, "_pinned_verified", False):
             return False
         try:
@@ -842,6 +957,8 @@ class SyncLiveBridge:
                 _srv.enforce_google_profile_policy(
                     url,
                     is_pinned=False,
+                    allow_google=bool(getattr(self, "_allow_google_verified", False)),
+                    profile_name=getattr(self, "_profile_name", None),
                     profile_dir=getattr(self, "_profile_dir", None),
                 )
                 return False
@@ -1440,7 +1557,11 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Control AGY Live Browser (Telegram Mini App real-time view + human takeover)."
     )
-    p.add_argument("--bot", default="auto", help="Bot target: auto | sg | main")
+    p.add_argument(
+        "--bot",
+        default="auto",
+        help="Bot target: auto (default; automatically binds to the spawning bridge bot from AGY_TG_ENV_FILE/AGY_TG_BOT_TOKEN; omit inside Telegram turns) or any bridge .env.<key> name for standalone CLI.",
+    )
     p.add_argument("--user-id", default=None, help="Explicit positive Telegram admin user ID for private DM ownership.")
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -1461,6 +1582,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_start.add_argument("--proxy-bao", dest="proxy_bao_ref", help="OpenBao secret ref for proxy (e.g. kv/proxies/us-west).")
     p_start.add_argument("--ephemeral", action="store_true", help="Use temporary profile directory cleaned up on stop.")
     p_start.add_argument("--restart", action="store_true", help="Safely restart & switch profile if idle.")
+    p_start.add_argument(
+        "--confirm-override",
+        action="store_true",
+        help="Explicitly confirm overriding fingerprint/egress on a dedicated Google profile for this launch (requires user consent; does not mutate profiles.json).",
+    )
 
     p_prof = sub.add_parser("profile", help="Manage named browser profiles, fingerprints, and proxy egress.")
     prof_sub = p_prof.add_subparsers(dest="profile_cmd", required=True)
@@ -1479,7 +1605,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_prof_create.add_argument("--proxy", help="Proxy URL (e.g. socks5://proxy.example.com:1080).")
     p_prof_create.add_argument("--proxy-bao", dest="proxy_bao_ref", help="OpenBao secret ref for proxy (e.g. kv/proxies/us-west).")
     p_prof_create.add_argument("--ephemeral", action="store_true", help="Mark profile ephemeral (non-persistent).")
-    p_prof_create.add_argument("--overwrite", action="store_true", help="Overwrite existing profile config.")
+    p_prof_create.add_argument(
+        "--allow-google",
+        action="store_true",
+        help="Mark persistent profile as a dedicated Google-capable profile (requires AGY_LIVE_BROWSER_ALLOW_DEDICATED_GOOGLE_PROFILES=1).",
+    )
+    p_prof_create.add_argument(
+        "--account",
+        default=None,
+        help="Optional account label/identifier (1..128 chars, no whitespace/control chars; never store passwords).",
+    )
+    p_prof_create.add_argument("--overwrite", action="store_true", help="Overwrite existing profile config (while idle).")
 
     p_prof_del = prof_sub.add_parser("delete", help="Delete a non-pinned, stopped named profile.")
     p_prof_del.add_argument("name", help="Profile name to delete.")
@@ -1555,6 +1691,7 @@ def main() -> int:
                 proxy_bao_ref=args.proxy_bao_ref,
                 ephemeral=args.ephemeral,
                 restart=args.restart,
+                allow_override=args.confirm_override,
             )
         elif args.cmd == "profile":
             if args.profile_cmd == "list":
@@ -1573,6 +1710,8 @@ def main() -> int:
                     proxy=args.proxy,
                     proxy_bao_ref=args.proxy_bao_ref,
                     persistent=False if args.ephemeral else True,
+                    allow_google=bool(args.allow_google),
+                    account=args.account,
                 )
             elif args.profile_cmd == "delete":
                 out = cli.delete_profile(args.name)

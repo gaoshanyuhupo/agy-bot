@@ -821,11 +821,12 @@ class TestInstinctDaemonAntiPoisoningAndDream(unittest.TestCase):
             )
             ref_today = date(2026, 11, 20)
 
-            # Verify jeff reload sentinel is included alongside main & sg
+            # Verify jeff & sgcli reload sentinels are included alongside main & sg
             reload_names = {p.name for p in daemon.BRIDGE_RELOAD_FILES}
             self.assertIn("agy_bridge_reload", reload_names)
             self.assertIn("agy_bridge_sg_reload", reload_names)
             self.assertIn("agy_bridge_jeff_reload", reload_names)
+            self.assertIn("agy_bridge_sgcli_reload", reload_names)
 
             # Verify test isolation: GLOBAL_PLUGIN_DIR stays inside tmp
             self.assertIsNotNone(daemon.GLOBAL_PLUGIN_DIR)

@@ -94,7 +94,10 @@ class TestLiveBrowserProfiles(unittest.TestCase):
         self.cfg_dir.mkdir(parents=True, exist_ok=True)
         self.profiles_data.mkdir(parents=True, exist_ok=True)
 
-        self._orig_env = os.environ.get("AGY_GOOGLE_SKILL_SCRIPTS")
+        self._saved_environ = dict(os.environ)
+        for _k in list(os.environ.keys()):
+            if _k.startswith("AGY_"):
+                os.environ.pop(_k, None)
         self._orig_cfg_dir = srv.CONFIG_DIR
         self._orig_cfg_file = srv.CONFIG_FILE
         self._orig_prof_file = srv.PROFILES_FILE
@@ -115,10 +118,8 @@ class TestLiveBrowserProfiles(unittest.TestCase):
         srv.PROFILES_FILE = self._orig_prof_file
         srv.LOCAL_TOKEN_FILE = self._orig_tok_file
         srv.PROFILES_DATA_DIR = self._orig_data_dir
-        if self._orig_env is None:
-            os.environ.pop("AGY_GOOGLE_SKILL_SCRIPTS", None)
-        else:
-            os.environ["AGY_GOOGLE_SKILL_SCRIPTS"] = self._orig_env
+        os.environ.clear()
+        os.environ.update(self._saved_environ)
         self._tmp.cleanup()
 
     def _install_mock_google_browser(self, profile_name: str = "pinned_acct") -> Path:
@@ -1367,6 +1368,1213 @@ class TestLiveBrowserProfiles(unittest.TestCase):
                 self.assertTrue(input_task.done())
 
         asyncio.run(_scenario())
+
+    # ---------------- C1..C8 Dedicated Multi-Profile Google Isolation Tests ----------------
+
+    @staticmethod
+    def _make_fake_web() -> types.SimpleNamespace:
+        return types.SimpleNamespace(
+            json_response=lambda data, status=200: types.SimpleNamespace(data=data, status=status),
+            HTTPForbidden=RuntimeError,
+        )
+
+    @staticmethod
+    def _make_internal_req(
+        hub: srv.LiveBrowserHub,
+        *,
+        token: str = "sec-tok",
+        body: dict | None = None,
+        query: dict | None = None,
+        match_info: dict | None = None,
+    ) -> types.SimpleNamespace:
+        async def _json():
+            return body if body is not None else {}
+
+        return types.SimpleNamespace(
+            headers={"X-Live-Token": token},
+            remote="127.0.0.1",
+            app={"hub": hub},
+            query=query or {},
+            match_info=match_info or {},
+            json=_json,
+        )
+
+    def test_c1_pinned_invariants_zero_regression_and_unit_env(self) -> None:
+        """C1: Host-pinned primary profile invariants, forbidden overrides incl. allow_override=True, and systemd unit env."""
+        pinned_dir = self._install_mock_google_browser("pinned_acct")
+
+        # 1. Omitting / "" / "default" / pinned name all derive from host canonical google_browser.py
+        for req in (None, "", "default", "pinned_acct"):
+            spec = srv.resolve_launch_spec(req)
+            self.assertTrue(spec["pinned"])
+            self.assertTrue(spec["pinned_verified"])
+            self.assertEqual("pinned_acct", spec["name"])
+            self.assertEqual(pinned_dir, spec["profile_dir"])
+            kwargs, egress = srv.build_camoufox_kwargs(spec, spec["profile_dir"])
+            self.assertEqual("windows", kwargs["os"])
+            self.assertEqual("virtual", kwargs["headless"])
+            self.assertEqual("direct", egress)
+            self.assertEqual({"network.proxy.type": 0}, kwargs["firefox_user_prefs"])
+            self.assertEqual("*", kwargs["env"]["NO_PROXY"])
+
+        # 2. All PINNED_FORBIDDEN_OVERRIDES + proxy env + non-0 prefs + allow_google/account/allow_override=True fail closed
+        forbidden_cases: list[tuple[dict | None, bool]] = [
+            ({"proxy": "socks5://proxy.example.com:1080"}, False),
+            ({"proxy_bao_ref": "kv/proxies/us-west"}, False),
+            ({"os": "macos"}, False),
+            ({"locale": "ja-JP"}, False),
+            ({"window": "1440x900"}, False),
+            ({"mobile": True}, False),
+            ({"webgl_config": "Apple,Apple M2"}, False),
+            ({"block_webrtc": True}, False),
+            ({"geoip": True}, False),
+            ({"headless": False}, False),
+            ({"user_data_dir": str(self.root / "escape")}, False),
+            ({"persistent_context": False}, False),
+            ({"persistent": False}, False),
+            ({"ephemeral": True}, False),
+            ({"pinned": False}, False),
+            ({"allow_google": False}, False),
+            ({"account": "acct-a@example.com"}, False),
+            ({"env": {"HTTPS_PROXY": "http://proxy.example.com:8080"}}, False),
+            ({"firefox_user_prefs": {"network.proxy.type": 1}}, False),
+            ({"firefox_user_prefs": {"network.proxy.http": "proxy.example.com"}}, False),
+            (None, True),
+            ({"os": "macos"}, True),
+        ]
+        for ov, ao in forbidden_cases:
+            with self.subTest(ov=ov, allow_override=ao):
+                with self.assertRaises(ValueError):
+                    srv.resolve_launch_spec("default", overrides=ov, allow_override=ao)
+
+        # HTTP POST /internal/start maps pinned overrides & allow_override=True to HTTP 400
+        async def _http_check() -> None:
+            hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "sec-tok")
+            with mock.patch.object(srv, "web", self._make_fake_web()):
+                for body in (
+                    {"profile": "default", "allow_override": True, "notify": False},
+                    {"profile": "default", "allow_google": False, "notify": False},
+                    {"profile": "default", "account": "acct@example.com", "notify": False},
+                    {"profile": "default", "env": {"HTTP_PROXY": "http://proxy.example.com:8080"}, "notify": False},
+                    {"profile": "default", "firefox_user_prefs": {"network.proxy.type": 1}, "notify": False},
+                ):
+                    r = await srv.internal_start(self._make_internal_req(hub, body=body))  # type: ignore[arg-type]
+                    self.assertEqual(400, r.status, f"Expected 400 for body={body!r}, got {r.status}: {r.data}")
+
+        asyncio.run(_http_check())
+
+        # 3. create_profile / delete_profile forbid default & pinned_acct
+        for name in ("default", "pinned_acct"):
+            with self.assertRaises(ValueError):
+                srv.create_profile(name, {"os": "linux"})
+            with self.assertRaises(ValueError):
+                srv.delete_profile(name)
+
+        # 4. AGY_LIVE_BROWSER_REQUIRE_PINNED=1 with AGY_GOOGLE_SKILL_SCRIPTS="" raises RuntimeError
+        with mock.patch.dict(
+            os.environ,
+            {"AGY_LIVE_BROWSER_REQUIRE_PINNED": "1", "AGY_GOOGLE_SKILL_SCRIPTS": ""},
+            clear=False,
+        ):
+            with self.assertRaises(RuntimeError):
+                srv.discover_pinned_host_profile()
+
+        # 5. systemd unit retains REQUIRE_PINNED=1 and adds ALLOW_DEDICATED_GOOGLE_PROFILES=1
+        unit_path = REPO_ROOT / "systemd/agy-live-browser.service"
+        if unit_path.is_file():
+            unit_txt = unit_path.read_text(encoding="utf-8")
+            self.assertIn("Environment=AGY_LIVE_BROWSER_REQUIRE_PINNED=1", unit_txt)
+            self.assertIn("Environment=AGY_LIVE_BROWSER_ALLOW_DEDICATED_GOOGLE_PROFILES=1", unit_txt)
+
+    def test_c2_host_switch_default_off_and_strict_bool_validation(self) -> None:
+        """C2: Host switch defaults off (100% single-pinned fail-closed) and strict bool validation on allow_google/pinned/allow_override."""
+        self._install_mock_google_browser("pinned_acct")
+        srv.create_profile(
+            "google-us-1",
+            {
+                "os": "macos",
+                "locale": "en-US",
+                "allow_google": True,
+                "persistent": True,
+                "account": "acct-us@example.com",
+            },
+        )
+        g_dir = self.profiles_data / "google-us-1"
+        g_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1. Host switch unset / 0 / false / invalid keeps dedicated profile 100% blocked from Google
+        for raw_switch in (None, "", "0", "false", "no", "invalid", "2"):
+            env_patch = {} if raw_switch is None else {"AGY_LIVE_BROWSER_ALLOW_DEDICATED_GOOGLE_PROFILES": raw_switch}
+            with mock.patch.dict(os.environ, env_patch, clear=False):
+                if raw_switch is None:
+                    os.environ.pop("AGY_LIVE_BROWSER_ALLOW_DEDICATED_GOOGLE_PROFILES", None)
+                self.assertFalse(srv.is_dedicated_google_profiles_enabled())
+                spec = srv.resolve_launch_spec("google-us-1")
+                self.assertTrue(spec["allow_google"])
+                self.assertFalse(spec["allow_google_verified"])
+                for g_url in (
+                    "https://www.google.com",
+                    "https://mail.google.com/mail/u/0/#inbox",
+                    "https://" + ".".join(("www", "youtube", "com")) + "/watch?v=1",
+                ):
+                    with self.assertRaises(ValueError):
+                        srv.enforce_google_profile_policy(
+                            g_url,
+                            is_pinned=False,
+                            allow_google=True,
+                            profile_name="google-us-1",
+                            profile_dir=g_dir,
+                        )
+
+        # Hosted launch with switch OFF installs ctx.route + framenavigated and opens new_tab to about:blank
+        fake_mod = types.ModuleType("camoufox.async_api")
+        fake_mod.AsyncCamoufox = _FakeAsyncCamoufoxCM  # type: ignore[attr-defined]
+        fake_pkg = types.ModuleType("camoufox")
+        fake_pkg.async_api = fake_mod  # type: ignore[attr-defined]
+
+        async def _switch_off_hosted() -> None:
+            hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "sec-tok")
+            with mock.patch.dict(sys.modules, {"camoufox": fake_pkg, "camoufox.async_api": fake_mod}):
+                with self.assertRaises(ValueError):
+                    await hub.start_hosted(initial_url="https://mail.google.com", profile="google-us-1", notify_tg=False)
+                self.assertEqual("idle", hub.engine_mode)
+
+                await hub.start_hosted(initial_url="https://example.com", profile="google-us-1", notify_tg=False)
+                self.assertFalse(hub._is_active_google_allowed())
+                self.assertTrue(hub.ctx._callbacks.get("route"), "ctx.route guard must be installed when host switch is off")
+                self.assertTrue(
+                    hub._current_page()._callbacks.get("framenavigated"),
+                    "framenavigated guard must be installed when host switch is off",
+                )
+                hub.takeover = True
+                await hub._execute_human_cmd_async({"action": "new_tab"})
+                self.assertEqual("about:blank", hub._current_page().url)
+                await hub.stop_hosted(notify_finished=False)
+
+        asyncio.run(_switch_off_hosted())
+
+        # 2. Strict bool checks on allow_google, pinned, allow_override (direct & HTTP 400)
+        for bad_bool in ("true", "false", 1, 0, "1"):
+            with self.subTest(bad_allow_google=bad_bool):
+                with self.assertRaises(ValueError):
+                    srv.create_profile("bad-ag", {"os": "linux", "allow_google": bad_bool})
+            with self.subTest(bad_allow_override=bad_bool):
+                with self.assertRaises(ValueError):
+                    srv.resolve_launch_spec("google-us-1", allow_override=bad_bool)
+        with self.assertRaises(ValueError):
+            srv.create_profile("bad-pin", {"os": "windows", "pinned": True})
+
+        async def _http_strict_bool() -> None:
+            hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "sec-tok")
+            with mock.patch.object(srv, "web", self._make_fake_web()):
+                for bad_bool in ("true", "false", 1, 0):
+                    r_p = await srv.internal_profiles_create(
+                        self._make_internal_req(hub, body={"name": "bad-http-ag", "os": "linux", "allow_google": bad_bool})
+                    )  # type: ignore[arg-type]
+                    self.assertEqual(400, r_p.status)
+                    r_s = await srv.internal_start(
+                        self._make_internal_req(
+                            hub, body={"profile": "google-us-1", "allow_override": bad_bool, "notify": False}
+                        )
+                    )  # type: ignore[arg-type]
+                    self.assertEqual(400, r_s.status)
+                r_pin = await srv.internal_profiles_create(
+                    self._make_internal_req(hub, body={"name": "bad-http-pin", "os": "windows", "pinned": True})
+                )  # type: ignore[arg-type]
+                self.assertEqual(400, r_pin.status)
+
+        asyncio.run(_http_strict_bool())
+
+    def test_c3_no_bare_bool_tampered_profiles_symlink_and_sync_guard(self) -> None:
+        """C3: Reject bare allow_google=True, tampered profiles.json, symlink traversal before mkdir/chmod, and forged sync claims."""
+        pinned_dir = self._install_mock_google_browser("pinned_acct")
+        with mock.patch.dict(os.environ, {"AGY_LIVE_BROWSER_ALLOW_DEDICATED_GOOGLE_PROFILES": "1"}, clear=False):
+            # 1. Bare allow_google=True with None / unregistered / non-existent / out-of-bounds dir -> ValueError
+            srv.create_profile("google-reg", {"os": "macos", "allow_google": True, "persistent": True})
+            unregistered_dir = self.profiles_data / "unregistered"
+            unregistered_dir.mkdir(parents=True, exist_ok=True)
+            outside_dir = self.root / "outside-google-reg"
+            outside_dir.mkdir(parents=True, exist_ok=True)
+            missing_reg_dir = self.profiles_data / "google-reg"  # does not exist on disk yet!
+            for bad_dir in (None, unregistered_dir, outside_dir, missing_reg_dir):
+                with self.subTest(bad_dir=bad_dir):
+                    with self.assertRaises(ValueError):
+                        srv.enforce_google_profile_policy(
+                            "https://mail.google.com",
+                            is_pinned=False,
+                            allow_google=True,
+                            profile_dir=bad_dir,
+                        )
+
+            # 2. Tampered profiles.json entries (pinned=True, allow_google="true", allow_google=True+persistent=False)
+            tampered_raw = {
+                "tamper-pin": {"os": "windows", "persistent": True, "pinned": True, "allow_google": True},
+                "tamper-str": {"os": "windows", "persistent": True, "allow_google": "true"},
+                "tamper-ephem": {"os": "windows", "persistent": False, "allow_google": True},
+            }
+            srv.save_profiles(tampered_raw)
+            for tname in tampered_raw:
+                tdir = self.profiles_data / tname
+                tdir.mkdir(parents=True, exist_ok=True)
+                spec = srv.resolve_launch_spec(tname)
+                self.assertFalse(spec["pinned"])
+                self.assertFalse(spec["allow_google"])
+                self.assertFalse(spec["allow_google_verified"])
+                with self.assertRaises(ValueError):
+                    srv.enforce_google_profile_policy(
+                        "https://accounts.google.com/signin",
+                        is_pinned=False,
+                        allow_google=True,
+                        profile_name=tname,
+                        profile_dir=tdir,
+                    )
+            listed = {p["name"]: p for p in srv.list_profiles()}
+            for tname in tampered_raw:
+                self.assertFalse(listed[tname]["pinned"])
+                self.assertFalse(listed[tname]["allow_google"])
+
+            # 3. Symlink at PROFILES_DATA_DIR/<name> (to outside OR to pinned_dir) rejected BEFORE mkdir/chmod & policy
+            srv.create_profile("sym-out", {"os": "linux", "allow_google": True, "persistent": True})
+            srv.create_profile("sym-pin", {"os": "linux", "allow_google": True, "persistent": True})
+            sym_target = self.root / "symlink-target"
+            sym_target.mkdir(parents=True, exist_ok=True)
+            os.chmod(sym_target, 0o755)
+            (self.profiles_data / "sym-out").symlink_to(sym_target)
+            (self.profiles_data / "sym-pin").symlink_to(pinned_dir)
+
+            for sname in ("sym-out", "sym-pin"):
+                with self.assertRaises(ValueError):
+                    srv.enforce_google_profile_policy(
+                        "https://mail.google.com",
+                        is_pinned=False,
+                        allow_google=True,
+                        profile_name=sname,
+                        profile_dir=self.profiles_data / sname,
+                    )
+                with self.assertRaises(ValueError):
+                    srv.resolve_launch_spec(sname)
+
+            async def _sym_start_and_sync() -> None:
+                hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "sec-tok")
+                with self.assertRaises(ValueError):
+                    await hub.start_hosted(initial_url="https://example.com", profile="sym-out", notify_tg=False)
+                self.assertEqual("idle", hub.engine_mode)
+                # Verify chmod(0o700) was NOT executed on symlink target!
+                self.assertEqual(0o755, stat.S_IMODE(sym_target.stat().st_mode))
+
+                # 4. internal_sync_start rejects forged allow_google=True claims, accepts authentic verified dir
+                srv.create_profile("sync-goog", {"os": "macos", "allow_google": True, "persistent": True})
+                sync_goog_dir = self.profiles_data / "sync-goog"
+                with mock.patch.object(srv, "web", self._make_fake_web()):
+                    for bad_body in (
+                        {"allow_google": True},
+                        {"allow_google": True, "profile_dir": str(unregistered_dir)},
+                        {"allow_google": True, "profile_dir": str(self.profiles_data / "sym-out")},
+                        {"allow_google": True, "profile_dir": str(sync_goog_dir)},  # dir does not exist yet
+                    ):
+                        r_bad = await srv.internal_sync_start(
+                            self._make_internal_req(hub, body=bad_body)
+                        )  # type: ignore[arg-type]
+                        self.assertEqual(200, r_bad.status)
+                        self.assertFalse(r_bad.data["allow_google_verified"])
+                        self.assertFalse(r_bad.data["google_allowed"])
+                        self.assertFalse(hub._is_active_google_allowed())
+
+                    # Now create authentic dir -> verified!
+                    sync_goog_dir.mkdir(parents=True, exist_ok=True)
+                    r_ok = await srv.internal_sync_start(
+                        self._make_internal_req(
+                            hub,
+                            body={"allow_google": True, "profile": "sync-goog", "profile_dir": str(sync_goog_dir)},
+                        )
+                    )  # type: ignore[arg-type]
+                    self.assertEqual(200, r_ok.status)
+                    self.assertTrue(r_ok.data["allow_google_verified"])
+                    self.assertTrue(r_ok.data["google_allowed"])
+                    self.assertTrue(hub._is_active_google_allowed())
+
+            asyncio.run(_sym_start_and_sync())
+
+    def test_c4_dedicated_google_ephemeral_mutex_drift_guard_and_consented_override(self) -> None:
+        """C4: allow_google+ephemeral mutex, default drift fail-closed, consented allow_override=True, immutable keys, and unlimited profiles."""
+        self._install_mock_google_browser("pinned_acct")
+        with mock.patch.dict(os.environ, {"AGY_LIVE_BROWSER_ALLOW_DEDICATED_GOOGLE_PROFILES": "1"}, clear=False):
+            # 1. allow_google + ephemeral / persistent=False rejected
+            for bad_cfg in (
+                {"os": "linux", "allow_google": True, "ephemeral": True},
+                {"os": "linux", "allow_google": True, "persistent": False},
+            ):
+                with self.assertRaises(ValueError):
+                    srv.create_profile("bad-ephem-g", bad_cfg)
+
+            # Create dedicated Google profile
+            srv.create_profile(
+                "google-us-1",
+                {
+                    "os": "macos",
+                    "locale": "en-US",
+                    "window": "1440x900",
+                    "block_webrtc": True,
+                    "geoip": "203.0.113.10",
+                    "proxy": "socks5://MOCK_U1:MOCK_P1@proxy.example.com:1080",
+                    "allow_google": True,
+                    "persistent": True,
+                    "account": "acct-us@example.com",
+                },
+            )
+            disk_before = self.profiles_file.read_text(encoding="utf-8")
+
+            # 2. Default (allow_override=False) rejects ALL fingerprint/egress drift overrides incl. NO_PROXY & network.proxy.type=0
+            drift_cases = [
+                {"proxy": "socks5://proxy.example.org:1080"},
+                {"proxy": ""},
+                {"proxy_bao_ref": "kv/proxies/alt"},
+                {"os": "linux"},
+                {"locale": "ja-JP"},
+                {"window": "1280x720"},
+                {"mobile": True},
+                {"webgl_config": "Intel,Iris"},
+                {"block_webrtc": False},
+                {"geoip": False},
+                {"env": {"HTTP_PROXY": "http://proxy.example.org:8080"}},
+                {"env": {"NO_PROXY": "*"}},
+                {"firefox_user_prefs": {"network.proxy.type": 0}},
+                {"firefox_user_prefs": {"network.proxy.socks": "proxy.example.org"}},
+            ]
+            for ov in drift_cases:
+                with self.subTest(default_drift=ov):
+                    with self.assertRaises(ValueError) as cm:
+                        srv.resolve_launch_spec("google-us-1", overrides=ov)
+                    err_txt = str(cm.exception)
+                    self.assertIn("--overwrite", err_txt)
+                    self.assertIn("--confirm-override", err_txt)
+
+            # 3. Consented strict allow_override=True permits fingerprint/egress overrides without touching profiles.json
+            ov_spec = srv.resolve_launch_spec(
+                "google-us-1",
+                overrides={
+                    "proxy": "http://MOCK_OV_U:MOCK_OV_P@proxy.example.com:8081",
+                    "os": "linux",
+                    "locale": "de-DE",
+                    "window": "1600x900",
+                    "env": {"TZ": "Europe/Berlin"},
+                    "firefox_user_prefs": {"intl.accept_languages": "de-DE"},
+                },
+                allow_override=True,
+            )
+            self.assertTrue(ov_spec["allow_google"])
+            self.assertTrue(ov_spec["allow_google_verified"])
+            self.assertEqual("linux", ov_spec["os"])
+            self.assertEqual("de-DE", ov_spec["locale"])
+            self.assertEqual([1600, 900], ov_spec["window"])
+            kwargs, egress = srv.build_camoufox_kwargs(ov_spec, ov_spec["profile_dir"])
+            self.assertEqual("http://***@" + "proxy.example.com:8081", egress)
+            self.assertNotIn("MOCK_OV_P", egress)
+            self.assertEqual("MOCK_OV_U", kwargs["proxy"]["username"])
+            self.assertEqual("MOCK_OV_P", kwargs["proxy"]["password"])
+            self.assertEqual("Europe/Berlin", kwargs["env"]["TZ"])
+            self.assertEqual("de-DE", kwargs["firefox_user_prefs"]["intl.accept_languages"])
+            # Disk profiles.json MUST remain untouched!
+            self.assertEqual(disk_before, self.profiles_file.read_text(encoding="utf-8"))
+
+            # Security boundary keys are STILL permanently forbidden even with allow_override=True
+            immutable_cases = [
+                {"user_data_dir": str(self.root / "hijack")},
+                {"persistent_context": False},
+                {"persistent": False},
+                {"ephemeral": True},
+                {"pinned": True},
+                {"allow_google": False},
+                {"account": "other@example.org"},
+                {"headless": False},
+            ]
+            for imm_ov in immutable_cases:
+                with self.subTest(immutable_override=imm_ov):
+                    with self.assertRaises(ValueError):
+                        srv.resolve_launch_spec("google-us-1", overrides=imm_ov, allow_override=True)
+
+            # P2-1 (C4): overrides passing BOTH non-empty proxy and non-empty proxy_bao_ref MUST fail closed
+            for mutex_ov in (
+                {"proxy": "http://proxy.example.com:8080", "proxy_bao_ref": "kv/proxies/us-west"},
+                {"proxy": {"server": "socks5://proxy.example.com:1080"}, "proxy_bao_ref": "kv/proxies/us-west"},
+            ):
+                with self.subTest(prof="google-us-1", mutex_ov=mutex_ov):
+                    with self.assertRaises(ValueError) as cm_mutex:
+                        srv.resolve_launch_spec("google-us-1", overrides=mutex_ov, allow_override=True)
+                    self.assertIn("proxy", str(cm_mutex.exception))
+                    self.assertIn("proxy_bao_ref", str(cm_mutex.exception))
+
+            # HTTP POST /internal/start verifies both 400 default drift, 400 immutable keys, and 200 consented override
+            fake_mod = types.ModuleType("camoufox.async_api")
+            fake_mod.AsyncCamoufox = _FakeAsyncCamoufoxCM  # type: ignore[attr-defined]
+            fake_pkg = types.ModuleType("camoufox")
+            fake_pkg.async_api = fake_mod  # type: ignore[attr-defined]
+
+            async def _http_c4() -> None:
+                hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "sec-tok")
+                with (
+                    mock.patch.object(srv, "web", self._make_fake_web()),
+                    mock.patch.dict(sys.modules, {"camoufox": fake_pkg, "camoufox.async_api": fake_mod}),
+                ):
+                    r_bad_ephem = await srv.internal_profiles_create(
+                        self._make_internal_req(
+                            hub, body={"name": "ephem-g-http", "os": "linux", "allow_google": True, "ephemeral": True}
+                        )
+                    )  # type: ignore[arg-type]
+                    self.assertEqual(400, r_bad_ephem.status)
+
+                    r_drift = await srv.internal_start(
+                        self._make_internal_req(
+                            hub,
+                            body={
+                                "profile": "google-us-1",
+                                "firefox_user_prefs": {"network.proxy.type": 0},
+                                "notify": False,
+                            },
+                        )
+                    )  # type: ignore[arg-type]
+                    self.assertEqual(400, r_drift.status)
+
+                    r_imm = await srv.internal_start(
+                        self._make_internal_req(
+                            hub,
+                            body={
+                                "profile": "google-us-1",
+                                "allow_override": True,
+                                "user_data_dir": str(self.root / "bad"),
+                                "notify": False,
+                            },
+                        )
+                    )  # type: ignore[arg-type]
+                    self.assertEqual(400, r_imm.status)
+
+                    r_ok = await srv.internal_start(
+                        self._make_internal_req(
+                            hub,
+                            body={
+                                "profile": "google-us-1",
+                                "allow_override": True,
+                                "proxy": "http://MOCK_OV_U:MOCK_OV_P@proxy.example.com:8082",
+                                "os": "linux",
+                                "notify": False,
+                            },
+                        )
+                    )  # type: ignore[arg-type]
+                    self.assertEqual(200, r_ok.status)
+                    self.assertEqual("http://***@" + "proxy.example.com:8082", r_ok.data["egress"])
+                    self.assertNotIn("MOCK_OV_P", json.dumps(r_ok.data))
+                    await hub.stop_hosted(notify_finished=False)
+
+            asyncio.run(_http_c4())
+            self.assertEqual(disk_before, self.profiles_file.read_text(encoding="utf-8"))
+
+            # P2-1 (C4) ordinary profile also rejects simultaneous proxy + proxy_bao_ref overrides
+            srv.create_profile("ord-mutex-c4", {"os": "linux"})
+            with self.assertRaises(ValueError) as cm_ord_mutex:
+                srv.resolve_launch_spec(
+                    "ord-mutex-c4",
+                    overrides={"proxy": "socks5://proxy.example.com:1080", "proxy_bao_ref": "kv/proxies/us-west"},
+                )
+            self.assertIn("proxy", str(cm_ord_mutex.exception))
+            self.assertIn("proxy_bao_ref", str(cm_ord_mutex.exception))
+
+            # 4. Persistent overwrite while idle + unlimited dedicated Google profiles (4+ distinct profiles)
+            updated = srv.create_profile(
+                "google-us-1",
+                {
+                    "os": "macos",
+                    "locale": "en-US",
+                    "proxy": "socks5://MOCK_NEW_U:MOCK_NEW_P@proxy.example.com:1081",
+                    "allow_google": True,
+                    "persistent": True,
+                    "account": "acct-us@example.com",
+                },
+                overwrite=True,
+            )
+            self.assertEqual("socks5://***@" + "proxy.example.com:1081", updated["egress"])
+
+            srv.create_profile(
+                "google-jp-2",
+                {
+                    "os": "windows",
+                    "locale": "ja-JP",
+                    "proxy": "http://proxy.example.org:3128",
+                    "allow_google": True,
+                    "persistent": True,
+                    "account": "acct-jp@example.org",
+                },
+            )
+            srv.create_profile(
+                "google-eu-3",
+                {
+                    "os": "linux",
+                    "locale": "de-DE",
+                    "proxy_bao_ref": "kv/proxies/eu-res#url",
+                    "allow_google": True,
+                    "persistent": True,
+                    "account": "acct-eu@example.net",
+                },
+            )
+            srv.create_profile(
+                "google-direct-4",
+                {
+                    "os": "windows",
+                    "locale": "en-GB",
+                    "allow_google": True,
+                    "persistent": True,
+                    "account": "acct-uk@example.com",
+                },
+            )
+            for pname in ("google-us-1", "google-jp-2", "google-eu-3", "google-direct-4"):
+                sp = srv.resolve_launch_spec(pname)
+                self.assertTrue(sp["allow_google_verified"])
+                self.assertFalse(sp["pinned"])
+
+            # Verify CLI parser flags: --allow-google, --account, --confirm-override
+            parser = live_browser_ctl.build_parser()
+            ns_c = parser.parse_args(
+                ["profile", "create", "google-cli-5", "--allow-google", "--account", "acct-cli@example.com", "--os", "macos"]
+            )
+            self.assertTrue(ns_c.allow_google)
+            self.assertEqual("acct-cli@example.com", ns_c.account)
+            ns_s = parser.parse_args(
+                ["start", "--profile", "google-cli-5", "--confirm-override", "--proxy", "socks5://proxy.example.com:1080"]
+            )
+            self.assertTrue(ns_s.confirm_override)
+
+    def test_c5_running_profile_overwrite_and_delete_409_conflict(self) -> None:
+        """C5: Overwriting or deleting a running profile fails closed with RuntimeError / HTTP 409; succeeds after stop."""
+        self._install_mock_google_browser("pinned_acct")
+        with mock.patch.dict(os.environ, {"AGY_LIVE_BROWSER_ALLOW_DEDICATED_GOOGLE_PROFILES": "1"}, clear=False):
+            srv.create_profile(
+                "google-run",
+                {
+                    "os": "macos",
+                    "proxy": "socks5://proxy.example.com:1080",
+                    "allow_google": True,
+                    "persistent": True,
+                    "account": "acct-run@example.com",
+                },
+            )
+            before_disk = self.profiles_file.read_text(encoding="utf-8")
+
+            fake_mod = types.ModuleType("camoufox.async_api")
+            fake_mod.AsyncCamoufox = _FakeAsyncCamoufoxCM  # type: ignore[attr-defined]
+            fake_pkg = types.ModuleType("camoufox")
+            fake_pkg.async_api = fake_mod  # type: ignore[attr-defined]
+
+            async def _scenario() -> None:
+                hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "sec-tok")
+                with (
+                    mock.patch.object(srv, "web", self._make_fake_web()),
+                    mock.patch.dict(sys.modules, {"camoufox": fake_pkg, "camoufox.async_api": fake_mod}),
+                ):
+                    await hub.start_hosted(initial_url="https://example.com", profile="google-run", notify_tg=False)
+                    self.assertEqual("google-run", hub.active_profile)
+
+                    # Direct calls raise RuntimeError
+                    with self.assertRaises(RuntimeError):
+                        srv.create_profile(
+                            "google-run",
+                            {"os": "linux", "allow_google": True, "persistent": True},
+                            overwrite=True,
+                            active_profile=hub.active_profile,
+                        )
+                    with self.assertRaises(RuntimeError):
+                        srv.delete_profile("google-run", active_profile=hub.active_profile)
+
+                    # HTTP POST /internal/profiles (overwrite=true) & DELETE return 409, profiles.json untouched
+                    r_ov = await srv.internal_profiles_create(
+                        self._make_internal_req(
+                            hub,
+                            body={
+                                "name": "google-run",
+                                "overwrite": True,
+                                "os": "linux",
+                                "allow_google": True,
+                                "persistent": True,
+                            },
+                        )
+                    )  # type: ignore[arg-type]
+                    self.assertEqual(409, r_ov.status)
+
+                    r_del = await srv.internal_profiles_delete(
+                        self._make_internal_req(hub, match_info={"name": "google-run"})
+                    )  # type: ignore[arg-type]
+                    self.assertEqual(409, r_del.status)
+                    self.assertEqual(before_disk, self.profiles_file.read_text(encoding="utf-8"))
+
+                    # Stop -> idle -> overwrite & delete succeed with 200
+                    await hub.stop_hosted(notify_finished=False)
+                    self.assertEqual("idle", hub.engine_mode)
+
+                    # P1-1 (C5): Concurrent startup TOCTOU race — AsyncCamoufox.__aenter__ suspended while
+                    # POST /internal/profiles (overwrite=True) & DELETE /internal/profiles/<name> arrive.
+                    # Both MUST serialize on hub._engine_lock, return 409, and leave profiles.json byte-identical!
+                    entered_ev = asyncio.Event()
+                    release_ev = asyncio.Event()
+
+                    class _BlockingStartCamoufoxCM(_FakeAsyncCamoufoxCM):
+                        async def __aenter__(self) -> _FakeContext:
+                            entered_ev.set()
+                            await release_ev.wait()
+                            return await super().__aenter__()
+
+                    block_mod = types.ModuleType("camoufox.async_api")
+                    block_mod.AsyncCamoufox = _BlockingStartCamoufoxCM  # type: ignore[attr-defined]
+                    block_pkg = types.ModuleType("camoufox")
+                    block_pkg.async_api = block_mod  # type: ignore[attr-defined]
+
+                    with mock.patch.dict(sys.modules, {"camoufox": block_pkg, "camoufox.async_api": block_mod}):
+                        start_task = asyncio.create_task(
+                            hub.start_hosted(initial_url="https://example.com", profile="google-run", notify_tg=False)
+                        )
+                        await asyncio.wait_for(entered_ev.wait(), timeout=2.0)
+                        self.assertEqual("", hub.active_profile)
+
+                        ov_race_task = asyncio.create_task(
+                            srv.internal_profiles_create(
+                                self._make_internal_req(
+                                    hub,
+                                    body={
+                                        "name": "google-run",
+                                        "overwrite": True,
+                                        "os": "linux",
+                                        "allow_google": True,
+                                        "persistent": True,
+                                    },
+                                )
+                            )  # type: ignore[arg-type]
+                        )
+                        del_race_task = asyncio.create_task(
+                            srv.internal_profiles_delete(
+                                self._make_internal_req(hub, match_info={"name": "google-run"})
+                            )  # type: ignore[arg-type]
+                        )
+                        await asyncio.sleep(0.02)
+                        self.assertFalse(ov_race_task.done(), "overwrite must block on _engine_lock during startup")
+                        self.assertFalse(del_race_task.done(), "delete must block on _engine_lock during startup")
+
+                        release_ev.set()
+                        st_race, r_ov_race, r_del_race = await asyncio.gather(start_task, ov_race_task, del_race_task)
+                        self.assertTrue(st_race["running"])
+                        self.assertEqual("google-run", hub.active_profile)
+                        self.assertEqual(409, r_ov_race.status)
+                        self.assertEqual(409, r_del_race.status)
+                        self.assertEqual(before_disk, self.profiles_file.read_text(encoding="utf-8"))
+
+                    await hub.stop_hosted(notify_finished=False)
+                    self.assertEqual("idle", hub.engine_mode)
+
+                    r_ov2 = await srv.internal_profiles_create(
+                        self._make_internal_req(
+                            hub,
+                            body={
+                                "name": "google-run",
+                                "overwrite": True,
+                                "os": "linux",
+                                "proxy": "http://proxy.example.org:8080",
+                                "allow_google": True,
+                                "persistent": True,
+                                "account": "acct-run@example.com",
+                            },
+                        )
+                    )  # type: ignore[arg-type]
+                    self.assertEqual(200, r_ov2.status)
+                    self.assertEqual("http://proxy.example.org:8080", r_ov2.data["profile"]["egress"])
+
+                    r_del2 = await srv.internal_profiles_delete(
+                        self._make_internal_req(hub, match_info={"name": "google-run"})
+                    )  # type: ignore[arg-type]
+                    self.assertEqual(200, r_del2.status)
+
+            asyncio.run(_scenario())
+
+    def test_c6_ordinary_ephemeral_fail_closed_and_dedicated_positive_flow(self) -> None:
+        """C6: With host switch ON, ordinary & ephemeral profiles stay 100% blocked while dedicated Google profile works end-to-end."""
+        self._install_mock_google_browser("pinned_acct")
+        with mock.patch.dict(os.environ, {"AGY_LIVE_BROWSER_ALLOW_DEDICATED_GOOGLE_PROFILES": "1"}, clear=False):
+            srv.create_profile("ord-prof", {"os": "linux", "allow_google": False, "persistent": True})
+            srv.create_profile("ephem-prof", {"os": "linux", "persistent": False})
+            srv.create_profile(
+                "ded-goog",
+                {
+                    "os": "macos",
+                    "locale": "en-US",
+                    "proxy": "socks5://proxy.example.com:1080",
+                    "allow_google": True,
+                    "persistent": True,
+                    "account": "acct-ded@example.com",
+                },
+            )
+
+            fake_mod = types.ModuleType("camoufox.async_api")
+            fake_mod.AsyncCamoufox = _FakeAsyncCamoufoxCM  # type: ignore[attr-defined]
+            fake_pkg = types.ModuleType("camoufox")
+            fake_pkg.async_api = fake_mod  # type: ignore[attr-defined]
+
+            async def _scenario() -> None:
+                hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "sec-tok")
+                with mock.patch.dict(sys.modules, {"camoufox": fake_pkg, "camoufox.async_api": fake_mod}):
+                    # Ordinary & ephemeral profiles remain blocked across start_hosted, AI goto, human new_tab, ctx.route
+                    for blocked_prof in ("ord-prof", "ephem-prof"):
+                        with self.assertRaises(ValueError):
+                            await hub.start_hosted(
+                                initial_url="https://mail.google.com", profile=blocked_prof, notify_tg=False
+                            )
+                        self.assertEqual("idle", hub.engine_mode)
+
+                        await hub.start_hosted(
+                            initial_url="https://example.com", profile=blocked_prof, notify_tg=False
+                        )
+                        self.assertFalse(hub._is_active_google_allowed())
+                        self.assertTrue(hub.ctx._callbacks.get("route"))
+                        with self.assertRaises(ValueError):
+                            await hub.execute_ai_action(
+                                {"action": "goto", "url": "https://accounts.google.com/signin", "notify": False}
+                            )
+                        hub.takeover = True
+                        await hub._execute_human_cmd_async({"action": "new_tab"})
+                        self.assertEqual("about:blank", hub._current_page().url)
+                        await hub.stop_hosted(notify_finished=False)
+
+                    # Positive flow: dedicated Google profile allowed on start_hosted, AI goto, human goto & new_tab!
+                    st = await hub.start_hosted(
+                        initial_url="https://mail.google.com/mail/u/0/#inbox",
+                        profile="ded-goog",
+                        notify_tg=False,
+                    )
+                    self.assertTrue(st["running"])
+                    self.assertTrue(st["allow_google"])
+                    self.assertFalse(st["pinned"])
+                    self.assertTrue(hub._is_active_google_allowed())
+                    self.assertFalse(hub.ctx._callbacks.get("route"))
+
+                    await hub.execute_ai_action(
+                        {"action": "goto", "url": "https://myaccount.google.com", "notify": False}
+                    )
+                    self.assertEqual("https://myaccount.google.com", hub._current_page().url)
+
+                    hub.takeover = True
+                    await hub._execute_human_cmd_async({"action": "new_tab"})
+                    self.assertEqual("https://www.google.com", hub._current_page().url)
+                    await hub.stop_hosted(notify_finished=False)
+
+            asyncio.run(_scenario())
+
+            # SyncLiveBridge consistency check: ordinary/ephemeral blocked, verified dedicated allowed
+            ord_dir = self.profiles_data / "ord-prof"
+            ord_dir.mkdir(parents=True, exist_ok=True)
+            ded_dir = self.profiles_data / "ded-goog"
+            ded_dir.mkdir(parents=True, exist_ok=True)
+
+            br_ord = live_browser_ctl.SyncLiveBridge.__new__(live_browser_ctl.SyncLiveBridge)
+            br_ord._pinned_verified = False
+            br_ord._allow_google_verified = False
+            br_ord._profile_name = "ord-prof"
+            br_ord._profile_dir = ord_dir
+            self.assertTrue(br_ord._is_sync_google_nav_blocked("https://mail.google.com"))
+
+            br_ded = live_browser_ctl.SyncLiveBridge.__new__(live_browser_ctl.SyncLiveBridge)
+            br_ded._pinned_verified = False
+            br_ded._allow_google_verified = True
+            br_ded._profile_name = "ded-goog"
+            br_ded._profile_dir = ded_dir
+            self.assertFalse(br_ded._is_sync_google_nav_blocked("https://mail.google.com"))
+
+    def test_c7_account_validation_and_group_nonowner_readonly_redaction(self) -> None:
+        """C7: Strict account label validation and redaction across group, non-owner & readonly views (HTTP + WS)."""
+        self._install_mock_google_browser("pinned_acct")
+        # 1. Account validation & secret rejection
+        for bad_acct in (123, True, ["a"], "has space", "   ", "line\nbreak", "ctrl\x00char", "a" * 129):
+            with self.subTest(bad_account=bad_acct):
+                with self.assertRaises(ValueError):
+                    srv.create_profile("bad-acct", {"os": "linux", "account": bad_acct})
+        for secret_key in ("password", "google_password", "secret", "token"):
+            with self.subTest(secret_key=secret_key):
+                with self.assertRaises(ValueError):
+                    srv.create_profile("bad-sec", {"os": "linux", secret_key: "MOCK_SECRET_VAL"})
+
+        # Empty string normalizes to None
+        empty_acct = srv.create_profile("empty-acct", {"os": "linux", "account": ""})
+        self.assertNotIn("account", empty_acct)
+
+        # Valid dedicated profile with account + proxy credentials
+        created = srv.create_profile(
+            "secret-acct-prof",
+            {
+                "os": "macos",
+                "allow_google": True,
+                "persistent": True,
+                "account": "sensitive-user@example.com",
+                "proxy": "socks5://MOCK_U:MOCK_P@proxy.example.com:1080",
+            },
+        )
+        self.assertEqual("sensitive-user@example.com", created["account"])
+        self.assertNotIn("MOCK_P", json.dumps(created))
+        self.assertEqual(0o600, stat.S_IMODE(self.profiles_file.stat().st_mode))
+
+        # 2. Group / non-owner / readonly redaction across HTTP & WS
+        bdir = self.root / "bridge-c7"
+        bdir.mkdir(parents=True, exist_ok=True)
+        bot_token = "123456789:EXAMPLE_C7_TEST_TOKEN_PAYLOAD_12345"
+        (bdir / ".env").write_text(
+            f"AGY_TG_BOT_TOKEN={bot_token}\n"
+            "AGY_TG_ALLOWED_CHATS=111,112,113,-1001234567890\n"
+            "AGY_TG_ADMIN_USERS=111,113\n"
+            "AGY_TG_USER_ROLES=111:admin,112:readonly,113:admin\n",
+            encoding="utf-8",
+        )
+
+        import hashlib
+        import hmac
+        import time as _time
+        import urllib.parse as _urlparse
+
+        def _sign_init(uid: int) -> str:
+            user_json = json.dumps({"id": uid, "first_name": "Tester"}, separators=(",", ":"))
+            fields = {"auth_date": str(int(_time.time())), "query_id": "Q1", "user": user_json}
+            dcs = "\n".join(f"{k}={v}" for k, v in sorted(fields.items()))
+            secret = hmac.new(b"WebAppData", bot_token.encode("utf-8"), hashlib.sha256).digest()
+            fields["hash"] = hmac.new(secret, dcs.encode("utf-8"), hashlib.sha256).hexdigest()
+            return _urlparse.urlencode(fields)
+
+        async def _scenario() -> None:
+            hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "sec-tok")
+            hub.engine_mode = "async_hosted"
+            hub.session_gen = 5
+            hub.session_owner = ("main", 111)
+            hub.active_profile = "secret-acct-prof"
+            hub.active_egress = "socks5://***@" + "proxy.example.com:1080"
+
+            with (
+                mock.patch.object(srv, "_BRIDGE_DIR", bdir),
+                mock.patch.object(srv, "web", self._make_fake_web()),
+            ):
+                # _redacted_state_dict & state_dict_for_viewer (non-owner admin 113 & readonly 112)
+                for redacted in (
+                    hub._redacted_state_dict(),
+                    hub.state_dict_for_viewer("main", 113, "admin"),
+                    hub.state_dict_for_viewer("main", 112, "readonly"),
+                ):
+                    blob = json.dumps(redacted)
+                    self.assertEqual([], redacted["profiles"])
+                    self.assertIsNone(redacted["profile"])
+                    self.assertNotIn("sensitive-user@example.com", blob)
+                    self.assertNotIn("secret-acct-prof", blob)
+                    self.assertNotIn("proxy.example.com", blob)
+
+                # Even when idle, readonly viewer sees profiles=[] and zero account/proxy leak
+                hub.engine_mode = "idle"
+                ro_idle = hub.state_dict_for_viewer("main", 112, "readonly")
+                self.assertEqual([], ro_idle["profiles"])
+                self.assertNotIn("sensitive-user@example.com", json.dumps(ro_idle))
+                hub.engine_mode = "async_hosted"
+
+                # HTTP /internal/profiles & /internal/status for group, non-owner, readonly
+                restricted_queries = [
+                    {"source": "tg_cmd", "bot": "main", "user_id": "111", "chat_id": "-1001234567890", "chat_scope": "group"},
+                    {"source": "tg_cmd", "bot": "main", "user_id": "113", "chat_id": "113"},
+                    {"source": "tg_cmd", "bot": "main", "user_id": "112", "chat_id": "112"},
+                ]
+                for q in restricted_queries:
+                    rp = await srv.internal_profiles_list(self._make_internal_req(hub, query=q))  # type: ignore[arg-type]
+                    self.assertEqual([], rp.data["profiles"])
+                    self.assertIsNone(rp.data["active_profile"])
+                    self.assertNotIn("sensitive-user@example.com", json.dumps(rp.data))
+
+                    rs = await srv.internal_status(self._make_internal_req(hub, query=q))  # type: ignore[arg-type]
+                    self.assertEqual([], rs.data["profiles"])
+                    self.assertIsNone(rs.data["profile"])
+                    self.assertNotIn("sensitive-user@example.com", json.dumps(rs.data))
+
+                # Owner admin DM sees account & masked proxy
+                rp_own = await srv.internal_profiles_list(
+                    self._make_internal_req(hub, query={"source": "tg_cmd", "bot": "main", "user_id": "111", "chat_id": "111"})
+                )  # type: ignore[arg-type]
+                by_name = {p["name"]: p for p in rp_own.data["profiles"]}
+                self.assertEqual("sensitive-user@example.com", by_name["secret-acct-prof"]["account"])
+                self.assertNotIn("MOCK_P", json.dumps(rp_own.data))
+
+                # WS list_profiles for non-owner (113) & readonly (112): returns profiles=[] and zero account leak
+                class _FakeWSMsg:
+                    def __init__(self, payload: str) -> None:
+                        self.type = "TEXT"
+                        self.data = payload
+
+                class _FakeWS:
+                    def __init__(self, msgs: list[dict]) -> None:
+                        self._msgs = [_FakeWSMsg(json.dumps(m)) for m in msgs]
+                        self.sent: list[dict] = []
+                        self.closed = False
+
+                    async def prepare(self, _req) -> None:
+                        return None
+
+                    async def receive(self, timeout=None):  # noqa: ARG002
+                        return self._msgs.pop(0)
+
+                    async def send_str(self, s: str) -> None:
+                        self.sent.append(json.loads(s))
+
+                    async def send_bytes(self, _b: bytes) -> None:
+                        return None
+
+                    async def close(self, **_kw) -> None:
+                        self.closed = True
+
+                    def __aiter__(self):
+                        return self
+
+                    async def __anext__(self):
+                        if self._msgs:
+                            return self._msgs.pop(0)
+                        raise StopAsyncIteration
+
+                for viewer_uid in (113, 112):
+                    ws_inst = _FakeWS(
+                        [{"type": "auth", "initData": _sign_init(viewer_uid)}, {"type": "list_profiles"}]
+                    )
+                    fake_ws_web = types.SimpleNamespace(
+                        WebSocketResponse=lambda **_kw: ws_inst,
+                        json_response=self._make_fake_web().json_response,
+                        HTTPForbidden=RuntimeError,
+                    )
+                    with (
+                        mock.patch.object(srv, "web", fake_ws_web),
+                        mock.patch.object(srv, "WSMsgType", types.SimpleNamespace(TEXT="TEXT")),
+                    ):
+                        await srv.handle_ws(types.SimpleNamespace(remote="127.0.0.1", app={"hub": hub}))  # type: ignore[arg-type]
+                    pl_msgs = [m for m in ws_inst.sent if m.get("type") == "profiles_list"]
+                    self.assertEqual(1, len(pl_msgs))
+                    self.assertEqual([], pl_msgs[0]["profiles"])
+                    self.assertIsNone(pl_msgs[0]["active_profile"])
+                    self.assertNotIn("sensitive-user@example.com", json.dumps(ws_inst.sent))
+                    self.assertNotIn("secret-acct-prof", json.dumps(ws_inst.sent))
+
+                # P0-1 (C7): WS initial state snapshot replay MUST sanitize for readonly viewers in BOTH:
+                #   (A) hub.engine_mode == "idle" (readonly user 112)
+                #   (B) active session where original owner (111) was demoted to readonly
+                hub.engine_mode = "idle"
+                ws_ro_idle = _FakeWS([{"type": "auth", "initData": _sign_init(112)}])
+                fake_ws_web_idle = types.SimpleNamespace(
+                    WebSocketResponse=lambda **_kw: ws_ro_idle,
+                    json_response=self._make_fake_web().json_response,
+                    HTTPForbidden=RuntimeError,
+                )
+                with (
+                    mock.patch.object(srv, "web", fake_ws_web_idle),
+                    mock.patch.object(srv, "WSMsgType", types.SimpleNamespace(TEXT="TEXT")),
+                ):
+                    await srv.handle_ws(types.SimpleNamespace(remote="127.0.0.1", app={"hub": hub}))  # type: ignore[arg-type]
+                idle_states = [m for m in ws_ro_idle.sent if m.get("type") == "state"]
+                self.assertEqual(1, len(idle_states))
+                self.assertEqual([], idle_states[0]["profiles"])
+                self.assertIsNone(idle_states[0]["profile"])
+                self.assertEqual("", idle_states[0]["egress"])
+                idle_blob = json.dumps(ws_ro_idle.sent)
+                self.assertNotIn("sensitive-user@example.com", idle_blob)
+                self.assertNotIn("secret-acct-prof", idle_blob)
+                self.assertNotIn("proxy.example.com", idle_blob)
+
+                # (B) Demote original owner 111 -> readonly while session is active
+                hub.engine_mode = "async_hosted"
+                hub.session_owner = ("main", 111)
+                hub.active_profile = "secret-acct-prof"
+                hub.active_egress = "socks5://***@" + "proxy.example.com:1080"
+                orig_env_txt = (bdir / ".env").read_text(encoding="utf-8")
+                try:
+                    (bdir / ".env").write_text(
+                        f"AGY_TG_BOT_TOKEN={bot_token}\n"
+                        "AGY_TG_ALLOWED_CHATS=111,112,113,-1001234567890\n"
+                        "AGY_TG_ADMIN_USERS=113\n"
+                        "AGY_TG_USER_ROLES=111:readonly,112:readonly,113:admin\n",
+                        encoding="utf-8",
+                    )
+                    ws_demoted = _FakeWS([{"type": "auth", "initData": _sign_init(111)}])
+                    fake_ws_web_demoted = types.SimpleNamespace(
+                        WebSocketResponse=lambda **_kw: ws_demoted,
+                        json_response=self._make_fake_web().json_response,
+                        HTTPForbidden=RuntimeError,
+                    )
+                    with (
+                        mock.patch.object(srv, "web", fake_ws_web_demoted),
+                        mock.patch.object(srv, "WSMsgType", types.SimpleNamespace(TEXT="TEXT")),
+                    ):
+                        await srv.handle_ws(types.SimpleNamespace(remote="127.0.0.1", app={"hub": hub}))  # type: ignore[arg-type]
+                    demoted_states = [m for m in ws_demoted.sent if m.get("type") == "state"]
+                    self.assertEqual(1, len(demoted_states))
+                    self.assertEqual([], demoted_states[0]["profiles"])
+                    self.assertIsNone(demoted_states[0]["profile"])
+                    self.assertEqual("", demoted_states[0]["egress"])
+                    demoted_blob = json.dumps(ws_demoted.sent)
+                    self.assertNotIn("sensitive-user@example.com", demoted_blob)
+                    self.assertNotIn("secret-acct-prof", demoted_blob)
+                    self.assertNotIn("proxy.example.com", demoted_blob)
+                finally:
+                    (bdir / ".env").write_text(orig_env_txt, encoding="utf-8")
+
+                # P1-2 (C7): HTTP POST /internal/profiles & DELETE /internal/profiles/<name> RBAC + group error redaction
+                r_grp_create = await srv.internal_profiles_create(
+                    self._make_internal_req(
+                        hub,
+                        body={
+                            "name": "grp-secret-prof",
+                            "os": "macos",
+                            "allow_google": True,
+                            "persistent": True,
+                            "account": "grp-acct@example.com",
+                            "proxy": "socks5://MOCK_U:MOCK_P@proxy.example.com:1080",
+                            "source": "tg_cmd",
+                            "bot": "main",
+                            "user_id": 111,
+                            "chat_id": -1001234567890,
+                            "chat_scope": "group",
+                        },
+                    )
+                )  # type: ignore[arg-type]
+                self.assertEqual(403, r_grp_create.status)
+                grp_create_blob = json.dumps(r_grp_create.data)
+                self.assertNotIn("grp-secret-prof", grp_create_blob)
+                self.assertNotIn("grp-acct@example.com", grp_create_blob)
+                self.assertNotIn("proxy.example.com", grp_create_blob)
+                self.assertNotIn("MOCK_P", grp_create_blob)
+
+                r_ro_create = await srv.internal_profiles_create(
+                    self._make_internal_req(
+                        hub,
+                        body={
+                            "name": "ro-secret-prof",
+                            "os": "linux",
+                            "account": "ro-acct@example.com",
+                            "source": "tg_cmd",
+                            "bot": "main",
+                            "user_id": 112,
+                            "chat_id": 112,
+                        },
+                    )
+                )  # type: ignore[arg-type]
+                self.assertEqual(403, r_ro_create.status)
+                self.assertNotIn("ro-secret-prof", json.dumps(r_ro_create.data))
+                self.assertNotIn("ro-acct@example.com", json.dumps(r_ro_create.data))
+
+                r_grp_del = await srv.internal_profiles_delete(
+                    self._make_internal_req(
+                        hub,
+                        match_info={"name": "secret-acct-prof"},
+                        query={
+                            "source": "tg_cmd",
+                            "bot": "main",
+                            "user_id": "111",
+                            "chat_id": "-1001234567890",
+                            "chat_scope": "group",
+                        },
+                    )
+                )  # type: ignore[arg-type]
+                self.assertEqual(403, r_grp_del.status)
+                self.assertNotIn("secret-acct-prof", json.dumps(r_grp_del.data))
+                self.assertNotIn("sensitive-user@example.com", json.dumps(r_grp_del.data))
+
+                r_ro_del = await srv.internal_profiles_delete(
+                    self._make_internal_req(
+                        hub,
+                        match_info={"name": "secret-acct-prof"},
+                        query={"source": "tg_cmd", "bot": "main", "user_id": "112", "chat_id": "112"},
+                    )
+                )  # type: ignore[arg-type]
+                self.assertEqual(403, r_ro_del.status)
+                self.assertNotIn("secret-acct-prof", json.dumps(r_ro_del.data))
+
+                # Group error-path redaction for internal_profiles_delete (404/409/400) if control passes
+                with mock.patch.object(
+                    srv, "_verify_internal_caller_control", return_value=(True, "ok", None, {"is_tg": False})
+                ):
+                    for err_name, expected_status in (
+                        ("secret-acct-prof", 409),
+                        ("missing-secret-prof", 404),
+                        ("pinned_acct", 400),
+                    ):
+                        r_gerr = await srv.internal_profiles_delete(
+                            self._make_internal_req(
+                                hub,
+                                match_info={"name": err_name},
+                                query={"chat_scope": "group", "chat_id": "-1001234567890"},
+                            )
+                        )  # type: ignore[arg-type]
+                        self.assertEqual(expected_status, r_gerr.status)
+                        self.assertNotIn(err_name, json.dumps(r_gerr.data))
+                        self.assertNotIn("proxy.example.com", json.dumps(r_gerr.data))
+
+                # TG DM owner admin CAN create & delete when idle; pure local CLI unaffected
+                hub.engine_mode = "idle"
+                hub.active_profile = ""
+                r_dm_create = await srv.internal_profiles_create(
+                    self._make_internal_req(
+                        hub,
+                        body={
+                            "name": "dm-owner-prof",
+                            "os": "linux",
+                            "source": "tg_cmd",
+                            "bot": "main",
+                            "user_id": 111,
+                            "chat_id": 111,
+                        },
+                    )
+                )  # type: ignore[arg-type]
+                self.assertEqual(200, r_dm_create.status)
+                r_dm_del = await srv.internal_profiles_delete(
+                    self._make_internal_req(
+                        hub,
+                        match_info={"name": "dm-owner-prof"},
+                        query={"source": "tg_cmd", "bot": "main", "user_id": "111", "chat_id": "111"},
+                    )
+                )  # type: ignore[arg-type]
+                self.assertEqual(200, r_dm_del.status)
+
+        asyncio.run(_scenario())
+
+        # P2-2 (C7): LiveBrowserClient.list_profiles() daemon-offline fallback group/non-DM redaction
+        for group_env in (
+            {"AGY_BOT_CHAT_ID": "-1001234567890"},
+            {"AGY_BOT_CHAT_ID": "-1001234567890", "AGY_LIVE_USER_ID": "111"},
+            {"AGY_BOT_CHAT_SCOPE": "group"},
+        ):
+            with self.subTest(offline_group_env=group_env):
+                with mock.patch.dict(os.environ, group_env, clear=False):
+                    client = live_browser_ctl.LiveBrowserClient(bot="sg")
+                    try:
+                        with mock.patch.object(client, "is_alive", return_value=False):
+                            res_off = client.list_profiles()
+                        self.assertEqual({"ok": True, "active_profile": None, "profiles": []}, res_off)
+                        off_blob = json.dumps(res_off)
+                        self.assertNotIn("sensitive-user@example.com", off_blob)
+                        self.assertNotIn("secret-acct-prof", off_blob)
+                        self.assertNotIn("proxy.example.com", off_blob)
+                    finally:
+                        client.session.close()
+
+        # Pure local CLI offline fallback (no group env) still lists configured profiles
+        cli_client = live_browser_ctl.LiveBrowserClient(bot="sg")
+        try:
+            with mock.patch.object(cli_client, "is_alive", return_value=False):
+                res_cli = cli_client.list_profiles()
+            self.assertTrue(res_cli["ok"])
+            self.assertTrue(any(p["name"] == "secret-acct-prof" for p in res_cli["profiles"]))
+        finally:
+            cli_client.session.close()
+
+    def test_c8_public_files_sanitization_guard(self) -> None:
+        """C8: Public-synced live-browser files contain zero hardcoded host user home paths."""
+        forbidden_home = "/" + "home" + "/" + "ubuntu"
+        public_files = (
+            REPO_ROOT / ".agents/skills/live-browser/scripts/live_browser_server.py",
+            REPO_ROOT / ".agents/skills/live-browser/scripts/live_browser_ctl.py",
+            REPO_ROOT / ".agents/skills/live-browser/SKILL.md",
+            REPO_ROOT / "tests/test_live_browser_profiles.py",
+        )
+        for pf in public_files:
+            txt = pf.read_text(encoding="utf-8")
+            self.assertNotIn(forbidden_home, txt, f"Hardcoded host path found in public file {pf.name}")
 
 
 if __name__ == "__main__":

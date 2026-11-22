@@ -478,12 +478,13 @@ class TestTemplatesAndSystemdUnits(unittest.TestCase):
             REPO_ROOT / "systemd" / "agy-tg-bridge.service",
             REPO_ROOT / "systemd" / "agy-tg-bridge-sg.service",
             REPO_ROOT / "systemd" / "agy-tg-bridge-jeff.service",
+            REPO_ROOT / "systemd" / "agy-tg-bridge-sgcli.service",
             REPO_ROOT / "systemd" / "agy-llm-shim.service",
             REPO_ROOT / "systemd" / "user" / "antigravity-cli-daemon.service",
         ]
         existing_private = [u for u in private_units if u.is_file()]
         if existing_private:
-            self.assertEqual(5, len(existing_private), "All 5 private systemd units must exist")
+            self.assertEqual(6, len(existing_private), "All 6 private systemd units must exist")
             for unit in existing_private:
                 txt = unit.read_text(encoding="utf-8")
                 self.assertIn(

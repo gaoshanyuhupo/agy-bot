@@ -910,6 +910,7 @@ class TestLiveBrowserHandoverAndAuthContracts(unittest.TestCase):
                 "AGY_BOT_CHAT_ID": str(GROUP_CHAT_ID),
                 "AGY_LIVE_USER_ID": "",
                 "AGY_TG_BOT_TOKEN": BOT_SG_TOKEN,
+                "AGY_TG_ENV_FILE": str(self.auth_ws.bridge_dir / ".env.sg"),
             },
             clear=False,
         ):
@@ -1353,6 +1354,124 @@ class TestLiveBrowserHandoverAndAuthContracts(unittest.TestCase):
             with self.subTest(takeover_timeout=bad_t):
                 with self.assertRaises(ValueError):
                     bridge.sync_checkpoint(takeover_timeout=bad_t)  # type: ignore[arg-type]
+
+    def test_cross_bot_override_blocked_inside_telegram_bridge_turn(self) -> None:
+        """A Telegram bot turn (e.g. sgcli / main) MUST bind to its own bot and reject --bot <other>."""
+        sgcli_id = str(300 + 3)
+        sgcli_tok = f"{sgcli_id}:" + "SGCLI_" + "TEST_TOK_GAMMA"
+        sgcli_env = {
+            "AGY_TG_ENV_FILE": "/tmp/mock-bridge/.env.sgcli",
+            "AGY_TG_BOT_TOKEN": sgcli_tok,
+            "AGY_BOT_CHAT_ID": str(ADMIN_UID_A),
+            "AGY_BOT_HANDLE": "mock_sgcli_bot",
+        }
+        with mock.patch.dict(os.environ, sgcli_env, clear=False):
+            # Default / auto resolves to canonical spawning bot key ("sgcli")
+            self.assertEqual("sgcli", ctl.LiveBrowserClient().bot)
+            self.assertEqual("sgcli", ctl.LiveBrowserClient(bot="auto").bot)
+            # Explicit self key or self numeric bot_id is allowed
+            self.assertEqual("sgcli", ctl.LiveBrowserClient(bot="sgcli").bot)
+            self.assertEqual(sgcli_id, ctl.LiveBrowserClient(bot=sgcli_id).bot)
+            # Cross-bot override (--bot sg / --bot main / other numeric ID) MUST fail closed
+            for wrong_bot in ("sg", "main", "jeff", str(200 + 2)):
+                with self.subTest(wrong_bot=wrong_bot):
+                    with self.assertRaises(ValueError):
+                        ctl.LiveBrowserClient(bot=wrong_bot)
+                    with self.assertRaises(ValueError):
+                        ctl.SyncLiveBridge(types.SimpleNamespace(pages=[]), bot_hint=wrong_bot)
+
+            # CLI entrypoint fails closed with rc=1 and zero HTTP calls
+            with mock.patch("requests.Session.post", side_effect=AssertionError("Must not call HTTP on cross-bot mismatch")):
+                with mock.patch.object(sys, "argv", ["live-browser", "--bot", "sg", "start"]):
+                    rc = ctl.main()
+            self.assertEqual(1, rc)
+
+        # Main bot (.env) resolves to "main" and rejects "--bot sg"
+        main_env = {
+            "AGY_TG_ENV_FILE": "/tmp/mock-bridge/.env",
+            "AGY_TG_BOT_TOKEN": BOT_MAIN_TOKEN,
+            "AGY_BOT_CHAT_ID": str(ADMIN_UID_A),
+        }
+        with mock.patch.dict(os.environ, main_env, clear=False):
+            self.assertEqual("main", ctl.LiveBrowserClient(bot="auto").bot)
+            with self.assertRaises(ValueError):
+                ctl.LiveBrowserClient(bot="sg")
+
+        # Pure standalone CLI (no Telegram bridge env vars) retains explicit --bot & default "sg" compatibility
+        self.assertEqual("sg", ctl.LiveBrowserClient(bot="auto").bot)
+        self.assertEqual("sgcli", ctl.LiveBrowserClient(bot="sgcli").bot)
+        self.assertEqual("main", ctl.LiveBrowserClient(bot="main").bot)
+
+    def test_p0_cross_bot_fail_closed_when_env_key_missing_only_token_and_chat_id(self) -> None:
+        """Even without AGY_TG_ENV_FILE (env_key=None), a Telegram turn with token+chat_id MUST block --bot sg."""
+        tok_id = str(300 + 7)
+        tok_val = f"{tok_id}:" + "TOKEN_ONLY_" + "TEST_DELTA"
+        for label, extra in (
+            ("missing_env_file", {}),
+            ("malformed_env_file", {"AGY_TG_ENV_FILE": "/tmp/../.env.sg"}),
+        ):
+            with self.subTest(case=label):
+                env_vars = {
+                    "AGY_TG_BOT_TOKEN": tok_val,
+                    "AGY_BOT_CHAT_ID": str(ADMIN_UID_A),
+                    **extra,
+                }
+                with mock.patch.dict(os.environ, env_vars, clear=False):
+                    if "AGY_TG_ENV_FILE" not in extra:
+                        os.environ.pop("AGY_TG_ENV_FILE", None)
+                    self.assertEqual(tok_id, ctl.resolve_bot_target("auto"))
+                    self.assertEqual(tok_id, ctl.LiveBrowserClient(bot=tok_id).bot)
+                    for wrong_bot in ("sg", "main", "other_bot", str(200 + 2)):
+                        with self.assertRaises(ValueError):
+                            ctl.resolve_bot_target(wrong_bot)
+                        with self.assertRaises(ValueError):
+                            ctl.LiveBrowserClient(bot=wrong_bot)
+                        with self.assertRaises(ValueError):
+                            ctl.SyncLiveBridge(types.SimpleNamespace(pages=[]), bot_hint=wrong_bot)
+                    with mock.patch(
+                        "requests.Session.post",
+                        side_effect=AssertionError("Must not call HTTP on cross-bot mismatch"),
+                    ):
+                        with mock.patch.object(sys, "argv", ["live-browser", "--bot", "sg", "start"]):
+                            self.assertEqual(1, ctl.main())
+
+    def test_p0_parse_env_file_bot_key_strict_sanitization(self) -> None:
+        """_parse_env_file_bot_key rejects traversal, control chars, shell metachars, spaces, extra dots, ignored suffixes."""
+        self.assertEqual("main", ctl._parse_env_file_bot_key("/tmp/mock-bridge/.env"))
+        self.assertEqual("sgcli", ctl._parse_env_file_bot_key("/tmp/mock-bridge/.env.sgcli"))
+        self.assertEqual("bot_01-a", ctl._parse_env_file_bot_key("/tmp/mock-bridge/.env.bot_01-a"))
+
+        bad_inputs = [
+            None,
+            "",
+            "   ",
+            "/tmp/../.env.sg",
+            "../.env",
+            "/tmp/bridge/..\\.env.sg",
+            "/tmp/.env.sg;id",
+            "/tmp/.env.sg;rm",
+            "/tmp/.env.sg bot",
+            "/tmp/.env. ",
+            "/tmp/.env.sg\n",
+            "/tmp/.env.sg\r",
+            "/tmp/\x00.env.sg",
+            "/tmp/.env.\x1bsg",
+            "/tmp/.env.sg\t",
+            "/tmp/.env.sg\x7f",
+            "/tmp/.env.sg.bak",
+            "/tmp/.env.a.b",
+            "/tmp/.env.bak",
+            "/tmp/.env.tmp",
+            "/tmp/.env.example",
+            "/tmp/.env.EXAMPLE",
+            "/tmp/.env.disabled",
+            "/tmp/.env.orig",
+            "/tmp/.env." + ("a" * 33),
+            "/tmp/.env.sg/",
+        ]
+        for raw in bad_inputs:
+            with self.subTest(raw=raw):
+                self.assertIsNone(ctl._parse_env_file_bot_key(raw))
 
 
 if __name__ == "__main__":
