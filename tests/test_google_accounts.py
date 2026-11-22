@@ -116,29 +116,38 @@ def _load_isolated_bridge(tmp: str, extra_env: dict[str, str] | None = None):
         return bridge
 
 
-class _UnixHTTPConnection(http.client.HTTPConnection):
-    def __init__(self, sock_path: str, timeout: float = 5.0) -> None:
-        super().__init__("localhost", timeout=timeout)
-        self._sock_path = sock_path
+def _ipc_post(sock_path: str, path: str, body: dict, headers: dict[str, str], timeout: float = 5.0) -> tuple[int, dict]:
+    raw = json.dumps(body).encode("utf-8")
+    req_headers = {
+        "Host": "localhost",
+        "Connection": "close",
+        "Content-Type": "application/json",
+        "Content-Length": str(len(raw)),
+        **headers,
+    }
+    header_lines = [f"POST {path} HTTP/1.1"]
+    header_lines.extend(f"{k}: {v}" for k, v in req_headers.items())
+    payload = ("\r\n".join(header_lines) + "\r\n\r\n").encode("iso-8859-1") + raw
 
-    def connect(self) -> None:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(self.timeout)
-        sock.connect(self._sock_path)
-        self.sock = sock
-
-
-def _ipc_post(sock_path: str, path: str, body: dict, headers: dict[str, str]) -> tuple[int, dict]:
-    conn = _UnixHTTPConnection(sock_path)
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    resp: http.client.HTTPResponse | None = None
     try:
-        raw = json.dumps(body).encode("utf-8")
-        req_headers = {"Content-Type": "application/json", "Content-Length": str(len(raw)), **headers}
-        conn.request("POST", path, body=raw, headers=req_headers)
-        resp = conn.getresponse()
+        sock.settimeout(timeout)
+        sock.connect(sock_path)
+        try:
+            sock.sendall(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            # Server may fail-closed (e.g. proxy headers or wrong SO_PEERCRED UID),
+            # write 403, and close the socket before sendall finishes; read the buffered response.
+            pass
+        resp = http.client.HTTPResponse(sock, method="POST")
+        resp.begin()
         data = json.loads(resp.read().decode("utf-8"))
         return resp.status, data
     finally:
-        conn.close()
+        if resp is not None:
+            resp.close()
+        sock.close()
 
 
 # ---------------------------------------------------------------------------
