@@ -45,6 +45,7 @@ PROTECTED_FILES: Tuple[str, ...] = (
 BRIDGE_TEST_FILES: Tuple[str, ...] = (
     "tests/test_access_control.py",
     "tests/test_agy_auto_update_guard.py",
+    "tests/test_bridge_anti_hang.py",
     "tests/test_bridge_core.py",
     "tests/test_bridge_p0.py",
     "tests/test_bot_bus.py",

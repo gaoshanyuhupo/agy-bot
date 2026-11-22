@@ -25,6 +25,7 @@ import importlib.util
 import inspect
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import re
@@ -147,6 +148,31 @@ _GOOGLE_HOST_RE = re.compile(
     r")$"
 )
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
+_CARD_SECRET_REDACT_RE = re.compile(
+    r"(?:bot\d+:[A-Za-z0-9_-]{8,}|(?i:x-live-token\s*[:=]\s*)[A-Za-z0-9._-]{6,}|(?i:bearer\s+)[A-Za-z0-9._-]{10,})"
+)
+
+
+def _sanitize_card_error(raw: Any, max_len: int = 200) -> str:
+    """Sanitize card/delivery error text so bot/local tokens and control chars are never leaked."""
+    text = str(raw or "").replace("\r", " ").replace("\n", " ").strip()
+    text = _CARD_SECRET_REDACT_RE.sub("[REDACTED]", text)
+    text = _CONTROL_CHAR_RE.sub(" ", text)
+    return re.sub(r"\s+", " ", text).strip()[:max_len]
+
+
+def _validate_positive_timeout(raw: Any, default: float = 600.0) -> float:
+    """Validate that timeout is a positive finite number (rejects bool, <=0, NaN, inf)."""
+    val = default if raw is None else raw
+    if isinstance(val, bool):
+        raise ValueError("timeout must be a positive finite number, not bool")
+    try:
+        num = float(val)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid timeout: {raw!r}") from exc
+    if not math.isfinite(num) or num <= 0:
+        raise ValueError(f"timeout must be a positive finite number, got {raw!r}")
+    return num
 
 QUALITY_PRESETS: dict[str, dict[str, Any]] = {
     "smooth": {
@@ -1452,6 +1478,7 @@ class TelegramLiveCardPublisher:
         # overwrite or drop bounded retirement retries (`retire_attempts` capped at 3).
         self.pending_retire_cards: dict[tuple[str, int, int], dict[str, Any]] = {}
         self._lock = asyncio.Lock()
+        self.last_card_error: str | None = None
 
     def _stage_card_for_retire(
         self,
@@ -1868,9 +1895,12 @@ class TelegramLiveCardPublisher:
         preferred_user_id: int | None = None,
     ) -> dict[str, Any] | None:
         """Create or update the live browser card in the session owner's verified private DM chat."""
+        self.last_card_error = None
         if not bot_key or self.hub.engine_mode == "idle":
+            self.last_card_error = "浏览器未运行或缺少 Bot 身份"
             return None
         if not self.hub._has_verified_session_owner():
+            self.last_card_error = "会话未绑定管理员私聊归属，无法发送 Telegram 实况卡片"
             log.warning(
                 "Skipping live card send for bot=%s: session has no explicit verified (bot_key, user_id) owner",
                 bot_key,
@@ -1882,6 +1912,7 @@ class TelegramLiveCardPublisher:
             bot_key, preferred_user_id=preferred_user_id, require_admin=True
         )
         if not token or not chat_id or chat_id <= 0:
+            self.last_card_error = "未找到已授权的管理员私聊目标"
             if token:
                 log.warning(
                     "Skipping live card send for bot=%s: no unambiguous authorized private chat_id",
@@ -1889,12 +1920,16 @@ class TelegramLiveCardPublisher:
                 )
             return None
         if not self._matches_session_owner(bot_key, chat_id):
+            self.last_card_error = "目标私聊与当前会话归属者不匹配"
             log.warning(
                 "Blocking live card send for bot=%s chat_id=%s: session owned by %s",
                 bot_key,
                 chat_id,
                 self.hub.session_owner,
             )
+            return None
+        if not self.http:
+            self.last_card_error = "Telegram 推送通道未就绪"
             return None
 
         # Wait briefly if first frame is still arriving
@@ -1904,6 +1939,7 @@ class TelegramLiveCardPublisher:
                 or self.hub.session_owner != card_owner
                 or self.hub.engine_mode == "idle"
             ):
+                self.last_card_error = "发卡前会话状态已变更"
                 return None
             if self.hub.latest_jpeg:
                 break
@@ -1916,6 +1952,9 @@ class TelegramLiveCardPublisher:
             or not self.http
             or not self._matches_session_owner(bot_key, chat_id)
         ):
+            self.last_card_error = (
+                "浏览器画面尚未就绪" if not self.hub.latest_jpeg else "发卡前会话状态或归属已变更"
+            )
             return None
 
         card_key = (bot_key, chat_id)
@@ -1927,12 +1966,14 @@ class TelegramLiveCardPublisher:
                 or not self.hub.latest_jpeg
                 or not self._matches_session_owner(bot_key, chat_id)
             ):
+                self.last_card_error = "发卡前会话状态或归属已变更"
                 return None
             # Re-check live authorization right before calling Telegram API!
             bots, _, _, allowed_by_bot, bot_roles = _load_auth_context()
             live_token = self._is_card_currently_authorized(bot_key, chat_id, bots, allowed_by_bot, bot_roles)
             if not live_token:
                 self._drop_revoked_cards(bot_key, chat_id)
+                self.last_card_error = "管理员权限未授权或已撤销"
                 return None
 
             existing = self.cards.get(card_key)
@@ -1944,9 +1985,14 @@ class TelegramLiveCardPublisher:
                     or self.hub.session_owner != card_owner
                     or not self._matches_session_owner(bot_key, chat_id)
                 ):
+                    self.last_card_error = "卡片更新期间会话状态已变更"
                     return None
                 cur = self.cards.get(card_key)
-                return cur if (cur is not None and cur.get("session_gen") == card_gen) else None
+                if cur is not None and cur.get("session_gen") == card_gen:
+                    self.last_card_error = None
+                    return cur
+                self.last_card_error = "既有实况卡片已失效"
+                return None
             if existing and existing.get("session_gen") != card_gen:
                 # Preserve stale card's retirement retry tracking before sending a new card
                 self._stage_card_for_retire(existing, card_key=card_key)
@@ -1969,6 +2015,7 @@ class TelegramLiveCardPublisher:
 
             send_ok = False
             mid = 0
+            send_err: str | None = None
             try:
                 parsed_mid = 0
                 io_send_ok = False
@@ -1986,7 +2033,8 @@ class TelegramLiveCardPublisher:
                             if isinstance(err_data, dict)
                             else f"HTTP {status}"
                         )
-                        log.warning("sendPhoto failed (%s, HTTP %s): %s", bot_key, status, desc)
+                        send_err = _sanitize_card_error(f"Telegram sendPhoto HTTP {status}: {desc}")
+                        log.warning("sendPhoto failed (%s, HTTP %s): %s", bot_key, status, _sanitize_card_error(desc))
                     else:
                         data = await resp.json()
                         if (
@@ -2003,7 +2051,8 @@ class TelegramLiveCardPublisher:
                             io_send_ok = True
                         else:
                             desc = data.get("description") if isinstance(data, dict) else data
-                            log.warning("sendPhoto failed (%s): %s", bot_key, desc)
+                            send_err = _sanitize_card_error(f"Telegram sendPhoto failed: {desc}")
+                            log.warning("sendPhoto failed (%s): %s", bot_key, _sanitize_card_error(desc))
                 # Commit success only after async with __aexit__ exits cleanly
                 if io_send_ok:
                     mid = parsed_mid
@@ -2011,7 +2060,8 @@ class TelegramLiveCardPublisher:
             except Exception as exc:
                 send_ok = False
                 mid = 0
-                log.warning("sendPhoto error (%s): %s", bot_key, exc)
+                send_err = _sanitize_card_error(f"Telegram sendPhoto error: {exc}")
+                log.warning("sendPhoto error (%s): %s", bot_key, _sanitize_card_error(exc))
             except BaseException:
                 self._recheck_auth_or_drop_locked(bot_key, chat_id)
                 raise
@@ -2020,6 +2070,7 @@ class TelegramLiveCardPublisher:
             # (200 ok, non-200 / ok=false, missing/malformed message_id, or transport/JSON exception).
             still_token = self._recheck_auth_or_drop_locked(bot_key, chat_id)
             if not still_token:
+                self.last_card_error = "发卡期间管理员权限已撤销"
                 log.info(
                     "Discarding live cards bot=%s chat_id=%s mid=%s: authorization revoked in-flight during sendPhoto",
                     bot_key,
@@ -2028,6 +2079,7 @@ class TelegramLiveCardPublisher:
                 )
                 return None
             if not send_ok:
+                self.last_card_error = send_err or "Telegram sendPhoto 发送失败"
                 return None
 
             if (
@@ -2036,6 +2088,7 @@ class TelegramLiveCardPublisher:
                 or self.hub.session_owner != card_owner
                 or not self._matches_session_owner(bot_key, chat_id)
             ):
+                self.last_card_error = "发卡期间会话状态已变更"
                 log.info(
                     "Discarding & retiring orphan live card bot=%s chat_id=%s mid=%s (card_gen=%d cur_gen=%d)",
                     bot_key,
@@ -2071,6 +2124,7 @@ class TelegramLiveCardPublisher:
                 "last_markup": markup,
                 "last_ts": time.monotonic(),
             }
+            self.last_card_error = None
             log.info(
                 "Created Telegram live card bot=%s chat_id=%s message_id=%s gen=%d",
                 bot_key,
@@ -4708,6 +4762,8 @@ class LiveBrowserHub:
         expected_session_gen: int | None = None,
     ) -> dict[str, Any]:
         async with self._engine_lock:
+            if expected_session_gen is not None and self.session_gen != expected_session_gen:
+                raise PermissionError("会话代次已变更，已拒绝过期启动/切换请求")
             is_remote_actor = (source != "cli") or (actor is not None)
             if is_remote_actor:
                 if (
@@ -4722,8 +4778,6 @@ class LiveBrowserHub:
                 live_role = _check_live_user_role(a_bot, a_uid)
                 if live_role != "admin":
                     raise PermissionError("当前用户未授权或不是管理员")
-                if expected_session_gen is not None and self.session_gen != expected_session_gen:
-                    raise PermissionError("会话代次已变更，已拒绝过期启动/切换请求")
                 if self.engine_mode != "idle":
                     if not self._viewer_can_mutate(a_bot, a_uid, live_role):
                         raise PermissionError("🔒 当前浏览器会话由其他 Bot/用户或本机 CLI 持有，无权复用、导航或切换")
@@ -4880,13 +4934,16 @@ class LiveBrowserHub:
 
                     # Final pre-commit RBAC, idle, generation & owner re-verification AFTER all async
                     # launch awaits and BEFORE publishing the new session (fail-closed: closes unpublished CM!).
+                    if (
+                        self.engine_mode != "idle"
+                        or self.session_gen != pre_launch_gen
+                        or (expected_session_gen is not None and not restart and self.session_gen != expected_session_gen)
+                    ):
+                        raise PermissionError("会话发布前状态或代次已变更，已中止启动（fail-closed）")
                     if is_remote_actor:
                         resolved_owner_check = (self.resolve_bot_key(bot_hint), preferred_user_id)
                         if (
                             _check_live_user_role(a_bot, a_uid) != "admin"
-                            or self.engine_mode != "idle"
-                            or self.session_gen != pre_launch_gen
-                            or (expected_session_gen is not None and not restart and self.session_gen != expected_session_gen)
                             or resolved_owner_check != pre_launch_owner
                             or resolved_owner_check != (a_bot, a_uid)
                         ):
@@ -4994,13 +5051,36 @@ class LiveBrowserHub:
             await self._capture_once(force_broadcast=True)
             await self.broadcast_state()
             result_state = self.state_dict()
+            owner_bound = self._has_verified_session_owner()
 
+        card_sent = False
+        card_error: str | None = None
         if notify_tg:
-            if not is_remote_actor or _check_live_user_role(a_bot, a_uid) == "admin":
+            if not owner_bound:
+                card_error = "会话未绑定管理员私聊归属，无法发送 Telegram 实况卡片"
+            elif is_remote_actor and _check_live_user_role(a_bot, a_uid) != "admin":
+                card_error = "管理员权限未授权或已撤销"
+            else:
                 bot_key = self.resolve_bot_key(bot_hint)
-                if bot_key is not None:
-                    asyncio.create_task(self.tg.ensure_card(bot_key, preferred_user_id=preferred_user_id))
+                if bot_key is None:
+                    card_error = "无法识别目标 Bot 身份"
+                else:
+                    try:
+                        card_res = await self.tg.ensure_card(bot_key, preferred_user_id=preferred_user_id)
+                        if card_res is not None:
+                            card_sent = True
+                            card_error = None
+                        else:
+                            card_error = _sanitize_card_error(
+                                self.tg.last_card_error or "Telegram 实况卡片发送失败"
+                            )
+                    except Exception as exc:
+                        card_sent = False
+                        card_error = _sanitize_card_error(f"Telegram 实况卡片发送异常: {exc}")
 
+        result_state["owner_bound"] = owner_bound
+        result_state["card_sent"] = card_sent
+        result_state["card_error"] = card_error
         return result_state
 
     async def stop_hosted(
@@ -5020,6 +5100,8 @@ class LiveBrowserHub:
                 ok_v, msg_v = pre_stop_verify()
                 if not ok_v:
                     return False, str(msg_v)
+            if expected_session_gen is not None and self.session_gen != expected_session_gen:
+                return False, "会话代次已变更，已拒绝过期停止请求"
             if source != "cli" or actor is not None:
                 if (
                     actor is None
@@ -5042,8 +5124,6 @@ class LiveBrowserHub:
                     if not ok_cv:
                         return False, msg_cv
                 else:
-                    if expected_session_gen is not None and self.session_gen != expected_session_gen:
-                        return False, "会话代次已变更，已拒绝过期停止请求"
                     live_role = _check_live_user_role(a_bot, a_uid)
                     if live_role != "admin":
                         return False, "当前用户未授权或不是管理员"
@@ -6412,34 +6492,203 @@ class LiveBrowserHub:
 
     # ---------------- AI Agent Action RPC ----------------
 
-    async def execute_ai_action(self, payload: dict[str, Any]) -> dict[str, Any]:
+    async def execute_ai_action(
+        self,
+        payload: dict[str, Any],
+        *,
+        auth_ctx: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if auth_ctx is None:
+            ok_ctrl, err_ctrl, _, auth_ctx = _verify_internal_caller_control(
+                self, payload, require_running=False
+            )
+            if not ok_ctrl:
+                raise PermissionError(err_ctrl)
+
         action = str(payload.get("action", "")).strip()
-        bot_hint = payload.get("bot")
-        raw_uid = payload.get("user_id")
-        pref_uid = int(raw_uid) if raw_uid is not None and str(raw_uid).isdigit() and int(raw_uid) > 0 else None
+        is_tg = bool(auth_ctx.get("is_tg"))
+        actor_arg = (auth_ctx["bot_key"], auth_ctx["chat_id"]) if is_tg else None
+        source_arg = str(auth_ctx.get("source") or "tg_cmd") if is_tg else "cli"
+        exp_gen = (
+            auth_ctx.get("expected_gen")
+            if is_tg
+            else (
+                _parse_strict_int(payload.get("expected_session_gen"))
+                if payload.get("expected_session_gen") is not None
+                else None
+            )
+        )
+        bot_hint = actor_arg[0] if actor_arg is not None else payload.get("bot")
+        pref_uid = actor_arg[1] if actor_arg is not None else _parse_positive_int(payload.get("user_id"))
         notify = bool(payload.get("notify", True))
-        self.mark_active(mark_tabs_dirty=True)
+
+        def _should_redact_tg_state(expected_gen: int | None) -> bool:
+            if not is_tg or actor_arg is None:
+                return False
+            a_bot, a_uid = actor_arg
+            if expected_gen is not None and self.session_gen != expected_gen:
+                return True
+            live_role = _check_live_user_role(a_bot, a_uid)
+            if live_role != "admin":
+                return True
+            return not self._viewer_can_read_session(a_bot, a_uid, live_role)
+
+        def _safe_action_state(expected_gen: int | None) -> dict[str, Any]:
+            if _should_redact_tg_state(expected_gen):
+                return self._redacted_state_dict()
+            return self.state_dict()
 
         if action == "wait_human":
+            # Validate timeout strictly BEFORE any browser launch / card / takeover side effect!
+            timeout = _validate_positive_timeout(payload.get("timeout"), default=600.0)
             reason = str(payload.get("reason") or "请点击下方按钮打开面板完成手动操作，完成后点【▶️ 交还给 AI】")
-            timeout = float(payload.get("timeout", 600.0))
+            self.mark_active(mark_tabs_dirty=True)
+            card_sent = False
+            card_error: str | None = None
             if self.engine_mode == "idle":
-                await self.start_hosted(bot_hint=bot_hint, notify_tg=notify, preferred_user_id=pref_uid)
-            elif notify:
-                bot_key = self.resolve_bot_key(bot_hint)
-                if bot_key is not None:
-                    await self.tg.ensure_card(bot_key, preferred_user_id=pref_uid)
-            await self.set_takeover(True, reason=reason, owner=self.session_owner)
-            await asyncio.wait_for(self.ai_allowed_event.wait(), timeout=timeout)
-            await self._capture_once()
-            return {"ok": True, "resumed": True, **self.state_dict()}
+                start_res = await self.start_hosted(
+                    bot_hint=bot_hint,
+                    notify_tg=notify,
+                    preferred_user_id=pref_uid,
+                    actor=actor_arg,
+                    source=source_arg,
+                    expected_session_gen=exp_gen,
+                )
+                card_sent = bool(start_res.get("card_sent"))
+                card_error = start_res.get("card_error")
+                active_sgen = _parse_strict_int(start_res.get("session_gen"))
+            else:
+                active_sgen = exp_gen if exp_gen is not None else self.session_gen
+                if notify:
+                    bot_key = actor_arg[0] if actor_arg is not None else self.resolve_bot_key(bot_hint)
+                    if bot_key is not None:
+                        card_res = await self.tg.ensure_card(bot_key, preferred_user_id=pref_uid)
+                        card_sent = card_res is not None
+                        card_error = (
+                            None
+                            if card_sent
+                            else _sanitize_card_error(self.tg.last_card_error or "Telegram 实况卡片发送失败")
+                        )
+                    else:
+                        card_sent = False
+                        card_error = "无法识别目标 Bot 身份"
 
+            owner_bound = self._has_verified_session_owner()
+            has_active_viewer = False
+            if owner_bound and self.session_owner is not None:
+                o_bot, o_uid = self.session_owner
+                has_active_viewer = self._has_eligible_admin_viewer(o_bot, o_uid)
+
+            if notify and not card_sent and not has_active_viewer:
+                fail_err = _sanitize_card_error(
+                    card_error
+                    or (
+                        "会话未绑定管理员私聊归属，已中止人工接管等待"
+                        if not owner_bound
+                        else "Telegram 实况卡片发送失败且无活跃管理员面板，已中止等待"
+                    )
+                )
+                return {
+                    "ok": False,
+                    "resumed": False,
+                    "owner_bound": owner_bound,
+                    "card_sent": False,
+                    "card_error": fail_err,
+                    "error": fail_err,
+                    **_safe_action_state(active_sgen),
+                }
+
+            ok_tk, err_tk, tk_sgen, tk_tgen = await self.set_takeover(
+                True,
+                reason=reason,
+                owner=self.session_owner,
+                expected_session_gen=active_sgen,
+                actor=actor_arg,
+            )
+            if not ok_tk:
+                raise PermissionError(err_tk)
+
+            try:
+                await asyncio.wait_for(self.ai_allowed_event.wait(), timeout=timeout)
+            except (asyncio.TimeoutError, TimeoutError):
+                # Clean up ONLY the exact (session_gen, takeover_gen) we acquired so a concurrent
+                # newer session or newer takeover generation is never clobbered.
+                await self.set_takeover(
+                    False,
+                    reason=f"等待人工交还超时（{timeout:g}s），已自动清理接管状态",
+                    expected_session_gen=tk_sgen,
+                    expected_takeover_gen=tk_tgen,
+                )
+                return {
+                    "ok": False,
+                    "resumed": False,
+                    "timeout": True,
+                    "owner_bound": owner_bound,
+                    "card_sent": card_sent,
+                    "card_error": card_error,
+                    "error": f"等待人工交还超时（{timeout:g}s）",
+                    **_safe_action_state(tk_sgen),
+                }
+
+            if self.engine_mode == "idle" or self.session_gen != tk_sgen:
+                return {
+                    "ok": False,
+                    "resumed": False,
+                    "owner_bound": False if _should_redact_tg_state(tk_sgen) else self._has_verified_session_owner(),
+                    "card_sent": card_sent,
+                    "card_error": card_error,
+                    "error": "等待人工交还期间浏览器会话已关闭或切换",
+                    **_safe_action_state(tk_sgen),
+                }
+
+            if _should_redact_tg_state(tk_sgen):
+                return {
+                    "ok": False,
+                    "resumed": False,
+                    "owner_bound": False,
+                    "card_sent": card_sent,
+                    "card_error": card_error,
+                    "error": "等待人工交还期间权限已撤销或会话归属已变更",
+                    **self._redacted_state_dict(),
+                }
+
+            await self._capture_once()
+            return {
+                "ok": True,
+                "resumed": True,
+                "owner_bound": owner_bound,
+                "card_sent": card_sent,
+                "card_error": card_error,
+                **_safe_action_state(tk_sgen),
+            }
+
+        self.mark_active(mark_tabs_dirty=True)
         if self.engine_mode == "idle":
-            await self.start_hosted(bot_hint=bot_hint, notify_tg=notify, preferred_user_id=pref_uid)
-        elif notify and bot_hint:
-            bot_key = self.resolve_bot_key(bot_hint)
-            if bot_key is not None and not self.tg.has_card_for_bot(bot_key):
-                asyncio.create_task(self.tg.ensure_card(bot_key, preferred_user_id=pref_uid))
+            start_res = await self.start_hosted(
+                bot_hint=bot_hint,
+                notify_tg=notify,
+                preferred_user_id=pref_uid,
+                actor=actor_arg,
+                source=source_arg,
+                expected_session_gen=exp_gen,
+            )
+            active_sgen = _parse_strict_int(start_res.get("session_gen"))
+        else:
+            active_sgen = exp_gen if exp_gen is not None else self.session_gen
+            if notify and bot_hint:
+                bot_key = actor_arg[0] if actor_arg is not None else self.resolve_bot_key(bot_hint)
+                if bot_key is not None and not self.tg.has_card_for_bot(bot_key):
+                    asyncio.create_task(self.tg.ensure_card(bot_key, preferred_user_id=pref_uid))
+
+        def _reverify_tg_action_actor() -> None:
+            if active_sgen is not None and self.session_gen != active_sgen:
+                raise PermissionError("会话代次已变更，已拒绝执行动作")
+            if not is_tg or actor_arg is None:
+                return
+            a_bot, a_uid = actor_arg
+            live_role = _check_live_user_role(a_bot, a_uid)
+            if live_role != "admin" or not self._viewer_can_mutate(a_bot, a_uid, live_role):
+                raise PermissionError("当前用户未授权、权限已撤销或非会话归属者")
 
         self.ai_busy_count += 1
         result_data: dict[str, Any] = {}
@@ -6447,6 +6696,7 @@ class LiveBrowserHub:
             # Handle pure sleep wait outside `_exec_lock` while still respecting takeover
             if action == "wait" and str(payload["target"]).isdigit():
                 await self.wait_until_ai_allowed()
+                _reverify_tg_action_actor()
                 ms = int(str(payload["target"]))
                 self.ai_status = f"等待 {ms}ms..."
                 await asyncio.sleep(ms / 1000.0)
@@ -6458,6 +6708,7 @@ class LiveBrowserHub:
                     async with self._exec_lock:
                         if self.takeover:
                             continue
+                        _reverify_tg_action_actor()
                         page = self._current_page()
                         if not page:
                             raise RuntimeError("没有可用的浏览器标签页。")
@@ -6471,6 +6722,7 @@ class LiveBrowserHub:
                             )
                             self.ai_status = f"正在打开: {url[:60]}"
                             await self.broadcast_state()
+                            _reverify_tg_action_actor()
                             await page.goto(
                                 url,
                                 wait_until=str(payload.get("wait_until", "domcontentloaded")),
@@ -6482,6 +6734,7 @@ class LiveBrowserHub:
                             target = str(payload["target"])
                             self.ai_status = f"正在点击: {target[:50]}"
                             await self.broadcast_state()
+                            _reverify_tg_action_actor()
                             if "," in target and all(
                                 p.strip().replace(".", "", 1).isdigit() for p in target.split(",", 1)
                             ):
@@ -6492,6 +6745,7 @@ class LiveBrowserHub:
                             else:
                                 loc = page.locator(target).first
                                 box = await loc.bounding_box(timeout=int(payload.get("timeout", 15000)))
+                                _reverify_tg_action_actor()
                                 if box:
                                     cx = round(box["x"] + box["width"] / 2, 1)
                                     cy = round(box["y"] + box["height"] / 2, 1)
@@ -6504,10 +6758,12 @@ class LiveBrowserHub:
                             text = str(payload["text"])
                             self.ai_status = f"正在填写: {selector[:40]}"
                             await self.broadcast_state()
+                            _reverify_tg_action_actor()
                             await page.locator(selector).first.fill(
                                 text, timeout=int(payload.get("timeout", 15000))
                             )
                             if payload.get("submit"):
+                                _reverify_tg_action_actor()
                                 await page.keyboard.press("Enter")
                             self.ai_status = f"已填写: {selector[:40]}"
 
@@ -6515,8 +6771,10 @@ class LiveBrowserHub:
                             text = str(payload["text"])
                             self.ai_status = "正在输入文字..."
                             await self.broadcast_state()
+                            _reverify_tg_action_actor()
                             await page.keyboard.type(text, delay=int(payload.get("delay", 20)))
                             if payload.get("submit"):
+                                _reverify_tg_action_actor()
                                 await page.keyboard.press("Enter")
                             self.ai_status = "已完成文字输入"
 
@@ -6527,9 +6785,12 @@ class LiveBrowserHub:
 
                         elif action == "wait":
                             target = str(payload["target"])
+                            wait_state = str(payload.get("state") or "visible").strip()
+                            if wait_state not in ("attached", "detached", "visible", "hidden"):
+                                raise ValueError(f"Invalid wait state: {wait_state!r}")
                             self.ai_status = f"等待元素: {target[:45]}"
                             await page.locator(target).first.wait_for(
-                                state="visible", timeout=int(payload.get("timeout", 30000))
+                                state=wait_state, timeout=int(payload.get("timeout", 30000))
                             )
                             self.ai_status = "等待完成"
 
@@ -6542,8 +6803,31 @@ class LiveBrowserHub:
 
                         elif action == "eval":
                             expr = str(payload["expression"])
-                            val = await page.evaluate(expr)
+                            if "arg" in payload:
+                                val = await page.evaluate(expr, payload["arg"])
+                            else:
+                                val = await page.evaluate(expr)
                             result_data["value"] = val
+
+                        elif action == "scroll":
+                            raw_dx = payload.get("dx", 0)
+                            raw_dy = payload.get("dy", 400)
+                            if isinstance(raw_dx, bool) or isinstance(raw_dy, bool):
+                                raise ValueError("scroll dx/dy must be finite numbers")
+                            dx, dy = float(raw_dx), float(raw_dy)
+                            if not (math.isfinite(dx) and math.isfinite(dy)):
+                                raise ValueError("scroll dx/dy must be finite numbers")
+                            vp = page.viewport_size or {"width": 1280, "height": 800}
+                            raw_x = payload.get("x", vp.get("width", 1280) * 0.5)
+                            raw_y = payload.get("y", vp.get("height", 800) * 0.5)
+                            if isinstance(raw_x, bool) or isinstance(raw_y, bool):
+                                raise ValueError("scroll x/y must be finite numbers")
+                            cx, cy = float(raw_x), float(raw_y)
+                            if not (math.isfinite(cx) and math.isfinite(cy)):
+                                raise ValueError("scroll x/y must be finite numbers")
+                            await page.mouse.move(cx, cy)
+                            _reverify_tg_action_actor()
+                            await page.mouse.wheel(dx, dy)
 
                         elif action == "screenshot":
                             out = Path(str(payload["path"])).expanduser().resolve()
@@ -6561,6 +6845,8 @@ class LiveBrowserHub:
             self.ai_busy_count = max(0, self.ai_busy_count - 1)
             await self.broadcast_state()
         asyncio.create_task(self.tg.tick_updates(force=False))
+        if _should_redact_tg_state(active_sgen):
+            return {"ok": True, **result_data, **self._redacted_state_dict()}
         return {"ok": True, **result_data, "url": self.url, "title": self.title}
 
 
@@ -7997,6 +8283,11 @@ async def internal_status(request: web.Request) -> web.Response:
 
 
 def _parse_positive_int(raw: Any) -> int | None:
+    if isinstance(raw, str):
+        if not raw or any(ch.isspace() for ch in raw):
+            return None
+        if len(raw) > 1 and raw.startswith("0"):
+            return None
     val = _parse_strict_int(raw)
     return val if (val is not None and val > 0) else None
 
@@ -8007,7 +8298,7 @@ def _verify_internal_caller_control(
     *,
     require_running: bool = True,
 ) -> tuple[bool, str, tuple[str, int | None] | None, dict[str, Any]]:
-    """Verify bot/user/card ownership on internal control endpoints when Telegram user/card context is supplied.
+    """Verify bot/user/card ownership and session generation on internal control endpoints.
 
     Returns `(ok, err, owner_tuple, auth_ctx)` where `auth_ctx` can be re-verified inside execution locks.
     """
@@ -8016,11 +8307,19 @@ def _verify_internal_caller_control(
     raw_cid = body.get("chat_id")
     raw_mid = body.get("message_id")
     raw_source = str(body.get("source") or "").strip().lower()
+    raw_scope = str(body.get("chat_scope") or "").strip().lower()
+    raw_exp_gen = body.get("expected_session_gen")
     from_card = (
         raw_source == "tg_card"
         or _parse_bool_flag(body.get("from_card"))
         or (raw_mid is not None)
     )
+
+    parsed_exp_gen: int | None = None
+    if raw_exp_gen is not None:
+        parsed_exp_gen = _parse_strict_int(raw_exp_gen)
+        if parsed_exp_gen is None or parsed_exp_gen != hub.session_gen:
+            return False, "会话代次已变更，已拒绝过期请求", None, {}
 
     uid_val = _parse_positive_int(raw_uid if raw_uid is not None else raw_cid)
     cid_val = _parse_positive_int(raw_cid if raw_cid is not None else raw_uid)
@@ -8029,6 +8328,7 @@ def _verify_internal_caller_control(
     has_tg_identity = (
         from_card
         or raw_source in ("tg_cmd", "tg_card", "tg")
+        or bool(raw_scope)
         or (raw_uid is not None)
         or (raw_cid is not None)
     )
@@ -8037,8 +8337,20 @@ def _verify_internal_caller_control(
             bkey = hub.resolve_bot_key(str(raw_bot))
             if bkey is None:
                 return False, "无法识别目标 Bot 身份", None, {}
-            return True, "ok", (bkey, None), {"is_tg": False}
-        return True, "ok", None, {"is_tg": False}
+            return True, "ok", (bkey, None), {"is_tg": False, "expected_gen": parsed_exp_gen}
+        return True, "ok", None, {"is_tg": False, "expected_gen": parsed_exp_gen}
+
+    # Group / supergroup / channel delivery scope (or non-positive chat_id) MUST ALWAYS fail closed
+    if _is_group_internal_scope(body):
+        return False, "当前操作未获授权，请前往私聊查看与操作", None, {}
+
+    # Non-positive / invalid chat_id (including negative group IDs) or invalid user_id MUST fail closed
+    if raw_cid is not None and cid_val is None:
+        return False, "当前操作未获授权，请前往私聊查看与操作", None, {}
+    if raw_uid is not None and uid_val is None:
+        return False, "缺少有效的私聊用户身份", None, {}
+    if uid_val is not None and cid_val is not None and uid_val != cid_val:
+        return False, "用户身份与私聊会话不匹配", None, {}
 
     # Strictly require explicit `bot` for Telegram callers — NEVER fall back to single-bot auto-resolution!
     if raw_bot is None or not str(raw_bot).strip():
@@ -8047,7 +8359,7 @@ def _verify_internal_caller_control(
     if not target_bot or not cid_val:
         return False, "缺少有效的 Bot 或私聊用户身份", None, {}
 
-    expected_gen = hub.session_gen
+    expected_gen = parsed_exp_gen if parsed_exp_gen is not None else hub.session_gen
     if from_card:
         if mid_val is None or mid_val <= 0:
             return False, "Telegram 卡片回调缺少有效的正整数 message_id", None, {}
@@ -8113,7 +8425,7 @@ async def internal_takeover(request: web.Request) -> web.Response:
     active = _parse_bool_flag(body.get("active", True))
     reason = str(body.get("reason") or "")
     actor_arg = (auth_ctx["bot_key"], auth_ctx["chat_id"]) if auth_ctx.get("is_tg") else None
-    exp_gen = auth_ctx.get("expected_gen") if auth_ctx.get("is_tg") else None
+    exp_gen = auth_ctx.get("expected_gen")
     ok_tk, err_tk, _, _ = await hub.set_takeover(
         active,
         reason=reason,
@@ -8162,7 +8474,7 @@ async def internal_start(request: web.Request) -> web.Response:
     pref_uid = _parse_positive_int(body.get("user_id"))
     actor_arg = (auth_ctx["bot_key"], auth_ctx["chat_id"]) if auth_ctx.get("is_tg") else None
     source_arg = str(auth_ctx.get("source") or "tg_cmd") if auth_ctx.get("is_tg") else "cli"
-    exp_gen = auth_ctx.get("expected_gen") if auth_ctx.get("is_tg") else None
+    exp_gen = auth_ctx.get("expected_gen")
     is_group_scope = _is_group_internal_scope(body)
     try:
         st = await hub.start_hosted(
@@ -8273,7 +8585,7 @@ async def internal_profiles_switch(request: web.Request) -> web.Response:
     pref_uid = _parse_positive_int(body.get("user_id"))
     actor_arg = (auth_ctx["bot_key"], auth_ctx["chat_id"]) if auth_ctx.get("is_tg") else None
     source_arg = str(auth_ctx.get("source") or "tg_cmd") if auth_ctx.get("is_tg") else "cli"
-    exp_gen = auth_ctx.get("expected_gen") if auth_ctx.get("is_tg") else None
+    exp_gen = auth_ctx.get("expected_gen")
     is_group_scope = _is_group_internal_scope(body)
     try:
         st = await hub.start_hosted(
@@ -8366,7 +8678,13 @@ async def internal_stop(request: web.Request) -> web.Response:
             force=force,
         )
     else:
-        stop_res = await hub.stop_hosted(notify_finished=True)
+        if auth_ctx.get("expected_gen") is not None:
+            stop_res = await hub.stop_hosted(
+                notify_finished=True,
+                expected_session_gen=auth_ctx.get("expected_gen"),
+            )
+        else:
+            stop_res = await hub.stop_hosted(notify_finished=True)
     if isinstance(stop_res, tuple) and len(stop_res) == 2:
         ok_stop, err_stop = stop_res
         if not ok_stop:
@@ -8378,33 +8696,66 @@ async def internal_stop(request: web.Request) -> web.Response:
 async def internal_action(request: web.Request) -> web.Response:
     hub: LiveBrowserHub = request.app["hub"]
     check_local_auth(request, hub)
-    body = await request.json()
     try:
-        res = await hub.execute_ai_action(body)
+        body = await request.json()
+    except Exception:
+        body = None
+    if not isinstance(body, dict):
+        return web.json_response({"ok": False, "error": "Request body must be a JSON object"}, status=400)
+    is_group_scope = _is_group_internal_scope(body)
+    ok_ctrl, err_ctrl, _, auth_ctx = _verify_internal_caller_control(hub, body, require_running=False)
+    if not ok_ctrl:
+        err_msg = "当前操作未获授权，请前往私聊查看与操作" if is_group_scope else err_ctrl
+        return web.json_response({"ok": False, "error": err_msg}, status=403)
+    try:
+        res = await hub.execute_ai_action(body, auth_ctx=auth_ctx)
+        if isinstance(res, dict) and res.get("ok") is False:
+            if res.get("timeout"):
+                status_code = 408
+            elif res.get("owner_bound") is False:
+                status_code = 409
+            else:
+                status_code = 502
+            return web.json_response(res, status=status_code)
         return web.json_response(res)
+    except PermissionError as exc:
+        err_msg = "当前操作未获授权，请前往私聊查看与操作" if is_group_scope else str(exc)
+        return web.json_response({"ok": False, "error": err_msg}, status=403)
     except ValueError as exc:
-        return web.json_response({"ok": False, "error": str(exc)}, status=400)
+        err_msg = "请求参数无效，请前往私聊检查" if is_group_scope else str(exc)
+        return web.json_response({"ok": False, "error": err_msg}, status=400)
     except RuntimeError as exc:
-        return web.json_response({"ok": False, "error": str(exc)}, status=409)
+        err_msg = "当前浏览器会话冲突或正忙，请前往私聊查看与操作" if is_group_scope else str(exc)
+        return web.json_response({"ok": False, "error": err_msg}, status=409)
     except Exception as exc:
-        return web.json_response({"ok": False, "error": str(exc)}, status=500)
+        err_msg = "浏览器服务暂不可用，请前往私聊重试" if is_group_scope else _sanitize_card_error(exc)
+        return web.json_response({"ok": False, "error": err_msg}, status=500)
 
 
 async def internal_config(request: web.Request) -> web.Response:
     hub: LiveBrowserHub = request.app["hub"]
     check_local_auth(request, hub)
-    body = await request.json()
-    if "public_url" in body:
-        hub.config["public_url"] = str(body["public_url"]).strip().rstrip("/")
-        save_local_config(hub.config)
-        await hub.broadcast_state()
-        asyncio.create_task(hub.tg.tick_updates(force=True))
-    if "direct_app_url" in body:
-        hub.config["direct_app_url"] = str(body["direct_app_url"]).strip().rstrip("/")
-        save_local_config(hub.config)
-        await hub.broadcast_state()
-    if "takeover" in body:
-        await hub.set_takeover(bool(body["takeover"]), str(body.get("reason", "")))
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    if not isinstance(body, dict):
+        return web.json_response({"ok": False, "error": "Request body must be a JSON object"}, status=400)
+
+    is_group_scope = _is_group_internal_scope(body)
+    ok_ctrl, err_ctrl, owner, auth_ctx = _verify_internal_caller_control(hub, body, require_running=False)
+    if not ok_ctrl:
+        err_msg = "当前操作未获授权，请前往私聊查看与操作" if is_group_scope else err_ctrl
+        return web.json_response({"ok": False, "error": err_msg}, status=403)
+
+    # Validate all request parameters BEFORE any mutating writes (public_url/direct_app_url/set_takeover)
+    exp_tgen: int | None = None
+    if body.get("expected_takeover_gen") is not None:
+        exp_tgen = _parse_strict_int(body.get("expected_takeover_gen"))
+        if exp_tgen is None:
+            return web.json_response({"ok": False, "error": "Invalid expected_takeover_gen"}, status=400)
+
+    refresh_plan: dict[str, Any] | None = None
     if body.get("refresh_card"):
         raw_cid = body.get("chat_id")
         raw_bot = body.get("bot")
@@ -8426,7 +8777,7 @@ async def internal_config(request: web.Request) -> web.Response:
             if mid_val is None or mid_val <= 0:
                 return web.json_response({"ok": False, "error": "Telegram 卡片刷新缺少有效的正整数 message_id"}, status=403)
             pre_gen = hub.session_gen
-            # Verify card, ownership, live admin role & positive message_id BEFORE triggering any HD capture!
+            # Verify card, ownership, live admin role & positive message_id BEFORE any writes or HD capture!
             ok_pre, msg_pre, _ = hub.tg.verify_card_control(
                 target_bot,
                 target_cid,
@@ -8437,6 +8788,107 @@ async def internal_config(request: web.Request) -> web.Response:
             )
             if not ok_pre or not target_bot:
                 return web.json_response({"ok": False, "error": msg_pre}, status=403)
+            refresh_plan = {
+                "is_tg_card": True,
+                "target_bot": target_bot,
+                "target_cid": target_cid,
+                "mid_val": mid_val,
+                "pre_gen": pre_gen,
+            }
+        else:
+            bot_filter = hub.resolve_bot_key(str(raw_bot)) if raw_bot else None
+            if raw_bot and bot_filter is None:
+                return web.json_response({"ok": False, "error": "无法识别目标 Bot 身份"}, status=403)
+            refresh_plan = {"is_tg_card": False, "bot_filter": bot_filter}
+
+    def _reverify_config_tg_actor() -> tuple[bool, str]:
+        if not auth_ctx.get("is_tg"):
+            return True, "ok"
+        a_bot = str(auth_ctx["bot_key"])
+        a_uid = int(auth_ctx["chat_id"])
+        exp_sgen = auth_ctx.get("expected_gen")
+        if exp_sgen is not None and hub.session_gen != exp_sgen:
+            return False, "会话代次已变更，已拒绝过期请求"
+        live_role = _check_live_user_role(a_bot, a_uid)
+        if live_role != "admin":
+            return False, "当前用户未授权或不是管理员"
+        if hub.engine_mode != "idle" and not hub._viewer_can_mutate(a_bot, a_uid, live_role):
+            return False, "无权操作其他 Bot/用户或本机 CLI 持有的浏览器会话"
+        return True, "ok"
+
+    acquired_takeover: tuple[int, int] | None = None
+
+    async def _rollback_acquired_takeover(reason_txt: str) -> None:
+        nonlocal acquired_takeover
+        if acquired_takeover is None:
+            return
+        rb_sgen, rb_tgen = acquired_takeover
+        acquired_takeover = None
+        await hub.set_takeover(
+            False,
+            reason=reason_txt,
+            expected_session_gen=rb_sgen,
+            expected_takeover_gen=rb_tgen,
+        )
+
+    if "public_url" in body:
+        hub.config["public_url"] = str(body["public_url"]).strip().rstrip("/")
+        save_local_config(hub.config)
+        await hub.broadcast_state()
+        asyncio.create_task(hub.tg.tick_updates(force=True))
+    if "direct_app_url" in body:
+        ok_rv, err_rv = _reverify_config_tg_actor()
+        if not ok_rv:
+            err_msg = "当前操作未获授权，请前往私聊查看与操作" if is_group_scope else err_rv
+            return web.json_response({"ok": False, "error": err_msg}, status=403)
+        hub.config["direct_app_url"] = str(body["direct_app_url"]).strip().rstrip("/")
+        save_local_config(hub.config)
+        await hub.broadcast_state()
+    if "takeover" in body:
+        ok_rv, err_rv = _reverify_config_tg_actor()
+        if not ok_rv:
+            err_msg = "当前操作未获授权，请前往私聊查看与操作" if is_group_scope else err_rv
+            return web.json_response({"ok": False, "error": err_msg}, status=403)
+        want_takeover = bool(body["takeover"])
+        actor_arg = (auth_ctx["bot_key"], auth_ctx["chat_id"]) if auth_ctx.get("is_tg") else None
+        exp_sgen = auth_ctx.get("expected_gen")
+        ok_tk, err_tk, tk_sgen, tk_tgen = await hub.set_takeover(
+            want_takeover,
+            str(body.get("reason", "")),
+            owner=(owner if want_takeover else None),
+            expected_session_gen=exp_sgen,
+            expected_takeover_gen=exp_tgen,
+            actor=actor_arg,
+            card_message_id=auth_ctx.get("message_id"),
+            require_card=bool(auth_ctx.get("from_card")),
+        )
+        if not ok_tk:
+            err_msg = "当前操作未获授权，请前往私聊查看与操作" if is_group_scope else err_tk
+            return web.json_response({"ok": False, "error": err_msg}, status=403)
+        if want_takeover:
+            acquired_takeover = (tk_sgen, tk_tgen)
+    if refresh_plan is not None:
+        ok_rv, err_rv = _reverify_config_tg_actor()
+        if not ok_rv:
+            await _rollback_acquired_takeover("刷新卡片前权限已撤销，已自动回滚接管状态")
+            err_msg = "当前操作未获授权，请前往私聊查看与操作" if is_group_scope else err_rv
+            return web.json_response({"ok": False, "error": err_msg}, status=403)
+        if refresh_plan["is_tg_card"]:
+            target_bot = refresh_plan["target_bot"]
+            target_cid = refresh_plan["target_cid"]
+            mid_val = refresh_plan["mid_val"]
+            pre_gen = refresh_plan["pre_gen"]
+            ok_pre2, msg_pre2, _ = hub.tg.verify_card_control(
+                target_bot,
+                target_cid,
+                message_id=mid_val,
+                require_card=True,
+                require_running=True,
+                expected_session_gen=pre_gen,
+            )
+            if not ok_pre2:
+                await _rollback_acquired_takeover("刷新卡片鉴权失败，已自动回滚接管状态")
+                return web.json_response({"ok": False, "error": msg_pre2}, status=403)
             if hub.engine_mode == "async_hosted":
                 await hub._capture_once(force_broadcast=True, hd=True)
             ok_rf, msg_rf, status_rf = await hub.tg._refresh_single_card_with_status(
@@ -8445,26 +8897,65 @@ async def internal_config(request: web.Request) -> web.Response:
             if not ok_rf:
                 return web.json_response({"ok": False, "error": msg_rf}, status=status_rf)
         else:
-            bot_filter = hub.resolve_bot_key(str(raw_bot)) if raw_bot else None
-            if raw_bot and bot_filter is None:
-                return web.json_response({"ok": False, "error": "无法识别目标 Bot 身份"}, status=403)
             if hub.engine_mode == "async_hosted":
                 await hub._capture_once(force_broadcast=True, hd=True)
-            await hub.tg.tick_updates(force=True, bot_filter=bot_filter)
+            await hub.tg.tick_updates(force=True, bot_filter=refresh_plan["bot_filter"])
+
+    card_sent: bool | None = None
+    card_error: str | None = None
     if body.get("ensure_card"):
-        bot_key = hub.resolve_bot_key(body.get("bot"))
-        pref_uid = _parse_positive_int(body.get("user_id"))
-        if bot_key is not None:
-            await hub.tg.ensure_card(
-                bot_key, force_new=bool(body.get("force_new", False)), preferred_user_id=pref_uid
-            )
-    return web.json_response(
-        {
-            "ok": True,
-            "config": hub.config,
-            "cards": [f"{bk}:{cid}" for (bk, cid) in hub.tg.cards.keys()],
-        }
-    )
+        ok_rv, err_rv = _reverify_config_tg_actor()
+        if not ok_rv:
+            await _rollback_acquired_takeover("发卡前权限已撤销，已自动回滚接管状态")
+            err_msg = "当前操作未获授权，请前往私聊查看与操作" if is_group_scope else err_rv
+            return web.json_response({"ok": False, "error": err_msg}, status=403)
+        bot_key = auth_ctx.get("bot_key") if auth_ctx.get("is_tg") else hub.resolve_bot_key(body.get("bot"))
+        pref_uid = auth_ctx.get("chat_id") if auth_ctx.get("is_tg") else _parse_positive_int(body.get("user_id"))
+        if bot_key is None:
+            card_sent = False
+            card_error = "无法识别目标 Bot 身份"
+        else:
+            try:
+                card_res = await hub.tg.ensure_card(
+                    bot_key, force_new=bool(body.get("force_new", False)), preferred_user_id=pref_uid
+                )
+                if card_res is not None:
+                    card_sent = True
+                    card_error = None
+                else:
+                    card_sent = False
+                    card_error = _sanitize_card_error(hub.tg.last_card_error or "Telegram 实况卡片发送失败")
+            except Exception as exc:
+                card_sent = False
+                card_error = _sanitize_card_error(f"Telegram 实况卡片发送异常: {exc}")
+
+        if not card_sent and acquired_takeover is not None:
+            has_active_viewer = False
+            if hub._has_verified_session_owner() and hub.session_owner is not None:
+                o_bot, o_uid = hub.session_owner
+                has_active_viewer = hub._has_eligible_admin_viewer(o_bot, o_uid)
+            if not has_active_viewer:
+                await _rollback_acquired_takeover(
+                    "Telegram 实况卡片发送失败且无活跃管理员面板，已自动回滚接管状态"
+                )
+
+    owner_bound = hub._has_verified_session_owner()
+    resp_body: dict[str, Any] = {
+        "ok": True if card_sent is not False else False,
+        "owner_bound": owner_bound,
+        "session_gen": hub.session_gen,
+        "takeover_gen": hub.takeover_gen,
+        "takeover": hub.takeover,
+        "config": hub.config,
+        "cards": [f"{bk}:{cid}" for (bk, cid) in hub.tg.cards.keys()],
+    }
+    if card_sent is not None:
+        resp_body["card_sent"] = card_sent
+        resp_body["card_error"] = card_error
+        if not card_sent:
+            resp_body["error"] = card_error or "Telegram 实况卡片发送失败"
+            return web.json_response(resp_body, status=(409 if not owner_bound else 502))
+    return web.json_response(resp_body)
 
 
 async def internal_yield_lock(request: web.Request) -> web.Response:
@@ -8483,10 +8974,60 @@ async def internal_yield_lock(request: web.Request) -> web.Response:
 async def internal_sync_start(request: web.Request) -> web.Response:
     hub: LiveBrowserHub = request.app["hub"]
     check_local_auth(request, hub)
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "Invalid JSON body"}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response({"ok": False, "error": "Request body must be a JSON object"}, status=400)
+
+    is_group_scope = _is_group_internal_scope(body)
+    ok_ctrl, err_ctrl, _, auth_ctx = _verify_internal_caller_control(hub, body, require_running=False)
+    if not ok_ctrl:
+        err_msg = "当前操作未获授权，请前往私聊查看与操作" if is_group_scope else err_ctrl
+        return web.json_response({"ok": False, "error": err_msg}, status=403)
+
+    is_tg = bool(auth_ctx.get("is_tg"))
+    exp_gen = auth_ctx.get("expected_gen")
     prev_sync_retire: tuple[int, bytes | None] | None = None
 
     async with hub._engine_lock:
+        if exp_gen is not None and hub.session_gen != exp_gen:
+            return web.json_response(
+                {"ok": False, "error": "会话代次已变更，已拒绝过期请求"},
+                status=403,
+            )
+        if is_tg:
+            a_bot = str(auth_ctx["bot_key"])
+            a_uid = int(auth_ctx["chat_id"])
+            if auth_ctx.get("from_card"):
+                ok_cv, msg_cv, _ = hub.tg.verify_card_control(
+                    a_bot,
+                    a_uid,
+                    message_id=auth_ctx.get("message_id"),
+                    require_card=True,
+                    require_running=False,
+                    expected_session_gen=exp_gen,
+                )
+                if not ok_cv:
+                    return web.json_response({"ok": False, "error": msg_cv}, status=403)
+            live_role = _check_live_user_role(a_bot, a_uid)
+            if live_role != "admin":
+                return web.json_response(
+                    {"ok": False, "error": "当前用户未授权或不是管理员"},
+                    status=403,
+                )
+            if hub.engine_mode != "idle" and not hub._viewer_can_mutate(a_bot, a_uid, live_role):
+                return web.json_response(
+                    {"ok": False, "error": "无权操作其他 Bot/用户或本机 CLI 持有的浏览器会话"},
+                    status=403,
+                )
+            bot_key: str | None = a_bot
+            pref_uid: int | None = a_uid
+        else:
+            bot_key = hub.resolve_bot_key(body.get("bot"))
+            pref_uid = None
+
         if hub.engine_mode == "async_hosted":
             await hub._stop_hosted_locked(notify_finished=False)
         elif hub.engine_mode == "sync_external":
@@ -8497,8 +9038,6 @@ async def internal_sync_start(request: web.Request) -> web.Response:
         lease_id = secrets.token_hex(12)
         hub.engine_mode = "sync_external"
         hub._sync_lease_id = lease_id
-        bot_key = hub.resolve_bot_key(body.get("bot"))
-        pref_uid = _parse_positive_int(body.get("user_id"))
         hub.session_owner = (bot_key, pref_uid) if bot_key is not None else None
 
         # Never infer producer `pinned=True` from host discovery alone!

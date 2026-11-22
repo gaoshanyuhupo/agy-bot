@@ -140,8 +140,29 @@ ACB_UNDO_DIR = os.path.join(HOME, ".gemini/antigravity-cli/cache/acb_undo")
 ACB_UNDO_BLOBS_DIR = os.path.join(ACB_UNDO_DIR, "blobs")
 os.makedirs(BOT_OUTBOX_DIR, exist_ok=True)
 os.makedirs(ACB_UNDO_BLOBS_DIR, exist_ok=True)
+def _parse_nonneg_float_env(name, default):
+    """Parse a non-negative finite float from environment variable `name`; fall back to `default` on invalid/negative."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return float(default)
+    s = str(raw).strip()
+    if not s:
+        return float(default)
+    try:
+        val = float(s)
+    except (TypeError, ValueError):
+        return float(default)
+    if not math.isfinite(val) or val < 0:
+        return float(default)
+    return val
+
+
 IDLE_SESSION_TTL = int(os.environ.get("AGY_TG_IDLE_TTL", "2700"))
 MAX_WARM_SESSIONS = int(os.environ.get("AGY_TG_MAX_WARM_SESSIONS", "4"))
+BG_WAIT_TIMEOUT = _parse_nonneg_float_env("AGY_BG_WAIT_TIMEOUT", 300.0)
+TURN_SILENCE_TIMEOUT = _parse_nonneg_float_env("AGY_TURN_SILENCE_TIMEOUT", 420.0)
+PREEMPT_WAITING_BG = access_control.parse_bool_flag(os.environ.get("AGY_PREEMPT_WAITING_BG", "1"), default=True)
+PREEMPT_BG_GRACE_SEC = _parse_nonneg_float_env("AGY_PREEMPT_BG_GRACE_SEC", 5.0)
 ALBUM_DEBOUNCE_SECONDS = float(os.environ.get("AGY_TG_ALBUM_DEBOUNCE", "1.25"))
 DEFAULT_AUTO_COMPACT_TOKENS = int(os.environ.get("AGY_TG_AUTO_COMPACT_TOKENS", "140000"))
 AGY_HARD_COMPACT_CEILING = 254000
@@ -758,6 +779,10 @@ turn_running_scope = None   # scope_key of currently executing interactive turn
 turn_running_chat = None    # chat_id of currently executing interactive turn
 turn_running_web_id = None  # turn_id if currently executing turn is a Web Studio IPC turn
 turn_running_cid = None     # conversation_id of currently executing interactive turn
+turn_gen = 0                # Monotonically increasing generation counter per run_agy turn
+turn_waiting_bg = False     # True while current turn finished intermediate step and waits on bg event
+turn_waiting_bg_since = None  # Timestamp (time.time()) when current turn entered waiting_bg
+turn_preempted_gen = None   # Generation ID of the turn preempted by same-scope admin message
 session_dirty_scopes = set()  # scope_keys whose warm session must recycle after active turn
 cancel_requested = False    # True if user triggered /cancel or native Stop button
 
@@ -2118,6 +2143,8 @@ class AgySession:
     with non-blocking stdout event queue for instant cancellation & 60ms result lookahead.
     """
 
+    _eof_fallback_lock = threading.Lock()
+
     def __init__(self, conv, mode, model, effort, project=None, workdir=None, scope_key=None, readonly=False, untrusted=False):
         self.cid = conv
         self.readonly = bool(readonly)
@@ -2188,6 +2215,10 @@ class AgySession:
         log("Spawning persistent AgySession (conv=%s, project=%s, cwd=%s, model=%s, effort=%s, route=%s, mode=%s, bus=%s, ro=%s, untrusted=%s)"
             % ((conv or "new")[:8], self.project or "default", self.workdir, model or "default", effort or "default",
                f"gw:{self._gateway_id}" if self._gateway_id else "native", self.mode, self.bus_enable, self.readonly, self.untrusted))
+        self._close_lock = threading.Lock()
+        self._closed = False
+        self._eof_lock = threading.Lock()
+        self._eof_emitted = False
         self.proc = subprocess.Popen(
             cmd,
             cwd=self.workdir,
@@ -2201,36 +2232,66 @@ class AgySession:
             env=env,
             start_new_session=True,
         )
-        threading.Thread(target=self._drain_stdout, daemon=True).start()
-        threading.Thread(target=self._drain_stderr, daemon=True).start()
+        _pid = getattr(self.proc, "pid", None)
+        self._proc_starttime = _read_proc_starttime(_pid) if _pid is not None else None
+        self._stdout_thread = threading.Thread(target=self._drain_stdout, daemon=True)
+        self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
+        self._stdout_thread.start()
+        self._stderr_thread.start()
+
+    def _signal_eof(self):
+        self.eof_reached = True
+        eof_lock = getattr(self, "_eof_lock", None) or AgySession._eof_fallback_lock
+        with eof_lock:
+            if not getattr(self, "_eof_emitted", False):
+                self._eof_emitted = True
+                self.event_q.put({"event": "__eof__"})
 
     def _drain_stdout(self):
+        p = self.proc
+        stream = p.stdout if p is not None else None
         try:
-            for raw in self.proc.stdout:
-                raw = raw.strip()
-                if not raw:
-                    continue
-                try:
-                    ev = json.loads(raw)
-                except Exception:
-                    continue
-                if ev.get("event") == "init":
-                    cid = ev.get("conversation_id")
-                    if cid:
-                        self.cid = cid
-                self.event_q.put(ev)
+            if stream is not None:
+                for raw in stream:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        ev = json.loads(raw)
+                    except Exception:
+                        continue
+                    if ev.get("event") == "init":
+                        cid = ev.get("conversation_id")
+                        if cid:
+                            self.cid = cid
+                    self.event_q.put(ev)
         except Exception:
             pass
         finally:
-            self.eof_reached = True
-            self.event_q.put({"event": "__eof__"})
+            if stream is not None:
+                try:
+                    if not getattr(stream, "closed", False):
+                        stream.close()
+                except Exception:
+                    pass
+            self._signal_eof()
 
     def _drain_stderr(self):
+        p = self.proc
+        stream = p.stderr if p is not None else None
         try:
-            for line in self.proc.stderr:
-                self.stderr_tail.append(line)
+            if stream is not None:
+                for line in stream:
+                    self.stderr_tail.append(line)
         except Exception:
             pass
+        finally:
+            if stream is not None:
+                try:
+                    if not getattr(stream, "closed", False):
+                        stream.close()
+                except Exception:
+                    pass
 
     def next_event(self, timeout=0.25):
         """Return next parsed event dict, or None on timeout (never blocks cancellation)."""
@@ -2301,36 +2362,296 @@ class AgySession:
         self.proc.stdin.flush()
         self.last_used = time.time()
 
-    def close(self, force=False):
+    def close(self, force=False, term_timeout=None):
         p = self.proc
         if p is None:
             return
-        try:
-            if p.stdin and not p.stdin.closed:
-                p.stdin.close()
-        except Exception:
-            pass
-        if not force:
-            try:
-                p.wait(timeout=1.5)
+        lock = getattr(self, "_close_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._close_lock = lock
+        with lock:
+            if getattr(self, "_closed", False):
                 return
+            try:
+                try:
+                    if p.stdin and not p.stdin.closed:
+                        p.stdin.close()
+                except Exception:
+                    pass
+                exited_cleanly = False
+                if not force:
+                    try:
+                        p.wait(timeout=1.5)
+                        exited_cleanly = True
+                    except Exception:
+                        exited_cleanly = False
+                if p.poll() is None and (force or not exited_cleanly):
+                    t_out = (1.5 if force else 2.0) if term_timeout is None else float(term_timeout)
+                    _pid = getattr(p, "pid", None)
+                    if _pid is not None:
+                        _kill_process_tree(
+                            _pid,
+                            term_timeout=t_out,
+                            proc=p,
+                            expected_root_starttime=getattr(self, "_proc_starttime", None),
+                        )
+                    else:
+                        try:
+                            p.terminate()
+                        except Exception:
+                            pass
+                    try:
+                        if p.poll() is None:
+                            p.wait(timeout=1.0)
+                    except Exception:
+                        pass
+            finally:
+                stdout_th = getattr(self, "_stdout_thread", None)
+                stderr_th = getattr(self, "_stderr_thread", None)
+                for th in (stdout_th, stderr_th):
+                    if th is not None and th.is_alive() and th is not threading.current_thread():
+                        try:
+                            th.join(timeout=0.5)
+                        except Exception:
+                            pass
+                if p.stdin is not None:
+                    try:
+                        if not getattr(p.stdin, "closed", False):
+                            p.stdin.close()
+                    except Exception:
+                        pass
+                if p.stdout is not None and (stdout_th is None or not stdout_th.is_alive()):
+                    try:
+                        if not getattr(p.stdout, "closed", False):
+                            p.stdout.close()
+                    except Exception:
+                        pass
+                if p.stderr is not None and (stderr_th is None or not stderr_th.is_alive()):
+                    try:
+                        if not getattr(p.stderr, "closed", False):
+                            p.stderr.close()
+                    except Exception:
+                        pass
+                if stdout_th is not None and stdout_th.is_alive():
+                    self._signal_eof()
+                self._closed = True
+
+
+def _read_proc_stat_info(pid, proc_root="/proc"):
+    """Read `(state, starttime)` from `/proc/<pid>/stat` using `rfind(')')` (safe for spaces/parens in comm)."""
+    stat_path = os.path.join(proc_root, str(pid), "stat")
+    try:
+        with open(stat_path, "r", encoding="utf-8", errors="ignore") as fh:
+            raw = fh.read()
+    except OSError:
+        return None, None
+    idx = raw.rfind(")")
+    if idx < 0:
+        return None, None
+    rest = raw[idx + 2:].split()
+    if len(rest) <= 19:
+        return None, None
+    return rest[0], rest[19]
+
+
+def _read_proc_starttime(pid, proc_root="/proc"):
+    """Return process `starttime` (post-comm index 19) from `/proc/<pid>/stat`, or None."""
+    _state, starttime = _read_proc_stat_info(pid, proc_root=proc_root)
+    return starttime
+
+
+def _read_proc_euid(pid, proc_root="/proc"):
+    """Return effective UID from `/proc/<pid>/status` (`Uid:` line), or None on failure."""
+    status_path = os.path.join(proc_root, str(pid), "status")
+    try:
+        with open(status_path, "r", encoding="utf-8", errors="ignore") as fh:
+            raw = fh.read()
+    except OSError:
+        return None
+    for line in raw.splitlines():
+        if line.startswith("Uid:"):
+            parts = line.split()
+            try:
+                if len(parts) >= 3:
+                    return int(parts[2])
+                if len(parts) == 2:
+                    return int(parts[1])
+            except ValueError:
+                return None
+            return None
+    return None
+
+
+def _list_proc_children(pid, proc_root="/proc"):
+    """Return direct child PIDs from `/proc/<pid>/task/*/children`."""
+    task_dir = os.path.join(proc_root, str(pid), "task")
+    children = []
+    try:
+        tids = os.listdir(task_dir)
+    except OSError:
+        return children
+    for tid in tids:
+        cpath = os.path.join(task_dir, tid, "children")
+        try:
+            with open(cpath, "r", encoding="utf-8", errors="ignore") as fh:
+                data = fh.read().strip()
+        except OSError:
+            continue
+        if not data:
+            continue
+        for tok in data.split():
+            try:
+                cpid = int(tok)
+                if cpid > 1:
+                    children.append(cpid)
+            except ValueError:
+                continue
+    return children
+
+
+def _collect_descendant_pids(root_pid, proc_root="/proc"):
+    """Recursively collect all descendant PIDs of `root_pid` (excluding `root_pid` itself)."""
+    descendants = []
+    visited = {root_pid}
+    dq = collections.deque([root_pid])
+    while dq:
+        cur = dq.popleft()
+        for cpid in _list_proc_children(cur, proc_root=proc_root):
+            if cpid <= 1 or cpid in visited:
+                continue
+            visited.add(cpid)
+            descendants.append(cpid)
+            dq.append(cpid)
+    return descendants
+
+
+def _kill_process_tree(root_pid, term_timeout=2.0, proc_root="/proc", proc=None, expected_root_starttime=None):
+    """Safely terminate and kill `root_pid` and all verified descendants (including detached setsid subtrees).
+
+    Fail-closed guards before both SIGTERM and SIGKILL:
+    1. Permanently excludes PID <= 1, self PID, and any process sharing our own PGID.
+    2. Requires `/proc/<pid>/status` effective UID == `os.geteuid()`.
+    3. Verifies `/proc/<pid>/stat` `starttime` (parsed via `rfind(')')`) for `root_pid` upfront (when provided)
+       and for every target before SIGTERM/SIGKILL to prevent PID reuse.
+    4. Only uses `os.killpg(root_pgid, ...)` when `root_pgid == root_pid` and `root_pgid != my_pgid`.
+    """
+    try:
+        root_pid = int(root_pid)
+    except (TypeError, ValueError):
+        return
+    my_pid = os.getpid()
+    my_pgid = os.getpgrp()
+    my_euid = os.geteuid()
+    if root_pid <= 1 or root_pid == my_pid:
+        return
+
+    def _validate_target(pid, expected_starttime=None):
+        if pid <= 1 or pid == my_pid:
+            return False, None, None
+        try:
+            pgid = os.getpgid(pid)
+        except OSError:
+            return False, None, None
+        if pgid <= 1 or pgid == my_pgid:
+            return False, None, None
+        euid = _read_proc_euid(pid, proc_root=proc_root)
+        if euid is None or euid != my_euid:
+            return False, None, None
+        state, st = _read_proc_stat_info(pid, proc_root=proc_root)
+        if st is None or state in ("Z", "X"):
+            return False, None, None
+        if expected_starttime is not None and str(st) != str(expected_starttime):
+            return False, None, None
+        return True, st, pgid
+
+    # Fail-closed upfront check on `root_pid` (UID, PGID, state, and optional expected starttime).
+    root_ok, root_st, root_pgid = _validate_target(root_pid, expected_starttime=expected_root_starttime)
+    if not root_ok:
+        if proc is not None:
+            try:
+                proc.poll()
             except Exception:
                 pass
-        if p.poll() is None:
+        return
+
+    # Snapshot full descendant tree BEFORE killing root so detached setsid children are captured before reparenting.
+    targets = {root_pid: (root_st, root_pgid)}
+    descendants = _collect_descendant_pids(root_pid, proc_root=proc_root)
+    for pid in descendants:
+        ok, st, pgid = _validate_target(pid)
+        if ok:
+            targets[pid] = (st, pgid)
+
+    can_killpg = root_pgid == root_pid and root_pgid > 1 and root_pgid != my_pgid
+    killpg_term_sent = False
+    if can_killpg:
+        r_ok, _rst, cur_rpgid = _validate_target(root_pid, expected_starttime=root_st)
+        if r_ok and cur_rpgid == root_pid:
             try:
-                os.killpg(os.getpgid(p.pid), signal.SIGTERM)
-            except Exception:
-                try:
-                    p.terminate()
-                except Exception:
-                    pass
+                os.killpg(root_pgid, signal.SIGTERM)
+                killpg_term_sent = True
+            except OSError:
+                pass
+
+    for pid, (st, _orig_pgid) in list(targets.items()):
+        ok, _cur_st, cur_pgid = _validate_target(pid, expected_starttime=st)
+        if not ok:
+            continue
+        if pid == root_pid and killpg_term_sent and cur_pgid == root_pgid:
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+    wait_budget = max(0.0, float(term_timeout or 0.0))
+    deadline = time.monotonic() + wait_budget
+    while True:
+        if proc is not None:
             try:
-                p.wait(timeout=2.0)
+                proc.poll()
             except Exception:
-                try:
-                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
-                except Exception:
-                    pass
+                pass
+        alive = []
+        for pid, (st, _orig_pgid) in list(targets.items()):
+            ok, _cur_st, cur_pgid = _validate_target(pid, expected_starttime=st)
+            if ok:
+                alive.append((pid, st, cur_pgid))
+        if not alive:
+            return
+        rem = deadline - time.monotonic()
+        if rem <= 0:
+            break
+        time.sleep(min(0.05, rem))
+
+    killpg_kill_sent = False
+    if can_killpg:
+        root_ok_kill, _rst, cur_rpgid = _validate_target(root_pid, expected_starttime=root_st)
+        if root_ok_kill and cur_rpgid == root_pid:
+            try:
+                os.killpg(root_pgid, signal.SIGKILL)
+                killpg_kill_sent = True
+            except OSError:
+                pass
+
+    for pid, (st, _orig_pgid) in list(targets.items()):
+        ok, _cur_st, cur_pgid = _validate_target(pid, expected_starttime=st)
+        if not ok:
+            continue
+        if pid == root_pid and killpg_kill_sent and cur_pgid == root_pgid:
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+    if proc is not None:
+        try:
+            if proc.poll() is None:
+                proc.wait(timeout=1.0)
+        except Exception:
+            pass
 
 
 def close_session_async(sess, force=False):
@@ -3061,6 +3382,7 @@ class LiveDraftStreamer:
         if not text:
             return
         with self.lock:
+            self.waiting_bg = False
             snip = extract_live_thought_snippet(text)
             if snip:
                 self.latest_thought = snip
@@ -3100,6 +3422,7 @@ class LiveDraftStreamer:
         with self.lock:
             was_status = (self.phase != "text")
             self.paused = False
+            self.waiting_bg = False
             self.delay_until = 0.0
             self.phase = "text"
             self.stream_text = accumulated_text
@@ -3206,7 +3529,7 @@ class LiveDraftStreamer:
         if self.status_override:
             title = self.status_override.replace("{elapsed}", str(elapsed))
         elif self.waiting_bg and not self.active_tool and not self.latest_thought and not self.tool_history:
-            title = f"⏳ <b>等待后台任务响应 ({elapsed}s)...</b>"
+            title = f"⏳ <b>等待后台任务响应 ({elapsed}s)...</b>\n<i>可直接发消息打断，或发送 /cancel 终止</i>"
         elif self.total_tools > 0:
             title = f"⚡ <b>思考与执行中 ({elapsed}s · 第 {self.total_tools} 步)...</b>"
         else:
@@ -4894,7 +5217,8 @@ def run_agy(
     override_workdir=None,
     sync_tg=False,
 ):
-    global turn_running, turn_running_scope, turn_running_chat, turn_running_web_id, turn_running_cid, cancel_requested
+    global turn_running, turn_running_scope, turn_running_chat, turn_running_web_id, turn_running_cid
+    global turn_gen, turn_waiting_bg, turn_waiting_bg_since, turn_preempted_gen, cancel_requested
 
     is_web_turn = event_sink is not None
     sync_tg_enabled = bool(is_web_turn and sync_tg is True)
@@ -5063,12 +5387,21 @@ def run_agy(
             log("Conversation lease busy for conv=%s; proceeding on TG path after warning" % (conv[:8],))
 
     with session_lock:
+        turn_gen += 1
+        my_turn_gen = turn_gen
         turn_running = True
         turn_running_scope = exec_skey
         turn_running_chat = chat_id
         turn_running_web_id = web_turn_id
         turn_running_cid = conv
+        turn_waiting_bg = False
+        turn_waiting_bg_since = None
+        turn_preempted_gen = None
         cancel_requested = False
+
+    def _is_my_turn_preempted():
+        with session_lock:
+            return turn_preempted_gen == my_turn_gen
 
     update_scope_state(
         exec_skey,
@@ -5220,6 +5553,8 @@ def run_agy(
 
         result = None
         sess = None
+        watchdog_timeout_reason = None
+        watchdog_elapsed_s = 0.0
         while True:
             attempt_tools = 0
             if active_model not in attempted_models:
@@ -5255,7 +5590,14 @@ def run_agy(
                 raise
 
             got_turn_event = False
-            while not cancel_requested and not shutting_down:
+            last_activity_at = time.time()
+            waiting_bg_since = None
+            with session_lock:
+                if turn_gen == my_turn_gen:
+                    turn_waiting_bg = False
+                    turn_waiting_bg_since = None
+
+            while not cancel_requested and not shutting_down and not _is_my_turn_preempted():
                 ev = sess.next_event(timeout=0.25)
                 if not is_web_turn and (time.time() - last_live_img_scan) >= 2.0:
                     last_live_img_scan = time.time()
@@ -5265,6 +5607,29 @@ def run_agy(
                         thread_id=norm_tid, workdir=workdir,
                     )
                 if ev is None:
+                    if _is_my_turn_preempted():
+                        break
+                    now_wd = time.time()
+                    if (
+                        waiting_bg_since is not None
+                        and BG_WAIT_TIMEOUT > 0
+                        and (now_wd - waiting_bg_since) >= BG_WAIT_TIMEOUT
+                    ):
+                        watchdog_timeout_reason = "bg_wait_timeout"
+                        watchdog_elapsed_s = now_wd - waiting_bg_since
+                        log(
+                            "Watchdog triggered (bg_wait_timeout: %.1fs >= %.1fs, scope=%s, conv=%s)"
+                            % (watchdog_elapsed_s, BG_WAIT_TIMEOUT, exec_skey, (conv or "none")[:8])
+                        )
+                        break
+                    if TURN_SILENCE_TIMEOUT > 0 and (now_wd - last_activity_at) >= TURN_SILENCE_TIMEOUT:
+                        watchdog_timeout_reason = "turn_silence_timeout"
+                        watchdog_elapsed_s = now_wd - last_activity_at
+                        log(
+                            "Watchdog triggered (turn_silence_timeout: %.1fs >= %.1fs, scope=%s, conv=%s)"
+                            % (watchdog_elapsed_s, TURN_SILENCE_TIMEOUT, exec_skey, (conv or "none")[:8])
+                        )
+                        break
                     continue
 
                 kind = ev.get("event")
@@ -5272,6 +5637,7 @@ def run_agy(
                     break
 
                 if kind == "init":
+                    last_activity_at = time.time()
                     cid = ev.get("conversation_id")
                     if cid:
                         sess.cid = cid
@@ -5306,6 +5672,13 @@ def run_agy(
                 sess.last_used = time.time()
 
                 if kind == "step_update":
+                    last_activity_at = time.time()
+                    if waiting_bg_since is not None:
+                        waiting_bg_since = None
+                        with session_lock:
+                            if turn_gen == my_turn_gen:
+                                turn_waiting_bg = False
+                                turn_waiting_bg_since = None
                     if streamer.status_override:
                         streamer.set_status_override(None)
                     su = ev.get("step_update") or {}
@@ -5379,6 +5752,12 @@ def run_agy(
                                 if imm_res is not None:
                                     result = imm_res
                                     break
+                                bg_ts = time.time()
+                                waiting_bg_since = bg_ts
+                                with session_lock:
+                                    if turn_gen == my_turn_gen and turn_preempted_gen != my_turn_gen:
+                                        turn_waiting_bg = True
+                                        turn_waiting_bg_since = bg_ts
                                 continue
 
                             cur_cid = conv or get_scope_value(exec_skey, "conversation_id")
@@ -5466,12 +5845,26 @@ def run_agy(
                                     result = imm_res
                                     break
                                 streamer.start_next_segment(segment_start_line)
+                                bg_ts = time.time()
+                                waiting_bg_since = bg_ts
+                                with session_lock:
+                                    if turn_gen == my_turn_gen and turn_preempted_gen != my_turn_gen:
+                                        turn_waiting_bg = True
+                                        turn_waiting_bg_since = bg_ts
 
                 elif kind == "result":
+                    last_activity_at = time.time()
+                    if waiting_bg_since is not None:
+                        waiting_bg_since = None
+                        with session_lock:
+                            if turn_gen == my_turn_gen:
+                                turn_waiting_bg = False
+                                turn_waiting_bg_since = None
                     result = ev.get("result") or ev
                     break
 
-            if cancel_requested or shutting_down:
+            preempted_now = _is_my_turn_preempted()
+            if cancel_requested or shutting_down or preempted_now or watchdog_timeout_reason:
                 break
             if result is not None and result.get("status") == "ERROR":
                 chk_cid = result.get("conversation_id") or conv or get_scope_value(exec_skey, "conversation_id")
@@ -5571,7 +5964,102 @@ def run_agy(
 
         streamer.stop()
 
+        preempted_final = _is_my_turn_preempted()
+        if preempted_final and (not coalesced_final_delivered) and (result is None or result.get("status") != "SUCCESS"):
+            partial = (step_buffers.get(active_step_idx, "") if active_step_idx is not None else "").strip()
+            if not partial and isinstance(result, dict):
+                partial = (result.get("response") or "").strip() or _latest_step_buffer_text(step_buffers)
+            with session_lock:
+                if _session_pool.get(exec_skey) is sess:
+                    _session_pool.pop(exec_skey, None)
+                session_dirty_scopes.discard(exec_skey)
+            if sess is not None:
+                try:
+                    sess.close(force=True)
+                except Exception as close_err:
+                    log("preempt force close error: %r" % close_err)
+            with state_lock:
+                sc_w = _ensure_scope_locked(exec_skey)
+                if isinstance(sc_w.get("last_turn"), dict):
+                    sc_w["last_turn"]["status"] = "PREEMPTED"
+                if delivered_steps == 0 and pre_turn_conv is None:
+                    sc_w["conversation_id"] = None
+            _emit_web("aborted", {
+                "conversation_id": conv,
+                "partial_text": partial,
+                "reason": "preempted",
+            })
+            pending_chat_sync_status = "aborted"
+            return
+
         if result is None:
+            partial = (step_buffers.get(active_step_idx, "") if active_step_idx is not None else "").strip()
+
+            if watchdog_timeout_reason:
+                with session_lock:
+                    if _session_pool.get(exec_skey) is sess:
+                        _session_pool.pop(exec_skey, None)
+                    session_dirty_scopes.discard(exec_skey)
+                if sess is not None:
+                    try:
+                        sess.close(force=True)
+                    except Exception as close_err:
+                        log("watchdog force close error: %r" % close_err)
+                with state_lock:
+                    sc_w = _ensure_scope_locked(exec_skey)
+                    if isinstance(sc_w.get("last_turn"), dict):
+                        sc_w["last_turn"]["status"] = "TIMEOUT"
+                    if delivered_steps == 0 and pre_turn_conv is None:
+                        sc_w["conversation_id"] = None
+                is_group_chat = bool(chat_id is not None and int(chat_id) < 0)
+                if watchdog_timeout_reason == "bg_wait_timeout":
+                    wd_label = f"后台等待超时（>{int(BG_WAIT_TIMEOUT)}s 无进展）"
+                else:
+                    wd_label = f"静默超时（>{int(TURN_SILENCE_TIMEOUT)}s 无新事件）"
+                wd_err_str = f"任务已自动中止并恢复：{wd_label}"
+                _emit_web("error", {
+                    "conversation_id": conv,
+                    "error": wd_err_str,
+                    "status": "TIMEOUT",
+                    "reason": watchdog_timeout_reason,
+                })
+                pending_chat_sync_status = "error"
+                if is_web_turn:
+                    if sync_tg_enabled:
+                        _mirror_web_result_to_tg(user_id, "error", wd_err_str, status="TIMEOUT", cid=conv)
+                    return
+                is_admin_turn = (user_role == "admin") and (not session_readonly)
+                wd_kb = retry_kb if is_admin_turn else None
+                if is_group_chat or wd_kb is None:
+                    wd_notice = (
+                        f"⏱️ <b>任务{wd_label}，已自动清理卡住的进程并恢复会话。</b>\n"
+                        f"现在可以直接发送新消息继续。"
+                    )
+                else:
+                    wd_notice = (
+                        f"⏱️ <b>任务{wd_label}，已自动清理卡住的进程并恢复会话。</b>\n"
+                        f"现在可以直接发送新消息继续，或点击下方按钮重试上一轮。"
+                    )
+                w_mid = _extract_sent_mid(
+                    send(
+                        chat_id,
+                        wd_notice,
+                        parse_mode="HTML",
+                        reply_markup=wd_kb,
+                        thread_id=norm_tid,
+                    )
+                )
+                if w_mid and is_group_chat:
+                    _record_and_relay_bot_group_msg(
+                        chat_id,
+                        w_mid,
+                        norm_tid,
+                        wd_notice,
+                        relay_mentions=False,
+                        source_hop=mention_hop,
+                    )
+                return
+
             invalidate_session("eof_or_cancel", force=True, scope_key=exec_skey)
             with state_lock:
                 sc_w = _ensure_scope_locked(exec_skey)
@@ -5579,7 +6067,6 @@ def run_agy(
                     sc_w["last_turn"]["status"] = "CANCELLED" if cancel_requested else "ERROR"
                 if delivered_steps == 0 and pre_turn_conv is None:
                     sc_w["conversation_id"] = None
-            partial = (step_buffers.get(active_step_idx, "") if active_step_idx is not None else "").strip()
             if is_web_turn:
                 if cancel_requested or (sess and sess.proc.returncode in (-15, 143, -2, 130)):
                     _emit_web("aborted", {
@@ -5989,6 +6476,10 @@ def run_agy(
             turn_running_chat = None
             turn_running_web_id = None
             turn_running_cid = None
+            turn_waiting_bg = False
+            turn_waiting_bg_since = None
+            if turn_preempted_gen == my_turn_gen:
+                turn_preempted_gen = None
             if exec_skey in session_dirty_scopes and exec_skey in _session_pool:
                 recycle = _session_pool.pop(exec_skey, None)
                 session_dirty_scopes.discard(exec_skey)
@@ -7338,6 +7829,7 @@ def _handle_bot_bus_packet(pkt):
                 chain_id=str(pkt.get("chain_id") or ""),
                 is_mention=True,
                 raw_text=excerpt,
+                allow_preempt=False,
             )
     elif ptype == "scheduled_handoff":
         c_id = int(pkt.get("chat_id") or 0)
@@ -7367,6 +7859,7 @@ def _handle_bot_bus_packet(pkt):
                 is_mention=False,
                 has_media=False,
                 raw_text="",
+                allow_preempt=False,
             )
     elif ptype == "sync_group_model":
         m_mode = str(pkt.get("model_mode") or bot_bus.MODEL_MODE_DEFAULT).strip().lower()
@@ -9374,7 +9867,7 @@ def safe_workspace_path(name, scope_key=None):
 
 
 def cancel_current_task(chat_id, clear_all=False, from_native_stop=False, thread_id=None, scope_key=None):
-    global cancel_requested
+    global cancel_requested, turn_waiting_bg, turn_waiting_bg_since
     norm_tid = _normalize_thread_id(thread_id)
     skey = scope_key or scope_key_for(chat_id, norm_tid)
 
@@ -9388,6 +9881,8 @@ def cancel_current_task(chat_id, clear_all=False, from_native_stop=False, thread
             # Cancel active turn if triggered in same scope, clear_all, native Stop, or nothing else in this scope is queued
             if is_same_scope or clear_all or from_native_stop or queued_in_scope == 0:
                 cancel_requested = True
+                turn_waiting_bg = False
+                turn_waiting_bg_since = None
                 target_sk = turn_running_scope or skey
                 to_kill = _session_pool.pop(target_sk, None)
                 cancelled = True
@@ -11615,6 +12110,10 @@ def cmd_status(chat_id, thread_id=None, scope_key=None):
     with session_lock:
         is_running_here = turn_running and (turn_running_scope == skey)
         is_running_any = turn_running
+        active_scope = turn_running_scope
+        active_chat = turn_running_chat
+        active_waiting_bg = bool(turn_waiting_bg)
+        active_waiting_bg_since = turn_waiting_bg_since
         warm_sess = _session_pool.get(skey)
         is_warm = warm_sess is not None and warm_sess.is_alive()
         warm_total = sum(1 for s in _session_pool.values() if s.is_alive())
@@ -11628,10 +12127,39 @@ def cmd_status(chat_id, thread_id=None, scope_key=None):
     ) if conv else "<code>0k</code>"
     proj_label = current_project(skey) or "default-cli-project"
     wdir_short = current_workdir(skey).replace(HOME, "~")
+    bg_wait_sec = int(max(0.0, time.time() - active_waiting_bg_since)) if (active_waiting_bg and active_waiting_bg_since) else 0
+    bg_suffix = f" · ⏳ waiting_bg {bg_wait_sec}s" if active_waiting_bg else ""
+    is_group_view = bool(chat_id is not None and int(chat_id) < 0)
     if is_running_here:
-        run_str = "yes (native draft streaming ⚡)"
+        if active_waiting_bg:
+            run_str = f"yes (⏳ waiting_bg {bg_wait_sec}s · 可直接发消息打断或 /cancel)"
+        else:
+            run_str = "yes (native draft streaming ⚡)"
     elif is_running_any:
-        run_str = f"idle here (busy in <code>{html_mod.escape(str(turn_running_scope))}</code>)"
+        active_is_private = False
+        if active_scope:
+            sc_str = str(active_scope)
+            if sc_str.startswith("web:"):
+                active_is_private = True
+            elif sc_str.startswith("bus:"):
+                job_id_hint = _active_bus_job_id or sc_str[4:]
+                job_obj = bot_bus.get_job(job_id_hint) if job_id_hint else None
+                origin_cid = int((job_obj or {}).get("origin_chat_id") or 0)
+                if not origin_cid and (job_obj or {}).get("origin_scope_key"):
+                    p_cid, _ = parse_scope_key(job_obj.get("origin_scope_key"))
+                    origin_cid = int(p_cid or 0)
+                if origin_cid > 0 or (origin_cid == 0 and active_chat is not None and int(active_chat) > 0):
+                    active_is_private = True
+            else:
+                sc_cid, _ = parse_scope_key(active_scope)
+                if sc_cid is not None and int(sc_cid) > 0:
+                    active_is_private = True
+        if active_chat is not None and int(active_chat) > 0:
+            active_is_private = True
+        if is_group_view and active_is_private:
+            run_str = f"idle here (busy in 其他私聊任务（已隔离上下文）{bg_suffix})"
+        else:
+            run_str = f"idle here (busy in <code>{html_mod.escape(str(active_scope or 'active'))}</code>{bg_suffix})"
     elif is_warm:
         run_str = f"idle (warm ⚡ · pool {warm_total}/{MAX_WARM_SESSIONS})"
     else:
@@ -12687,6 +13215,14 @@ def handle_callback(cb):
         _handle_team_callback(cb_id, chat_id, thread_id, skey, msg_id, data)
 
     elif data == "action:cancel":
+        if role != "admin":
+            tg(
+                "answerCallbackQuery",
+                callback_query_id=cb_id,
+                text=access_control.format_rbac_denied_message(data, is_callback=True),
+                show_alert=True,
+            )
+            return
         tg("answerCallbackQuery", callback_query_id=cb_id, text="Cancelling task...")
         cancel_current_task(chat_id, thread_id=thread_id, scope_key=skey)
 
@@ -13676,6 +14212,14 @@ def handle_message(msg):
             else:
                 perform_hot_reload(notify_chat_id=chat_id, notify_thread_id=thread_id)
         elif cmd in ("/cancel", "/stop"):
+            if role != "admin":
+                send(
+                    chat_id,
+                    access_control.format_rbac_denied_message(cmd),
+                    parse_mode="HTML",
+                    thread_id=thread_id,
+                )
+                return
             cancel_current_task(chat_id, clear_all=(arg == "all"), thread_id=thread_id, scope_key=skey)
         elif cmd == "/status":
             cmd_status(chat_id, thread_id=thread_id, scope_key=skey)
@@ -13771,59 +14315,142 @@ def enqueue(
     raw_text=None,
     user_role="admin",
     user_id=None,
+    allow_preempt=True,
 ):
+    global turn_waiting_bg, turn_waiting_bg_since, turn_preempted_gen
     norm_tid = _normalize_thread_id(thread_id)
     skey = scope_key or scope_key_for(chat_id, norm_tid)
-    busy, busy_desc, pending = _describe_active_busy_task()
 
-    if (
-        busy
-        and chat_id
-        and int(chat_id) < 0
-        and BUS_FAST_CHAT_ENABLED
-        and _is_fast_chat_candidate(raw_text if raw_text is not None else prompt, has_media=has_media, is_mention=is_mention)
-    ):
-        if _fast_chat_sem.acquire(blocking=False):
-            log("Routing group message to isolated read-only fast-reply lane (chat=%s, busy=%s)" % (chat_id, busy_desc))
-            threading.Thread(
-                target=_run_fast_group_reply,
-                args=(chat_id, prompt),
-                kwargs={
-                    "thread_id": norm_tid,
-                    "scope_key": skey,
+    # C5/C6: Atomic same-scope admin preemption ONLY while the current turn is waiting_bg past grace window.
+    preempted = False
+    preempt_kill_sess = None
+    preempt_wait_sec = 0.0
+    preempted_gen_val = None
+    now_enq = time.time()
+    with session_lock:
+        if (
+            PREEMPT_WAITING_BG
+            and allow_preempt
+            and user_role == "admin"
+            and turn_running
+            and turn_running_scope == skey
+            and turn_waiting_bg
+            and turn_waiting_bg_since is not None
+            and turn_preempted_gen != turn_gen
+            and (now_enq - turn_waiting_bg_since) >= PREEMPT_BG_GRACE_SEC
+        ):
+            preempted = True
+            preempt_wait_sec = max(0.0, now_enq - turn_waiting_bg_since)
+            preempted_gen_val = turn_gen
+            turn_preempted_gen = turn_gen
+            turn_waiting_bg = False
+            turn_waiting_bg_since = None
+            preempt_kill_sess = _session_pool.pop(skey, None)
+
+    if preempted:
+        log(
+            "Preempting waiting_bg turn (scope=%s, waited=%.1fs, gen=%s)"
+            % (skey, preempt_wait_sec, preempted_gen_val)
+        )
+        enq_prompt = (
+            f"[BRIDGE_NOTICE] 上一轮任务在后台等待了 {int(preempt_wait_sec)} 秒未返回，已被用户的新消息打断。"
+            "请直接响应下方最新消息。\n\n"
+            + prompt
+        )
+        if origin_msg_id or mention_hop or chain_id or user_role != "admin" or user_id is not None:
+            item_payload = (
+                "__CHAT_TURN__",
+                {
+                    "prompt": enq_prompt,
                     "origin_msg_id": int(origin_msg_id or 0),
                     "mention_hop": int(mention_hop or 0),
-                    "busy_desc": busy_desc,
-                    "user_role": user_role,
+                    "chain_id": str(chain_id or ""),
+                    "user_role": str(user_role or "admin"),
                     "user_id": user_id,
                 },
-                daemon=True,
-            ).start()
-            return
+            )
+        else:
+            item_payload = enq_prompt
+        # Enqueue M2 BEFORE network I/O (`send`) so concurrent `_flush_album` or hot-reload cannot overtake/drop it.
+        job_q.put((chat_id, norm_tid, skey, item_payload))
+        if preempt_kill_sess is not None:
+            close_session_async(preempt_kill_sess, force=True)
+        send(
+            chat_id,
+            f"⚡ 检测到当前会话处于后台等待（已等待 {int(preempt_wait_sec)}s），已切换处理你的新消息。",
+            thread_id=norm_tid,
+            reply_to_message_id=origin_msg_id or None,
+        )
+        return
+    else:
+        busy, busy_desc, pending = _describe_active_busy_task()
 
-    if pending or busy:
-        if (chat_id and int(chat_id) < 0) or BUS_CHAT_MODE == "conversational":
-            if busy_desc:
-                q_text = (
-                    f"⏳ 我手头正在跑 {busy_desc}，这条需求我已接下排队（第 {pending + 1} 位），完成后马上处理。"
+        if (
+            busy
+            and chat_id
+            and int(chat_id) < 0
+            and BUS_FAST_CHAT_ENABLED
+            and _is_fast_chat_candidate(raw_text if raw_text is not None else prompt, has_media=has_media, is_mention=is_mention)
+        ):
+            if _fast_chat_sem.acquire(blocking=False):
+                log("Routing group message to isolated read-only fast-reply lane (chat=%s, busy=%s)" % (chat_id, busy_desc))
+                threading.Thread(
+                    target=_run_fast_group_reply,
+                    args=(chat_id, prompt),
+                    kwargs={
+                        "thread_id": norm_tid,
+                        "scope_key": skey,
+                        "origin_msg_id": int(origin_msg_id or 0),
+                        "mention_hop": int(mention_hop or 0),
+                        "busy_desc": busy_desc,
+                        "user_role": user_role,
+                        "user_id": user_id,
+                    },
+                    daemon=True,
+                ).start()
+                return
+
+        if pending or busy:
+            cancel_kb = (
+                {"inline_keyboard": [[{"text": "🛑 终止当前任务", "callback_data": "action:cancel"}]]}
+                if user_role == "admin"
+                else None
+            )
+            if (chat_id and int(chat_id) < 0) or BUS_CHAT_MODE == "conversational":
+                if busy_desc:
+                    q_text = (
+                        f"⏳ 我手头正在跑 {busy_desc}，这条需求我已接下排队（第 {pending + 1} 位），完成后马上处理。"
+                    )
+                else:
+                    q_text = (
+                        f"⏳ 我手头正在处理上一条任务，这条需求我已接下排队（第 {pending + 1} 位），完成后马上处理。"
+                    )
+                send(
+                    chat_id,
+                    q_text,
+                    thread_id=norm_tid,
+                    reply_to_message_id=origin_msg_id or None,
+                    reply_markup=cancel_kb,
                 )
             else:
-                q_text = (
-                    f"⏳ 我手头正在处理上一条任务，这条需求我已接下排队（第 {pending + 1} 位），完成后马上处理。"
+                q_hint = (
+                    "📋 Queued (position %d) — starts right after current turn (/cancel to interrupt)" % (pending + 1)
+                    if user_role == "admin"
+                    else "📋 Queued (position %d) — starts right after current turn" % (pending + 1)
                 )
-            send(chat_id, q_text, thread_id=norm_tid, reply_to_message_id=origin_msg_id or None)
-        else:
-            send(
-                chat_id,
-                "📋 Queued (position %d) — starts right after current turn (/cancel to interrupt)" % (pending + 1),
-                thread_id=norm_tid,
-            )
+                send(
+                    chat_id,
+                    q_hint,
+                    thread_id=norm_tid,
+                    reply_markup=cancel_kb,
+                )
+        enq_prompt = prompt
 
     if origin_msg_id or mention_hop or chain_id or user_role != "admin" or user_id is not None:
         item_payload = (
             "__CHAT_TURN__",
             {
-                "prompt": prompt,
+                "prompt": enq_prompt,
                 "origin_msg_id": int(origin_msg_id or 0),
                 "mention_hop": int(mention_hop or 0),
                 "chain_id": str(chain_id or ""),
@@ -13832,7 +14459,7 @@ def enqueue(
             },
         )
     else:
-        item_payload = prompt
+        item_payload = enq_prompt
     job_q.put((chat_id, norm_tid, skey, item_payload))
 
 

@@ -1424,7 +1424,7 @@ class TestBridgeBrowserPanelAndRbac(unittest.TestCase):
                     self.assertEqual([], r_prof_grp.data.get("profiles"))
                     self.assertIsNone(r_prof_grp.data.get("active_profile"))
 
-                    # Group-scoped /internal/start hitting 409 conflict does NOT leak active_profile!
+                    # Group-scoped /internal/start fails closed with 403 and NEVER leaks active_profile!
                     r_start_grp = await srv.internal_start(
                         _FakeReq(
                             body={
@@ -1437,8 +1437,9 @@ class TestBridgeBrowserPanelAndRbac(unittest.TestCase):
                             }
                         )  # type: ignore[arg-type]
                     )
-                    self.assertEqual(409, r_start_grp.status)
+                    self.assertEqual(403, r_start_grp.status)
                     self.assertNotIn("ultra-secret-profile", str(r_start_grp.data.get("error", "")))
+                    self.assertIn("私聊", str(r_start_grp.data.get("error", "")))
 
                     # Even when idle, group-scoped /internal/status and /internal/profiles do NOT expose profile catalog!
                     hub.engine_mode = "idle"

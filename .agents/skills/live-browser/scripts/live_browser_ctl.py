@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -12,7 +13,7 @@ import shutil
 import subprocess
 import sys
 import time
-from typing import Any
+from typing import Any, Mapping
 import urllib.parse
 
 import requests
@@ -40,6 +41,126 @@ def _sanitize_tab_cmd_id(raw: Any) -> str | None:
     if not val or not _TAB_CMD_ID_RE.match(val):
         return None
     return val
+
+
+def _parse_strict_int_no_ws(raw: Any) -> int | None:
+    """Parse a strict ASCII integer rejecting bools, floats, leading zeros, and any whitespace."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, str):
+        if not raw or any(ch.isspace() for ch in raw):
+            return None
+        digits = raw[1:] if raw.startswith("-") else raw
+        if not digits or not digits.isascii() or not digits.isdigit():
+            return None
+        if len(digits) > 1 and digits.startswith("0"):
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _parse_strict_positive_int(raw: Any) -> int | None:
+    """Return a strict positive integer (> 0, not bool, no whitespace) or None."""
+    val = _parse_strict_int_no_ws(raw)
+    return val if (val is not None and val > 0) else None
+
+
+def _validate_positive_timeout(raw: Any, default: float = 600.0) -> float:
+    """Validate timeout is a positive finite number (rejects bool, <=0, NaN, inf)."""
+    val = default if raw is None else raw
+    if isinstance(val, bool):
+        raise ValueError("timeout must be a positive finite number, not bool")
+    try:
+        num = float(val)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid timeout: {raw!r}") from exc
+    if not math.isfinite(num) or num <= 0:
+        raise ValueError(f"timeout must be a positive finite number, got {raw!r}")
+    return num
+
+
+def resolve_tg_identity(
+    *,
+    explicit_user_id: Any = None,
+    explicit_chat_id: Any = None,
+    env: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Resolve Telegram caller identity for internal Live Browser requests.
+
+    Priority: explicit args > AGY_LIVE_USER_ID > AGY_BOT_CHAT_ID.
+    - Pure local CLI (no explicit args and neither env var set/non-empty) returns {}.
+    - Only a strict positive integer private DM ID binds `user_id` + `chat_id` + `source="tg_cmd"`.
+    - Negative group IDs (`-100...`), `"0"`, `"abc"`, whitespace, or invalid env strings NEVER
+      infer a positive `user_id`; they carry `source="tg_cmd"` + raw/negative `chat_id` (or
+      invalid `user_id`) so the server fails closed with HTTP 403 and never sends cards to groups.
+    """
+    if explicit_user_id is not None:
+        uid = _parse_strict_positive_int(explicit_user_id)
+        if uid is None:
+            raise ValueError("user_id must be a strict positive integer")
+        if explicit_chat_id is not None:
+            if isinstance(explicit_chat_id, bool):
+                raise ValueError("chat_id must not be a boolean")
+            cid_int = _parse_strict_int_no_ws(explicit_chat_id)
+            if cid_int is None:
+                raise ValueError("chat_id must be a strict integer")
+            return {"source": "tg_cmd", "user_id": uid, "chat_id": cid_int}
+        return {"source": "tg_cmd", "user_id": uid, "chat_id": uid}
+
+    if explicit_chat_id is not None:
+        if isinstance(explicit_chat_id, bool):
+            raise ValueError("chat_id must not be a boolean")
+        cid_int = _parse_strict_int_no_ws(explicit_chat_id)
+        if cid_int is not None and cid_int > 0:
+            return {"source": "tg_cmd", "user_id": cid_int, "chat_id": cid_int}
+        return {
+            "source": "tg_cmd",
+            "chat_id": cid_int if cid_int is not None else str(explicit_chat_id),
+        }
+
+    e = os.environ if env is None else env
+    raw_env_uid = e.get("AGY_LIVE_USER_ID")
+    raw_env_cid = e.get("AGY_BOT_CHAT_ID")
+    has_env_uid = raw_env_uid is not None and raw_env_uid != ""
+    has_env_cid = raw_env_cid is not None and raw_env_cid != ""
+    if not has_env_uid and not has_env_cid:
+        return {}
+
+    if has_env_uid:
+        uid = _parse_strict_positive_int(raw_env_uid)
+        if uid is None:
+            bad_uid = _parse_strict_int_no_ws(raw_env_uid)
+            out: dict[str, Any] = {
+                "source": "tg_cmd",
+                "user_id": bad_uid if bad_uid is not None else str(raw_env_uid),
+            }
+            if has_env_cid:
+                cid_parsed = _parse_strict_int_no_ws(raw_env_cid)
+                out["chat_id"] = cid_parsed if cid_parsed is not None else str(raw_env_cid)
+            return out
+        if has_env_cid:
+            cid_parsed = _parse_strict_int_no_ws(raw_env_cid)
+            if cid_parsed is None or cid_parsed <= 0:
+                return {
+                    "source": "tg_cmd",
+                    "user_id": uid,
+                    "chat_id": cid_parsed if cid_parsed is not None else str(raw_env_cid),
+                }
+            return {"source": "tg_cmd", "user_id": uid, "chat_id": cid_parsed}
+        return {"source": "tg_cmd", "user_id": uid, "chat_id": uid}
+
+    cid_int = _parse_strict_int_no_ws(raw_env_cid)
+    if cid_int is not None and cid_int > 0:
+        return {"source": "tg_cmd", "user_id": cid_int, "chat_id": cid_int}
+    return {
+        "source": "tg_cmd",
+        "chat_id": cid_int if cid_int is not None else str(raw_env_cid),
+    }
 
 
 def _detect_current_bot_hint() -> str:
@@ -74,11 +195,44 @@ def _load_hub_conn() -> tuple[str, str]:
 class LiveBrowserClient:
     """Client for controlling the persistent AsyncCamoufox Live Browser Hub."""
 
-    def __init__(self, bot: str | None = None) -> None:
+    def __init__(
+        self,
+        bot: str | None = None,
+        *,
+        user_id: int | str | None = None,
+        chat_id: int | str | None = None,
+    ) -> None:
         self.base_url, self.token = _load_hub_conn()
         self.bot = bot if (bot and bot != "auto") else _detect_current_bot_hint()
+        self._explicit_user_id: Any = None
+        self._explicit_chat_id: Any = None
+        if user_id is not None or chat_id is not None:
+            # Validate explicit arguments immediately at construction time
+            resolve_tg_identity(explicit_user_id=user_id, explicit_chat_id=chat_id)
+            self._explicit_user_id = user_id
+            self._explicit_chat_id = chat_id
         self.session = requests.Session()
         self.session.trust_env = False  # Always direct to 127.0.0.1
+
+    def _identity_payload(
+        self,
+        *,
+        user_id: Any = None,
+        chat_id: Any = None,
+    ) -> dict[str, Any]:
+        eff_uid = user_id if user_id is not None else self._explicit_user_id
+        eff_cid = chat_id if chat_id is not None else self._explicit_chat_id
+        return resolve_tg_identity(explicit_user_id=eff_uid, explicit_chat_id=eff_cid)
+
+    @property
+    def user_id(self) -> int | None:
+        ident = self._identity_payload()
+        return _parse_strict_positive_int(ident.get("user_id"))
+
+    @property
+    def chat_id(self) -> int | str | None:
+        ident = self._identity_payload()
+        return ident.get("chat_id")
 
     def _headers(self) -> dict[str, str]:
         return {"X-Live-Token": self.token}
@@ -103,10 +257,12 @@ class LiveBrowserClient:
         except Exception:
             return False
 
-    def status(self) -> dict[str, Any]:
-        r = self.session.get(
-            f"{self.base_url}/internal/status", headers=self._headers(), timeout=5.0
-        )
+    def status(self, *, user_id: Any = None, chat_id: Any = None) -> dict[str, Any]:
+        ident = self._identity_payload(user_id=user_id, chat_id=chat_id)
+        kwargs: dict[str, Any] = {"headers": self._headers(), "timeout": 5.0}
+        if ident:
+            kwargs["params"] = {"bot": self.bot, **ident}
+        r = self.session.get(f"{self.base_url}/internal/status", **kwargs)
         r.raise_for_status()
         return r.json()
 
@@ -127,8 +283,14 @@ class LiveBrowserClient:
         proxy_bao_ref: str | None = None,
         ephemeral: bool = False,
         restart: bool = False,
+        user_id: Any = None,
+        chat_id: Any = None,
+        expected_session_gen: int | None = None,
     ) -> dict[str, Any]:
-        payload: dict[str, Any] = {"url": url, "bot": self.bot, "notify": notify}
+        ident = self._identity_payload(user_id=user_id, chat_id=chat_id)
+        payload: dict[str, Any] = {"url": url, "bot": self.bot, "notify": notify, **ident}
+        if expected_session_gen is not None:
+            payload["expected_session_gen"] = expected_session_gen
         if profile is not None:
             payload["profile"] = profile
         if os_name is not None:
@@ -163,9 +325,11 @@ class LiveBrowserClient:
 
     def list_profiles(self) -> dict[str, Any]:
         if self.is_alive() and self.token:
-            r = self.session.get(
-                f"{self.base_url}/internal/profiles", headers=self._headers(), timeout=5.0
-            )
+            ident = self._identity_payload()
+            kwargs: dict[str, Any] = {"headers": self._headers(), "timeout": 5.0}
+            if ident:
+                kwargs["params"] = {"bot": self.bot, **ident}
+            r = self.session.get(f"{self.base_url}/internal/profiles", **kwargs)
             return r.json()
         srv = _import_server_module()
 
@@ -199,14 +363,42 @@ class LiveBrowserClient:
 
         return srv.delete_profile(name)
 
-    def stop(self) -> dict[str, Any]:
-        r = self.session.post(
-            f"{self.base_url}/internal/stop", headers=self._headers(), timeout=20.0
-        )
+    def stop(
+        self,
+        *,
+        force: bool = False,
+        user_id: Any = None,
+        chat_id: Any = None,
+        expected_session_gen: int | None = None,
+    ) -> dict[str, Any]:
+        ident = self._identity_payload(user_id=user_id, chat_id=chat_id)
+        req_kwargs: dict[str, Any] = {"headers": self._headers(), "timeout": 20.0}
+        if ident or force or expected_session_gen is not None:
+            body: dict[str, Any] = {"bot": self.bot, **ident}
+            if force:
+                body["force"] = True
+            if expected_session_gen is not None:
+                body["expected_session_gen"] = expected_session_gen
+            req_kwargs["json"] = body
+        r = self.session.post(f"{self.base_url}/internal/stop", **req_kwargs)
         return r.json()
 
-    def action(self, action: str, timeout_http: float = 120.0, **kwargs: Any) -> dict[str, Any]:
-        payload = {"action": action, "bot": self.bot, **kwargs}
+    def action(
+        self,
+        action: str,
+        timeout_http: float = 120.0,
+        *,
+        expected_session_gen: int | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        call_uid = kwargs.pop("user_id", None)
+        call_cid = kwargs.pop("chat_id", None)
+        ident = self._identity_payload(user_id=call_uid, chat_id=call_cid)
+        payload: dict[str, Any] = {"action": action, "bot": self.bot, **ident, **kwargs}
+        if expected_session_gen is not None:
+            payload["expected_session_gen"] = expected_session_gen
+        if action == "wait_human" and "timeout" in payload and payload["timeout"] is not None:
+            payload["timeout"] = _validate_positive_timeout(payload["timeout"])
         r = self.session.post(
             f"{self.base_url}/internal/action",
             headers=self._headers(),
@@ -216,7 +408,10 @@ class LiveBrowserClient:
         return r.json()
 
     def update_config(self, **kwargs: Any) -> dict[str, Any]:
-        payload = {"bot": self.bot, **kwargs}
+        call_uid = kwargs.pop("user_id", None)
+        call_cid = kwargs.pop("chat_id", None)
+        ident = self._identity_payload(user_id=call_uid, chat_id=call_cid)
+        payload: dict[str, Any] = {"bot": self.bot, **ident, **kwargs}
         r = self.session.post(
             f"{self.base_url}/internal/config",
             headers=self._headers(),
@@ -240,9 +435,10 @@ class SyncLiveBridge:
         user_id: int | None = None,
         profile_dir: str | Path | None = None,
         pinned_launch: bool = False,
+        chat_id: int | None = None,
     ) -> None:
         self.raw_ctx = raw_ctx
-        self.client = LiveBrowserClient(bot=bot_hint)
+        self.client = LiveBrowserClient(bot=bot_hint, user_id=user_id, chat_id=chat_id)
         self.notify = (os.environ.get("AGY_LIVE_NOTIFY", "1") != "0") if notify is None else notify
         self.enabled = self.client.is_alive() and bool(self.client.token)
         self.active_idx = 0
@@ -258,25 +454,30 @@ class SyncLiveBridge:
         self._last_clip: str = self._read_x11_clip()
         if self.enabled:
             try:
+                ident = self.client._identity_payload()
                 start_body: dict[str, Any] = {
                     "bot": self.client.bot,
                     "ai_status": "已启动同步浏览器会话",
+                    **ident,
                 }
+                if ident and _parse_strict_positive_int(ident.get("user_id")) is None:
+                    # Group / non-private / invalid TG identity: never send live cards
+                    self.notify = False
                 if profile_dir is not None:
                     start_body["profile_dir"] = str(profile_dir)
                 if pinned_launch:
                     start_body["pinned_launch"] = True
-                raw_uid = user_id if user_id is not None else os.environ.get("AGY_LIVE_USER_ID")
-                if raw_uid is not None and str(raw_uid).strip().isdigit() and int(str(raw_uid).strip()) > 0:
-                    start_body["user_id"] = int(str(raw_uid).strip())
                 resp = self.client.session.post(
                     f"{self.client.base_url}/internal/sync/start",
                     headers=self.client._headers(),
                     json=start_body,
                     timeout=3.0,
                 )
+                status_code = getattr(resp, "status_code", 200)
                 start_data = resp.json() if hasattr(resp, "json") else {}
-                if isinstance(start_data, dict):
+                if status_code >= 400 or (isinstance(start_data, dict) and start_data.get("ok") is False):
+                    self.enabled = False
+                elif isinstance(start_data, dict):
                     self._sync_lease_id = start_data.get("sync_lease_id")
                     self._sync_session_gen = start_data.get("session_gen")
                     self._pinned_verified = bool(start_data.get("pinned_verified"))
@@ -422,9 +623,16 @@ class SyncLiveBridge:
         ai_status: str = "",
         cursor: tuple[float, float, str] | None = None,
         allow_takeover_loop: bool = True,
-    ) -> None:
+        takeover_timeout: float | None = None,
+    ) -> bool:
+        """Push current frame & process human commands. Returns True iff exited due to takeover_timeout."""
+        validated_timeout: float | None = None
+        if takeover_timeout is not None:
+            validated_timeout = _validate_positive_timeout(takeover_timeout)
         if not self.enabled or self._in_checkpoint:
-            return
+            return False
+        deadline = (time.monotonic() + validated_timeout) if validated_timeout is not None else None
+        timed_out = False
         self._in_checkpoint = True
         try:
             while True:
@@ -587,8 +795,20 @@ class SyncLiveBridge:
                     self._release_held_buttons_sync()
                 if not allow_takeover_loop or not is_takeover or not self.enabled:
                     break
+                if deadline is not None and time.monotonic() >= deadline:
+                    timed_out = True
+                    self._release_held_buttons_sync()
+                    break
                 ai_status = "人工接管中（脚本已挂起等待）"
-                time.sleep(0.09)
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        timed_out = True
+                        self._release_held_buttons_sync()
+                        break
+                    time.sleep(min(0.09, remaining))
+                else:
+                    time.sleep(0.09)
         except Exception:
             if not self.enabled:
                 self._release_held_buttons_sync()
@@ -596,6 +816,7 @@ class SyncLiveBridge:
             if not self.enabled:
                 self._release_held_buttons_sync()
             self._in_checkpoint = False
+        return timed_out
 
     @staticmethod
     def _is_raw_page_closed(page: Any) -> bool:
@@ -1103,12 +1324,66 @@ class WrappedSyncPage:
             self._raw.wait_for_timeout(step_ms)
             self._bridge.sync_checkpoint(ai_status="等待页面响应...")
 
-    def wait_for_human(self, reason: str = "请完成手动确认后点击【交还给 AI】") -> None:
-        """Explicitly pause sync script and pump live 11 FPS takeover loop until user resumes AI."""
+    def wait_for_human(
+        self,
+        reason: str = "请完成手动确认后点击【交还给 AI】",
+        timeout: float = 600.0,
+    ) -> None:
+        """Explicitly pause sync script and pump live takeover loop until user resumes AI or timeout."""
+        timeout_s = _validate_positive_timeout(timeout)
         if not self._bridge.enabled:
-            return
-        self._bridge.client.update_config(takeover=True, reason=reason, ensure_card=True)
-        self._bridge.sync_checkpoint(ai_status=reason, allow_takeover_loop=True)
+            raise RuntimeError("Live Browser 同步会话未启用，无法发起人工接管")
+        cfg_kwargs: dict[str, Any] = {
+            "takeover": True,
+            "reason": reason,
+            "ensure_card": bool(self._bridge.notify),
+        }
+        if self._bridge._sync_session_gen is not None:
+            cfg_kwargs["expected_session_gen"] = self._bridge._sync_session_gen
+        cfg_res = self._bridge.client.update_config(**cfg_kwargs)
+        if not isinstance(cfg_res, dict) or not cfg_res.get("ok"):
+            err = (
+                (cfg_res or {}).get("error")
+                or (cfg_res or {}).get("card_error")
+                or "无法启用人工接管或发送私聊卡片"
+            )
+            tk_sgen = _parse_strict_int_no_ws((cfg_res or {}).get("session_gen"))
+            tk_tgen = _parse_strict_int_no_ws((cfg_res or {}).get("takeover_gen"))
+            if isinstance(cfg_res, dict) and cfg_res.get("takeover") and tk_sgen is not None and tk_tgen is not None:
+                try:
+                    self._bridge.client.update_config(
+                        takeover=False,
+                        reason="发卡失败，自动清理接管状态",
+                        expected_session_gen=tk_sgen,
+                        expected_takeover_gen=tk_tgen,
+                    )
+                except Exception:
+                    pass
+            raise RuntimeError(str(err))
+        tk_sgen = _parse_strict_int_no_ws(cfg_res.get("session_gen"))
+        if tk_sgen is None:
+            tk_sgen = self._bridge._sync_session_gen
+        tk_tgen = _parse_strict_int_no_ws(cfg_res.get("takeover_gen"))
+        timed_out = self._bridge.sync_checkpoint(
+            ai_status=reason,
+            allow_takeover_loop=True,
+            takeover_timeout=timeout_s,
+        )
+        if timed_out:
+            release_kwargs: dict[str, Any] = {
+                "takeover": False,
+                "reason": f"等待人工交还超时（{timeout_s:g}s），已自动清理接管状态",
+            }
+            if tk_sgen is not None:
+                release_kwargs["expected_session_gen"] = tk_sgen
+            if tk_tgen is not None:
+                release_kwargs["expected_takeover_gen"] = tk_tgen
+            try:
+                self._bridge.client.update_config(**release_kwargs)
+            except Exception:
+                pass
+            self._bridge._release_held_buttons_sync()
+            raise TimeoutError(f"wait_for_human timed out after {timeout_s:g}s")
 
     def __getattr__(self, name: str) -> Any:
         attr = getattr(self._raw, name)
@@ -1166,6 +1441,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Control AGY Live Browser (Telegram Mini App real-time view + human takeover)."
     )
     p.add_argument("--bot", default="auto", help="Bot target: auto | sg | main")
+    p.add_argument("--user-id", default=None, help="Explicit positive Telegram admin user ID for private DM ownership.")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("status", help="Inspect Live Browser Hub status and public Mini App URL.")
@@ -1259,9 +1535,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
-    cli = LiveBrowserClient(bot=args.bot)
-
     try:
+        cli = LiveBrowserClient(bot=args.bot, user_id=args.user_id)
         if args.cmd == "status":
             out = cli.status()
         elif args.cmd == "start":
@@ -1324,11 +1599,12 @@ def main() -> int:
         elif args.cmd == "screenshot":
             out = cli.action("screenshot", path=args.path, full_page=args.full_page)
         elif args.cmd == "wait-human":
+            timeout_s = _validate_positive_timeout(args.timeout)
             out = cli.action(
                 "wait_human",
                 reason=args.reason,
-                timeout=args.timeout,
-                timeout_http=args.timeout + 15.0,
+                timeout=timeout_s,
+                timeout_http=timeout_s + 15.0,
             )
         elif args.cmd == "set-public-url":
             out = cli.update_config(public_url=args.url)
@@ -1336,7 +1612,7 @@ def main() -> int:
             out = cli.update_config(ensure_card=True, force_new=args.new)
         else:
             raise SystemExit(f"Unknown command: {args.cmd}")
-    except (ValueError, KeyError, RuntimeError) as exc:
+    except (ValueError, KeyError, RuntimeError, TimeoutError) as exc:
         out = {"ok": False, "error": str(exc)}
 
     print(json.dumps(out, ensure_ascii=False, indent=2))
