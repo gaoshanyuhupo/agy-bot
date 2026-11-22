@@ -28,6 +28,7 @@ if str(_BRIDGE_SRC_DIR) not in sys.path:
 
 import bot_bus  # noqa: E402
 import cost_usage  # noqa: E402
+import google_accounts  # noqa: E402
 import scheduler  # noqa: E402
 import studio_ipc  # noqa: E402
 
@@ -863,6 +864,8 @@ class StudioDataSources:
         summaries_db: Path | None = None,
         meta_file: Path | None = None,
         projects_dir: Path | None = None,
+        google_accounts_dir: Path | None = None,
+        account_manager: Any | None = None,
     ) -> None:
         home = Path.home()
         agy_root = home / ".gemini" / "antigravity-cli"
@@ -892,6 +895,20 @@ class StudioDataSources:
         self.projects_dir = projects_dir or Path(
             os.environ.get("AGY_PROJECTS_DIR", str(home / ".gemini" / "config" / "projects"))
         )
+        env_accts_dir = os.environ.get("AGY_GOOGLE_ACCOUNTS_DIR", "").strip()
+        self._isolated_mode = any(
+            p is not None
+            for p in (bus_dir, schedules_file, cost_ledger_file, cost_config_file, quota_cache_file, brain_root)
+        )
+        if google_accounts_dir is not None:
+            self.google_accounts_dir = google_accounts_dir
+        elif env_accts_dir:
+            self.google_accounts_dir = Path(env_accts_dir)
+        elif self._isolated_mode:
+            self.google_accounts_dir = self.cost_config_file.parent / "accounts"
+        else:
+            self.google_accounts_dir = agy_root / "accounts"
+        self.account_manager = account_manager
         self.cost_tz_name = cost_tz_name or os.environ.get("AGY_TG_COST_TZ", "Asia/Shanghai")
         self.live_browser_url = (
             live_browser_url or os.environ.get("AGY_LIVE_BROWSER_URL", "http://127.0.0.1:18795")
@@ -1423,16 +1440,76 @@ class StudioDataSources:
         }
 
     # ------------------------------------------------------------------ Costs & Quota (Read-Only)
-    def get_costs(self, *, scope: str = "all") -> dict[str, Any]:
+    def _read_accounts_quota_ro(self) -> tuple[dict[str, Any], dict[str, str]]:
+        """Read strictly desensitized multi-plan quota summary and alias map without creating files."""
+        empty_summary: dict[str, Any] = {
+            "active_account_id": None,
+            "total_unique_accounts": 0,
+            "total_slots": 0,
+            "duplicate_slot_count": 0,
+            "for_group": False,
+            "tiers": [],
+        }
+        alias_map: dict[str, str] = {}
+        mgr = self.account_manager
+        try:
+            if mgr is not None and getattr(mgr, "registry_path", None) is not None and mgr.registry_path.is_file():
+                summary = mgr.summarize_plan_quotas(for_group=False)
+                for acct in mgr.list_accounts(for_group=False):
+                    aid = str(acct.get("account_id") or "")
+                    if aid:
+                        alias_map[aid] = str(acct.get("alias") or aid)
+                return summary, alias_map
+
+            reg_path = self.google_accounts_dir / "registry.json"
+            if reg_path.is_file() and not reg_path.is_symlink():
+                ro_mgr = google_accounts.GoogleAccountManager(
+                    root_dir=self.google_accounts_dir,
+                    auto_adopt_host=False,
+                )
+                summary = ro_mgr.summarize_plan_quotas(for_group=False)
+                for acct in ro_mgr.list_accounts(for_group=False):
+                    aid = str(acct.get("account_id") or "")
+                    if aid:
+                        alias_map[aid] = str(acct.get("alias") or aid)
+                return summary, alias_map
+        except Exception:
+            pass
+        return empty_summary, alias_map
+
+    def get_costs(
+        self,
+        *,
+        scope: str = "all",
+        account_id: str | None = None,
+        plan_tier: str | None = None,
+    ) -> dict[str, Any]:
         if scope not in ("all", "agent", "sched"):
             scope = "all"
+
+        clean_aid: str | None = None
+        if isinstance(account_id, str):
+            raw_aid = account_id.strip()
+            if raw_aid and raw_aid.lower() != "all":
+                clean_aid = _sanitize_slug(raw_aid, max_len=64) or None
+
+        clean_tier: str | None = None
+        if isinstance(plan_tier, str):
+            raw_tier = plan_tier.strip().lower()
+            if raw_tier and raw_tier != "all":
+                clean_tier = _sanitize_controlled_label(raw_tier, fallback="unknown").lower()
 
         tz, tz_lbl = cost_usage.get_cost_tz(self.cost_tz_name)
         now_local = datetime.datetime.now(tz)
         now_utc = now_local.astimezone(datetime.timezone.utc)
         today_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
         week_start_utc, _week_end_utc, week_start_loc, week_end_loc, week_rem_str = (
-            cost_usage.get_weekly_quota_bounds(now_utc, tz, str(self.cost_config_file))
+            cost_usage.get_weekly_quota_bounds(
+                now_utc,
+                tz,
+                str(self.cost_config_file),
+                account_id=clean_aid,
+            )
         )
         d7_start = today_start - datetime.timedelta(days=6)
         d14_start = today_start - datetime.timedelta(days=13)
@@ -1453,6 +1530,10 @@ class StudioDataSources:
         by_day: dict[str, dict[str, Any]] = {}
         by_model_week: dict[str, dict[str, Any]] = {}
         by_model_month: dict[str, dict[str, Any]] = {}
+        by_account_month_raw: dict[str, dict[str, Any]] = {}
+        by_account_tier: dict[str, str] = {}
+        by_plan_month_raw: dict[str, dict[str, Any]] = {}
+        by_plan_accounts: dict[str, set[str]] = {}
 
         for entry in convs.values():
             if not isinstance(entry, dict):
@@ -1463,6 +1544,16 @@ class StudioDataSources:
                 continue
             if scope == "sched" and not is_sched:
                 continue
+            entry_acct = _sanitize_slug(entry.get("account_id") or "", max_len=64) or "unassigned"
+            entry_tier = _sanitize_controlled_label(
+                str(entry.get("plan_tier") or "unknown").strip().lower(),
+                fallback="unknown",
+            ).lower()
+            if clean_aid is not None and entry_acct != clean_aid:
+                continue
+            if clean_tier is not None and entry_tier != clean_tier:
+                continue
+
             hours = entry.get("hours")
             if not isinstance(hours, dict):
                 continue
@@ -1505,6 +1596,19 @@ class StudioDataSources:
                             by_model_month.setdefault(fam, cost_usage.new_cost_agg()),
                             inp, ca, out, calls, cost_u, nocache_u,
                         )
+                        cost_usage.add_cost_agg(
+                            by_account_month_raw.setdefault(entry_acct, cost_usage.new_cost_agg()),
+                            inp, ca, out, calls, cost_u, nocache_u,
+                        )
+                        if by_account_tier.get(entry_acct, "unknown") == "unknown" and entry_tier != "unknown":
+                            by_account_tier[entry_acct] = entry_tier
+                        else:
+                            by_account_tier.setdefault(entry_acct, entry_tier)
+                        cost_usage.add_cost_agg(
+                            by_plan_month_raw.setdefault(entry_tier, cost_usage.new_cost_agg()),
+                            inp, ca, out, calls, cost_u, nocache_u,
+                        )
+                        by_plan_accounts.setdefault(entry_tier, set()).add(entry_acct)
 
         def _pack_agg(agg: dict[str, Any]) -> dict[str, Any]:
             tot_tok, cache_pct, _bar, saved, save_pct = cost_usage.agg_metrics(agg)
@@ -1552,6 +1656,33 @@ class StudioDataSources:
                 })
             return rows
 
+        accounts_quota, acct_alias_map = self._read_accounts_quota_ro()
+
+        by_account_month: list[dict[str, Any]] = []
+        for aid, aagg in sorted(by_account_month_raw.items(), key=lambda kv: (-kv[1]["cost"], kv[0])):
+            tier_k = by_account_tier.get(aid, "unknown")
+            by_account_month.append({
+                "account_id": aid,
+                "alias": acct_alias_map.get(aid, "未归属 (历史)" if aid == "unassigned" else aid),
+                "plan_tier": tier_k,
+                "plan_label": google_accounts.PLAN_TIER_LABELS.get(tier_k, "Unknown"),
+                **_pack_agg(aagg),
+            })
+
+        by_plan_month: list[dict[str, Any]] = []
+        for tier_k, pagg in sorted(
+            by_plan_month_raw.items(),
+            key=lambda kv: (-kv[1]["cost"], -google_accounts.PLAN_TIER_PRIORITY.get(kv[0], 0), kv[0]),
+        ):
+            accts_sorted = sorted(by_plan_accounts.get(tier_k, set()))
+            by_plan_month.append({
+                "plan_tier": tier_k,
+                "plan_label": google_accounts.PLAN_TIER_LABELS.get(tier_k, "Unknown"),
+                "accounts": accts_sorted,
+                "account_count": len(accts_sorted),
+                **_pack_agg(pagg),
+            })
+
         quota_snap = cost_usage.load_cached_plan_quota(str(self.quota_cache_file))
         quota_groups: list[dict[str, Any]] = []
         if isinstance(quota_snap, dict):
@@ -1594,6 +1725,13 @@ class StudioDataSources:
             "daily_14d": daily_14d,
             "by_model_week": _pack_models(by_model_week),
             "by_model_month": _pack_models(by_model_month),
+            "by_account_month": by_account_month,
+            "by_plan_month": by_plan_month,
+            "accounts_quota": accounts_quota,
+            "filter": {
+                "account_id": clean_aid,
+                "plan_tier": clean_tier,
+            },
             "quota_groups": quota_groups,
         }
 

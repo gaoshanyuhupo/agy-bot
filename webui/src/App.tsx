@@ -151,6 +151,7 @@ export function App() {
   const [schedulesEventVer, setSchedulesEventVer] = useState(0);
   const [botsEventVer, setBotsEventVer] = useState(0);
   const [gatewaysEventVer, setGatewaysEventVer] = useState(0);
+  const [accountsEventVer, setAccountsEventVer] = useState(0);
   const [workbenchStateEventVer, setWorkbenchStateEventVer] = useState(0);
   const [overviewEventVer, setOverviewEventVer] = useState(0);
   const [attentionEventVer, setAttentionEventVer] = useState(0);
@@ -444,6 +445,9 @@ export function App() {
           });
         } else if (ev.type === "gateways_updated") {
           setGatewaysEventVer((n) => n + 1);
+        } else if (ev.type === "accounts_updated") {
+          setAccountsEventVer((n) => n + 1);
+          setOverviewEventVer((n) => n + 1);
         } else if (ev.type === "workbench_state_updated") {
           setWorkbenchStateEventVer((n) => n + 1);
         } else if (ev.type === "session_updated") {
@@ -542,6 +546,7 @@ export function App() {
           setSchedulesEventVer((n) => n + 1);
           setBotsEventVer((n) => n + 1);
           setGatewaysEventVer((n) => n + 1);
+          setAccountsEventVer((n) => n + 1);
           setWorkbenchStateEventVer((n) => n + 1);
           setOverviewEventVer((n) => n + 1);
           setAttentionEventVer((n) => n + 1);
@@ -843,7 +848,13 @@ export function App() {
                   onSessionRevoked={handleSessionRevoked}
                 />
               )}
-              {activeTab === "costs" && <CostsView />}
+              {activeTab === "costs" && (
+                <CostsView
+                  session={session}
+                  eventVersion={accountsEventVer}
+                  onSessionRevoked={handleSessionRevoked}
+                />
+              )}
             </div>
           )}
         </main>

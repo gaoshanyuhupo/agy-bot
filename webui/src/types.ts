@@ -212,6 +212,7 @@ export type StudioEventType =
   | "schedule_updated"
   | "bots_updated"
   | "gateways_updated"
+  | "accounts_updated"
   | "workbench_state_updated"
   | "session_updated"
   | "room_message"
@@ -273,6 +274,194 @@ export interface QuotaGroup {
   }[];
 }
 
+export interface AccountCostRow extends CostAgg {
+  account_id: string;
+  alias: string;
+  plan_tier: string;
+  plan_label: string;
+}
+
+export interface PlanCostRow extends CostAgg {
+  plan_tier: string;
+  plan_label: string;
+  accounts: string[];
+  account_count: number;
+}
+
+export type PlanTierId = "ultra" | "pro" | "enterprise" | "free" | "unknown" | string;
+
+export interface AccountQuotaBucket {
+  id: string;
+  name: string;
+  window: string;
+  remaining_fraction: number;
+  remaining_pct: number;
+  reset_time: string | null;
+}
+
+export interface AccountQuotaGroup {
+  name: string;
+  buckets: AccountQuotaBucket[];
+}
+
+export interface AccountQuotaSummary {
+  has_quota: boolean;
+  fetched_at_iso: string;
+  gemini_5h_pct: number | null;
+  gemini_5h_reset_at: string | null;
+  gemini_weekly_pct: number | null;
+  gemini_weekly_reset_at: string | null;
+  claude_gpt_5h_pct: number | null;
+  claude_gpt_5h_reset_at: string | null;
+  claude_gpt_weekly_pct: number | null;
+  claude_gpt_weekly_reset_at: string | null;
+  groups: AccountQuotaGroup[];
+}
+
+export interface WeeklyResetUtcConfig {
+  weekday: number;
+  hour: number;
+  minute?: number;
+}
+
+export interface GoogleAccountItem {
+  account_id: string;
+  alias: string;
+  email_masked: string;
+  plan_tier: PlanTierId;
+  plan_label: string;
+  is_active: boolean;
+  is_duplicate: boolean;
+  duplicate_of: string | null;
+  status: "ready" | "pending_login" | "logged_out" | string;
+  auth_method?: string;
+  is_host_adopted?: boolean;
+  credential_fingerprint?: string;
+  paid_tier_id?: string;
+  current_tier_id?: string;
+  last_checked_at?: string;
+  last_error?: string;
+  created_at?: string;
+  updated_at?: string;
+  quota_summary: AccountQuotaSummary;
+  weekly_reset_utc?: WeeklyResetUtcConfig | null;
+}
+
+export interface PlanPoolMetric {
+  accounts_with_data: number;
+  total_remaining_fraction: number;
+  avg_remaining_pct: number | null;
+  max_remaining_pct: number | null;
+  exhausted_count: number;
+  earliest_reset_at: string | null;
+}
+
+export interface PlanTierQuotaSummary {
+  plan_tier: PlanTierId;
+  plan_label: string;
+  unique_accounts: number;
+  slot_count: number;
+  duplicate_slots: number;
+  account_ids: string[];
+  pools: {
+    gemini_5h: PlanPoolMetric;
+    gemini_weekly: PlanPoolMetric;
+    claude_gpt_5h: PlanPoolMetric;
+    claude_gpt_weekly: PlanPoolMetric;
+  };
+}
+
+export interface MultiPlanQuotaSummary {
+  active_account_id: string | null;
+  total_unique_accounts: number;
+  total_slots: number;
+  duplicate_slot_count: number;
+  for_group?: boolean;
+  tiers: PlanTierQuotaSummary[];
+}
+
+export interface AccountRecommendationBucket {
+  model_group: "claude_gpt" | "gemini" | string;
+  recommended: GoogleAccountItem | null;
+  reason: string;
+  candidates: GoogleAccountItem[];
+}
+
+export interface GoogleAccountsResponse {
+  ok: boolean;
+  active_account_id: string | null;
+  accounts: GoogleAccountItem[];
+  by_plan: MultiPlanQuotaSummary;
+  recommendation: {
+    claude_gpt: AccountRecommendationBucket;
+    gemini: AccountRecommendationBucket;
+  };
+  can_edit: boolean;
+  updated_at: string;
+}
+
+export interface GoogleAccountAddPayload {
+  account_id: string;
+  alias?: string;
+}
+
+export interface GoogleAccountPatchPayload {
+  alias?: string;
+  weekly_reset_utc_weekday?: number;
+  weekly_reset_utc_hour?: number;
+  weekly_reset_utc_minute?: number;
+}
+
+export interface GoogleAccountMutationResponse {
+  ok: boolean;
+  account?: GoogleAccountItem;
+  account_id?: string;
+  was_active?: boolean;
+  snapshot: GoogleAccountsResponse;
+}
+
+export interface GoogleAccountActivateResponse {
+  ok: boolean;
+  previous_account_id: string | null;
+  active_account_id: string;
+  switched: boolean;
+  account: GoogleAccountItem;
+  recycle_results?: {
+    handle: string;
+    ok: boolean;
+    status: number | string;
+    recycled?: boolean;
+    error?: string;
+  }[];
+  snapshot: GoogleAccountsResponse;
+}
+
+export interface GoogleAccountRefreshAllResponse {
+  ok: boolean;
+  all_succeeded: boolean;
+  refreshed: GoogleAccountItem[];
+  errors: Record<string, string>;
+  snapshot: GoogleAccountsResponse;
+}
+
+export interface GoogleLoginFlowState {
+  flow_id: string;
+  account_id: string;
+  alias: string;
+  status: "awaiting_code" | "submitting" | "completed" | "cancelled" | "expired" | "failed" | string;
+  created_at: number;
+  expires_at: number;
+  auth_url?: string;
+  error: string;
+  account?: GoogleAccountItem | null;
+}
+
+export interface GoogleLoginFlowResponse {
+  ok: boolean;
+  flow: GoogleLoginFlowState;
+  snapshot?: GoogleAccountsResponse;
+}
+
 export interface CostsResponse {
   ok: boolean;
   readonly: boolean;
@@ -291,6 +480,13 @@ export interface CostsResponse {
   daily_14d: DailyCostRow[];
   by_model_week: ModelCostRow[];
   by_model_month: ModelCostRow[];
+  by_account_month?: AccountCostRow[];
+  by_plan_month?: PlanCostRow[];
+  accounts_quota?: MultiPlanQuotaSummary;
+  filter?: {
+    account_id: string | null;
+    plan_tier: string | null;
+  };
   quota_groups: QuotaGroup[];
 }
 

@@ -23,6 +23,13 @@ import type {
   GatewayProbePayload,
   GatewayProbeResponse,
   GatewaysListResponse,
+  GoogleAccountActivateResponse,
+  GoogleAccountAddPayload,
+  GoogleAccountMutationResponse,
+  GoogleAccountPatchPayload,
+  GoogleAccountRefreshAllResponse,
+  GoogleAccountsResponse,
+  GoogleLoginFlowResponse,
   JobCancelResponse,
   JobDetailResponse,
   JobDispatchPayload,
@@ -400,6 +407,7 @@ export class StudioEventClient {
     bindType("schedule_updated");
     bindType("bots_updated");
     bindType("gateways_updated");
+    bindType("accounts_updated");
     bindType("workbench_state_updated");
     bindType("session_updated");
     bindType("room_message");
@@ -455,8 +463,158 @@ export class StudioEventClient {
   }
 }
 
-export function fetchCosts(scope: "all" | "agent" | "sched" = "all"): Promise<CostsResponse> {
-  return requestJson<CostsResponse>(`/api/costs?scope=${encodeURIComponent(scope)}`);
+export function fetchCosts(
+  scope: "all" | "agent" | "sched" = "all",
+  filters?: { account_id?: string | null; plan_tier?: string | null },
+): Promise<CostsResponse> {
+  const q = new URLSearchParams({ scope });
+  if (filters?.account_id && filters.account_id !== "all") {
+    q.set("account_id", filters.account_id);
+  }
+  if (filters?.plan_tier && filters.plan_tier !== "all") {
+    q.set("plan_tier", filters.plan_tier);
+  }
+  return requestJson<CostsResponse>(`/api/costs?${q.toString()}`);
+}
+
+// Multi-Google-Account OAuth & Multi-Plan Quota APIs
+export function fetchGoogleAccounts(): Promise<GoogleAccountsResponse> {
+  return requestJson<GoogleAccountsResponse>("/api/google-accounts");
+}
+
+export function addGoogleAccount(
+  payload: GoogleAccountAddPayload,
+): Promise<GoogleAccountMutationResponse> {
+  return requestJson<GoogleAccountMutationResponse>(
+    "/api/google-accounts",
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+    true,
+  );
+}
+
+export function updateGoogleAccount(
+  accountId: string,
+  payload: GoogleAccountPatchPayload,
+): Promise<GoogleAccountMutationResponse> {
+  return requestJson<GoogleAccountMutationResponse>(
+    `/api/google-accounts/${encodeURIComponent(accountId)}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    },
+    true,
+  );
+}
+
+export function deleteGoogleAccount(
+  accountId: string,
+): Promise<GoogleAccountMutationResponse> {
+  return requestJson<GoogleAccountMutationResponse>(
+    `/api/google-accounts/${encodeURIComponent(accountId)}`,
+    {
+      method: "DELETE",
+      body: "{}",
+    },
+    true,
+  );
+}
+
+export function startGoogleAccountLogin(
+  accountId: string,
+  payload?: { alias?: string; timeout_sec?: number },
+): Promise<GoogleLoginFlowResponse> {
+  return requestJson<GoogleLoginFlowResponse>(
+    `/api/google-accounts/${encodeURIComponent(accountId)}/login/start`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload || {}),
+    },
+    true,
+  );
+}
+
+export function fetchGoogleLoginFlow(flowId: string): Promise<GoogleLoginFlowResponse> {
+  return requestJson<GoogleLoginFlowResponse>(
+    `/api/google-accounts/login/${encodeURIComponent(flowId)}`,
+  );
+}
+
+export function submitGoogleLoginCode(
+  flowId: string,
+  codeOrUrl: string,
+): Promise<GoogleLoginFlowResponse> {
+  return requestJson<GoogleLoginFlowResponse>(
+    `/api/google-accounts/login/${encodeURIComponent(flowId)}/submit`,
+    {
+      method: "POST",
+      body: JSON.stringify({ code_or_url: codeOrUrl }),
+    },
+    true,
+  );
+}
+
+export function cancelGoogleLoginFlow(flowId: string): Promise<GoogleLoginFlowResponse> {
+  return requestJson<GoogleLoginFlowResponse>(
+    `/api/google-accounts/login/${encodeURIComponent(flowId)}/cancel`,
+    {
+      method: "POST",
+      body: "{}",
+    },
+    true,
+  );
+}
+
+export function logoutGoogleAccount(
+  accountId: string,
+): Promise<GoogleAccountMutationResponse> {
+  return requestJson<GoogleAccountMutationResponse>(
+    `/api/google-accounts/${encodeURIComponent(accountId)}/logout`,
+    {
+      method: "POST",
+      body: "{}",
+    },
+    true,
+  );
+}
+
+export function activateGoogleAccount(
+  accountId: string,
+): Promise<GoogleAccountActivateResponse> {
+  return requestJson<GoogleAccountActivateResponse>(
+    `/api/google-accounts/${encodeURIComponent(accountId)}/activate`,
+    {
+      method: "POST",
+      body: "{}",
+    },
+    true,
+  );
+}
+
+export function refreshGoogleAccountQuota(
+  accountId: string,
+): Promise<GoogleAccountMutationResponse> {
+  return requestJson<GoogleAccountMutationResponse>(
+    `/api/google-accounts/${encodeURIComponent(accountId)}/refresh-quota`,
+    {
+      method: "POST",
+      body: "{}",
+    },
+    true,
+  );
+}
+
+export function refreshAllGoogleAccountsQuota(): Promise<GoogleAccountRefreshAllResponse> {
+  return requestJson<GoogleAccountRefreshAllResponse>(
+    "/api/google-accounts/refresh-all",
+    {
+      method: "POST",
+      body: "{}",
+    },
+    true,
+  );
 }
 
 export function fetchBrowserStatus(): Promise<BrowserStatusResponse> {

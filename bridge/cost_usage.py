@@ -190,9 +190,17 @@ def collect_cost_hourly_buckets(
     mem_cache: dict,
     cache_lock,
     log_fn=None,
+    active_account_id: str | None = None,
+    active_plan_tier: str | None = None,
 ):
-    """Aggregate hourly token/cost buckets across transcripts and persistent ledger."""
+    """Aggregate hourly token/cost buckets across transcripts and persistent ledger.
+
+    Backward-compatible with legacy `cost_ledger_v2.json` entries that lack `account_id`/`plan_tier`
+    (classified as `unassigned` / `unknown`).
+    """
     tpaths = glob.glob(os.path.join(brain_root, "*", ".system_generated", "logs", "transcript.jsonl"))
+    eff_acct_id = str(active_account_id or "").strip() or "unassigned"
+    eff_plan_tier = str(active_plan_tier or "").strip().lower() or "unknown"
 
     dirty = False
     live_convs = {}
@@ -239,12 +247,16 @@ def collect_cost_hourly_buckets(
                 acc[3] += 1
                 acc[4] += cost_u
                 acc[5] += nocache_u
+        conv_acct = str(m_info.get("account_id") or "").strip() or eff_acct_id
+        conv_tier = str(m_info.get("plan_tier") or "").strip().lower() or eff_plan_tier
         conv_hours[cid] = {
             "mtime_ns": mtime_ns,
             "size": size,
             "project_id": m_info["project_id"],
             "is_observer": m_info["is_observer"],
             "is_scheduled": bool(m_info.get("is_scheduled", False) or has_sched),
+            "account_id": conv_acct,
+            "plan_tier": conv_tier,
             "hours": hours_map,
         }
 
@@ -263,14 +275,26 @@ def collect_cost_hourly_buckets(
                         ledger = {}
                 saved_convs = ledger.get("conversations") or {}
                 for cid, entry in saved_convs.items():
+                    if not isinstance(entry, dict):
+                        continue
                     if cid not in conv_hours:
                         if meta_map.get(cid, {}).get("is_scheduled") and not entry.get("is_scheduled"):
                             entry = dict(entry)
                             entry["is_scheduled"] = True
                             dirty = True
                         archived_convs[cid] = entry
-                    elif bool(entry.get("is_scheduled", False)) != bool(conv_hours[cid]["is_scheduled"]):
-                        dirty = True
+                    else:
+                        # Preserve original conversation account attribution if previously recorded
+                        prev_acct = str(entry.get("account_id") or "").strip()
+                        prev_tier = str(entry.get("plan_tier") or "").strip().lower()
+                        if prev_acct and prev_acct != "unassigned" and not meta_map.get(cid, {}).get("account_id"):
+                            conv_hours[cid]["account_id"] = prev_acct
+                            if prev_tier:
+                                conv_hours[cid]["plan_tier"] = prev_tier
+                        elif prev_acct != conv_hours[cid]["account_id"] or prev_tier != conv_hours[cid]["plan_tier"]:
+                            dirty = True
+                        if bool(entry.get("is_scheduled", False)) != bool(conv_hours[cid]["is_scheduled"]):
+                            dirty = True
                 if dirty or not os.path.isfile(cost_ledger_file):
                     merged = dict(archived_convs)
                     merged.update(conv_hours)
@@ -289,9 +313,13 @@ def collect_cost_hourly_buckets(
 
     records = []
     for cid, entry in all_convs.items():
+        if not isinstance(entry, dict):
+            continue
         pid = entry.get("project_id") or "default-cli-project"
         is_obs = bool(entry.get("is_observer", False))
         is_sched = bool(entry.get("is_scheduled", False))
+        acct_id = str(entry.get("account_id") or "").strip() or "unassigned"
+        plan_tier = str(entry.get("plan_tier") or "").strip().lower() or "unknown"
         for hour_utc, fam_map in (entry.get("hours") or {}).items():
             try:
                 dt_h = datetime.datetime.strptime(hour_utc, "%Y-%m-%dT%H").replace(tzinfo=datetime.timezone.utc)
@@ -302,6 +330,7 @@ def collect_cost_hourly_buckets(
                     dt_h, cid, pid, is_obs, is_sched, fam,
                     int(vals[0]), int(vals[1]), int(vals[2]), int(vals[3]),
                     float(vals[4]), float(vals[5]),
+                    acct_id, plan_tier,
                 ))
     return records
 
@@ -407,11 +436,20 @@ def make_cost_keyboard(view="overview", scope="all"):
     return {"inline_keyboard": [row_views, row_scopes, row_refresh]}
 
 
-def load_weekly_reset_utc(cost_config_file: str):
+def load_weekly_reset_utc(cost_config_file: str, account_id: str | None = None):
     if os.path.isfile(cost_config_file):
         try:
             with open(cost_config_file, "r", encoding="utf-8") as f:
                 cfg = json.load(f) or {}
+            if account_id:
+                acct_map = cfg.get("account_weekly_resets")
+                if isinstance(acct_map, dict):
+                    rec = acct_map.get(str(account_id))
+                    if isinstance(rec, dict) and "weekly_reset_utc_weekday" in rec and "weekly_reset_utc_hour" in rec:
+                        wd = int(rec.get("weekly_reset_utc_weekday", DEFAULT_WEEKLY_RESET_UTC[0])) % 7
+                        hr = int(rec.get("weekly_reset_utc_hour", DEFAULT_WEEKLY_RESET_UTC[1])) % 24
+                        mn = int(rec.get("weekly_reset_utc_minute", DEFAULT_WEEKLY_RESET_UTC[2])) % 60
+                        return wd, hr, mn
             wd = int(cfg.get("weekly_reset_utc_weekday", DEFAULT_WEEKLY_RESET_UTC[0])) % 7
             hr = int(cfg.get("weekly_reset_utc_hour", DEFAULT_WEEKLY_RESET_UTC[1])) % 24
             mn = int(cfg.get("weekly_reset_utc_minute", DEFAULT_WEEKLY_RESET_UTC[2])) % 60
@@ -421,22 +459,60 @@ def load_weekly_reset_utc(cost_config_file: str):
     return DEFAULT_WEEKLY_RESET_UTC
 
 
-def save_weekly_reset_utc(cost_config_file: str, wd, hr, mn):
+def save_weekly_reset_utc(cost_config_file: str, wd, hr, mn, account_id: str | None = None):
     os.makedirs(os.path.dirname(cost_config_file), exist_ok=True)
+    existing = {}
+    if os.path.isfile(cost_config_file):
+        try:
+            with open(cost_config_file, "r", encoding="utf-8") as rf:
+                loaded = json.load(rf)
+            if isinstance(loaded, dict):
+                existing = dict(loaded)
+        except Exception:
+            existing = {}
+
+    now_iso = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    wd_i = int(wd) % 7
+    hr_i = int(hr) % 24
+    mn_i = int(mn) % 60
+
+    acct_map = existing.get("account_weekly_resets")
+    if not isinstance(acct_map, dict):
+        acct_map = {}
+
+    if account_id:
+        acct_map[str(account_id)] = {
+            "weekly_reset_utc_weekday": wd_i,
+            "weekly_reset_utc_hour": hr_i,
+            "weekly_reset_utc_minute": mn_i,
+            "updated_at": now_iso,
+        }
+        payload = {
+            "weekly_reset_utc_weekday": int(existing.get("weekly_reset_utc_weekday", DEFAULT_WEEKLY_RESET_UTC[0])) % 7,
+            "weekly_reset_utc_hour": int(existing.get("weekly_reset_utc_hour", DEFAULT_WEEKLY_RESET_UTC[1])) % 24,
+            "weekly_reset_utc_minute": int(existing.get("weekly_reset_utc_minute", DEFAULT_WEEKLY_RESET_UTC[2])) % 60,
+            "updated_at": now_iso,
+            "account_weekly_resets": acct_map,
+        }
+    else:
+        payload = {
+            "weekly_reset_utc_weekday": wd_i,
+            "weekly_reset_utc_hour": hr_i,
+            "weekly_reset_utc_minute": mn_i,
+            "updated_at": now_iso,
+        }
+        if acct_map:
+            payload["account_weekly_resets"] = acct_map
+
     tmp = f"{cost_config_file}.{os.getpid()}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({
-            "weekly_reset_utc_weekday": int(wd) % 7,
-            "weekly_reset_utc_hour": int(hr) % 24,
-            "weekly_reset_utc_minute": int(mn) % 60,
-            "updated_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        }, f, indent=2)
+        json.dump(payload, f, indent=2)
     os.replace(tmp, cost_config_file)
 
 
-def get_weekly_quota_bounds(now_utc, local_tz, cost_config_file: str):
+def get_weekly_quota_bounds(now_utc, local_tz, cost_config_file: str, account_id: str | None = None):
     """Return `(cycle_start_utc, cycle_end_utc, cycle_start_local, cycle_end_local, rem_str)`."""
-    wd, hr, mn = load_weekly_reset_utc(cost_config_file)
+    wd, hr, mn = load_weekly_reset_utc(cost_config_file, account_id=account_id)
     days_ahead = (wd - now_utc.weekday()) % 7
     cand_end = now_utc.replace(hour=hr, minute=mn, second=0, microsecond=0) + datetime.timedelta(days=days_ahead)
     if cand_end <= now_utc:
@@ -462,11 +538,11 @@ def get_weekly_quota_bounds(now_utc, local_tz, cost_config_file: str):
     )
 
 
-def calibrate_weekly_reset_from_text(raw_arg: str, cost_config_file: str) -> bool:
+def calibrate_weekly_reset_from_text(raw_arg: str, cost_config_file: str, account_id: str | None = None) -> bool:
     """Parse e.g. '5 days, 11 hours' or '5d 11h' or 'default' and persist new UTC weekly anchor."""
     s = (raw_arg or "").strip().lower()
     if s in ("default", "reset"):
-        save_weekly_reset_utc(cost_config_file, *DEFAULT_WEEKLY_RESET_UTC)
+        save_weekly_reset_utc(cost_config_file, *DEFAULT_WEEKLY_RESET_UTC, account_id=account_id)
         return True
     m_d = re.search(r"(\d+)\s*(?:days?|d|天)", s)
     m_h = re.search(r"(\d+)\s*(?:hours?|hrs?|h|小时)", s)
@@ -485,8 +561,178 @@ def calibrate_weekly_reset_from_text(raw_arg: str, cost_config_file: str) -> boo
             target = target.replace(minute=0, second=0, microsecond=0)
     else:
         target = target.replace(second=0, microsecond=0)
-    save_weekly_reset_utc(cost_config_file, target.weekday(), target.hour, target.minute)
+    save_weekly_reset_utc(cost_config_file, target.weekday(), target.hour, target.minute, account_id=account_id)
     return True
+
+
+def _unpack_cost_record(rec):
+    """Unpack either legacy 12-tuple or extended 14-tuple cost record safely."""
+    if len(rec) >= 14:
+        return (
+            rec[0], rec[1], rec[2], rec[3], rec[4], rec[5],
+            rec[6], rec[7], rec[8], rec[9], rec[10], rec[11],
+            str(rec[12] or "unassigned"),
+            str(rec[13] or "unknown").lower(),
+        )
+    return (
+        rec[0], rec[1], rec[2], rec[3], rec[4], rec[5],
+        rec[6], rec[7], rec[8], rec[9], rec[10], rec[11],
+        "unassigned",
+        "unknown",
+    )
+
+
+def aggregate_by_account(records, *, start_utc=None):
+    """Aggregate cost records grouped by `account_id`."""
+    out = {}
+    for rec in records:
+        dt_utc_h, _cid, _pid, _is_obs, _is_sched, _fam, inp, ca, out_tok, calls, cost_u, nocache_u, acct_id, plan_tier = (
+            _unpack_cost_record(rec)
+        )
+        if start_utc is not None and dt_utc_h < start_utc:
+            continue
+        bucket = out.get(acct_id)
+        if bucket is None:
+            bucket = {
+                "account_id": acct_id,
+                "plan_tier": plan_tier,
+                **new_cost_agg(),
+            }
+            out[acct_id] = bucket
+        elif bucket["plan_tier"] == "unknown" and plan_tier != "unknown":
+            bucket["plan_tier"] = plan_tier
+        add_cost_agg(bucket, inp, ca, out_tok, calls, cost_u, nocache_u)
+    return out
+
+
+def aggregate_by_plan(records, *, start_utc=None):
+    """Aggregate cost records grouped by `plan_tier`."""
+    out = {}
+    acct_sets = {}
+    for rec in records:
+        dt_utc_h, _cid, _pid, _is_obs, _is_sched, _fam, inp, ca, out_tok, calls, cost_u, nocache_u, acct_id, plan_tier = (
+            _unpack_cost_record(rec)
+        )
+        if start_utc is not None and dt_utc_h < start_utc:
+            continue
+        bucket = out.get(plan_tier)
+        if bucket is None:
+            bucket = {
+                "plan_tier": plan_tier,
+                "accounts": [],
+                **new_cost_agg(),
+            }
+            out[plan_tier] = bucket
+            acct_sets[plan_tier] = set()
+        acct_sets[plan_tier].add(acct_id)
+        add_cost_agg(bucket, inp, ca, out_tok, calls, cost_u, nocache_u)
+    for tier, bucket in out.items():
+        bucket["accounts"] = sorted(acct_sets[tier])
+    return out
+
+
+_GROUP_EMAIL_SCRUB_RE = re.compile(r"(?<![A-Za-z0-9._%*+-])[A-Za-z0-9._%*+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+_GROUP_AT_DOMAIN_SCRUB_RE = re.compile(r"@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+_GROUP_PATH_SCRUB_RE = re.compile(r"(?:/home/[A-Za-z0-9._-]+(?:/[^\s\"'<>]*)?|/Users/[A-Za-z0-9._-]+(?:/[^\s\"'<>]*)?|~/[^\s\"'<>]*)")
+_ERR_BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{4,}")
+_ERR_YA29_RE = re.compile(r"\bya29\.[A-Za-z0-9._~+/-]{4,}")
+_ERR_REFRESH_1_RE = re.compile(r"(?<![A-Za-z0-9_])1//[A-Za-z0-9._~+/-]{4,}")
+_ERR_JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\b")
+
+
+def _scrub_group_text(raw: str) -> str:
+    s = _GROUP_EMAIL_SCRUB_RE.sub("[redacted]", str(raw or ""))
+    s = _GROUP_AT_DOMAIN_SCRUB_RE.sub("", s)
+    s = _GROUP_PATH_SCRUB_RE.sub("", s)
+    return s.strip()
+
+
+def _scrub_error_text(raw: str, *, redact_for_group: bool = False) -> str:
+    """Redact secrets and local home paths from error text; strip emails and domain suffixes in group chats."""
+    s = str(raw or "")
+    if not s:
+        return ""
+    try:
+        import google_accounts as _ga  # type: ignore[import-not-found]
+    except ImportError:
+        try:
+            from bridge import google_accounts as _ga
+        except ImportError:
+            _ga = None
+    if _ga is not None:
+        return _ga.scrub_error_for_public(s, redact_for_group=redact_for_group)
+    s = _ERR_BEARER_RE.sub("Bearer [REDACTED]", s)
+    s = _ERR_YA29_RE.sub("[REDACTED_TOKEN]", s)
+    s = _ERR_REFRESH_1_RE.sub("[REDACTED_REFRESH]", s)
+    s = _ERR_JWT_RE.sub("[REDACTED_JWT]", s)
+    s = _GROUP_PATH_SCRUB_RE.sub("[path-redacted]", s)
+    if redact_for_group:
+        s = _GROUP_EMAIL_SCRUB_RE.sub("[redacted]", s)
+        s = _GROUP_AT_DOMAIN_SCRUB_RE.sub("", s)
+    return s.strip()
+
+
+def format_multi_plan_summary(
+    plan_summary: dict | None,
+    *,
+    active_account: dict | None = None,
+    redact_for_group: bool = False,
+    cost_tz_name: str = "Asia/Shanghai",
+) -> str:
+    """Format active account badge + deduplicated multi-plan quota pool summary HTML block."""
+    lines = []
+    tz, _tz_lbl = get_cost_tz(cost_tz_name)
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+
+    if isinstance(active_account, dict) and active_account.get("account_id"):
+        alias = str(active_account.get("alias") or active_account.get("account_id"))
+        if redact_for_group:
+            alias = _scrub_group_text(alias) or str(active_account.get("account_id"))
+        plan_lbl = str(active_account.get("plan_label") or active_account.get("plan_tier") or "Unknown")
+        acct_line = f"👤 <b>当前活跃账号：</b><code>{html_mod.escape(alias)}</code> · <code>{html_mod.escape(plan_lbl)}</code>"
+        if not redact_for_group:
+            masked_em = str(active_account.get("email_masked") or "").strip()
+            if masked_em:
+                acct_line += f" <code>({html_mod.escape(masked_em)})</code>"
+        lines.append(acct_line)
+
+    if isinstance(plan_summary, dict):
+        tiers = plan_summary.get("tiers") or []
+        dup_cnt = int(plan_summary.get("duplicate_slot_count") or 0)
+        uniq_cnt = int(plan_summary.get("total_unique_accounts") or 0)
+        if tiers:
+            header_note = f"共 {uniq_cnt} 个去重账号" + (f" · 已去重 {dup_cnt} 个重复槽位" if dup_cnt > 0 else "")
+            lines.append(f"📦 <b>多套餐去重额度池</b> <code>({header_note})</code>")
+            for t in tiers:
+                tlbl = str(t.get("plan_label") or t.get("plan_tier") or "Unknown")
+                u_cnt = int(t.get("unique_accounts") or 0)
+                pools = t.get("pools") or {}
+                parts = []
+                for pk, short_lbl in (
+                    ("gemini_weekly", "Gem周"),
+                    ("gemini_5h", "Gem5h"),
+                    ("claude_gpt_weekly", "C/G周"),
+                    ("claude_gpt_5h", "C/G5h"),
+                ):
+                    p = pools.get(pk) or {}
+                    if int(p.get("accounts_with_data") or 0) > 0:
+                        avg_p = p.get("avg_remaining_pct")
+                        tot_f = float(p.get("total_remaining_fraction") or 0.0)
+                        rst_iso = p.get("earliest_reset_at")
+                        rst_txt = ""
+                        if rst_iso:
+                            rst_dt = parse_iso_z(rst_iso)
+                            if rst_dt is not None:
+                                rst_txt = f"/{fmt_quota_countdown(rst_dt, now_utc)}"
+                        if u_cnt > 1:
+                            parts.append(f"{short_lbl} {avg_p:.0f}% (池{tot_f * 100:.0f}%{rst_txt})")
+                        else:
+                            parts.append(f"{short_lbl} {avg_p:.0f}%{rst_txt}")
+                pool_desc = " · ".join(parts) if parts else "待刷新配额"
+                lines.append(
+                    f"• <b>{html_mod.escape(tlbl)}</b> ×{u_cnt}：<code>{html_mod.escape(pool_desc)}</code>"
+                )
+    return "\n".join(lines)
 
 
 def render_cost_panel(
@@ -538,7 +784,10 @@ def render_cost_panel(
     by_model_week = {}
     by_model_month = {}
 
-    for dt_utc_h, _cid, pid, is_obs, is_sched, fam, inp, ca, out, calls, cost_u, nocache_u in records:
+    for rec in records:
+        dt_utc_h, _cid, pid, is_obs, is_sched, fam, inp, ca, out, calls, cost_u, nocache_u, _acct_id, _plan_tier = (
+            _unpack_cost_record(rec)
+        )
         if scope == "agent" and (is_obs or is_sched):
             continue
         if scope == "sched" and not is_sched:
@@ -732,8 +981,17 @@ def fmt_quota_countdown(rst_utc, now_utc):
     return f"剩{m}m"
 
 
-def render_usage_panel(snap, is_fallback: bool, err_str: str, cost_tz_name: str = "Asia/Shanghai"):
-    """Render `/usage` HTML panel + keyboard from a quota snapshot."""
+def render_usage_panel(
+    snap,
+    is_fallback: bool,
+    err_str: str,
+    cost_tz_name: str = "Asia/Shanghai",
+    *,
+    active_account: dict | None = None,
+    plan_summary: dict | None = None,
+    redact_for_group: bool = False,
+):
+    """Render `/usage` HTML panel + keyboard from a quota snapshot and optional multi-plan summary."""
     tz, tz_lbl = get_cost_tz(cost_tz_name)
     now_local = datetime.datetime.now(tz)
     now_utc = now_local.astimezone(datetime.timezone.utc)
@@ -743,15 +1001,23 @@ def render_usage_panel(snap, is_fallback: bool, err_str: str, cost_tz_name: str 
         f"<code>口径: ☁️ 官方云端总套餐实时配额 (全端共享) · {tz_lbl}</code>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
     )
+    multi_plan_block = format_multi_plan_summary(
+        plan_summary,
+        active_account=active_account,
+        redact_for_group=redact_for_group,
+        cost_tz_name=cost_tz_name,
+    )
+    multi_plan_prefix = (multi_plan_block + "\n━━━━━━━━━━━━━━━━━━━━\n") if multi_plan_block else ""
     kb = make_usage_keyboard()
 
     if not snap:
+        safe_err = _scrub_error_text(err_str or "", redact_for_group=redact_for_group)
         body = (
             "⚠️ <b>暂无法获取云端总套餐实时配额</b>\n"
-            f"<code>{html_mod.escape((err_str or '')[:220] or '未知错误')}</code>\n\n"
+            f"<code>{html_mod.escape(safe_err[:220] or '未知错误')}</code>\n\n"
             "<i>可点击下方按钮重试，或查看本机统计 <code>/cost</code>。</i>"
         )
-        return header + body, kb
+        return header + multi_plan_prefix + body, kb
 
     group_blocks = []
     gemini_wk_pct = None
@@ -862,4 +1128,4 @@ def render_usage_panel(snap, is_fallback: bool, err_str: str, cost_tz_name: str 
         )
 
     body = "\n\n".join(group_blocks) + tip
-    return header + body + footer, kb
+    return header + multi_plan_prefix + body + footer, kb

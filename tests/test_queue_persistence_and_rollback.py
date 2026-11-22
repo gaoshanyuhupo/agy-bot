@@ -442,7 +442,7 @@ class TestHotReloadSelfCheckAndAutoRollback(unittest.TestCase):
 
             # Seed fake repo with minimal valid files matching subset of MAPPINGS
             (fake_repo / "bridge").mkdir(parents=True)
-            for fname in ("bridge.py", "memory_guard.py", "formatting.py", "access_control.py", "model_failover.py", "cost_usage.py", "scheduler.py", "bot_bus.py", "bot_bus_mcp.py", "github_webhook.py", "gateway_adapter.py", "studio_ipc.py"):
+            for fname in ("bridge.py", "memory_guard.py", "formatting.py", "access_control.py", "model_failover.py", "cost_usage.py", "scheduler.py", "bot_bus.py", "bot_bus_mcp.py", "github_webhook.py", "gateway_adapter.py", "studio_ipc.py", "google_accounts.py"):
                 shutil.copy2(BRIDGE_DIR / fname, fake_repo / "bridge" / fname)
 
             # Seed pre-existing live files (version v1)
@@ -473,6 +473,7 @@ class TestHotReloadSelfCheckAndAutoRollback(unittest.TestCase):
                     ("bridge/github_webhook.py", live_bridge / "github_webhook.py", "file", True),
                     ("bridge/gateway_adapter.py", live_bridge / "gateway_adapter.py", "file", True),
                     ("bridge/studio_ipc.py", live_bridge / "studio_ipc.py", "file", True),
+                    ("bridge/google_accounts.py", live_bridge / "google_accounts.py", "file", True),
                 ]
 
                 # 1. Pre-deploy py_compile failure aborts before modifying live

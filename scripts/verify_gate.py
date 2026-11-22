@@ -48,6 +48,7 @@ BRIDGE_TEST_FILES: Tuple[str, ...] = (
     "tests/test_bridge_core.py",
     "tests/test_bridge_p0.py",
     "tests/test_bot_bus.py",
+    "tests/test_google_accounts.py",
     "tests/test_group_chat_bus.py",
     "tests/test_model_failover.py",
     "tests/test_queue_persistence_and_rollback.py",
@@ -524,43 +525,47 @@ def step_webui_build(
         )
 
     build_env = _child_env({"npm_config_offline": "true"})
-    cmds = [
-        (["npx", "--no-install", "tsc", "--noEmit"], "tsc --noEmit"),
-        (["npm", "run", "build"], "npm run build"),
-    ]
-    for cmd, label in cmds:
-        try:
-            proc = subprocess.run(
-                cmd,
-                cwd=str(webui_dir),
-                env=build_env,
-                capture_output=True,
-                text=True,
-            )
-        except FileNotFoundError as exc:
-            return StepResult(
-                name="webui_build",
-                status="fail",
-                duration_s=time.monotonic() - t0,
-                exit_code=127,
-                summary=f"{label} failed to start: {exc}",
-            )
-        if proc.returncode != 0:
-            snippet = _tail_text(proc.stderr or proc.stdout)
-            return StepResult(
-                name="webui_build",
-                status="fail",
-                duration_s=time.monotonic() - t0,
-                exit_code=proc.returncode,
-                summary=f"{label} failed (exit {proc.returncode}): {snippet}",
-            )
+    with tempfile.TemporaryDirectory(prefix="agy_verify_webui_dist_") as tmpdir:
+        cmds = [
+            (["npx", "--no-install", "tsc", "--noEmit"], "tsc --noEmit"),
+            (
+                ["npx", "--no-install", "vite", "build", "--outDir", tmpdir, "--emptyOutDir"],
+                "vite build (isolated outDir)",
+            ),
+        ]
+        for cmd, label in cmds:
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    cwd=str(webui_dir),
+                    env=build_env,
+                    capture_output=True,
+                    text=True,
+                )
+            except FileNotFoundError as exc:
+                return StepResult(
+                    name="webui_build",
+                    status="fail",
+                    duration_s=time.monotonic() - t0,
+                    exit_code=127,
+                    summary=f"{label} failed to start: {exc}",
+                )
+            if proc.returncode != 0:
+                snippet = _tail_text(proc.stderr or proc.stdout)
+                return StepResult(
+                    name="webui_build",
+                    status="fail",
+                    duration_s=time.monotonic() - t0,
+                    exit_code=proc.returncode,
+                    summary=f"{label} failed (exit {proc.returncode}): {snippet}",
+                )
 
     return StepResult(
         name="webui_build",
         status="pass",
         duration_s=time.monotonic() - t0,
         exit_code=0,
-        summary="Offline tsc --noEmit and npm run build succeeded",
+        summary="Offline tsc --noEmit and isolated vite build succeeded (live webui/dist untouched)",
     )
 
 

@@ -90,6 +90,11 @@ try:
 except ImportError:
     from bridge import studio_ipc
 
+try:
+    import google_accounts
+except ImportError:
+    from bridge import google_accounts
+
 # Load local .env file if present
 _env_file = os.environ.get("AGY_TG_ENV_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 if os.path.isfile(_env_file):
@@ -145,6 +150,12 @@ SUMMARIES_DB = os.path.join(HOME, ".gemini/antigravity-cli/conversation_summarie
 COST_LEDGER_FILE = os.path.join(HOME, ".gemini/antigravity-cli/cache/cost_ledger_v2.json")
 COST_CONFIG_FILE = os.path.join(HOME, ".gemini/antigravity-cli/cache/cost_config.json")
 QUOTA_CACHE_FILE = os.path.join(HOME, ".gemini/antigravity-cli/cache/quota_usage.json")
+GOOGLE_ACCOUNTS_DIR = os.environ.get("AGY_GOOGLE_ACCOUNTS_DIR") or os.path.join(HOME, ".gemini/antigravity-cli/accounts")
+HOST_OAUTH_TOKEN_FILE = os.environ.get("AGY_HOST_OAUTH_TOKEN_FILE") or os.path.join(HOME, ".gemini/antigravity-cli/antigravity-oauth-token")
+STUDIO_USERS_FILE = os.environ.get("AGY_STUDIO_USERS_FILE") or os.path.join(
+    os.environ.get("AGY_STUDIO_CONFIG_DIR") or os.path.join(HOME, ".config/agy-studio"),
+    "users.json",
+)
 COST_LEDGER_LOCK = "/tmp/agy_cost_ledger.lock"
 SCHEDULED_CIDS_FILE = os.path.join(HOME, ".gemini/antigravity-cli/cache/scheduled_cids.json")
 COST_TZ_NAME = os.environ.get("AGY_TG_COST_TZ", "Asia/Shanghai")
@@ -1729,6 +1740,7 @@ _PRIVATE_COMMANDS = [
     {"command": "team", "description": "Multi-bot Coordinator Bus roster, roles & jobs"},
     {"command": "delegate", "description": "Directly assign a task to a sibling bot (/delegate @bot task)"},
     {"command": "usage", "description": "Overall Antigravity plan quota & reset time"},
+    {"command": "accounts", "description": "Manage Google accounts & multi-plan quotas"},
     {"command": "cost", "description": "My local token usage, cache rate & USD bill"},
     {"command": "schedule", "description": "Manage scheduled tasks, cron jobs & timers"},
     {"command": "compact", "description": "Compact context now or set auto-compact"},
@@ -6260,6 +6272,7 @@ def perform_hot_reload(notify_chat_id=None, notify_thread_id=None):
     if notify_chat_id:
         send(notify_chat_id, "🔄 正在热重载桥接服务...", thread_id=notify_thread_id)
     close_all_sessions_sync()
+    _cleanup_google_login_flows()
     _stop_studio_ipc()
     _stop_gateway_adapter()
     time.sleep(0.3)
@@ -7504,8 +7517,69 @@ def _studio_ipc_sock_path():
         return ""
 
 
+def _resolve_studio_users_json_role(user_id):
+    """Live-recompute role from Studio `users.json` when present (fail-closed on symlink/corruption)."""
+    users_path = os.environ.get("AGY_STUDIO_USERS_FILE", "").strip() or STUDIO_USERS_FILE
+    if not users_path:
+        return None
+    if os.path.islink(users_path):
+        return "denied"
+    if not os.path.isfile(users_path):
+        return None
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(users_path, flags)
+        try:
+            with os.fdopen(fd, "r", encoding="utf-8") as fh:
+                doc = json.load(fh)
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            return "denied"
+    except Exception:
+        return "denied"
+    if not isinstance(doc, dict) or not isinstance(doc.get("users"), dict):
+        return "denied"
+    target_uid = int(user_id)
+    matched_roles = []
+    for rec in doc["users"].values():
+        if not isinstance(rec, dict):
+            return "denied"
+        if "enabled" in rec and not isinstance(rec.get("enabled"), bool):
+            return "denied"
+        if "disabled" in rec and not isinstance(rec.get("disabled"), bool):
+            return "denied"
+        rec_uid = rec.get("user_id")
+        if isinstance(rec_uid, bool) or not isinstance(rec_uid, int):
+            continue
+        if rec_uid != target_uid:
+            continue
+        if rec.get("enabled") is False or bool(rec.get("disabled", False)):
+            continue
+        r = str(rec.get("role") or "").strip().lower()
+        if r in ("admin", "readonly"):
+            matched_roles.append(r)
+    if not matched_roles:
+        return "denied"
+    if "admin" in matched_roles:
+        return "admin"
+    return "readonly"
+
+
 def _studio_ipc_resolve_role(user_id):
-    return _get_user_role(user_id, from_user={"id": int(user_id)}, allow_uid_fallback=True)
+    env_role = _get_user_role(user_id, from_user={"id": int(user_id)}, allow_uid_fallback=True)
+    if env_role not in ("admin", "readonly"):
+        return "denied"
+    users_role = _resolve_studio_users_json_role(user_id)
+    if users_role is None:
+        return env_role
+    if users_role not in ("admin", "readonly"):
+        return "denied"
+    if env_role == "admin" and users_role == "admin":
+        return "admin"
+    return "readonly"
 
 
 def _studio_ipc_get_meta():
@@ -8508,6 +8582,47 @@ def _schedule_ipc_hot_reload(delay_sec=0.25):
     return t
 
 
+def _recycle_warm_sessions_for_account_switch(reason="account_switch", account_id=None):
+    """Recycle idle warm `AgySession` processes and mark any running session dirty (never force-killing active turns)."""
+    to_close = []
+    recycled_idle = 0
+    deferred_running = 0
+    with session_lock:
+        for sk in list(_session_pool.keys()):
+            if turn_running and turn_running_scope == sk:
+                session_dirty_scopes.add(sk)
+                deferred_running += 1
+                log("Marked running session dirty for account switch (%s · scope=%s)" % (reason, sk))
+            else:
+                sess = _session_pool.pop(sk, None)
+                session_dirty_scopes.discard(sk)
+                if sess is not None:
+                    to_close.append(sess)
+                    recycled_idle += 1
+                    log("Recycling idle warm session for account switch (%s · scope=%s)" % (reason, sk))
+        dirty_count = len(session_dirty_scopes)
+    for sess in to_close:
+        close_session_async(sess, force=False)
+    return {
+        "recycled_idle": recycled_idle,
+        "deferred_running": deferred_running,
+        "dirty_scopes_count": dirty_count,
+        "account_id": str(account_id or ""),
+    }
+
+
+def _studio_ipc_recycle_accounts(req):
+    """Handle `POST /ipc/accounts/recycle`: recycle idle warm sessions without killing in-flight turns."""
+    aid = req.get("account_id")
+    reason = str(req.get("reason") or "account_switch").strip() or "account_switch"
+    stats = _recycle_warm_sessions_for_account_switch(reason=f"ipc:{reason}", account_id=aid)
+    return 200, {
+        "ok": True,
+        "bot": _current_bot_handle(),
+        **stats,
+    }
+
+
 def _studio_ipc_reload_bot(user_id):
     """Run synchronous `_pre_reload_self_check()` and schedule zero-downtime reload if healthy."""
     ok_chk, detail = _pre_reload_self_check()
@@ -8897,6 +9012,7 @@ def _start_studio_ipc():
             room_turn_fn=_studio_ipc_room_turn,
             attention_notify_fn=_studio_ipc_attention_notify,
             tg_group_send_fn=_studio_ipc_tg_group_send,
+            recycle_accounts_fn=_studio_ipc_recycle_accounts,
             buffer=_studio_ipc_buffer,
             summaries_db=SUMMARIES_DB,
             meta_file=META_FILE,
@@ -10020,6 +10136,7 @@ def _parse_transcript_cost_steps(tpath):
 
 
 def _collect_cost_hourly_buckets():
+    acct_id, plan_tier = _get_active_google_account_context()
     return cost_usage.collect_cost_hourly_buckets(
         brain_root=BRAIN_ROOT,
         cost_ledger_file=COST_LEDGER_FILE,
@@ -10028,6 +10145,8 @@ def _collect_cost_hourly_buckets():
         mem_cache=_cost_mem_cache,
         cache_lock=_cost_cache_lock,
         log_fn=log,
+        active_account_id=acct_id,
+        active_plan_tier=plan_tier,
     )
 
 
@@ -10194,9 +10313,106 @@ def fetch_plan_quota_data(force_live=True):
             return None, False, err_msg
 
 
-def build_usage_panel(force_live=True):
+_google_accounts_lock = threading.Lock()
+_google_account_mgr = None
+_google_login_flow_mgr = None
+
+
+def _get_google_account_manager():
+    """Return lazy singleton `GoogleAccountManager` bound to configured paths."""
+    global _google_account_mgr
+    with _google_accounts_lock:
+        if _google_account_mgr is None:
+            _google_account_mgr = google_accounts.GoogleAccountManager(
+                root_dir=GOOGLE_ACCOUNTS_DIR,
+                host_token_path=HOST_OAUTH_TOKEN_FILE,
+                quota_cache_file=QUOTA_CACHE_FILE,
+                cost_config_file=COST_CONFIG_FILE,
+                agy_bin=AGY_BIN,
+            )
+        return _google_account_mgr
+
+
+def _get_google_login_flow_manager():
+    """Return lazy singleton `GoogleLoginFlowManager`."""
+    global _google_login_flow_mgr
+    mgr = _get_google_account_manager()
+    with _google_accounts_lock:
+        if _google_login_flow_mgr is None:
+            _google_login_flow_mgr = google_accounts.GoogleLoginFlowManager(mgr)
+        return _google_login_flow_mgr
+
+
+def _cleanup_google_login_flows():
+    """Terminate and reap all active OAuth login subprocesses on shutdown/reload."""
+    with _google_accounts_lock:
+        fmgr = _google_login_flow_mgr
+    if fmgr is not None:
+        try:
+            fmgr.cleanup_all_flows()
+        except Exception as e:
+            log("cleanup google login flows warning: %r" % e)
+
+
+def _get_active_google_account_context():
+    """Return `(account_id, plan_tier)` for cost ledger tagging without mutating uninitialized host state."""
+    with _google_accounts_lock:
+        mgr = _google_account_mgr
+    if mgr is not None:
+        return mgr.get_active_account_context()
+    reg_file = os.path.join(GOOGLE_ACCOUNTS_DIR, "registry.json")
+    if os.path.islink(reg_file) or not os.path.isfile(reg_file):
+        return "unassigned", "unknown"
+    try:
+        tmp_mgr = google_accounts.GoogleAccountManager(
+            root_dir=GOOGLE_ACCOUNTS_DIR,
+            host_token_path=HOST_OAUTH_TOKEN_FILE,
+            auto_adopt_host=False,
+        )
+        return tmp_mgr.get_active_account_context()
+    except Exception:
+        return "unassigned", "unknown"
+
+
+def _get_accounts_usage_context(is_group=False):
+    """Safely fetch `(active_account_public, plan_summary)` for `/usage` rendering."""
+    with _google_accounts_lock:
+        mgr = _google_account_mgr
+    if mgr is None:
+        reg_file = os.path.join(GOOGLE_ACCOUNTS_DIR, "registry.json")
+        if os.path.islink(reg_file) or not os.path.isfile(reg_file):
+            return None, None
+        try:
+            mgr = google_accounts.GoogleAccountManager(
+                root_dir=GOOGLE_ACCOUNTS_DIR,
+                host_token_path=HOST_OAUTH_TOKEN_FILE,
+                auto_adopt_host=False,
+            )
+        except Exception:
+            return None, None
+    try:
+        active_acct = mgr.get_active_account(for_group=is_group)
+        summary = mgr.summarize_plan_quotas(for_group=is_group)
+        if not summary.get("tiers"):
+            summary = None
+        return active_acct, summary
+    except Exception:
+        return None, None
+
+
+def build_usage_panel(force_live=True, chat_id=None):
+    is_group = bool(chat_id is not None and int(chat_id) < 0)
     snap, is_fallback, err_str = fetch_plan_quota_data(force_live=force_live)
-    return cost_usage.render_usage_panel(snap, is_fallback, err_str, cost_tz_name=COST_TZ_NAME)
+    active_acct, plan_summary = _get_accounts_usage_context(is_group=is_group)
+    return cost_usage.render_usage_panel(
+        snap,
+        is_fallback,
+        err_str,
+        cost_tz_name=COST_TZ_NAME,
+        active_account=active_acct,
+        plan_summary=plan_summary,
+        redact_for_group=is_group,
+    )
 
 
 def cmd_usage(chat_id, raw_rest="", edit_msg_id=None, thread_id=None):
@@ -10212,7 +10428,7 @@ def cmd_usage(chat_id, raw_rest="", edit_msg_id=None, thread_id=None):
 
     def _bg():
         try:
-            panel_text, panel_kb = build_usage_panel(force_live=True)
+            panel_text, panel_kb = build_usage_panel(force_live=True, chat_id=chat_id)
             if placeholder_mid:
                 r = tg(
                     "editMessageText",
@@ -10229,11 +10445,299 @@ def cmd_usage(chat_id, raw_rest="", edit_msg_id=None, thread_id=None):
             else:
                 send(chat_id, panel_text, parse_mode="HTML", reply_markup=panel_kb, thread_id=thread_id)
         except Exception as e:
-            log("cmd_usage error: %r" % e)
-            send(chat_id, f"❌ 查询总套餐配额失败: <code>{html_mod.escape(str(e))}</code>",
+            log("cmd_usage error: %s" % google_accounts.redact_secrets(repr(e)))
+            is_group = bool(chat_id is not None and int(chat_id) < 0)
+            safe_err = google_accounts.scrub_error_for_public(str(e), redact_for_group=is_group)
+            send(chat_id, f"❌ 查询总套餐配额失败: <code>{html_mod.escape(safe_err[:240] or '未知错误')}</code>",
                  parse_mode="HTML", thread_id=thread_id)
 
     threading.Thread(target=_bg, daemon=True).start()
+
+
+def _accounts_owner_session_id(chat_id, from_user=None):
+    uid = access_control.extract_user_id(from_user)
+    if uid is not None:
+        return f"tg-dm:{uid}"
+    return f"tg-dm:{int(chat_id)}"
+
+
+def build_accounts_panel(chat_id, from_user=None):
+    """Render `/accounts` overview panel (strictly redacted & read-only in group chats)."""
+    is_group = bool(chat_id is not None and int(chat_id) < 0)
+    mgr = _get_google_account_manager()
+    accounts = mgr.list_accounts(for_group=is_group)
+    summary = mgr.summarize_plan_quotas(for_group=is_group)
+    active_acct = mgr.get_active_account(for_group=is_group)
+
+    lines = [
+        "<b>🔐 多 Google 账号与多套餐额度面板 (/accounts)</b>",
+        "<code>模式: 群聊脱敏只读视图（变更仅限管理员私聊）</code>" if is_group else "<code>模式: 管理员私聊控制面板</code>",
+        "━━━━━━━━━━━━━━━━━━━━",
+    ]
+    if not accounts:
+        lines.append("• <code>暂无已登记账号</code>")
+        if not is_group:
+            lines.append("\n<i>使用 <code>/accounts add &lt;id&gt; [别名]</code> + <code>/accounts login &lt;id&gt;</code> 添加账号。</i>")
+    else:
+        for acct in accounts:
+            badge = "✅ <b>[活跃]</b> " if acct.get("is_active") else ""
+            dup_note = f" <code>(重复槽位→{html_mod.escape(str(acct.get('duplicate_of') or ''))})</code>" if acct.get("is_duplicate") else ""
+            alias_s = html_mod.escape(str(acct.get("alias") or acct.get("account_id") or ""))
+            aid_s = html_mod.escape(str(acct.get("account_id") or ""))
+            plan_s = html_mod.escape(str(acct.get("plan_label") or acct.get("plan_tier") or "Unknown"))
+            st_s = html_mod.escape(str(acct.get("status") or "unknown"))
+            row = f"• {badge}<b>{alias_s}</b> (<code>{aid_s}</code>) · <code>{plan_s}</code> · <code>{st_s}</code>{dup_note}"
+            if not is_group:
+                em = str(acct.get("email_masked") or "").strip()
+                if em:
+                    row += f"\n  邮箱: <code>{html_mod.escape(em)}</code>"
+            qs = acct.get("quota_summary") or {}
+            q_parts = []
+            if qs.get("gemini_weekly_pct") is not None:
+                q_parts.append(f"Gem周 {qs['gemini_weekly_pct']:.0f}%")
+            if qs.get("gemini_5h_pct") is not None:
+                q_parts.append(f"Gem5h {qs['gemini_5h_pct']:.0f}%")
+            if qs.get("claude_gpt_weekly_pct") is not None:
+                q_parts.append(f"C/G周 {qs['claude_gpt_weekly_pct']:.0f}%")
+            if qs.get("claude_gpt_5h_pct") is not None:
+                q_parts.append(f"C/G5h {qs['claude_gpt_5h_pct']:.0f}%")
+            if q_parts:
+                row += f"\n  额度: <code>{' · '.join(q_parts)}</code>"
+            lines.append(row)
+
+    pool_block = cost_usage.format_multi_plan_summary(
+        summary,
+        active_account=active_acct,
+        redact_for_group=is_group,
+        cost_tz_name=COST_TZ_NAME,
+    )
+    if pool_block:
+        lines.append("\n" + pool_block)
+
+    kb = None
+    if not is_group:
+        rows = []
+        switch_row = []
+        for acct in accounts[:6]:
+            aid = str(acct.get("account_id") or "")
+            if not aid or acct.get("is_active") or acct.get("status") != "ready":
+                continue
+            switch_row.append({
+                "text": f"⇄ 切至 {acct.get('alias') or aid}"[:24],
+                "callback_data": f"accounts:switch:{aid}",
+            })
+            if len(switch_row) == 2:
+                rows.append(switch_row)
+                switch_row = []
+        if switch_row:
+            rows.append(switch_row)
+        rows.append([
+            {"text": "🔄 刷新全部额度", "callback_data": "accounts:refresh:all"},
+            {"text": "📊 配额卡片 (/usage)", "callback_data": "action:usage"},
+        ])
+        kb = {"inline_keyboard": rows}
+    else:
+        kb = {
+            "inline_keyboard": [
+                [{"text": "📊 配额卡片 (/usage)", "callback_data": "action:usage"}],
+            ]
+        }
+    return "\n".join(lines), kb
+
+
+def cmd_accounts(chat_id, raw_rest="", thread_id=None, scope_key=None, from_user=None):
+    """Manage multi-Google accounts (strictly read-only & redacted in groups; full admin control in DM)."""
+    norm_tid = _normalize_thread_id(thread_id)
+    is_group = bool(chat_id is not None and int(chat_id) < 0)
+    rest = (raw_rest or "").strip()
+    parts = rest.split() if rest else []
+    sub = parts[0].lower() if parts else ""
+
+    try:
+        if not rest or sub in ("list", "status", "panel"):
+            text, kb = build_accounts_panel(chat_id, from_user=from_user)
+            send(chat_id, text, parse_mode="HTML", reply_markup=kb, thread_id=norm_tid)
+            return
+
+        if is_group:
+            send(
+                chat_id,
+                "🔒 账号变更操作仅限管理员私聊执行（群聊仅支持脱敏只读查看 <code>/accounts</code>）。",
+                parse_mode="HTML",
+                thread_id=norm_tid,
+            )
+            return
+
+        role = _get_user_role(chat_id, from_user=from_user, allow_uid_fallback=True)
+        if role != "admin":
+            send(
+                chat_id,
+                access_control.format_rbac_denied_message(f"/accounts {sub}"),
+                parse_mode="HTML",
+                thread_id=norm_tid,
+            )
+            return
+
+        mgr = _get_google_account_manager()
+        fmgr = _get_google_login_flow_manager()
+        owner_sess = _accounts_owner_session_id(chat_id, from_user=from_user)
+
+        if sub == "add":
+            if len(parts) < 2:
+                send(chat_id, "用法：<code>/accounts add &lt;account_id&gt; [别名]</code>", parse_mode="HTML", thread_id=norm_tid)
+                return
+            aid = parts[1].strip()
+            alias = rest.split(None, 2)[2].strip() if len(parts) >= 3 else None
+            acct = mgr.add_account(aid, alias=alias)
+            send(
+                chat_id,
+                f"✅ 已添加账号槽位 <b>{html_mod.escape(acct['alias'])}</b> (<code>{html_mod.escape(acct['account_id'])}</code>)\n"
+                f"下一步：发送 <code>/accounts login {html_mod.escape(acct['account_id'])}</code> 获取 Google 登录链接。",
+                parse_mode="HTML",
+                thread_id=norm_tid,
+            )
+            return
+
+        if sub == "login":
+            if len(parts) < 2:
+                send(chat_id, "用法：<code>/accounts login &lt;account_id&gt; [别名]</code>", parse_mode="HTML", thread_id=norm_tid)
+                return
+            aid = parts[1].strip()
+            alias = rest.split(None, 2)[2].strip() if len(parts) >= 3 else None
+            flow = fmgr.start_login(aid, alias=alias, owner_session_id=owner_sess)
+            send(
+                chat_id,
+                f"🔐 <b>Google OAuth 无头登录已启动</b>\n"
+                f"• 账号槽位：<code>{html_mod.escape(flow['account_id'])}</code>\n"
+                f"• Flow ID：<code>{html_mod.escape(flow['flow_id'])}</code>（5 分钟有效）\n\n"
+                f"1️⃣ 在浏览器打开下方链接完成授权：\n{html_mod.escape(str(flow.get('auth_url') or ''))}\n\n"
+                f"2️⃣ 复制浏览器回调地址或授权码，回复：\n"
+                f"<code>/accounts code {html_mod.escape(flow['flow_id'])} &lt;code_or_callback_url&gt;</code>",
+                parse_mode="HTML",
+                thread_id=norm_tid,
+                disable_web_page_preview=True,
+            )
+            return
+
+        if sub == "code":
+            if len(parts) < 3:
+                send(chat_id, "用法：<code>/accounts code &lt;flow_id&gt; &lt;code_or_url&gt;</code>", parse_mode="HTML", thread_id=norm_tid)
+                return
+            flow_id = parts[1].strip()
+            code_or_url = rest.split(None, 2)[2].strip()
+            flow = fmgr.submit_code(flow_id, code_or_url, owner_session_id=owner_sess)
+            acct = flow.get("account") or {}
+            em = html_mod.escape(str(acct.get("email_masked") or "未知"))
+            send(
+                chat_id,
+                f"✅ <b>Google 账号登录成功</b>\n"
+                f"• 槽位：<code>{html_mod.escape(str(acct.get('account_id') or flow['account_id']))}</code>\n"
+                f"• 邮箱：<code>{em}</code>\n"
+                f"• 套餐：<code>{html_mod.escape(str(acct.get('plan_label') or 'Unknown'))}</code>\n"
+                f"可使用 <code>/accounts refresh {html_mod.escape(str(acct.get('account_id') or flow['account_id']))}</code> 同步配额或 <code>/accounts switch</code> 切换。",
+                parse_mode="HTML",
+                thread_id=norm_tid,
+            )
+            return
+
+        if sub == "cancel":
+            if len(parts) < 2:
+                send(chat_id, "用法：<code>/accounts cancel &lt;flow_id&gt;</code>", parse_mode="HTML", thread_id=norm_tid)
+                return
+            flow_id = parts[1].strip()
+            fmgr.cancel_flow(flow_id, owner_session_id=owner_sess)
+            send(chat_id, f"🛑 已取消登录流 <code>{html_mod.escape(flow_id)}</code>。", parse_mode="HTML", thread_id=norm_tid)
+            return
+
+        if sub == "switch":
+            if len(parts) < 2:
+                send(chat_id, "用法：<code>/accounts switch &lt;account_id&gt;</code>", parse_mode="HTML", thread_id=norm_tid)
+                return
+            aid = parts[1].strip()
+            res = mgr.switch_account(aid)
+            stats = _recycle_warm_sessions_for_account_switch(reason=f"tg_switch:{aid}", account_id=aid)
+            acct = res.get("account") or {}
+            send(
+                chat_id,
+                f"⇄ <b>已切换活跃 Google 账号</b>\n"
+                f"• 活跃槽位：<b>{html_mod.escape(str(acct.get('alias') or aid))}</b> (<code>{html_mod.escape(aid)}</code>)\n"
+                f"• 套餐：<code>{html_mod.escape(str(acct.get('plan_label') or 'Unknown'))}</code>\n"
+                f"• 会话回收：已关闭空闲 warm 会话 <code>{stats['recycled_idle']}</code> 个，运行中延后标脏 <code>{stats['deferred_running']}</code> 个。",
+                parse_mode="HTML",
+                thread_id=norm_tid,
+            )
+            return
+
+        if sub == "refresh":
+            target_id = parts[1].strip() if len(parts) >= 2 and parts[1].strip().lower() != "all" else None
+            if target_id:
+                acct = mgr.refresh_account(target_id)
+                send(
+                    chat_id,
+                    f"🔄 已刷新账号 <code>{html_mod.escape(acct['account_id'])}</code> · "
+                    f"套餐 <code>{html_mod.escape(acct['plan_label'])}</code>。",
+                    parse_mode="HTML",
+                    thread_id=norm_tid,
+                )
+            else:
+                res = mgr.refresh_all_accounts()
+                err_cnt = len(res.get("errors") or {})
+                ok_cnt = len(res.get("refreshed") or [])
+                send(
+                    chat_id,
+                    f"🔄 已刷新全部账号：成功 <code>{ok_cnt}</code>，失败 <code>{err_cnt}</code>。",
+                    parse_mode="HTML",
+                    thread_id=norm_tid,
+                )
+            text, kb = build_accounts_panel(chat_id, from_user=from_user)
+            send(chat_id, text, parse_mode="HTML", reply_markup=kb, thread_id=norm_tid)
+            return
+
+        if sub == "logout":
+            if len(parts) < 2:
+                send(chat_id, "用法：<code>/accounts logout &lt;account_id&gt;</code>", parse_mode="HTML", thread_id=norm_tid)
+                return
+            aid = parts[1].strip()
+            res = mgr.logout_account(aid)
+            if res.get("was_active"):
+                _recycle_warm_sessions_for_account_switch(reason=f"tg_logout:{aid}", account_id=aid)
+            send(chat_id, f"🚪 已登出账号槽位 <code>{html_mod.escape(aid)}</code>。", parse_mode="HTML", thread_id=norm_tid)
+            return
+
+        if sub == "delete":
+            if len(parts) < 2:
+                send(chat_id, "用法：<code>/accounts delete &lt;account_id&gt;</code>", parse_mode="HTML", thread_id=norm_tid)
+                return
+            aid = parts[1].strip()
+            fmgr.cancel_flows_for_account(aid)
+            res = mgr.delete_account(aid)
+            if res.get("was_active"):
+                _recycle_warm_sessions_for_account_switch(reason=f"tg_delete:{aid}", account_id=aid)
+            send(chat_id, f"🗑 已删除账号槽位 <code>{html_mod.escape(aid)}</code>。", parse_mode="HTML", thread_id=norm_tid)
+            return
+
+        send(
+            chat_id,
+            "<b>🔐 /accounts 用法（管理员私聊）：</b>\n"
+            "• <code>/accounts</code> — 查看账号列表与多套餐去重额度池\n"
+            "• <code>/accounts add &lt;id&gt; [别名]</code> — 创建隔离账号槽位\n"
+            "• <code>/accounts login &lt;id&gt;</code> — 发起无头 Google OAuth 登录\n"
+            "• <code>/accounts code &lt;flow_id&gt; &lt;code_or_url&gt;</code> — 提交回调地址或授权码\n"
+            "• <code>/accounts cancel &lt;flow_id&gt;</code> — 取消登录流\n"
+            "• <code>/accounts switch &lt;id&gt;</code> — 切换活跃账号并回收空闲会话\n"
+            "• <code>/accounts refresh [id]</code> — 刷新指定或全部账号配额\n"
+            "• <code>/accounts logout &lt;id&gt;</code> / <code>delete &lt;id&gt;</code> — 登出或删除槽位",
+            parse_mode="HTML",
+            thread_id=norm_tid,
+        )
+    except Exception as exc:
+        safe_err = google_accounts.scrub_error_for_public(str(exc), redact_for_group=is_group)
+        send(
+            chat_id,
+            f"❌ 账号操作失败：<code>{html_mod.escape(safe_err[:240] or '未知错误')}</code>",
+            parse_mode="HTML",
+            thread_id=norm_tid,
+        )
 
 
 def _send_schedule_created(chat_id, t, title_prefix="定时任务", thread_id=None):
@@ -11918,6 +12422,65 @@ def handle_callback(cb):
         tg("answerCallbackQuery", callback_query_id=cb_id, text="正在刷新总套餐实时配额...")
         cmd_usage(chat_id, "", edit_msg_id=msg_id, thread_id=thread_id)
 
+    elif data == "action:accounts" or data == "accounts:list":
+        tg("answerCallbackQuery", callback_query_id=cb_id)
+        try:
+            panel_text, panel_kb = build_accounts_panel(chat_id, from_user=from_user)
+            if msg_id:
+                tg("editMessageText", chat_id=chat_id, message_id=msg_id,
+                   text=panel_text, parse_mode="HTML", reply_markup=panel_kb)
+            else:
+                send(chat_id, panel_text, parse_mode="HTML", reply_markup=panel_kb, thread_id=thread_id)
+        except Exception as exc:
+            is_grp = bool(chat_id is not None and int(chat_id) < 0)
+            safe_err = google_accounts.scrub_error_for_public(str(exc), redact_for_group=is_grp)
+            send(
+                chat_id,
+                f"❌ 账号面板加载失败：<code>{html_mod.escape(safe_err[:240] or '未知错误')}</code>",
+                parse_mode="HTML",
+                thread_id=thread_id,
+            )
+
+    elif data.startswith("accounts:"):
+        if chat_id is None or int(chat_id) <= 0 or role != "admin":
+            tg("answerCallbackQuery", callback_query_id=cb_id,
+               text="🔒 账号变更操作仅限管理员私聊执行。", show_alert=True)
+            return
+        parts = data.split(":", 2)
+        sub = parts[1] if len(parts) > 1 else ""
+        arg = parts[2] if len(parts) > 2 else ""
+        if sub == "switch" and arg:
+            try:
+                mgr = _get_google_account_manager()
+                mgr.switch_account(arg)
+                _recycle_warm_sessions_for_account_switch(reason=f"cb_switch:{arg}", account_id=arg)
+                tg("answerCallbackQuery", callback_query_id=cb_id, text=f"已切换至 {arg}")
+            except Exception as exc:
+                safe_err = google_accounts.scrub_paths_for_public(str(exc))[:120]
+                tg("answerCallbackQuery", callback_query_id=cb_id, text=f"切换失败: {safe_err}", show_alert=True)
+                return
+            if msg_id:
+                panel_text, panel_kb = build_accounts_panel(chat_id, from_user=from_user)
+                tg("editMessageText", chat_id=chat_id, message_id=msg_id,
+                   text=panel_text, parse_mode="HTML", reply_markup=panel_kb)
+        elif sub == "refresh":
+            tg("answerCallbackQuery", callback_query_id=cb_id, text="正在刷新账号配额...")
+            try:
+                mgr = _get_google_account_manager()
+                if arg and arg != "all":
+                    mgr.refresh_account(arg)
+                else:
+                    mgr.refresh_all_accounts()
+            except Exception:
+                pass
+            if msg_id:
+                panel_text, panel_kb = build_accounts_panel(chat_id, from_user=from_user)
+                tg("editMessageText", chat_id=chat_id, message_id=msg_id,
+                   text=panel_text, parse_mode="HTML", reply_markup=panel_kb)
+        else:
+            tg("answerCallbackQuery", callback_query_id=cb_id,
+               text="🔒 不支持或受限的账号操作。", show_alert=True)
+
     elif data == "action:cost":
         tg("answerCallbackQuery", callback_query_id=cb_id)
         cmd_cost(chat_id, "", thread_id=thread_id, scope_key=skey)
@@ -12912,6 +13475,7 @@ _KNOWN_BRIDGE_COMMANDS = frozenset({
     "/compact", "/context",
     "/dream",
     "/usage", "/quota",
+    "/accounts", "/account",
     "/cost", "/bill",
     "/schedule", "/cron", "/timer", "/timers",
     "/project", "/projects",
@@ -13052,6 +13616,8 @@ def handle_message(msg):
             cmd_dream(chat_id, raw_rest, thread_id=thread_id)
         elif cmd in ("/usage", "/quota"):
             cmd_usage(chat_id, raw_rest, thread_id=thread_id)
+        elif cmd in ("/accounts", "/account"):
+            cmd_accounts(chat_id, raw_rest, thread_id=thread_id, scope_key=skey, from_user=from_user)
         elif cmd in ("/cost", "/bill"):
             cmd_cost(chat_id, raw_rest, thread_id=thread_id, scope_key=skey)
         elif cmd in ("/schedule", "/cron", "/timer", "/timers"):
@@ -13509,6 +14075,7 @@ def main():
         invalidate_session("shutdown_timeout", force=True)
     else:
         close_all_sessions_sync()
+    _cleanup_google_login_flows()
     _stop_studio_ipc()
     _stop_gateway_adapter()
 

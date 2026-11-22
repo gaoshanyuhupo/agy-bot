@@ -84,6 +84,12 @@ _FORBIDDEN_EVENT_KEYS = frozenset({
     "secret",
     "api_key",
     "authorization",
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "code_verifier",
+    "oauth_state",
+    "profile_dir",
 })
 
 _VALID_CHAT_SYNC_SOURCES = frozenset({"web", "tg"})

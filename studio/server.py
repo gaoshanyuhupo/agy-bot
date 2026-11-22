@@ -32,6 +32,7 @@ from .control_plane import StudioControlPlane
 from .data_sources import StudioDataSources
 from .event_hub import StudioEventHub
 from .gateway_service import GatewayService
+from .google_accounts_service import StudioGoogleAccountsService
 from .room_service import StudioRoomService
 from .secrets_config_service import SecretsConfigService
 from .workbench_state_service import WorkbenchStateService
@@ -52,6 +53,9 @@ ROOM_SERVICE_KEY: web.AppKey[StudioRoomService] = web.AppKey("room_service", Stu
 ATTENTION_SERVICE_KEY: web.AppKey[StudioAttentionService] = web.AppKey("attention_service", StudioAttentionService)
 SECRETS_CONFIG_KEY: web.AppKey[SecretsConfigService] = web.AppKey("secrets_config", SecretsConfigService)
 GATEWAY_SERVICE_KEY: web.AppKey[GatewayService] = web.AppKey("gateway_service", GatewayService)
+GOOGLE_ACCOUNTS_KEY: web.AppKey[StudioGoogleAccountsService] = web.AppKey(
+    "google_accounts", StudioGoogleAccountsService
+)
 WORKBENCH_STATE_KEY: web.AppKey[WorkbenchStateService] = web.AppKey(
     "workbench_state", WorkbenchStateService
 )
@@ -206,6 +210,10 @@ def create_app(
     event_hub_max_events: int = 256,
     event_watcher_interval: float = 0.5,
     workbench_state_path: Path | None = None,
+    google_accounts_root_dir: Path | None = None,
+    google_accounts_host_token_path: Path | None = None,
+    google_accounts_audit_log_path: Path | None = None,
+    google_accounts_service: StudioGoogleAccountsService | None = None,
 ) -> web.Application:
     public_url = os.environ.get("AGY_STUDIO_PUBLIC_URL", "").strip()
     auth = auth_mgr or StudioAuthManager(public_url=public_url)
@@ -273,6 +281,16 @@ def create_app(
         chat_service.audit,
         event_hub=event_hub,
     )
+    google_accounts_svc = google_accounts_service or StudioGoogleAccountsService(
+        auth,
+        sources,
+        event_hub,
+        root_dir=google_accounts_root_dir,
+        host_token_path=google_accounts_host_token_path,
+        audit_log_path=google_accounts_audit_log_path,
+    )
+    if sources.account_manager is None:
+        sources.account_manager = google_accounts_svc.account_manager
     workbench_state = WorkbenchStateService(
         auth,
         chat_service.audit,
@@ -300,6 +318,7 @@ def create_app(
     app[ATTENTION_SERVICE_KEY] = attention_service
     app[SECRETS_CONFIG_KEY] = secrets_config
     app[GATEWAY_SERVICE_KEY] = gateway_service
+    app[GOOGLE_ACCOUNTS_KEY] = google_accounts_svc
     app[WORKBENCH_STATE_KEY] = workbench_state
     app[STATIC_DIST_KEY] = dist_dir
 
@@ -308,6 +327,7 @@ def create_app(
         event_hub.start_watcher()
 
     async def _on_cleanup(application: web.Application) -> None:
+        await google_accounts_svc.close_all()
         await room_service.close_all()
         await event_hub.close_all()
         await chat_service.close_all()
@@ -488,6 +508,7 @@ def create_app(
         ok_csrf, err_csrf = auth.check_csrf(request, sess)
         if not ok_csrf:
             return studio_auth_error(err_csrf, status=403)
+        google_accounts_svc.on_session_logout(sess["session_hash"])
         await auth.destroy_session(sess["session_hash"])
         resp = web.json_response({"ok": True, "authenticated": False})
         auth.clear_session_cookie(resp, request)
@@ -530,7 +551,11 @@ def create_app(
         if not ok or not sess:
             return studio_auth_error(err, status=status_code)
         scope = request.query.get("scope", "all")
-        return web.json_response(sources.get_costs(scope=scope))
+        account_id = request.query.get("account_id") or None
+        plan_tier = request.query.get("plan_tier") or None
+        return web.json_response(
+            sources.get_costs(scope=scope, account_id=account_id, plan_tier=plan_tier)
+        )
 
     async def handle_api_browser_status(request: web.Request) -> web.Response:
         ok, sess, err, status_code = await auth.authenticate_request(request)
@@ -657,6 +682,20 @@ def create_app(
     app.router.add_patch("/api/gateways/{gateway_id}", gateway_service.handle_update_gateway)
     app.router.add_delete("/api/gateways/{gateway_id}", gateway_service.handle_delete_gateway)
     app.router.add_post("/api/gateways/{gateway_id}/probe", gateway_service.handle_probe_gateway)
+
+    # Multi-Google-Account OAuth & Multi-Plan Quota APIs
+    app.router.add_get("/api/google-accounts", google_accounts_svc.handle_list_accounts)
+    app.router.add_post("/api/google-accounts", google_accounts_svc.handle_add_account)
+    app.router.add_post("/api/google-accounts/refresh-all", google_accounts_svc.handle_refresh_all)
+    app.router.add_get("/api/google-accounts/login/{flow_id}", google_accounts_svc.handle_get_login_status)
+    app.router.add_post("/api/google-accounts/login/{flow_id}/submit", google_accounts_svc.handle_submit_login)
+    app.router.add_post("/api/google-accounts/login/{flow_id}/cancel", google_accounts_svc.handle_cancel_login)
+    app.router.add_patch("/api/google-accounts/{account_id}", google_accounts_svc.handle_update_account)
+    app.router.add_delete("/api/google-accounts/{account_id}", google_accounts_svc.handle_delete_account)
+    app.router.add_post("/api/google-accounts/{account_id}/login/start", google_accounts_svc.handle_start_login)
+    app.router.add_post("/api/google-accounts/{account_id}/logout", google_accounts_svc.handle_logout_account)
+    app.router.add_post("/api/google-accounts/{account_id}/activate", google_accounts_svc.handle_activate_account)
+    app.router.add_post("/api/google-accounts/{account_id}/refresh-quota", google_accounts_svc.handle_refresh_account)
 
     # Workbench Sidebar State Server Sync (9 semantic fields; optimistic concurrency)
     app.router.add_get("/api/workbench/state", workbench_state.handle_get_state)

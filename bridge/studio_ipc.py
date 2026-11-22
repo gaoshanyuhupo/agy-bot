@@ -135,6 +135,33 @@ _ALLOWED_TG_GROUP_IPC_KEYS = frozenset({
     "priority",
     "interrupt_current",
 })
+_FORBIDDEN_ACCOUNT_RECYCLE_IPC_KEYS = frozenset({
+    "role",
+    "cmd",
+    "command",
+    "shell",
+    "script",
+    "workdir",
+    "ipc_sock",
+    "token_path",
+    "reload_file",
+    "env",
+    "profile_dir",
+    "host_token_path",
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "oauth_state",
+    "code",
+})
+_ALLOWED_ACCOUNT_RECYCLE_IPC_KEYS = frozenset({
+    "user_id",
+    "actor_username",
+    "account_id",
+    "reason",
+})
+_ACCOUNT_ID_IPC_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
+_FORBIDDEN_ACCOUNT_ID_IPC_NAMES = frozenset({".", "..", "__proto__", "constructor", "prototype"})
 _VALID_IPC_PRIORITIES = frozenset({"normal", "urgent"})
 UNDO_ENTRY_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 ROOM_ID_IPC_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,31}$")
@@ -1099,6 +1126,53 @@ class _StudioIPCHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(403, {"ok": False, "error": err_u, "source": "bridge_ipc"})
             return
 
+        if path == "/ipc/accounts/recycle":
+            bad_k = _find_forbidden_ipc_key(body, _FORBIDDEN_ACCOUNT_RECYCLE_IPC_KEYS)
+            if bad_k is not None:
+                self._send_json(400, {"ok": False, "error": f"禁止传入受限字段: {bad_k}"})
+                return
+            unknown = set(body.keys()) - _ALLOWED_ACCOUNT_RECYCLE_IPC_KEYS
+            if unknown:
+                self._send_json(400, {"ok": False, "error": f"不支持的字段: {sorted(unknown)[0]}"})
+                return
+            raw_aid = body.get("account_id")
+            account_id: str | None = None
+            if raw_aid is not None and str(raw_aid).strip() != "":
+                if not isinstance(raw_aid, str):
+                    self._send_json(400, {"ok": False, "error": "account_id 必须为字符串"})
+                    return
+                aid_s = raw_aid.strip()
+                if aid_s in _FORBIDDEN_ACCOUNT_ID_IPC_NAMES or not _ACCOUNT_ID_IPC_RE.fullmatch(aid_s):
+                    self._send_json(400, {"ok": False, "error": "非法的 account_id 格式"})
+                    return
+                account_id = aid_s
+            raw_reason = body.get("reason", "account_switch")
+            if raw_reason is None:
+                reason_val = "account_switch"
+            elif not isinstance(raw_reason, str):
+                self._send_json(400, {"ok": False, "error": "reason 必须为字符串"})
+                return
+            else:
+                reason_val = re.sub(r"[\x00-\x1f\x7f\r\n]+", " ", raw_reason).strip()[:128] or "account_switch"
+            raw_actor = re.sub(r"[\x00-\x1f\x7f\r\n]+", " ", str(body.get("actor_username") or "")).strip()
+            safe_actor = neutralize_control_tags(raw_actor)[:64]
+            if self.ipc.recycle_accounts_fn is None:
+                self._send_json(501, {"ok": False, "error": "accounts_recycle 未启用"})
+                return
+            req_acc = {
+                "user_id": uid,
+                "actor_username": safe_actor,
+                "account_id": account_id,
+                "reason": reason_val,
+            }
+            try:
+                status_code, resp_payload = self.ipc.recycle_accounts_fn(req_acc)
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": f"accounts_recycle failed: {type(exc).__name__}"})
+                return
+            self._send_json(int(status_code), resp_payload)
+            return
+
         if path == "/ipc/tg_group/send":
             # Strictly reject ANY client-supplied role/chat_id/thread_id/mirror_*/scope_key/shell keys recursively
             bad_k = _find_forbidden_ipc_key(body, _FORBIDDEN_TG_GROUP_IPC_KEYS)
@@ -1491,6 +1565,7 @@ class StudioIPCServer:
         room_turn_fn: Callable[[dict[str, Any]], tuple[int, dict[str, Any]]] | None = None,
         attention_notify_fn: Callable[[dict[str, Any]], tuple[int, dict[str, Any]]] | None = None,
         tg_group_send_fn: Callable[[dict[str, Any]], tuple[int, dict[str, Any]]] | None = None,
+        recycle_accounts_fn: Callable[[dict[str, Any]], tuple[int, dict[str, Any]]] | None = None,
         buffer: TurnEventBuffer | None = None,
         summaries_db: str | Path | None = None,
         meta_file: str | Path | None = None,
@@ -1518,6 +1593,7 @@ class StudioIPCServer:
         self.room_turn_fn = room_turn_fn
         self.attention_notify_fn = attention_notify_fn
         self.tg_group_send_fn = tg_group_send_fn
+        self.recycle_accounts_fn = recycle_accounts_fn
         self.buffer = buffer or TurnEventBuffer()
         self.summaries_db = summaries_db
         self.meta_file = meta_file

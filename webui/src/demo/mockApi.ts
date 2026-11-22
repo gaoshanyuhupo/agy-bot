@@ -1,4 +1,5 @@
 import type {
+  AccountCostRow,
   ActiveSessionTurnResponse,
   AttentionDecideResponse,
   AttentionItem,
@@ -31,6 +32,15 @@ import type {
   GatewayProbePayload,
   GatewayProbeResponse,
   GatewaysListResponse,
+  GoogleAccountActivateResponse,
+  GoogleAccountAddPayload,
+  GoogleAccountItem,
+  GoogleAccountMutationResponse,
+  GoogleAccountPatchPayload,
+  GoogleAccountRefreshAllResponse,
+  GoogleAccountsResponse,
+  GoogleLoginFlowResponse,
+  GoogleLoginFlowState,
   JobCancelResponse,
   JobDetail,
   JobDetailResponse,
@@ -43,11 +53,14 @@ import type {
   ModelCostRow,
   ModelOption,
   ModelsResponse,
+  MultiPlanQuotaSummary,
   OpenBaoConfigResponse,
   OpenBaoConfigUpdatePayload,
   OpenBaoTestPayload,
   OpenBaoTestResponse,
   OverviewResponse,
+  PlanCostRow,
+  PlanTierQuotaSummary,
   ProjectOption,
   ProjectsResponse,
   RoomActivityBotItem,
@@ -1606,10 +1619,596 @@ function makeCostAgg(
   };
 }
 
-export async function fetchCosts(scope: "all" | "agent" | "sched" = "all"): Promise<CostsResponse> {
+const DEMO_PLAN_LABELS: Record<string, string> = {
+  ultra: "Google AI Ultra",
+  pro: "Google AI Pro",
+  enterprise: "Enterprise",
+  free: "Free",
+  unknown: "Unknown",
+};
+
+const DEMO_PLAN_PRIORITY: Record<string, number> = {
+  ultra: 4,
+  pro: 3,
+  enterprise: 2,
+  free: 1,
+  unknown: 0,
+};
+
+const isoAhead = (secAhead: number): string =>
+  new Date((nowSec() + secAhead) * 1000).toISOString();
+
+let demoActiveGoogleAccountId: string | null = "ultra_main";
+let demoGoogleAccounts: GoogleAccountItem[] = [
+  {
+    account_id: "ultra_main",
+    alias: "Ultra 主力号",
+    email_masked: "u***a@example.com",
+    plan_tier: "ultra",
+    plan_label: "Google AI Ultra",
+    is_active: true,
+    is_duplicate: false,
+    duplicate_of: null,
+    status: "ready",
+    auth_method: "oauth-personal",
+    is_host_adopted: true,
+    credential_fingerprint: "demo_fp_ultra_01",
+    last_checked_at: isoAgo(120),
+    last_error: "",
+    weekly_reset_utc: { weekday: 4, hour: 23, minute: 0 },
+    quota_summary: {
+      has_quota: true,
+      fetched_at_iso: isoAgo(120),
+      gemini_5h_pct: 92,
+      gemini_5h_reset_at: isoAhead(3 * 3600 + 25 * 60),
+      gemini_weekly_pct: 78,
+      gemini_weekly_reset_at: isoAhead(4 * 86400 + 6 * 3600),
+      claude_gpt_5h_pct: 64,
+      claude_gpt_5h_reset_at: isoAhead(2 * 3600 + 18 * 60),
+      claude_gpt_weekly_pct: 58,
+      claude_gpt_weekly_reset_at: isoAhead(4 * 86400 + 6 * 3600),
+      groups: [],
+    },
+  },
+  {
+    account_id: "pro_work",
+    alias: "Pro 协作号",
+    email_masked: "p***k@example.com",
+    plan_tier: "pro",
+    plan_label: "Google AI Pro",
+    is_active: false,
+    is_duplicate: false,
+    duplicate_of: null,
+    status: "ready",
+    auth_method: "oauth-personal",
+    is_host_adopted: false,
+    credential_fingerprint: "demo_fp_pro_02",
+    last_checked_at: isoAgo(300),
+    last_error: "",
+    weekly_reset_utc: { weekday: 1, hour: 8, minute: 0 },
+    quota_summary: {
+      has_quota: true,
+      fetched_at_iso: isoAgo(300),
+      gemini_5h_pct: 86,
+      gemini_5h_reset_at: isoAhead(4 * 3600 + 10 * 60),
+      gemini_weekly_pct: 84,
+      gemini_weekly_reset_at: isoAhead(2 * 86400 + 14 * 3600),
+      claude_gpt_5h_pct: 95,
+      claude_gpt_5h_reset_at: isoAhead(4 * 3600 + 10 * 60),
+      claude_gpt_weekly_pct: 88,
+      claude_gpt_weekly_reset_at: isoAhead(2 * 86400 + 14 * 3600),
+      groups: [],
+    },
+  },
+  {
+    account_id: "free_lab",
+    alias: "Free 实验号",
+    email_masked: "f***e@example.com",
+    plan_tier: "free",
+    plan_label: "Free",
+    is_active: false,
+    is_duplicate: false,
+    duplicate_of: null,
+    status: "ready",
+    auth_method: "oauth-personal",
+    is_host_adopted: false,
+    credential_fingerprint: "demo_fp_free_03",
+    last_checked_at: isoAgo(600),
+    last_error: "",
+    weekly_reset_utc: null,
+    quota_summary: {
+      has_quota: true,
+      fetched_at_iso: isoAgo(600),
+      gemini_5h_pct: 70,
+      gemini_5h_reset_at: isoAhead(1 * 3600 + 45 * 60),
+      gemini_weekly_pct: 62,
+      gemini_weekly_reset_at: isoAhead(5 * 86400 + 2 * 3600),
+      claude_gpt_5h_pct: 40,
+      claude_gpt_5h_reset_at: isoAhead(1 * 3600 + 45 * 60),
+      claude_gpt_weekly_pct: 35,
+      claude_gpt_weekly_reset_at: isoAhead(5 * 86400 + 2 * 3600),
+      groups: [],
+    },
+  },
+];
+
+const demoLoginFlows = new Map<string, GoogleLoginFlowState>();
+
+function buildDemoPlanSummary(): MultiPlanQuotaSummary {
+  const tierMap = new Map<string, PlanTierQuotaSummary>();
+  const seenFp = new Set<string>();
+  let totalUnique = 0;
+  let dupSlots = 0;
+
+  for (const acct of demoGoogleAccounts) {
+    const tierKey = acct.plan_tier || "unknown";
+    let t = tierMap.get(tierKey);
+    if (!t) {
+      const emptyPool = () => ({
+        accounts_with_data: 0,
+        total_remaining_fraction: 0,
+        avg_remaining_pct: null as number | null,
+        max_remaining_pct: null as number | null,
+        exhausted_count: 0,
+        earliest_reset_at: null as string | null,
+      });
+      t = {
+        plan_tier: tierKey,
+        plan_label: acct.plan_label || DEMO_PLAN_LABELS[tierKey] || "Unknown",
+        unique_accounts: 0,
+        slot_count: 0,
+        duplicate_slots: 0,
+        account_ids: [],
+        pools: {
+          gemini_5h: emptyPool(),
+          gemini_weekly: emptyPool(),
+          claude_gpt_5h: emptyPool(),
+          claude_gpt_weekly: emptyPool(),
+        },
+      };
+      tierMap.set(tierKey, t);
+    }
+    t.slot_count += 1;
+    t.account_ids.push(acct.account_id);
+    const dedupKey = acct.credential_fingerprint ? `fp:${acct.credential_fingerprint}` : `slot:${acct.account_id}`;
+    if (seenFp.has(dedupKey)) {
+      t.duplicate_slots += 1;
+      dupSlots += 1;
+      continue;
+    }
+    seenFp.add(dedupKey);
+    t.unique_accounts += 1;
+    totalUnique += 1;
+
+    const qs = acct.quota_summary;
+    const poolPairs: [keyof PlanTierQuotaSummary["pools"], number | null, string | null][] = [
+      ["gemini_5h", qs.gemini_5h_pct, qs.gemini_5h_reset_at],
+      ["gemini_weekly", qs.gemini_weekly_pct, qs.gemini_weekly_reset_at],
+      ["claude_gpt_5h", qs.claude_gpt_5h_pct, qs.claude_gpt_5h_reset_at],
+      ["claude_gpt_weekly", qs.claude_gpt_weekly_pct, qs.claude_gpt_weekly_reset_at],
+    ];
+    for (const [pk, pct, rst] of poolPairs) {
+      if (pct === null) continue;
+      const pool = t.pools[pk];
+      pool.accounts_with_data += 1;
+      pool.total_remaining_fraction = Number((pool.total_remaining_fraction + pct / 100).toFixed(4));
+      pool.max_remaining_pct = pool.max_remaining_pct === null ? pct : Math.max(pool.max_remaining_pct, pct);
+      if (pct <= 5) pool.exhausted_count += 1;
+      if (rst && (!pool.earliest_reset_at || rst < pool.earliest_reset_at)) {
+        pool.earliest_reset_at = rst;
+      }
+    }
+  }
+
+  for (const t of tierMap.values()) {
+    for (const pool of Object.values(t.pools)) {
+      if (pool.accounts_with_data > 0) {
+        pool.avg_remaining_pct = Number(
+          ((pool.total_remaining_fraction / pool.accounts_with_data) * 100).toFixed(1),
+        );
+      }
+    }
+  }
+
+  const tiers = Array.from(tierMap.values()).sort(
+    (a, b) => (DEMO_PLAN_PRIORITY[b.plan_tier] || 0) - (DEMO_PLAN_PRIORITY[a.plan_tier] || 0),
+  );
+  return {
+    active_account_id: demoActiveGoogleAccountId,
+    total_unique_accounts: totalUnique,
+    total_slots: demoGoogleAccounts.length,
+    duplicate_slot_count: dupSlots,
+    tiers,
+  };
+}
+
+function buildDemoGoogleAccountsSnapshot(): GoogleAccountsResponse {
+  const accounts = demoGoogleAccounts.map((a) => ({
+    ...a,
+    is_active: a.account_id === demoActiveGoogleAccountId,
+    quota_summary: { ...a.quota_summary },
+    weekly_reset_utc: a.weekly_reset_utc ? { ...a.weekly_reset_utc } : null,
+  }));
+  const by_plan = buildDemoPlanSummary();
+
+  const pickBest = (group: "claude_gpt" | "gemini") => {
+    const ready = accounts
+      .filter((a) => a.status === "ready")
+      .map((a) => {
+        const vals =
+          group === "gemini"
+            ? [a.quota_summary.gemini_5h_pct, a.quota_summary.gemini_weekly_pct]
+            : [a.quota_summary.claude_gpt_5h_pct, a.quota_summary.claude_gpt_weekly_pct];
+        const nums = vals.filter((v): v is number => v !== null);
+        const eff = nums.length > 0 ? Math.min(...nums) : -1;
+        return { a, eff };
+      })
+      .filter((x) => x.eff > 5)
+      .sort((x, y) => y.eff - x.eff);
+    const top = ready[0] || null;
+    return {
+      model_group: group,
+      recommended: top ? top.a : null,
+      reason: top
+        ? `Selected ${top.a.account_id} (${top.a.plan_label}, min remaining ${top.eff.toFixed(1)}%)`
+        : `No non-exhausted account available for ${group}`,
+      candidates: ready.map((x) => x.a),
+    };
+  };
+
+  return {
+    ok: true,
+    active_account_id: demoActiveGoogleAccountId,
+    accounts,
+    by_plan,
+    recommendation: {
+      claude_gpt: pickBest("claude_gpt"),
+      gemini: pickBest("gemini"),
+    },
+    can_edit: true,
+    updated_at: new Date().toISOString(),
+  };
+}
+
+export async function fetchGoogleAccounts(): Promise<GoogleAccountsResponse> {
+  await delay(30);
+  requireAuth();
+  return buildDemoGoogleAccountsSnapshot();
+}
+
+export async function addGoogleAccount(
+  payload: GoogleAccountAddPayload,
+): Promise<GoogleAccountMutationResponse> {
+  await delay(40);
+  requireAuth();
+  const aid = (payload.account_id || "").trim().toLowerCase();
+  if (!/^[a-z0-9][a-z0-9_-]{0,47}$/.test(aid)) {
+    throw new StudioApiError("account_id 格式非法", 400, "studio_api");
+  }
+  if (demoGoogleAccounts.some((a) => a.account_id === aid)) {
+    throw new StudioApiError(`Account '${aid}' already exists`, 409, "studio_api");
+  }
+  const item: GoogleAccountItem = {
+    account_id: aid,
+    alias: payload.alias?.trim() || aid,
+    email_masked: "",
+    plan_tier: "unknown",
+    plan_label: "Unknown",
+    is_active: false,
+    is_duplicate: false,
+    duplicate_of: null,
+    status: "pending_login",
+    auth_method: "oauth-personal",
+    is_host_adopted: false,
+    last_checked_at: "",
+    last_error: "",
+    weekly_reset_utc: null,
+    quota_summary: {
+      has_quota: false,
+      fetched_at_iso: "",
+      gemini_5h_pct: null,
+      gemini_5h_reset_at: null,
+      gemini_weekly_pct: null,
+      gemini_weekly_reset_at: null,
+      claude_gpt_5h_pct: null,
+      claude_gpt_5h_reset_at: null,
+      claude_gpt_weekly_pct: null,
+      claude_gpt_weekly_reset_at: null,
+      groups: [],
+    },
+  };
+  demoGoogleAccounts = [...demoGoogleAccounts, item];
+  emitDemoEvent("accounts_updated", { action: "add", account_id: aid, ts: nowSec() });
+  return { ok: true, account: item, snapshot: buildDemoGoogleAccountsSnapshot() };
+}
+
+export async function updateGoogleAccount(
+  accountId: string,
+  payload: GoogleAccountPatchPayload,
+): Promise<GoogleAccountMutationResponse> {
   await delay(35);
   requireAuth();
-  const scale = scope === "all" ? 1 : scope === "agent" ? 0.78 : 0.22;
+  const target = demoGoogleAccounts.find((a) => a.account_id === accountId);
+  if (!target) {
+    throw new StudioApiError(`账号 '${accountId}' 不存在`, 404, "studio_api");
+  }
+  if (payload.alias && payload.alias.trim()) {
+    target.alias = payload.alias.trim();
+  }
+  if (
+    payload.weekly_reset_utc_weekday !== undefined ||
+    payload.weekly_reset_utc_hour !== undefined
+  ) {
+    target.weekly_reset_utc = {
+      weekday: payload.weekly_reset_utc_weekday ?? target.weekly_reset_utc?.weekday ?? 4,
+      hour: payload.weekly_reset_utc_hour ?? target.weekly_reset_utc?.hour ?? 23,
+      minute: payload.weekly_reset_utc_minute ?? 0,
+    };
+  }
+  emitDemoEvent("accounts_updated", { action: "update", account_id: accountId, ts: nowSec() });
+  return { ok: true, account: { ...target }, snapshot: buildDemoGoogleAccountsSnapshot() };
+}
+
+export async function deleteGoogleAccount(
+  accountId: string,
+): Promise<GoogleAccountMutationResponse> {
+  await delay(40);
+  requireAuth();
+  const wasActive = demoActiveGoogleAccountId === accountId;
+  demoGoogleAccounts = demoGoogleAccounts.filter((a) => a.account_id !== accountId);
+  if (wasActive) {
+    demoActiveGoogleAccountId = demoGoogleAccounts[0]?.account_id || null;
+  }
+  emitDemoEvent("accounts_updated", { action: "delete", account_id: accountId, ts: nowSec() });
+  return {
+    ok: true,
+    account_id: accountId,
+    was_active: wasActive,
+    snapshot: buildDemoGoogleAccountsSnapshot(),
+  };
+}
+
+export async function startGoogleAccountLogin(
+  accountId: string,
+  payload?: { alias?: string; timeout_sec?: number },
+): Promise<GoogleLoginFlowResponse> {
+  await delay(45);
+  requireAuth();
+  const now = nowSec();
+  const fid = `gflow_demo_${now.toString(36)}`;
+  const stateToken = `demo_state_${now.toString(36)}`;
+  const existing = demoGoogleAccounts.find((a) => a.account_id === accountId);
+  const flow: GoogleLoginFlowState = {
+    flow_id: fid,
+    account_id: accountId,
+    alias: payload?.alias || existing?.alias || accountId,
+    status: "awaiting_code",
+    created_at: now,
+    expires_at: now + 300,
+    auth_url: `https://accounts.google.com/o/oauth2/auth?client_id=demo&redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback&response_type=code&state=${stateToken}`,
+    error: "",
+  };
+  demoLoginFlows.set(fid, flow);
+  return { ok: true, flow: { ...flow } };
+}
+
+export async function fetchGoogleLoginFlow(flowId: string): Promise<GoogleLoginFlowResponse> {
+  await delay(20);
+  requireAuth();
+  const flow = demoLoginFlows.get(flowId);
+  if (!flow) {
+    throw new StudioApiError("未找到对应的 OAuth 登录流", 404, "studio_api");
+  }
+  const { auth_url: _omit, ...safeFlow } = flow;
+  void _omit;
+  return { ok: true, flow: safeFlow };
+}
+
+export async function submitGoogleLoginCode(
+  flowId: string,
+  codeOrUrl: string,
+): Promise<GoogleLoginFlowResponse> {
+  await delay(65);
+  requireAuth();
+  const flow = demoLoginFlows.get(flowId);
+  if (!flow) {
+    throw new StudioApiError("未找到对应的 OAuth 登录流", 404, "studio_api");
+  }
+  if (!codeOrUrl.trim()) {
+    throw new StudioApiError("请提供授权码或回调 URL", 400, "studio_api");
+  }
+  let target = demoGoogleAccounts.find((a) => a.account_id === flow.account_id);
+  if (!target) {
+    target = {
+      account_id: flow.account_id,
+      alias: flow.alias,
+      email_masked: `${flow.account_id[0] || "u"}***@example.com`,
+      plan_tier: "pro",
+      plan_label: "Google AI Pro",
+      is_active: false,
+      is_duplicate: false,
+      duplicate_of: null,
+      status: "ready",
+      credential_fingerprint: `demo_fp_${flow.account_id}`,
+      last_checked_at: new Date().toISOString(),
+      last_error: "",
+      weekly_reset_utc: null,
+      quota_summary: {
+        has_quota: true,
+        fetched_at_iso: new Date().toISOString(),
+        gemini_5h_pct: 98,
+        gemini_5h_reset_at: isoAhead(5 * 3600),
+        gemini_weekly_pct: 96,
+        gemini_weekly_reset_at: isoAhead(6 * 86400),
+        claude_gpt_5h_pct: 95,
+        claude_gpt_5h_reset_at: isoAhead(5 * 3600),
+        claude_gpt_weekly_pct: 94,
+        claude_gpt_weekly_reset_at: isoAhead(6 * 86400),
+        groups: [],
+      },
+    };
+    demoGoogleAccounts = [...demoGoogleAccounts, target];
+  } else {
+    target.status = "ready";
+    target.email_masked = target.email_masked || `${target.account_id[0] || "u"}***@example.com`;
+    if (target.plan_tier === "unknown") {
+      target.plan_tier = "pro";
+      target.plan_label = "Google AI Pro";
+    }
+    target.last_checked_at = new Date().toISOString();
+    target.quota_summary = {
+      ...target.quota_summary,
+      has_quota: true,
+      fetched_at_iso: new Date().toISOString(),
+      gemini_5h_pct: target.quota_summary.gemini_5h_pct ?? 96,
+      gemini_weekly_pct: target.quota_summary.gemini_weekly_pct ?? 92,
+      claude_gpt_5h_pct: target.quota_summary.claude_gpt_5h_pct ?? 94,
+      claude_gpt_weekly_pct: target.quota_summary.claude_gpt_weekly_pct ?? 90,
+    };
+  }
+  flow.status = "completed";
+  flow.account = { ...target };
+  flow.auth_url = undefined;
+  emitDemoEvent("accounts_updated", { action: "login_completed", account_id: target.account_id, ts: nowSec() });
+  return {
+    ok: true,
+    flow: { ...flow },
+    snapshot: buildDemoGoogleAccountsSnapshot(),
+  };
+}
+
+export async function cancelGoogleLoginFlow(flowId: string): Promise<GoogleLoginFlowResponse> {
+  await delay(20);
+  requireAuth();
+  const flow = demoLoginFlows.get(flowId);
+  if (!flow) {
+    throw new StudioApiError("未找到对应的 OAuth 登录流", 404, "studio_api");
+  }
+  flow.status = "cancelled";
+  flow.auth_url = undefined;
+  return { ok: true, flow: { ...flow } };
+}
+
+export async function logoutGoogleAccount(
+  accountId: string,
+): Promise<GoogleAccountMutationResponse> {
+  await delay(35);
+  requireAuth();
+  const target = demoGoogleAccounts.find((a) => a.account_id === accountId);
+  if (!target) {
+    throw new StudioApiError(`账号 '${accountId}' 不存在`, 404, "studio_api");
+  }
+  const wasActive = demoActiveGoogleAccountId === accountId;
+  if (wasActive) demoActiveGoogleAccountId = null;
+  target.status = "logged_out";
+  target.is_active = false;
+  target.quota_summary = {
+    ...target.quota_summary,
+    has_quota: false,
+    gemini_5h_pct: null,
+    gemini_weekly_pct: null,
+    claude_gpt_5h_pct: null,
+    claude_gpt_weekly_pct: null,
+  };
+  emitDemoEvent("accounts_updated", { action: "logout", account_id: accountId, ts: nowSec() });
+  return {
+    ok: true,
+    account: { ...target },
+    was_active: wasActive,
+    snapshot: buildDemoGoogleAccountsSnapshot(),
+  };
+}
+
+export async function activateGoogleAccount(
+  accountId: string,
+): Promise<GoogleAccountActivateResponse> {
+  await delay(45);
+  requireAuth();
+  const target = demoGoogleAccounts.find((a) => a.account_id === accountId);
+  if (!target) {
+    throw new StudioApiError(`账号 '${accountId}' 不存在`, 404, "studio_api");
+  }
+  const prev = demoActiveGoogleAccountId;
+  demoActiveGoogleAccountId = accountId;
+  emitDemoEvent("accounts_updated", {
+    action: "activate",
+    account_id: accountId,
+    active_account_id: accountId,
+    ts: nowSec(),
+  });
+  const snap = buildDemoGoogleAccountsSnapshot();
+  return {
+    ok: true,
+    previous_account_id: prev,
+    active_account_id: accountId,
+    switched: prev !== accountId,
+    account: snap.accounts.find((a) => a.account_id === accountId) || target,
+    recycle_results: [{ handle: "example_main_bot", ok: true, status: 200, recycled: true }],
+    snapshot: snap,
+  };
+}
+
+export async function refreshGoogleAccountQuota(
+  accountId: string,
+): Promise<GoogleAccountMutationResponse> {
+  await delay(50);
+  requireAuth();
+  const target = demoGoogleAccounts.find((a) => a.account_id === accountId);
+  if (!target) {
+    throw new StudioApiError(`账号 '${accountId}' 不存在`, 404, "studio_api");
+  }
+  target.last_checked_at = new Date().toISOString();
+  target.quota_summary.fetched_at_iso = target.last_checked_at;
+  emitDemoEvent("accounts_updated", { action: "refresh", account_id: accountId, ts: nowSec() });
+  return { ok: true, account: { ...target }, snapshot: buildDemoGoogleAccountsSnapshot() };
+}
+
+export async function refreshAllGoogleAccountsQuota(): Promise<GoogleAccountRefreshAllResponse> {
+  await delay(70);
+  requireAuth();
+  const nowIso = new Date().toISOString();
+  for (const a of demoGoogleAccounts) {
+    if (a.status === "ready") {
+      a.last_checked_at = nowIso;
+      a.quota_summary.fetched_at_iso = nowIso;
+    }
+  }
+  emitDemoEvent("accounts_updated", { action: "refresh_all", ts: nowSec() });
+  const snap = buildDemoGoogleAccountsSnapshot();
+  return {
+    ok: true,
+    all_succeeded: true,
+    refreshed: snap.accounts.filter((a) => a.status === "ready"),
+    errors: {},
+    snapshot: snap,
+  };
+}
+
+export async function fetchCosts(
+  scope: "all" | "agent" | "sched" = "all",
+  filters?: { account_id?: string | null; plan_tier?: string | null },
+): Promise<CostsResponse> {
+  await delay(35);
+  requireAuth();
+  const baseScale = scope === "all" ? 1 : scope === "agent" ? 0.78 : 0.22;
+
+  const accountWeights: { account_id: string; alias: string; plan_tier: string; weight: number }[] = [
+    { account_id: "ultra_main", alias: "Ultra 主力号", plan_tier: "ultra", weight: 0.58 },
+    { account_id: "pro_work", alias: "Pro 协作号", plan_tier: "pro", weight: 0.31 },
+    { account_id: "free_lab", alias: "Free 实验号", plan_tier: "free", weight: 0.11 },
+  ];
+
+  const cleanAid = filters?.account_id && filters.account_id !== "all" ? filters.account_id : null;
+  const cleanTier = filters?.plan_tier && filters.plan_tier !== "all" ? filters.plan_tier : null;
+
+  const matchedAccounts = accountWeights.filter((a) => {
+    if (cleanAid && a.account_id !== cleanAid) return false;
+    if (cleanTier && a.plan_tier !== cleanTier) return false;
+    return true;
+  });
+  const filterWeight = matchedAccounts.reduce((acc, item) => acc + item.weight, 0);
+  const scale = baseScale * filterWeight;
+
   const dayWeights = [0.65, 0.9, 1.25, 0.82, 1.4, 1.15, 0.72, 1.1, 1.55, 1.32, 0.94, 1.48, 1.22, 1.0];
   const daily_14d: DailyCostRow[] = dayWeights.map((w, idx) => {
     const dt = new Date(Date.now() - (13 - idx) * 86400 * 1000);
@@ -1626,27 +2225,53 @@ export async function fetchCosts(scope: "all" | "agent" | "sched" = "all"): Prom
     };
   });
 
-  const by_model_month: ModelCostRow[] = [
-    {
-      family: "claude-sonnet-4",
-      label: "Claude Sonnet 4 (OpenRouter)",
-      ...makeCostAgg(scale, 1840, 7420, 620, 290, 18.4, 42.1),
-    },
-    {
-      family: "gemini-2.5-pro",
-      label: "Gemini 2.5 Pro (AGY / CPA)",
-      ...makeCostAgg(scale, 1520, 6380, 480, 240, 13.8, 31.6),
-    },
-    {
-      family: "deepseek-reasoner",
-      label: "DeepSeek Reasoner",
-      ...makeCostAgg(scale, 960, 2850, 390, 145, 6.7, 11.4),
-    },
-  ];
+  const by_model_month: ModelCostRow[] =
+    scale <= 0
+      ? []
+      : [
+          {
+            family: "claude-sonnet-4",
+            label: "Claude Sonnet 4 (OpenRouter)",
+            ...makeCostAgg(scale, 1840, 7420, 620, 290, 18.4, 42.1),
+          },
+          {
+            family: "gemini-2.5-pro",
+            label: "Gemini 2.5 Pro (AGY / CPA)",
+            ...makeCostAgg(scale, 1520, 6380, 480, 240, 13.8, 31.6),
+          },
+          {
+            family: "deepseek-reasoner",
+            label: "DeepSeek Reasoner",
+            ...makeCostAgg(scale, 960, 2850, 390, 145, 6.7, 11.4),
+          },
+        ];
 
   const by_model_week: ModelCostRow[] = by_model_month.map((m) => ({
     ...m,
     ...makeCostAgg(0.3 * scale, 520, 2100, 180, 76, m.cost_usd, m.saved_usd),
+  }));
+
+  const by_account_month: AccountCostRow[] = matchedAccounts.map((a) => ({
+    account_id: a.account_id,
+    alias: a.alias,
+    plan_tier: a.plan_tier,
+    plan_label: DEMO_PLAN_LABELS[a.plan_tier] || "Unknown",
+    ...makeCostAgg(baseScale * a.weight, 4320, 16650, 1490, 675, 38.9, 85.1),
+  }));
+
+  const planAggMap = new Map<string, { weight: number; accounts: string[] }>();
+  for (const a of matchedAccounts) {
+    const cur = planAggMap.get(a.plan_tier) || { weight: 0, accounts: [] };
+    cur.weight += a.weight;
+    cur.accounts.push(a.account_id);
+    planAggMap.set(a.plan_tier, cur);
+  }
+  const by_plan_month: PlanCostRow[] = Array.from(planAggMap.entries()).map(([tier, info]) => ({
+    plan_tier: tier,
+    plan_label: DEMO_PLAN_LABELS[tier] || "Unknown",
+    accounts: info.accounts,
+    account_count: info.accounts.length,
+    ...makeCostAgg(baseScale * info.weight, 4320, 16650, 1490, 675, 38.9, 85.1),
   }));
 
   return {
@@ -1667,6 +2292,13 @@ export async function fetchCosts(scope: "all" | "agent" | "sched" = "all"): Prom
     daily_14d,
     by_model_week,
     by_model_month,
+    by_account_month,
+    by_plan_month,
+    accounts_quota: buildDemoPlanSummary(),
+    filter: {
+      account_id: cleanAid,
+      plan_tier: cleanTier,
+    },
     quota_groups: [
       {
         name: "AGY 主配额池（演示）",
