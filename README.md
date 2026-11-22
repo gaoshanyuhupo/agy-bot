@@ -7,6 +7,7 @@
 - **开源协议**：[MIT](./LICENSE)
 - **代码仓库**：[gaoshanyuhupo/agy-bot](https://github.com/gaoshanyuhupo/agy-bot)
 - **项目展示页**：[aibigbigworld.com/agy-bot](https://aibigbigworld.com/agy-bot/)
+- **在线交互 Demo**：[aibigbigworld.com/agy-bot/demo](https://aibigbigworld.com/agy-bot/demo/)（免部署直开体验 AGY Studio 桌面/移动工作台）
 - **社区交流**：[LINUX.DO](https://linux.do/)
 - **安全与贡献**：[SECURITY.md](./SECURITY.md) · [CONTRIBUTING.md](./CONTRIBUTING.md)
 
@@ -96,6 +97,8 @@
 - **桌面端交互体验**：提供三栏桌面工作台布局——左侧支持项目列表、置顶、归档、新建会话以及 `✦ Team` 群组协同视图；右侧可查看工作区变更与状态；内置外部模型与 OpenBao 可视化管理页。
 - **顺手的多模态与任务调度**：支持直接拖入或粘贴图片/附件、键入 `@` 快速引用工作区文件；对话中实时呈现「收件 → 思考 → 工具调用 → 应答」处理环节；当上一条任务还在运行时，既可以按顺序**排队发送**，也能一键点击 **「⚡ 马上执行」** 紧急插队。
 - **三端无缝互通**：**Telegram、桌面 WebUI、移动 WebUI** 全面打通——你在桌面工作台里切换某个 Bot 的默认模型或 Effort、发出的对话消息、群组 Team 协作动态以及侧栏项目状态，都会实时同步到 Telegram 与移动端，换设备接着干活零割裂感。
+
+> **在线交互体验**：无需本地部署，直接打开 **[AGY Studio 在线 Demo](https://aibigbigworld.com/agy-bot/demo/)** 即可在浏览器中完整体验桌面/移动工作台、多 Bot 团队视图与模型/账号管理界面。
 
 ![AGY Studio 模拟桌面版反重力工作台](./docs/images/showcase-workbench.svg)
 

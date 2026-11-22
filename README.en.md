@@ -7,6 +7,7 @@ An open-source AI collaborative workbench and multi-platform companion suite bui
 - **License**: [MIT](./LICENSE)
 - **Repository**: [gaoshanyuhupo/agy-bot](https://github.com/gaoshanyuhupo/agy-bot)
 - **Showcase Site**: [aibigbigworld.com/agy-bot](https://aibigbigworld.com/agy-bot/)
+- **Live Interactive Demo**: [aibigbigworld.com/agy-bot/demo](https://aibigbigworld.com/agy-bot/demo/) (try AGY Studio Desktop & Mobile WebUI directly in your browser—no setup required)
 - **Community**: [LINUX.DO](https://linux.do/)
 - **Security & Contributing**: [SECURITY.md](./SECURITY.md) · [CONTRIBUTING.md](./CONTRIBUTING.md)
 
@@ -96,6 +97,8 @@ Telegram is unbeatable for issuing tasks on the go, while deep code review, file
 - **Desktop-App Feel in Your Browser**: Clean three-column workbench featuring project management (pinning, archiving, new chats), a dedicated `✦ Team` group collaboration view, workspace file diff inspection, and built-in External Models & OpenBao management pages.
 - **Multimodal Input & Smart Task Scheduling**: Drag-and-drop or paste screenshots/attachments, use `@` mentions to reference workspace files directly, watch real-time processing stages (Receive → Think → Tool Calls → Reply), and choose between **Queue** or **⚡ Run Now** priority execution while a turn is active.
 - **True 3-Platform Continuity**: **Telegram, Desktop WebUI, and Mobile WebUI** stay continuously synchronized—chat messages, team collaboration activity, sidebar project states, and each bot's default model/effort settings propagate across all three surfaces automatically.
+
+> **Try It Live**: Open the **[AGY Studio Interactive Demo](https://aibigbigworld.com/agy-bot/demo/)** directly in your browser—no installation required—to explore the desktop/mobile workbench, multi-bot team view, and model/account management UI.
 
 ![AGY Studio Desktop-Style Workbench](./docs/images/showcase-workbench.svg)
 
