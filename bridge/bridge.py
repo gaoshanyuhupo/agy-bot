@@ -1453,6 +1453,29 @@ def sig_handler(signum, frame):
     shutting_down = True
 
 
+_TG_FLOOD_LOCK = threading.Lock()
+_TG_FLOOD_UNTIL = {}  # key ("chat:<id>" | "__global__") -> monotonic deadline
+_TG_FLOOD_GLOBAL_KEY = "__global__"
+_TG_FLOOD_LOGGED_UNTIL = {}
+_TG_SECRET_REDACT_RE = re.compile(r"bot\d+:[A-Za-z0-9_-]{8,}")
+
+
+def _sanitize_tg_log_text(raw, max_len=300):
+    text = str(raw or "").replace("\r", " ").replace("\n", " ").strip()
+    if BOT_TOKEN:
+        text = text.replace(BOT_TOKEN, "[REDACTED]")
+    text = _TG_SECRET_REDACT_RE.sub("bot[REDACTED]", text)
+    return text[:max_len]
+
+
+def _is_tg_control_read_method(method):
+    """Control-plane / read-only Bot API methods (getUpdates, getMe, getFile, ...) are never blocked."""
+    m = str(method or "").strip()
+    if not m:
+        return True
+    return m.startswith("get")
+
+
 def _tg_json(resp):
     """Safely parse a Telegram HTTP response as a dict without raising on HTML/5xx bodies."""
     if resp is None:
@@ -1468,13 +1491,144 @@ def _tg_ok(resp):
     return bool(_tg_json(resp).get("ok"))
 
 
-def _tg_retry_after(resp):
-    if resp is None or getattr(resp, "status_code", None) != 429:
+def _tg_is_429(resp):
+    if resp is None:
+        return False
+    if getattr(resp, "status_code", None) == 429:
+        return True
+    return _tg_json(resp).get("error_code") == 429
+
+
+def _parse_positive_retry_after_int(raw):
+    """Parse a positive finite retry_after value as int (>=1), rejecting bool/NaN/inf/<=0."""
+    if raw is None or isinstance(raw, bool):
         return None
-    try:
-        return max(1, int(_tg_json(resp).get("parameters", {}).get("retry_after", 2)))
-    except Exception:
-        return 2
+    val = None
+    if isinstance(raw, (int, float)):
+        val = float(raw)
+    elif isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return None
+        try:
+            val = float(s)
+        except ValueError:
+            try:
+                from email.utils import parsedate_to_datetime
+
+                dt = parsedate_to_datetime(s)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=datetime.timezone.utc)
+                val = (dt - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+            except Exception:
+                return None
+    else:
+        return None
+    if not math.isfinite(val) or val <= 0:
+        return None
+    return max(1, int(math.ceil(val)))
+
+
+def _tg_retry_after(resp):
+    if not _tg_is_429(resp):
+        return None
+    data = _tg_json(resp)
+    params = data.get("parameters")
+    has_raw_param = isinstance(params, dict) and ("retry_after" in params)
+    raw_param = params.get("retry_after") if has_raw_param else None
+    parsed = _parse_positive_retry_after_int(raw_param)
+    if parsed is not None:
+        return parsed
+    headers = getattr(resp, "headers", None)
+    if headers is not None:
+        hdr_val = None
+        if hasattr(headers, "get"):
+            hdr_val = headers.get("Retry-After")
+            if hdr_val is None:
+                hdr_val = headers.get("retry-after")
+        if hdr_val is None and hasattr(headers, "items"):
+            for k, v in headers.items():
+                if str(k).lower() == "retry-after":
+                    hdr_val = v
+                    break
+        parsed_hdr = _parse_positive_retry_after_int(hdr_val)
+        if parsed_hdr is not None:
+            return parsed_hdr
+    if has_raw_param and not isinstance(raw_param, bool) and isinstance(raw_param, (int, float)) and raw_param == 0:
+        return 1
+    return 2
+
+
+def _tg_flood_key(chat_id=None):
+    if chat_id is None or isinstance(chat_id, bool):
+        return _TG_FLOOD_GLOBAL_KEY
+    s = str(chat_id).strip()
+    if not s:
+        return _TG_FLOOD_GLOBAL_KEY
+    return f"chat:{s}"
+
+
+def _tg_is_global_rate_limit(resp):
+    desc = str(_tg_json(resp).get("description", "")).lower()
+    return "global" in desc and ("limit" in desc or "too many" in desc)
+
+
+def _tg_flood_remaining(chat_id=None, *, now=None):
+    """Return remaining outbound FloodWait cooldown seconds for `chat_id` (or global)."""
+    cur = time.monotonic() if now is None else float(now)
+    key = _tg_flood_key(chat_id)
+    check_keys = (key, _TG_FLOOD_GLOBAL_KEY) if key != _TG_FLOOD_GLOBAL_KEY else (_TG_FLOOD_GLOBAL_KEY,)
+    with _TG_FLOOD_LOCK:
+        rem = 0.0
+        for ck in check_keys:
+            until = _TG_FLOOD_UNTIL.get(ck, 0.0)
+            if until <= cur:
+                if ck in _TG_FLOOD_UNTIL:
+                    _TG_FLOOD_UNTIL.pop(ck, None)
+                    _TG_FLOOD_LOGGED_UNTIL.pop(ck, None)
+            else:
+                rem = max(rem, until - cur)
+        return rem
+
+
+def _tg_record_flood_wait(retry_after, *, chat_id=None, method="", resp=None, is_global=False):
+    """Record full untruncated outbound FloodWait cooldown window in monotonic time and log warning."""
+    wait_s = _parse_positive_retry_after_int(retry_after)
+    if wait_s is None:
+        wait_s = 2
+    use_global = bool(is_global or (resp is not None and _tg_is_global_rate_limit(resp)))
+    key = _TG_FLOOD_GLOBAL_KEY if (use_global or chat_id is None) else _tg_flood_key(chat_id)
+    now = time.monotonic()
+    deadline = now + float(wait_s)
+    should_log = False
+    with _TG_FLOOD_LOCK:
+        prev = _TG_FLOOD_UNTIL.get(key, 0.0)
+        if deadline > prev:
+            _TG_FLOOD_UNTIL[key] = deadline
+            last_logged = _TG_FLOOD_LOGGED_UNTIL.get(key, 0.0)
+            if deadline > last_logged + 0.5:
+                _TG_FLOOD_LOGGED_UNTIL[key] = deadline
+                should_log = True
+    if should_log:
+        target = "global" if key == _TG_FLOOD_GLOBAL_KEY else key
+        err_snip = _sanitize_tg_log_text(_tg_json(resp).get("description", "")) if resp is not None else ""
+        suffix = f" ({err_snip})" if err_snip else ""
+        log(
+            "WARNING: Telegram HTTP 429 FloodWait on %s [%s]: retry_after=%ss; pausing outbound calls%s"
+            % (method or "outbound", target, wait_s, suffix)
+        )
+    return wait_s
+
+
+def _tg_clear_flood_wait(chat_id=None):
+    with _TG_FLOOD_LOCK:
+        if chat_id is None:
+            _TG_FLOOD_UNTIL.clear()
+            _TG_FLOOD_LOGGED_UNTIL.clear()
+        else:
+            key = _tg_flood_key(chat_id)
+            _TG_FLOOD_UNTIL.pop(key, None)
+            _TG_FLOOD_LOGGED_UNTIL.pop(key, None)
 
 
 POLL_BACKOFF_BASE = 2.0
@@ -1503,13 +1657,17 @@ def _poll_backoff_seconds(streak):
 
 
 def tg(method, _timeout=None, _retry_429=True, _max_429_wait=12, **params):
-    """Call Telegram Bot API with configurable timeout and interruptible 429 retry."""
+    """Call Telegram Bot API with configurable timeout, interruptible 429 retry, and shared cooldown."""
     to = _timeout or DEFAULT_TIMEOUT
+    is_read_ctrl = _is_tg_control_read_method(method)
+    chat_id = params.get("chat_id")
+    if not is_read_ctrl and _tg_flood_remaining(chat_id) > 0:
+        return None
     try:
         r = http_session.post(API + "/" + method, json=params, timeout=to)
         slept = 0.0
         for _ in range(2):
-            if r is None or r.status_code != 429 or not _retry_429:
+            if not _tg_is_429(r) or not _retry_429:
                 break
             wait_s = _tg_retry_after(r) or 2
             if slept + wait_s > _max_429_wait:
@@ -1519,9 +1677,12 @@ def tg(method, _timeout=None, _retry_429=True, _max_429_wait=12, **params):
                 break
             slept += wait_s + 0.25
             r = http_session.post(API + "/" + method, json=params, timeout=to)
+        if not is_read_ctrl and _tg_is_429(r):
+            wait_s = _tg_retry_after(r) or 2
+            _tg_record_flood_wait(wait_s, chat_id=chat_id, method=method, resp=r)
         return r
     except Exception as e:
-        log("tg %s failed: %s" % (method, e))
+        log("tg %s failed: %s" % (method, _sanitize_tg_log_text(e)))
         return None
 
 
@@ -1541,6 +1702,8 @@ def tg_send_in_route(method, chat_id, thread_id=None, _timeout=None, _retry_429=
         kw["reply_to_message_id"] = int(kw["reply_to_message_id"])
 
     r = tg(method, _timeout=_timeout, _retry_429=_retry_429, _max_429_wait=_max_429_wait, **kw)
+    if _tg_is_429(r) or _tg_flood_remaining(chat_id) > 0:
+        return r
     if norm_tid is not None and r is not None:
         j = _tg_json(r)
         if not j.get("ok") and "thread not found" in str(j.get("description", "")).lower():
@@ -1548,6 +1711,8 @@ def tg_send_in_route(method, chat_id, thread_id=None, _timeout=None, _retry_429=
                 % (method, norm_tid, _format_tg_err(r)))
             kw.pop("message_thread_id", None)
             r = tg(method, _timeout=_timeout, _retry_429=_retry_429, _max_429_wait=_max_429_wait, **kw)
+            if _tg_is_429(r) or _tg_flood_remaining(chat_id) > 0:
+                return r
 
     if kw.get("reply_to_message_id") and not _tg_ok(r):
         j = _tg_json(r)
@@ -1572,6 +1737,8 @@ def tg_send_in_route(method, chat_id, thread_id=None, _timeout=None, _retry_429=
 
 def send_file(chat_id, filepath, caption=None, thread_id=None):
     """Send document or photo (if image) via multipart/form-data."""
+    if _tg_flood_remaining(chat_id) > 0:
+        return None
     filename = os.path.basename(filepath)
     ext = os.path.splitext(filename)[1].lower()
     is_image = ext in IMAGE_EXTS
@@ -1590,16 +1757,17 @@ def send_file(chat_id, filepath, caption=None, thread_id=None):
                 if caption:
                     data["caption"] = caption[:1024]
                 r = http_session.post(API + "/" + method, data=data, files=files, timeout=(10, 120))
+            if _tg_is_429(r):
+                wait_s = _tg_retry_after(r) or 2
+                _tg_record_flood_wait(wait_s, chat_id=chat_id, method=method, resp=r)
+                return r
             if attempt_tid is not None and r is not None:
-                try:
-                    j = r.json()
-                except Exception:
-                    j = {}
+                j = _tg_json(r)
                 if not j.get("ok") and "thread not found" in str(j.get("description", "")).lower():
                     continue
             return r
     except Exception as e:
-        log("send_file %s failed: %s" % (filepath, e))
+        log("send_file %s failed: %s" % (filepath, _sanitize_tg_log_text(e)))
         return None
 
 
@@ -1607,6 +1775,8 @@ def send_media_group(chat_id, filepaths, caption=None, thread_id=None):
     """Send 2..10 static images in a single Telegram album (`sendMediaGroup`).
     Returns True if accepted by Telegram, else False so caller can fall back per-file.
     """
+    if _tg_flood_remaining(chat_id) > 0:
+        return False
     paths = list(filepaths or [])[:10]
     if len(paths) < 2:
         return False
@@ -1633,10 +1803,11 @@ def send_media_group(chat_id, filepaths, caption=None, thread_id=None):
             data["message_thread_id"] = norm_tid
         r = http_session.post(API + "/sendMediaGroup", data=data, files=files, timeout=(10, 120))
         if r is not None:
-            try:
-                j = r.json()
-            except Exception:
-                j = {}
+            if _tg_is_429(r):
+                wait_s = _tg_retry_after(r) or 2
+                _tg_record_flood_wait(wait_s, chat_id=chat_id, method="sendMediaGroup", resp=r)
+                return False
+            j = _tg_json(r)
             if j.get("ok"):
                 return True
             if norm_tid is not None and "thread not found" in str(j.get("description", "")).lower():
@@ -1644,11 +1815,15 @@ def send_media_group(chat_id, filepaths, caption=None, thread_id=None):
                 for fobj in opened:
                     fobj.seek(0)
                 r2 = http_session.post(API + "/sendMediaGroup", data=data, files=files, timeout=(10, 120))
-                if r2 is not None and r2.json().get("ok"):
+                if _tg_is_429(r2):
+                    wait_s = _tg_retry_after(r2) or 2
+                    _tg_record_flood_wait(wait_s, chat_id=chat_id, method="sendMediaGroup", resp=r2)
+                    return False
+                if _tg_ok(r2):
                     return True
-            log("sendMediaGroup rejected (%s); will fallback per-file" % j.get("description", r.status_code))
+            log("sendMediaGroup rejected (%s); will fallback per-file" % _sanitize_tg_log_text(j.get("description", r.status_code)))
     except Exception as e:
-        log("sendMediaGroup error: %s" % e)
+        log("sendMediaGroup error: %s" % _sanitize_tg_log_text(e))
     finally:
         for fobj in opened:
             try:
@@ -2960,7 +3135,7 @@ def _format_tg_err(resp):
     """Format Telegram API failure without falling into `bool(requests.Response)` 4xx falsiness."""
     if resp is None:
         return "network"
-    return f"HTTP {resp.status_code}: {(resp.text or '')[:300]}"
+    return f"HTTP {resp.status_code}: {_sanitize_tg_log_text(getattr(resp, 'text', '') or '', max_len=300)}"
 
 
 def send(chat_id, text, parse_mode=None, reply_markup=None, thread_id=None, _max_429_wait=45, reply_to_message_id=None, disable_web_page_preview=False):
@@ -2968,6 +3143,8 @@ def send(chat_id, text, parse_mode=None, reply_markup=None, thread_id=None, _max
     text = (text or "(empty response)").strip() or "(empty response)"
     last_mid = None
     for i in range(0, len(text), 4000):
+        if _tg_flood_remaining(chat_id) > 0:
+            break
         chunk = text[i:i + 4000]
         is_first = (i == 0)
         is_last = (i + 4000 >= len(text))
@@ -2983,6 +3160,9 @@ def send(chat_id, text, parse_mode=None, reply_markup=None, thread_id=None, _max
             kw["link_preview_options"] = {"is_disabled": True}
         r = tg_send_in_route("sendMessage", chat_id, thread_id=thread_id, _max_429_wait=_max_429_wait, **kw)
         mid = _extract_msg_id(r)
+        if not mid and (_tg_is_429(r) or _tg_flood_remaining(chat_id) > 0):
+            log("send aborted due to 429 FloodWait cooldown: %s" % _format_tg_err(r))
+            break
         if not mid and parse_mode == "HTML":
             desc = str(_tg_json(r).get("description", "")).lower()
             if "parse entities" in desc or "can't find end" in desc or "byte offset" in desc:
@@ -2997,6 +3177,9 @@ def send(chat_id, text, parse_mode=None, reply_markup=None, thread_id=None, _max
                     plain_kw["link_preview_options"] = {"is_disabled": True}
                 r = tg_send_in_route("sendMessage", chat_id, thread_id=thread_id, _max_429_wait=_max_429_wait, **plain_kw)
                 mid = _extract_msg_id(r)
+                if not mid and (_tg_is_429(r) or _tg_flood_remaining(chat_id) > 0):
+                    log("send plain fallback aborted due to 429 FloodWait cooldown: %s" % _format_tg_err(r))
+                    break
         if mid:
             last_mid = mid
         else:
@@ -3006,6 +3189,8 @@ def send(chat_id, text, parse_mode=None, reply_markup=None, thread_id=None, _max
 
 def send_rich_chunk(chat_id, chunk, prefix_html="", footer_html="", reply_markup=None, thread_id=None, _max_429_wait=65, reply_to_message_id=None):
     """Send a single markdown chunk as HTML, returning (msg_id, sent_html_or_none)."""
+    if _tg_flood_remaining(chat_id) > 0:
+        return None, None
     rendered = md_to_html(chunk)
     full_html = prefix_html + rendered + footer_html
     if full_html and len(full_html) <= 4090:
@@ -3024,11 +3209,13 @@ def send_rich_chunk(chat_id, chunk, prefix_html="", footer_html="", reply_markup
         mid = _extract_msg_id(r)
         if mid:
             return mid, full_html
+        if _tg_is_429(r) or _tg_flood_remaining(chat_id) > 0:
+            log("send_rich_chunk aborted due to 429 FloodWait cooldown: %s" % _format_tg_err(r))
+            return None, None
         log("send_rich_chunk HTML failed: %s, falling back to plain text" % _format_tg_err(r))
-        # If we still hit 429 after waiting, pause briefly so plain fallback isn't fired blindly at 0ms
-        if r is not None and r.status_code == 429:
-            _sleep_wait_429(min(_tg_retry_after(r) or 5, 15) + 0.5)
 
+    if _tg_flood_remaining(chat_id) > 0:
+        return None, None
     plain = chunk
     if footer_html:
         plain += "\n\n" + re.sub(r"<[^>]+>", "", html_mod.unescape(footer_html)).strip()
@@ -3056,6 +3243,9 @@ def _rescue_deliver_text(chat_id, text, thread_id=None):
     except Exception as e:
         log("_rescue_deliver_text write error: %s" % e)
         return None
+    if _tg_flood_remaining(chat_id) > 0:
+        log("_rescue_deliver_text saved locally to %s; skipping sendDocument upload during 429 cooldown" % rescue_path)
+        return rescue_path
     sent = send_file(chat_id, rescue_path, caption="📄 回复受群频控或长度限制，已转为完整文件发送", thread_id=thread_id)
     if _tg_ok(sent):
         return rescue_path
@@ -3075,7 +3265,8 @@ def send_rich(chat_id, text, header_html=None, footer_str=None, reply_markup=Non
     total_chunks = len(chunks)
     start_idx = 0
     pending_reply_mid = reply_to_message_id
-    if header_html:
+    flood_aborted = _tg_flood_remaining(chat_id) > 0
+    if header_html and not flood_aborted:
         first_rendered = md_to_html(chunks[0])
         tail = footer_html if len(chunks) == 1 else ""
         if len(header_html) + len(first_rendered) + len(tail) <= 4050:
@@ -3090,6 +3281,8 @@ def send_rich(chat_id, text, header_html=None, footer_str=None, reply_markup=Non
             pending_reply_mid = None
             if last_info[0]:
                 delivered_chunks += 1
+            elif _tg_flood_remaining(chat_id) > 0:
+                flood_aborted = True
             start_idx = 1
         else:
             if len(header_html) <= 4090:
@@ -3101,36 +3294,52 @@ def send_rich(chat_id, text, header_html=None, footer_str=None, reply_markup=Non
                 pending_reply_mid = None
                 if not _extract_msg_id(hr):
                     log("send_rich header HTML failed: %s" % _format_tg_err(hr))
+                    if _tg_is_429(hr) or _tg_flood_remaining(chat_id) > 0:
+                        flood_aborted = True
             else:
                 plain_hdr = re.sub(r"<[^>]+>", "", html_mod.unescape(header_html))[:4090]
                 if plain_hdr:
-                    tg_send_in_route(
+                    hr = tg_send_in_route(
                         "sendMessage", chat_id, thread_id=thread_id, _max_429_wait=65, text=plain_hdr,
                         reply_to_message_id=pending_reply_mid,
                     )
                     pending_reply_mid = None
+                    if _tg_is_429(hr) or _tg_flood_remaining(chat_id) > 0:
+                        flood_aborted = True
             start_idx = 0
 
-    for idx in range(start_idx, len(chunks)):
-        if idx > start_idx and is_group:
-            time.sleep(0.35)
-        is_last = (idx == len(chunks) - 1)
-        info = send_rich_chunk(
-            chat_id, chunks[idx],
-            footer_html=footer_html if is_last else "",
-            reply_markup=reply_markup if is_last else None,
-            thread_id=thread_id,
-            reply_to_message_id=pending_reply_mid if idx == start_idx else None,
-        )
-        pending_reply_mid = None
-        if info[0]:
-            last_info = info
-            delivered_chunks += 1
+    if not flood_aborted:
+        for idx in range(start_idx, len(chunks)):
+            if _tg_flood_remaining(chat_id) > 0:
+                flood_aborted = True
+                break
+            if idx > start_idx and is_group:
+                time.sleep(0.35)
+            is_last = (idx == len(chunks) - 1)
+            info = send_rich_chunk(
+                chat_id, chunks[idx],
+                footer_html=footer_html if is_last else "",
+                reply_markup=reply_markup if is_last else None,
+                thread_id=thread_id,
+                reply_to_message_id=pending_reply_mid if idx == start_idx else None,
+            )
+            pending_reply_mid = None
+            if info[0]:
+                last_info = info
+                delivered_chunks += 1
+            elif _tg_flood_remaining(chat_id) > 0:
+                flood_aborted = True
+                break
 
     if delivered_chunks < total_chunks and text.strip():
-        log("send_rich partial/failed delivery (%d/%d chunks) in chat %s; triggering document rescue"
-            % (delivered_chunks, total_chunks, chat_id))
-        _rescue_deliver_text(chat_id, text, thread_id=thread_id)
+        if flood_aborted or _tg_flood_remaining(chat_id) > 0:
+            log("send_rich aborted (%d/%d chunks) in chat %s due to active 429 cooldown; saving locally without network upload"
+                % (delivered_chunks, total_chunks, chat_id))
+            _rescue_deliver_text(chat_id, text, thread_id=thread_id)
+        else:
+            log("send_rich partial/failed delivery (%d/%d chunks) in chat %s; triggering document rescue"
+                % (delivered_chunks, total_chunks, chat_id))
+            _rescue_deliver_text(chat_id, text, thread_id=thread_id)
 
     return last_info
 
@@ -3722,6 +3931,12 @@ class LiveDraftStreamer:
             with self.lock:
                 if self.paused or self.stop_ev.is_set():
                     return
+            rem_shared = _tg_flood_remaining(self.chat_id)
+            if rem_shared > 0:
+                with self.lock:
+                    self.flood_until = max(self.flood_until, time.time() + rem_shared)
+                self.last_push_at = time.time()
+                return
 
             if self.use_draft_api:
                 params = {
@@ -3734,13 +3949,21 @@ class LiveDraftStreamer:
                     params["parse_mode"] = "HTML"
                 r = tg_send_in_route("sendMessageDraft", self.chat_id, thread_id=self.thread_id,
                                      _timeout=FAST_TIMEOUT, _retry_429=False, **params)
-                if r is not None:
-                    if r.status_code == 429:
-                        wait_s = _tg_retry_after(r) or 2
+                if r is None:
+                    rem_after = _tg_flood_remaining(self.chat_id)
+                    if rem_after > 0:
                         with self.lock:
-                            self.flood_until = max(self.flood_until, time.time() + min(wait_s, 30) + 0.5)
+                            self.flood_until = max(self.flood_until, time.time() + rem_after)
                         self.last_push_at = time.time()
                         return
+                elif _tg_is_429(r):
+                    wait_s = _tg_retry_after(r) or 2
+                    _tg_record_flood_wait(wait_s, chat_id=self.chat_id, method="sendMessageDraft", resp=r)
+                    with self.lock:
+                        self.flood_until = max(self.flood_until, time.time() + float(wait_s) + 0.5)
+                    self.last_push_at = time.time()
+                    return
+                else:
                     j = _tg_json(r)
                     if j.get("ok"):
                         self.last_push_at = time.time()
@@ -3753,14 +3976,33 @@ class LiveDraftStreamer:
                                               _timeout=FAST_TIMEOUT, _retry_429=False,
                                               draft_id=draft_id, text=plain,
                                               can_stop=True, keep_on_stop=True)
+                        if _tg_is_429(r2):
+                            wait_s = _tg_retry_after(r2) or 2
+                            _tg_record_flood_wait(wait_s, chat_id=self.chat_id, method="sendMessageDraft", resp=r2)
+                            with self.lock:
+                                self.flood_until = max(self.flood_until, time.time() + float(wait_s) + 0.5)
+                            self.last_push_at = time.time()
+                            return
                         if _tg_ok(r2):
                             self.last_push_at = time.time()
                             return
+                        if _tg_flood_remaining(self.chat_id) > 0:
+                            rem_after = _tg_flood_remaining(self.chat_id)
+                            with self.lock:
+                                self.flood_until = max(self.flood_until, time.time() + rem_after)
+                            self.last_push_at = time.time()
+                            return
                     # Otherwise fallback cleanly to editMessageText mode
-                    log("sendMessageDraft returned %s; switching to editMessageText fallback" % desc)
+                    log("sendMessageDraft returned %s; switching to editMessageText fallback" % _sanitize_tg_log_text(desc))
                     self.use_draft_api = False
 
             # Fallback path (e.g. group chats / topics)
+            if _tg_flood_remaining(self.chat_id) > 0:
+                rem_after = _tg_flood_remaining(self.chat_id)
+                with self.lock:
+                    self.flood_until = max(self.flood_until, time.time() + rem_after)
+                self.last_push_at = time.time()
+                return
             fb_text = html_text or "🧠 <b>正在思考中...</b>"
             use_parse_html = True
             for _fb_try in range(2):
@@ -3791,15 +4033,27 @@ class LiveDraftStreamer:
                         self.last_push_at = time.time()
                         return
 
-                if r is not None and r.status_code == 429:
+                if _tg_is_429(r):
                     wait_s = _tg_retry_after(r) or 5
+                    _tg_record_flood_wait(
+                        wait_s,
+                        chat_id=self.chat_id,
+                        method="sendMessage" if self.fallback_msg_id is None else "editMessageText",
+                        resp=r,
+                    )
                     with self.lock:
                         self._fb_min_gap = min(8.0, self._fb_min_gap + 1.2)
-                        self.flood_until = max(self.flood_until, time.time() + min(wait_s, 90) + 1.0)
+                        self.flood_until = max(self.flood_until, time.time() + float(wait_s) + 1.0)
                         gap_now = self._fb_min_gap
                     if (time.time() - self._fb_429_logged_at) > 10.0:
                         self._fb_429_logged_at = time.time()
                         log("DraftStreamer fallback hit 429 (retry_after=%ss); backing off (gap=%.1fs)" % (wait_s, gap_now))
+                    self.last_push_at = time.time()
+                    return
+                if r is None and _tg_flood_remaining(self.chat_id) > 0:
+                    rem_after = _tg_flood_remaining(self.chat_id)
+                    with self.lock:
+                        self.flood_until = max(self.flood_until, time.time() + rem_after)
                     self.last_push_at = time.time()
                     return
 
@@ -3823,7 +4077,8 @@ class LiveDraftStreamer:
             with self.lock:
                 now = time.time()
                 is_paused = self.paused
-                rem_delay = max(0.0, max(self.delay_until, self.flood_until) - now)
+                rem_shared = _tg_flood_remaining(self.chat_id)
+                rem_delay = max(0.0, max(self.delay_until, self.flood_until) - now, rem_shared)
                 is_text = (self.phase == "text")
                 is_urgent = self.urgent
             if is_paused:
@@ -3841,7 +4096,7 @@ class LiveDraftStreamer:
 
             now = time.time()
             with self.lock:
-                if self.paused or now < max(self.delay_until, self.flood_until):
+                if self.paused or now < max(self.delay_until, self.flood_until) or _tg_flood_remaining(self.chat_id) > 0:
                     continue
                 if self.use_draft_api:
                     min_gap = 0.20 if self.phase == "text" else (0.12 if self.urgent else 1.1)
@@ -3856,7 +4111,12 @@ class LiveDraftStreamer:
                     break
 
             with self.lock:
-                if self.paused or self.stop_ev.is_set() or time.time() < max(self.delay_until, self.flood_until):
+                if (
+                    self.paused
+                    or self.stop_ev.is_set()
+                    or time.time() < max(self.delay_until, self.flood_until)
+                    or _tg_flood_remaining(self.chat_id) > 0
+                ):
                     continue
                 self.urgent = False
                 if self.phase == "text":
@@ -4195,11 +4455,16 @@ def push_step_images(
         log("Auto-pushing image album (%d images, live_watch=%s)" % (len(album_ok_paths), live_watch))
         if send_media_group(chat_id, album_ok_paths, caption=cap, thread_id=thread_id):
             album_ok_paths = []
+        elif _tg_flood_remaining(chat_id) > 0:
+            log("Skipping per-file image fallback in chat %s due to active 429 cooldown" % chat_id)
+            return
         else:
             other_paths = album_ok_paths + other_paths
             album_ok_paths = []
 
     for rp in album_ok_paths + other_paths:
+        if _tg_flood_remaining(chat_id) > 0:
+            break
         log("Auto-pushing generated/referenced image: %s (live_watch=%s)" % (rp, live_watch))
         send_file(chat_id, rp, caption=f"🖼 {os.path.basename(rp)}", thread_id=thread_id)
 

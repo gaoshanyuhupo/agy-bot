@@ -2296,6 +2296,11 @@ async def read_x11_clipboard_async(display: str | None) -> str:
 class TelegramLiveCardPublisher:
     """Manages the in-chat live-updating photo card (`sendPhoto` + `editMessageMedia`)."""
 
+    _FLOOD_MIN_RETRY_AFTER_S = 1.0
+    _FLOOD_DEFAULT_COOLDOWN_S = 5.0
+    _TRANSIENT_BACKOFF_BASE_S = 3.0
+    _TRANSIENT_BACKOFF_MAX_S = 60.0
+
     def __init__(self, hub: "LiveBrowserHub") -> None:
         self.hub = hub
         self.http: Any = None
@@ -2307,6 +2312,159 @@ class TelegramLiveCardPublisher:
         self.pending_retire_cards: dict[tuple[str, int, int], dict[str, Any]] = {}
         self._lock = asyncio.Lock()
         self.last_card_error: str | None = None
+        # Per-bot Telegram HTTP 429 FloodWait cooldown deadlines (monotonic seconds)
+        self._bot_flood_until: dict[str, float] = {}
+
+    @classmethod
+    def _parse_positive_retry_after(cls, raw: Any) -> float | None:
+        """Parse a positive finite retry_after value (seconds or HTTP-date); reject bool/NaN/inf/<=0."""
+        if raw is None or isinstance(raw, bool):
+            return None
+        val: float | None = None
+        if isinstance(raw, (int, float)):
+            val = float(raw)
+        elif isinstance(raw, str):
+            s = raw.strip()
+            if not s:
+                return None
+            try:
+                val = float(s)
+            except ValueError:
+                try:
+                    import datetime
+                    from email.utils import parsedate_to_datetime
+
+                    dt = parsedate_to_datetime(s)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=datetime.timezone.utc)
+                    val = (dt - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+                except Exception:
+                    return None
+        else:
+            return None
+        if not math.isfinite(val) or val <= 0:
+            return None
+        return max(cls._FLOOD_MIN_RETRY_AFTER_S, val)
+
+    @classmethod
+    def _extract_retry_after(cls, resp: Any, data: Any) -> float:
+        """Extract retry_after from JSON `parameters.retry_after` or HTTP `Retry-After` header.
+
+        Never truncates legitimate long windows (e.g. 12704s); falls back to `_FLOOD_DEFAULT_COOLDOWN_S`
+        when missing, malformed, bool, NaN, inf, or non-positive.
+        """
+        if isinstance(data, dict):
+            params = data.get("parameters")
+            if isinstance(params, dict):
+                parsed = cls._parse_positive_retry_after(params.get("retry_after"))
+                if parsed is not None:
+                    return parsed
+        headers = getattr(resp, "headers", None)
+        if headers is not None:
+            hdr_val: Any = None
+            if hasattr(headers, "get"):
+                hdr_val = headers.get("Retry-After")
+                if hdr_val is None:
+                    hdr_val = headers.get("retry-after")
+            if hdr_val is None and hasattr(headers, "items"):
+                for k, v in headers.items():
+                    if str(k).lower() == "retry-after":
+                        hdr_val = v
+                        break
+            parsed_hdr = cls._parse_positive_retry_after(hdr_val)
+            if parsed_hdr is not None:
+                return parsed_hdr
+        return cls._FLOOD_DEFAULT_COOLDOWN_S
+
+    def _resolve_bot_key_for_token(self, token: str) -> str:
+        """Map a bot token back to its logical `bot_key` (never returns or logs raw token)."""
+        if not token:
+            return ""
+        try:
+            bots, _, _, _, _ = _load_auth_context()
+            for bk, tok in bots.items():
+                if tok == token:
+                    return bk
+        except Exception:
+            pass
+        return "tok:" + hashlib.sha256(token.encode("utf-8", errors="ignore")).hexdigest()[:12]
+
+    def _bot_flood_remaining(self, bot_key: str, *, now: float | None = None) -> float:
+        """Return remaining 429 FloodWait cooldown seconds for `bot_key` (0.0 when expired/clear)."""
+        if not bot_key:
+            return 0.0
+        cur = time.monotonic() if now is None else float(now)
+        until = self._bot_flood_until.get(bot_key, 0.0)
+        if until <= cur:
+            if bot_key in self._bot_flood_until:
+                self._bot_flood_until.pop(bot_key, None)
+            return 0.0
+        return until - cur
+
+    def _record_bot_flood(
+        self,
+        bot_key: str,
+        retry_after: float,
+        *,
+        method: str,
+        desc: str = "",
+    ) -> float:
+        """Record per-bot monotonic 429 cooldown deadline (never truncates) and emit sanitized WARNING."""
+        parsed = self._parse_positive_retry_after(retry_after)
+        wait_s = parsed if parsed is not None else self._FLOOD_DEFAULT_COOLDOWN_S
+        now = time.monotonic()
+        deadline = now + wait_s
+        if bot_key:
+            prev = self._bot_flood_until.get(bot_key, 0.0)
+            if deadline > prev:
+                self._bot_flood_until[bot_key] = deadline
+        safe_desc = _sanitize_card_error(desc) if desc else "Too Many Requests"
+        log.warning(
+            "Telegram HTTP 429 FloodWait on %s (bot=%s): retry_after=%.1fs; pausing outbound calls (%s)",
+            method,
+            bot_key or "unknown",
+            wait_s,
+            safe_desc,
+        )
+        return wait_s
+
+    async def _inspect_tg_response(
+        self,
+        resp: Any,
+        *,
+        bot_key: str,
+        method: str,
+    ) -> tuple[int, Any, float | None]:
+        """Parse status + JSON body of a Telegram HTTP response and record per-bot 429 cooldown if hit."""
+        raw_status = getattr(resp, "status", 200)
+        status = raw_status if isinstance(raw_status, int) else 200
+        data: Any = None
+        try:
+            data = await resp.json()
+        except Exception:
+            data = None
+        is_429 = (status == 429) or (isinstance(data, dict) and data.get("error_code") == 429)
+        if is_429:
+            retry_after = self._extract_retry_after(resp, data)
+            desc = (
+                str(data.get("description") or "")
+                if isinstance(data, dict)
+                else f"HTTP {status}"
+            )
+            recorded = self._record_bot_flood(bot_key, retry_after, method=method, desc=desc)
+            return status, data, recorded
+        return status, data, None
+
+    def _record_card_transient_error(self, card: dict[str, Any], *, bot_key: str) -> float:
+        """Advance bounded exponential backoff on a live card after 5xx or transport error."""
+        streak = int(card.get("transient_err_streak") or 0) + 1
+        delay = min(
+            self._TRANSIENT_BACKOFF_MAX_S,
+            self._TRANSIENT_BACKOFF_BASE_S * (2 ** min(streak - 1, 6)),
+        )
+        card["transient_err_streak"] = streak
+        card["backoff_until"] = time.monotonic() + delay
+        return delay
 
     def _stage_card_for_retire(
         self,
@@ -2518,7 +2676,6 @@ class TelegramLiveCardPublisher:
     def _build_caption(self, finished: bool = False) -> str:
         if finished:
             return self._build_finished_caption()
-        ts_str = time.strftime("%H:%M:%S", time.localtime())
         title = html.escape((self.hub.title or "加载中...")[:70])
         url = html.escape((self.hub.url or "about:blank")[:120])
         if self.hub.takeover:
@@ -2526,7 +2683,7 @@ class TelegramLiveCardPublisher:
             reason = html.escape(self.hub.takeover_reason or "AI 已暂停，等待你在面板操作完成后交还")
             status_line = f"🖐 <b>状态</b>：{reason}"
         else:
-            header = f"🔴 <b>LIVE 浏览器实况</b> · <code>👀 实时同步 ({ts_str})</code>"
+            header = "🔴 <b>LIVE 浏览器实况</b> · <code>👀 实时同步</code>"
             ai_st = html.escape(self.hub.ai_status or "浏览器运行中")
             status_line = f"🤖 <b>动作</b>：{ai_st}"
 
@@ -2582,7 +2739,14 @@ class TelegramLiveCardPublisher:
             return True
         return False
 
-    async def _retire_orphan_card_message(self, token: str, chat_id: int, message_id: int) -> bool:
+    async def _retire_orphan_card_message(
+        self,
+        token: str,
+        chat_id: int,
+        message_id: int,
+        *,
+        bot_key: str | None = None,
+    ) -> bool:
         """Silently retire an orphaned Telegram card using strictly stateless fixed copy (zero hub reads).
 
         Returns True when Telegram confirms `ok=true` or returns a permanent terminal error
@@ -2592,6 +2756,9 @@ class TelegramLiveCardPublisher:
         if not token or chat_id <= 0 or message_id <= 0:
             return True
         if not self.http:
+            return False
+        eff_bot_key = bot_key or self._resolve_bot_key_for_token(token)
+        if self._bot_flood_remaining(eff_bot_key) > 0:
             return False
         try:
             finished_caption = self._build_finished_caption()
@@ -2605,22 +2772,40 @@ class TelegramLiveCardPublisher:
                     "reply_markup": {"inline_keyboard": []},
                 },
             ) as resp:
-                status = getattr(resp, "status", 200)
-                if isinstance(status, int) and (status == 429 or status >= 500):
+                status, data, retry_after = await self._inspect_tg_response(
+                    resp,
+                    bot_key=eff_bot_key,
+                    method="editMessageCaption",
+                )
+                if retry_after is not None:
+                    return False
+                if isinstance(status, int) and status >= 500:
                     log.debug(
-                        "Orphan card retire transient HTTP %s (chat_id=%s mid=%s)",
+                        "Orphan card retire transient HTTP %s (bot=%s chat_id=%s mid=%s)",
                         status,
+                        eff_bot_key,
                         chat_id,
                         message_id,
                     )
                     return False
-                data = await resp.json()
                 if self._is_tg_retire_terminal_response(status, data):
                     return True
-                log.debug("Orphan card retire non-ok response (chat_id=%s mid=%s): %s", chat_id, message_id, data)
+                log.debug(
+                    "Orphan card retire non-ok response (bot=%s chat_id=%s mid=%s): %s",
+                    eff_bot_key,
+                    chat_id,
+                    message_id,
+                    _sanitize_card_error(data),
+                )
                 return False
         except Exception as exc:
-            log.debug("Orphan card retire transient error (chat_id=%s mid=%s): %s", chat_id, message_id, exc)
+            log.debug(
+                "Orphan card retire transient error (bot=%s chat_id=%s mid=%s): %s",
+                eff_bot_key,
+                chat_id,
+                message_id,
+                _sanitize_card_error(exc),
+            )
             return False
 
     async def _retire_card_record_locked(
@@ -2662,6 +2847,9 @@ class TelegramLiveCardPublisher:
             return False
         if not self.http:
             return False
+        # Per-bot 429 cooldown check AFTER live RBAC check and BEFORE consuming retire_attempts.
+        if self._bot_flood_remaining(bot_key) > 0:
+            return False
         try:
             if jpeg_override:
                 retired_ok = await self._update_card_locked(
@@ -2676,7 +2864,9 @@ class TelegramLiveCardPublisher:
                 if retire_key not in self.pending_retire_cards:
                     return retired_ok
             else:
-                retired_ok = await self._retire_orphan_card_message(live_token, chat_id, mid)
+                retired_ok = await self._retire_orphan_card_message(
+                    live_token, chat_id, mid, bot_key=bot_key
+                )
         except BaseException:
             self._recheck_auth_or_drop_locked(bot_key, chat_id)
             raise
@@ -2825,6 +3015,13 @@ class TelegramLiveCardPublisher:
                 # Preserve stale card's retirement retry tracking before sending a new card
                 self._stage_card_for_retire(existing, card_key=card_key)
 
+            rem_flood = self._bot_flood_remaining(bot_key)
+            if rem_flood > 0:
+                self.last_card_error = _sanitize_card_error(
+                    f"Telegram HTTP 429 冷却中（剩余约 {int(math.ceil(rem_flood))}s）"
+                )
+                return None
+
             snap_jpeg = self.hub.latest_jpeg
             caption = self._build_caption(finished=False)
             markup = self._build_markup(bot_key, finished=False)
@@ -2850,21 +3047,29 @@ class TelegramLiveCardPublisher:
                 async with self.http.post(
                     f"https://api.telegram.org/bot{live_token}/sendPhoto", data=form
                 ) as resp:
-                    status = getattr(resp, "status", 200)
-                    if isinstance(status, int) and status >= 400:
-                        try:
-                            err_data = await resp.json()
-                        except Exception:
-                            err_data = None
+                    status, data, retry_after = await self._inspect_tg_response(
+                        resp,
+                        bot_key=bot_key,
+                        method="sendPhoto",
+                    )
+                    if retry_after is not None:
                         desc = (
-                            err_data.get("description")
-                            if isinstance(err_data, dict)
+                            data.get("description")
+                            if isinstance(data, dict)
+                            else f"HTTP {status}"
+                        )
+                        send_err = _sanitize_card_error(
+                            f"Telegram sendPhoto HTTP 429 (retry_after={int(math.ceil(retry_after))}s): {desc}"
+                        )
+                    elif isinstance(status, int) and status >= 400:
+                        desc = (
+                            data.get("description")
+                            if isinstance(data, dict)
                             else f"HTTP {status}"
                         )
                         send_err = _sanitize_card_error(f"Telegram sendPhoto HTTP {status}: {desc}")
                         log.warning("sendPhoto failed (%s, HTTP %s): %s", bot_key, status, _sanitize_card_error(desc))
                     else:
-                        data = await resp.json()
                         if (
                             isinstance(data, dict)
                             and data.get("ok")
@@ -3242,9 +3447,15 @@ class TelegramLiveCardPublisher:
             jpeg_bytes = jpeg_override
         if not jpeg_bytes:
             return False
-        now = time.monotonic()
-        if not force and not finished and (now - card["last_ts"]) < 3.0:
+        # Per-bot 429 FloodWait cooldown short-circuits ALL outbound calls (including force=True).
+        if self._bot_flood_remaining(bot_key) > 0:
             return False
+        now = time.monotonic()
+        if not force and not finished:
+            if (now - card["last_ts"]) < 3.0:
+                return False
+            if now < float(card.get("backoff_until") or 0.0):
+                return False
 
         sha = hashlib.sha1(jpeg_bytes).hexdigest()
         caption = self._build_finished_caption() if finished else self._build_caption(finished=False)
@@ -3282,15 +3493,22 @@ class TelegramLiveCardPublisher:
         io_result = False
         io_media_ok = False
         io_retry_after: float | None = None
+        io_transient_err = False
         try:
             async with self.http.post(
                 f"https://api.telegram.org/bot{token}/editMessageMedia", data=form
             ) as resp:
-                status = getattr(resp, "status", 200)
-                if isinstance(status, int) and (status == 429 or status >= 500):
-                    log.debug("editMessageMedia transient HTTP %s (%s)", status, bot_key)
+                status, data, retry_after = await self._inspect_tg_response(
+                    resp,
+                    bot_key=bot_key,
+                    method="editMessageMedia",
+                )
+                if retry_after is not None:
+                    io_retry_after = retry_after
+                elif isinstance(status, int) and status >= 500:
+                    io_transient_err = True
+                    log.warning("editMessageMedia transient HTTP %s (%s)", status, bot_key)
                 else:
-                    data = await resp.json()
                     if (
                         isinstance(data, dict)
                         and data.get("ok")
@@ -3301,10 +3519,7 @@ class TelegramLiveCardPublisher:
                     else:
                         if isinstance(data, dict):
                             desc = str(data.get("description", ""))
-                            retry = (data.get("parameters") or {}).get("retry_after")
-                            if retry:
-                                io_retry_after = float(retry)
-                            elif (
+                            if (
                                 not finished
                                 and not data.get("ok")
                                 and (not isinstance(status, int) or status in (200, 400))
@@ -3314,7 +3529,7 @@ class TelegramLiveCardPublisher:
                                 io_media_ok = True
                                 io_result = True
                             elif "message is not modified" not in desc.lower():
-                                log.debug("editMessageMedia (%s): %s", bot_key, desc)
+                                log.debug("editMessageMedia (%s): %s", bot_key, _sanitize_card_error(desc))
                         if finished:
                             io_result = self._is_tg_retire_terminal_response(status, data)
             # Mark I/O clean only after async with __aexit__ exits cleanly
@@ -3324,7 +3539,8 @@ class TelegramLiveCardPublisher:
             io_result = False
             io_media_ok = False
             io_retry_after = None
-            log.debug("editMessageMedia error (%s): %s", bot_key, exc)
+            io_transient_err = True
+            log.warning("editMessageMedia error (%s): %s", bot_key, _sanitize_card_error(exc))
         except BaseException:
             self._recheck_auth_or_drop_locked(bot_key, chat_id)
             raise
@@ -3355,6 +3571,8 @@ class TelegramLiveCardPublisher:
                 return False
 
         if not io_ok_clean:
+            if not finished and io_transient_err:
+                self._record_card_transient_error(card, bot_key=bot_key)
             return False
 
         if io_media_ok:
@@ -3362,8 +3580,13 @@ class TelegramLiveCardPublisher:
             card["last_caption"] = caption
             card["last_markup"] = markup
             card["last_ts"] = time.monotonic()
+            card["transient_err_streak"] = 0
+            card["backoff_until"] = 0.0
         elif io_retry_after is not None:
-            card["last_ts"] = time.monotonic() + io_retry_after
+            # Per-bot cooldown deadline is already recorded in `self._bot_flood_until[bot_key]`.
+            pass
+        elif io_transient_err and not finished:
+            self._record_card_transient_error(card, bot_key=bot_key)
         return io_result
 
     async def send_clip_message(
@@ -3375,6 +3598,8 @@ class TelegramLiveCardPublisher:
             return False
         token, chat_id = self._resolve_bot_token_and_chat(bot_key, preferred_user_id=preferred_user_id)
         if not token or not chat_id or chat_id <= 0:
+            return False
+        if self._bot_flood_remaining(bot_key) > 0:
             return False
         snippet = html.escape(cleaned[:3800])
         msg_html = f"📋 <b>从浏览器提取的内容</b>\n<pre><code>{snippet}</code></pre>"
@@ -3388,10 +3613,20 @@ class TelegramLiveCardPublisher:
                     "disable_web_page_preview": True,
                 },
             ) as resp:
-                data = await resp.json()
-                return bool(data.get("ok"))
+                status, data, retry_after = await self._inspect_tg_response(
+                    resp,
+                    bot_key=bot_key,
+                    method="sendMessage",
+                )
+                if retry_after is not None:
+                    return False
+                return bool(
+                    isinstance(data, dict)
+                    and data.get("ok")
+                    and not (isinstance(status, int) and status >= 400)
+                )
         except Exception as exc:
-            log.warning("send_clip_message error (%s): %s", bot_key, exc)
+            log.warning("send_clip_message error (%s): %s", bot_key, _sanitize_card_error(exc))
             return False
 
     async def send_photo_bytes(
@@ -3406,6 +3641,8 @@ class TelegramLiveCardPublisher:
             return False
         token, chat_id = self._resolve_bot_token_and_chat(bot_key, preferred_user_id=preferred_user_id)
         if not token or not chat_id or chat_id <= 0:
+            return False
+        if self._bot_flood_remaining(bot_key) > 0:
             return False
         form = FormData()
         form.add_field("chat_id", str(chat_id))
@@ -3422,10 +3659,20 @@ class TelegramLiveCardPublisher:
             async with self.http.post(
                 f"https://api.telegram.org/bot{token}/sendPhoto", data=form
             ) as resp:
-                data = await resp.json()
-                return bool(data.get("ok"))
+                status, data, retry_after = await self._inspect_tg_response(
+                    resp,
+                    bot_key=bot_key,
+                    method="sendPhoto",
+                )
+                if retry_after is not None:
+                    return False
+                return bool(
+                    isinstance(data, dict)
+                    and data.get("ok")
+                    and not (isinstance(status, int) and status >= 400)
+                )
         except Exception as exc:
-            log.warning("send_photo_bytes error (%s): %s", bot_key, exc)
+            log.warning("send_photo_bytes error (%s): %s", bot_key, _sanitize_card_error(exc))
             return False
 
     async def send_document_file(
@@ -3448,6 +3695,8 @@ class TelegramLiveCardPublisher:
         token, chat_id = self._resolve_bot_token_and_chat(bot_key, preferred_user_id=preferred_user_id)
         if not token or not chat_id or chat_id <= 0:
             return False
+        if self._bot_flood_remaining(bot_key) > 0:
+            return False
         safe_name = Path(filename or file_path.name).name or "download.bin"
         form = FormData()
         form.add_field("chat_id", str(chat_id))
@@ -3468,10 +3717,20 @@ class TelegramLiveCardPublisher:
             async with self.http.post(
                 f"https://api.telegram.org/bot{token}/sendDocument", data=form
             ) as resp:
-                data = await resp.json()
-                return bool(data.get("ok"))
+                status, data, retry_after = await self._inspect_tg_response(
+                    resp,
+                    bot_key=bot_key,
+                    method="sendDocument",
+                )
+                if retry_after is not None:
+                    return False
+                return bool(
+                    isinstance(data, dict)
+                    and data.get("ok")
+                    and not (isinstance(status, int) and status >= 400)
+                )
         except Exception as exc:
-            log.warning("send_document_file error (%s): %s", bot_key, exc)
+            log.warning("send_document_file error (%s): %s", bot_key, _sanitize_card_error(exc))
             return False
 
 

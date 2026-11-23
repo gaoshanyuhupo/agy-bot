@@ -166,6 +166,9 @@ class TestTelegram429Retry(unittest.TestCase):
             self.assertIs(res_cap, r429_long)
             self.assertEqual(1, m_post.call_count)
             m_sleep.assert_not_called()
+            # Case 2 registered shared cooldown on this chat; clear it before testing Case 3 retries
+            self.assertGreater(bridge._tg_flood_remaining(-1001234567890), 0.0)
+            bridge._tg_clear_flood_wait(-1001234567890)
 
             # Case 3: Persistent 429 caps at max 2 retries (3 total attempts)
             r429_short = _FakeResp(429, {"ok": False, "parameters": {"retry_after": 1}})
@@ -2764,6 +2767,333 @@ class TestCoordinatorFirstTurnPrefix(unittest.TestCase):
             ):
                 bridge.run_agy(chat_id, saved_lt["prompt"], scope_key=skey, user_role="admin", user_id=123456)
             self.assertEqual([raw_prompt], retry_with_conv)
+
+
+class TestTelegram429FloodWaitCircuitBreaker(unittest.TestCase):
+    """Prod-Release contract tests C5-C8 for `bridge/bridge.py` 429 cooldown, zero amplification & control-plane isolation."""
+
+    @staticmethod
+    def _load_clean_bridge(tmp: str, extra_env: dict[str, str] | None = None):
+        """Load bridge in an env-isolated sandbox clearing inherited AGY_* variables (incl. EFFORT/MODEL)."""
+        base_env = {k: v for k, v in os.environ.items() if not k.startswith("AGY_")}
+        chat_a = -(10**12 + 200001)
+        chat_b = chat_a - 1
+        dm_uid = 100000 + 211
+        tok = f"{300 + 3}:" + "FLOOD_" + "TEST_TOK_01"
+        base_env.update(
+            {
+                "AGY_BOT_BUS_DIR": os.path.join(tmp, "bus"),
+                "AGY_TG_STATE_FILE": os.path.join(tmp, "state.json"),
+                "AGY_TG_WORKDIR": os.path.join(tmp, "workdir"),
+                "AGY_TG_LOCK_DIR": os.path.join(tmp, "locks"),
+                "AGY_TG_ALLOWED_CHATS": f"{chat_a},{chat_b},{dm_uid}",
+                "AGY_TG_ALLOWED_USERS": str(dm_uid),
+                "AGY_TG_BOT_TOKEN": tok,
+                "AGY_TG_ENV_FILE": os.path.join(tmp, "nonexistent.env"),
+                "AGY_TG_BOT_MODEL": "",
+                "AGY_TG_BOT_EFFORT": "",
+                "AGY_BOT_CHAIN": "",
+                "AGY_BOT_ORIGIN_MSG_ID": "0",
+                "AGY_BOT_MENTION_HOP": "0",
+            }
+        )
+        if extra_env:
+            base_env.update(extra_env)
+        with mock.patch.dict(os.environ, base_env, clear=True):
+            import bot_bus  # noqa: E402
+            import bridge  # noqa: E402
+
+            importlib.reload(bot_bus)
+            importlib.reload(bridge)
+            os.makedirs(bridge.WORKDIR, exist_ok=True)
+            os.makedirs(bridge.UPLOADDIR, exist_ok=True)
+            bridge.BOT_OUTBOX_DIR = os.path.join(tmp, "outbox")
+            os.makedirs(bridge.BOT_OUTBOX_DIR, exist_ok=True)
+            bridge._tg_clear_flood_wait()
+            return bridge, chat_a, chat_b, dm_uid, tok
+
+    class _FakeResp:
+        def __init__(self, status_code, body, headers=None, text=""):
+            self.status_code = status_code
+            self._body = body
+            self.headers = headers or {}
+            self.text = text
+
+        def json(self):
+            if isinstance(self._body, Exception):
+                raise self._body
+            return self._body
+
+    def test_c5_untruncated_retry_after_header_and_shared_cooldown_registration(self):
+        """C5: _tg_retry_after parses JSON & Retry-After header; LiveDraftStreamer removes 30s/90s truncation
+        and syncs shared cooldown; tg() records full cooldown + sanitized warning and auto-recovers on expiry."""
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge, chat_a, _chat_b, dm_uid, tok = self._load_clean_bridge(tmp)
+            mono = [1000.0]
+            wall = [1700000000.0]
+
+            # 1. _tg_retry_after: JSON 12704, header 3600 without valid JSON, reject bool/NaN/neg
+            self.assertEqual(
+                12704,
+                bridge._tg_retry_after(
+                    self._FakeResp(429, {"ok": False, "error_code": 429, "parameters": {"retry_after": 12704}})
+                ),
+            )
+            self.assertEqual(
+                3600,
+                bridge._tg_retry_after(
+                    self._FakeResp(429, ValueError("bad json"), headers={"Retry-After": "3600"})
+                ),
+            )
+            self.assertEqual(
+                2,
+                bridge._tg_retry_after(self._FakeResp(429, {"parameters": {"retry_after": True}})),
+            )
+            self.assertEqual(
+                2,
+                bridge._tg_retry_after(self._FakeResp(429, {"parameters": {"retry_after": float("nan")}})),
+            )
+            self.assertEqual(
+                2,
+                bridge._tg_retry_after(self._FakeResp(429, {"parameters": {"retry_after": -5}})),
+            )
+
+            r429_long = self._FakeResp(
+                429,
+                {
+                    "ok": False,
+                    "error_code": 429,
+                    "description": f"Too Many Requests: retry after 12704 (bot{tok})",
+                    "parameters": {"retry_after": 12704},
+                },
+                text=f"bot{tok} flood",
+            )
+            r200 = self._FakeResp(200, {"ok": True, "result": {"message_id": 55}})
+            logs: list[str] = []
+
+            with (
+                mock.patch.object(bridge.time, "monotonic", side_effect=lambda: mono[0]),
+                mock.patch.object(bridge.time, "time", side_effect=lambda: wall[0]),
+                mock.patch.object(bridge, "log", side_effect=lambda m: logs.append(str(m))),
+            ):
+                # 2. LiveDraftStreamer native sendMessageDraft 429 -> NO 30s truncation, writes shared cooldown
+                streamer_dm = bridge.LiveDraftStreamer(dm_uid, wall[0], enabled=False)
+                self.assertTrue(streamer_dm.use_draft_api)
+                with mock.patch.object(bridge.http_session, "post", return_value=r429_long) as m_post:
+                    streamer_dm._push_draft(streamer_dm.status_draft_id, "<b>working</b>")
+                self.assertEqual(1, m_post.call_count)
+                self.assertGreaterEqual(streamer_dm.flood_until - wall[0], 12704.0)
+                self.assertAlmostEqual(12704.0, bridge._tg_flood_remaining(dm_uid), delta=0.1)
+
+                # Subsequent tg() to same DM during cooldown makes 0 HTTP calls
+                with mock.patch.object(bridge.http_session, "post", return_value=r200) as m_post2:
+                    self.assertIsNone(bridge.tg("sendMessage", chat_id=dm_uid, text="blocked"))
+                self.assertEqual(0, m_post2.call_count)
+
+                # 3. LiveDraftStreamer fallback sendMessage/editMessageText 429 -> NO 90s truncation
+                streamer_grp = bridge.LiveDraftStreamer(chat_a, wall[0], enabled=False)
+                self.assertFalse(streamer_grp.use_draft_api)
+                with mock.patch.object(bridge.http_session, "post", return_value=r429_long) as m_post3:
+                    streamer_grp._push_draft(streamer_grp.status_draft_id, "<b>group</b>")
+                self.assertEqual(1, m_post3.call_count)
+                self.assertGreaterEqual(streamer_grp.flood_until - wall[0], 12704.0)
+                self.assertAlmostEqual(12704.0, bridge._tg_flood_remaining(chat_a), delta=0.1)
+
+                # 4. tg() directly hitting header-only Retry-After: 3600 -> writes full 3600s cooldown
+                bridge._tg_clear_flood_wait(chat_a)
+                r429_hdr = self._FakeResp(429, ValueError("html 429"), headers={"Retry-After": "3600"})
+                with (
+                    mock.patch.object(bridge.http_session, "post", return_value=r429_hdr) as m_post4,
+                    mock.patch.object(bridge, "_sleep_wait_429") as m_sleep,
+                ):
+                    res = bridge.tg("sendMessage", _max_429_wait=12, chat_id=chat_a, text="hi")
+                self.assertIs(res, r429_hdr)
+                self.assertEqual(1, m_post4.call_count)
+                m_sleep.assert_not_called()
+                self.assertAlmostEqual(3600.0, bridge._tg_flood_remaining(chat_a), delta=0.1)
+
+                # 5. Cooldown expiry -> automatic recovery (no deadlock)
+                mono[0] += 3601.0
+                wall[0] += 3601.0
+                self.assertEqual(0.0, bridge._tg_flood_remaining(chat_a))
+                with mock.patch.object(bridge.http_session, "post", return_value=r200) as m_post5:
+                    res_ok = bridge.tg("sendMessage", chat_id=chat_a, text="recovered")
+                self.assertIs(res_ok, r200)
+                self.assertEqual(1, m_post5.call_count)
+
+                # Sanitized warning emitted & zero token leak
+                joined = "\n".join(logs)
+                self.assertIn("429", joined)
+                self.assertNotIn(tok, joined)
+
+    def test_c6_outbound_circuit_breaker_zero_amplification(self):
+        """C6: 4-chunk send_rich, multi-chunk send, multi-image send_media_group/push_step_images,
+        and threaded tg_send_in_route/send_file each produce ONLY 1 HTTP request on 429 (zero amplification)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge, chat_a, _chat_b, _dm_uid, _tok = self._load_clean_bridge(tmp)
+            r429 = self._FakeResp(
+                429,
+                {"ok": False, "error_code": 429, "parameters": {"retry_after": 12704}, "description": "Too Many Requests"},
+            )
+
+            # (1) 4-chunk Markdown send_rich() -> chunk 1 hits 429 -> TOTAL 1 HTTP call, no sleep, no plain fallback, no sendDocument
+            long_md = "\n\n".join(f"Section {i}: " + ("word " * 500) for i in range(4))
+            self.assertGreaterEqual(len(bridge.split_markdown(long_md, max_len=3000)), 4)
+            with (
+                mock.patch.object(bridge.http_session, "post", return_value=r429) as m_post,
+                mock.patch.object(bridge, "_sleep_wait_429") as m_sleep,
+            ):
+                mid, rendered = bridge.send_rich(chat_a, long_md, thread_id=77, reply_to_message_id=99)
+            self.assertIsNone(mid)
+            self.assertIsNone(rendered)
+            self.assertEqual(1, m_post.call_count, "4-chunk send_rich on 429 must emit ONLY 1 HTTP call")
+            m_sleep.assert_not_called()
+            # Local rescue .md file may be written, while network upload count stays 0
+            rescue_files = list(Path(bridge.BOT_OUTBOX_DIR).glob("reply_*.md"))
+            self.assertGreaterEqual(len(rescue_files), 1)
+
+            # (1b) Long standalone header_html branch in send_rich() hitting 429 -> TOTAL 1 HTTP call
+            bridge._tg_clear_flood_wait()
+            big_header = "<b>" + ("H" * 3500) + "</b>"
+            with mock.patch.object(bridge.http_session, "post", return_value=r429) as m_post_hdr:
+                bridge.send_rich(chat_a, "Body " + ("B" * 1000), header_html=big_header)
+            self.assertEqual(1, m_post_hdr.call_count)
+
+            # (2) Multi-chunk send() hitting 429 on chunk 1 -> TOTAL 1 HTTP call, no plain fallback, no remaining chunks
+            bridge._tg_clear_flood_wait()
+            big_text = "A" * 9500
+            with mock.patch.object(bridge.http_session, "post", return_value=r429) as m_post_send:
+                self.assertIsNone(bridge.send(chat_a, big_text, parse_mode="HTML", thread_id=77))
+            self.assertEqual(1, m_post_send.call_count)
+
+            # (3) Multi-image album via push_step_images -> send_media_group hits 429 -> TOTAL 1 HTTP call (no cascading send_file)
+            bridge._tg_clear_flood_wait()
+            img_paths = []
+            for idx in range(3):
+                p = Path(bridge.BOT_OUTBOX_DIR) / f"shot_{idx}.png"
+                p.write_bytes(b"\x89PNG\r\n\x1a\n" + (b"\x00" * 128))
+                img_paths.append(str(p))
+            with (
+                mock.patch.object(bridge, "collect_step_images", return_value=[(p, 1.0) for p in img_paths]),
+                mock.patch.object(bridge.http_session, "post", return_value=r429) as m_post_album,
+            ):
+                bridge.push_step_images(chat_a, "", None, 0.0, {}, {}, thread_id=77)
+            self.assertEqual(1, m_post_album.call_count, "Album 429 must NOT cascade into N send_file() calls")
+            self.assertTrue(m_post_album.call_args[0][0].endswith("/sendMediaGroup"))
+
+            # (4) tg_send_in_route with thread_id + reply_to_message_id hitting 429 -> TOTAL 1 HTTP call (no stripping retry)
+            bridge._tg_clear_flood_wait()
+            r429_tricky = self._FakeResp(
+                429,
+                {
+                    "ok": False,
+                    "error_code": 429,
+                    "parameters": {"retry_after": 12704},
+                    "description": "Too Many Requests: thread not found / message not found",
+                },
+            )
+            with mock.patch.object(bridge.http_session, "post", return_value=r429_tricky) as m_post_route:
+                bridge.tg_send_in_route(
+                    "sendMessage", chat_a, thread_id=77, reply_to_message_id=88, text="hello"
+                )
+            self.assertEqual(1, m_post_route.call_count)
+
+            # (4b) send_file with thread_id hitting 429 -> TOTAL 1 HTTP call (no thread_id strip retry)
+            bridge._tg_clear_flood_wait()
+            doc_p = Path(tmp) / "note.txt"
+            doc_p.write_text("hello", encoding="utf-8")
+            with mock.patch.object(bridge.http_session, "post", return_value=r429_tricky) as m_post_file:
+                bridge.send_file(chat_a, str(doc_p), caption="doc", thread_id=77)
+            self.assertEqual(1, m_post_file.call_count)
+
+    def test_c7_control_plane_bot_bus_and_other_chat_unaffected(self):
+        """C7: while chat_A is in 12704s 429 cooldown, getUpdates, getMe, Bot Bus heartbeat,
+        and sending to unrelated chat_B all succeed normally."""
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge, chat_a, chat_b, _dm_uid, _tok = self._load_clean_bridge(tmp)
+            r429 = self._FakeResp(
+                429,
+                {"ok": False, "error_code": 429, "parameters": {"retry_after": 12704}, "description": "Too Many Requests"},
+            )
+            r200_msg = self._FakeResp(200, {"ok": True, "result": {"message_id": 321}})
+            r200_me = self._FakeResp(200, {"ok": True, "result": {"id": 9001, "username": "test_c7_bot", "first_name": "C7"}})
+            r200_upd = self._FakeResp(200, {"ok": True, "result": []})
+
+            # Trigger long 429 cooldown on chat_A
+            with mock.patch.object(bridge.http_session, "post", return_value=r429):
+                bridge.tg("sendMessage", chat_id=chat_a, text="flood")
+            self.assertGreater(bridge._tg_flood_remaining(chat_a), 12000.0)
+            self.assertEqual(0.0, bridge._tg_flood_remaining(chat_b))
+
+            # (1) getUpdates control-plane polling unaffected
+            with mock.patch.object(bridge.http_session, "get", return_value=r200_upd) as m_get_upd:
+                off, fp, streak = bridge._run_poll_iteration(10, False, 0)
+            self.assertEqual((10, False, 0), (off, fp, streak))
+            self.assertEqual(1, m_get_upd.call_count)
+
+            # (2) getMe identity probe & tg("getMe") / tg("getFile") unaffected
+            with mock.patch.object(bridge.http_session, "get", return_value=r200_me) as m_get_me:
+                self.assertTrue(bridge._init_bot_identity())
+            self.assertEqual(1, m_get_me.call_count)
+            with mock.patch.object(bridge.http_session, "post", return_value=r200_me) as m_post_me:
+                self.assertIs(r200_me, bridge.tg("getMe"))
+            self.assertEqual(1, m_post_me.call_count)
+
+            # (3) Bot Bus heartbeat unaffected
+            bridge._publish_bot_heartbeat()
+            roster = bridge.bot_bus.list_roster(include_offline=True)
+            self.assertTrue(any(b.get("handle") == "test_c7_bot" for b in roster))
+
+            # (4) Unrelated chat_B sendMessage & send_file unaffected while chat_A stays blocked
+            doc_b = Path(tmp) / "other.txt"
+            doc_b.write_text("ok-b", encoding="utf-8")
+            with mock.patch.object(bridge.http_session, "post", return_value=r200_msg) as m_post_b:
+                self.assertIsNone(bridge.tg("sendMessage", chat_id=chat_a, text="still blocked"))
+                self.assertIsNone(bridge.send_file(chat_a, str(doc_b), caption="blocked"))
+                self.assertEqual(0, m_post_b.call_count)
+                res_b = bridge.tg("sendMessage", chat_id=chat_b, text="other chat ok")
+                self.assertIs(res_b, r200_msg)
+                res_fb = bridge.send_file(chat_b, str(doc_b), caption="other file ok")
+                self.assertIs(res_fb, r200_msg)
+                self.assertEqual(2, m_post_b.call_count)
+
+            # (5) Even under global outbound cooldown (no chat_id), getMe/getUpdates stay unblocked
+            bridge._tg_record_flood_wait(600, chat_id=None, method="setMyCommands")
+            with mock.patch.object(bridge.http_session, "post", return_value=r200_me) as m_post_ctrl:
+                self.assertIs(r200_me, bridge.tg("getMe"))
+                self.assertIsNone(bridge.tg("sendMessage", chat_id=chat_b, text="blocked by global"))
+            self.assertEqual(1, m_post_ctrl.call_count)
+
+    def test_c8_log_redaction_and_env_isolation(self):
+        """C8: 429/5xx logs and _format_tg_err redact bot tokens; fixture isolates inherited AGY_* env vars."""
+        with mock.patch.dict(
+            os.environ,
+            {"AGY_TG_BOT_EFFORT": "inherited-xhigh", "AGY_TG_BOT_MODEL": "inherited-model"},
+            clear=False,
+        ):
+            with tempfile.TemporaryDirectory() as tmp:
+                bridge, chat_a, _chat_b, _dm_uid, tok = self._load_clean_bridge(tmp)
+                self.assertFalse(bridge.ENV_BOT_EFFORT)
+                self.assertFalse(bridge.ENV_BOT_MODEL)
+
+                # Verify _format_tg_err & tg() exception logging redact raw BOT_TOKEN
+                resp_leaky = self._FakeResp(502, {}, text=f"upstream https://api.telegram.org/bot{tok}/sendMessage 502")
+                formatted = bridge._format_tg_err(resp_leaky)
+                self.assertNotIn(tok, formatted)
+                self.assertIn("[REDACTED]", formatted)
+
+                logs: list[str] = []
+                with (
+                    mock.patch.object(bridge, "log", side_effect=lambda m: logs.append(str(m))),
+                    mock.patch.object(
+                        bridge.http_session,
+                        "post",
+                        side_effect=RuntimeError(f"POST https://api.telegram.org/bot{tok}/sendMessage timed out"),
+                    ),
+                ):
+                    self.assertIsNone(bridge.tg("sendMessage", chat_id=chat_a, text="hi"))
+                self.assertTrue(logs)
+                self.assertNotIn(tok, "\n".join(logs))
 
 
 if __name__ == "__main__":

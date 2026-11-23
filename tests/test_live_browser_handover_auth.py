@@ -1474,5 +1474,510 @@ class TestLiveBrowserHandoverAndAuthContracts(unittest.TestCase):
                 self.assertIsNone(ctl._parse_env_file_bot_key(raw))
 
 
+class TestTelegram429FloodWaitAndBackoffContract(unittest.TestCase):
+    """Prod-Release contract tests C1-C4 & C8 for `TelegramLiveCardPublisher` 429/5xx/dedup/isolation."""
+
+    class _FakeFormData:
+        def __init__(self) -> None:
+            self.fields: dict[str, object] = {}
+
+        def add_field(self, name: str, value, **_kw) -> None:
+            self.fields[name] = value
+
+    class _ScriptedHTTP:
+        def __init__(self, script: list[object]) -> None:
+            self._script = list(script)
+            self.calls: list[tuple[str, str]] = []
+
+        def post(self, url: str, data=None, json=None):
+            endpoint = url.rsplit("/", 1)[-1]
+            self.calls.append((endpoint, url))
+            if not self._script:
+                raise AssertionError(f"Unexpected extra HTTP call to {endpoint}")
+            item = self._script.pop(0)
+            if isinstance(item, BaseException):
+                raise item
+
+            status_val = item.get("http_status", 200) if isinstance(item, dict) else 200
+            headers_val = item.get("headers", {}) if isinstance(item, dict) else {}
+            json_exc = item.get("json_exc") if isinstance(item, dict) else None
+            payload = item.get("body", item) if isinstance(item, dict) else item
+
+            class _Resp:
+                status = status_val
+                headers = headers_val
+
+                async def __aenter__(self_r):
+                    return self_r
+
+                async def __aexit__(self_r, *_a):
+                    return False
+
+                async def json(self_r):
+                    if json_exc is not None:
+                        raise json_exc
+                    return payload
+
+            return _Resp()
+
+    @staticmethod
+    def _write_dual_bot_envs(bdir: Path, *, main_role: str = "admin", sg_role: str = "admin") -> tuple[Path, Path]:
+        env_main = bdir / ".env"
+        env_sg = bdir / ".env.sg"
+        if main_role == "admin":
+            env_main.write_text(
+                f"AGY_TG_BOT_TOKEN={BOT_MAIN_TOKEN}\n"
+                f"AGY_TG_ALLOWED_CHATS={ADMIN_UID_A}\n"
+                f"AGY_TG_ADMIN_USERS={ADMIN_UID_A}\n",
+                encoding="utf-8",
+            )
+        elif main_role == "readonly":
+            env_main.write_text(
+                f"AGY_TG_BOT_TOKEN={BOT_MAIN_TOKEN}\n"
+                f"AGY_TG_ALLOWED_CHATS={ADMIN_UID_A}\n"
+                f"AGY_TG_READONLY_USERS={ADMIN_UID_A}\n",
+                encoding="utf-8",
+            )
+        else:
+            env_main.write_text(
+                f"AGY_TG_BOT_TOKEN={BOT_MAIN_TOKEN}\n"
+                f"AGY_TG_ALLOWED_CHATS=\n",
+                encoding="utf-8",
+            )
+        env_sg.write_text(
+            f"AGY_TG_BOT_TOKEN={BOT_SG_TOKEN}\n"
+            f"AGY_TG_ALLOWED_CHATS={ADMIN_UID_B}\n"
+            f"AGY_TG_ADMIN_USERS={ADMIN_UID_B if sg_role == 'admin' else ''}\n",
+            encoding="utf-8",
+        )
+        return env_main, env_sg
+
+    def test_c1_429_parsing_warning_and_per_bot_cooldown_gate(self) -> None:
+        """C1: parse parameters.retry_after (untruncated 12704s), HTTP Retry-After header, reject malformed/bool/NaN/<=0,
+        emit sanitized WARNING, short-circuit ALL outbound calls for that bot (incl. force=True & refresh_single_card->502),
+        and auto-resume cleanly after cooldown expires."""
+        with tempfile.TemporaryDirectory() as tmp:
+            bdir = Path(tmp)
+            env_main, env_sg = self._write_dual_bot_envs(bdir)
+            sample_doc = bdir / "sample.txt"
+            sample_doc.write_bytes(b"hello-c1")
+            clock = [1000.0]
+
+            async def _scenario() -> None:
+                with (
+                    mock.patch.object(srv, "_BRIDGE_DIR", bdir),
+                    mock.patch.object(srv, "BRIDGE_ENV_FILES", {"main": env_main, "sg": env_sg}),
+                    mock.patch.object(srv, "FormData", self._FakeFormData),
+                    mock.patch.object(srv.time, "monotonic", side_effect=lambda: clock[0]),
+                ):
+                    # 1. Parsing edge cases: JSON retry_after, Retry-After header fallback, bool/NaN/neg/0 fallback
+                    class _HdrResp:
+                        def __init__(self, headers=None):
+                            self.headers = headers or {}
+
+                    self.assertEqual(
+                        12704.0,
+                        srv.TelegramLiveCardPublisher._extract_retry_after(
+                            _HdrResp(),
+                            {"ok": False, "error_code": 429, "parameters": {"retry_after": 12704}},
+                        ),
+                    )
+                    self.assertEqual(
+                        45.0,
+                        srv.TelegramLiveCardPublisher._extract_retry_after(
+                            _HdrResp({"Retry-After": "45"}),
+                            None,
+                        ),
+                    )
+                    for bad in (True, False, float("nan"), float("inf"), -10, 0, "not-a-num"):
+                        self.assertEqual(
+                            srv.TelegramLiveCardPublisher._FLOOD_DEFAULT_COOLDOWN_S,
+                            srv.TelegramLiveCardPublisher._extract_retry_after(
+                                _HdrResp(),
+                                {"ok": False, "error_code": 429, "parameters": {"retry_after": bad}},
+                            ),
+                            f"bad retry_after={bad!r} must use safe positive floor",
+                        )
+
+                    # 2. editMessageMedia hits 429 with retry_after=12704 and token embedded in description
+                    http_obj = self._ScriptedHTTP(
+                        [
+                            {
+                                "http_status": 429,
+                                "body": {
+                                    "ok": False,
+                                    "error_code": 429,
+                                    "description": f"Too Many Requests bot{BOT_MAIN_TOKEN}: retry after 12704",
+                                    "parameters": {"retry_after": 12704},
+                                },
+                            },
+                            # After cooldown expiry, subsequent calls succeed
+                            {"http_status": 200, "body": {"ok": True, "result": {"message_id": 701}}},
+                            {"http_status": 200, "body": {"ok": True, "result": {"message_id": 702}}},
+                            # Header-only 429 (invalid JSON body + Retry-After: 45) on sendPhoto
+                            {
+                                "http_status": 429,
+                                "headers": {"Retry-After": "45"},
+                                "json_exc": ValueError("non-json gateway body"),
+                            },
+                        ]
+                    )
+                    hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, LOCAL_TOKEN)
+                    hub.tg.http = http_obj
+                    hub.engine_mode = "async_hosted"
+                    hub.session_gen = 1
+                    hub.session_owner = ("main", ADMIN_UID_A)
+                    hub.latest_jpeg = b"JPEG_C1_FRAME_1"
+                    hub.tg.cards[("main", ADMIN_UID_A)] = {
+                        "bot_key": "main",
+                        "chat_id": ADMIN_UID_A,
+                        "message_id": 701,
+                        "session_gen": 1,
+                        "owner": ("main", ADMIN_UID_A),
+                        "last_sha1": "stale_sha",
+                        "last_caption": "stale_cap",
+                        "last_markup": None,
+                        "last_ts": 0.0,
+                    }
+
+                    with self.assertLogs("live-browser", level="WARNING") as cm:
+                        await hub.tg.tick_updates(force=False)
+                    self.assertEqual(["editMessageMedia"], [c[0] for c in http_obj.calls])
+                    joined_logs = "\n".join(cm.output)
+                    self.assertIn("429", joined_logs)
+                    self.assertIn("12704", joined_logs)
+                    self.assertNotIn(BOT_MAIN_TOKEN, joined_logs)
+                    self.assertAlmostEqual(12704.0, hub.tg._bot_flood_remaining("main"), delta=0.1)
+
+                    # 3. During active cooldown, EVERY outbound method for `main` short-circuits with 0 new HTTP calls
+                    for step in range(5):
+                        clock[0] += 1.2
+                        await hub.tg.tick_updates(force=False)
+                        await hub.tg.tick_updates(force=True)
+                    self.assertIsNone(await hub.tg.ensure_card("main", force_new=True, preferred_user_id=ADMIN_UID_A))
+                    self.assertFalse(await hub.tg.send_clip_message("main", "clip text", preferred_user_id=ADMIN_UID_A))
+                    self.assertFalse(await hub.tg.send_photo_bytes("main", b"JPEG_HD", preferred_user_id=ADMIN_UID_A))
+                    self.assertFalse(
+                        await hub.tg.send_document_file(
+                            "main", sample_doc, "sample.txt", preferred_user_id=ADMIN_UID_A
+                        )
+                    )
+                    self.assertFalse(await hub.tg._retire_orphan_card_message(BOT_MAIN_TOKEN, ADMIN_UID_A, 701))
+                    ok_ref, _msg_ref, st_ref = await hub.tg._refresh_single_card_with_status(
+                        "main", ADMIN_UID_A, message_id=701, expected_session_gen=1
+                    )
+                    self.assertFalse(ok_ref)
+                    self.assertEqual(502, st_ref)
+                    self.assertEqual(1, len(http_obj.calls), "Zero new HTTP calls allowed during 429 cooldown")
+
+                    # 4. Advance past 12704s cooldown -> auto-resumes normally
+                    clock[0] = 1000.0 + 12705.0
+                    self.assertEqual(0.0, hub.tg._bot_flood_remaining("main"))
+                    await hub.tg.tick_updates(force=False)
+                    self.assertEqual(2, len(http_obj.calls))
+                    self.assertTrue(await hub.tg.send_clip_message("main", "after-cooldown", preferred_user_id=ADMIN_UID_A))
+                    self.assertEqual(3, len(http_obj.calls))
+
+                    # 5. Header-only Retry-After: 45 on send_photo_bytes triggers 45s cooldown
+                    self.assertFalse(await hub.tg.send_photo_bytes("main", b"JPEG_HD2", preferred_user_id=ADMIN_UID_A))
+                    self.assertAlmostEqual(45.0, hub.tg._bot_flood_remaining("main"), delta=0.1)
+                    self.assertFalse(await hub.tg.send_document_file("main", sample_doc, "sample.txt", preferred_user_id=ADMIN_UID_A))
+                    self.assertEqual(4, len(http_obj.calls))
+
+            asyncio.run(_scenario())
+
+    def test_c2_5xx_and_transport_error_bounded_exponential_backoff(self) -> None:
+        """C2: consecutive 502/503 or transport exceptions apply bounded exponential backoff (cap 60s),
+        never looping every 1.2s; 200 ok or 400 message-is-not-modified resets backoff to normal 3s cadence."""
+        with tempfile.TemporaryDirectory() as tmp:
+            bdir = Path(tmp)
+            env_main, env_sg = self._write_dual_bot_envs(bdir)
+            clock = [500.0]
+
+            async def _scenario() -> None:
+                with (
+                    mock.patch.object(srv, "_BRIDGE_DIR", bdir),
+                    mock.patch.object(srv, "BRIDGE_ENV_FILES", {"main": env_main, "sg": env_sg}),
+                    mock.patch.object(srv, "FormData", self._FakeFormData),
+                    mock.patch.object(srv.time, "monotonic", side_effect=lambda: clock[0]),
+                ):
+                    http_obj = self._ScriptedHTTP(
+                        [
+                            {"http_status": 502, "body": {"ok": False, "error_code": 502, "description": "Bad Gateway"}},
+                            {"http_status": 503, "body": {"ok": False, "error_code": 503, "description": "Service Unavailable"}},
+                            TimeoutError("connect timeout"),
+                            ConnectionError("connection reset"),
+                            {"http_status": 502, "body": {"ok": False, "error_code": 502, "description": "Bad Gateway"}},
+                            {"http_status": 503, "body": {"ok": False, "error_code": 503, "description": "Service Unavailable"}},
+                            {"http_status": 200, "body": {"ok": True, "result": {"message_id": 701}}},
+                            {"http_status": 503, "body": {"ok": False, "error_code": 503, "description": "Service Unavailable"}},
+                            {"http_status": 400, "body": {"ok": False, "error_code": 400, "description": "Bad Request: message is not modified"}},
+                        ]
+                    )
+                    hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, LOCAL_TOKEN)
+                    hub.tg.http = http_obj
+                    hub.engine_mode = "async_hosted"
+                    hub.session_gen = 1
+                    hub.session_owner = ("main", ADMIN_UID_A)
+                    hub.latest_jpeg = b"JPEG_C2_FRAME"
+                    card = {
+                        "bot_key": "main",
+                        "chat_id": ADMIN_UID_A,
+                        "message_id": 701,
+                        "session_gen": 1,
+                        "owner": ("main", ADMIN_UID_A),
+                        "last_sha1": "old",
+                        "last_caption": "old",
+                        "last_markup": None,
+                        "last_ts": 100.0,
+                    }
+                    hub.tg.cards[("main", ADMIN_UID_A)] = card
+
+                    expected_delays = [3.0, 6.0, 12.0, 24.0, 48.0, 60.0]
+                    for idx, exp_delay in enumerate(expected_delays, start=1):
+                        await hub.tg.tick_updates(force=False)
+                        self.assertEqual(idx, len(http_obj.calls))
+                        self.assertEqual(idx, card["transient_err_streak"])
+                        self.assertEqual(100.0, card["last_ts"], "last_ts must remain unchanged on failure")
+                        self.assertAlmostEqual(clock[0] + exp_delay, card["backoff_until"], delta=0.01)
+                        # Simulate 1.2s maintenance ticks inside the backoff window -> 0 calls!
+                        clock[0] += min(1.2, exp_delay - 0.1)
+                        await hub.tg.tick_updates(force=False)
+                        self.assertEqual(idx, len(http_obj.calls), "Must not hammer every 1.2s during backoff")
+                        clock[0] = card["backoff_until"] + 0.05
+
+                    # 7th call: 200 ok resets streak & backoff to 0
+                    await hub.tg.tick_updates(force=False)
+                    self.assertEqual(7, len(http_obj.calls))
+                    self.assertEqual(0, card["transient_err_streak"])
+                    self.assertEqual(0.0, card["backoff_until"])
+
+                    # Change frame + advance 3.1s -> 8th call hits 503 (streak=1, delay=3s)
+                    hub.latest_jpeg = b"JPEG_C2_FRAME_2"
+                    clock[0] += 3.1
+                    await hub.tg.tick_updates(force=False)
+                    self.assertEqual(8, len(http_obj.calls))
+                    self.assertEqual(1, card["transient_err_streak"])
+
+                    # After 3.1s backoff expires -> 400 'message is not modified' also resets backoff to 0
+                    clock[0] += 3.1
+                    await hub.tg.tick_updates(force=False)
+                    self.assertEqual(9, len(http_obj.calls))
+                    self.assertEqual(0, card["transient_err_streak"])
+                    self.assertEqual(0.0, card["backoff_until"])
+
+            asyncio.run(_scenario())
+
+    def test_c3_static_frame_caption_dedup_across_wall_clock_seconds(self) -> None:
+        """C3: static frame/title/url/status/takeover/profile/public_url across advancing wall-clock seconds
+        hits (sha, caption, markup) dedup fast-path with 0 extra editMessageMedia calls; real changes still refresh."""
+        with tempfile.TemporaryDirectory() as tmp:
+            bdir = Path(tmp)
+            env_main, env_sg = self._write_dual_bot_envs(bdir)
+            clock = [200.0]
+            wall_sec = [0]
+
+            def _fake_strftime(fmt, *_args):
+                return f"12:00:{wall_sec[0]:02d}"
+
+            async def _scenario() -> None:
+                with (
+                    mock.patch.object(srv, "_BRIDGE_DIR", bdir),
+                    mock.patch.object(srv, "BRIDGE_ENV_FILES", {"main": env_main, "sg": env_sg}),
+                    mock.patch.object(srv, "FormData", self._FakeFormData),
+                    mock.patch.object(srv.time, "monotonic", side_effect=lambda: clock[0]),
+                    mock.patch.object(srv.time, "strftime", side_effect=_fake_strftime),
+                ):
+                    http_obj = self._ScriptedHTTP(
+                        [
+                            {"http_status": 200, "body": {"ok": True, "result": {"message_id": 701}}}
+                            for _ in range(10)
+                        ]
+                    )
+                    hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, LOCAL_TOKEN)
+                    hub.tg.http = http_obj
+                    hub.engine_mode = "async_hosted"
+                    hub.session_gen = 1
+                    hub.session_owner = ("main", ADMIN_UID_A)
+                    hub.latest_jpeg = b"STATIC_JPEG_BYTES"
+                    hub.title = "Example Page"
+                    hub.url = "https://example.com/dashboard"
+                    hub.ai_status = "空闲等待"
+                    hub.active_profile = "prof-1"
+                    hub.tg.cards[("main", ADMIN_UID_A)] = {
+                        "bot_key": "main",
+                        "chat_id": ADMIN_UID_A,
+                        "message_id": 701,
+                        "session_gen": 1,
+                        "owner": ("main", ADMIN_UID_A),
+                        "last_sha1": "",
+                        "last_caption": "",
+                        "last_markup": None,
+                        "last_ts": 0.0,
+                    }
+
+                    cap_live = hub.tg._build_caption(finished=False)
+                    self.assertNotIn("12:00:", cap_live, "Live caption must not contain per-second wall-clock time")
+
+                    # 10 ticks spaced >3s apart with advancing wall clock -> ONLY 1 editMessageMedia call!
+                    for i in range(10):
+                        wall_sec[0] = i
+                        clock[0] += 4.0
+                        await hub.tg.tick_updates(force=False)
+                    self.assertEqual(1, len(http_obj.calls), "Remaining 9 ticks must hit (sha, caption, markup) dedup")
+
+                    # Real state mutations (jpeg, title, url, ai_status, takeover, public_url/markup) still refresh
+                    mutations = [
+                        lambda: setattr(hub, "latest_jpeg", b"CHANGED_JPEG_BYTES"),
+                        lambda: setattr(hub, "title", "Updated Title"),
+                        lambda: setattr(hub, "url", "https://example.com/next"),
+                        lambda: setattr(hub, "ai_status", "点击登录"),
+                        lambda: setattr(hub, "takeover", True),
+                        lambda: hub.config.__setitem__("public_url", "https://example.com/panel"),
+                    ]
+                    expected_calls = 1
+                    for mutate in mutations:
+                        mutate()
+                        clock[0] += 4.0
+                        expected_calls += 1
+                        await hub.tg.tick_updates(force=False)
+                        self.assertEqual(expected_calls, len(http_obj.calls))
+
+            asyncio.run(_scenario())
+
+    def test_c4_cross_bot_isolation_rbac_precedence_and_retire_attempt_preservation(self) -> None:
+        """C4: (1) Bot A 429 never blocks Bot B; (2) live RBAC & ownership checks run BEFORE cooldown
+        (revoked drops cards immediately; unauthorized/stale refresh returns 403, not 502);
+        (3) session_gen change still stages pending_retire_cards, and cooldown skips do NOT consume retire_attempts."""
+        with tempfile.TemporaryDirectory() as tmp:
+            bdir = Path(tmp)
+            env_main, env_sg = self._write_dual_bot_envs(bdir, main_role="admin", sg_role="admin")
+            clock = [300.0]
+
+            async def _scenario() -> None:
+                with (
+                    mock.patch.object(srv, "_BRIDGE_DIR", bdir),
+                    mock.patch.object(srv, "BRIDGE_ENV_FILES", {"main": env_main, "sg": env_sg}),
+                    mock.patch.object(srv, "FormData", self._FakeFormData),
+                    mock.patch.object(srv.time, "monotonic", side_effect=lambda: clock[0]),
+                ):
+                    http_obj = self._ScriptedHTTP(
+                        [
+                            # 1. Bot main hits 429 (12704s)
+                            {
+                                "http_status": 429,
+                                "body": {
+                                    "ok": False,
+                                    "error_code": 429,
+                                    "parameters": {"retry_after": 12704},
+                                    "description": "Too Many Requests",
+                                },
+                            },
+                            # 2. Bot sg ensure_card sendPhoto succeeds
+                            {"http_status": 200, "body": {"ok": True, "result": {"message_id": 801}}},
+                            # 3. Bot sg tick_updates editMessageMedia succeeds
+                            {"http_status": 200, "body": {"ok": True, "result": {"message_id": 801}}},
+                            # 4. Bot sg send_photo_bytes succeeds
+                            {"http_status": 200, "body": {"ok": True, "result": {"message_id": 802}}},
+                            # 5. After main cooldown expires, pending retire succeeds
+                            {"http_status": 200, "body": {"ok": True, "result": {"message_id": 701}}},
+                        ]
+                    )
+                    hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, LOCAL_TOKEN)
+                    hub.tg.http = http_obj
+                    hub.engine_mode = "async_hosted"
+                    hub.session_gen = 5
+                    hub.session_owner = ("main", ADMIN_UID_A)
+                    hub.latest_jpeg = b"JPEG_C4_MAIN"
+                    hub.tg.cards[("main", ADMIN_UID_A)] = {
+                        "bot_key": "main",
+                        "chat_id": ADMIN_UID_A,
+                        "message_id": 701,
+                        "session_gen": 5,
+                        "owner": ("main", ADMIN_UID_A),
+                        "last_sha1": "s0",
+                        "last_caption": "c0",
+                        "last_markup": None,
+                        "last_ts": 0.0,
+                    }
+
+                    # Trigger 429 on `main`
+                    await hub.tg.tick_updates(force=False)
+                    self.assertGreater(hub.tg._bot_flood_remaining("main"), 12000.0)
+                    self.assertEqual(0.0, hub.tg._bot_flood_remaining("sg"))
+
+                    # (1) Switch session owner to `sg` (which also makes main's card stale!) -> `sg` works freely
+                    hub.session_gen = 6
+                    hub.session_owner = ("sg", ADMIN_UID_B)
+                    hub.latest_jpeg = b"JPEG_C4_SG_1"
+                    created_sg = await hub.tg.ensure_card("sg", preferred_user_id=ADMIN_UID_B)
+                    self.assertIsNotNone(created_sg)
+                    self.assertEqual(801, created_sg["message_id"])
+                    hub.latest_jpeg = b"JPEG_C4_SG_2"
+                    clock[0] += 4.0
+                    await hub.tg.tick_updates(force=False)
+                    self.assertTrue(await hub.tg.send_photo_bytes("sg", b"JPEG_SG_HD", preferred_user_id=ADMIN_UID_B))
+
+                    # (3) Meanwhile `main`'s stale card 701 was staged into pending_retire_cards AND
+                    # repeated ticks during `main`'s 429 cooldown NEVER consumed retire_attempts!
+                    self.assertNotIn(("main", ADMIN_UID_A), hub.tg.cards)
+                    self.assertIn(("main", ADMIN_UID_A, 701), hub.tg.pending_retire_cards)
+                    for _ in range(4):
+                        clock[0] += 4.0
+                        await hub.tg.tick_updates(force=False)
+                        await hub.tg.retire_cards(session_gen=5, mark_finished=True)
+                    self.assertIn(("main", ADMIN_UID_A, 701), hub.tg.pending_retire_cards)
+                    self.assertEqual(
+                        0,
+                        int(hub.tg.pending_retire_cards[("main", ADMIN_UID_A, 701)].get("retire_attempts") or 0),
+                        "429 cooldown skip MUST NOT consume retire_attempts",
+                    )
+
+                    # (2) Wrong-owner / stale refresh_single_card during cooldown MUST return 403 (never 502)
+                    ok_stale, _msg_stale, st_stale = await hub.tg._refresh_single_card_with_status(
+                        "main", ADMIN_UID_A, message_id=701, expected_session_gen=5
+                    )
+                    self.assertFalse(ok_stale)
+                    self.assertEqual(403, st_stale)
+
+                    # Cooldown expires -> pending card 701 retires cleanly!
+                    clock[0] = 300.0 + 12705.0
+                    await hub.tg.tick_updates(force=False)
+                    self.assertNotIn(("main", ADMIN_UID_A, 701), hub.tg.pending_retire_cards)
+
+                    # (2b) Live RBAC revocation DURING cooldown immediately drops active & pending cards (403 on refresh)
+                    hub.tg._bot_flood_until["main"] = clock[0] + 5000.0
+                    hub.session_gen = 7
+                    hub.session_owner = ("main", ADMIN_UID_A)
+                    hub.tg.cards[("main", ADMIN_UID_A)] = {
+                        "bot_key": "main",
+                        "chat_id": ADMIN_UID_A,
+                        "message_id": 709,
+                        "session_gen": 7,
+                        "owner": ("main", ADMIN_UID_A),
+                        "last_sha1": "s",
+                        "last_caption": "c",
+                        "last_markup": None,
+                        "last_ts": 0.0,
+                    }
+                    hub.tg.pending_retire_cards[("main", ADMIN_UID_A, 708)] = {
+                        "bot_key": "main",
+                        "chat_id": ADMIN_UID_A,
+                        "message_id": 708,
+                        "session_gen": 6,
+                        "owner": ("main", ADMIN_UID_A),
+                    }
+                    self._write_dual_bot_envs(bdir, main_role="readonly", sg_role="admin")
+                    ok_rev, _msg_rev, st_rev = await hub.tg._refresh_single_card_with_status(
+                        "main", ADMIN_UID_A, message_id=709, expected_session_gen=7
+                    )
+                    self.assertFalse(ok_rev)
+                    self.assertEqual(403, st_rev)
+                    self.assertNotIn(("main", ADMIN_UID_A), hub.tg.cards)
+                    self.assertNotIn(("main", ADMIN_UID_A, 708), hub.tg.pending_retire_cards)
+
+            asyncio.run(_scenario())
+
+
 if __name__ == "__main__":
     unittest.main()

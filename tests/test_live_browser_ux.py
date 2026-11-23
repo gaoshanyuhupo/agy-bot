@@ -5885,6 +5885,9 @@ class TestRound6FinalClosureRegression(unittest.TestCase):
                     self.assertIn(("main", 111, 8881), hub.tg.pending_retire_cards)
                     await hub.tg.tick_updates(force=True)
                     self.assertIn(("main", 111, 8881), hub.tg.pending_retire_cards)
+                    # Attempt 2 hit 429 -> bot enters cooldown; clear cooldown to simulate expiry before attempt 3
+                    self.assertGreater(hub.tg._bot_flood_remaining("main"), 0.0)
+                    hub.tg._bot_flood_until.clear()
                     await hub.tg.tick_updates(force=True)
                     self.assertNotIn(("main", 111), hub.tg.cards)
                     self.assertNotIn(
@@ -6301,13 +6304,13 @@ class TestRound6FinalClosureRegression(unittest.TestCase):
                     mock.patch.object(srv, "FormData", _FakeFormData),
                 ):
                     # 1. Cross-path concurrent transient failure:
-                    #    tick_updates() wins _lock -> 429 (attempt 1, retained)
+                    #    tick_updates() wins _lock -> 502 (attempt 1, retained)
                     #    queued explicit retire_cards() takes _lock -> 503 (attempt 2, STILL retained!)
                     #    next idle + latest_jpeg=None maintenance tick -> ok=True (attempt 3, succeeds & pops!)
                     gate = asyncio.Event()
                     http_cross = _FlakyHTTP(
                         [
-                            {"http_status": 429, "ok": False, "description": "Too Many Requests"},
+                            {"http_status": 502, "ok": False, "description": "Bad Gateway"},
                             {"http_status": 503, "ok": False, "description": "Service Unavailable"},
                             {"ok": True, "result": {"message_id": 901}},
                         ],
@@ -6413,6 +6416,9 @@ class TestRound6FinalClosureRegression(unittest.TestCase):
                     self.assertEqual(0, await hub.tg.retire_cards(session_gen=16, mark_finished=True))
                     self.assertIn(("main", 111, 904), hub.tg.pending_retire_cards)
                     self.assertEqual(2, hub.tg.pending_retire_cards[("main", 111, 904)].get("retire_attempts"))
+                    # Attempt 2 hit 429 -> clear cooldown to simulate expiry before attempt 3
+                    self.assertGreater(hub.tg._bot_flood_remaining("main"), 0.0)
+                    hub.tg._bot_flood_until.clear()
 
                     await hub.tg.tick_updates(force=False)
                     self.assertNotIn(("main", 111), hub.tg.cards)
@@ -7175,6 +7181,9 @@ class TestRound6FinalClosureRegression(unittest.TestCase):
                     self.assertEqual(["701", "702"], media_mids4, "Authorized admin stop MUST attempt both 701 & 702")
                     self.assertEqual(1, hub4.tg.pending_retire_cards[("main", 111, 701)].get("retire_attempts"))
                     self.assertEqual(1, hub4.tg.pending_retire_cards[("main", 111, 702)].get("retire_attempts"))
+                    # Card 702 hit 429 -> clear cooldown to simulate expiry before Tick 2
+                    self.assertGreater(hub4.tg._bot_flood_remaining("main"), 0.0)
+                    hub4.tg._bot_flood_until.clear()
 
                     # Tick 2: 701 gets 503 (attempt 2 -> retained), 702 gets 200 ok (retired & popped)
                     await hub4.tg.tick_updates(force=False)
