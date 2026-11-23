@@ -319,6 +319,46 @@ class TestQueueRestartPersistence(unittest.TestCase):
             kept = bridge2.job_q.get()
             self.assertEqual("readonly pending query", kept[3][1]["prompt"])
 
+    def test_put_front_and_promote_to_front_persist_order_across_crash_restart(self):
+        """C7: put_front and promote_to_front atomically persist (0o600) and restore exact head order."""
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge, _ = _load_isolated_bridge(tmp)
+            qfile = Path(bridge.QUEUE_FILE)
+
+            # Part 1: put(Q1), put(Q2), put_front(U1) -> crash reload -> [U1, Q1, Q2]
+            qid_q1 = bridge.job_q.put((111, None, "111", "Q1"))
+            qid_q2 = bridge.job_q.put((111, None, "111", "Q2"))
+            qid_u1 = bridge.job_q.put_front((111, None, "111", "U1"))
+            self.assertTrue(qid_q1 and qid_q2 and qid_u1)
+            self.assertEqual(0o600, stat.S_IMODE(qfile.stat().st_mode))
+
+            bridge_reloaded, _ = _load_isolated_bridge(tmp)
+            summary1 = bridge_reloaded.restore_persisted_queue(notify=False)
+            self.assertEqual(3, summary1["restored"])
+            got1 = [bridge_reloaded.job_q.get()[3] for _ in range(3)]
+            for _ in range(3):
+                bridge_reloaded.job_q.task_done()
+            self.assertEqual(["U1", "Q1", "Q2"], got1)
+
+            # Part 2: put(Q1), put(Q2), promote_to_front(Q2, scope) -> crash reload -> [Q2, Q1]
+            bridge_p2, _ = _load_isolated_bridge(tmp)
+            p2_q1 = bridge_p2.job_q.put((111, None, "111", "Q1"))
+            p2_q2 = bridge_p2.job_q.put((111, None, "111", "Q2"))
+            # Cross-scope promote must fail closed without changing order
+            self.assertFalse(bridge_p2.job_q.promote_to_front(p2_q2, "-1001234567890"))
+            # Matching-scope promote succeeds and persists atomically
+            self.assertTrue(bridge_p2.job_q.promote_to_front(p2_q2, "111"))
+            self.assertEqual(0o600, stat.S_IMODE(qfile.stat().st_mode))
+            self.assertNotEqual(p2_q1, p2_q2)
+
+            bridge_p2_reloaded, _ = _load_isolated_bridge(tmp)
+            summary2 = bridge_p2_reloaded.restore_persisted_queue(notify=False)
+            self.assertEqual(2, summary2["restored"])
+            got2 = [bridge_p2_reloaded.job_q.get()[3] for _ in range(2)]
+            for _ in range(2):
+                bridge_p2_reloaded.job_q.task_done()
+            self.assertEqual(["Q2", "Q1"], got2)
+
 
 class TestHotReloadSelfCheckAndAutoRollback(unittest.TestCase):
     """Verify `--self-check`, pre-exec abort, LKG startup rollback, and sync_live deploy/rollback."""

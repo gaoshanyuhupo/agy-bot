@@ -121,7 +121,7 @@ class TestRbacEnforcementAndSessionIsolation(unittest.TestCase):
                     "AGY_TG_READONLY_USERS": "222",
                 },
             )
-            bridge.BOT_META.update({"bot_id": 100, "handle": "main_bot", "resolved": True})
+            bridge.BOT_META.update({"bot_id": 100, "handle": "example_main_bot", "resolved": True})
 
             sent_texts = []
             enqueued = []
@@ -153,6 +153,12 @@ class TestRbacEnforcementAndSessionIsolation(unittest.TestCase):
                     "/mode auto",
                     "/reload",
                     "/cancel",
+                    "/urgent 紧急插队任务",
+                    "/urgent@example_main_bot 紧急插队任务",
+                    "@example_main_bot /urgent 紧急插队任务",
+                    "/urgent",
+                    "! 紧急插队任务",
+                    "@example_main_bot ! 紧急插队任务",
                     "/get .env",
                     "/cost reset 1d",
                     "/guard",
@@ -196,13 +202,32 @@ class TestRbacEnforcementAndSessionIsolation(unittest.TestCase):
                 self.assertEqual(222, enqueued[0][1]["user_id"])
 
                 # Blocked mutating callback vs allowed read-only callback
-                bridge.handle_callback({
-                    "id": "cb-1",
-                    "from": {"id": 222},
-                    "message": {"chat": {"id": -1001234567890}, "message_id": 50},
-                    "data": "model:gemini-4-carbon",
-                })
-                self.assertTrue(any("权限不足" in kw.get("text", "") for _, kw in cb_answers))
+                for denied_cb in ("model:gemini-4-carbon", "action:preempt:deadbeef1234", "action:cancel"):
+                    cb_answers.clear()
+                    bridge.handle_callback({
+                        "id": f"cb-{denied_cb}",
+                        "from": {"id": 222},
+                        "message": {"chat": {"id": -1001234567890}, "message_id": 50},
+                        "data": denied_cb,
+                    })
+                    self.assertTrue(
+                        any("权限不足" in kw.get("text", "") and kw.get("show_alert") is True for _, kw in cb_answers),
+                        f"Callback {denied_cb!r} must be rejected with show_alert for readonly",
+                    )
+
+                # Direct access_control API check for /urgent and action:preempt:<qid>
+                self.assertEqual((True, ""), _ac.is_command_allowed_for_role("admin", "/urgent", "fix now"))
+                self.assertEqual((False, "/urgent"), _ac.is_command_allowed_for_role("readonly", "/urgent", "fix now"))
+                self.assertEqual((False, "unauthorized"), _ac.is_command_allowed_for_role("denied", "/urgent", "fix now"))
+                self.assertEqual((True, ""), _ac.is_callback_allowed_for_role("admin", "action:preempt:a1b2c3d4e5f6"))
+                self.assertEqual(
+                    (False, "action:preempt:a1b2c3d4e5f6"),
+                    _ac.is_callback_allowed_for_role("readonly", "action:preempt:a1b2c3d4e5f6"),
+                )
+                self.assertEqual(
+                    (False, "unauthorized"),
+                    _ac.is_callback_allowed_for_role("denied", "action:preempt:a1b2c3d4e5f6"),
+                )
 
                 cb_answers.clear()
                 with mock.patch.object(bridge, "cmd_cost") as m_cost:

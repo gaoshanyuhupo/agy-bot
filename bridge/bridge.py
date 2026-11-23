@@ -336,6 +336,15 @@ def _release_instance_lock():
 shutting_down = False
 
 
+def _is_same_scope_or_readonly_child(active_scope, target_scope):
+    """Return True if `active_scope` is identical to `target_scope` or a readonly child (`<target>:ro:<uid>`)."""
+    if not active_scope or not target_scope:
+        return False
+    a = str(active_scope)
+    t = str(target_scope)
+    return a == t or a.startswith(f"{t}:ro:")
+
+
 class _JobQueue:
     """Thread-safe FIFO job queue with atomic disk persistence, scope inspection, and selective cancellation."""
 
@@ -343,6 +352,7 @@ class _JobQueue:
         self._cond = threading.Condition()
         self._entries = collections.deque()     # pending items: {"qid": str, "enqueued_at": float, "item": Any}
         self._dispatched = collections.deque()  # currently executing items until task_done()
+        self._dispatched_cancel_flags = {}      # qid -> "cancel" | "preempt" (for dequeue->run_agy window)
         self._persist_path = persist_path
         self._use_global_queue_file = bool(use_global_queue_file)
 
@@ -526,6 +536,7 @@ class _JobQueue:
             if _persist and not self._is_control_sentinel(item):
                 self._persist_locked()
             self._cond.notify()
+        return entry["qid"]
 
     def put_front(self, item, *, _persist=True, _enqueued_at=None, _qid=None):
         """Atomically insert an urgent item at the head of the queue (ahead of all normal pending items)."""
@@ -539,8 +550,95 @@ class _JobQueue:
             if _persist and not self._is_control_sentinel(item):
                 self._persist_locked()
             self._cond.notify()
+        return entry["qid"]
 
-    def get(self):
+    def put_front_and_mark_dispatched_preempt(self, item, scope_key, *, _persist=True, _enqueued_at=None, _qid=None):
+        """Atomically insert an urgent item at queue head and mark any same-scope dispatched item as preempted."""
+        entry = {
+            "qid": _qid or uuid.uuid4().hex[:12],
+            "enqueued_at": float(_enqueued_at if _enqueued_at is not None else time.time()),
+            "item": item,
+        }
+        marked_dispatched = 0
+        with self._cond:
+            self._entries.appendleft(entry)
+            for dent in self._dispatched:
+                if dent["qid"] != entry["qid"] and _is_same_scope_or_readonly_child(
+                    self._item_scope(dent["item"]), scope_key
+                ):
+                    self._dispatched_cancel_flags[dent["qid"]] = "preempt"
+                    marked_dispatched += 1
+            if _persist and not self._is_control_sentinel(item):
+                self._persist_locked()
+            self._cond.notify()
+        return entry["qid"], marked_dispatched
+
+    def promote_to_front(self, qid, scope_key, *, _persist=True):
+        """Move pending item `qid` to the head of the queue if it exists and belongs to `scope_key`."""
+        ok, _marked, _reason = self.promote_to_front_and_mark_dispatched_preempt(
+            qid,
+            scope_key,
+            claim_once=False,
+            mark_dispatched=False,
+            _persist=_persist,
+        )
+        return ok
+
+    def promote_to_front_and_mark_dispatched_preempt(
+        self,
+        qid,
+        scope_key,
+        *,
+        claim_once=True,
+        mark_dispatched=True,
+        _persist=True,
+    ):
+        """Atomically validate `(qid, scope_key)`, move pending item to head, persist, and optionally mark dispatched."""
+        target_qid = str(qid or "").strip()
+        if not target_qid or not scope_key:
+            return False, 0, "invalid"
+        marked_dispatched = 0
+        with self._cond:
+            target_idx = None
+            target_ent = None
+            for idx, ent in enumerate(self._entries):
+                if ent["qid"] == target_qid:
+                    target_idx = idx
+                    target_ent = ent
+                    break
+            if target_ent is None:
+                return False, 0, "missing_or_started"
+            if self._item_scope(target_ent["item"]) != scope_key:
+                return False, 0, "scope_mismatch"
+            if claim_once and target_ent.get("preempt_claimed"):
+                return False, 0, "already_claimed"
+            if claim_once:
+                target_ent["preempt_claimed"] = True
+            moved = False
+            if target_idx is not None and target_idx > 0:
+                del self._entries[target_idx]
+                self._entries.appendleft(target_ent)
+                moved = True
+            if mark_dispatched:
+                for dent in self._dispatched:
+                    if dent["qid"] != target_qid and _is_same_scope_or_readonly_child(
+                        self._item_scope(dent["item"]), scope_key
+                    ):
+                        self._dispatched_cancel_flags[dent["qid"]] = "preempt"
+                        marked_dispatched += 1
+            if moved and _persist and not self._is_control_sentinel(target_ent["item"]):
+                self._persist_locked()
+            self._cond.notify()
+        return True, marked_dispatched, "ok"
+
+    def consume_dispatched_cancel(self, qid):
+        """Pop and return any pending cancel/preempt flag (`'cancel'` | `'preempt'`) for a dispatched `qid`."""
+        if not qid:
+            return None
+        with self._cond:
+            return self._dispatched_cancel_flags.pop(qid, None)
+
+    def get_entry(self):
         with self._cond:
             while not self._entries:
                 self._cond.wait()
@@ -548,7 +646,10 @@ class _JobQueue:
             if not self._is_control_sentinel(entry["item"]):
                 self._dispatched.append(entry)
                 self._persist_locked()
-            return entry["item"]
+            return entry["qid"], entry["item"]
+
+    def get(self):
+        return self.get_entry()[1]
 
     def qsize(self):
         with self._cond:
@@ -558,15 +659,44 @@ class _JobQueue:
         with self._cond:
             return not self._entries
 
-    def task_done(self):
+    def task_done(self, qid=None):
         with self._cond:
+            if qid is not None:
+                self._dispatched_cancel_flags.pop(qid, None)
+                for idx, ent in enumerate(self._dispatched):
+                    if ent["qid"] == qid:
+                        del self._dispatched[idx]
+                        self._persist_locked()
+                        return
             if self._dispatched:
-                self._dispatched.popleft()
+                popped = self._dispatched.popleft()
+                self._dispatched_cancel_flags.pop(popped["qid"], None)
                 self._persist_locked()
 
     def count_scope(self, scope_key):
         with self._cond:
             return sum(1 for ent in self._entries if self._item_scope(ent["item"]) == scope_key)
+
+    def cancel_scope_and_mark_dispatched(self, scope_key):
+        """Atomically remove pending items in `scope_key` and flag matching `_dispatched` items as cancelled."""
+        removed = 0
+        marked_dispatched = 0
+        kept = collections.deque()
+        with self._cond:
+            while self._entries:
+                ent = self._entries.popleft()
+                if self._item_scope(ent["item"]) == scope_key:
+                    removed += 1
+                else:
+                    kept.append(ent)
+            self._entries = kept
+            for dent in self._dispatched:
+                if _is_same_scope_or_readonly_child(self._item_scope(dent["item"]), scope_key):
+                    self._dispatched_cancel_flags[dent["qid"]] = "cancel"
+                    marked_dispatched += 1
+            if removed:
+                self._persist_locked()
+        return removed, marked_dispatched
 
     def cancel_scope(self, scope_key):
         removed = 0
@@ -662,6 +792,19 @@ class _JobQueue:
             if removed:
                 self._persist_locked()
         return removed
+
+    def clear_all_and_mark_dispatched(self):
+        """Atomically clear all pending items and flag all currently `_dispatched` items as cancelled."""
+        marked_dispatched = 0
+        with self._cond:
+            removed = len(self._entries)
+            self._entries.clear()
+            for dent in self._dispatched:
+                self._dispatched_cancel_flags[dent["qid"]] = "cancel"
+                marked_dispatched += 1
+            if removed:
+                self._persist_locked()
+        return removed, marked_dispatched
 
     def clear_all(self):
         with self._cond:
@@ -778,6 +921,7 @@ class _JobQueue:
         }
 
 
+PersistentJobQueue = _JobQueue
 job_q = _JobQueue(use_global_queue_file=True)
 
 
@@ -826,6 +970,7 @@ turn_running_scope = None   # scope_key of currently executing interactive turn
 turn_running_chat = None    # chat_id of currently executing interactive turn
 turn_running_web_id = None  # turn_id if currently executing turn is a Web Studio IPC turn
 turn_running_cid = None     # conversation_id of currently executing interactive turn
+turn_running_qid = None     # queue entry qid of currently executing worker job
 turn_gen = 0                # Monotonically increasing generation counter per run_agy turn
 turn_waiting_bg = False     # True while current turn finished intermediate step and waits on bg event
 turn_waiting_bg_since = None  # Timestamp (time.time()) when current turn entered waiting_bg
@@ -2050,6 +2195,7 @@ _PRIVATE_COMMANDS = [
     {"command": "get", "description": "Download workspace file (/get <name>)"},
     {"command": "mode", "description": "Switch auto/safe mode"},
     {"command": "reload", "description": "Gracefully reload bridge process"},
+    {"command": "urgent", "description": "Interrupt active task & run urgent prompt immediately"},
     {"command": "cancel", "description": "Cancel currently running task"},
     {"command": "help", "description": "Show commands and instructions"},
 ]
@@ -2063,6 +2209,7 @@ _GROUP_TEAM_COMMANDS = [
     {"command": "project", "description": "📂 切换本群/Topic 协同的项目仓库"},
     {"command": "status", "description": "📊 查看团队主控状态与本群会话"},
     {"command": "new", "description": "🔄 开启本群/Topic 新会话 (隔离私聊)"},
+    {"command": "urgent", "description": "⚡ 紧急插队：中断当前任务并立刻执行"},
     {"command": "cancel", "description": "🛑 中止当前群内正在运行的任务"},
     {"command": "help", "description": "❓ 查看群内团队协作指南"},
 ]
@@ -5034,18 +5181,25 @@ def _compute_workspace_diff_and_footer(
     return " · ".join(suffix), reply_markup
 
 
-def _sleep_interruptible(seconds):
+def _is_turn_gen_preempted(my_turn_gen):
+    if my_turn_gen is None:
+        return False
+    with session_lock:
+        return turn_preempted_gen == my_turn_gen
+
+
+def _sleep_interruptible(seconds, *, my_turn_gen=None):
     deadline = time.time() + max(0.0, seconds)
     while time.time() < deadline:
-        if cancel_requested or shutting_down:
+        if cancel_requested or shutting_down or _is_turn_gen_preempted(my_turn_gen):
             return False
         time.sleep(min(0.2, max(0.01, deadline - time.time())))
-    return not (cancel_requested or shutting_down)
+    return not (cancel_requested or shutting_down or _is_turn_gen_preempted(my_turn_gen))
 
 
 def _execute_compact_on_session(
     scope_key, conv, mode, model, effort, project, workdir,
-    instruction="", readonly=False, untrusted=None,
+    instruction="", readonly=False, untrusted=None, my_turn_gen=None,
 ):
     """Run `/compact` on `conv` while `turn_running` is held. Auto-retries once on transient OAuth hiccup."""
     if not conv:
@@ -5060,12 +5214,15 @@ def _execute_compact_on_session(
     last_err = ""
 
     for attempt in (1, 2):
-        if cancel_requested or shutting_down:
+        if cancel_requested or shutting_down or _is_turn_gen_preempted(my_turn_gen):
             return False, time.time() - t0, "cancelled"
         sess, reused_warm = _acquire_session(
             scope_key, conv, mode, model, effort, project, workdir,
             force_new=(attempt > 1), readonly=readonly, untrusted=is_untrusted,
         )
+        if cancel_requested or shutting_down or _is_turn_gen_preempted(my_turn_gen):
+            invalidate_session("compact_cancelled", force=True, scope_key=scope_key)
+            return False, time.time() - t0, "cancelled"
         compact_start_line = get_transcript_line_count(conv)
         try:
             sess.send_user_prompt(slash_cmd, raw_slash=True)
@@ -5078,7 +5235,7 @@ def _execute_compact_on_session(
 
         res = None
         got_ev = False
-        while not cancel_requested and not shutting_down:
+        while not cancel_requested and not shutting_down and not _is_turn_gen_preempted(my_turn_gen):
             ev = sess.next_event(timeout=0.25)
             if ev is None:
                 continue
@@ -5093,7 +5250,7 @@ def _execute_compact_on_session(
                 res = ev.get("result") or ev
                 break
 
-        if cancel_requested or shutting_down:
+        if cancel_requested or shutting_down or _is_turn_gen_preempted(my_turn_gen):
             invalidate_session("compact_cancelled", force=True, scope_key=scope_key)
             return False, time.time() - t0, "cancelled"
 
@@ -5199,9 +5356,10 @@ def _maybe_post_turn_auto_compact(chat_id, conv, mode, model, effort, project=No
             )
 
 
-def run_compact(chat_id, instruction="", thread_id=None, scope_key=None):
+def run_compact(chat_id, instruction="", thread_id=None, scope_key=None, claimed_turn_gen=None, claimed_qid=None):
     """Execute explicit `/compact` job requested by user via command or button."""
-    global turn_running, turn_running_scope, turn_running_chat, cancel_requested
+    global turn_running, turn_running_scope, turn_running_chat, turn_running_qid
+    global turn_gen, turn_preempted_gen, cancel_requested
 
     skey = scope_key or scope_key_for(chat_id, thread_id)
     sc = get_scope_state(skey)
@@ -5220,10 +5378,35 @@ def run_compact(chat_id, instruction="", thread_id=None, scope_key=None):
     before_k = format_tokens_k(before_stats["ctx_tokens"])
 
     with session_lock:
-        turn_running = True
-        turn_running_scope = skey
-        turn_running_chat = chat_id
-        cancel_requested = False
+        if claimed_turn_gen is not None:
+            my_turn_gen = claimed_turn_gen
+            turn_running = True
+            turn_running_scope = skey
+            turn_running_chat = chat_id
+            if claimed_qid is not None:
+                turn_running_qid = claimed_qid
+        else:
+            turn_gen += 1
+            my_turn_gen = turn_gen
+            turn_running = True
+            turn_running_scope = skey
+            turn_running_chat = chat_id
+            turn_running_qid = claimed_qid
+            turn_preempted_gen = None
+            cancel_requested = False
+        already_aborted = bool(cancel_requested or shutting_down or turn_preempted_gen == my_turn_gen)
+
+    if already_aborted:
+        with session_lock:
+            if turn_gen == my_turn_gen:
+                turn_running = False
+                turn_running_scope = None
+                turn_running_chat = None
+                turn_running_qid = None
+                if turn_preempted_gen == my_turn_gen:
+                    turn_preempted_gen = None
+                cancel_requested = False
+        return
 
     c_streamer = LiveDraftStreamer(
         chat_id, time.time(), cid=conv, start_line=before_stats["total_lines"],
@@ -5233,24 +5416,36 @@ def run_compact(chat_id, instruction="", thread_id=None, scope_key=None):
         f"🧹 <b>正在压缩会话上下文 (当前 {before_k} · {{elapsed}}s)...</b>"
     )
     c_streamer.start()
+    was_cancelled = False
+    was_preempted = False
     try:
         ok, dur_s, err_str = _execute_compact_on_session(
-            skey, conv, mode, model, effort, project, workdir, instruction=instruction
+            skey, conv, mode, model, effort, project, workdir,
+            instruction=instruction, my_turn_gen=my_turn_gen,
         )
     finally:
         c_streamer.stop()
         recycle = None
         with session_lock:
-            turn_running = False
-            turn_running_scope = None
-            turn_running_chat = None
+            was_cancelled = bool(cancel_requested)
+            was_preempted = (turn_preempted_gen == my_turn_gen)
+            if turn_gen == my_turn_gen:
+                turn_running = False
+                turn_running_scope = None
+                turn_running_chat = None
+                turn_running_qid = None
+                if turn_preempted_gen == my_turn_gen:
+                    turn_preempted_gen = None
+                cancel_requested = False
             if skey in session_dirty_scopes and skey in _session_pool:
                 recycle = _session_pool.pop(skey, None)
                 session_dirty_scopes.discard(skey)
         if recycle is not None:
             close_session_async(recycle, force=False)
 
-    if cancel_requested:
+    if was_preempted:
+        return
+    if was_cancelled:
         send(chat_id, "🛑 已取消上下文压缩。", thread_id=thread_id)
         return
     if ok:
@@ -5758,8 +5953,10 @@ def run_agy(
     override_project=None,
     override_workdir=None,
     sync_tg=False,
+    claimed_turn_gen=None,
+    claimed_qid=None,
 ):
-    global turn_running, turn_running_scope, turn_running_chat, turn_running_web_id, turn_running_cid
+    global turn_running, turn_running_scope, turn_running_chat, turn_running_web_id, turn_running_cid, turn_running_qid
     global turn_gen, turn_waiting_bg, turn_waiting_bg_since, turn_preempted_gen, cancel_requested
 
     is_web_turn = event_sink is not None
@@ -5785,6 +5982,26 @@ def run_agy(
                 _studio_ipc_buffer.append(tg_turn_id, ev_type, ev_payload)
             except Exception as buf_err:
                 log("tg stream buffer error (%s): %r" % (ev_type, buf_err))
+
+    # Fast pre-start abort check if worker() already pre-claimed this turn_gen and a concurrent
+    # /cancel or /urgent arrived before setup / snapshot / session spawn.
+    if claimed_turn_gen is not None:
+        early_abort = None
+        with session_lock:
+            if turn_preempted_gen == claimed_turn_gen:
+                early_abort = "preempted"
+            elif cancel_requested:
+                early_abort = "cancelled"
+            elif shutting_down:
+                early_abort = "shutdown"
+        if early_abort is not None:
+            if is_web_turn:
+                _emit_web("aborted", {
+                    "conversation_id": override_cid,
+                    "partial_text": "",
+                    "reason": early_abort,
+                })
+            return
 
     norm_tid = _normalize_thread_id(thread_id)
     skey = scope_key or scope_key_for(chat_id, norm_tid)
@@ -5928,18 +6145,61 @@ def run_agy(
                 return
             log("Conversation lease busy for conv=%s; proceeding on TG path after warning" % (conv[:8],))
 
+    pre_start_aborted = None
     with session_lock:
-        turn_gen += 1
-        my_turn_gen = turn_gen
-        turn_running = True
-        turn_running_scope = exec_skey
-        turn_running_chat = chat_id
-        turn_running_web_id = web_turn_id
-        turn_running_cid = conv
-        turn_waiting_bg = False
-        turn_waiting_bg_since = None
-        turn_preempted_gen = None
-        cancel_requested = False
+        if claimed_turn_gen is not None:
+            my_turn_gen = claimed_turn_gen
+            turn_running = True
+            turn_running_scope = exec_skey
+            turn_running_chat = chat_id
+            turn_running_web_id = web_turn_id
+            turn_running_cid = conv
+            if claimed_qid is not None:
+                turn_running_qid = claimed_qid
+            # Do NOT clear cancel_requested or turn_preempted_gen for a pre-claimed turn!
+            if turn_preempted_gen == my_turn_gen:
+                pre_start_aborted = "preempted"
+            elif cancel_requested:
+                pre_start_aborted = "cancelled"
+            elif shutting_down:
+                pre_start_aborted = "shutdown"
+        else:
+            turn_gen += 1
+            my_turn_gen = turn_gen
+            turn_running = True
+            turn_running_scope = exec_skey
+            turn_running_chat = chat_id
+            turn_running_web_id = web_turn_id
+            turn_running_cid = conv
+            turn_running_qid = claimed_qid
+            turn_waiting_bg = False
+            turn_waiting_bg_since = None
+            turn_preempted_gen = None
+            cancel_requested = False
+
+    if pre_start_aborted is not None:
+        if conv_lease is not None:
+            conv_lease.release()
+        with session_lock:
+            if turn_gen == my_turn_gen:
+                turn_running = False
+                turn_running_scope = None
+                turn_running_chat = None
+                turn_running_web_id = None
+                turn_running_cid = None
+                turn_running_qid = None
+                turn_waiting_bg = False
+                turn_waiting_bg_since = None
+                if turn_preempted_gen == my_turn_gen:
+                    turn_preempted_gen = None
+                cancel_requested = False
+        if is_web_turn:
+            _emit_web("aborted", {
+                "conversation_id": conv,
+                "partial_text": "",
+                "reason": pre_start_aborted,
+            })
+        return
 
     def _is_my_turn_preempted():
         with session_lock:
@@ -6078,7 +6338,7 @@ def run_agy(
         # Pre-turn guard: if resuming a heavy session already >= auto_compact_tokens, compact cleanly first!
         if conv and not session_readonly:
             pre_need, pre_stats = should_auto_compact(conv, scope_key=skey)
-            if pre_need and not cancel_requested and not shutting_down:
+            if pre_need and not cancel_requested and not shutting_down and not _is_my_turn_preempted():
                 pre_k = format_tokens_k(pre_stats["raw_ctx_tokens"])
                 log("Pre-turn auto-compact triggered for %s (%s)" % (conv[:8], pre_k))
                 streamer.set_status_override(
@@ -6086,7 +6346,7 @@ def run_agy(
                 )
                 _execute_compact_on_session(
                     exec_skey, conv, mode, active_model, effort, project, workdir,
-                    readonly=session_readonly,
+                    readonly=session_readonly, my_turn_gen=my_turn_gen,
                 )
                 streamer.set_status_override(None)
                 segment_start_line = get_transcript_line_count(conv)
@@ -6099,6 +6359,8 @@ def run_agy(
         watchdog_elapsed_s = 0.0
         empty_pretool_alert_sent = False
         while True:
+            if cancel_requested or shutting_down or _is_my_turn_preempted():
+                break
             attempt_tools = 0
             if active_model not in attempted_models:
                 attempted_models.append(active_model)
@@ -6112,6 +6374,15 @@ def run_agy(
                 exec_skey, conv, mode, active_model, effort, project, workdir,
                 **acq_kw,
             )
+            if cancel_requested or shutting_down or _is_my_turn_preempted():
+                with session_lock:
+                    if _session_pool.get(exec_skey) is sess:
+                        _session_pool.pop(exec_skey, None)
+                try:
+                    sess.close(force=True)
+                except Exception:
+                    pass
+                break
             if sess.cid and sess.cid != conv:
                 conv = sess.cid
                 streamer.set_cid(conv)
@@ -6125,8 +6396,21 @@ def run_agy(
             try:
                 sess.send_user_prompt(effective_prompt)
             except Exception as e:
+                if cancel_requested or shutting_down or _is_my_turn_preempted():
+                    log(
+                        "send_user_prompt interrupted by cancel/preempt/shutdown (reused_warm=%s, model=%s): %s"
+                        % (reused_warm, active_model or "default", e)
+                    )
+                    break
                 log("send_user_prompt failed (reused_warm=%s, model=%s): %s" % (reused_warm, active_model or "default", e))
-                if reused_warm and same_model_retries == 0 and candidate_idx == 0 and not cancel_requested and not shutting_down:
+                if (
+                    reused_warm
+                    and same_model_retries == 0
+                    and candidate_idx == 0
+                    and not cancel_requested
+                    and not shutting_down
+                    and not _is_my_turn_preempted()
+                ):
                     invalidate_session("stdin_broken_pipe", force=True, scope_key=exec_skey)
                     same_model_retries += 1
                     continue
@@ -6520,7 +6804,7 @@ def run_agy(
                     streamer.set_status_override(
                         f"🔄 <b>检测到上游凭证/预压缩瞬时波动，正在自动恢复重试 ({same_model_retries}/{same_model_cap} · {{elapsed}}s)...</b>"
                     )
-                    if not _sleep_interruptible(wait_s):
+                    if not _sleep_interruptible(wait_s, my_turn_gen=my_turn_gen):
                         break
                     if is_summarization_error(err_candidate) and conv:
                         streamer.set_status_override(
@@ -6528,7 +6812,7 @@ def run_agy(
                         )
                         _execute_compact_on_session(
                             exec_skey, conv, mode, active_model, effort, project, workdir,
-                            readonly=session_readonly,
+                            readonly=session_readonly, my_turn_gen=my_turn_gen,
                         )
                     streamer.set_status_override(None)
                     step_buffers.clear()
@@ -7073,16 +7357,21 @@ def run_agy(
             except Exception as ue:
                 log("finalize_turn_undo error: %r" % ue)
         recycle = None
+        was_cancelled_finally = False
         with session_lock:
-            turn_running = False
-            turn_running_scope = None
-            turn_running_chat = None
-            turn_running_web_id = None
-            turn_running_cid = None
-            turn_waiting_bg = False
-            turn_waiting_bg_since = None
-            if turn_preempted_gen == my_turn_gen:
-                turn_preempted_gen = None
+            was_cancelled_finally = bool(cancel_requested)
+            if turn_gen == my_turn_gen:
+                turn_running = False
+                turn_running_scope = None
+                turn_running_chat = None
+                turn_running_web_id = None
+                turn_running_cid = None
+                turn_running_qid = None
+                turn_waiting_bg = False
+                turn_waiting_bg_since = None
+                if turn_preempted_gen == my_turn_gen:
+                    turn_preempted_gen = None
+                cancel_requested = False
             if exec_skey in session_dirty_scopes and exec_skey in _session_pool:
                 recycle = _session_pool.pop(exec_skey, None)
                 session_dirty_scopes.discard(exec_skey)
@@ -7090,7 +7379,7 @@ def run_agy(
             conv_lease.release()
         final_sync_cid = conv or chat_sync_running_cid
         if final_sync_cid:
-            final_sync_status = pending_chat_sync_status or ("aborted" if cancel_requested else "error")
+            final_sync_status = pending_chat_sync_status or ("aborted" if was_cancelled_finally else "error")
             _write_chat_sync_safe(final_sync_cid, final_sync_status)
         if recycle is not None:
             close_session_async(recycle, force=False)
@@ -8028,8 +8317,8 @@ def _summarize_conv_usage(cid, started_ts, skip_steps=0):
     return out
 
 
-def _execute_bus_job(job_id):
-    global turn_running, turn_running_scope, turn_running_chat, cancel_requested, _active_bus_job_id
+def _execute_bus_job(job_id, *, claimed_turn_gen=None, claimed_qid=None):
+    global turn_running, turn_running_scope, turn_running_chat, turn_running_qid, cancel_requested, _active_bus_job_id
     my_handle = _current_bot_handle()
     job = bot_bus.claim_job(job_id, my_handle, os.getpid())
     if not job:
@@ -8223,10 +8512,26 @@ def _execute_bus_job(job_id):
             turn_running = True
             turn_running_scope = f"bus:{job_id}"
             turn_running_chat = mirror_chat or (PRIMARY_CHAT_ID or 0)
-            cancel_requested = False
+            if claimed_qid is not None:
+                turn_running_qid = claimed_qid
+            # Preserve any /cancel signal received after worker() Step W1 pre-claimed this turn.
+            if claimed_turn_gen is None:
+                cancel_requested = False
             _active_bus_job_id = job_id
 
         _publish_bot_heartbeat()
+        if shutting_down or cancel_requested or bot_bus.is_job_cancelled(job_id):
+            aborted_reason = (
+                "shutdown"
+                if shutting_down
+                else ("cancelled_local" if cancel_requested else "cancelled_by_coordinator")
+            )
+            log("Bus job %s cancelled before Popen (reason=%s)" % (job_id, aborted_reason))
+            final_status = "cancelled"
+            err_msg = aborted_reason
+            usage = _summarize_conv_usage(new_cid, started_ts, skip_steps=skip_steps)
+            return
+
         log("Starting Bus job %s (from=@%s, model=%s, cwd=%s, conv=%s)" % (
             job_id, from_bot, exec_model or "default", exec_workdir, (resume_cid or "new")[:8]
         ))
@@ -8406,9 +8711,12 @@ def _execute_bus_job(job_id):
         usage = _summarize_conv_usage(new_cid, started_ts, skip_steps=skip_steps)
     finally:
         with session_lock:
-            turn_running = False
-            turn_running_scope = None
-            turn_running_chat = None
+            if claimed_turn_gen is None or turn_gen == claimed_turn_gen:
+                turn_running = False
+                turn_running_scope = None
+                turn_running_chat = None
+                turn_running_qid = None
+                cancel_requested = False
             _active_bus_job_id = None
 
         delivered_to_group = False
@@ -9427,9 +9735,9 @@ def _studio_ipc_enqueue_turn(req):
     # Put urgent/interrupt turn at the head of the queue BEFORE interrupting the running turn,
     # so the worker picks up this turn immediately after the interrupted turn exits cleanly.
     if priority == "urgent" or interrupt_current:
-        job_q.put_front((0, None, scope_key, ("__WEB_TURN__", web_req)))
+        new_qid = job_q.put_front((0, None, scope_key, ("__WEB_TURN__", web_req)))
     else:
-        job_q.put((0, None, scope_key, ("__WEB_TURN__", web_req)))
+        new_qid = job_q.put((0, None, scope_key, ("__WEB_TURN__", web_req)))
 
     interrupted_turn_id = None
     if interrupt_current and target_abort_tid:
@@ -9445,9 +9753,14 @@ def _studio_ipc_enqueue_turn(req):
             to_kill = None
             aborted_running = False
             with session_lock:
-                if turn_running and (
-                    (turn_running_web_id == target_abort_tid)
-                    or (not turn_running_web_id and cid and turn_running_cid == cid)
+                if (
+                    turn_running
+                    and turn_running_qid != new_qid
+                    and turn_running_web_id != turn_id
+                    and (
+                        (turn_running_web_id == target_abort_tid)
+                        or (not turn_running_web_id and cid and turn_running_cid == cid)
+                    )
                 ):
                     cancel_requested = True
                     target_sk = turn_running_scope
@@ -10401,7 +10714,6 @@ def _resolve_studio_mirror_target():
 
 def _studio_ipc_tg_group_send(req):
     """Mirror an authenticated Web admin message into the whitelisted TG group & enqueue real group turn."""
-    global cancel_requested
     mirror_chat_id, mirror_thread_id = _resolve_studio_mirror_target()
     if not mirror_chat_id or int(mirror_chat_id) >= 0:
         return 400, {"ok": False, "error": "服务端未配置有效的 TG 镜像工作群"}
@@ -10482,22 +10794,23 @@ def _studio_ipc_tg_group_send(req):
             "override_workdir": override_workdir,
         },
     )
-    if priority == "urgent" or interrupt_current:
+    interrupted_current = False
+    if interrupt_current:
+        new_qid, marked_dispatched = job_q.put_front_and_mark_dispatched_preempt(
+            (int(mirror_chat_id), mirror_thread_id, skey, item_payload),
+            skey,
+        )
+        preempted_active, _other_scope_busy, to_kill, _preempted_gen = _preempt_active_turn_for_scope(
+            skey,
+            exclude_qid=new_qid,
+        )
+        if to_kill is not None:
+            close_session_async(to_kill, force=True)
+        interrupted_current = bool(preempted_active or marked_dispatched > 0)
+    elif priority == "urgent":
         job_q.put_front((int(mirror_chat_id), mirror_thread_id, skey, item_payload))
     else:
         job_q.put((int(mirror_chat_id), mirror_thread_id, skey, item_payload))
-
-    interrupted_current = False
-    if interrupt_current:
-        to_kill = None
-        with session_lock:
-            # Only interrupt an active turn belonging to this exact whitelisted TG workgroup scope.
-            if turn_running and turn_running_scope == skey:
-                cancel_requested = True
-                to_kill = _session_pool.pop(skey, None)
-                interrupted_current = True
-        if to_kill is not None:
-            close_session_async(to_kill, force=True)
 
     entry_payload = None
     seq_val = 0
@@ -10529,7 +10842,6 @@ def _studio_ipc_tg_group_send(req):
 
 def _studio_ipc_room_turn(req):
     """Execute a single isolated Web Room turn in `scope_key = room:<room_id>` (zero TG/chat_sync)."""
-    global cancel_requested
     room_id = str(req.get("room_id") or "").strip().lower()
     if not studio_ipc.is_valid_room_id(room_id):
         return 400, {"ok": False, "error": "非法的 room_id 格式"}
@@ -10554,18 +10866,23 @@ def _studio_ipc_room_turn(req):
         "done_ev": done_ev,
         "result_box": result_box,
     }
-    if priority == "urgent" or interrupt_current:
+    interrupted_current = False
+    if interrupt_current:
+        new_qid, marked_dispatched = job_q.put_front_and_mark_dispatched_preempt(
+            (0, None, scope_key, ("__ROOM_TURN__", room_req)),
+            scope_key,
+        )
+        preempted_active, _other_scope_busy, to_kill, _preempted_gen = _preempt_active_turn_for_scope(
+            scope_key,
+            exclude_qid=new_qid,
+        )
+        if to_kill is not None:
+            close_session_async(to_kill, force=True)
+        interrupted_current = bool(preempted_active or marked_dispatched > 0)
+    elif priority == "urgent":
         job_q.put_front((0, None, scope_key, ("__ROOM_TURN__", room_req)))
     else:
         job_q.put((0, None, scope_key, ("__ROOM_TURN__", room_req)))
-    if interrupt_current:
-        to_kill = None
-        with session_lock:
-            if turn_running and turn_running_scope == scope_key:
-                cancel_requested = True
-                to_kill = _session_pool.pop(scope_key, None)
-        if to_kill is not None:
-            close_session_async(to_kill, force=True)
     if not done_ev.wait(timeout=120.0):
         return 504, {"ok": False, "error": "群聊室 Bot 回复超时", "bot": _current_bot_handle()}
     if result_box.get("status") != "done":
@@ -10582,10 +10899,11 @@ def _studio_ipc_room_turn(req):
         "turn_id": turn_id,
         "status": "done",
         "reply": str(result_box.get("reply") or ""),
+        "interrupted_current": interrupted_current,
     }
 
 
-def _execute_room_turn(room_req):
+def _execute_room_turn(room_req, *, claimed_turn_gen=None, claimed_qid=None):
     turn_id = room_req["turn_id"]
     uid = int(room_req["user_id"])
     scope_key = room_req["scope_key"]
@@ -10632,6 +10950,8 @@ def _execute_room_turn(room_req):
             override_project=project,
             override_workdir=override_workdir,
             sync_tg=False,
+            claimed_turn_gen=claimed_turn_gen,
+            claimed_qid=claimed_qid,
         )
         reply_text = "".join(deltas).strip() or final_resp["text"].strip()
         result_box["status"] = final_resp["status"]
@@ -10645,7 +10965,7 @@ def _execute_room_turn(room_req):
         done_ev.set()
 
 
-def _execute_web_turn(web_req):
+def _execute_web_turn(web_req, *, claimed_turn_gen=None, claimed_qid=None):
     turn_id = web_req["turn_id"]
     uid = int(web_req["user_id"])
     scope_key = web_req["scope_key"]
@@ -10677,6 +10997,8 @@ def _execute_web_turn(web_req):
             override_project=project,
             override_workdir=override_workdir,
             sync_tg=(web_req.get("sync_tg") is True),
+            claimed_turn_gen=claimed_turn_gen,
+            claimed_qid=claimed_qid,
         )
     except Exception as exc:
         log("web turn %s failed: %r" % (turn_id, exc))
@@ -10746,8 +11068,11 @@ def _stop_studio_ipc():
 
 
 def worker():
+    global turn_running, turn_running_scope, turn_running_chat, turn_running_web_id, turn_running_cid, turn_running_qid
+    global turn_gen, turn_waiting_bg, turn_waiting_bg_since, turn_preempted_gen, cancel_requested
+
     while True:
-        item = job_q.get()
+        qid, item = job_q.get_entry()
         if isinstance(item, tuple) and len(item) == 4:
             chat_id, thread_id, skey, prompt = item
         else:
@@ -10756,23 +11081,105 @@ def worker():
             skey = scope_key_for(chat_id, None)
 
         if prompt == "__RELOAD__":
-            job_q.task_done()
+            job_q.task_done(qid)
             if perform_hot_reload(notify_chat_id=chat_id, notify_thread_id=thread_id):
                 return
             continue
         is_web_item = isinstance(prompt, tuple) and len(prompt) == 2 and prompt[0] == "__WEB_TURN__"
+        is_chat_item = isinstance(prompt, tuple) and len(prompt) == 2 and prompt[0] == "__CHAT_TURN__"
+        is_compact_item = isinstance(prompt, tuple) and len(prompt) == 2 and prompt[0] == "__COMPACT__"
+        is_bus_item = isinstance(prompt, tuple) and len(prompt) == 2 and prompt[0] == "__BUS_JOB__"
+        is_room_item = isinstance(prompt, tuple) and len(prompt) == 2 and prompt[0] == "__ROOM_TURN__"
+        is_sched_item = isinstance(prompt, tuple) and len(prompt) == 2 and prompt[0] == "__SCHEDULED__"
+
+        # Compute effective claim scope before acquiring session_lock (zero lock nesting with job_q._cond).
+        claim_scope = skey
+        claim_web_id = None
+        if is_chat_item and isinstance(prompt[1], dict):
+            meta_pre = prompt[1]
+            if str(meta_pre.get("user_role") or "admin") == "readonly":
+                ro_uid = meta_pre.get("user_id")
+                claim_scope = f"{skey}:ro:{ro_uid if ro_uid is not None else 'guest'}"
+        elif is_web_item and isinstance(prompt[1], dict):
+            claim_web_id = prompt[1].get("turn_id")
+        elif is_bus_item:
+            claim_scope = f"bus:{prompt[1]}"
+
+        # Step W1 (session_lock ONLY): immediately claim turn_running & turn_gen BEFORE checking
+        # dispatched cancel flags so concurrent /cancel or /urgent is 100% caught on either side.
+        claimed_turn_gen = None
+        with session_lock:
+            turn_gen += 1
+            claimed_turn_gen = turn_gen
+            turn_running = True
+            turn_running_scope = claim_scope
+            turn_running_chat = chat_id
+            turn_running_web_id = claim_web_id
+            turn_running_cid = None
+            turn_running_qid = qid
+            turn_waiting_bg = False
+            turn_waiting_bg_since = None
+            turn_preempted_gen = None
+            cancel_requested = False
+
         try:
-            if isinstance(prompt, tuple) and len(prompt) == 2 and prompt[0] == "__COMPACT__":
-                run_compact(chat_id, instruction=prompt[1], thread_id=thread_id, scope_key=skey)
-            elif isinstance(prompt, tuple) and len(prompt) == 2 and prompt[0] == "__SCHEDULED__":
+            # Step W2 (job_q._cond ONLY): check whether /cancel or /urgent arrived during the
+            # dequeue -> session_lock window and marked this dispatched qid.
+            disp_flag = job_q.consume_dispatched_cancel(qid)
+            if disp_flag is not None:
+                log(
+                    "Worker skipped dispatched job before start (qid=%s, scope=%s, reason=%s)"
+                    % (qid, claim_scope, disp_flag)
+                )
+                if is_web_item and isinstance(prompt[1], dict) and prompt[1].get("turn_id"):
+                    _studio_ipc_buffer.mark_aborted(prompt[1]["turn_id"])
+                    _studio_ipc_buffer.append(
+                        prompt[1]["turn_id"],
+                        "aborted",
+                        {
+                            "conversation_id": prompt[1].get("cid"),
+                            "partial_text": "",
+                            "reason": "preempted" if disp_flag == "preempt" else "cancelled",
+                        },
+                    )
+                elif is_room_item and isinstance(prompt[1], dict):
+                    rb = prompt[1].get("result_box")
+                    if isinstance(rb, dict):
+                        rb["status"] = "aborted"
+                        rb["error"] = "preempted" if disp_flag == "preempt" else "cancelled"
+                    ev = prompt[1].get("done_ev")
+                    if ev is not None:
+                        ev.set()
+                elif is_bus_item and prompt[1]:
+                    try:
+                        bot_bus.finish_job(
+                            prompt[1],
+                            status="cancelled",
+                            result_text="",
+                            error="cancelled_local" if disp_flag == "cancel" else "preempted",
+                        )
+                    except Exception:
+                        pass
+                continue
+
+            if is_compact_item:
+                run_compact(
+                    chat_id,
+                    instruction=prompt[1],
+                    thread_id=thread_id,
+                    scope_key=skey,
+                    claimed_turn_gen=claimed_turn_gen,
+                    claimed_qid=qid,
+                )
+            elif is_sched_item:
                 execute_scheduled_task(prompt[1])
-            elif isinstance(prompt, tuple) and len(prompt) == 2 and prompt[0] == "__BUS_JOB__":
-                _execute_bus_job(prompt[1])
+            elif is_bus_item:
+                _execute_bus_job(prompt[1], claimed_turn_gen=claimed_turn_gen, claimed_qid=qid)
             elif is_web_item:
-                _execute_web_turn(prompt[1])
-            elif isinstance(prompt, tuple) and len(prompt) == 2 and prompt[0] == "__ROOM_TURN__":
-                _execute_room_turn(prompt[1])
-            elif isinstance(prompt, tuple) and len(prompt) == 2 and prompt[0] == "__CHAT_TURN__":
+                _execute_web_turn(prompt[1], claimed_turn_gen=claimed_turn_gen, claimed_qid=qid)
+            elif is_room_item:
+                _execute_room_turn(prompt[1], claimed_turn_gen=claimed_turn_gen, claimed_qid=qid)
+            elif is_chat_item:
                 meta = prompt[1]
                 lb_kind = meta.get("lb_takeover_kind")
                 if lb_kind in ("takeover_ack", "handback"):
@@ -10806,9 +11213,18 @@ def worker():
                     user_id=meta.get("user_id"),
                     override_project=meta.get("override_project"),
                     override_workdir=meta.get("override_workdir"),
+                    claimed_turn_gen=claimed_turn_gen,
+                    claimed_qid=qid,
                 )
             else:
-                run_agy(chat_id, prompt, thread_id=thread_id, scope_key=skey)
+                run_agy(
+                    chat_id,
+                    prompt,
+                    thread_id=thread_id,
+                    scope_key=skey,
+                    claimed_turn_gen=claimed_turn_gen,
+                    claimed_qid=qid,
+                )
         except Exception as e:
             log("worker error: %r" % e)
             if is_web_item and isinstance(prompt[1], dict) and prompt[1].get("turn_id"):
@@ -10838,7 +11254,20 @@ def worker():
                         source_hop=w_hop,
                     )
         finally:
-            job_q.task_done()
+            with session_lock:
+                if claimed_turn_gen is not None and turn_gen == claimed_turn_gen:
+                    turn_running = False
+                    turn_running_scope = None
+                    turn_running_chat = None
+                    turn_running_web_id = None
+                    turn_running_cid = None
+                    turn_running_qid = None
+                    turn_waiting_bg = False
+                    turn_waiting_bg_since = None
+                    if turn_preempted_gen == claimed_turn_gen:
+                        turn_preempted_gen = None
+                    cancel_requested = False
+            job_q.task_done(qid)
             if os.path.exists(RELOAD_TRIGGER):
                 try:
                     os.remove(RELOAD_TRIGGER)
@@ -11106,21 +11535,30 @@ def cancel_current_task(chat_id, clear_all=False, from_native_stop=False, thread
     norm_tid = _normalize_thread_id(thread_id)
     skey = scope_key or scope_key_for(chat_id, norm_tid)
 
-    cancelled = False
+    # Step 1 (under job_q._cond ONLY — never nested with session_lock):
+    # Atomically clear queued items and flag matching `_dispatched` items so any job
+    # popped by `worker()` prior to acquiring `session_lock` is deterministically intercepted.
+    if clear_all:
+        cleared, marked_dispatched = job_q.clear_all_and_mark_dispatched()
+    else:
+        cleared, marked_dispatched = job_q.cancel_scope_and_mark_dispatched(skey)
+    queued_in_scope_before = cleared
+
+    # Step 2 (under session_lock ONLY — never nested with job_q._cond):
+    cancelled_active = False
     to_kill = None
     active_was_other_scope = False
     with session_lock:
         if turn_running:
-            is_same_scope = (turn_running_scope == skey)
-            queued_in_scope = job_q.count_scope(skey)
-            # Cancel active turn if triggered in same scope, clear_all, native Stop, or nothing else in this scope is queued
-            if is_same_scope or clear_all or from_native_stop or queued_in_scope == 0:
+            is_same_scope = _is_same_scope_or_readonly_child(turn_running_scope, skey)
+            # Cancel active turn if triggered in same scope, clear_all, native Stop, or nothing else in this scope was queued
+            if is_same_scope or clear_all or from_native_stop or queued_in_scope_before == 0:
                 cancel_requested = True
                 turn_waiting_bg = False
                 turn_waiting_bg_since = None
                 target_sk = turn_running_scope or skey
                 to_kill = _session_pool.pop(target_sk, None)
-                cancelled = True
+                cancelled_active = True
                 active_was_other_scope = not is_same_scope
             else:
                 active_was_other_scope = True
@@ -11132,21 +11570,125 @@ def cancel_current_task(chat_id, clear_all=False, from_native_stop=False, thread
             send(chat_id, f"cancel failed: {e}", thread_id=norm_tid)
             return
 
-    if clear_all:
-        cleared = job_q.clear_all()
-    else:
-        cleared = job_q.cancel_scope(skey)
-
+    cancelled = cancelled_active or (marked_dispatched > 0)
     if cancelled:
         scope_note = "（跨会话中断正在运行的任务）" if active_was_other_scope else ""
+        rem_q = job_q.qsize()
         extra = f" (已清空 {cleared} 个排队任务)" if cleared else (
-            f" (队列中仍有 {job_q.qsize()} 个其它会话任务)" if job_q.qsize() else ""
+            f" (队列中仍有 {rem_q} 个其它会话任务)" if rem_q else ""
         )
         send(chat_id, f"🛑 已终止当前任务{scope_note}{extra}", thread_id=norm_tid)
     elif cleared:
         send(chat_id, f"🗑 已取消本会话排队中的 {cleared} 个任务。", thread_id=norm_tid)
     elif not from_native_stop:
         send(chat_id, "No running task.", thread_id=norm_tid)
+
+
+def _preempt_active_turn_for_scope(skey, *, exclude_qid=None):
+    """Atomically preempt an active same-scope turn without nesting `job_q._cond`.
+
+    Strictly isolates other scopes (other groups, topics, `bus:*`, `web:*`) and never
+    interrupts the job identified by `exclude_qid`.
+
+    Returns `(preempted_active, other_scope_busy, to_kill, preempted_gen_val)`.
+    """
+    global turn_preempted_gen, turn_waiting_bg, turn_waiting_bg_since
+    preempted_active = False
+    other_scope_busy = False
+    to_kill = None
+    preempted_gen_val = None
+    with session_lock:
+        if turn_running:
+            if exclude_qid is not None and turn_running_qid == exclude_qid:
+                pass
+            elif _is_same_scope_or_readonly_child(turn_running_scope, skey):
+                if turn_preempted_gen != turn_gen and not cancel_requested:
+                    turn_preempted_gen = turn_gen
+                    turn_waiting_bg = False
+                    turn_waiting_bg_since = None
+                    target_sk = turn_running_scope or skey
+                    to_kill = _session_pool.pop(target_sk, None)
+                    preempted_gen_val = turn_gen
+                    preempted_active = True
+                else:
+                    preempted_gen_val = turn_gen
+                    preempted_active = True
+            else:
+                other_scope_busy = True
+    return preempted_active, other_scope_busy, to_kill, preempted_gen_val
+
+
+def _handle_preempt_callback(cb_id, chat_id, thread_id, skey, msg_id, target_qid):
+    """Handle `action:preempt:<qid>` inline-keyboard click (admin-only, scope-verified, idempotent)."""
+    norm_tid = _normalize_thread_id(thread_id)
+    in_flood = _tg_flood_remaining(chat_id) > 0
+
+    def _answer(text, *, show_alert=False):
+        if _tg_flood_remaining(chat_id) > 0:
+            return
+        tg("answerCallbackQuery", callback_query_id=cb_id, text=text, show_alert=show_alert)
+
+    clean_qid = str(target_qid or "").strip()
+    if not clean_qid:
+        _answer("任务标识无效或已过期", show_alert=True)
+        return
+
+    promoted, marked_dispatched, reason = job_q.promote_to_front_and_mark_dispatched_preempt(
+        clean_qid,
+        skey,
+        claim_once=True,
+        mark_dispatched=True,
+    )
+    if not promoted:
+        if reason == "already_claimed":
+            _answer("⚡ 该任务已在插队处理中")
+        else:
+            _answer("ℹ️ 该任务已开始执行、已取消或已过期")
+            if msg_id and reason == "missing_or_started" and not in_flood:
+                tg(
+                    "editMessageReplyMarkup",
+                    chat_id=chat_id,
+                    message_id=msg_id,
+                    reply_markup={"inline_keyboard": []},
+                )
+        return
+
+    preempted_active, other_scope_busy, to_kill, preempted_gen_val = _preempt_active_turn_for_scope(
+        skey,
+        exclude_qid=clean_qid,
+    )
+    if to_kill is not None:
+        close_session_async(to_kill, force=True)
+
+    if msg_id and not in_flood:
+        tg(
+            "editMessageReplyMarkup",
+            chat_id=chat_id,
+            message_id=msg_id,
+            reply_markup={"inline_keyboard": []},
+        )
+
+    if preempted_active or marked_dispatched > 0:
+        log(
+            "Card preempt promoted qid=%s (scope=%s, gen=%s, marked_dispatched=%d)"
+            % (clean_qid, skey, preempted_gen_val, marked_dispatched)
+        )
+        _answer("⚡ 已中断当前任务，正在优先执行该条")
+        send(
+            chat_id,
+            "⚡ 已中断当前任务，正在优先执行选中的排队任务。",
+            thread_id=norm_tid,
+        )
+    elif other_scope_busy:
+        log("Card preempt promoted qid=%s to front while other scope busy (scope=%s)" % (clean_qid, skey))
+        _answer("⚡ 其他会话占用中，已置顶排队（未中断其他会话）")
+        send(
+            chat_id,
+            "⚡ 其他会话正在占用执行，已将该任务置顶排队（未中断其他会话），待当前会话结束后立即优先执行。",
+            thread_id=norm_tid,
+        )
+    else:
+        _answer("⚡ 已置顶，即将立即执行")
 
 
 # ---------------------------------------------------------------- keyboard builders
@@ -15212,6 +15754,19 @@ def handle_callback(cb):
     elif data.startswith("group:"):
         _handle_group_callback(cb_id, chat_id, thread_id, skey, msg_id, data, from_user=from_user)
 
+    elif data.startswith("action:preempt:"):
+        if role != "admin":
+            if _tg_flood_remaining(chat_id) <= 0:
+                tg(
+                    "answerCallbackQuery",
+                    callback_query_id=cb_id,
+                    text=access_control.format_rbac_denied_message(data, is_callback=True),
+                    show_alert=True,
+                )
+            return
+        target_qid = data[len("action:preempt:"):].strip()
+        _handle_preempt_callback(cb_id, chat_id, thread_id, skey, msg_id, target_qid)
+
     elif data == "action:cancel":
         if role != "admin":
             tg(
@@ -16028,10 +16583,41 @@ _KNOWN_BRIDGE_COMMANDS = frozenset({
     "/files", "/get",
     "/mode",
     "/reload",
+    "/urgent",
     "/cancel", "/stop",
     "/status",
     "/start", "/help",
 })
+
+
+def _parse_urgent_bang(text, *, chat_id=None):
+    """Parse explicit `! <msg>` or `@my_handle ! <msg>` urgent-preempt shortcut.
+
+    Returns extracted non-empty message body `str`, or `None` if `text` is not a
+    valid urgent bang shortcut for this bot.
+    - Requires ASCII `!` followed by >= 1 whitespace char and non-empty body.
+    - Rejects `!`, `!!!`, `!?`, `!   `, `!无空格`, and `@bot_two ! <msg>`.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    body_text = raw
+    if body_text.startswith("@"):
+        m_at = re.match(r"^@([A-Za-z0-9_]{3,32})[\s,:;]+(!.*)$", body_text, flags=re.DOTALL)
+        if not m_at:
+            return None
+        my_handle = bot_bus.normalize_handle(_current_bot_handle())
+        mention_h = bot_bus.normalize_handle(m_at.group(1))
+        if not my_handle or mention_h != my_handle:
+            return None
+        body_text = m_at.group(2)
+    m_bang = re.match(r"^!\s+(.+)$", body_text, flags=re.DOTALL)
+    if not m_bang:
+        return None
+    urgent_body = m_bang.group(1).strip()
+    if not urgent_body:
+        return None
+    return urgent_body
 
 
 def _parse_slash_command(text, *, chat_id=None):
@@ -16219,6 +16805,36 @@ def handle_message(msg):
                 job_q.put((chat_id, thread_id, skey, "__RELOAD__"))
             else:
                 perform_hot_reload(notify_chat_id=chat_id, notify_thread_id=thread_id)
+        elif cmd == "/urgent":
+            if role != "admin":
+                send(
+                    chat_id,
+                    access_control.format_rbac_denied_message(cmd),
+                    parse_mode="HTML",
+                    thread_id=thread_id,
+                )
+                return
+            urgent_body = (raw_rest or "").strip()
+            if not urgent_body:
+                send(
+                    chat_id,
+                    "⚡ <b>用法：</b><code>/urgent &lt;紧急指令&gt;</code> 或 <code>! &lt;紧急指令&gt;</code>\n"
+                    "<i>将中断当前会话正在执行的任务并立即优先执行你的紧急指令（不影响其他群/话题，且保留原有排队任务）。</i>",
+                    parse_mode="HTML",
+                    thread_id=thread_id,
+                )
+                return
+            full_prompt = _apply_reply_context(urgent_body, msg)
+            enqueue_urgent(
+                chat_id,
+                full_prompt,
+                thread_id=thread_id,
+                scope_key=skey,
+                origin_msg_id=msg_id,
+                chain_id=chain_id,
+                user_role=role,
+                user_id=access_control.extract_user_id(from_user),
+            )
         elif cmd in ("/cancel", "/stop"):
             if role != "admin":
                 send(
@@ -16251,6 +16867,7 @@ def handle_message(msg):
                      "/browser — Live-Browser 浏览器多指纹控制面板\n"
                      "/status — 查看当前主控状态、Scope 与在线队员数\n"
                      "/new — 清空本群/当前 Topic 主控上下文（不影响私聊）\n"
+                     "/urgent &lt;内容&gt; 或 ! &lt;内容&gt; — 中断当前同会话任务并立刻优先执行（管理员）\n"
                      "/cancel [all] — 中止当前群内正在运行的任务\n\n"
                      "<i>私聊各 Bot 仍保留全部个人指令与独立上下文；其余单机高阶指令（如 /undo、/model fallback、/cost）在群里手动输入也可直接调用。</i>",
                      parse_mode="HTML", thread_id=thread_id)
@@ -16289,12 +16906,36 @@ def handle_message(msg):
                  "/get &lt;name&gt; — download file or view photo\n"
                  "/mode auto|safe — tool permission mode\n"
                  "/reload — gracefully reload bridge without dropping jobs\n"
+                 "/urgent &lt;msg&gt; or ! &lt;msg&gt; — interrupt active same-scope turn &amp; run immediately\n"
                  "/cancel [all] — kill running task &amp; optionally clear queue\n\n"
                  "<i>Send documents/photos (single or album) to automatically load them into the workspace.</i>",
                  parse_mode="HTML", thread_id=thread_id)
         else:
             send(chat_id, f"ℹ️ 未知桥接命令 <code>{html_mod.escape(cmd)}</code>（输入 <code>/help</code> 查看可用命令）",
                  parse_mode="HTML", thread_id=thread_id)
+        return
+
+    urgent_bang_body = _parse_urgent_bang(text, chat_id=chat_id)
+    if urgent_bang_body is not None:
+        if role != "admin":
+            send(
+                chat_id,
+                access_control.format_rbac_denied_message("/urgent"),
+                parse_mode="HTML",
+                thread_id=thread_id,
+            )
+            return
+        full_prompt = _apply_reply_context(urgent_bang_body, msg)
+        enqueue_urgent(
+            chat_id,
+            full_prompt,
+            thread_id=thread_id,
+            scope_key=skey,
+            origin_msg_id=msg_id,
+            chain_id=chain_id,
+            user_role=role,
+            user_id=access_control.extract_user_id(from_user),
+        )
         return
 
     full_prompt = _apply_reply_context(text, msg)
@@ -16309,6 +16950,88 @@ def handle_message(msg):
         user_role=role,
         user_id=access_control.extract_user_id(from_user),
     )
+
+
+def enqueue_urgent(
+    chat_id,
+    prompt,
+    thread_id=None,
+    scope_key=None,
+    *,
+    origin_msg_id=0,
+    mention_hop=0,
+    chain_id="",
+    user_role="admin",
+    user_id=None,
+):
+    """Explicit admin urgent preemption (`/urgent <msg>` / `! <msg>`).
+
+    - Fail-closed if `user_role != "admin"`.
+    - Never nests `job_q._cond` and `session_lock`.
+    - Atomically inserts urgent item at queue head (`put_front`) and marks any same-scope
+      dispatched item (closing the dequeue->run_agy race window), then preempts any active
+      same-scope turn (even when `turn_waiting_bg=False`) without touching other scopes.
+    """
+    norm_tid = _normalize_thread_id(thread_id)
+    skey = scope_key or scope_key_for(chat_id, norm_tid)
+
+    if user_role != "admin":
+        send(
+            chat_id,
+            access_control.format_rbac_denied_message("/urgent"),
+            parse_mode="HTML",
+            thread_id=norm_tid,
+        )
+        return None
+
+    if origin_msg_id or mention_hop or chain_id or user_id is not None:
+        item_payload = (
+            "__CHAT_TURN__",
+            {
+                "prompt": prompt,
+                "origin_msg_id": int(origin_msg_id or 0),
+                "mention_hop": int(mention_hop or 0),
+                "chain_id": str(chain_id or ""),
+                "user_role": "admin",
+                "user_id": user_id,
+            },
+        )
+    else:
+        item_payload = prompt
+
+    urgent_qid, marked_dispatched = job_q.put_front_and_mark_dispatched_preempt(
+        (chat_id, norm_tid, skey, item_payload),
+        skey,
+    )
+
+    preempted_active, other_scope_busy, to_kill, preempted_gen_val = _preempt_active_turn_for_scope(
+        skey,
+        exclude_qid=urgent_qid,
+    )
+
+    if to_kill is not None:
+        close_session_async(to_kill, force=True)
+
+    if preempted_active or marked_dispatched > 0:
+        log(
+            "Explicit urgent preemption (scope=%s, qid=%s, gen=%s, marked_dispatched=%d)"
+            % (skey, urgent_qid, preempted_gen_val, marked_dispatched)
+        )
+        send(
+            chat_id,
+            "⚡ 已中断当前任务，正在优先处理你的紧急指令（其余排队任务保持原顺序）。",
+            thread_id=norm_tid,
+            reply_to_message_id=origin_msg_id or None,
+        )
+    elif other_scope_busy:
+        log("Explicit urgent queued at front while other scope busy (scope=%s, qid=%s)" % (skey, urgent_qid))
+        send(
+            chat_id,
+            "⚡ 其他会话正在占用执行，已将你的紧急任务置顶排队（未中断其他会话），待当前会话结束后立即优先执行。",
+            thread_id=norm_tid,
+            reply_to_message_id=origin_msg_id or None,
+        )
+    return urgent_qid
 
 
 def enqueue(
@@ -16420,12 +17143,35 @@ def enqueue(
                 ).start()
                 return
 
-        if pending or busy:
-            cancel_kb = (
-                {"inline_keyboard": [[{"text": "🛑 终止当前任务", "callback_data": "action:cancel"}]]}
-                if user_role == "admin"
-                else None
+        enq_prompt = prompt
+        if origin_msg_id or mention_hop or chain_id or user_role != "admin" or user_id is not None:
+            item_payload = (
+                "__CHAT_TURN__",
+                {
+                    "prompt": enq_prompt,
+                    "origin_msg_id": int(origin_msg_id or 0),
+                    "mention_hop": int(mention_hop or 0),
+                    "chain_id": str(chain_id or ""),
+                    "user_role": str(user_role or "admin"),
+                    "user_id": user_id,
+                },
             )
+        else:
+            item_payload = enq_prompt
+
+        # Put into job_q BEFORE sending the queued notice so we have a real `qid`
+        # for the `action:preempt:<qid>` inline button (admin-only, <= 64 bytes).
+        qid = job_q.put((chat_id, norm_tid, skey, item_payload))
+
+        if pending or busy:
+            queue_kb = None
+            if user_role == "admin":
+                rows = []
+                preempt_cb = f"action:preempt:{qid}" if qid else ""
+                if preempt_cb and len(preempt_cb.encode("utf-8")) <= 64:
+                    rows.append([{"text": "⚡ 中断当前并立即执行这条", "callback_data": preempt_cb}])
+                rows.append([{"text": "🛑 终止当前任务", "callback_data": "action:cancel"}])
+                queue_kb = {"inline_keyboard": rows}
             if (chat_id and int(chat_id) < 0) or BUS_CHAT_MODE == "conversational":
                 if busy_desc:
                     q_text = (
@@ -16440,11 +17186,11 @@ def enqueue(
                     q_text,
                     thread_id=norm_tid,
                     reply_to_message_id=origin_msg_id or None,
-                    reply_markup=cancel_kb,
+                    reply_markup=queue_kb,
                 )
             else:
                 q_hint = (
-                    "📋 Queued (position %d) — starts right after current turn (/cancel to interrupt)" % (pending + 1)
+                    "📋 Queued (position %d) — starts right after current turn (/urgent or /cancel to interrupt)" % (pending + 1)
                     if user_role == "admin"
                     else "📋 Queued (position %d) — starts right after current turn" % (pending + 1)
                 )
@@ -16452,25 +17198,9 @@ def enqueue(
                     chat_id,
                     q_hint,
                     thread_id=norm_tid,
-                    reply_markup=cancel_kb,
+                    reply_markup=queue_kb,
                 )
-        enq_prompt = prompt
-
-    if origin_msg_id or mention_hop or chain_id or user_role != "admin" or user_id is not None:
-        item_payload = (
-            "__CHAT_TURN__",
-            {
-                "prompt": enq_prompt,
-                "origin_msg_id": int(origin_msg_id or 0),
-                "mention_hop": int(mention_hop or 0),
-                "chain_id": str(chain_id or ""),
-                "user_role": str(user_role or "admin"),
-                "user_id": user_id,
-            },
-        )
-    else:
-        item_payload = enq_prompt
-    job_q.put((chat_id, norm_tid, skey, item_payload))
+        return qid
 
 
 def handle_voice(msg):
