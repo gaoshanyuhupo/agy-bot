@@ -45,6 +45,7 @@ PROTECTED_FILES: Tuple[str, ...] = (
 BRIDGE_TEST_FILES: Tuple[str, ...] = (
     "tests/test_access_control.py",
     "tests/test_agy_auto_update_guard.py",
+    "tests/test_benchmark_digest.py",
     "tests/test_bridge_anti_hang.py",
     "tests/test_bridge_core.py",
     "tests/test_bridge_p0.py",
@@ -56,10 +57,12 @@ BRIDGE_TEST_FILES: Tuple[str, ...] = (
     "tests/test_queue_persistence_and_rollback.py",
     "tests/test_scheduler.py",
     "tests/test_memory_guard_and_dream.py",
+    "tests/test_taint_outbound_guard.py",
 )
 
 SECURITY_TEST_FILES: Tuple[str, ...] = (
     "tests/test_security_audit_webui.py",
+    "tests/test_taint_outbound_guard.py",
     "tests/test_verify_gate.py",
 )
 
@@ -226,9 +229,19 @@ def collect_scope_py_files(root: Path, scope: str) -> List[str]:
         files.extend(_existing_rel_files(root, ["tests/test_browser_panel.py"]))
     elif scope == "bridge":
         files.extend(_iter_py_under(root, "bridge"))
-        files.extend(_existing_rel_files(root, ["scripts/agy_cli_upgrade.py"]))
+        files.extend(_iter_py_under(root, "hooks"))
+        files.extend(
+            _existing_rel_files(
+                root,
+                [
+                    "scripts/agy_cli_upgrade.py",
+                    "scripts/benchmark_digest.py",
+                ],
+            )
+        )
         files.extend(_existing_rel_files(root, BRIDGE_TEST_FILES))
     elif scope == "security":
+        files.extend(_iter_py_under(root, "hooks"))
         files.extend(
             _existing_rel_files(
                 root,

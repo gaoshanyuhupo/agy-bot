@@ -54,10 +54,14 @@ class TestGroupChatBus(unittest.TestCase):
             "AGY_TG_ALLOWED_CHATS": "-1001234567890",
             "AGY_TG_BOT_TOKEN": "1234567890:EXAMPLE_TOKEN_FOR_TEST_ONLY",
             "AGY_TG_ENV_FILE": os.path.join(tmp, "nonexistent.env"),
+            "AGY_TG_BOT_MODEL": "",
             "AGY_TG_BOT_EFFORT": "",
             "AGY_BOT_CHAIN": "",
             "AGY_BOT_ORIGIN_MSG_ID": "0",
             "AGY_BOT_MENTION_HOP": "0",
+            "AGY_UNTRUSTED_SESSION": "",
+            "AGY_MEMORY_READONLY": "",
+            "AGY_INTERNAL_OBSERVER": "",
         }
         if extra_env:
             env_patch.update(extra_env)
@@ -1223,6 +1227,109 @@ class TestGroupChatBus(unittest.TestCase):
                 with bridge_coord.session_lock:
                     bridge_coord.turn_running = False
                     bridge_coord.turn_running_scope = None
+
+    def test_scheduled_handoff_anti_truncation_2500_5200_and_legacy_compat_c2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge_sender = self._load_bridge(
+                tmp,
+                {"AGY_BOT_HANDLE": "bot_two", "AGY_BOT_BUS_ROLE": "worker"},
+            )
+            bridge_sender.BOT_META.update({"bot_id": 222, "handle": "bot_two", "resolved": True})
+            bridge_sender.bot_bus.heartbeat_bot(
+                {"handle": "bot_one", "pid": os.getpid(), "role": "coordinator", "allowed_chats": [-1001234567890]}
+            )
+            bridge_sender.bot_bus.heartbeat_bot(
+                {"handle": "bot_two", "pid": os.getpid(), "role": "worker", "allowed_chats": [-1001234567890]}
+            )
+
+            # 1. 2500-char body -> NOT truncated (truncated=False, full_len=2500), group_history excerpt stays <=500
+            body_2500 = ("A" * 2480) + "TAIL_END_2500_MARKER"
+            self.assertEqual(2500, len(body_2500))
+            bridge_sender._deliver_scheduled_group_handoff(
+                target_chat=-1001234567890,
+                target_thread=None,
+                sent_mid=9101,
+                clean_text=body_2500,
+                task_id="t-len-2500",
+                task_name="Digest2500",
+                handoff_bot="@bot_one",
+                has_no_handoff=False,
+            )
+
+            # 2. 5200-char body -> truncated to 4000 (truncated=True, full_len=5200)
+            body_5200 = ("B" * 5180) + "TAIL_END_5200_MARKER"
+            self.assertEqual(5200, len(body_5200))
+            bridge_sender._deliver_scheduled_group_handoff(
+                target_chat=-1001234567890,
+                target_thread=None,
+                sent_mid=9102,
+                clean_text=body_5200,
+                task_id="t-len-5200",
+                task_name="Digest5200",
+                handoff_bot="@bot_one",
+                has_no_handoff=False,
+            )
+
+            # Verify group_history ledger preserved 500-char text_excerpt invariant + full_text
+            ledger = bridge_sender.bot_bus.get_unseen_group_history(-1001234567890, "bot_one", advance_cursor=False)
+            self.assertEqual(2, len(ledger))
+            self.assertEqual(500, len(ledger[0]["text_excerpt"]))
+            self.assertEqual(500, len(ledger[1]["text_excerpt"]))
+            self.assertIn("TAIL_END_5200_MARKER", ledger[1]["full_text"])
+
+            pkts = bridge_sender.bot_bus.pop_inbox_packets("bot_one")
+            self.assertEqual(2, len(pkts))
+            pkt_2500, pkt_5200 = pkts[0], pkts[1]
+
+            self.assertFalse(pkt_2500["truncated"])
+            self.assertEqual(2500, pkt_2500["full_len"])
+            self.assertEqual(2500, len(pkt_2500["text_excerpt"]))
+            self.assertIn("TAIL_END_2500_MARKER", pkt_2500["text_excerpt"])
+
+            self.assertTrue(pkt_5200["truncated"])
+            self.assertEqual(5200, pkt_5200["full_len"])
+            self.assertEqual(4000, len(pkt_5200["text_excerpt"]))
+            self.assertNotIn("TAIL_END_5200_MARKER", pkt_5200["text_excerpt"])
+
+            # 3. Receiver `_handle_bot_bus_packet`: 2500 no trunc hint, 5200 hints group_history + msg_id,
+            #    legacy packet (no full_len / truncated keys) works without error or false truncation notice.
+            bridge_rx = self._load_bridge(
+                tmp,
+                {"AGY_BOT_HANDLE": "bot_one", "AGY_BOT_BUS_ROLE": "coordinator"},
+            )
+            bridge_rx.BOT_META.update({"bot_id": 111, "handle": "bot_one", "resolved": True})
+
+            legacy_pkt = {
+                "type": "scheduled_handoff",
+                "from_bot": "bot_two",
+                "to_bot": "bot_one",
+                "chat_id": -1001234567890,
+                "thread_id": None,
+                "msg_id": 9103,
+                "task_id": "t-legacy",
+                "task_name": "LegacyWatch",
+                "text_excerpt": "Legacy payload body",
+                "created_at": time.time(),
+            }
+            for pkt in (pkt_2500, pkt_5200, legacy_pkt):
+                bridge_rx._handle_bot_bus_packet(pkt)
+
+            prompts = []
+            while not bridge_rx.job_q.empty():
+                item = bridge_rx.job_q.get()
+                prompts.append(item[3][1]["prompt"])
+                bridge_rx.job_q.task_done()
+            self.assertEqual(3, len(prompts))
+
+            self.assertIn("TAIL_END_2500_MARKER", prompts[0])
+            self.assertNotIn("group_history", prompts[0])
+
+            self.assertIn("4000/5200", prompts[1])
+            self.assertIn("group_history", prompts[1])
+            self.assertIn("msg_id=9102", prompts[1])
+
+            self.assertIn("Legacy payload body", prompts[2])
+            self.assertNotIn("group_history", prompts[2])
 
 
 class TestModelSelectionAndFollowSync(unittest.TestCase):

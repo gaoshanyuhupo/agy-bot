@@ -29,6 +29,9 @@ except ImportError:
 
 DEFAULT_SINCE_HOURS = 168
 DEFAULT_MAX_ITEMS = 10
+COMPACT_MAX_ITEMS = 3
+DEFAULT_RELEASE_SUMMARY_LIMIT = 260
+COMPACT_RELEASE_SUMMARY_LIMIT = 140
 MAX_SEEN_RELEASES = 100
 MAX_SEEN_PRS = 200
 MAX_SEEN_COMMITS = 200
@@ -208,7 +211,7 @@ def collect_repo_snapshot(
     }
 
 
-def _summarize_release(rel: Dict[str, Any]) -> Dict[str, Any]:
+def _summarize_release(rel: Dict[str, Any], *, summary_limit: int = DEFAULT_RELEASE_SUMMARY_LIMIT) -> Dict[str, Any]:
     pub = str(rel.get("published_at") or rel.get("created_at") or "")
     tag = sanitize_untrusted_text(rel.get("tag_name") or "", limit=80)
     name = sanitize_untrusted_text(rel.get("name") or tag or "", limit=140)
@@ -219,22 +222,22 @@ def _summarize_release(rel: Dict[str, Any]) -> Dict[str, Any]:
         "prerelease": bool(rel.get("prerelease")),
         "published_at": pub,
         "html_url": sanitize_untrusted_text(rel.get("html_url") or "", limit=240),
-        "summary": sanitize_untrusted_text(rel.get("body") or "", limit=260),
+        "summary": sanitize_untrusted_text(rel.get("body") or "", limit=max(1, int(summary_limit))),
     }
 
 
-def _summarize_merged_pr(pr: Dict[str, Any]) -> Dict[str, Any]:
+def _summarize_merged_pr(pr: Dict[str, Any], *, title_limit: int = 180) -> Dict[str, Any]:
     author = ((pr.get("user") or {}).get("login")) or "unknown"
     return {
         "number": pr.get("number"),
-        "title": sanitize_untrusted_text(pr.get("title") or "", limit=180),
+        "title": sanitize_untrusted_text(pr.get("title") or "", limit=max(1, int(title_limit))),
         "author": sanitize_untrusted_text(author, limit=80),
         "merged_at": str(pr.get("merged_at") or ""),
         "html_url": sanitize_untrusted_text(pr.get("html_url") or "", limit=240),
     }
 
 
-def _summarize_commit(cm: Dict[str, Any]) -> Dict[str, Any]:
+def _summarize_commit(cm: Dict[str, Any], *, message_limit: int = 180) -> Dict[str, Any]:
     sha = str(cm.get("sha") or "")
     commit_obj = cm.get("commit") or {}
     msg_line = str(commit_obj.get("message") or "").splitlines()[0] if commit_obj.get("message") else ""
@@ -254,7 +257,7 @@ def _summarize_commit(cm: Dict[str, Any]) -> Dict[str, Any]:
         "short_sha": sha[:8],
         "author": sanitize_untrusted_text(author, limit=80),
         "date": date_str,
-        "message": sanitize_untrusted_text(msg_line, limit=180),
+        "message": sanitize_untrusted_text(msg_line, limit=max(1, int(message_limit))),
         "html_url": sanitize_untrusted_text(cm.get("html_url") or "", limit=240),
     }
 
@@ -267,11 +270,15 @@ def compute_repo_delta_and_state(
     since_cutoff: datetime.datetime,
     max_items: int = DEFAULT_MAX_ITEMS,
     checked_at: str = "",
+    compact: bool = False,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Compute incremental delta and updated bounded per-repo state."""
     repo = target["repo"]
     repo_data = snapshot["repo"]
     prev = prev_repo_state or {}
+
+    rel_summary_limit = COMPACT_RELEASE_SUMMARY_LIMIT if compact else DEFAULT_RELEASE_SUMMARY_LIMIT
+    item_text_limit = 120 if compact else 180
 
     prev_rel_ids = {str(k): str(v) for k, v in (prev.get("seen_release_ids") or {}).items()}
     prev_pr_nums = {str(k): str(v) for k, v in (prev.get("seen_merged_prs") or {}).items()}
@@ -289,7 +296,7 @@ def compute_repo_delta_and_state(
         curr_rel_ids[rid_str] = pub
         if rid_str not in prev_rel_ids and _within_cutoff(pub, since_cutoff):
             if len(new_releases) < max_items:
-                new_releases.append(_summarize_release(rel))
+                new_releases.append(_summarize_release(rel, summary_limit=rel_summary_limit))
 
     new_merged_prs: List[Dict[str, Any]] = []
     curr_pr_nums: Dict[str, str] = {}
@@ -302,7 +309,7 @@ def compute_repo_delta_and_state(
         curr_pr_nums[num_str] = merged_at
         if num_str not in prev_pr_nums and _within_cutoff(merged_at, since_cutoff):
             if len(new_merged_prs) < max_items:
-                new_merged_prs.append(_summarize_merged_pr(pr))
+                new_merged_prs.append(_summarize_merged_pr(pr, title_limit=item_text_limit))
 
     new_commits: List[Dict[str, Any]] = []
     curr_commit_shas: List[str] = []
@@ -311,7 +318,7 @@ def compute_repo_delta_and_state(
         if not sha:
             continue
         curr_commit_shas.append(sha)
-        summary = _summarize_commit(cm)
+        summary = _summarize_commit(cm, message_limit=item_text_limit)
         if sha not in prev_commit_set and _within_cutoff(summary["date"], since_cutoff):
             if len(new_commits) < max_items:
                 new_commits.append(summary)
@@ -368,16 +375,18 @@ def format_digest_text(
     *,
     total_repos: int,
     since_hours: int,
+    compact: bool = False,
 ) -> str:
     """Format multi-repo upstream benchmark digest or `[SILENT]` when empty."""
     active_deltas = [d for d in deltas if d.get("has_changes")]
     if not active_deltas and not errors:
         return "[SILENT]"
 
+    compact_flag = " compact=1" if compact else ""
     lines = [
         (
             f"[BENCHMARK_DIGEST_DELTA repos={total_repos} active={len(active_deltas)} "
-            f"errors={len(errors)} since_hours={since_hours}]"
+            f"errors={len(errors)} since_hours={since_hours}{compact_flag}]"
         ),
         repo_watch.UNTRUSTED_WARNING,
     ]
@@ -385,6 +394,21 @@ def format_digest_text(
     for d in active_deltas:
         cat_part = f" [{d['category']}]" if d.get("category") else ""
         note_part = f" — {d['note']}" if d.get("note") else ""
+        if compact:
+            lines.append(f"\n## {d['repo']}{cat_part} ({d['default_branch']}, ★{d['stars']})")
+            for rel in d.get("releases") or []:
+                pre_tag = " [pre]" if rel.get("prerelease") else ""
+                date_part = str(rel.get("published_at") or "")[:10]
+                lines.append(f"- Rel {rel['tag_name']}{pre_tag} ({date_part}) {rel['html_url']}")
+                if rel.get("summary"):
+                    summary_txt = sanitize_untrusted_text(rel["summary"], limit=COMPACT_RELEASE_SUMMARY_LIMIT)
+                    lines.append(f"  {summary_txt}")
+            for pr in d.get("merged_prs") or []:
+                lines.append(f"- PR #{pr['number']} {pr['title']} (@{pr['author']}) {pr['html_url']}")
+            for cm in d.get("commits") or []:
+                lines.append(f"- {cm['short_sha']} {cm['message']} (@{cm['author']})")
+            continue
+
         lines.append(
             f"\n## {d['repo']}{cat_part} (branch={d['default_branch']}, stars={d['stars']}){note_part}"
         )
@@ -416,12 +440,20 @@ def format_digest_text(
     return "\n".join(lines)
 
 
+def resolve_effective_max_items(max_items: Optional[int], *, compact: bool = False) -> int:
+    """Resolve effective max-items limit (`--compact` defaults to 3; explicit value always wins)."""
+    if max_items is None:
+        return COMPACT_MAX_ITEMS if compact else DEFAULT_MAX_ITEMS
+    return int(max_items)
+
+
 def run_digest(
     targets: Sequence[Dict[str, str]],
     *,
     state_file: Path,
     since_hours: int = DEFAULT_SINCE_HOURS,
-    max_items: int = DEFAULT_MAX_ITEMS,
+    max_items: Optional[int] = None,
+    compact: bool = False,
     seed: bool = False,
     verbose_seed: bool = False,
     first_run_silent: bool = False,
@@ -429,11 +461,12 @@ def run_digest(
     now: Optional[datetime.datetime] = None,
 ) -> Tuple[int, str]:
     """Execute one upstream benchmark digest cycle across all target repos."""
+    eff_max_items = resolve_effective_max_items(max_items, compact=compact)
     if not targets:
         raise ValueError("Target repository list must not be empty")
     if since_hours <= 0:
         raise ValueError("--since-hours must be > 0")
-    if max_items < 1:
+    if eff_max_items < 1:
         raise ValueError("--max-items must be >= 1")
 
     now_utc = (now or datetime.datetime.now(datetime.timezone.utc)).astimezone(datetime.timezone.utc)
@@ -453,14 +486,15 @@ def run_digest(
         repo = target["repo"]
         prev_repo_state = prev_repos.get(repo) if isinstance(prev_repos, dict) else None
         try:
-            snapshot = collect_repo_snapshot(repo, since_cutoff=since_cutoff, max_items=max_items)
+            snapshot = collect_repo_snapshot(repo, since_cutoff=since_cutoff, max_items=eff_max_items)
             delta, next_repo_state = compute_repo_delta_and_state(
                 target,
                 snapshot,
                 prev_repo_state if isinstance(prev_repo_state, dict) else None,
                 since_cutoff=since_cutoff,
-                max_items=max_items,
+                max_items=eff_max_items,
                 checked_at=checked_at,
+                compact=compact,
             )
             next_repos[repo] = next_repo_state
             deltas.append(delta)
@@ -547,6 +581,7 @@ def run_digest(
         errors,
         total_repos=len(targets),
         since_hours=since_hours,
+        compact=compact,
     )
 
 
@@ -565,8 +600,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-items",
         type=int,
-        default=DEFAULT_MAX_ITEMS,
-        help=f"Max items per category per repo (default: {DEFAULT_MAX_ITEMS})",
+        default=None,
+        help=(
+            f"Max items per category per repo (default: {DEFAULT_MAX_ITEMS}, "
+            f"or {COMPACT_MAX_ITEMS} when --compact is set)"
+        ),
+    )
+    parser.add_argument(
+        "--compact",
+        action="store_true",
+        help=f"Emit compact digest (default max-items={COMPACT_MAX_ITEMS}, release summary <= {COMPACT_RELEASE_SUMMARY_LIMIT} chars)",
     )
     parser.add_argument("--seed", action="store_true", help="Record baseline state without emitting digest")
     parser.add_argument("--verbose-seed", action="store_true", help="Print baseline summary when --seed is set")
@@ -595,6 +638,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             state_file=state_path,
             since_hours=args.since_hours,
             max_items=args.max_items,
+            compact=bool(args.compact),
             seed=bool(args.seed),
             verbose_seed=bool(args.verbose_seed),
             first_run_silent=bool(args.first_run_silent),

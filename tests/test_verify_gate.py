@@ -86,6 +86,8 @@ class TestVerifyGate(unittest.TestCase):
                 ".agents/skills/google-profile/scripts/google_browser.py",
                 "bridge/bridge.py",
                 "bridge/memory_guard.py",
+                "hooks/taint_outbound_guard.py",
+                "scripts/benchmark_digest.py",
                 "scripts/security_audit.py",
                 "scripts/verify_gate.py",
                 "scripts/sync_live.py",
@@ -94,7 +96,9 @@ class TestVerifyGate(unittest.TestCase):
                 "tests/test_live_browser_profiles.py",
                 "tests/test_browser_panel.py",
                 "tests/test_access_control.py",
+                "tests/test_benchmark_digest.py",
                 "tests/test_memory_guard_and_dream.py",
+                "tests/test_taint_outbound_guard.py",
                 "tests/test_verify_gate.py",
             ]
             for rel in files_to_create:
@@ -129,17 +133,23 @@ class TestVerifyGate(unittest.TestCase):
                 [
                     "bridge/bridge.py",
                     "bridge/memory_guard.py",
+                    "hooks/taint_outbound_guard.py",
+                    "scripts/benchmark_digest.py",
                     "tests/test_access_control.py",
+                    "tests/test_benchmark_digest.py",
                     "tests/test_memory_guard_and_dream.py",
+                    "tests/test_taint_outbound_guard.py",
                 ],
             )
             self.assertEqual(
                 verify_gate.collect_scope_py_files(root, "security"),
                 [
+                    "hooks/taint_outbound_guard.py",
                     "scripts/security_audit.py",
                     "scripts/sync_live.py",
                     "scripts/verify_gate.py",
                     "tests/test_security_audit_webui.py",
+                    "tests/test_taint_outbound_guard.py",
                     "tests/test_verify_gate.py",
                 ],
             )
@@ -180,7 +190,9 @@ class TestVerifyGate(unittest.TestCase):
                 bridge_plan,
                 [
                     (sys_py, "tests/test_access_control.py"),
+                    (sys_py, "tests/test_benchmark_digest.py"),
                     (sys_py, "tests/test_memory_guard_and_dream.py"),
+                    (sys_py, "tests/test_taint_outbound_guard.py"),
                 ],
             )
 
@@ -191,6 +203,7 @@ class TestVerifyGate(unittest.TestCase):
                 security_plan,
                 [
                     (sys_py, "tests/test_security_audit_webui.py"),
+                    (sys_py, "tests/test_taint_outbound_guard.py"),
                     (sys_py, "tests/test_verify_gate.py"),
                 ],
             )

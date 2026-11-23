@@ -50,6 +50,7 @@ GROUP_HISTORY_LIMIT = 40
 GROUP_HISTORY_INJECT_LIMIT = 15
 GROUP_HISTORY_MAX_CHARS = 2400
 GROUP_HISTORY_FULL_TEXT_MAX_BYTES = 12 * 1024
+SCHEDULED_HANDOFF_EXCERPT_LIMIT = 4000
 HUMAN_CHAIN_TTL_SECONDS = 1800.0
 MENTION_WINDOW_SECONDS = 300.0
 MENTION_WINDOW_MAX = 6
@@ -1917,6 +1918,9 @@ def enqueue_scheduled_handoff(
 
     norm_tid = _norm_tid(thread_id)
     now = time.time()
+    raw_excerpt = (text_excerpt or "").strip()
+    full_len = len(raw_excerpt)
+    truncated = full_len > SCHEDULED_HANDOFF_EXCERPT_LIMIT
     pkt = {
         "type": "scheduled_handoff",
         "from_bot": sender,
@@ -1926,7 +1930,9 @@ def enqueue_scheduled_handoff(
         "msg_id": int(msg_id or 0),
         "task_id": str(task_id or ""),
         "task_name": str(task_name or "")[:120],
-        "text_excerpt": (text_excerpt or "").strip()[:800],
+        "text_excerpt": raw_excerpt[:SCHEDULED_HANDOFF_EXCERPT_LIMIT],
+        "full_len": full_len,
+        "truncated": truncated,
         "created_at": now,
     }
     with _bus_lock():
