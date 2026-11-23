@@ -1080,6 +1080,103 @@ export interface BotReloadResponse {
   cooldown_sec?: number;
 }
 
+export type BotProfileDocName = "SOUL.md" | "RULES.md" | "MEMORY.md";
+
+export interface BotSkillsPolicy {
+  mode: "allowlist" | "all";
+  enabled_catalog_skills: string[];
+}
+
+export interface BotProfileSkillItem {
+  slug: string;
+  name: string;
+  scope: string;
+  description: string;
+  size_bytes: number;
+  updated_at: number;
+  owner?: string;
+  enabled?: boolean;
+}
+
+export interface BotTeamMemoryRow {
+  handle: string;
+  project: string;
+  observations_count: number;
+  summaries_count: number;
+  instincts_count: number;
+}
+
+export interface BotMemoryStats {
+  memory_project: string;
+  memory_scope: "isolated" | "coordinator_all" | string;
+  observations_count: number;
+  summaries_count: number;
+  instincts_count: number;
+  active_instincts_preview: string;
+  team_memory?: BotTeamMemoryRow[];
+  total_observations?: number;
+  total_summaries?: number;
+  total_instincts?: number;
+}
+
+export interface BotProfileResponse {
+  ok: boolean;
+  ipc_online: boolean;
+  can_edit: boolean;
+  handle: string;
+  role: string;
+  rev: number;
+  max_doc_bytes: number;
+  specialty: string;
+  memory_project: string;
+  memory_scope: string;
+  updated_at: number;
+  updated_by: string;
+  docs: Record<BotProfileDocName, string>;
+  doc_bytes: Record<BotProfileDocName, number>;
+  skills_policy: BotSkillsPolicy;
+  own_skills: BotProfileSkillItem[];
+  catalog_skills: BotProfileSkillItem[];
+  team_skills: BotProfileSkillItem[];
+  effective_skills: BotProfileSkillItem[];
+  memory_stats: BotMemoryStats;
+}
+
+export interface BotProfileUpdatePayload {
+  expected_rev: number;
+  doc?: BotProfileDocName;
+  content?: string;
+  docs?: Partial<Record<BotProfileDocName, string>>;
+  skills_policy?: BotSkillsPolicy;
+  specialty?: string;
+}
+
+export interface BotSkillDetailResponse {
+  ok: boolean;
+  handle: string;
+  slug: string;
+  rev: number;
+  name: string;
+  description: string;
+  content: string;
+  size_bytes: number;
+  max_doc_bytes: number;
+  can_edit: boolean;
+}
+
+export interface BotSkillPutPayload {
+  expected_rev: number;
+  content: string;
+}
+
+export interface BotSkillDeleteResponse {
+  ok: boolean;
+  deleted: boolean;
+  handle: string;
+  slug: string;
+  rev: number;
+}
+
 // Phase B M2: Web Multi-Bot Chat Rooms, Unified Attention Queue & Multi-Pane Workbench
 export interface RoomSummary {
   room_id: string;

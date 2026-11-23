@@ -60,6 +60,8 @@ BRIDGE_TEST_FILES: Tuple[str, ...] = (
     "tests/test_bridge_core.py",
     "tests/test_bridge_p0.py",
     "tests/test_bot_bus.py",
+    "tests/test_bot_isolation.py",
+    "tests/test_bot_isolation_hooks.py",
     "tests/test_google_accounts.py",
     "tests/test_group_chat_bus.py",
     "tests/test_group_on_demand.py",
@@ -72,6 +74,8 @@ BRIDGE_TEST_FILES: Tuple[str, ...] = (
 )
 
 SECURITY_TEST_FILES: Tuple[str, ...] = (
+    "tests/test_bot_isolation.py",
+    "tests/test_bot_isolation_hooks.py",
     "tests/test_pretool_guard_defenses.py",
     "tests/test_security_audit_webui.py",
     "tests/test_taint_outbound_guard.py",
@@ -248,6 +252,7 @@ def collect_scope_py_files(root: Path, scope: str) -> List[str]:
                 [
                     "scripts/agy_cli_upgrade.py",
                     "scripts/benchmark_digest.py",
+                    "scripts/migrate_bot_isolation.py",
                 ],
             )
         )

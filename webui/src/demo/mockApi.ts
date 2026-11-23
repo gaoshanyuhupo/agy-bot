@@ -7,8 +7,14 @@ import type {
   AuthMode,
   BotConfigPatchPayload,
   BotConfigResponse,
+  BotProfileDocName,
+  BotProfileResponse,
+  BotProfileUpdatePayload,
   BotReloadResponse,
   BotRosterItem,
+  BotSkillDeleteResponse,
+  BotSkillDetailResponse,
+  BotSkillPutPayload,
   BotsResponse,
   BrowserStatusResponse,
   ChatAbortResponse,
@@ -2777,6 +2783,245 @@ export async function reloadBot(handle: string): Promise<BotReloadResponse> {
     self_check: "ok (demo zero-downtime sentinel)",
     cooldown_sec: 15,
   };
+}
+
+const demoBotProfiles: Record<
+  string,
+  {
+    rev: number;
+    docs: Record<BotProfileDocName, string>;
+    skills_policy: { mode: "allowlist" | "all"; enabled_catalog_skills: string[] };
+    own_skills: Record<string, string>;
+  }
+> = {};
+
+function ensureDemoBotProfile(handle: string) {
+  const clean = handle.replace(/^@/, "").toLowerCase();
+  if (!demoBotProfiles[clean]) {
+    const bot = demoBots.find((b) => b.handle.replace(/^@/, "").toLowerCase() === clean);
+    const isCoord = bot?.role === "coordinator";
+    demoBotProfiles[clean] = {
+      rev: 1,
+      docs: {
+        "SOUL.md": `# ${bot?.display_name || clean}\n\n演示 Bot 独立人格配置。`,
+        "RULES.md": "- 优先执行只读检查与单元测试。\n- 保持输出简洁结构化。",
+        "MEMORY.md": "- 演示长期记忆笔记（独立隔离）。",
+      },
+      skills_policy: {
+        mode: isCoord ? "all" : "allowlist",
+        enabled_catalog_skills: ["dev-qa-contract"],
+      },
+      own_skills: {
+        "demo-own-workflow":
+          "---\nname: demo-own-workflow\ndescription: Demo bot private workflow skill\n---\n\n# Demo Own Workflow\n",
+      },
+    };
+  }
+  return demoBotProfiles[clean];
+}
+
+export async function fetchBotProfile(handle: string): Promise<BotProfileResponse> {
+  await delay(30);
+  const sess = requireAuth();
+  const bot = demoBots.find((b) => b.handle === handle) || demoBots[0];
+  const clean = bot.handle.replace(/^@/, "").toLowerCase();
+  const st = ensureDemoBotProfile(clean);
+  const isCoord = bot.role === "coordinator";
+  const enc = new TextEncoder();
+  const ownSkills = Object.entries(st.own_skills).map(([slug, content]) => ({
+    slug,
+    name: slug,
+    scope: "bot",
+    owner: clean,
+    description: "Bot 自有独立 Skill",
+    size_bytes: enc.encode(content).length,
+    updated_at: nowSec(),
+  }));
+  const catalogSkills = ["dev-qa-contract", "live-browser", "mem-search"].map((slug) => ({
+    slug,
+    name: slug,
+    scope: "catalog",
+    description: `共享目录技能 (${slug})`,
+    size_bytes: 512,
+    updated_at: nowSec(),
+    enabled:
+      isCoord ||
+      st.skills_policy.mode === "all" ||
+      st.skills_policy.enabled_catalog_skills.includes(slug),
+  }));
+  const teamSkills = isCoord
+    ? demoBots
+        .filter((b) => b.handle !== bot.handle)
+        .map((b) => {
+          const oh = b.handle.replace(/^@/, "").toLowerCase();
+          return {
+            slug: "demo-own-workflow",
+            name: "demo-own-workflow",
+            scope: "team_bot",
+            owner: oh,
+            description: `${b.display_name} 专属技能`,
+            size_bytes: 120,
+            updated_at: nowSec(),
+          };
+        })
+    : [];
+  return {
+    ok: true,
+    ipc_online: true,
+    can_edit: sess.role === "admin",
+    handle: clean,
+    role: bot.role,
+    rev: st.rev,
+    max_doc_bytes: 24 * 1024,
+    specialty: bot.specialty,
+    memory_project: `bot-${clean}`,
+    memory_scope: isCoord ? "coordinator_all" : "isolated",
+    updated_at: nowSec(),
+    updated_by: sess.username || "demo-admin",
+    docs: { ...st.docs },
+    doc_bytes: {
+      "SOUL.md": enc.encode(st.docs["SOUL.md"]).length,
+      "RULES.md": enc.encode(st.docs["RULES.md"]).length,
+      "MEMORY.md": enc.encode(st.docs["MEMORY.md"]).length,
+    },
+    skills_policy: {
+      mode: st.skills_policy.mode,
+      enabled_catalog_skills: [...st.skills_policy.enabled_catalog_skills],
+    },
+    own_skills: ownSkills,
+    catalog_skills: catalogSkills,
+    team_skills: teamSkills,
+    effective_skills: [...ownSkills, ...teamSkills, ...catalogSkills.filter((c) => c.enabled)],
+    memory_stats: {
+      memory_project: `bot-${clean}`,
+      memory_scope: isCoord ? "coordinator_all" : "isolated",
+      observations_count: 12,
+      summaries_count: 3,
+      instincts_count: 2,
+      active_instincts_preview: "- **[workflow]** Always run verify_gate before release.",
+      ...(isCoord
+        ? {
+            team_memory: demoBots.map((b) => {
+              const h = b.handle.replace(/^@/, "").toLowerCase();
+              return {
+                handle: h,
+                project: `bot-${h}`,
+                observations_count: 12,
+                summaries_count: 3,
+                instincts_count: 2,
+              };
+            }),
+            total_observations: demoBots.length * 12,
+            total_summaries: demoBots.length * 3,
+            total_instincts: demoBots.length * 2,
+          }
+        : {}),
+    },
+  };
+}
+
+export async function updateBotProfile(
+  handle: string,
+  payload: BotProfileUpdatePayload,
+): Promise<BotProfileResponse> {
+  await delay(40);
+  const sess = requireAuth();
+  if (sess.role !== "admin") {
+    throw new StudioApiError("只读权限禁止修改 Profile", 403, "studio_api");
+  }
+  const clean = handle.replace(/^@/, "").toLowerCase();
+  const st = ensureDemoBotProfile(clean);
+  if (payload.expected_rev !== st.rev) {
+    throw new StudioApiError("版本冲突", 409, "upstream", undefined, undefined, "rev_conflict", undefined, {
+      current_rev: st.rev,
+    });
+  }
+  if (payload.doc && payload.content !== undefined) {
+    st.docs[payload.doc] = payload.content;
+  }
+  if (payload.docs) {
+    for (const [k, v] of Object.entries(payload.docs)) {
+      if (v !== undefined) st.docs[k as BotProfileDocName] = v;
+    }
+  }
+  if (payload.skills_policy) {
+    st.skills_policy = {
+      mode: payload.skills_policy.mode,
+      enabled_catalog_skills: [...payload.skills_policy.enabled_catalog_skills],
+    };
+  }
+  st.rev += 1;
+  emitDemoEvent("bots_updated", { handle, action: "profile_updated", ts: nowSec() });
+  return fetchBotProfile(handle);
+}
+
+export async function fetchBotSkill(handle: string, slug: string): Promise<BotSkillDetailResponse> {
+  await delay(25);
+  const sess = requireAuth();
+  const clean = handle.replace(/^@/, "").toLowerCase();
+  const st = ensureDemoBotProfile(clean);
+  const content = st.own_skills[slug];
+  if (content === undefined) {
+    throw new StudioApiError(`未找到 Skill ${slug}`, 404, "upstream");
+  }
+  return {
+    ok: true,
+    handle: clean,
+    slug,
+    rev: st.rev,
+    name: slug,
+    description: "Bot 自有 Skill",
+    content,
+    size_bytes: new TextEncoder().encode(content).length,
+    max_doc_bytes: 24 * 1024,
+    can_edit: sess.role === "admin",
+  };
+}
+
+export async function saveBotSkill(
+  handle: string,
+  slug: string,
+  payload: BotSkillPutPayload,
+): Promise<BotSkillDetailResponse> {
+  await delay(40);
+  const sess = requireAuth();
+  if (sess.role !== "admin") {
+    throw new StudioApiError("只读权限禁止编辑 Skill", 403, "studio_api");
+  }
+  const clean = handle.replace(/^@/, "").toLowerCase();
+  const st = ensureDemoBotProfile(clean);
+  if (payload.expected_rev !== st.rev) {
+    throw new StudioApiError("版本冲突", 409, "upstream", undefined, undefined, "rev_conflict", undefined, {
+      current_rev: st.rev,
+    });
+  }
+  st.own_skills[slug] = payload.content;
+  st.rev += 1;
+  emitDemoEvent("bots_updated", { handle, action: "skill_updated", slug, ts: nowSec() });
+  return fetchBotSkill(handle, slug);
+}
+
+export async function deleteBotSkill(
+  handle: string,
+  slug: string,
+  expectedRev: number,
+): Promise<BotSkillDeleteResponse> {
+  await delay(40);
+  const sess = requireAuth();
+  if (sess.role !== "admin") {
+    throw new StudioApiError("只读权限禁止删除 Skill", 403, "studio_api");
+  }
+  const clean = handle.replace(/^@/, "").toLowerCase();
+  const st = ensureDemoBotProfile(clean);
+  if (expectedRev !== st.rev) {
+    throw new StudioApiError("版本冲突", 409, "upstream", undefined, undefined, "rev_conflict", undefined, {
+      current_rev: st.rev,
+    });
+  }
+  delete st.own_skills[slug];
+  st.rev += 1;
+  emitDemoEvent("bots_updated", { handle, action: "skill_deleted", slug, ts: nowSec() });
+  return { ok: true, deleted: true, handle: clean, slug, rev: st.rev };
 }
 
 export async function fetchRooms(): Promise<RoomsResponse> {

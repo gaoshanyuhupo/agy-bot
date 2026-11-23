@@ -46,10 +46,61 @@ from .event_hub import StudioEventHub
 log = logging.getLogger("agy-studio.bot_control")
 
 DEFAULT_RELOAD_COOLDOWN_SEC = 15.0
+MAX_PROFILE_BODY_BYTES = 128 * 1024
+MAX_PROFILE_DOC_BYTES = 24 * 1024
 
 _HANDLE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+_SKILL_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_FORBIDDEN_SKILL_SLUGS = frozenset({".", "..", "__proto__", "constructor", "prototype"})
+_ALLOWED_PROFILE_DOCS = frozenset({"SOUL.md", "RULES.md", "MEMORY.md"})
+_VALID_SKILL_POLICY_MODES = frozenset({"allowlist", "all"})
 _VALID_MODEL_MODES = frozenset({"default", "follow", "custom"})
 _VALID_EFFORTS = frozenset({"", "low", "medium", "high", "xhigh", "max"})
+_PRIVATE_GET_HEADERS = {
+    "Cache-Control": "no-store",
+    "Referrer-Policy": "no-referrer",
+}
+
+_ALLOWED_PROFILE_PUT_KEYS = frozenset({
+    "expected_rev",
+    "doc",
+    "content",
+    "docs",
+    "skills_policy",
+    "specialty",
+})
+_ALLOWED_SKILL_PUT_KEYS = frozenset({
+    "expected_rev",
+    "content",
+})
+_ALLOWED_SKILL_DELETE_KEYS = frozenset({
+    "expected_rev",
+})
+_FORBIDDEN_PROFILE_KEYS = frozenset({
+    "workdir",
+    "default_workdir",
+    "ipc_sock",
+    "role",
+    "path",
+    "reload_file",
+    "env",
+    "headers",
+    "command",
+    "cmd",
+    "args",
+    "url",
+    "shell",
+    "script",
+    "token",
+    "secret",
+    "password",
+    "pid",
+    "allowed_chats",
+    "mirror_chat_id",
+    "mirror_thread_id",
+    "chat_id",
+    "thread_id",
+})
 
 _ALLOWED_CONFIG_PATCH_KEYS = frozenset({
     "model_mode",
@@ -957,4 +1008,1010 @@ class StudioBotControlService:
                 "cooldown_sec": int(self.reload_cooldown_sec),
             },
             status=202,
+        )
+
+    @staticmethod
+    def _validate_skill_slug(raw: Any) -> str | None:
+        if not isinstance(raw, str):
+            return None
+        s = raw.strip()
+        if (
+            not s
+            or s in _FORBIDDEN_SKILL_SLUGS
+            or "/" in s
+            or "\\" in s
+            or ".." in s
+            or "\x00" in s
+            or not _SKILL_SLUG_RE.fullmatch(s)
+        ):
+            return None
+        return s
+
+    @staticmethod
+    def _parse_expected_rev(raw: Any) -> int | None:
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            return None
+        return raw if raw >= 0 else None
+
+    @staticmethod
+    def _sanitize_skill_entry(item: Any, *, include_owner: bool = False, include_enabled: bool = False) -> dict[str, Any] | None:
+        if not isinstance(item, dict):
+            return None
+        slug = _sanitize_slug(item.get("slug") or item.get("name"), max_len=64)
+        if not slug:
+            return None
+        out: dict[str, Any] = {
+            "slug": slug,
+            "name": _sanitize_slug(item.get("name") or slug, max_len=64) or slug,
+            "scope": _sanitize_slug(item.get("scope") or "bot", max_len=24) or "bot",
+            "description": _redact_bot_text(item.get("description") or "", max_len=160),
+            "size_bytes": max(0, int(item.get("size_bytes") or 0)),
+            "updated_at": max(0, int(item.get("updated_at") or 0)),
+        }
+        if include_owner and item.get("owner"):
+            out["owner"] = _sanitize_slug(item.get("owner"), max_len=64)
+        if include_enabled:
+            out["enabled"] = bool(item.get("enabled", False))
+        return out
+
+    def _sanitize_profile_response(
+        self,
+        *,
+        handle: str,
+        raw: dict[str, Any],
+        ipc_online: bool,
+        can_edit: bool,
+    ) -> dict[str, Any]:
+        raw_docs = raw.get("docs") if isinstance(raw.get("docs"), dict) else {}
+        docs_out: dict[str, str] = {}
+        doc_bytes: dict[str, int] = {}
+        for dname in ("SOUL.md", "RULES.md", "MEMORY.md"):
+            val = raw_docs.get(dname)
+            txt = val if isinstance(val, str) else ""
+            if len(txt.encode("utf-8")) > MAX_PROFILE_DOC_BYTES + 1024:
+                txt = txt[:MAX_PROFILE_DOC_BYTES]
+            docs_out[dname] = txt
+            doc_bytes[dname] = len(txt.encode("utf-8"))
+
+        raw_pol = raw.get("skills_policy") if isinstance(raw.get("skills_policy"), dict) else {}
+        pmode = str(raw_pol.get("mode") or "allowlist").strip().lower()
+        if pmode not in _VALID_SKILL_POLICY_MODES:
+            pmode = "allowlist"
+        raw_en = raw_pol.get("enabled_catalog_skills")
+        en_list = sorted(
+            {
+                s
+                for s in (raw_en if isinstance(raw_en, list) else [])[:200]
+                if isinstance(s, str) and self._validate_skill_slug(s)
+            }
+        )
+
+        own_skills = [
+            e
+            for e in (
+                self._sanitize_skill_entry(it, include_owner=True)
+                for it in (raw.get("own_skills") or [])[:200]
+            )
+            if e is not None
+        ]
+        catalog_skills = [
+            e
+            for e in (
+                self._sanitize_skill_entry(it, include_enabled=True)
+                for it in (raw.get("catalog_skills") or [])[:200]
+            )
+            if e is not None
+        ]
+        team_skills = [
+            e
+            for e in (
+                self._sanitize_skill_entry(it, include_owner=True)
+                for it in (raw.get("team_skills") or [])[:200]
+            )
+            if e is not None
+        ]
+        effective_skills = [
+            e
+            for e in (
+                self._sanitize_skill_entry(it, include_owner=True)
+                for it in (raw.get("effective_skills") or [])[:200]
+            )
+            if e is not None
+        ]
+
+        raw_ms = raw.get("memory_stats") if isinstance(raw.get("memory_stats"), dict) else {}
+        mem_stats: dict[str, Any] = {
+            "memory_project": _sanitize_slug(raw_ms.get("memory_project") or f"bot-{handle}", max_len=80) or f"bot-{handle}",
+            "memory_scope": _sanitize_slug(raw_ms.get("memory_scope") or "isolated", max_len=24) or "isolated",
+            "observations_count": max(0, int(raw_ms.get("observations_count") or 0)),
+            "summaries_count": max(0, int(raw_ms.get("summaries_count") or 0)),
+            "instincts_count": max(0, int(raw_ms.get("instincts_count") or 0)),
+            "active_instincts_preview": _redact_bot_text(raw_ms.get("active_instincts_preview") or "", max_len=2000),
+        }
+        if isinstance(raw_ms.get("team_memory"), list):
+            tm_out = []
+            for row in raw_ms["team_memory"][:64]:
+                if not isinstance(row, dict):
+                    continue
+                tm_out.append({
+                    "handle": _sanitize_slug(row.get("handle") or "", max_len=64),
+                    "project": _sanitize_slug(row.get("project") or "", max_len=80),
+                    "observations_count": max(0, int(row.get("observations_count") or 0)),
+                    "summaries_count": max(0, int(row.get("summaries_count") or 0)),
+                    "instincts_count": max(0, int(row.get("instincts_count") or 0)),
+                })
+            mem_stats["team_memory"] = tm_out
+            mem_stats["total_observations"] = max(0, int(raw_ms.get("total_observations") or 0))
+            mem_stats["total_summaries"] = max(0, int(raw_ms.get("total_summaries") or 0))
+            mem_stats["total_instincts"] = max(0, int(raw_ms.get("total_instincts") or 0))
+
+        role_val = _sanitize_slug(raw.get("role") or "worker", max_len=24) or "worker"
+        return {
+            "ok": True,
+            "ipc_online": ipc_online,
+            "can_edit": can_edit and ipc_online,
+            "handle": handle,
+            "role": role_val,
+            "rev": max(0, int(raw.get("rev") or 0)),
+            "max_doc_bytes": MAX_PROFILE_DOC_BYTES,
+            "specialty": _redact_bot_text(raw.get("specialty") or "", max_len=160),
+            "memory_project": _sanitize_slug(raw.get("memory_project") or f"bot-{handle}", max_len=80) or f"bot-{handle}",
+            "memory_scope": _sanitize_slug(raw.get("memory_scope") or ("coordinator_all" if role_val == "coordinator" else "isolated"), max_len=24),
+            "updated_at": max(0, int(raw.get("updated_at") or 0)),
+            "updated_by": _redact_bot_text(raw.get("updated_by") or "", max_len=64),
+            "docs": docs_out,
+            "doc_bytes": doc_bytes,
+            "skills_policy": {"mode": pmode, "enabled_catalog_skills": en_list},
+            "own_skills": own_skills,
+            "catalog_skills": catalog_skills,
+            "team_skills": team_skills,
+            "effective_skills": effective_skills,
+            "memory_stats": mem_stats,
+        }
+
+    # ------------------------------------------------------------------ GET /api/bots/{handle}/profile
+    async def handle_get_bot_profile(self, request: web.Request) -> web.Response:
+        ok, sess, err, status_code = await self.auth_mgr.authenticate_request(request)
+        if not ok or not sess:
+            return studio_auth_error(err, status=status_code)
+
+        handle = _normalize_strict_handle(request.match_info.get("handle") or "")
+        if not handle:
+            return web.json_response(
+                {"ok": False, "source": "studio_api", "error": "非法的 Bot handle 格式"},
+                status=400,
+                headers=_PRIVATE_GET_HEADERS,
+            )
+
+        roster_bot = self._find_roster_bot(handle)
+        ipc_ep = self._resolve_bot_ipc(handle)
+        if roster_bot is None and ipc_ep is None:
+            return web.json_response(
+                {"ok": False, "source": "studio_api", "error": "未找到对应的 Bot 节点"},
+                status=404,
+                headers=_PRIVATE_GET_HEADERS,
+            )
+
+        can_edit = sess.get("role") == "admin"
+        if ipc_ep is not None:
+            sock_p, tok = ipc_ep
+            sc, data = await self._ipc_request_json(
+                sock_path=sock_p,
+                token=tok,
+                method="GET",
+                path="/ipc/bot/profile",
+            )
+            if sc == 200 and data.get("ok"):
+                return web.json_response(
+                    self._sanitize_profile_response(
+                        handle=handle,
+                        raw=data,
+                        ipc_online=True,
+                        can_edit=can_edit,
+                    ),
+                    headers=_PRIVATE_GET_HEADERS,
+                )
+
+        fallback = dict(roster_bot or {})
+        return web.json_response(
+            self._sanitize_profile_response(
+                handle=handle,
+                raw=fallback,
+                ipc_online=False,
+                can_edit=False,
+            ),
+            headers=_PRIVATE_GET_HEADERS,
+        )
+
+    # ------------------------------------------------------------------ PUT /api/bots/{handle}/profile
+    async def handle_put_bot_profile(self, request: web.Request) -> web.Response:
+        raw_h = request.match_info.get("handle") or ""
+        handle = _normalize_strict_handle(raw_h)
+        safe_tid = handle or _sanitize_slug(raw_h, max_len=64)
+
+        ok_gate, sess, err_resp = await self._enforce_write_gate(
+            request, action="bot.profile.put", target_id=safe_tid
+        )
+        if not ok_gate or not sess:
+            assert err_resp is not None
+            return err_resp
+
+        client_ip = self.auth_mgr.extract_client_ip(request)
+        if not handle:
+            self.audit.record(
+                action="bot.profile.put",
+                status_code=400,
+                outcome="denied_invalid_handle",
+                client_ip=client_ip,
+                target_id=safe_tid,
+                sess=sess,
+            )
+            return web.json_response(
+                {"ok": False, "source": "studio_api", "error": "非法的 Bot handle 格式"},
+                status=400,
+            )
+
+        roster_bot = self._find_roster_bot(handle)
+        ipc_ep = self._resolve_bot_ipc(handle)
+        if roster_bot is None and ipc_ep is None:
+            self.audit.record(
+                action="bot.profile.put",
+                status_code=404,
+                outcome="denied_unknown_bot",
+                client_ip=client_ip,
+                target_id=handle,
+                sess=sess,
+                bot_override=handle,
+            )
+            return web.json_response(
+                {"ok": False, "source": "studio_api", "error": "未找到对应的 Bot 节点"},
+                status=404,
+            )
+
+        ok_body, body, body_sc, body_outcome, body_err = await _read_bounded_json_body(
+            request, max_bytes=MAX_PROFILE_BODY_BYTES, allow_empty=False
+        )
+        if not ok_body or body is None:
+            self.audit.record(
+                action="bot.profile.put",
+                status_code=body_sc,
+                outcome=body_outcome,
+                client_ip=client_ip,
+                target_id=handle,
+                sess=sess,
+                bot_override=handle,
+            )
+            return web.json_response(
+                {"ok": False, "source": "studio_api", "error": body_err},
+                status=body_sc,
+            )
+
+        bad_forb = _find_forbidden_key_recursive(body, _FORBIDDEN_PROFILE_KEYS)
+        if bad_forb is not None:
+            self.audit.record(
+                action="bot.profile.put",
+                status_code=400,
+                outcome=f"denied_forbidden_field:{bad_forb}",
+                client_ip=client_ip,
+                target_id=handle,
+                sess=sess,
+                bot_override=handle,
+            )
+            return web.json_response(
+                {"ok": False, "source": "studio_api", "error": f"禁止客户端传入受限字段: {bad_forb}"},
+                status=400,
+            )
+
+        extra_keys = set(body.keys()) - _ALLOWED_PROFILE_PUT_KEYS
+        if extra_keys:
+            self.audit.record(
+                action="bot.profile.put",
+                status_code=400,
+                outcome="denied_unknown_field",
+                client_ip=client_ip,
+                target_id=handle,
+                sess=sess,
+                bot_override=handle,
+            )
+            return web.json_response(
+                {"ok": False, "source": "studio_api", "error": "存在未允许的 Profile 字段"},
+                status=400,
+            )
+
+        exp_rev = self._parse_expected_rev(body.get("expected_rev"))
+        if exp_rev is None:
+            self.audit.record(
+                action="bot.profile.put",
+                status_code=400,
+                outcome="denied_missing_expected_rev",
+                client_ip=client_ip,
+                target_id=handle,
+                sess=sess,
+                bot_override=handle,
+            )
+            return web.json_response(
+                {"ok": False, "source": "studio_api", "error": "缺少有效的整数 expected_rev 乐观锁版本号"},
+                status=400,
+            )
+
+        ipc_payload: dict[str, Any] = {
+            "user_id": int(sess["user_id"]),
+            "actor_username": str(sess.get("username") or "")[:64],
+            "expected_rev": exp_rev,
+        }
+
+        if "doc" in body or "content" in body:
+            doc_val = body.get("doc")
+            content_val = body.get("content")
+            if not isinstance(doc_val, str) or doc_val not in _ALLOWED_PROFILE_DOCS:
+                self.audit.record(
+                    action="bot.profile.put",
+                    status_code=400,
+                    outcome="denied_invalid_doc",
+                    client_ip=client_ip,
+                    target_id=handle,
+                    sess=sess,
+                    bot_override=handle,
+                )
+                return web.json_response(
+                    {"ok": False, "source": "studio_api", "error": "doc 仅允许 SOUL.md / RULES.md / MEMORY.md"},
+                    status=400,
+                )
+            if not isinstance(content_val, str) or "\x00" in content_val:
+                self.audit.record(
+                    action="bot.profile.put",
+                    status_code=400,
+                    outcome="denied_invalid_content",
+                    client_ip=client_ip,
+                    target_id=handle,
+                    sess=sess,
+                    bot_override=handle,
+                )
+                return web.json_response(
+                    {"ok": False, "source": "studio_api", "error": "文档内容必须为不含 NUL 字节的合法 UTF-8 字符串"},
+                    status=400,
+                )
+            if len(content_val.encode("utf-8")) > MAX_PROFILE_DOC_BYTES:
+                self.audit.record(
+                    action="bot.profile.put",
+                    status_code=413,
+                    outcome="denied_doc_too_large",
+                    client_ip=client_ip,
+                    target_id=handle,
+                    sess=sess,
+                    bot_override=handle,
+                )
+                return web.json_response(
+                    {"ok": False, "source": "studio_api", "error": "单文档超过 24 KiB UTF-8 上限"},
+                    status=413,
+                )
+            ipc_payload["doc"] = doc_val
+            ipc_payload["content"] = content_val
+
+        if "docs" in body:
+            raw_docs = body.get("docs")
+            if not isinstance(raw_docs, dict):
+                self.audit.record(
+                    action="bot.profile.put",
+                    status_code=400,
+                    outcome="denied_invalid_docs",
+                    client_ip=client_ip,
+                    target_id=handle,
+                    sess=sess,
+                    bot_override=handle,
+                )
+                return web.json_response(
+                    {"ok": False, "source": "studio_api", "error": "docs 必须为对象映射"},
+                    status=400,
+                )
+            clean_docs: dict[str, str] = {}
+            for dk, dv in raw_docs.items():
+                if dk not in _ALLOWED_PROFILE_DOCS or not isinstance(dv, str) or "\x00" in dv:
+                    self.audit.record(
+                        action="bot.profile.put",
+                        status_code=400,
+                        outcome="denied_invalid_doc",
+                        client_ip=client_ip,
+                        target_id=handle,
+                        sess=sess,
+                        bot_override=handle,
+                    )
+                    return web.json_response(
+                        {"ok": False, "source": "studio_api", "error": "docs 包含非法键名或内容"},
+                        status=400,
+                    )
+                if len(dv.encode("utf-8")) > MAX_PROFILE_DOC_BYTES:
+                    self.audit.record(
+                        action="bot.profile.put",
+                        status_code=413,
+                        outcome="denied_doc_too_large",
+                        client_ip=client_ip,
+                        target_id=handle,
+                        sess=sess,
+                        bot_override=handle,
+                    )
+                    return web.json_response(
+                        {"ok": False, "source": "studio_api", "error": "单文档超过 24 KiB UTF-8 上限"},
+                        status=413,
+                    )
+                clean_docs[dk] = dv
+            ipc_payload["docs"] = clean_docs
+
+        if "skills_policy" in body:
+            sp = body.get("skills_policy")
+            if not isinstance(sp, dict):
+                self.audit.record(
+                    action="bot.profile.put",
+                    status_code=400,
+                    outcome="denied_invalid_skills_policy",
+                    client_ip=client_ip,
+                    target_id=handle,
+                    sess=sess,
+                    bot_override=handle,
+                )
+                return web.json_response(
+                    {"ok": False, "source": "studio_api", "error": "skills_policy 必须为对象"},
+                    status=400,
+                )
+            ipc_payload["skills_policy"] = sp
+
+        if "specialty" in body:
+            spec = body.get("specialty")
+            if not isinstance(spec, str) or "\x00" in spec or len(spec.encode("utf-8")) > 1024:
+                self.audit.record(
+                    action="bot.profile.put",
+                    status_code=400,
+                    outcome="denied_invalid_specialty",
+                    client_ip=client_ip,
+                    target_id=handle,
+                    sess=sess,
+                    bot_override=handle,
+                )
+                return web.json_response(
+                    {"ok": False, "source": "studio_api", "error": "specialty 格式或长度无效"},
+                    status=400,
+                )
+            ipc_payload["specialty"] = spec
+
+        if ipc_ep is None:
+            self.audit.record(
+                action="bot.profile.put",
+                status_code=503,
+                outcome="error_ipc_offline",
+                client_ip=client_ip,
+                target_id=handle,
+                sess=sess,
+                bot_override=handle,
+            )
+            return web.json_response(
+                {"ok": False, "source": "upstream", "error": "目标 Bot Bridge IPC 离线，无法保存 Profile"},
+                status=503,
+            )
+
+        sock_p, tok = ipc_ep
+        sc, data = await self._ipc_request_json(
+            sock_path=sock_p,
+            token=tok,
+            method="POST",
+            path="/ipc/bot/profile",
+            payload=ipc_payload,
+        )
+        if sc >= 400 or not data.get("ok"):
+            outcome = "conflict_rev" if sc == 409 else ("error_ipc" if sc >= 500 else "denied_ipc")
+            self.audit.record(
+                action="bot.profile.put",
+                status_code=sc,
+                outcome=outcome,
+                client_ip=client_ip,
+                target_id=handle,
+                sess=sess,
+                bot_override=handle,
+            )
+            err_body: dict[str, Any] = {
+                "ok": False,
+                "source": "upstream",
+                "error": _redact_bot_text(data.get("error") or "保存 Profile 失败", max_len=200),
+            }
+            if data.get("code"):
+                err_body["code"] = _sanitize_slug(data.get("code"), max_len=32)
+            if isinstance(data.get("current_rev"), int):
+                err_body["current_rev"] = int(data["current_rev"])
+            return web.json_response(err_body, status=sc)
+
+        self.audit.record(
+            action="bot.profile.put",
+            status_code=200,
+            outcome="allowed",
+            client_ip=client_ip,
+            target_id=handle,
+            sess=sess,
+            bot_override=handle,
+        )
+        self.event_hub.publish(
+            "bots_updated",
+            {"handle": handle, "action": "profile_updated", "source": "studio"},
+        )
+        return web.json_response(
+            self._sanitize_profile_response(
+                handle=handle,
+                raw=data,
+                ipc_online=True,
+                can_edit=True,
+            ),
+            headers=_PRIVATE_GET_HEADERS,
+        )
+
+    # ------------------------------------------------------------------ GET /api/bots/{handle}/skills/{slug}
+    async def handle_get_bot_skill(self, request: web.Request) -> web.Response:
+        ok, sess, err, status_code = await self.auth_mgr.authenticate_request(request)
+        if not ok or not sess:
+            return studio_auth_error(err, status=status_code)
+
+        handle = _normalize_strict_handle(request.match_info.get("handle") or "")
+        slug = self._validate_skill_slug(request.match_info.get("slug") or "")
+        if not handle or not slug:
+            return web.json_response(
+                {"ok": False, "source": "studio_api", "error": "非法的 Bot handle 或 skill slug 格式"},
+                status=400,
+                headers=_PRIVATE_GET_HEADERS,
+            )
+
+        roster_bot = self._find_roster_bot(handle)
+        ipc_ep = self._resolve_bot_ipc(handle)
+        if roster_bot is None and ipc_ep is None:
+            return web.json_response(
+                {"ok": False, "source": "studio_api", "error": "未找到对应的 Bot 节点"},
+                status=404,
+                headers=_PRIVATE_GET_HEADERS,
+            )
+        if ipc_ep is None:
+            return web.json_response(
+                {"ok": False, "source": "upstream", "error": "目标 Bot Bridge IPC 离线"},
+                status=503,
+                headers=_PRIVATE_GET_HEADERS,
+            )
+
+        sock_p, tok = ipc_ep
+        sc, data = await self._ipc_request_json(
+            sock_path=sock_p,
+            token=tok,
+            method="GET",
+            path=f"/ipc/bot/skills?slug={slug}",
+        )
+        if sc >= 400 or not data.get("ok"):
+            return web.json_response(
+                {
+                    "ok": False,
+                    "source": "upstream",
+                    "error": _redact_bot_text(data.get("error") or "读取 Skill 失败", max_len=200),
+                },
+                status=sc,
+                headers=_PRIVATE_GET_HEADERS,
+            )
+
+        content = data.get("content") if isinstance(data.get("content"), str) else ""
+        return web.json_response(
+            {
+                "ok": True,
+                "handle": handle,
+                "slug": slug,
+                "rev": max(0, int(data.get("rev") or 0)),
+                "name": _sanitize_slug(data.get("name") or slug, max_len=64) or slug,
+                "description": _redact_bot_text(data.get("description") or "", max_len=160),
+                "content": content,
+                "size_bytes": len(content.encode("utf-8")),
+                "max_doc_bytes": MAX_PROFILE_DOC_BYTES,
+                "can_edit": sess.get("role") == "admin",
+            },
+            headers=_PRIVATE_GET_HEADERS,
+        )
+
+    # ------------------------------------------------------------------ PUT /api/bots/{handle}/skills/{slug}
+    async def handle_put_bot_skill(self, request: web.Request) -> web.Response:
+        raw_h = request.match_info.get("handle") or ""
+        raw_slug = request.match_info.get("slug") or ""
+        handle = _normalize_strict_handle(raw_h)
+        slug = self._validate_skill_slug(raw_slug)
+        safe_tid = f"{handle or _sanitize_slug(raw_h, max_len=32)}:{slug or _sanitize_slug(raw_slug, max_len=32)}"
+
+        ok_gate, sess, err_resp = await self._enforce_write_gate(
+            request, action="bot.skill.put", target_id=safe_tid
+        )
+        if not ok_gate or not sess:
+            assert err_resp is not None
+            return err_resp
+
+        client_ip = self.auth_mgr.extract_client_ip(request)
+        if not handle or not slug:
+            self.audit.record(
+                action="bot.skill.put",
+                status_code=400,
+                outcome="denied_invalid_handle_or_slug",
+                client_ip=client_ip,
+                target_id=safe_tid,
+                sess=sess,
+            )
+            return web.json_response(
+                {"ok": False, "source": "studio_api", "error": "非法的 Bot handle 或 skill slug 格式"},
+                status=400,
+            )
+
+        roster_bot = self._find_roster_bot(handle)
+        ipc_ep = self._resolve_bot_ipc(handle)
+        if roster_bot is None and ipc_ep is None:
+            self.audit.record(
+                action="bot.skill.put",
+                status_code=404,
+                outcome="denied_unknown_bot",
+                client_ip=client_ip,
+                target_id=safe_tid,
+                sess=sess,
+                bot_override=handle,
+            )
+            return web.json_response(
+                {"ok": False, "source": "studio_api", "error": "未找到对应的 Bot 节点"},
+                status=404,
+            )
+
+        ok_body, body, body_sc, body_outcome, body_err = await _read_bounded_json_body(
+            request, max_bytes=MAX_PROFILE_BODY_BYTES, allow_empty=False
+        )
+        if not ok_body or body is None:
+            self.audit.record(
+                action="bot.skill.put",
+                status_code=body_sc,
+                outcome=body_outcome,
+                client_ip=client_ip,
+                target_id=safe_tid,
+                sess=sess,
+                bot_override=handle,
+            )
+            return web.json_response(
+                {"ok": False, "source": "studio_api", "error": body_err},
+                status=body_sc,
+            )
+
+        bad_forb = _find_forbidden_key_recursive(body, _FORBIDDEN_PROFILE_KEYS)
+        if bad_forb is not None:
+            self.audit.record(
+                action="bot.skill.put",
+                status_code=400,
+                outcome=f"denied_forbidden_field:{bad_forb}",
+                client_ip=client_ip,
+                target_id=safe_tid,
+                sess=sess,
+                bot_override=handle,
+            )
+            return web.json_response(
+                {"ok": False, "source": "studio_api", "error": f"禁止客户端传入受限字段: {bad_forb}"},
+                status=400,
+            )
+
+        extra_keys = set(body.keys()) - _ALLOWED_SKILL_PUT_KEYS
+        if extra_keys:
+            self.audit.record(
+                action="bot.skill.put",
+                status_code=400,
+                outcome="denied_unknown_field",
+                client_ip=client_ip,
+                target_id=safe_tid,
+                sess=sess,
+                bot_override=handle,
+            )
+            return web.json_response(
+                {"ok": False, "source": "studio_api", "error": "存在未允许的 Skill 字段"},
+                status=400,
+            )
+
+        exp_rev = self._parse_expected_rev(body.get("expected_rev"))
+        content = body.get("content")
+        if exp_rev is None:
+            self.audit.record(
+                action="bot.skill.put",
+                status_code=400,
+                outcome="denied_missing_expected_rev",
+                client_ip=client_ip,
+                target_id=safe_tid,
+                sess=sess,
+                bot_override=handle,
+            )
+            return web.json_response(
+                {"ok": False, "source": "studio_api", "error": "缺少有效的整数 expected_rev 乐观锁版本号"},
+                status=400,
+            )
+        if not isinstance(content, str) or "\x00" in content:
+            self.audit.record(
+                action="bot.skill.put",
+                status_code=400,
+                outcome="denied_invalid_content",
+                client_ip=client_ip,
+                target_id=safe_tid,
+                sess=sess,
+                bot_override=handle,
+            )
+            return web.json_response(
+                {"ok": False, "source": "studio_api", "error": "SKILL.md 内容必须为不含 NUL 字节的合法字符串"},
+                status=400,
+            )
+        if len(content.encode("utf-8")) > MAX_PROFILE_DOC_BYTES:
+            self.audit.record(
+                action="bot.skill.put",
+                status_code=413,
+                outcome="denied_doc_too_large",
+                client_ip=client_ip,
+                target_id=safe_tid,
+                sess=sess,
+                bot_override=handle,
+            )
+            return web.json_response(
+                {"ok": False, "source": "studio_api", "error": "SKILL.md 超过 24 KiB UTF-8 上限"},
+                status=413,
+            )
+
+        if ipc_ep is None:
+            self.audit.record(
+                action="bot.skill.put",
+                status_code=503,
+                outcome="error_ipc_offline",
+                client_ip=client_ip,
+                target_id=safe_tid,
+                sess=sess,
+                bot_override=handle,
+            )
+            return web.json_response(
+                {"ok": False, "source": "upstream", "error": "目标 Bot Bridge IPC 离线，无法保存 Skill"},
+                status=503,
+            )
+
+        sock_p, tok = ipc_ep
+        sc, data = await self._ipc_request_json(
+            sock_path=sock_p,
+            token=tok,
+            method="POST",
+            path="/ipc/bot/skills",
+            payload={
+                "user_id": int(sess["user_id"]),
+                "actor_username": str(sess.get("username") or "")[:64],
+                "slug": slug,
+                "content": content,
+                "expected_rev": exp_rev,
+            },
+        )
+        if sc >= 400 or not data.get("ok"):
+            outcome = "conflict_rev" if sc == 409 else ("error_ipc" if sc >= 500 else "denied_ipc")
+            self.audit.record(
+                action="bot.skill.put",
+                status_code=sc,
+                outcome=outcome,
+                client_ip=client_ip,
+                target_id=safe_tid,
+                sess=sess,
+                bot_override=handle,
+            )
+            err_body: dict[str, Any] = {
+                "ok": False,
+                "source": "upstream",
+                "error": _redact_bot_text(data.get("error") or "保存 Skill 失败", max_len=200),
+            }
+            if data.get("code"):
+                err_body["code"] = _sanitize_slug(data.get("code"), max_len=32)
+            if isinstance(data.get("current_rev"), int):
+                err_body["current_rev"] = int(data["current_rev"])
+            return web.json_response(err_body, status=sc)
+
+        self.audit.record(
+            action="bot.skill.put",
+            status_code=200,
+            outcome="allowed",
+            client_ip=client_ip,
+            target_id=safe_tid,
+            sess=sess,
+            bot_override=handle,
+        )
+        self.event_hub.publish(
+            "bots_updated",
+            {"handle": handle, "action": "skill_updated", "slug": slug, "source": "studio"},
+        )
+        saved_content = data.get("content") if isinstance(data.get("content"), str) else content
+        return web.json_response(
+            {
+                "ok": True,
+                "handle": handle,
+                "slug": slug,
+                "rev": max(0, int(data.get("rev") or 0)),
+                "name": _sanitize_slug(data.get("name") or slug, max_len=64) or slug,
+                "description": _redact_bot_text(data.get("description") or "", max_len=160),
+                "content": saved_content,
+                "size_bytes": len(saved_content.encode("utf-8")),
+                "max_doc_bytes": MAX_PROFILE_DOC_BYTES,
+                "can_edit": True,
+            },
+            headers=_PRIVATE_GET_HEADERS,
+        )
+
+    # ------------------------------------------------------------------ DELETE /api/bots/{handle}/skills/{slug}
+    async def handle_delete_bot_skill(self, request: web.Request) -> web.Response:
+        raw_h = request.match_info.get("handle") or ""
+        raw_slug = request.match_info.get("slug") or ""
+        handle = _normalize_strict_handle(raw_h)
+        slug = self._validate_skill_slug(raw_slug)
+        safe_tid = f"{handle or _sanitize_slug(raw_h, max_len=32)}:{slug or _sanitize_slug(raw_slug, max_len=32)}"
+
+        ok_gate, sess, err_resp = await self._enforce_write_gate(
+            request, action="bot.skill.delete", target_id=safe_tid
+        )
+        if not ok_gate or not sess:
+            assert err_resp is not None
+            return err_resp
+
+        client_ip = self.auth_mgr.extract_client_ip(request)
+        if not handle or not slug:
+            self.audit.record(
+                action="bot.skill.delete",
+                status_code=400,
+                outcome="denied_invalid_handle_or_slug",
+                client_ip=client_ip,
+                target_id=safe_tid,
+                sess=sess,
+            )
+            return web.json_response(
+                {"ok": False, "source": "studio_api", "error": "非法的 Bot handle 或 skill slug 格式"},
+                status=400,
+            )
+
+        roster_bot = self._find_roster_bot(handle)
+        ipc_ep = self._resolve_bot_ipc(handle)
+        if roster_bot is None and ipc_ep is None:
+            self.audit.record(
+                action="bot.skill.delete",
+                status_code=404,
+                outcome="denied_unknown_bot",
+                client_ip=client_ip,
+                target_id=safe_tid,
+                sess=sess,
+                bot_override=handle,
+            )
+            return web.json_response(
+                {"ok": False, "source": "studio_api", "error": "未找到对应的 Bot 节点"},
+                status=404,
+            )
+
+        ok_body, body, body_sc, body_outcome, body_err = await _read_bounded_json_body(
+            request, max_bytes=MAX_PROMPT_BODY_BYTES, allow_empty=False
+        )
+        if not ok_body or body is None:
+            self.audit.record(
+                action="bot.skill.delete",
+                status_code=body_sc,
+                outcome=body_outcome,
+                client_ip=client_ip,
+                target_id=safe_tid,
+                sess=sess,
+                bot_override=handle,
+            )
+            return web.json_response(
+                {"ok": False, "source": "studio_api", "error": body_err},
+                status=body_sc,
+            )
+
+        bad_forb = _find_forbidden_key_recursive(body, _FORBIDDEN_PROFILE_KEYS)
+        if bad_forb is not None:
+            self.audit.record(
+                action="bot.skill.delete",
+                status_code=400,
+                outcome=f"denied_forbidden_field:{bad_forb}",
+                client_ip=client_ip,
+                target_id=safe_tid,
+                sess=sess,
+                bot_override=handle,
+            )
+            return web.json_response(
+                {"ok": False, "source": "studio_api", "error": f"禁止客户端传入受限字段: {bad_forb}"},
+                status=400,
+            )
+
+        extra_keys = set(body.keys()) - _ALLOWED_SKILL_DELETE_KEYS
+        if extra_keys:
+            self.audit.record(
+                action="bot.skill.delete",
+                status_code=400,
+                outcome="denied_unknown_field",
+                client_ip=client_ip,
+                target_id=safe_tid,
+                sess=sess,
+                bot_override=handle,
+            )
+            return web.json_response(
+                {"ok": False, "source": "studio_api", "error": "存在未允许的删除参数"},
+                status=400,
+            )
+
+        exp_rev = self._parse_expected_rev(body.get("expected_rev"))
+        if exp_rev is None:
+            self.audit.record(
+                action="bot.skill.delete",
+                status_code=400,
+                outcome="denied_missing_expected_rev",
+                client_ip=client_ip,
+                target_id=safe_tid,
+                sess=sess,
+                bot_override=handle,
+            )
+            return web.json_response(
+                {"ok": False, "source": "studio_api", "error": "缺少有效的整数 expected_rev 乐观锁版本号"},
+                status=400,
+            )
+
+        if ipc_ep is None:
+            self.audit.record(
+                action="bot.skill.delete",
+                status_code=503,
+                outcome="error_ipc_offline",
+                client_ip=client_ip,
+                target_id=safe_tid,
+                sess=sess,
+                bot_override=handle,
+            )
+            return web.json_response(
+                {"ok": False, "source": "upstream", "error": "目标 Bot Bridge IPC 离线，无法删除 Skill"},
+                status=503,
+            )
+
+        sock_p, tok = ipc_ep
+        sc, data = await self._ipc_request_json(
+            sock_path=sock_p,
+            token=tok,
+            method="DELETE",
+            path="/ipc/bot/skills",
+            payload={
+                "user_id": int(sess["user_id"]),
+                "actor_username": str(sess.get("username") or "")[:64],
+                "slug": slug,
+                "expected_rev": exp_rev,
+            },
+        )
+        if sc >= 400 or not data.get("ok"):
+            outcome = "conflict_rev" if sc == 409 else ("error_ipc" if sc >= 500 else "denied_ipc")
+            self.audit.record(
+                action="bot.skill.delete",
+                status_code=sc,
+                outcome=outcome,
+                client_ip=client_ip,
+                target_id=safe_tid,
+                sess=sess,
+                bot_override=handle,
+            )
+            err_body: dict[str, Any] = {
+                "ok": False,
+                "source": "upstream",
+                "error": _redact_bot_text(data.get("error") or "删除 Skill 失败", max_len=200),
+            }
+            if data.get("code"):
+                err_body["code"] = _sanitize_slug(data.get("code"), max_len=32)
+            if isinstance(data.get("current_rev"), int):
+                err_body["current_rev"] = int(data["current_rev"])
+            return web.json_response(err_body, status=sc)
+
+        self.audit.record(
+            action="bot.skill.delete",
+            status_code=200,
+            outcome="allowed",
+            client_ip=client_ip,
+            target_id=safe_tid,
+            sess=sess,
+            bot_override=handle,
+        )
+        self.event_hub.publish(
+            "bots_updated",
+            {"handle": handle, "action": "skill_deleted", "slug": slug, "source": "studio"},
+        )
+        return web.json_response(
+            {
+                "ok": True,
+                "deleted": True,
+                "handle": handle,
+                "slug": slug,
+                "rev": max(0, int(data.get("rev") or 0)),
+            },
+            headers=_PRIVATE_GET_HEADERS,
         )

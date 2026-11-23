@@ -92,6 +92,11 @@ except ImportError:
     from bridge import studio_ipc
 
 try:
+    import bot_profiles
+except ImportError:
+    from bridge import bot_profiles
+
+try:
     import google_accounts
 except ImportError:
     from bridge import google_accounts
@@ -2105,6 +2110,34 @@ def ensure_team_mcp_configured():
         log("ensure_team_mcp_configured error: %r" % e)
 
 
+def ensure_claude_mem_proxy_configured(mcp_config_path=None, proxy_script=None):
+    """Wrap `claude-mem` in `~/.gemini/config/mcp_config.json` with `claude_mem_mcp_proxy.py` atomically."""
+    script = proxy_script or os.path.join(os.path.dirname(os.path.abspath(__file__)), "claude_mem_mcp_proxy.py")
+    cfg_path = mcp_config_path or os.path.join(HOME, ".gemini", "config", "mcp_config.json")
+    return bot_profiles.ensure_claude_mem_proxy_configured(
+        mcp_config_path=cfg_path,
+        proxy_script=script,
+        python_exe=sys.executable,
+    )
+
+
+def _inject_bot_isolation_env(env, *, handle=None, role=None, bus_role_override=None):
+    """Uniformly inject per-bot identity, role, memory project/scope & profiles dir into every `agy` subprocess."""
+    raw_h = handle if handle is not None else _current_bot_handle()
+    norm_h = bot_profiles.normalize_bot_handle(str(raw_h or "")) or "bridge"
+    eff_role = str(role if role is not None else _current_bot_role() or "worker").strip().lower()
+    if eff_role not in ("coordinator", "worker", "peer"):
+        eff_role = "worker"
+    env["AGY_BOT_HANDLE"] = norm_h
+    env["AGY_BOT_BUS_ROLE"] = (
+        str(bus_role_override).strip().lower() if bus_role_override is not None else eff_role
+    )
+    env["AGY_BOT_MEMORY_PROJECT"] = f"bot-{norm_h}"
+    env["AGY_BOT_MEMORY_SCOPE"] = "coordinator_all" if eff_role == "coordinator" else "isolated"
+    env["AGY_BOT_PROFILES_DIR"] = str(bot_profiles.resolve_profiles_dir())
+    return env
+
+
 def _should_ignore_group_message(msg):
     """In multi-bot group/supergroup chats, route @mentions cleanly so bots don't talk over each other."""
     chat = msg.get("chat") or {}
@@ -2674,8 +2707,7 @@ class AgySession:
         env["AGY_OUTBOX_DIR"] = BOT_OUTBOX_DIR
         origin_chat, origin_tid = parse_scope_key(self.scope_key)
         env["AGY_BOT_BUS_ENABLE"] = "1" if self.bus_enable else "0"
-        env["AGY_BOT_BUS_ROLE"] = self.bus_role
-        env["AGY_BOT_HANDLE"] = _current_bot_handle()
+        _inject_bot_isolation_env(env, handle=_current_bot_handle(), role=self.bus_role)
         env["AGY_BOT_INSTANCE_ID"] = BOT_INSTANCE_ID
         env["AGY_BOT_SCOPE_KEY"] = self.scope_key
         env["AGY_BOT_CHAT_ID"] = str(origin_chat or 0)
@@ -5260,6 +5292,10 @@ def _execute_compact_on_session(
 
         if res is not None and (res.get("status") in (None, "SUCCESS")) and not res.get("error"):
             _last_compacted_line[conv] = get_transcript_line_count(conv)
+            if scope_key:
+                with state_lock:
+                    _sc_c = _ensure_scope_locked(scope_key)
+                    _sc_c["profile_reinject_needed"] = True
             return True, time.time() - t0, ""
 
         if res is not None and (res.get("status") == "ERROR" or res.get("error")):
@@ -5273,6 +5309,10 @@ def _execute_compact_on_session(
                     % (str(compact_cid)[:8], compact_err[:160])
                 )
                 _last_compacted_line[conv] = get_transcript_line_count(conv)
+                if scope_key:
+                    with state_lock:
+                        _sc_c = _ensure_scope_locked(scope_key)
+                        _sc_c["profile_reinject_needed"] = True
                 return True, time.time() - t0, ""
 
         last_err = str((res or {}).get("error") or (res or {}).get("response") or sess.get_stderr_text() or "compact failed")
@@ -5694,6 +5734,7 @@ def _run_fast_group_reply(
         _apply_agy_auto_update_env(env)
         env["PATH"] = os.path.join(HOME, ".local/bin") + ":" + env.get("PATH", "")
         env.setdefault("HOME", HOME)
+        _inject_bot_isolation_env(env, handle=my_handle, role=_current_bot_role())
         env["AGY_BOT_BUS_ENABLE"] = "0"
         env["AGY_INTERNAL_OBSERVER"] = "1"
         fast_inspect = memory_guard.inspect_text(fast_prompt)
@@ -5723,6 +5764,8 @@ def _run_fast_group_reply(
             if isinstance(parsed, dict):
                 reply_text = (parsed.get("response") or "").strip()
                 fast_cid = parsed.get("conversation_id")
+                if fast_cid:
+                    bot_profiles.register_cid_owner(str(fast_cid), my_handle, bus_dir=bot_bus.BUS_DIR)
                 if fast_untrusted and fast_cid:
                     reason = "readonly_fast_reply" if user_role == "readonly" else ",".join(fast_inspect["reasons"][:4])
                     memory_guard.mark_tainted(
@@ -6074,6 +6117,43 @@ def run_agy(
 
     base_prompt = prompt
     prompt_parts = []
+    profile_injected_rev = None
+    try:
+        _cur_prof_rev, _prof_block = bot_profiles.render_bot_profile_prompt(
+            _current_bot_handle(),
+            role=_current_bot_role(),
+            catalog_dirs=[os.path.join(WORKDIR, ".agents", "skills")],
+        )
+    except Exception:
+        _cur_prof_rev, _prof_block = 0, ""
+    _cur_conv_ckpts = None
+    _detected_compact = False
+    if conv:
+        try:
+            _ctx_st = get_context_stats(conv)
+            _cur_conv_ckpts = int(_ctx_st.get("checkpoints") or 0)
+            if _ctx_st.get("just_compacted"):
+                _detected_compact = True
+        except Exception:
+            _cur_conv_ckpts = None
+    with state_lock:
+        _sc_prof = _ensure_scope_locked(exec_skey)
+        _prev_prof_rev = _sc_prof.get("injected_profile_rev")
+        _prev_ckpts = _sc_prof.get("last_seen_checkpoints")
+        if (
+            _detected_compact
+            or (_cur_conv_ckpts is not None and _prev_ckpts is not None and _cur_conv_ckpts > int(_prev_ckpts))
+        ):
+            _sc_prof["profile_reinject_needed"] = True
+        _need_reinject = bool(_sc_prof.get("profile_reinject_needed"))
+    _should_inject_profile = bool(
+        _prof_block
+        and "[ACB_BOT_PROFILE " not in (prompt or "")
+        and (conv is None or _need_reinject or _prev_prof_rev != _cur_prof_rev)
+    )
+    if _should_inject_profile:
+        prompt_parts.append(_prof_block)
+        profile_injected_rev = _cur_prof_rev
     if session_readonly:
         prompt_parts.append(access_control.build_readonly_prompt_prefix(user_id))
     elif (
@@ -6098,6 +6178,12 @@ def run_agy(
             prompt_parts.append(history_block)
     prompt_parts.append(prompt)
     effective_prompt = "\n\n".join(prompt_parts)
+    if profile_injected_rev is not None:
+        with state_lock:
+            _sc_prof_w = _ensure_scope_locked(exec_skey)
+            _sc_prof_w["injected_profile_rev"] = int(profile_injected_rev)
+            _sc_prof_w["last_seen_checkpoints"] = int(_cur_conv_ckpts or 0)
+            _sc_prof_w.pop("profile_reinject_needed", None)
 
     prompt_taint = memory_guard.inspect_text(effective_prompt)
     conv_already_tainted = bool(conv and memory_guard.is_tainted(conv, taint_file=MEMORY_TAINT_FILE))
@@ -6473,6 +6559,9 @@ def run_agy(
                             turn_running_cid = cid
                         if conv_lease is None and studio_ipc.is_valid_cid(cid):
                             conv_lease = studio_ipc.ConversationLease.try_acquire(bot_bus.BUS_DIR, cid)
+                        bot_profiles.register_cid_owner(
+                            cid, _current_bot_handle(), bus_dir=bot_bus.BUS_DIR
+                        )
                         if turn_untrusted:
                             memory_guard.mark_tainted(
                                 cid,
@@ -8060,6 +8149,7 @@ def execute_scheduled_task(task):
             env["PATH"] = os.path.join(HOME, ".local/bin") + ":" + env.get("PATH", "")
             env.setdefault("HOME", HOME)
             env["AGY_OUTBOX_DIR"] = BOT_OUTBOX_DIR
+            _inject_bot_isolation_env(env, handle=_current_bot_handle(), role=_current_bot_role())
             env["AGY_BOT_BUS_ENABLE"] = "0"
             if not payload.get("use_memory"):
                 env["AGY_INTERNAL_OBSERVER"] = "1"
@@ -8205,6 +8295,7 @@ def execute_scheduled_task(task):
 
             if new_cid:
                 _record_scheduled_cid(new_cid)
+                bot_profiles.register_cid_owner(str(new_cid), _current_bot_handle(), bus_dir=bot_bus.BUS_DIR)
                 if sched_untrusted:
                     memory_guard.mark_tainted(
                         str(new_cid),
@@ -8455,6 +8546,17 @@ def _execute_bus_job(job_id, *, claimed_turn_gen=None, claimed_qid=None):
             worker_specialty=cfg.get("specialty") or "",
             worktree_info=wt_info,
         )
+        if not resume_cid:
+            try:
+                _b_rev, _b_prof = bot_profiles.render_bot_profile_prompt(
+                    my_handle,
+                    role=_current_bot_role(),
+                    catalog_dirs=[os.path.join(exec_workdir, ".agents", "skills")],
+                )
+                if _b_prof and "[ACB_BOT_PROFILE " not in full_prompt:
+                    full_prompt = _b_prof + "\n\n" + full_prompt
+            except Exception:
+                pass
 
         exec_plan = _resolve_exec_target(exec_model, exec_effort)
         cli_model = exec_plan["cli_model"]
@@ -8484,6 +8586,8 @@ def _execute_bus_job(job_id, *, claimed_turn_gen=None, claimed_qid=None):
         env["PATH"] = os.path.join(HOME, ".local/bin") + ":" + env.get("PATH", "")
         env.setdefault("HOME", HOME)
         env["AGY_OUTBOX_DIR"] = BOT_OUTBOX_DIR
+        _bus_eff_role = _current_bot_role()
+        _inject_bot_isolation_env(env, handle=my_handle, role=_bus_eff_role)
         if mirror_chat and int(mirror_chat) < 0:
             worker_skey = scope_key_for(mirror_chat, mirror_thread)
             bot_bus.set_origin_context(
@@ -8496,7 +8600,8 @@ def _execute_bus_job(job_id, *, claimed_turn_gen=None, claimed_qid=None):
                 chain_id=str(job.get("chain_id") or ""),
             )
             env["AGY_BOT_BUS_ENABLE"] = "1"
-            env["AGY_BOT_BUS_ROLE"] = "worker"
+            if _bus_eff_role != "coordinator":
+                env["AGY_BOT_BUS_ROLE"] = "worker"
             env["AGY_BOT_CHAT_ID"] = str(mirror_chat)
             env["AGY_BOT_THREAD_ID"] = str(mirror_thread) if mirror_thread is not None else ""
             env["AGY_BOT_SCOPE_KEY"] = worker_skey
@@ -8504,7 +8609,6 @@ def _execute_bus_job(job_id, *, claimed_turn_gen=None, claimed_qid=None):
             env["AGY_BOT_MENTION_HOP"] = "0"
         else:
             env["AGY_BOT_BUS_ENABLE"] = "0"
-            env["AGY_BOT_BUS_ROLE"] = "disabled"
         env["AGY_BOT_HANDLE"] = my_handle
         env["AGY_BOT_CHAIN"] = ",".join(job.get("chain") or [])
 
@@ -8602,6 +8706,7 @@ def _execute_bus_job(job_id, *, claimed_turn_gen=None, claimed_qid=None):
                 cid = ev.get("conversation_id")
                 if cid:
                     new_cid = cid
+                    bot_profiles.register_cid_owner(str(cid), my_handle, bus_dir=bot_bus.BUS_DIR)
                 continue
             if kind == "step_update":
                 su = ev.get("step_update") or {}
@@ -10068,57 +10173,79 @@ def _collect_sanitized_mcp_list():
 
 
 def _collect_sanitized_skills_list():
-    """Return strictly allowlisted Skills metadata: `{name, scope, description (<=160)}` ONLY."""
+    """Return strictly allowlisted Skills metadata: `{name, scope, description (<=160)}` ONLY.
+
+    When `SKILLS_SEARCH_DIRS` is not overridden by tests, resolves effective skills strictly
+    according to per-bot isolation (Worker: own + allowlisted catalog; Coordinator: own +
+    full team aggregated + catalog).
+    """
     if SKILLS_SEARCH_DIRS is not None:
         roots = list(SKILLS_SEARCH_DIRS)
-    else:
-        roots = [
-            ("workspace", os.path.join(WORKDIR, ".agents", "skills")),
-            ("builtin", os.path.join(HOME, ".gemini", "antigravity-cli", "builtin", "skills")),
-        ]
-        plugins_dir = os.path.join(HOME, ".gemini", "config", "plugins")
-        if os.path.isdir(plugins_dir):
+        items = []
+        seen = set()
+        for scope, root_dir in roots:
+            if not root_dir or not os.path.isdir(root_dir):
+                continue
             try:
-                for p_ent in sorted(os.scandir(plugins_dir), key=lambda e: e.name):
-                    if p_ent.is_dir(follow_symlinks=False):
-                        sk_d = os.path.join(p_ent.path, "skills")
-                        if os.path.isdir(sk_d):
-                            roots.append(("plugin", sk_d))
+                entries = sorted(os.scandir(root_dir), key=lambda e: e.name)
             except OSError:
-                pass
+                continue
+            for ent in entries:
+                if not ent.is_dir(follow_symlinks=False):
+                    continue
+                md_path = os.path.join(ent.path, "SKILL.md")
+                if os.path.islink(md_path) or not os.path.isfile(md_path):
+                    continue
+                parsed_name, parsed_desc = _parse_skill_frontmatter(md_path)
+                safe_name = _sanitize_ipc_slug(parsed_name or ent.name, max_len=64)
+                if not safe_name:
+                    continue
+                key = (str(scope), safe_name)
+                if key in seen:
+                    continue
+                seen.add(key)
+                safe_desc = _redact_ipc_text(parsed_desc, max_len=160)
+                items.append({
+                    "name": safe_name,
+                    "scope": _sanitize_ipc_slug(scope, max_len=24) or "workspace",
+                    "description": safe_desc,
+                })
+                if len(items) >= 120:
+                    return items
+        return items
 
-    items = []
-    seen = set()
-    for scope, root_dir in roots:
-        if not root_dir or not os.path.isdir(root_dir):
-            continue
-        try:
-            entries = sorted(os.scandir(root_dir), key=lambda e: e.name)
-        except OSError:
-            continue
-        for ent in entries:
-            if not ent.is_dir(follow_symlinks=False):
-                continue
-            md_path = os.path.join(ent.path, "SKILL.md")
-            if os.path.islink(md_path) or not os.path.isfile(md_path):
-                continue
-            parsed_name, parsed_desc = _parse_skill_frontmatter(md_path)
-            safe_name = _sanitize_ipc_slug(parsed_name or ent.name, max_len=64)
+    try:
+        resolved = bot_profiles.resolve_effective_skills(
+            _current_bot_handle(),
+            role=_current_bot_role(),
+            catalog_dirs=[os.path.join(WORKDIR, ".agents", "skills")],
+            include_paths=False,
+        )
+        items = []
+        seen = set()
+        for sk in resolved.get("effective_skills") or []:
+            safe_name = _sanitize_ipc_slug(sk.get("name") or sk.get("slug") or "", max_len=64)
             if not safe_name:
                 continue
-            key = (str(scope), safe_name)
+            raw_scope = str(sk.get("scope") or "workspace")
+            if raw_scope == "team_bot" and sk.get("owner"):
+                scope_label = f"bot:{_sanitize_ipc_slug(sk.get('owner'), max_len=20)}"
+            else:
+                scope_label = _sanitize_ipc_slug(raw_scope, max_len=24) or "workspace"
+            key = (scope_label, safe_name)
             if key in seen:
                 continue
             seen.add(key)
-            safe_desc = _redact_ipc_text(parsed_desc, max_len=160)
             items.append({
                 "name": safe_name,
-                "scope": _sanitize_ipc_slug(scope, max_len=24) or "workspace",
-                "description": safe_desc,
+                "scope": scope_label,
+                "description": _redact_ipc_text(sk.get("description") or "", max_len=160),
             })
             if len(items) >= 120:
                 return items
-    return items
+        return items
+    except Exception:
+        return []
 
 
 def _resolve_project_by_id_or_workdir():
@@ -10583,6 +10710,110 @@ def _studio_ipc_update_bot_config(req):
     return 200, {"ok": True, **_studio_ipc_get_bot_config()}
 
 
+def _studio_ipc_get_bot_profile():
+    cfg = _current_bot_cfg()
+    me = _current_bot_handle()
+    role = _current_bot_role()
+    return bot_profiles.get_bot_profile_bundle(
+        me,
+        role=role,
+        specialty=str(cfg.get("specialty") or ""),
+        catalog_dirs=[os.path.join(WORKDIR, ".agents", "skills")],
+    )
+
+
+def _studio_ipc_update_bot_profile(req):
+    allowed_fields = {
+        "user_id",
+        "actor_username",
+        "expected_rev",
+        "doc",
+        "content",
+        "docs",
+        "skills_policy",
+        "specialty",
+    }
+    extra = set(req.keys()) - allowed_fields
+    if extra:
+        return 400, {"ok": False, "error": f"存在未允许的 Profile 字段: {sorted(extra)[0]}"}
+
+    me = _current_bot_handle()
+    role = _current_bot_role()
+    actor = str(req.get("actor_username") or f"uid:{req.get('user_id', '')}")[:64]
+    sc, res = bot_profiles.update_bot_profile(
+        me,
+        expected_rev=req.get("expected_rev"),
+        doc=req.get("doc"),
+        content=req.get("content"),
+        docs=req.get("docs"),
+        skills_policy=req.get("skills_policy"),
+        specialty=req.get("specialty"),
+        updated_by=actor,
+        role=role,
+        catalog_dirs=[os.path.join(WORKDIR, ".agents", "skills")],
+    )
+    if sc == 200 and res.get("ok"):
+        if "specialty" in req and isinstance(res.get("specialty"), str):
+            try:
+                bot_bus.update_bot_config(me, specialty=res["specialty"])
+            except Exception:
+                pass
+        invalidate_session("studio_bot_profile")
+        _publish_bot_heartbeat()
+    return sc, res
+
+
+def _studio_ipc_get_bot_skill(slug):
+    return bot_profiles.get_bot_skill(
+        _current_bot_handle(),
+        slug,
+        role=_current_bot_role(),
+    )
+
+
+def _studio_ipc_put_bot_skill(req):
+    allowed_fields = {"user_id", "actor_username", "slug", "content", "expected_rev"}
+    extra = set(req.keys()) - allowed_fields
+    if extra:
+        return 400, {"ok": False, "error": f"存在未允许的 Skill 字段: {sorted(extra)[0]}"}
+    me = _current_bot_handle()
+    role = _current_bot_role()
+    actor = str(req.get("actor_username") or f"uid:{req.get('user_id', '')}")[:64]
+    sc, res = bot_profiles.put_bot_skill(
+        me,
+        str(req.get("slug") or ""),
+        content=req.get("content"),
+        expected_rev=req.get("expected_rev"),
+        updated_by=actor,
+        role=role,
+    )
+    if sc == 200 and res.get("ok"):
+        invalidate_session("studio_bot_skill")
+        _publish_bot_heartbeat()
+    return sc, res
+
+
+def _studio_ipc_delete_bot_skill(req):
+    allowed_fields = {"user_id", "actor_username", "slug", "expected_rev"}
+    extra = set(req.keys()) - allowed_fields
+    if extra:
+        return 400, {"ok": False, "error": f"存在未允许的删除字段: {sorted(extra)[0]}"}
+    me = _current_bot_handle()
+    role = _current_bot_role()
+    actor = str(req.get("actor_username") or f"uid:{req.get('user_id', '')}")[:64]
+    sc, res = bot_profiles.delete_bot_skill(
+        me,
+        str(req.get("slug") or ""),
+        expected_rev=req.get("expected_rev"),
+        updated_by=actor,
+        role=role,
+    )
+    if sc == 200 and res.get("ok"):
+        invalidate_session("studio_bot_skill")
+        _publish_bot_heartbeat()
+    return sc, res
+
+
 def _schedule_ipc_hot_reload(delay_sec=0.25):
     """Trigger graceful hot reload via Bridge's own fixed `RELOAD_TRIGGER` & `job_q` after `delay_sec`."""
     def _emit():
@@ -11039,6 +11270,11 @@ def _start_studio_ipc():
             get_bot_config_fn=_studio_ipc_get_bot_config,
             update_bot_config_fn=_studio_ipc_update_bot_config,
             reload_bot_fn=_studio_ipc_reload_bot,
+            get_bot_profile_fn=_studio_ipc_get_bot_profile,
+            update_bot_profile_fn=_studio_ipc_update_bot_profile,
+            get_bot_skill_fn=_studio_ipc_get_bot_skill,
+            put_bot_skill_fn=_studio_ipc_put_bot_skill,
+            delete_bot_skill_fn=_studio_ipc_delete_bot_skill,
             room_turn_fn=_studio_ipc_room_turn,
             attention_notify_fn=_studio_ipc_attention_notify,
             tg_group_send_fn=_studio_ipc_tg_group_send,
@@ -11290,6 +11526,7 @@ def agy_native_models(use_cache=True):
     env = dict(os.environ)
     _strip_gateway_env(env)
     _apply_agy_auto_update_env(env)
+    _inject_bot_isolation_env(env)
     env["PATH"] = os.path.join(HOME, ".local/bin") + ":" + env.get("PATH", "")
     try:
         r = subprocess.run([AGY_BIN, "models"], capture_output=True, text=True,
@@ -12517,6 +12754,7 @@ def fetch_plan_quota_data(force_live=True):
         env = dict(os.environ)
         _strip_gateway_env(env)
         _apply_agy_auto_update_env(env)
+        _inject_bot_isolation_env(env)
         env["AGY_INTERNAL_OBSERVER"] = "1"
         env["PATH"] = os.path.join(HOME, ".local/bin") + ":" + env.get("PATH", "")
         env.setdefault("HOME", HOME)
@@ -17386,6 +17624,11 @@ def main():
         os.makedirs(UPLOADDIR, exist_ok=True)
         _init_bot_identity()
         ensure_team_mcp_configured()
+        if os.environ.get("AGY_CLAUDE_MEM_PROXY_DISABLE") != "1":
+            try:
+                ensure_claude_mem_proxy_configured()
+            except Exception as _proxy_exc:
+                log("ensure_claude_mem_proxy_configured error: %r" % _proxy_exc)
         _start_studio_ipc()
         _publish_bot_heartbeat()
         register_bot_commands()

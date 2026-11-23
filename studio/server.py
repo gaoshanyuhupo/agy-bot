@@ -653,10 +653,15 @@ def create_app(
     app.router.add_post("/api/undo/apply", workspace_files.handle_apply_undo)
     app.router.add_post("/api/undo/redo", workspace_files.handle_apply_redo)
 
-    # Phase B M1: Bot Team Control Plane (Config, Skills/MCP View & Safe Hot-Reload)
+    # Phase B M1: Bot Team Control Plane (Config, Profile/Rules/Soul/Skills & Safe Hot-Reload)
     app.router.add_get("/api/bots/{handle}/config", bot_control.handle_get_bot_config)
     app.router.add_patch("/api/bots/{handle}/config", bot_control.handle_patch_bot_config)
     app.router.add_post("/api/bots/{handle}/reload", bot_control.handle_reload_bot)
+    app.router.add_get("/api/bots/{handle}/profile", bot_control.handle_get_bot_profile)
+    app.router.add_put("/api/bots/{handle}/profile", bot_control.handle_put_bot_profile)
+    app.router.add_get("/api/bots/{handle}/skills/{slug}", bot_control.handle_get_bot_skill)
+    app.router.add_put("/api/bots/{handle}/skills/{slug}", bot_control.handle_put_bot_skill)
+    app.router.add_delete("/api/bots/{handle}/skills/{slug}", bot_control.handle_delete_bot_skill)
 
     # Phase B M2: Web Multi-Bot Chat Rooms & Unified Attention Queue
     app.router.add_get("/api/rooms", room_service.handle_get_rooms)

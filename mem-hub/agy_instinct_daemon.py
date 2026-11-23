@@ -33,25 +33,24 @@ from pathlib import Path
 from typing import Any
 
 
-def _load_memory_guard():
+def _load_bridge_module(mod_name: str):
     candidates = [
         Path(__file__).resolve().parents[1] / "bridge",
         Path(os.environ.get("AGY_BRIDGE_DIR", str(Path.home() / "agy-tg-bridge"))),
     ]
     for cand in candidates:
-        if (cand / "memory_guard.py").is_file():
+        if (cand / f"{mod_name}.py").is_file():
             if str(cand) not in sys.path:
                 sys.path.insert(0, str(cand))
             break
     try:
-        import memory_guard  # type: ignore
-
-        return memory_guard
+        return __import__(mod_name)
     except Exception:
         return None
 
 
-_MEMORY_GUARD = _load_memory_guard()
+_MEMORY_GUARD = _load_bridge_module("memory_guard")
+_BOT_PROFILES = _load_bridge_module("bot_profiles")
 
 SHIM_URL = os.environ.get("AGY_SHIM_COMPLETIONS_URL", "http://127.0.0.1:18791/v1/chat/completions")
 SHIM_MODEL = os.environ.get("AGY_SHIM_MODEL", "gemini-3.8-flash-low")
@@ -63,6 +62,7 @@ EVOLVED_SKILLS_DIR = HOMUNCULUS_DIR / "evolved" / "skills"
 ARCHIVE_DIR = HOMUNCULUS_DIR / "archive"
 ARCHIVE_INSTINCTS_DIR = ARCHIVE_DIR / "instincts"
 OBSERVATIONS_FILE = HOMUNCULUS_DIR / "observations.jsonl"
+LOCAL_ACTIVE_RULE_FILE = HOMUNCULUS_DIR / "active-instincts.md"
 
 HUB_DIR = Path(os.environ.get("AGY_MEM_HUB_DIR", str(Path.home() / "agy-mem-hub")))
 STATE_DIR = HUB_DIR / "state"
@@ -75,9 +75,17 @@ MEMORY_TAINT_FILE = Path(
     )
 )
 
+BOT_PROFILES_DIR = Path(
+    os.environ.get("AGY_BOT_PROFILES_DIR", str(Path.home() / ".config" / "agy-tg-bridge" / "bots"))
+)
+BUS_DIR = Path(
+    os.environ.get("AGY_BOT_BUS_DIR", str(Path.home() / ".config" / "agy-tg-bridge" / "bus"))
+)
+
 WORKSPACE_DIR = Path(os.environ.get("AGY_WORKSPACE_DIR", str(Path.home() / "agy-workspace")))
 WORKSPACE_AGENTS_DIR = WORKSPACE_DIR / ".agents"
-ACTIVE_RULE_FILE = WORKSPACE_AGENTS_DIR / "rules" / "ecc-active-instincts.md"
+ACTIVE_RULE_FILE = LOCAL_ACTIVE_RULE_FILE
+SHARED_WORKSPACE_RULE_FILE = WORKSPACE_AGENTS_DIR / "rules" / "ecc-active-instincts.md"
 CLAUDE_MEM_RECENT_RULE_FILE = WORKSPACE_AGENTS_DIR / "rules" / "claude-mem-recent.md"
 WORKSPACE_SKILLS_DIR = WORKSPACE_AGENTS_DIR / "skills"
 INSTINCT_CLI = WORKSPACE_SKILLS_DIR / "continuous-learning-v2" / "scripts" / "instinct-cli.py"
@@ -91,28 +99,14 @@ BRIDGE_RELOAD_FILES = [
 
 
 def _resolve_global_plugin_dir() -> Path | None:
-    explicit = os.environ.get("AGY_GLOBAL_PLUGIN_DIR", "").strip()
-    if explicit:
-        if explicit.lower() in ("none", "off", "false", "0"):
-            return None
-        return Path(explicit).expanduser()
-    env_ws = os.environ.get("AGY_WORKSPACE_DIR", "").strip()
-    default_ws = Path.home() / "agy-workspace"
-    if env_ws:
-        try:
-            if Path(env_ws).expanduser().resolve() != default_ws.resolve():
-                return Path(env_ws).expanduser() / ".gemini-plugin-ecc-instincts"
-        except OSError:
-            return Path(env_ws).expanduser() / ".gemini-plugin-ecc-instincts"
-    return Path.home() / ".gemini" / "config" / "plugins" / "ecc-instincts"
+    """Global `ecc-instincts` plugin projection is permanently disabled to prevent cross-bot leakage."""
+    return None
 
 
 GLOBAL_PLUGIN_DIR: Path | None = _resolve_global_plugin_dir()
-GLOBAL_PLUGIN_MANIFEST: Path | None = (GLOBAL_PLUGIN_DIR / "plugin.json") if GLOBAL_PLUGIN_DIR is not None else None
-GLOBAL_PLUGIN_RULE_FILE: Path | None = (
-    (GLOBAL_PLUGIN_DIR / "rules" / "AGENTS.md") if GLOBAL_PLUGIN_DIR is not None else None
-)
-GLOBAL_PLUGIN_SKILLS_DIR: Path | None = (GLOBAL_PLUGIN_DIR / "skills") if GLOBAL_PLUGIN_DIR is not None else None
+GLOBAL_PLUGIN_MANIFEST: Path | None = None
+GLOBAL_PLUGIN_RULE_FILE: Path | None = None
+GLOBAL_PLUGIN_SKILLS_DIR: Path | None = None
 
 POLL_INTERVAL_SEC = 180
 MIN_OBS_FOR_BATCH = 40
@@ -301,6 +295,14 @@ def _default_daemon_state() -> dict[str, Any]:
         "pending_correction": False,
         "evolved_domain_counts": {},
         "last_evolve_ts": 0.0,
+        "per_bot_obs_offsets": {},
+        "per_bot_last_analysis_ts": {},
+        "per_bot_pending_correction": {},
+        "per_bot_obs_compaction_gen": {},
+        "per_bot_evolved_domain_counts": {},
+        "per_bot_last_evolve_ts": {},
+        "per_bot_last_dream_ts": 0.0,
+        "per_bot_last_dream_summary": {},
     }
 
 
@@ -777,9 +779,10 @@ def _select_active_instincts(
 
 
 def sync_active_instincts_rule(*, today: date | None = None) -> tuple[int, bool]:
-    """Render selected instincts into workspace `.agents/rules/ecc-active-instincts.md`
-    AND global Antigravity plugin `~/.gemini/config/plugins/ecc-instincts/rules/AGENTS.md`
-    using deterministic ordering and omitting volatile confidence percentages to preserve prompt cache.
+    """Render selected instincts into isolated `LOCAL_ACTIVE_RULE_FILE` ONLY.
+
+    Strictly ZERO writes to `~/.gemini/config/plugins/ecc-instincts/` or shared
+    `agy-workspace/.agents/rules/ecc-active-instincts.md` to prevent cross-bot rule leakage.
     """
     existing = load_existing_instincts()
     active = _select_active_instincts(existing, today=today)
@@ -789,13 +792,10 @@ def sync_active_instincts_rule(*, today: date | None = None) -> tuple[int, bool]
         if ACTIVE_RULE_FILE.exists():
             ACTIVE_RULE_FILE.unlink()
             changed = True
-        if GLOBAL_PLUGIN_RULE_FILE is not None and GLOBAL_PLUGIN_RULE_FILE.exists():
-            GLOBAL_PLUGIN_RULE_FILE.unlink()
-            changed = True
         return 0, changed
 
     body_lines = [
-        "# Learned Workspace Instincts (ECC Auto-Synced)",
+        "# Learned Instincts (ECC Auto-Synced · Isolated)",
         "",
         "Apply these verified user & workflow preferences when their trigger matches:",
         "",
@@ -807,23 +807,8 @@ def sync_active_instincts_rule(*, today: date | None = None) -> tuple[int, bool]
         act_txt = act_m.group(1).strip().replace("\n", " ") if act_m else body.splitlines()[0]
         body_lines.append(f"- **[{inst.get('domain', 'general')}]** When {trig}: {act_txt}")
 
-    frontmatter_lines = [
-        "---",
-        "trigger: always_on",
-        "description: Auto-synced high-confidence learned instincts from ECC continuous-learning-v2",
-        "---",
-        "",
-    ]
-    ws_rendered = "\n".join(frontmatter_lines + body_lines) + "\n"
-    changed = _write_text_if_changed(ACTIVE_RULE_FILE, ws_rendered)
-
-    if GLOBAL_PLUGIN_DIR is not None and GLOBAL_PLUGIN_RULE_FILE is not None:
-        _ensure_global_plugin_manifest()
-        # Antigravity plugin rules/AGENTS.md uses plain markdown without frontmatter
-        plugin_rendered = "\n".join(body_lines) + "\n"
-        plugin_changed = _write_text_if_changed(GLOBAL_PLUGIN_RULE_FILE, plugin_rendered)
-        changed = changed or plugin_changed
-
+    rendered = "\n".join(body_lines) + "\n"
+    changed = _write_text_if_changed(ACTIVE_RULE_FILE, rendered)
     return len(active), changed
 
 
@@ -860,7 +845,7 @@ def _normalize_skill_frontmatter(md_text: str, clean_slug: str) -> str:
 
 
 def sync_evolved_skills() -> tuple[list[str], bool]:
-    """Mirror evolved skills from ~/.local/share/ecc-homunculus/**/evolved/skills into workspace .agents/skills/."""
+    """Normalize evolved skills inside `EVOLVED_SKILLS_DIR` ONLY (zero writes to shared workspace or global plugin)."""
     synced: list[str] = []
     any_changed = False
     candidate_dirs = [EVOLVED_SKILLS_DIR]
@@ -896,34 +881,1201 @@ def sync_evolved_skills() -> tuple[list[str], bool]:
                 by_slug[clean_slug] = (rank, normalized)
 
     chosen = sorted(by_slug.items(), key=lambda kv: (-kv[1][0][0], -kv[1][0][1], kv[0]))[:MAX_EVOLVED_SKILLS]
-    chosen_dest_names = {f"evolved-{clean_slug}" for clean_slug, _ in chosen}
-
-    if GLOBAL_PLUGIN_DIR is not None and GLOBAL_PLUGIN_SKILLS_DIR is not None:
-        if chosen:
-            _ensure_global_plugin_manifest()
-            GLOBAL_PLUGIN_SKILLS_DIR.mkdir(parents=True, exist_ok=True)
-        if GLOBAL_PLUGIN_SKILLS_DIR.is_dir():
-            for existing_dir in list(GLOBAL_PLUGIN_SKILLS_DIR.iterdir()):
-                if (
-                    existing_dir.is_dir()
-                    and existing_dir.name.startswith("evolved-")
-                    and existing_dir.name not in chosen_dest_names
-                ):
-                    shutil.rmtree(existing_dir, ignore_errors=True)
-                    any_changed = True
 
     for clean_slug, (_rank, normalized) in sorted(chosen, key=lambda kv: kv[0]):
-        dest_name = f"evolved-{clean_slug}"
-        dest_dir = WORKSPACE_SKILLS_DIR / dest_name
+        dest_file = EVOLVED_SKILLS_DIR / clean_slug / "SKILL.md"
+        if _write_text_if_changed(dest_file, normalized):
+            any_changed = True
+        synced.append(str(dest_file))
+    return synced, any_changed
+
+
+# ---------------------------------------------------------------------------
+# Per-Bot Isolated Instincts & Evolved Skills Pipeline + Coordinator Aggregation
+# ---------------------------------------------------------------------------
+
+
+def _resolve_cid_owner_handle(
+    cid: str,
+    *,
+    bus_dir: Path | None = None,
+) -> str | None:
+    """Resolve `cid` to its owning bot handle via `BUS_DIR/cid_owners.json` (with bus jobs fallback)."""
+    bdir = bus_dir or BUS_DIR
+    if _BOT_PROFILES is not None:
+        owner = _BOT_PROFILES.lookup_cid_owner(cid, bus_dir=bdir)
+        if owner:
+            return owner
+    else:
+        owners_file = bdir / "cid_owners.json"
+        if owners_file.is_file():
+            try:
+                data = json.loads(owners_file.read_text(encoding="utf-8", errors="replace"))
+                entry = (data.get("owners") or {}).get(cid)
+                if isinstance(entry, dict) and entry.get("handle"):
+                    return str(entry["handle"]).strip().lower()
+                if isinstance(entry, str) and entry.strip():
+                    return entry.strip().lower()
+            except Exception:
+                pass
+
+    # Fallback: inspect BUS_DIR/jobs/*.json for recorded worker conversation_id
+    jobs_dir = bdir / "jobs"
+    if jobs_dir.is_dir():
+        try:
+            for jf in jobs_dir.glob("*.json"):
+                try:
+                    jdata = json.loads(jf.read_text(encoding="utf-8", errors="replace"))
+                except Exception:
+                    continue
+                if isinstance(jdata, dict) and str(jdata.get("conversation_id") or "") == cid:
+                    tb = str(jdata.get("target_bot") or "").strip().lstrip("@").lower()
+                    if tb:
+                        return tb
+        except OSError:
+            pass
+    return None
+
+
+def _bot_instincts_paths(handle: str, *, profiles_dir: Path | None = None) -> dict[str, Path]:
+    pdir = profiles_dir or BOT_PROFILES_DIR
+    bdir = pdir / handle
+    idir = bdir / "instincts"
+    return {
+        "bot_dir": bdir,
+        "instincts_dir": idir,
+        "observations": idir / "observations.jsonl",
+        "personal": idir / "personal",
+        "archived": idir / "archived",
+        "active_md": idir / "active-instincts.md",
+        "daemon_state": idir / "daemon_state.json",
+        "skills_dir": bdir / "skills",
+    }
+
+
+def harvest_transcripts_per_bot(
+    state: dict[str, Any],
+    *,
+    profiles_dir: Path | None = None,
+    bus_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Harvest clean transcripts strictly into each owning bot's `bots/<handle>/instincts/observations.jsonl`.
+
+    - Unknown-owner CIDs are NEVER mixed into any Worker's observations.
+    - Tainted sessions & poisoned steps are 100% blocked and marked in `memory_taint.json`.
+    - Zero writes to global plugin or shared workspace `.agents/`.
+    """
+    pdir = profiles_dir or BOT_PROFILES_DIR
+    bdir = bus_dir or BUS_DIR
+    observer_cids = get_observer_cids()
+    tainted_cids = _get_tainted_cids()
+    offsets: dict[str, int] = state.setdefault("transcript_offsets", {})
+
+    per_bot_appended: dict[str, int] = {}
+    saw_correction_bots: set[str] = set()
+    unknown_owner_skipped = 0
+    tainted_skipped = 0
+
+    if not BRAIN_ROOT.is_dir():
+        return {
+            "per_bot_appended": per_bot_appended,
+            "saw_correction_bots": [],
+            "unknown_owner_skipped": unknown_owner_skipped,
+            "tainted_skipped": tainted_skipped,
+        }
+
+    for brain_dir in sorted(BRAIN_ROOT.iterdir()):
+        if not brain_dir.is_dir():
+            continue
+        cid = brain_dir.name
+        if cid in observer_cids:
+            continue
+        tpath = brain_dir / ".system_generated" / "logs" / "transcript.jsonl"
+        if not tpath.is_file():
+            continue
+
+        owner_handle = _resolve_cid_owner_handle(cid, bus_dir=bdir)
+        if not owner_handle:
+            unknown_owner_skipped += 1
+            continue
+
+        try:
+            lines = tpath.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            continue
+        total = len(lines)
+
+        if cid in tainted_cids:
+            prev_off = int(offsets.get(cid) or 0)
+            if prev_off < total:
+                state["poison_blocked_count"] = int(state.get("poison_blocked_count") or 0) + 1
+                _record_guard_block(1)
+            offsets[cid] = total
+            tainted_skipped += 1
+            continue
+
+        head_sample = "\n".join(lines[:12])
+        if "<STATELESS_TASK>" in head_sample or "[ACB_SCHEDULED_TASK" in head_sample:
+            if "[ACB_SCHEDULED_TASK" in head_sample:
+                _mark_cid_tainted(cid, "marker:[ACB_SCHEDULED_TASK", "instinct_daemon:per_bot_head")
+                tainted_cids.add(cid)
+                tainted_skipped += 1
+                _record_guard_block(1)
+            offsets[cid] = total
+            continue
+
+        start_idx = int(offsets.get(cid) or 0)
+        if start_idx > total:
+            start_idx = 0
+        if start_idx >= total:
+            continue
+
+        new_obs: list[dict[str, Any]] = []
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for raw in lines[start_idx:]:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                step = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(step, dict):
+                continue
+            is_bad, bad_reason = _inspect_step(step)
+            if is_bad:
+                _mark_cid_tainted(cid, bad_reason or "untrusted_step", "instinct_daemon:per_bot")
+                tainted_cids.add(cid)
+                state["poison_blocked_count"] = int(state.get("poison_blocked_count") or 0) + 1
+                _record_guard_block(1)
+                tainted_skipped += 1
+                new_obs.clear()
+                break
+
+            stype = step.get("type")
+            ts = step.get("created_at") or now_iso
+            if stype == "USER_INPUT":
+                raw_content = str(step.get("content") or "")
+                if "<STATELESS_TASK" in raw_content:
+                    continue
+                user_txt = scrub_secrets(unwrap_user_request(raw_content))
+                if not user_txt or user_txt.startswith("/compact") or "<STATELESS_TASK" in user_txt:
+                    continue
+                if CORRECTION_RE.search(user_txt):
+                    saw_correction_bots.add(owner_handle)
+                new_obs.append(
+                    {
+                        "timestamp": ts,
+                        "event": "user_prompt",
+                        "session": cid[:8],
+                        "input": user_txt[:1200],
+                        "project_id": f"bot-{owner_handle}",
+                        "project_name": f"bot-{owner_handle}",
+                        "bot": owner_handle,
+                    }
+                )
+            elif stype == "PLANNER_RESPONSE":
+                resp_txt = scrub_secrets(str(step.get("content") or "").strip())
+                if resp_txt:
+                    new_obs.append(
+                        {
+                            "timestamp": ts,
+                            "event": "assistant_reply",
+                            "session": cid[:8],
+                            "output": resp_txt[:800],
+                            "project_id": f"bot-{owner_handle}",
+                            "project_name": f"bot-{owner_handle}",
+                            "bot": owner_handle,
+                        }
+                    )
+
+        offsets[cid] = total
+        if new_obs:
+            paths = _bot_instincts_paths(owner_handle, profiles_dir=pdir)
+            paths["instincts_dir"].mkdir(parents=True, exist_ok=True)
+            os.chmod(paths["bot_dir"], 0o700)
+            os.chmod(paths["instincts_dir"], 0o700)
+            obs_file = paths["observations"]
+            lock_p = obs_file.with_name(obs_file.name + ".lock")
+            with open(lock_p, "a+", encoding="utf-8") as lf:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+                try:
+                    with obs_file.open("a", encoding="utf-8") as fh:
+                        for row in new_obs:
+                            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    os.chmod(obs_file, 0o600)
+                finally:
+                    fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+            per_bot_appended[owner_handle] = per_bot_appended.get(owner_handle, 0) + len(new_obs)
+
+    return {
+        "per_bot_appended": per_bot_appended,
+        "saw_correction_bots": sorted(saw_correction_bots),
+        "unknown_owner_skipped": unknown_owner_skipped,
+        "tainted_skipped": tainted_skipped,
+    }
+
+
+def load_bot_instincts(
+    handle: str,
+    *,
+    profiles_dir: Path | None = None,
+) -> dict[str, dict[str, Any]]:
+    paths = _bot_instincts_paths(handle, profiles_dir=profiles_dir)
+    p_dir = paths["personal"]
+    if not p_dir.is_dir():
+        return {}
+    result: dict[str, dict[str, Any]] = {}
+    for p in sorted(p_dir.glob("*.yaml")):
+        try:
+            txt = p.read_text(encoding="utf-8")
+            m = re.match(r"^---\n([\s\S]*?)\n---\n([\s\S]*)$", txt)
+            if not m:
+                continue
+            fm_raw, body = m.group(1), m.group(2).strip()
+            meta: dict[str, Any] = {}
+            for line in fm_raw.splitlines():
+                if ":" not in line:
+                    continue
+                k, v = line.split(":", 1)
+                k = k.strip()
+                v = v.strip()
+                if v.startswith('"') and v.endswith('"'):
+                    try:
+                        v = json.loads(v)
+                    except Exception:
+                        v = v.strip('"')
+                meta[k] = v
+            iid = str(meta.get("id") or p.stem)
+            meta["id"] = iid
+            meta["confidence"] = float(meta.get("confidence") or 0.5)
+            meta["body"] = body
+            meta["action"] = _extract_action_from_body(body)
+            meta["evidence"] = _extract_evidence_from_body(body)
+            meta["title"] = _extract_title_from_body(body, iid.replace("-", " ").title())
+            meta["path"] = str(p)
+            result[iid] = meta
+        except Exception:
+            continue
+    return result
+
+
+def write_bot_instinct_yaml(
+    handle: str,
+    inst: dict[str, Any],
+    *,
+    profiles_dir: Path | None = None,
+    preserve_last_observed: bool = False,
+) -> Path | None:
+    ok, _reason = _validate_instinct_candidate(inst, is_existing=False)
+    if not ok:
+        _record_guard_block(1)
+        return None
+    paths = _bot_instincts_paths(handle, profiles_dir=profiles_dir)
+    paths["personal"].mkdir(parents=True, exist_ok=True)
+    os.chmod(paths["bot_dir"], 0o700)
+    os.chmod(paths["instincts_dir"], 0o700)
+    os.chmod(paths["personal"], 0o700)
+
+    raw_id = str(inst.get("id") or "").strip().lower()
+    clean_id = re.sub(r"[^a-z0-9._-]+", "-", raw_id).strip("-")[:80] or "learned-pattern"
+    trigger = str(inst.get("trigger") or f"when operating as @{handle}").strip()
+    conf = max(0.30, min(0.95, round(float(inst.get("confidence") or 0.5), 2)))
+    domain = re.sub(r"[^a-z0-9_-]+", "-", str(inst.get("domain") or "workflow").lower()).strip("-") or "workflow"
+    title = str(inst.get("title") or clean_id.replace("-", " ").title()).strip()
+    action = str(inst.get("action") or "").strip()
+    evidence_list = inst.get("evidence") or []
+    if isinstance(evidence_list, str):
+        evidence_list = [evidence_list]
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    ev_lines = [f"- {str(e).strip()}" for e in evidence_list if str(e).strip()][:6]
+    if not preserve_last_observed:
+        ev_lines = [e for e in ev_lines if not e.startswith("- Last observed:")]
+        ev_lines.append(f"- Last observed: {today}")
+    elif not any("Last observed" in e for e in ev_lines):
+        ev_lines.append(f"- Last observed: {today}")
+
+    yaml_text = (
+        "---\n"
+        f"id: {clean_id}\n"
+        f"trigger: {json.dumps(trigger, ensure_ascii=False)}\n"
+        f"confidence: {conf}\n"
+        f"domain: {json.dumps(domain, ensure_ascii=False)}\n"
+        'source: "session-observation"\n'
+        f"scope: bot-{handle}\n"
+        "---\n\n"
+        f"# {title}\n\n"
+        "## Action\n"
+        f"{action}\n\n"
+        "## Evidence\n"
+        + "\n".join(ev_lines)
+        + "\n"
+    )
+    out_path = paths["personal"] / f"{clean_id}.yaml"
+    tmp = out_path.with_suffix(".yaml.tmp")
+    tmp.write_text(yaml_text, encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    tmp.replace(out_path)
+    os.chmod(out_path, 0o600)
+    return out_path
+
+
+def sync_bot_active_instincts(
+    handle: str,
+    *,
+    profiles_dir: Path | None = None,
+    today: date | None = None,
+) -> tuple[int, bool]:
+    """Deterministically render `bots/<handle>/instincts/active-instincts.md` (`0600`) with zero global writes."""
+    paths = _bot_instincts_paths(handle, profiles_dir=profiles_dir)
+    existing = load_bot_instincts(handle, profiles_dir=profiles_dir)
+    active = _select_active_instincts(existing, today=today)
+    target = paths["active_md"]
+    if not active:
+        if target.exists():
+            target.unlink()
+            return 0, True
+        return 0, False
+
+    lines = [
+        f"# Learned Instincts for @{handle}",
+        "",
+        "Apply these verified preferences when their trigger matches:",
+        "",
+    ]
+    for inst in active:
+        trig = re.sub(r"^when\s+", "", str(inst.get("trigger", "")).strip(), flags=re.IGNORECASE)
+        body = inst.get("body", "")
+        act_m = re.search(r"## Action\s*\n\s*(.+?)(?:\n\n|\n##|$)", body, re.DOTALL)
+        act_txt = act_m.group(1).strip().replace("\n", " ") if act_m else body.splitlines()[0]
+        lines.append(f"- **[{inst.get('domain', 'general')}]** When {trig}: {act_txt}")
+
+    rendered = "\n".join(lines) + "\n"
+    changed = _write_text_if_changed(target, rendered)
+    if target.is_file():
+        os.chmod(target, 0o600)
+    return len(active), changed
+
+
+def sync_bot_evolved_skills(
+    handle: str,
+    *,
+    evolved_items: dict[str, str] | None = None,
+    profiles_dir: Path | None = None,
+) -> tuple[list[str], bool]:
+    """Write evolved skills strictly into `bots/<handle>/skills/evolved-<slug>/SKILL.md` (`0600`)."""
+    paths = _bot_instincts_paths(handle, profiles_dir=profiles_dir)
+    paths["skills_dir"].mkdir(parents=True, exist_ok=True)
+    os.chmod(paths["bot_dir"], 0o700)
+    os.chmod(paths["skills_dir"], 0o700)
+
+    synced: list[str] = []
+    any_changed = False
+    src_map = evolved_items or {}
+    for raw_slug, md_text in sorted(src_map.items()):
+        clean_slug = _clean_evolved_slug(raw_slug)
+        if not clean_slug:
+            continue
+        bad_md, _ = _inspect_text(f"{clean_slug}\n{md_text}")
+        if bad_md:
+            _record_guard_block(1)
+            continue
+        normalized = _normalize_skill_frontmatter(md_text, clean_slug)
+        dest_dir = paths["skills_dir"] / f"evolved-{clean_slug}"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(dest_dir, 0o700)
         dest_file = dest_dir / "SKILL.md"
         if _write_text_if_changed(dest_file, normalized):
             any_changed = True
-        if GLOBAL_PLUGIN_SKILLS_DIR is not None:
-            plugin_skill_file = GLOBAL_PLUGIN_SKILLS_DIR / dest_name / "SKILL.md"
-            if _write_text_if_changed(plugin_skill_file, normalized):
-                any_changed = True
+        os.chmod(dest_file, 0o600)
         synced.append(str(dest_file))
     return synced, any_changed
+
+
+def _list_bot_profile_handles(profiles_dir: Path | None = None) -> list[str]:
+    pdir = profiles_dir or BOT_PROFILES_DIR
+    handles: list[str] = []
+    if pdir.is_dir():
+        for ent in sorted(pdir.iterdir()):
+            if ent.is_dir() and not ent.is_symlink() and not ent.name.startswith("."):
+                handles.append(ent.name)
+    return handles
+
+
+def _archive_bot_instinct_file(src_path: Path, archived_dir: Path, tag: str) -> Path:
+    archived_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(archived_dir, 0o700)
+    ts_tag = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    dest = archived_dir / f"{src_path.stem}-{tag}-{ts_tag}{src_path.suffix}"
+    counter = 1
+    while dest.exists():
+        dest = archived_dir / f"{src_path.stem}-{tag}-{ts_tag}-{counter}{src_path.suffix}"
+        counter += 1
+    shutil.move(str(src_path), str(dest))
+    os.chmod(dest, 0o600)
+    return dest
+
+
+def _compact_bot_observations_if_needed(
+    handle: str,
+    state: dict[str, Any],
+    *,
+    dry_run: bool = False,
+    profiles_dir: Path | None = None,
+    max_lines: int | None = None,
+    keep_tail: int | None = None,
+) -> dict[str, int]:
+    """Compress & gzip-archive a single bot's `observations.jsonl` into `bots/<handle>/instincts/archived/`."""
+    res = {"total_before": 0, "archived_lines": 0, "dropped_poison": 0, "total_after": 0}
+    paths = _bot_instincts_paths(handle, profiles_dir=profiles_dir)
+    obs_file = paths["observations"]
+    if not obs_file.is_file():
+        return res
+
+    max_l = DREAM_MAX_OBS_LINES if max_lines is None else max(20, int(max_lines))
+    tail_n = DREAM_OBS_KEEP_TAIL if keep_tail is None else max(0, int(keep_tail))
+
+    lock_p = obs_file.with_name(obs_file.name + ".lock")
+    lock_p.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_p, "a+", encoding="utf-8") as lf:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        try:
+            lines = obs_file.read_text(encoding="utf-8", errors="replace").splitlines()
+            total = len(lines)
+            res["total_before"] = total
+            if total <= max_l:
+                res["total_after"] = total
+                return res
+
+            fresh_state = load_daemon_state() if DAEMON_STATE_FILE.exists() else state
+            pb_offsets = fresh_state.get("per_bot_obs_offsets") or state.get("per_bot_obs_offsets") or {}
+            last_idx = int(pb_offsets.get(handle) or 0)
+            last_idx = max(0, min(total, last_idx))
+            effective_tail = min(tail_n, last_idx)
+            archive_end = max(0, last_idx - effective_tail)
+            if archive_end <= 0:
+                res["total_after"] = total
+                return res
+
+            raw_archive = lines[:archive_end]
+            raw_remaining = lines[archive_end:]
+            analyzed_in_remaining = last_idx - archive_end
+
+            clean_archive: list[str] = []
+            for ln in raw_archive:
+                bad, _ = _inspect_text(ln)
+                if bad:
+                    res["dropped_poison"] += 1
+                    continue
+                clean_archive.append(ln)
+
+            clean_remaining: list[str] = []
+            new_last_idx = analyzed_in_remaining
+            for idx, ln in enumerate(raw_remaining):
+                bad, _ = _inspect_text(ln)
+                if bad:
+                    res["dropped_poison"] += 1
+                    if idx < analyzed_in_remaining:
+                        new_last_idx = max(0, new_last_idx - 1)
+                    continue
+                clean_remaining.append(ln)
+
+            res["archived_lines"] = len(clean_archive)
+            res["total_after"] = len(clean_remaining)
+
+            if not dry_run:
+                if clean_archive:
+                    paths["archived"].mkdir(parents=True, exist_ok=True)
+                    os.chmod(paths["archived"], 0o700)
+                    ym = datetime.now(timezone.utc).strftime("%Y%m")
+                    gz_path = paths["archived"] / f"observations-{ym}.jsonl.gz"
+                    with gzip.open(gz_path, "at", encoding="utf-8") as gz:
+                        for ln in clean_archive:
+                            gz.write(ln + "\n")
+                    os.chmod(gz_path, 0o600)
+
+                tmp = obs_file.with_name(f".{obs_file.name}.{os.getpid()}.tmp")
+                tmp.write_text(("\n".join(clean_remaining) + "\n") if clean_remaining else "", encoding="utf-8")
+                os.chmod(tmp, 0o600)
+                tmp.replace(obs_file)
+                os.chmod(obs_file, 0o600)
+                if res["dropped_poison"]:
+                    _record_guard_block(res["dropped_poison"])
+
+                def _commit_bot_compact(latest: dict[str, Any]) -> None:
+                    offs = latest.setdefault("per_bot_obs_offsets", {})
+                    offs[handle] = new_last_idx
+                    gens = latest.setdefault("per_bot_obs_compaction_gen", {})
+                    gens[handle] = int(gens.get(handle) or 0) + 1
+                    if res["dropped_poison"]:
+                        latest["poison_blocked_count"] = (
+                            int(latest.get("poison_blocked_count") or 0) + res["dropped_poison"]
+                        )
+
+                updated_st = _update_daemon_state(_commit_bot_compact)
+                state["per_bot_obs_offsets"] = updated_st.get("per_bot_obs_offsets") or {}
+                state["per_bot_obs_compaction_gen"] = updated_st.get("per_bot_obs_compaction_gen") or {}
+                state["poison_blocked_count"] = updated_st.get("poison_blocked_count") or 0
+            return res
+        finally:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+
+
+def evolve_bot_skills(
+    handle: str,
+    *,
+    profiles_dir: Path | None = None,
+    quiet: bool = True,
+) -> dict[str, Any]:
+    """Synthesize or refresh one evolved skill strictly inside `bots/<handle>/skills/evolved-<slug>/SKILL.md`."""
+    pdir = profiles_dir or BOT_PROFILES_DIR
+    paths = _bot_instincts_paths(handle, profiles_dir=pdir)
+    existing = load_bot_instincts(handle, profiles_dir=pdir)
+    strong = [v for v in existing.values() if float(v.get("confidence", 0)) >= 0.70]
+    strong.sort(
+        key=lambda x: (
+            -_extract_last_observed_date(x).toordinal(),
+            -float(x.get("confidence", 0)),
+            str(x.get("id", "")),
+        )
+    )
+    existing_own_dirs = (
+        [d for d in sorted(paths["skills_dir"].iterdir()) if d.is_dir() and not d.is_symlink() and (d / "SKILL.md").is_file()]
+        if paths["skills_dir"].is_dir()
+        else []
+    )
+    existing_skill_names = sorted(d.name for d in existing_own_dirs)
+    existing_evolved_slugs = sorted(
+        {
+            _clean_evolved_slug(d.name)
+            for d in existing_own_dirs
+            if d.name.startswith("evolved-") and _clean_evolved_slug(d.name)
+        }
+    )
+    at_skill_cap = len(existing_evolved_slugs) >= MAX_EVOLVED_SKILLS
+    synced: list[str] = []
+    changed = False
+
+    if len(strong) >= 3:
+        cap_instruction = (
+            "Skill count is at cap: you MUST refresh one existing `evolved-*` slug from `existing_evolved_slugs` "
+            "(returning that exact slug without the `evolved-` prefix) by merging new strong instincts into it, "
+            "or output `{}` if none needs updating."
+            if at_skill_cap
+            else (
+                "If 3 or more instincts form a coherent reusable workflow/domain NOT already covered by existing "
+                "bot skills, synthesize ONE new Antigravity SKILL.md bundle; OR if an existing `evolved-*` "
+                "skill in `existing_evolved_slugs` is missing recent strong instincts, refresh it by returning its "
+                "existing slug."
+            )
+        )
+        sys_p = (
+            f"You are the ECC Skill Evolution Engine for bot @{handle}.\n"
+            f"{cap_instruction}\n"
+            "Output strict JSON: "
+            '{"slug":"short-kebab-name","description":"When to activate this skill","markdown":"Full markdown body (without frontmatter)"}. '
+            "Do NOT include an `evolved-` prefix in `slug`. "
+            "If nothing new or worth refreshing remains, output `{}`."
+        )
+        usr_p = json.dumps(
+            {
+                "bot": handle,
+                "already_existing_skills": existing_skill_names,
+                "existing_evolved_slugs": existing_evolved_slugs,
+                "at_skill_cap": at_skill_cap,
+                "strong_instincts": [
+                    {
+                        "id": v.get("id"),
+                        "trigger": v.get("trigger"),
+                        "confidence": v.get("confidence"),
+                        "domain": v.get("domain"),
+                        "last_observed": _extract_last_observed_date(v).strftime("%Y-%m-%d"),
+                        "body": v.get("body"),
+                    }
+                    for v in strong[:40]
+                ],
+            },
+            ensure_ascii=False,
+        )
+        try:
+            raw = call_shim_json(sys_p, usr_p, timeout=150)
+            obj_m = re.search(r"\{[\s\S]*\}", raw)
+            if obj_m:
+                data = json.loads(obj_m.group(0))
+                slug = _clean_evolved_slug(str(data.get("slug") or ""))
+                md = str(data.get("markdown") or "").strip()
+                desc = str(data.get("description") or "").strip()
+                bad_md, _ = _inspect_text(f"{slug}\n{desc}\n{md}")
+                allowed_slug = (not at_skill_cap) or (slug in existing_evolved_slugs)
+                if slug and md and desc and not bad_md and allowed_slug:
+                    full_md = (
+                        "---\n"
+                        f"name: evolved-{slug}\n"
+                        f"description: {json.dumps(desc, ensure_ascii=False)}\n"
+                        "---\n\n"
+                        f"{md}\n"
+                    )
+                    synced, changed = sync_bot_evolved_skills(
+                        handle,
+                        evolved_items={slug: full_md},
+                        profiles_dir=pdir,
+                    )
+        except Exception as e:
+            if not quiet:
+                log.warning("Per-bot LLM skill synthesis skipped for @%s: %s", handle, e)
+
+    return {
+        "handle": handle,
+        "strong_instincts": len(strong),
+        "synced_skills": synced,
+        "changed": changed,
+    }
+
+
+def evolve_per_bot_skills(
+    *,
+    profiles_dir: Path | None = None,
+    quiet: bool = False,
+) -> dict[str, Any]:
+    """Run per-bot skill evolution across all registered bots (zero global plugin or shared workspace writes)."""
+    pdir = profiles_dir or BOT_PROFILES_DIR
+    per_bot: dict[str, Any] = {}
+    for handle in _list_bot_profile_handles(pdir):
+        per_bot[handle] = evolve_bot_skills(handle, profiles_dir=pdir, quiet=quiet)
+    return {
+        "mode": "per_bot",
+        "per_bot": per_bot,
+        "coordinator_aggregation": build_coordinator_aggregation_view(profiles_dir=pdir),
+    }
+
+
+def analyze_per_bot_observations_batch(
+    force: bool = False,
+    *,
+    profiles_dir: Path | None = None,
+    bus_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Per-bot isolated transcript harvesting, LLM instinct extraction, active-instincts sync & skill evolution.
+
+    Strictly isolates observations, personal YAML instincts, active-instincts.md, and evolved skills
+    under `bots/<handle>/` (`0700`/`0600`) with zero writes to global plugin or shared `.agents/`.
+    """
+    ensure_dirs()
+    pdir = profiles_dir or BOT_PROFILES_DIR
+    bdir = bus_dir or BUS_DIR
+
+    state = load_daemon_state()
+    poison_before_harvest = int(state.get("poison_blocked_count") or 0)
+    harvest_res = harvest_transcripts_per_bot(state, profiles_dir=pdir, bus_dir=bdir)
+    harvest_poison_delta = max(0, int(state.get("poison_blocked_count") or 0) - poison_before_harvest)
+    harvested_offsets = dict(state.get("transcript_offsets") or {})
+    saw_corr_bots = list(harvest_res.get("saw_correction_bots") or [])
+
+    def _save_per_bot_harvest(latest: dict[str, Any]) -> None:
+        offsets = latest.setdefault("transcript_offsets", {})
+        for cid, off in harvested_offsets.items():
+            offsets[cid] = max(int(offsets.get(cid) or 0), int(off))
+        pb_corr = latest.setdefault("per_bot_pending_correction", {})
+        for h in saw_corr_bots:
+            pb_corr[h] = True
+        if harvest_poison_delta:
+            latest["poison_blocked_count"] = int(latest.get("poison_blocked_count") or 0) + harvest_poison_delta
+
+    state = _update_daemon_state(_save_per_bot_harvest)
+
+    handles = sorted(
+        set(_list_bot_profile_handles(pdir))
+        | set((harvest_res.get("per_bot_appended") or {}).keys())
+    )
+    bots_results: dict[str, Any] = {}
+    any_analyzed = False
+
+    sys_prompt = (
+        "You are the ECC Continuous-Learning v2.1 Observer Engine running on Antigravity CLI.\n"
+        "Analyze session observations (user prompts/corrections, tool usage, error fixes, repeated workflows) "
+        "and extract ONLY genuinely reusable atomic instincts for this specific bot.\n"
+        "Rules:\n"
+        "1. Be conservative: ignore one-off trivial Q&A; prioritize explicit user preferences/corrections, "
+        "infrastructure conventions, and repeated multi-step workflows.\n"
+        "2. Merge with existing instincts by reusing the same `id` and increasing `confidence` (+0.05..+0.15) "
+        "when re-confirmed, or decreasing (-0.10) if contradicted.\n"
+        "3. Initial confidence: explicit user rule/correction = 0.65..0.75; repeated workflow = 0.45..0.60; tentative = 0.35.\n"
+        "4. Never include raw secrets, tokens, or personal data.\n"
+        "5. Output STRICTLY a JSON array (no markdown prose outside JSON): "
+        '[{"id":"kebab-case-id","title":"Short Title","trigger":"when ...","action":"Concise actionable rule","domain":"workflow|code-style|ops|debugging|security|telegram","confidence":0.65,"evidence":["brief evidence 1"]}] '
+        "or `[]` if no clear reusable pattern is present."
+    )
+
+    for handle in handles:
+        paths = _bot_instincts_paths(handle, profiles_dir=pdir)
+        obs_file = paths["observations"]
+        if not obs_file.is_file():
+            bots_results[handle] = {"status": "no_observations"}
+            continue
+
+        lock_p = obs_file.with_name(obs_file.name + ".lock")
+        lock_p.parent.mkdir(parents=True, exist_ok=True)
+        with open(lock_p, "a+", encoding="utf-8") as lf:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_SH)
+            try:
+                cur_state = load_daemon_state()
+                all_lines = obs_file.read_text(encoding="utf-8", errors="replace").splitlines()
+            finally:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+
+        pb_gens = cur_state.get("per_bot_obs_compaction_gen") or {}
+        start_compaction_gen = int(pb_gens.get(handle) or 0)
+        pb_offsets = cur_state.get("per_bot_obs_offsets") or {}
+        last_idx = int(pb_offsets.get(handle) or 0)
+        if last_idx > len(all_lines):
+            last_idx = 0
+        batch_end_idx = len(all_lines)
+        last_batch_line = all_lines[-1] if all_lines else ""
+
+        pending_raw = all_lines[last_idx:]
+        pending: list[str] = []
+        obs_poison_delta = 0
+        for ln in pending_raw:
+            bad, _reason = _inspect_text(ln)
+            if bad:
+                obs_poison_delta += 1
+                _record_guard_block(1)
+                continue
+            pending.append(ln)
+
+        pb_corr_map = cur_state.get("per_bot_pending_correction") or {}
+        effective_corr = (handle in saw_corr_bots) or bool(pb_corr_map.get(handle))
+        min_needed = MIN_OBS_ON_CORRECTION if effective_corr else MIN_OBS_FOR_BATCH
+        effective_cooldown = CORRECTION_COOLDOWN_SEC if effective_corr else ANALYSIS_COOLDOWN_SEC
+        pb_last_ts_map = cur_state.get("per_bot_last_analysis_ts") or {}
+        last_ts = float(pb_last_ts_map.get(handle) or 0.0)
+
+        if not force:
+            if len(pending) < min_needed:
+                if obs_poison_delta:
+                    _update_daemon_state(
+                        lambda st, d=obs_poison_delta: st.__setitem__(
+                            "poison_blocked_count", int(st.get("poison_blocked_count") or 0) + d
+                        )
+                    )
+                bots_results[handle] = {
+                    "status": "waiting_for_more",
+                    "pending": len(pending),
+                    "needed": min_needed,
+                }
+                continue
+            if (time.time() - last_ts) < effective_cooldown:
+                if obs_poison_delta:
+                    _update_daemon_state(
+                        lambda st, d=obs_poison_delta: st.__setitem__(
+                            "poison_blocked_count", int(st.get("poison_blocked_count") or 0) + d
+                        )
+                    )
+                bots_results[handle] = {
+                    "status": "cooldown",
+                    "pending": len(pending),
+                    "cooldown_sec": effective_cooldown,
+                }
+                continue
+
+        if not pending:
+            def _commit_bot_empty(
+                latest: dict[str, Any],
+                *,
+                _h: str = handle,
+                _gen: int = start_compaction_gen,
+                _end: int = batch_end_idx,
+                _pd: int = obs_poison_delta,
+            ) -> None:
+                gens = latest.get("per_bot_obs_compaction_gen") or {}
+                if int(gens.get(_h) or 0) == _gen:
+                    offs = latest.setdefault("per_bot_obs_offsets", {})
+                    offs[_h] = max(int(offs.get(_h) or 0), _end)
+                latest.setdefault("per_bot_pending_correction", {})[_h] = False
+                if _pd:
+                    latest["poison_blocked_count"] = int(latest.get("poison_blocked_count") or 0) + _pd
+
+            _update_daemon_state(_commit_bot_empty)
+            bots_results[handle] = {"status": "up_to_date", "updated": 0}
+            continue
+
+        batch_slice = pending[-60:]
+        existing = load_bot_instincts(handle, profiles_dir=pdir)
+        existing_summary = [
+            {
+                "id": k,
+                "trigger": v.get("trigger"),
+                "confidence": v.get("confidence"),
+                "domain": v.get("domain"),
+            }
+            for k, v in existing.items()
+        ]
+        usr_prompt = (
+            f"Bot handle: @{handle}\n"
+            f"Existing instincts:\n{json.dumps(existing_summary, ensure_ascii=False)}\n\n"
+            f"Recent observations ({len(batch_slice)} items):\n" + "\n".join(batch_slice)
+        )
+
+        raw_reply = call_shim_json(sys_prompt, usr_prompt, timeout=150)
+        arr_match = re.search(r"\[[\s\S]*\]", raw_reply)
+        items: list[dict[str, Any]] = []
+        if arr_match:
+            try:
+                parsed = json.loads(arr_match.group(0))
+                if isinstance(parsed, list):
+                    items = [x for x in parsed if isinstance(x, dict) and x.get("id") and x.get("action")]
+            except json.JSONDecodeError:
+                log.warning("Could not parse JSON array from per-bot observer reply (@%s): %s", handle, raw_reply[:250])
+
+        written_ids: list[str] = []
+        blocked_candidates = 0
+        for item in items[:8]:
+            iid = re.sub(r"[^a-z0-9._-]+", "-", str(item["id"]).lower()).strip("-")
+            if iid in existing:
+                old_ev = [e for e in (existing[iid].get("evidence") or []) if not e.startswith("Last observed:")]
+                new_ev = item.get("evidence") or []
+                if isinstance(new_ev, str):
+                    new_ev = [new_ev]
+                item["evidence"] = list(dict.fromkeys(old_ev + [str(x) for x in new_ev]))[-5:]
+            out_p = write_bot_instinct_yaml(handle, item, profiles_dir=pdir)
+            if out_p is None:
+                blocked_candidates += 1
+                continue
+            written_ids.append(out_p.stem)
+
+        now_ts = time.time()
+        total_poison_delta = obs_poison_delta + blocked_candidates
+
+        def _commit_bot_analysis(
+            latest: dict[str, Any],
+            *,
+            _h: str = handle,
+            _gen: int = start_compaction_gen,
+            _start: int = last_idx,
+            _end: int = batch_end_idx,
+            _last_ln: str = last_batch_line,
+            _obs_f: Path = obs_file,
+            _now: float = now_ts,
+            _pd: int = total_poison_delta,
+        ) -> None:
+            gens = latest.get("per_bot_obs_compaction_gen") or {}
+            offs = latest.setdefault("per_bot_obs_offsets", {})
+            if int(gens.get(_h) or 0) == _gen:
+                offs[_h] = max(int(offs.get(_h) or 0), _end)
+            else:
+                cur_lines = (
+                    _obs_f.read_text(encoding="utf-8", errors="replace").splitlines()
+                    if _obs_f.is_file()
+                    else []
+                )
+                cur_idx = int(offs.get(_h) or 0)
+                if _last_ln:
+                    found_pos = None
+                    for idx_c in range(max(0, cur_idx), len(cur_lines)):
+                        if cur_lines[idx_c] == _last_ln:
+                            found_pos = idx_c + 1
+                    if found_pos is not None:
+                        offs[_h] = found_pos
+                    else:
+                        offs[_h] = min(len(cur_lines), cur_idx + max(0, _end - _start))
+                else:
+                    offs[_h] = min(len(cur_lines), cur_idx)
+            latest.setdefault("per_bot_last_analysis_ts", {})[_h] = _now
+            latest.setdefault("per_bot_pending_correction", {})[_h] = False
+            if _pd:
+                latest["poison_blocked_count"] = int(latest.get("poison_blocked_count") or 0) + _pd
+
+        state = _update_daemon_state(_commit_bot_analysis)
+
+        active_count, _active_changed = sync_bot_active_instincts(handle, profiles_dir=pdir)
+        latest_instincts = load_bot_instincts(handle, profiles_dir=pdir)
+        by_domain: dict[str, list[dict[str, Any]]] = {}
+        for v in latest_instincts.values():
+            if float(v.get("confidence", 0)) >= 0.80:
+                dom = str(v.get("domain") or "general")
+                by_domain.setdefault(dom, []).append(v)
+
+        pb_ev_counts_all = state.get("per_bot_evolved_domain_counts") or {}
+        dom_counts: dict[str, int] = {}
+        if isinstance(pb_ev_counts_all.get(handle), dict):
+            for k, val in pb_ev_counts_all[handle].items():
+                try:
+                    dom_counts[str(k)] = int(val)
+                except (TypeError, ValueError):
+                    pass
+
+        ready_domains = [
+            d
+            for d, items_d in by_domain.items()
+            if len(items_d) >= 3 and (d not in dom_counts or len(items_d) >= dom_counts[d] + EVOLVE_DELTA_MIN)
+        ]
+        pb_last_ev_map = state.get("per_bot_last_evolve_ts") or {}
+        last_ev_ts = float(pb_last_ev_map.get(handle) or 0.0)
+        evolve_due = (not last_ev_ts) or ((now_ts - last_ev_ts) >= EVOLVE_COOLDOWN_SEC)
+        evolved_skills: list[str] = []
+        if ready_domains and evolve_due:
+            ev_res = evolve_bot_skills(handle, profiles_dir=pdir, quiet=True)
+            evolved_skills = list(ev_res.get("synced_skills") or [])
+
+            def _record_bot_evolved(
+                latest: dict[str, Any],
+                *,
+                _h: str = handle,
+                _ready: list[str] = ready_domains,
+                _by_dom: dict[str, list[dict[str, Any]]] = by_domain,
+                _now: float = now_ts,
+            ) -> None:
+                ev_map = latest.setdefault("per_bot_evolved_domain_counts", {}).setdefault(_h, {})
+                for d in _ready:
+                    ev_map[d] = len(_by_dom.get(d) or [])
+                latest.setdefault("per_bot_last_evolve_ts", {})[_h] = _now
+
+            _update_daemon_state(_record_bot_evolved)
+
+        any_analyzed = True
+        bots_results[handle] = {
+            "status": "analyzed",
+            "observations_processed": len(pending),
+            "instincts_written": written_ids,
+            "candidates_blocked": blocked_candidates,
+            "active_instincts_synced": active_count,
+            "evolved_skills_synced": evolved_skills,
+        }
+
+    sync_claude_mem_recent_rule()
+    return {
+        "status": "analyzed" if any_analyzed else ("up_to_date" if bots_results else "no_observations"),
+        "mode": "per_bot",
+        "harvest": harvest_res,
+        "per_bot": bots_results,
+        "reloads_armed": False,
+    }
+
+
+def run_per_bot_dream(
+    *,
+    dry_run: bool = False,
+    force: bool = False,
+    quiet: bool = False,
+    use_llm: bool = False,
+    profiles_dir: Path | None = None,
+    today: date | None = None,
+) -> dict[str, Any]:
+    """Per-bot Dream consolidation across every bot under `profiles_dir`.
+
+    For each bot independently:
+    1. Re-validates personal instincts & quarantines unsafe entries to `bots/<handle>/instincts/archived/`
+    2. Applies gentle time decay & archives below-threshold instincts to `bots/<handle>/instincts/archived/`
+    3. Deduplicates/merges similar domain instincts within that bot only
+    4. Compacts `bots/<handle>/instincts/observations.jsonl` with rolling gzip archive
+    5. Deterministically refreshes `bots/<handle>/instincts/active-instincts.md` (`0600`)
+    """
+    ensure_dirs()
+    pdir = profiles_dir or BOT_PROFILES_DIR
+    state = load_daemon_state()
+    now_ts = time.time()
+    last_dream_ts = float(state.get("per_bot_last_dream_ts") or 0.0)
+    if not force and (now_ts - last_dream_ts) < DREAM_INTERVAL_SEC:
+        return {
+            "status": "cooldown",
+            "mode": "per_bot",
+            "last_dream_ts": last_dream_ts,
+            "next_due_in_sec": int(DREAM_INTERVAL_SEC - (now_ts - last_dream_ts)),
+        }
+
+    ref_today = today or datetime.now(timezone.utc).date()
+    handles = _list_bot_profile_handles(pdir)
+    per_bot_results: dict[str, Any] = {}
+    total_quarantine_poison = 0
+
+    for handle in handles:
+        paths = _bot_instincts_paths(handle, profiles_dir=pdir)
+        existing = load_bot_instincts(handle, profiles_dir=pdir)
+        quarantined_ids: list[str] = []
+        decayed_ids: list[str] = []
+        archived_low_conf_ids: list[str] = []
+        merged_groups: list[dict[str, Any]] = []
+        survivors: list[dict[str, Any]] = []
+
+        for iid, meta in sorted(existing.items()):
+            ok, bad_reason = _validate_instinct_candidate(meta, is_existing=True)
+            if not ok:
+                quarantined_ids.append(iid)
+                if not dry_run:
+                    _archive_bot_instinct_file(Path(meta["path"]), paths["archived"], "quarantined")
+                    total_quarantine_poison += 1
+                    _record_guard_block(1)
+                log.warning("Per-bot Dream quarantined unsafe instinct @%s/%s (%s)", handle, iid, bad_reason)
+                continue
+
+            last_obs = _extract_last_observed_date(meta)
+            days_stale = max(0, (ref_today - last_obs).days)
+            old_conf = float(meta.get("confidence") or 0.5)
+            new_conf = old_conf
+            if days_stale > DREAM_DECAY_GRACE_DAYS:
+                weeks_over = (days_stale - DREAM_DECAY_GRACE_DAYS) / 7.0
+                decay = round(min(0.30, max(0.02, weeks_over * 0.03)), 2)
+                new_conf = round(max(0.10, old_conf - decay), 2)
+
+            if new_conf < DREAM_ARCHIVE_CONF:
+                archived_low_conf_ids.append(iid)
+                if not dry_run:
+                    _archive_bot_instinct_file(Path(meta["path"]), paths["archived"], "decayed")
+                continue
+
+            updated = dict(meta)
+            if new_conf != old_conf:
+                updated["confidence"] = new_conf
+                decayed_ids.append(iid)
+                if not dry_run:
+                    write_bot_instinct_yaml(handle, updated, profiles_dir=pdir, preserve_last_observed=True)
+            survivors.append(updated)
+
+        by_domain: dict[str, list[dict[str, Any]]] = {}
+        for item in survivors:
+            dom = str(item.get("domain") or "workflow").lower()
+            by_domain.setdefault(dom, []).append(item)
+
+        for _dom, dom_items in sorted(by_domain.items()):
+            used: set[str] = set()
+            for i, anchor in enumerate(dom_items):
+                aid = str(anchor["id"])
+                if aid in used:
+                    continue
+                cluster = [anchor]
+                used.add(aid)
+                for cand in dom_items[i + 1 :]:
+                    cid = str(cand["id"])
+                    if cid in used:
+                        continue
+                    if _instinct_similarity(anchor, cand) >= 0.50:
+                        cluster.append(cand)
+                        used.add(cid)
+                if len(cluster) >= 2:
+                    merged = _merge_instinct_cluster(cluster, use_llm=use_llm)
+                    ok, _ = _validate_instinct_candidate(merged, is_existing=True)
+                    if not ok:
+                        continue
+                    merged_id = str(merged["id"])
+                    absorbed = [c for c in cluster if str(c["id"]) != merged_id]
+                    merged_groups.append({"kept": merged_id, "absorbed": [str(a["id"]) for a in absorbed]})
+                    if not dry_run:
+                        write_bot_instinct_yaml(handle, merged, profiles_dir=pdir, preserve_last_observed=True)
+                        for abs_item in absorbed:
+                            abs_p = Path(abs_item["path"])
+                            if abs_p.is_file():
+                                _archive_bot_instinct_file(abs_p, paths["archived"], "merged")
+
+        obs_compaction = _compact_bot_observations_if_needed(
+            handle,
+            state,
+            dry_run=dry_run,
+            profiles_dir=pdir,
+        )
+
+        active_rules = 0
+        rules_changed = False
+        if not dry_run:
+            active_rules, rules_changed = sync_bot_active_instincts(
+                handle,
+                profiles_dir=pdir,
+                today=ref_today,
+            )
+        else:
+            survivor_map = {str(s.get("id", "")): s for s in survivors}
+            active_rules = len(_select_active_instincts(survivor_map, today=ref_today))
+
+        per_bot_results[handle] = {
+            "quarantined_ids": quarantined_ids,
+            "decayed_ids": decayed_ids,
+            "archived_low_conf_ids": archived_low_conf_ids,
+            "merged_groups": merged_groups,
+            "observations_compaction": obs_compaction,
+            "active_instincts_synced": active_rules,
+            "rules_changed": rules_changed,
+        }
+
+    if not dry_run:
+        sync_claude_mem_recent_rule()
+        summary = {
+            "ts": now_ts,
+            "bots_processed": len(handles),
+            "quarantined": sum(len(v["quarantined_ids"]) for v in per_bot_results.values()),
+            "decayed": sum(len(v["decayed_ids"]) for v in per_bot_results.values()),
+            "archived_low_conf": sum(len(v["archived_low_conf_ids"]) for v in per_bot_results.values()),
+            "merged_groups": sum(len(v["merged_groups"]) for v in per_bot_results.values()),
+            "obs_archived_lines": sum(v["observations_compaction"]["archived_lines"] for v in per_bot_results.values()),
+        }
+
+        def _commit_per_bot_dream(latest: dict[str, Any]) -> None:
+            latest["per_bot_last_dream_ts"] = now_ts
+            latest["per_bot_last_dream_summary"] = summary
+            if total_quarantine_poison:
+                latest["poison_blocked_count"] = (
+                    int(latest.get("poison_blocked_count") or 0) + total_quarantine_poison
+                )
+
+        state = _update_daemon_state(_commit_per_bot_dream)
+
+    result = {
+        "status": "dry_run" if dry_run else "dreamed",
+        "mode": "per_bot",
+        "dry_run": dry_run,
+        "per_bot": per_bot_results,
+        "coordinator_aggregation": build_coordinator_aggregation_view(profiles_dir=pdir),
+        "poison_blocked_count": int(state.get("poison_blocked_count") or 0),
+        "reloads_armed": False,
+    }
+    if not quiet:
+        log.info("Per-bot Dream consolidation finished: %s", json.dumps(result, ensure_ascii=False))
+    return result
+
+
+def build_coordinator_aggregation_view(
+    *,
+    profiles_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Build a read-only full-team aggregation of all bots' instincts and own/evolved skills for Coordinator."""
+    pdir = profiles_dir or BOT_PROFILES_DIR
+    handles: list[str] = []
+    if pdir.is_dir():
+        for ent in sorted(pdir.iterdir()):
+            if ent.is_dir() and not ent.is_symlink() and not ent.name.startswith("."):
+                handles.append(ent.name)
+
+    bots_view: dict[str, Any] = {}
+    all_skills: list[dict[str, Any]] = []
+    all_instincts: list[dict[str, Any]] = []
+    for h in handles:
+        insts = load_bot_instincts(h, profiles_dir=pdir)
+        active = _select_active_instincts(insts)
+        sk_dir = pdir / h / "skills"
+        bot_skills: list[dict[str, Any]] = []
+        if sk_dir.is_dir():
+            for sd in sorted(sk_dir.iterdir()):
+                if sd.is_dir() and not sd.is_symlink() and (sd / "SKILL.md").is_file():
+                    bot_skills.append({"owner": h, "slug": sd.name, "evolved": sd.name.startswith("evolved-")})
+                    all_skills.append({"owner": h, "slug": sd.name, "evolved": sd.name.startswith("evolved-")})
+        for ins in active:
+            all_instincts.append(
+                {
+                    "owner": h,
+                    "id": ins.get("id"),
+                    "domain": ins.get("domain"),
+                    "trigger": ins.get("trigger"),
+                    "action": ins.get("action"),
+                }
+            )
+        bots_view[h] = {
+            "instincts_count": len(insts),
+            "active_instincts_count": len(active),
+            "skills": bot_skills,
+        }
+    return {
+        "bots": bots_view,
+        "all_skills": all_skills,
+        "all_instincts": all_instincts,
+    }
 
 
 def call_shim_json(system_prompt: str, user_prompt: str, timeout: int = 120) -> str:
@@ -1533,6 +2685,8 @@ def run_dream(
     quiet: bool = False,
     use_llm: bool = False,
     today: date | None = None,
+    per_bot: bool = False,
+    profiles_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Periodic Dream memory consolidation:
     1. Anti-poisoning re-validation on existing instincts
@@ -1541,6 +2695,15 @@ def run_dream(
     4. `observations.jsonl` rolling gzip archival with exact `last_analyzed_obs_line` recalculation
     5. Deterministic `ecc-active-instincts.md` sync (preserving prompt cache, zero bridge reload)
     """
+    if per_bot or profiles_dir is not None:
+        return run_per_bot_dream(
+            dry_run=dry_run,
+            force=force,
+            quiet=quiet,
+            use_llm=use_llm,
+            profiles_dir=profiles_dir,
+            today=today,
+        )
     ensure_dirs()
     state = load_daemon_state()
     now_ts = time.time()
@@ -1683,8 +2846,9 @@ def run_dream(
     return result
 
 
-def get_dream_status() -> dict[str, Any]:
-    """Return read-only Dream & Memory Guard status summary."""
+def get_dream_status(*, profiles_dir: Path | None = None) -> dict[str, Any]:
+    """Return read-only Dream, Per-Bot Isolation, Coordinator Aggregation & Memory Guard status summary."""
+    pdir = profiles_dir or BOT_PROFILES_DIR
     state = load_daemon_state()
     existing = load_existing_instincts()
     archived_cnt = len(list(ARCHIVE_INSTINCTS_DIR.glob("*.yaml"))) if ARCHIVE_INSTINCTS_DIR.is_dir() else 0
@@ -1696,11 +2860,14 @@ def get_dream_status() -> dict[str, Any]:
             obs_lines = 0
     guard_stats = _MEMORY_GUARD.get_guard_stats(taint_file=MEMORY_TAINT_FILE) if _MEMORY_GUARD is not None else {}
     selected_active = _select_active_instincts(existing)
-    evolved_cnt = (
-        len([d for d in WORKSPACE_SKILLS_DIR.iterdir() if d.is_dir() and d.name.startswith("evolved-")])
-        if WORKSPACE_SKILLS_DIR.is_dir()
+    coord_agg = build_coordinator_aggregation_view(profiles_dir=pdir)
+    per_bot_evolved_cnt = sum(1 for sk in coord_agg["all_skills"] if sk.get("evolved"))
+    local_evolved_cnt = (
+        len([d for d in EVOLVED_SKILLS_DIR.iterdir() if d.is_dir() and (d / "SKILL.md").is_file()])
+        if EVOLVED_SKILLS_DIR.is_dir()
         else 0
     )
+    evolved_cnt = per_bot_evolved_cnt + local_evolved_cnt
     plugin_synced = bool(
         GLOBAL_PLUGIN_MANIFEST is not None
         and GLOBAL_PLUGIN_MANIFEST.is_file()
@@ -1714,6 +2881,7 @@ def get_dream_status() -> dict[str, Any]:
         "core_active_slots": ACTIVE_RULE_CORE_SLOTS,
         "recent_active_slots": ACTIVE_RULE_RECENT_SLOTS,
         "evolved_skills_count": evolved_cnt,
+        "per_bot_evolved_skills_count": per_bot_evolved_cnt,
         "max_evolved_skills": MAX_EVOLVED_SKILLS,
         "global_plugin_dir": str(GLOBAL_PLUGIN_DIR) if GLOBAL_PLUGIN_DIR is not None else None,
         "global_plugin_synced": plugin_synced,
@@ -1722,6 +2890,10 @@ def get_dream_status() -> dict[str, Any]:
         "last_analyzed_obs_line": int(state.get("last_analyzed_obs_line") or 0),
         "last_dream_ts": float(state.get("last_dream_ts") or 0.0),
         "last_dream_summary": state.get("last_dream_summary") or {},
+        "per_bot_last_dream_ts": float(state.get("per_bot_last_dream_ts") or 0.0),
+        "per_bot_last_dream_summary": state.get("per_bot_last_dream_summary") or {},
+        "per_bot": coord_agg["bots"],
+        "coordinator_aggregation": coord_agg,
         "poison_blocked_count": int(state.get("poison_blocked_count") or 0),
         "guard": guard_stats,
     }
@@ -1824,48 +2996,51 @@ def evolve_with_llm_and_cli(quiet: bool = False) -> int:
 
     if not quiet:
         if synced:
-            print(f"\nSynced {len(synced)} evolved skill(s) into Antigravity workspace (.agents/skills/) and global plugin:")
+            print(f"\nSynced {len(synced)} evolved skill(s) into isolated local skill store (zero shared workspace or global plugin writes):")
             for s in synced:
                 print(f"  - {s}")
         else:
-            print("\nActive instincts synced to .agents/rules/ecc-active-instincts.md (accumulate more related instincts to synthesize multi-step SKILL.md).")
+            print("\nActive instincts synced to isolated local store (accumulate more related instincts to synthesize multi-step SKILL.md).")
     return 0
 
 
 def run_daemon_loop() -> None:
     ensure_dirs()
     sync_claude_mem_recent_rule()
-    sync_active_instincts_rule()
-    sync_evolved_skills()
-    log.info("Starting agy-instinct-daemon (poll=%ds, dream=%ds, shim=%s, model=%s)", POLL_INTERVAL_SEC, DREAM_INTERVAL_SEC, SHIM_URL, SHIM_MODEL)
+    for handle in _list_bot_profile_handles():
+        try:
+            sync_bot_active_instincts(handle)
+        except Exception as e:
+            log.warning("Startup per-bot instinct sync failed for @%s: %s", handle, e)
+    log.info("Starting agy-instinct-daemon in per-bot isolation mode (poll=%ds, dream=%ds, shim=%s, model=%s)", POLL_INTERVAL_SEC, DREAM_INTERVAL_SEC, SHIM_URL, SHIM_MODEL)
     while True:
         try:
-            res = analyze_observations_batch(force=False)
+            res = analyze_per_bot_observations_batch(force=False)
             if res.get("status") == "analyzed":
-                log.info("Instinct batch analyzed: %s", res)
-            dream_res = run_dream(force=False, quiet=True)
+                log.info("Per-bot instinct batch analyzed: %s", res)
+            dream_res = run_per_bot_dream(force=False, quiet=True)
             if dream_res.get("status") == "dreamed":
-                log.info("Periodic Dream consolidation completed: %s", dream_res)
+                log.info("Periodic per-bot Dream consolidation completed: %s", dream_res)
         except Exception as e:
             log.warning("Instinct loop iteration error: %s", e)
         time.sleep(POLL_INTERVAL_SEC)
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Antigravity ECC Continuous-Learning v2 Daemon & CLI")
+    parser = argparse.ArgumentParser(description="Antigravity ECC Continuous-Learning v2 Per-Bot Daemon & CLI")
     sub = parser.add_subparsers(dest="cmd")
-    sub.add_parser("daemon", help="Run background transcript-to-instinct observer loop")
-    sub.add_parser("analyze-now", help="Harvest transcripts and run instinct extraction immediately")
-    p_sync = sub.add_parser("sync", help="Sync high-confidence instincts & evolved skills to .agents/")
+    sub.add_parser("daemon", help="Run background per-bot transcript-to-instinct observer loop")
+    sub.add_parser("analyze-now", help="Harvest transcripts per-bot and run instinct extraction immediately")
+    p_sync = sub.add_parser("sync", help="Sync per-bot active instincts & print coordinator aggregation")
     p_sync.add_argument("--reload", action="store_true", help="Explicitly queue zero-downtime bridge reload")
-    sub.add_parser("status", help="Show ECC instinct status")
-    sub.add_parser("evolve", help="Cluster and evolve high-confidence instincts into .agents/skills/")
-    p_dream = sub.add_parser("dream", help="Consolidate instincts, apply decay, and compact observations")
+    sub.add_parser("status", help="Show per-bot ECC instinct & Dream status")
+    sub.add_parser("evolve", help="Cluster and evolve high-confidence per-bot instincts into bots/<handle>/skills/")
+    p_dream = sub.add_parser("dream", help="Consolidate per-bot instincts, apply decay, and compact observations")
     p_dream.add_argument("--dry-run", action="store_true", help="Preview consolidation without writing files")
     p_dream.add_argument("--force", action="store_true", help="Bypass DREAM_INTERVAL_SEC cooldown")
     p_dream.add_argument("--quiet", action="store_true", help="Suppress verbose log output")
     p_dream.add_argument("--use-llm", action="store_true", help="Allow optional LLM merge refinement via agy-llm-shim")
-    sub.add_parser("dream-status", help="Print JSON summary of Memory Guard & Dream status")
+    sub.add_parser("dream-status", help="Print JSON summary of Memory Guard, Per-Bot & Dream status")
 
     args, rest = parser.parse_known_args()
     cmd = args.cmd or "status"
@@ -1874,11 +3049,11 @@ def main() -> int:
         run_daemon_loop()
         return 0
     if cmd == "analyze-now":
-        res = analyze_observations_batch(force=True)
+        res = analyze_per_bot_observations_batch(force=True)
         print(json.dumps(res, indent=2, ensure_ascii=False))
         return 0
     if cmd == "dream":
-        res = run_dream(
+        res = run_per_bot_dream(
             dry_run=bool(getattr(args, "dry_run", False)),
             force=bool(getattr(args, "force", False)),
             quiet=bool(getattr(args, "quiet", False)),
@@ -1890,17 +3065,22 @@ def main() -> int:
         print(json.dumps(get_dream_status(), indent=2, ensure_ascii=False))
         return 0
     if cmd == "sync":
-        n_rules, r_ch = sync_active_instincts_rule()
+        per_bot_sync: dict[str, Any] = {}
+        any_changed = False
+        for handle in _list_bot_profile_handles():
+            n_active, changed = sync_bot_active_instincts(handle)
+            per_bot_sync[handle] = {"active_instincts_synced": n_active, "changed": changed}
+            any_changed = any_changed or changed
         m_ch = sync_claude_mem_recent_rule()
-        skills, s_ch = sync_evolved_skills()
-        if getattr(args, "reload", False) and (r_ch or s_ch):
+        if getattr(args, "reload", False) and any_changed:
             touch_bridge_reloads()
         print(
             json.dumps(
                 {
-                    "active_rules_synced": n_rules,
+                    "mode": "per_bot",
+                    "per_bot": per_bot_sync,
+                    "coordinator_aggregation": build_coordinator_aggregation_view(),
                     "claude_mem_recent_removed": m_ch,
-                    "evolved_skills_synced": skills,
                     "global_plugin_dir": str(GLOBAL_PLUGIN_DIR) if GLOBAL_PLUGIN_DIR is not None else None,
                     "global_plugin_rule_synced": bool(GLOBAL_PLUGIN_RULE_FILE and GLOBAL_PLUGIN_RULE_FILE.is_file()),
                 },
@@ -1910,11 +3090,15 @@ def main() -> int:
         )
         return 0
     if cmd == "evolve":
-        return evolve_with_llm_and_cli()
+        ev_res = evolve_per_bot_skills(quiet=False)
+        print(json.dumps(ev_res, indent=2, ensure_ascii=False))
+        return 0
     if cmd == "status":
-        sync_active_instincts_rule()
+        for handle in _list_bot_profile_handles():
+            sync_bot_active_instincts(handle)
         sync_claude_mem_recent_rule()
-        return subprocess.call([sys.executable, str(INSTINCT_CLI), "status", *rest])
+        print(json.dumps(get_dream_status(), indent=2, ensure_ascii=False))
+        return 0
 
     return subprocess.call([sys.executable, str(INSTINCT_CLI), cmd, *rest])
 

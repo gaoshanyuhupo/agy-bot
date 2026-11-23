@@ -974,9 +974,9 @@ class TestInstinctDaemonAntiPoisoningAndDream(unittest.TestCase):
             self.assertIn("agy_bridge_jeff_reload", reload_names)
             self.assertIn("agy_bridge_sgcli_reload", reload_names)
 
-            # Verify test isolation: GLOBAL_PLUGIN_DIR stays inside tmp
-            self.assertIsNotNone(daemon.GLOBAL_PLUGIN_DIR)
-            self.assertTrue(str(daemon.GLOBAL_PLUGIN_DIR).startswith(tmp))
+            # Verify test isolation: global plugin projection is disabled (C7 zero global leak)
+            self.assertIsNone(daemon.GLOBAL_PLUGIN_DIR)
+            self.assertIsNone(daemon.GLOBAL_PLUGIN_RULE_FILE)
 
             # Seed 4 core instincts tied at 0.95: older 'a-old-rule' vs fresher 'z-recent-core'
             for iid, obs_date in (
@@ -1021,29 +1021,26 @@ class TestInstinctDaemonAntiPoisoningAndDream(unittest.TestCase):
             self.assertEqual(5, count)
             self.assertTrue(changed)
 
-            ws_txt = daemon.ACTIVE_RULE_FILE.read_text(encoding="utf-8")
-            plugin_txt = daemon.GLOBAL_PLUGIN_RULE_FILE.read_text(encoding="utf-8")
-            manifest = json.loads(daemon.GLOBAL_PLUGIN_MANIFEST.read_text(encoding="utf-8"))
-            self.assertEqual("ecc-instincts", manifest["name"])
-            self.assertTrue(ws_txt.startswith("---\ntrigger: always_on"))
-            self.assertFalse(plugin_txt.startswith("---"), "Plugin rules/AGENTS.md must be plain markdown")
+            # Zero writes to shared workspace `.agents/rules/ecc-active-instincts.md`
+            self.assertFalse(daemon.SHARED_WORKSPACE_RULE_FILE.exists())
+            local_txt = daemon.ACTIVE_RULE_FILE.read_text(encoding="utf-8")
 
             # Recency broke the 0.95 tie: z-fresh-core wins over older a-old-core
-            self.assertIn("Apply z-fresh-core directive", plugin_txt)
-            self.assertNotIn("Apply a-old-core directive", plugin_txt)
+            self.assertIn("Apply z-fresh-core directive", local_txt)
+            self.assertNotIn("Apply a-old-core directive", local_txt)
             # Reserved recent slots admitted both fresh lessons while excluding stale 0.79 lesson
-            self.assertIn("Enforce fresh-lesson-1 guardrail", plugin_txt)
-            self.assertIn("Enforce fresh-lesson-2 guardrail", plugin_txt)
-            self.assertNotIn("Enforce stale-lesson-old guardrail", plugin_txt)
+            self.assertIn("Enforce fresh-lesson-1 guardrail", local_txt)
+            self.assertIn("Enforce fresh-lesson-2 guardrail", local_txt)
+            self.assertNotIn("Enforce stale-lesson-old guardrail", local_txt)
 
             # Deterministic repeat call preserves prefix cache (changed=False)
             count2, changed2 = daemon.sync_active_instincts_rule(today=ref_today)
             self.assertEqual(5, count2)
             self.assertFalse(changed2)
 
-            # Status reports global plugin projection health
+            # Status reports global plugin projection disabled
             st = daemon.get_dream_status()
-            self.assertTrue(st["global_plugin_synced"])
+            self.assertFalse(st["global_plugin_synced"])
             self.assertEqual(3, st["core_active_slots"])
             self.assertEqual(2, st["recent_active_slots"])
 
@@ -1068,7 +1065,9 @@ class TestInstinctDaemonAntiPoisoningAndDream(unittest.TestCase):
                 )
             synced_init, _ = daemon.sync_evolved_skills()
             self.assertEqual(2, len(synced_init))
-            self.assertTrue((daemon.GLOBAL_PLUGIN_SKILLS_DIR / "evolved-alpha-ops" / "SKILL.md").is_file())
+            self.assertTrue((daemon.EVOLVED_SKILLS_DIR / "alpha-ops" / "SKILL.md").is_file())
+            # Zero writes to shared workspace skills dir
+            self.assertFalse((daemon.WORKSPACE_SKILLS_DIR / "evolved-alpha-ops").exists())
 
             # Seed 3 strong instincts so evolve_with_llm_and_cli can refresh an existing skill at cap
             for i in range(3):
@@ -1108,7 +1107,7 @@ class TestInstinctDaemonAntiPoisoningAndDream(unittest.TestCase):
                 mock.patch.object(daemon, "call_shim_json", return_value=refresh_reply),
             ):
                 daemon.evolve_with_llm_and_cli(quiet=True)
-            refreshed = (daemon.GLOBAL_PLUGIN_SKILLS_DIR / "evolved-alpha-ops" / "SKILL.md").read_text(encoding="utf-8")
+            refreshed = (daemon.EVOLVED_SKILLS_DIR / "alpha-ops" / "SKILL.md").read_text(encoding="utf-8")
             self.assertIn("Refreshed Alpha Ops", refreshed)
 
             # Verify sticky pending_correction + shorter CORRECTION_COOLDOWN_SEC (60s vs 1800s)

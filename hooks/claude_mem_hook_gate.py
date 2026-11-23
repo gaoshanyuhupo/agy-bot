@@ -16,9 +16,13 @@ import json
 import os
 from pathlib import Path
 import re
+import sqlite3
 import subprocess
 import sys
+import tempfile
 from typing import Any
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 
 def _load_memory_guard():
@@ -246,6 +250,197 @@ def _should_skip_summarize(tail_steps: list[dict[str, Any]]) -> bool:
     return False
 
 
+_BOT_HANDLE_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
+_FORBIDDEN_BOT_HANDLES = frozenset({".", "..", "__proto__", "constructor", "prototype"})
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_NOISE_PROJECT_RE = re.compile(r"^(?:tmp[a-z0-9_-]*|agy_pretool_e2e_.*)$", re.IGNORECASE)
+
+
+def _normalize_bot_handle(raw: Any) -> str | None:
+    if not isinstance(raw, str):
+        return None
+    s = raw.strip()
+    if s.startswith("@"):
+        s = s[1:]
+    s = s.lower()
+    if not s or "/" in s or "\\" in s or ".." in s or "%" in s or "\x00" in s:
+        return None
+    if s in _FORBIDDEN_BOT_HANDLES or not _BOT_HANDLE_RE.fullmatch(s):
+        return None
+    return s
+
+
+def _resolve_bot_profiles_root() -> Path:
+    env_val = os.environ.get("AGY_BOT_PROFILES_DIR", "").strip()
+    if env_val:
+        return Path(env_val).expanduser()
+    return Path.home() / ".config" / "agy-tg-bridge" / "bots"
+
+
+def _has_git_ancestor(path: Path) -> bool:
+    cur = path.resolve(strict=False)
+    for anc in (cur, *cur.parents):
+        if (anc / ".git").exists():
+            return True
+    return False
+
+
+def _ensure_dir_0700(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+    return path
+
+
+def _ensure_bot_sentinel_cwd(handle: str) -> Path:
+    norm = _normalize_bot_handle(handle)
+    if not norm:
+        raise ValueError(f"Invalid bot handle: {handle!r}")
+    root = _resolve_bot_profiles_root()
+    candidate = root / norm / ".mem-cwd" / f"bot-{norm}"
+    if _has_git_ancestor(candidate):
+        fb_root = _ensure_dir_0700(Path(tempfile.gettempdir()) / f"agy-mem-cwd-{os.getuid()}")
+        fb_bot = _ensure_dir_0700(fb_root / norm)
+        return _ensure_dir_0700(fb_bot / f"bot-{norm}")
+    _ensure_dir_0700(root)
+    _ensure_dir_0700(root / norm)
+    _ensure_dir_0700(root / norm / ".mem-cwd")
+    sentinel = _ensure_dir_0700(candidate)
+    if _has_git_ancestor(sentinel):
+        fb_root = _ensure_dir_0700(Path(tempfile.gettempdir()) / f"agy-mem-cwd-{os.getuid()}")
+        fb_bot = _ensure_dir_0700(fb_root / norm)
+        return _ensure_dir_0700(fb_bot / f"bot-{norm}")
+    return sentinel
+
+
+def _rewrite_payload_and_env_for_bot(
+    payload: dict[str, Any],
+    sentinel_str: str,
+) -> tuple[str, dict[str, str]]:
+    rewritten = dict(payload)
+    rewritten["cwd"] = sentinel_str
+    rewritten["workspacePaths"] = [sentinel_str]
+    child_env = os.environ.copy()
+    child_env["GEMINI_CWD"] = sentinel_str
+    child_env["GEMINI_PROJECT_DIR"] = sentinel_str
+    child_env["CLAUDE_PROJECT_DIR"] = sentinel_str
+    return json.dumps(rewritten, ensure_ascii=False), child_env
+
+
+def _discover_coordinator_projects(handle: str) -> list[str]:
+    norm = _normalize_bot_handle(handle)
+    own_proj = f"bot-{norm}" if norm else ""
+    discovered: set[str] = set()
+    if own_proj:
+        discovered.add(own_proj)
+
+    root = _resolve_bot_profiles_root()
+    if root.is_dir() and not root.is_symlink():
+        try:
+            for ent in os.scandir(root):
+                if not ent.is_dir(follow_symlinks=False):
+                    continue
+                h = _normalize_bot_handle(ent.name)
+                if h and h == ent.name:
+                    discovered.add(f"bot-{h}")
+        except OSError:
+            pass
+
+    db_env = (
+        os.environ.get("CLAUDE_MEM_DB", "").strip()
+        or os.environ.get("CLAUDE_MEM_DB_PATH", "").strip()
+    )
+    db_path = Path(db_env).expanduser() if db_env else Path.home() / ".claude-mem" / "claude-mem.db"
+    if db_path.is_file():
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
+            try:
+                for tbl in ("observations", "session_summaries"):
+                    try:
+                        rows = conn.execute(f"SELECT DISTINCT project FROM {tbl}").fetchall()
+                    except sqlite3.Error:
+                        continue
+                    for (proj,) in rows:
+                        p = str(proj or "").strip()
+                        if not p or _NOISE_PROJECT_RE.match(p):
+                            continue
+                        discovered.add(p)
+            finally:
+                conn.close()
+        except Exception:
+            pass
+
+    others = sorted(p for p in discovered if p != own_proj)
+    return ([own_proj] if own_proj else []) + others
+
+
+def _parse_valid_port(val: Any) -> int | None:
+    if isinstance(val, bool) or val is None:
+        return None
+    try:
+        port = int(str(val).strip())
+    except (ValueError, TypeError):
+        return None
+    if 1 <= port <= 65535:
+        return port
+    return None
+
+
+def _resolve_claude_mem_worker_port() -> int:
+    env_port = _parse_valid_port(os.environ.get("CLAUDE_MEM_WORKER_PORT"))
+    if env_port is not None:
+        return env_port
+
+    raw_data_dir = os.environ.get("CLAUDE_MEM_DATA_DIR", "").strip()
+    data_dir = Path(raw_data_dir).expanduser() if raw_data_dir else (Path.home() / ".claude-mem")
+
+    pid_file = data_dir / "worker.pid"
+    if pid_file.is_file():
+        try:
+            pid_data = json.loads(pid_file.read_text(encoding="utf-8", errors="replace"))
+            if isinstance(pid_data, dict):
+                pid_port = _parse_valid_port(pid_data.get("port"))
+                if pid_port is not None:
+                    return pid_port
+        except Exception:
+            pass
+
+    settings_file = data_dir / "settings.json"
+    if settings_file.is_file():
+        try:
+            settings_data = json.loads(settings_file.read_text(encoding="utf-8", errors="replace"))
+            if isinstance(settings_data, dict):
+                settings_port = _parse_valid_port(settings_data.get("CLAUDE_MEM_WORKER_PORT"))
+                if settings_port is not None:
+                    return settings_port
+        except Exception:
+            pass
+
+    return 37777
+
+
+def _fetch_coordinator_context(projects: list[str]) -> dict[str, Any] | None:
+    if not projects:
+        return None
+    port = _resolve_claude_mem_worker_port()
+
+    params: list[tuple[str, str]] = [("projects", p) for p in projects]
+    params.append(("platformSource", "antigravity-cli"))
+    url = f"http://127.0.0.1:{port}/api/context/inject?{urlencode(params)}"
+    try:
+        req = Request(url, headers={"Accept": "text/plain, application/json"})
+        with urlopen(req, timeout=6.0) as resp:
+            raw_bytes = resp.read(512 * 1024)
+        text = _ANSI_ESCAPE_RE.sub("", raw_bytes.decode("utf-8", errors="replace")).strip()
+        if not text:
+            return None
+        return {"injectSteps": [{"ephemeralMessage": text}]}
+    except Exception:
+        return None
+
+
 def main() -> int:
     try:
         event = sys.argv[1] if len(sys.argv) > 1 else ""
@@ -310,13 +505,32 @@ def main() -> int:
                 print("{}")
                 return 0
 
+        bot_handle = _normalize_bot_handle(os.environ.get("AGY_BOT_HANDLE", ""))
+        bot_role = str(os.environ.get("AGY_BOT_BUS_ROLE", "worker") or "worker").strip().lower()
+        stdin_for_bun = raw_stdin
+        run_kwargs: dict[str, Any] = {}
+
+        if bot_handle:
+            if event == "context" and bot_role == "coordinator":
+                projects = _discover_coordinator_projects(bot_handle)
+                coord_ctx = _fetch_coordinator_context(projects)
+                if coord_ctx is not None:
+                    print(json.dumps(coord_ctx, ensure_ascii=False))
+                    return 0
+            sentinel_dir = _ensure_bot_sentinel_cwd(bot_handle)
+            sentinel_str = str(sentinel_dir)
+            stdin_for_bun, child_env = _rewrite_payload_and_env_for_bot(payload, sentinel_str)
+            run_kwargs["cwd"] = sentinel_str
+            run_kwargs["env"] = child_env
+
         proc = subprocess.run(
             [BUN_BIN, WORKER_CJS, "hook", "antigravity-cli", event],
-            input=raw_stdin,
+            input=stdin_for_bun,
             text=True,
             capture_output=True,
             timeout=28,
             check=False,
+            **run_kwargs,
         )
         out = (proc.stdout or "").strip()
         print(out if out else "{}")

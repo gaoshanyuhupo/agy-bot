@@ -38,7 +38,7 @@ TG_TURN_ID_RE = re.compile(r"^tg-[a-f0-9]{16}$")
 ENTITY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{1,63}$")
 MAX_PROMPT_BYTES = 32 * 1024
 MAX_TG_GROUP_CONTENT_BYTES = 16 * 1024
-MAX_IPC_BODY_BYTES = 64 * 1024
+MAX_IPC_BODY_BYTES = 128 * 1024
 
 DEFAULT_MAX_TURNS = 32
 DEFAULT_MAX_EVENTS_PER_TURN = 512
@@ -77,6 +77,33 @@ _FORBIDDEN_BOT_CONFIG_IPC_KEYS = frozenset({
     "secret",
     "password",
 })
+_FORBIDDEN_BOT_PROFILE_IPC_KEYS = frozenset({
+    "workdir",
+    "default_workdir",
+    "ipc_sock",
+    "role",
+    "path",
+    "reload_file",
+    "env",
+    "headers",
+    "command",
+    "cmd",
+    "args",
+    "url",
+    "shell",
+    "script",
+    "token",
+    "secret",
+    "password",
+    "pid",
+    "allowed_chats",
+    "mirror_chat_id",
+    "mirror_thread_id",
+    "chat_id",
+    "thread_id",
+})
+_BOT_SKILL_SLUG_IPC_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_FORBIDDEN_BOT_SKILL_SLUGS = frozenset({".", "..", "__proto__", "constructor", "prototype"})
 _FORBIDDEN_RELOAD_IPC_KEYS = frozenset({
     "reload_file",
     "cmd",
@@ -991,6 +1018,59 @@ class _StudioIPCHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(200, {"ok": True, **(cfg_payload if isinstance(cfg_payload, dict) else {})})
             return
 
+        if path == "/ipc/bot/profile":
+            if self.ipc.get_bot_profile_fn is None:
+                self._send_json(501, {"ok": False, "error": "bot_profile 未启用"})
+                return
+            try:
+                prof_payload = self.ipc.get_bot_profile_fn()
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": f"bot_profile failed: {type(exc).__name__}"})
+                return
+            self._send_json(200, {"ok": True, **(prof_payload if isinstance(prof_payload, dict) else {})})
+            return
+
+        if path == "/ipc/bot/skills":
+            raw_slug = ((qs.get("slug") or [""])[0]).strip()
+            if raw_slug:
+                if (
+                    raw_slug in _FORBIDDEN_BOT_SKILL_SLUGS
+                    or not _BOT_SKILL_SLUG_IPC_RE.fullmatch(raw_slug)
+                ):
+                    self._send_json(400, {"ok": False, "error": "非法的 skill slug 格式"})
+                    return
+                if self.ipc.get_bot_skill_fn is None:
+                    self._send_json(501, {"ok": False, "error": "bot_skill 读取未启用"})
+                    return
+                try:
+                    sc_sk, resp_sk = self.ipc.get_bot_skill_fn(raw_slug)
+                except Exception as exc:
+                    self._send_json(500, {"ok": False, "error": f"bot_skill failed: {type(exc).__name__}"})
+                    return
+                self._send_json(int(sc_sk), resp_sk)
+                return
+            if self.ipc.get_bot_profile_fn is None:
+                self._send_json(501, {"ok": False, "error": "bot_skills 未启用"})
+                return
+            try:
+                prof_payload = self.ipc.get_bot_profile_fn()
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": f"bot_skills failed: {type(exc).__name__}"})
+                return
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "rev": prof_payload.get("rev", 1),
+                    "skills_policy": prof_payload.get("skills_policy", {}),
+                    "own_skills": prof_payload.get("own_skills", []),
+                    "catalog_skills": prof_payload.get("catalog_skills", []),
+                    "team_skills": prof_payload.get("team_skills", []),
+                    "effective_skills": prof_payload.get("effective_skills", []),
+                },
+            )
+            return
+
         if path == "/ipc/undo/list":
             raw_uid = (qs.get("user_id") or [self.headers.get("X-Bridge-User-Id") or ""])[0]
             ok_u, uid, err_u = self._authorize_admin_user(raw_uid)
@@ -1423,6 +1503,56 @@ class _StudioIPCHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(int(status_code), resp_payload)
             return
 
+        if path == "/ipc/bot/profile":
+            bad_k = _find_forbidden_ipc_key(body, _FORBIDDEN_BOT_PROFILE_IPC_KEYS)
+            if bad_k is not None:
+                self._send_json(400, {"ok": False, "error": f"禁止传入受限字段: {bad_k}"})
+                return
+            if self.ipc.update_bot_profile_fn is None:
+                self._send_json(501, {"ok": False, "error": "bot_profile 写接口未启用"})
+                return
+            req_prof = dict(body)
+            req_prof["user_id"] = uid
+            req_prof["actor_username"] = str(body.get("actor_username") or "")[:64]
+            try:
+                status_code, resp_payload = self.ipc.update_bot_profile_fn(req_prof)
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": f"bot_profile update failed: {type(exc).__name__}"})
+                return
+            self._send_json(int(status_code), resp_payload)
+            return
+
+        if path == "/ipc/bot/skills":
+            bad_k = _find_forbidden_ipc_key(body, _FORBIDDEN_BOT_PROFILE_IPC_KEYS)
+            if bad_k is not None:
+                self._send_json(400, {"ok": False, "error": f"禁止传入受限字段: {bad_k}"})
+                return
+            raw_slug = body.get("slug")
+            if (
+                not isinstance(raw_slug, str)
+                or raw_slug in _FORBIDDEN_BOT_SKILL_SLUGS
+                or not _BOT_SKILL_SLUG_IPC_RE.fullmatch(raw_slug)
+            ):
+                self._send_json(400, {"ok": False, "error": "非法的 skill slug 格式"})
+                return
+            if self.ipc.put_bot_skill_fn is None:
+                self._send_json(501, {"ok": False, "error": "bot_skill 写接口未启用"})
+                return
+            req_sk = dict(body)
+            req_sk["user_id"] = uid
+            req_sk["actor_username"] = str(body.get("actor_username") or "")[:64]
+            try:
+                status_code, resp_payload = self.ipc.put_bot_skill_fn(req_sk)
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": f"bot_skill save failed: {type(exc).__name__}"})
+                return
+            self._send_json(int(status_code), resp_payload)
+            return
+
+        if path == "/ipc/bot/skills/delete":
+            self._handle_delete_bot_skill(body, uid)
+            return
+
         if path == "/ipc/bot/reload":
             bad_k = _find_forbidden_ipc_key(body, _FORBIDDEN_RELOAD_IPC_KEYS)
             if bad_k is not None:
@@ -1541,6 +1671,63 @@ class _StudioIPCHandler(http.server.BaseHTTPRequestHandler):
 
         self._send_json(404, {"ok": False, "error": "IPC endpoint not found"})
 
+    def _handle_delete_bot_skill(self, body: dict[str, Any], uid: int) -> None:
+        bad_k = _find_forbidden_ipc_key(body, _FORBIDDEN_BOT_PROFILE_IPC_KEYS)
+        if bad_k is not None:
+            self._send_json(400, {"ok": False, "error": f"禁止传入受限字段: {bad_k}"})
+            return
+        raw_slug = body.get("slug")
+        if (
+            not isinstance(raw_slug, str)
+            or raw_slug in _FORBIDDEN_BOT_SKILL_SLUGS
+            or not _BOT_SKILL_SLUG_IPC_RE.fullmatch(raw_slug)
+        ):
+            self._send_json(400, {"ok": False, "error": "非法的 skill slug 格式"})
+            return
+        if self.ipc.delete_bot_skill_fn is None:
+            self._send_json(501, {"ok": False, "error": "bot_skill 删除接口未启用"})
+            return
+        req_del = {
+            "user_id": uid,
+            "actor_username": str(body.get("actor_username") or "")[:64],
+            "slug": raw_slug,
+            "expected_rev": body.get("expected_rev"),
+        }
+        try:
+            status_code, resp_payload = self.ipc.delete_bot_skill_fn(req_del)
+        except Exception as exc:
+            self._send_json(500, {"ok": False, "error": f"bot_skill delete failed: {type(exc).__name__}"})
+            return
+        self._send_json(int(status_code), resp_payload)
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        ok, err = self._authenticate_transport()
+        if not ok:
+            self._send_json(403, {"ok": False, "error": err, "source": "bridge_ipc"})
+            return
+
+        parsed = urllib.parse.urlsplit(self.path)
+        path = parsed.path
+
+        ok_body, body, err_body, sc_body = self._read_json_body()
+        if not ok_body or body is None:
+            self._send_json(sc_body, {"ok": False, "error": err_body})
+            return
+
+        ok_u, uid, err_u = self._authorize_admin_user(body.get("user_id"))
+        if not ok_u or uid is None:
+            self._send_json(403, {"ok": False, "error": err_u, "source": "bridge_ipc"})
+            return
+
+        for bad_k in _UNTRUSTED_CLIENT_SEND_KEYS:
+            body.pop(bad_k, None)
+
+        if path == "/ipc/bot/skills":
+            self._handle_delete_bot_skill(body, uid)
+            return
+
+        self._send_json(404, {"ok": False, "error": "IPC endpoint not found"})
+
 
 class StudioIPCServer:
     """Lifecycle wrapper for per-bot UDS IPC server + bounded event buffer."""
@@ -1562,6 +1749,11 @@ class StudioIPCServer:
         get_bot_config_fn: Callable[[], dict[str, Any]] | None = None,
         update_bot_config_fn: Callable[[dict[str, Any]], tuple[int, dict[str, Any]]] | None = None,
         reload_bot_fn: Callable[[int], tuple[int, dict[str, Any]]] | None = None,
+        get_bot_profile_fn: Callable[[], dict[str, Any]] | None = None,
+        update_bot_profile_fn: Callable[[dict[str, Any]], tuple[int, dict[str, Any]]] | None = None,
+        get_bot_skill_fn: Callable[[str], tuple[int, dict[str, Any]]] | None = None,
+        put_bot_skill_fn: Callable[[dict[str, Any]], tuple[int, dict[str, Any]]] | None = None,
+        delete_bot_skill_fn: Callable[[dict[str, Any]], tuple[int, dict[str, Any]]] | None = None,
         room_turn_fn: Callable[[dict[str, Any]], tuple[int, dict[str, Any]]] | None = None,
         attention_notify_fn: Callable[[dict[str, Any]], tuple[int, dict[str, Any]]] | None = None,
         tg_group_send_fn: Callable[[dict[str, Any]], tuple[int, dict[str, Any]]] | None = None,
@@ -1590,6 +1782,11 @@ class StudioIPCServer:
         self.get_bot_config_fn = get_bot_config_fn
         self.update_bot_config_fn = update_bot_config_fn
         self.reload_bot_fn = reload_bot_fn
+        self.get_bot_profile_fn = get_bot_profile_fn
+        self.update_bot_profile_fn = update_bot_profile_fn
+        self.get_bot_skill_fn = get_bot_skill_fn
+        self.put_bot_skill_fn = put_bot_skill_fn
+        self.delete_bot_skill_fn = delete_bot_skill_fn
         self.room_turn_fn = room_turn_fn
         self.attention_notify_fn = attention_notify_fn
         self.tg_group_send_fn = tg_group_send_fn

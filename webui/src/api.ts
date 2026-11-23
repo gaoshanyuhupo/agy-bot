@@ -5,7 +5,12 @@ import type {
   AuthMode,
   BotConfigPatchPayload,
   BotConfigResponse,
+  BotProfileResponse,
+  BotProfileUpdatePayload,
   BotReloadResponse,
+  BotSkillDeleteResponse,
+  BotSkillDetailResponse,
+  BotSkillPutPayload,
   BotsResponse,
   BrowserStatusResponse,
   ChatAbortResponse,
@@ -837,6 +842,60 @@ export function reloadBot(handle: string): Promise<BotReloadResponse> {
     {
       method: "POST",
       body: "{}",
+    },
+    true,
+  );
+}
+
+export function fetchBotProfile(handle: string): Promise<BotProfileResponse> {
+  return requestJson<BotProfileResponse>(`/api/bots/${encodeURIComponent(handle)}/profile`);
+}
+
+export function updateBotProfile(
+  handle: string,
+  payload: BotProfileUpdatePayload,
+): Promise<BotProfileResponse> {
+  return requestJson<BotProfileResponse>(
+    `/api/bots/${encodeURIComponent(handle)}/profile`,
+    {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    },
+    true,
+  );
+}
+
+export function fetchBotSkill(handle: string, slug: string): Promise<BotSkillDetailResponse> {
+  return requestJson<BotSkillDetailResponse>(
+    `/api/bots/${encodeURIComponent(handle)}/skills/${encodeURIComponent(slug)}`,
+  );
+}
+
+export function saveBotSkill(
+  handle: string,
+  slug: string,
+  payload: BotSkillPutPayload,
+): Promise<BotSkillDetailResponse> {
+  return requestJson<BotSkillDetailResponse>(
+    `/api/bots/${encodeURIComponent(handle)}/skills/${encodeURIComponent(slug)}`,
+    {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    },
+    true,
+  );
+}
+
+export function deleteBotSkill(
+  handle: string,
+  slug: string,
+  expectedRev: number,
+): Promise<BotSkillDeleteResponse> {
+  return requestJson<BotSkillDeleteResponse>(
+    `/api/bots/${encodeURIComponent(handle)}/skills/${encodeURIComponent(slug)}`,
+    {
+      method: "DELETE",
+      body: JSON.stringify({ expected_rev: expectedRev }),
     },
     true,
   );

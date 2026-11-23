@@ -548,7 +548,7 @@ def build_rehydration(
                         dialogue_entries.append(f"[Step {step_idx} | User]:\n{utext}")
                     pending_tools.clear()
                 elif stype == "PLANNER_RESPONSE":
-                    tcs = obj.get("tool_calls") or []
+                    tcs = _filter_tool_calls_for_worker(obj.get("tool_calls") or [])
                     if tcs:
                         pending_tools.append(summarize_tool_calls(tcs))
                         for tc in tcs:
@@ -659,6 +659,8 @@ def build_rehydration(
                 size_tag = ""
             index_lines.append(f"- [{role_label} @ step {fstep}] `{fpath}`{size_tag}")
 
+    index_lines, spec_blocks = _filter_rehydration_for_bot(index_lines, spec_blocks)
+
     lineage_tag = ""
     if resolved_ancestors:
         chain_parts = [
@@ -691,6 +693,9 @@ def build_rehydration(
             "## 4. Recently Touched Workspace Files & Skills (Paths Only — `read_file` on demand)\n"
             + "\n".join(index_lines)
         )
+    bot_identity_block = _build_bot_identity_rehydration_section()
+    if bot_identity_block:
+        sections.append(f"## 5. Active Bot Identity & Memory Scope\n{bot_identity_block}")
 
     full_msg = "\n\n".join(sections)
     return full_msg, {
@@ -703,6 +708,238 @@ def build_rehydration(
         "chars": len(full_msg),
         "est_tokens": len(full_msg) // 3,
     }
+
+
+def _load_bot_profiles_module():
+    candidates = [
+        Path(__file__).resolve().parents[1] / "bridge",
+        Path(os.environ.get("AGY_BRIDGE_DIR", str(Path.home() / "agy-tg-bridge"))),
+    ]
+    for cand in candidates:
+        if (cand / "bot_profiles.py").is_file():
+            if str(cand) not in sys.path:
+                sys.path.insert(0, str(cand))
+            break
+    try:
+        import bot_profiles  # type: ignore
+
+        return bot_profiles
+    except Exception:
+        return None
+
+
+def _is_cross_bot_or_mem_text(
+    text: str,
+    self_handle: str,
+    profiles_root: Path,
+    *,
+    skill_policy: tuple[str, set[str]] | None = None,
+) -> bool:
+    if not text:
+        return False
+    low = text.replace("\\", "/").lower()
+    if (
+        "/.claude-mem/" in low
+        or low.endswith("/.claude-mem")
+        or "/.claude-mem`" in low
+        or re.search(r"(?:^|[\s`'\"(/])\.claude-mem(?:/|[`'\"\s)>]|$)", low)
+        or re.search(r"(?:^|[\s`'\"(/])claude-mem\.db(?:-wal|-shm)?(?:[`'\"\s)>]|$)", low)
+    ):
+        return True
+    root_variants: list[str] = ["/.config/agy-tg-bridge/bots"]
+    for p in (profiles_root, profiles_root.resolve(strict=False)):
+        s = str(p).replace("\\", "/").rstrip("/").lower()
+        if s and s not in root_variants:
+            root_variants.append(s)
+    for root_s in root_variants:
+        pat = re.compile(re.escape(root_s) + r"/([^/\s`\"'<>)]+)")
+        for m in pat.finditer(low):
+            seg = m.group(1).strip()
+            if seg and seg != self_handle:
+                return True
+    if skill_policy is not None:
+        policy_mode, allowed_catalog = skill_policy
+        if policy_mode != "all":
+            allowed_low = {str(s).lower() for s in (allowed_catalog or set())}
+            for m in re.finditer(r"(?:^|[\s`'\"(/])\.agents/skills/([^/\s`'\"<>)]+)", low):
+                slug = m.group(1).strip().rstrip(".,;:")
+                if slug and slug not in allowed_low:
+                    return True
+            if re.search(r"(?:^|[\s`'\"(/])\.agents/skills/?(?:[`'\"\s)>.,;:]|$)", low):
+                return True
+    return False
+
+
+def _resolve_worker_filter_ctx() -> tuple[str, Path, tuple[str, set[str]]] | None:
+    raw_handle = os.environ.get("AGY_BOT_HANDLE", "").strip()
+    if not raw_handle:
+        return None
+    role = str(os.environ.get("AGY_BOT_BUS_ROLE", "worker") or "worker").strip().lower()
+    if role == "coordinator":
+        return None
+    bp = _load_bot_profiles_module()
+    if bp is None:
+        return None
+    norm_handle = bp.normalize_bot_handle(raw_handle)
+    if not norm_handle:
+        return None
+    profiles_root = bp.resolve_profiles_dir()
+    try:
+        skill_policy = bp.get_worker_allowed_catalog_slugs(norm_handle, profiles_dir=profiles_root)
+    except Exception:
+        skill_policy = ("allowlist", set())
+    return norm_handle, profiles_root, skill_policy
+
+
+def _filter_tool_calls_for_worker(tcs: list[Any]) -> list[Any]:
+    if not tcs or not os.environ.get("AGY_BOT_HANDLE", "").strip():
+        return tcs
+    ctx = _resolve_worker_filter_ctx()
+    if ctx is None:
+        return tcs
+    norm_handle, profiles_root, skill_policy = ctx
+    kept: list[Any] = []
+    for tc in tcs:
+        if not isinstance(tc, dict):
+            kept.append(tc)
+            continue
+        targs = tc.get("args") or tc.get("arguments") or {}
+        blocked = False
+        if isinstance(targs, dict):
+            for val in targs.values():
+                if isinstance(val, str):
+                    if _is_cross_bot_or_mem_text(
+                        val, norm_handle, profiles_root, skill_policy=skill_policy
+                    ):
+                        blocked = True
+                        break
+                elif isinstance(val, list):
+                    for item in val:
+                        if isinstance(item, str) and _is_cross_bot_or_mem_text(
+                            item, norm_handle, profiles_root, skill_policy=skill_policy
+                        ):
+                            blocked = True
+                            break
+                    if blocked:
+                        break
+            if not blocked:
+                try:
+                    serialized = json.dumps(targs, ensure_ascii=False)
+                    if _is_cross_bot_or_mem_text(
+                        serialized, norm_handle, profiles_root, skill_policy=skill_policy
+                    ):
+                        blocked = True
+                except Exception:
+                    pass
+        if not blocked:
+            kept.append(tc)
+    return kept
+
+
+def _filter_rehydration_for_bot(
+    index_lines: list[str],
+    spec_blocks: list[str],
+) -> tuple[list[str], list[str]]:
+    ctx = _resolve_worker_filter_ctx()
+    if ctx is None:
+        return index_lines, spec_blocks
+    norm_handle, profiles_root, skill_policy = ctx
+    filtered_index = [
+        ln
+        for ln in index_lines
+        if not _is_cross_bot_or_mem_text(
+            ln, norm_handle, profiles_root, skill_policy=skill_policy
+        )
+    ]
+    filtered_specs = [
+        sb
+        for sb in spec_blocks
+        if not _is_cross_bot_or_mem_text(
+            sb, norm_handle, profiles_root, skill_policy=skill_policy
+        )
+    ]
+    return filtered_index, filtered_specs
+
+
+def _summarize_bot_rules_snippet(bp: Any, bot_dir: Path, max_chars: int = 240) -> str:
+    rules_path = bot_dir / "RULES.md"
+    if not rules_path.is_file() or rules_path.is_symlink():
+        return ""
+    try:
+        raw = bp._read_text_nofollow(rules_path, base_dir=bot_dir, max_bytes=4096)
+    except Exception:
+        return ""
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    joined = " | ".join(lines)
+    if len(joined) > max_chars:
+        return joined[: max_chars - 1].rstrip() + "…"
+    return joined
+
+
+def _build_bot_identity_rehydration_section() -> str:
+    raw_handle = os.environ.get("AGY_BOT_HANDLE", "").strip()
+    if not raw_handle:
+        return ""
+    bp = _load_bot_profiles_module()
+    if bp is None:
+        return ""
+    norm_handle = bp.normalize_bot_handle(raw_handle)
+    if not norm_handle:
+        return ""
+    role = str(os.environ.get("AGY_BOT_BUS_ROLE", "worker") or "worker").strip().lower()
+    effective_role = "coordinator" if role == "coordinator" else "worker"
+
+    parts: list[str] = []
+    try:
+        _rev, rendered = bp.render_bot_profile_prompt(
+            norm_handle,
+            role=effective_role,
+            max_section_chars=3000,
+        )
+        if rendered:
+            parts.append(rendered)
+    except Exception:
+        pass
+
+    if effective_role == "coordinator":
+        try:
+            root = bp.resolve_profiles_dir()
+            handles = bp.list_profile_handles(profiles_dir=root)
+            overview_lines: list[str] = []
+            for h in handles:
+                bot_dir = root / h
+                sk_info = bp.resolve_effective_skills(
+                    h,
+                    role="coordinator" if h == norm_handle else "worker",
+                    profiles_dir=root,
+                    include_paths=False,
+                )
+                own_slugs = [str(s.get("slug") or "") for s in sk_info.get("own_skills") or [] if s.get("slug")]
+                en_cat = [
+                    str(s.get("slug") or "")
+                    for s in sk_info.get("catalog_skills") or []
+                    if s.get("enabled") and s.get("slug")
+                ]
+                rules_snip = _summarize_bot_rules_snippet(bp, bot_dir)
+                item = f"- `@{h}` | `memory_project=bot-{h}`"
+                if own_slugs:
+                    item += f" | own_skills={','.join(own_slugs[:12])}"
+                if en_cat:
+                    item += f" | catalog_skills={','.join(en_cat[:12])}"
+                if rules_snip:
+                    item += f" | rules: {rules_snip}"
+                overview_lines.append(item)
+            if overview_lines:
+                parts.append(
+                    "### Team Bots Aggregation (Coordinator Full Visibility)\n"
+                    + "\n".join(overview_lines)
+                )
+        except Exception:
+            pass
+
+    return "\n\n".join(parts).strip()
 
 
 def save_state(state_path: Path, cp: int | None, offset: int, fork_ancestors: list[dict[str, Any]] | None = None) -> None:

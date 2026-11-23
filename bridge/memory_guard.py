@@ -946,15 +946,42 @@ def _is_protected_guard_path(
             return True, "agents_md"
         if base_low == "memory_guard.py":
             return True, "memory_guard"
-        if base_low in ("taint_outbound_guard.py", "claude_mem_hook_gate.py", "rehydrate_after_compact.py"):
+        if base_low in (
+            "taint_outbound_guard.py",
+            "claude_mem_hook_gate.py",
+            "rehydrate_after_compact.py",
+            "bot_isolation_guard.py",
+        ):
             return True, "repo_hooks_guard"
         if len(parts) >= 2 and parts[-2].lower() == "hooks" and base_low in (
             "hooks.json",
             "taint_outbound_guard.py",
             "claude_mem_hook_gate.py",
             "rehydrate_after_compact.py",
+            "bot_isolation_guard.py",
         ):
             return True, "repo_hooks_guard"
+
+        cand_clean = cand.replace("\\", "/").rstrip("/")
+        cand_low = cand_clean.lower()
+        if (
+            "/.config/agy-tg-bridge/bots/" in f"{cand_low}/"
+            or cand_low.endswith("/.config/agy-tg-bridge/bots")
+            or cand_low == ".config/agy-tg-bridge/bots"
+        ):
+            return True, "bot_profiles_store"
+        raw_bot_roots = [f"{eff_home}/.config/agy-tg-bridge/bots"]
+        env_bots_dir = os.environ.get("AGY_BOT_PROFILES_DIR", "").strip()
+        if env_bots_dir:
+            raw_bot_roots.append(env_bots_dir)
+        for raw_br in raw_bot_roots:
+            b_norm, b_res = _expand_and_normalize_path(raw_br, cwd=cwd, home_dir=eff_home)
+            for broot in (b_norm, b_res):
+                if not broot:
+                    continue
+                br_low = broot.replace("\\", "/").rstrip("/").lower()
+                if br_low and (cand_low == br_low or cand_low.startswith(f"{br_low}/")):
+                    return True, "bot_profiles_store"
 
     return False, ""
 
@@ -981,6 +1008,8 @@ def _is_protected_download_target(
         parts = [p.lower() for p in cand.split("/") if p]
         if not parts:
             continue
+        if low == ".config/agy-tg-bridge" or low.endswith("/.config/agy-tg-bridge"):
+            return True, "bot_profiles_store"
         if any(p in ("bridge", "agy-tg-bridge") for p in parts):
             return True, "bridge_runtime_dir"
         if parts[-1] == "hooks" or low.endswith("/.gemini/config") or low == ".gemini/config":
