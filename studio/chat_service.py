@@ -28,6 +28,7 @@ from .data_sources import (
     MAX_MODEL_SLUG_LEN,
     StreamRedactor,
     StudioDataSources,
+    _SENSITIVE_HOST_PATH_RE,
     _sanitize_slug,
     redact_secrets_only,
     truncate_utf8_bytes,
@@ -46,6 +47,70 @@ MAX_TURN_OWNERS = 512
 _VALID_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 _VALID_EXECUTION_MODES = frozenset({"queue", "interrupt"})
 INTERRUPT_WAIT_TIMEOUT_SEC = 2.5
+_FORBIDDEN_CHAT_SEND_KEYS = frozenset({
+    "workdir",
+    "cwd",
+    "worktree_path",
+    "root",
+    "dir_abs",
+    "abs_path",
+    "ipc_sock",
+})
+
+
+def _find_forbidden_chat_key(obj: Any, forbidden: frozenset[str], *, depth: int = 0) -> str | None:
+    if depth > 16:
+        return "max_depth_exceeded"
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            kl = str(k).strip().lower()
+            if kl in forbidden:
+                return kl
+            found = _find_forbidden_chat_key(v, forbidden, depth=depth + 1)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = _find_forbidden_chat_key(item, forbidden, depth=depth + 1)
+            if found:
+                return found
+    return None
+
+
+def _sanitize_worktree_payload(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    out: dict[str, Any] = {"active": bool(raw.get("active", False))}
+    wt_id = str(raw.get("worktree_id") or "").strip()
+    if wt_id and studio_ipc.is_valid_worktree_id(wt_id):
+        out["worktree_id"] = wt_id
+    branch = str(raw.get("branch") or "").strip()
+    if branch and not branch.startswith("/") and ".." not in branch:
+        out["branch"] = _SENSITIVE_HOST_PATH_RE.sub("[REDACTED]", redact_secrets_only(branch, max_len=128))
+    pid = str(raw.get("project_id") or "").strip()
+    if pid:
+        out["project_id"] = _sanitize_slug(pid, max_len=64)
+    reason = str(raw.get("reason") or "").strip()
+    if reason and not out["active"]:
+        out["reason"] = _sanitize_slug(reason, max_len=64)
+    if raw.get("created_at") is not None:
+        try:
+            out["created_at"] = int(raw["created_at"])
+        except (TypeError, ValueError):
+            pass
+    if raw.get("dirty_count") is not None:
+        try:
+            out["dirty_count"] = max(0, int(raw["dirty_count"]))
+        except (TypeError, ValueError):
+            pass
+    if raw.get("commits_ahead") is not None:
+        try:
+            out["commits_ahead"] = max(0, int(raw["commits_ahead"]))
+        except (TypeError, ValueError):
+            pass
+    if "busy" in raw:
+        out["busy"] = bool(raw.get("busy"))
+    return out
 
 
 def _utc_iso_now() -> str:
@@ -608,6 +673,37 @@ class StudioChatService:
                 status=body_sc,
             )
 
+        bad_forb = _find_forbidden_chat_key(body, _FORBIDDEN_CHAT_SEND_KEYS)
+        if bad_forb is not None:
+            self.audit.record(
+                action="chat.send",
+                status_code=400,
+                outcome=f"denied_forbidden_field:{bad_forb}",
+                client_ip=client_ip,
+                sess=sess,
+            )
+            return web.json_response(
+                {"ok": False, "source": "studio_api", "error": f"禁止客户端传入受限字段: {bad_forb}"},
+                status=400,
+            )
+
+        worktree = False
+        if "worktree" in body:
+            raw_wt = body.get("worktree")
+            if not isinstance(raw_wt, bool):
+                self.audit.record(
+                    action="chat.send",
+                    status_code=400,
+                    outcome="denied_invalid_worktree",
+                    client_ip=client_ip,
+                    sess=sess,
+                )
+                return web.json_response(
+                    {"ok": False, "source": "studio_api", "error": "worktree 必须为布尔值（true/false）"},
+                    status=400,
+                )
+            worktree = raw_wt
+
         raw_prompt = body.get("prompt")
         if raw_prompt is None:
             raw_prompt = ""
@@ -884,6 +980,7 @@ class StudioChatService:
             "model": str(body.get("model") or "").strip() or None,
             "effort": effort_raw or None,
             "sync_tg": sync_tg,
+            "worktree": worktree,
             "priority": "urgent" if execution_mode == "interrupt" else "normal",
             "interrupt_current": execution_mode == "interrupt",
         }
@@ -939,6 +1036,9 @@ class StudioChatService:
                 "execution_mode": execution_mode,
                 "interrupted_turn_id": interrupted_turn_id,
             }
+            safe_wt = _sanitize_worktree_payload(resp_data.get("worktree"))
+            if safe_wt is not None:
+                resp_out["worktree"] = safe_wt
             if public_atts:
                 resp_out["attachments"] = public_atts
             if ctx_rel_list:
@@ -1558,7 +1658,11 @@ class StudioChatService:
     def _sanitize_event_payload(ev_name: str, data: dict[str, Any]) -> dict[str, Any]:
         out: dict[str, Any] = {}
         for k, v in data.items():
-            if isinstance(v, str):
+            if k == "worktree" and isinstance(v, dict):
+                safe_wt = _sanitize_worktree_payload(v)
+                if safe_wt is not None:
+                    out[k] = safe_wt
+            elif isinstance(v, str):
                 out[k] = redact_secrets_only(v)
             elif isinstance(v, (int, float, bool)) or v is None:
                 out[k] = v

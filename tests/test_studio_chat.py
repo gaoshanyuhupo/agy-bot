@@ -503,7 +503,7 @@ class TestPAC1SingleWriterIPCAndBridgeHooks(unittest.TestCase):
                 elif isinstance(node, ast.Attribute):
                     forbidden_attrs = (
                         ("create_subprocess_shell", "Popen")
-                        if py_file.name == "workspace_files.py"
+                        if py_file.name in ("workspace_files.py", "git_workflow.py")
                         else ("create_subprocess_exec", "create_subprocess_shell", "Popen")
                     )
                     self.assertNotIn(
@@ -512,16 +512,25 @@ class TestPAC1SingleWriterIPCAndBridgeHooks(unittest.TestCase):
                         f"Forbidden process spawn attribute {node.attr} in {py_file.name}",
                     )
                 elif (
-                    py_file.name == "workspace_files.py"
+                    py_file.name in ("workspace_files.py", "git_workflow.py")
                     and isinstance(node, ast.Call)
                     and isinstance(node.func, ast.Attribute)
                     and node.func.attr == "create_subprocess_exec"
                 ):
-                    # Phase B M1: workspace_files.py may ONLY invoke read-only `git` via create_subprocess_exec
-                    self.assertTrue(node.args, "create_subprocess_exec must have literal 'git' executable")
+                    self.assertTrue(node.args, f"create_subprocess_exec must specify executable in {py_file.name}")
                     first_arg = node.args[0]
-                    self.assertIsInstance(first_arg, ast.Constant)
-                    self.assertEqual(first_arg.value, "git")
+                    if py_file.name == "workspace_files.py":
+                        # Phase B M1: workspace_files.py may ONLY invoke read-only `git` via create_subprocess_exec
+                        self.assertIsInstance(first_arg, ast.Constant)
+                        self.assertEqual(first_arg.value, "git")
+                    else:
+                        # Coding Trio: git_workflow.py may ONLY invoke `git`, `gh_bin`, or `bao_bin` (never `agy`)
+                        if isinstance(first_arg, ast.Constant):
+                            self.assertEqual(first_arg.value, "git")
+                        elif isinstance(first_arg, ast.Name):
+                            self.assertIn(first_arg.id, ("gh_bin", "bao_bin"))
+                        else:
+                            self.fail(f"Unexpected executable AST in git_workflow.py: {ast.dump(first_arg)}")
             # Zero `readlines()` in studio/data_sources.py (bounded reverse seek required)
             if py_file.name == "data_sources.py":
                 self.assertNotIn(".readlines(", src)

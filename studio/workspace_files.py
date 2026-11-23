@@ -115,8 +115,27 @@ _SENSITIVE_SUBSTRINGS = (
     ".sqlite",
 )
 
-_FORBIDDEN_QUERY_PARAMS = frozenset({"workdir", "root", "cwd", "dir_abs", "abs_path"})
+_FORBIDDEN_QUERY_PARAMS = frozenset({
+    "workdir",
+    "root",
+    "cwd",
+    "dir_abs",
+    "abs_path",
+    "worktree_path",
+})
+_FORBIDDEN_DIFF_CKPT_QUERY_PARAMS = frozenset({
+    "workdir",
+    "root",
+    "cwd",
+    "dir_abs",
+    "abs_path",
+    "worktree_path",
+    "sha1",
+    "pre_sha1",
+    "post_sha1",
+})
 _ALLOWED_DIFF_SCOPES = frozenset({"all", "staged", "unstaged"})
+_WORKTREE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$")
 
 _FORBIDDEN_UNDO_KEYS = frozenset({
     "workdir",
@@ -193,6 +212,67 @@ def is_sensitive_rel_path(rel_path: str) -> bool:
         if is_sensitive_name(part):
             return True
     return False
+
+
+def _resolve_worktree_root(
+    project_root: Path,
+    raw_wt_id: str | None,
+) -> tuple[Path | None, str, int, str]:
+    """Validate optional `worktree_id` strictly inside `<project_root>/.worktrees/<wt_id>`.
+
+    Returns `(effective_root, normalized_wt_id, http_status, error_message)`.
+    Format violation -> 400; symlink or path escape -> 403; missing worktree -> 404.
+    """
+    if raw_wt_id is None:
+        return project_root, "", 200, ""
+    if not isinstance(raw_wt_id, str):
+        return None, "", 400, "非法的 worktree_id 格式"
+    wt_s = raw_wt_id.strip()
+    if not wt_s:
+        return project_root, "", 200, ""
+    if (
+        ".." in wt_s
+        or "/" in wt_s
+        or "\\" in wt_s
+        or "\x00" in wt_s
+        or not _WORKTREE_ID_RE.fullmatch(wt_s)
+    ):
+        return None, "", 400, "非法的 worktree_id 格式"
+
+    try:
+        proj_real = project_root.resolve(strict=True)
+    except OSError:
+        return None, "", 404, "项目工作区目录不可访问"
+
+    wt_parent = proj_real / ".worktrees"
+    if os.path.islink(wt_parent):
+        return None, "", 403, "禁止访问符号链接 worktree 目录"
+    if not wt_parent.exists():
+        return None, "", 404, "未找到对应的 worktree"
+    if not wt_parent.is_dir():
+        return None, "", 404, "未找到对应的 worktree"
+    try:
+        wt_parent_real = wt_parent.resolve(strict=True)
+    except OSError:
+        return None, "", 404, "未找到对应的 worktree"
+    if not wt_parent_real.is_relative_to(proj_real):
+        return None, "", 403, "worktree 目录越界，已拒绝访问"
+
+    wt_dir = wt_parent_real / wt_s
+    if os.path.islink(wt_dir):
+        return None, "", 403, "禁止访问符号链接 worktree 目录"
+    if not wt_dir.exists():
+        return None, "", 404, "未找到对应的 worktree"
+    if not wt_dir.is_dir():
+        return None, "", 404, "未找到对应的 worktree"
+    try:
+        wt_real = wt_dir.resolve(strict=True)
+    except OSError:
+        return None, "", 404, "未找到对应的 worktree"
+    if not wt_real.is_relative_to(wt_parent_real) or wt_real == wt_parent_real:
+        return None, "", 403, "worktree 路径越界，已拒绝访问"
+
+    return wt_real, wt_s, 200, ""
 
 
 def _resolve_sandboxed_path(
@@ -493,34 +573,49 @@ class StudioWorkspaceFilesService:
                 )
         return None
 
-    def _resolve_project_root(self, request: web.Request) -> tuple[dict[str, str] | None, Path | None, web.Response | None]:
+    def _resolve_project_root(
+        self,
+        request: web.Request,
+        *,
+        allow_worktree: bool = True,
+    ) -> tuple[dict[str, str] | None, Path | None, str, web.Response | None]:
         forb = self._reject_forbidden_query_params(request)
         if forb is not None:
-            return None, None, forb
+            return None, None, "", forb
         raw_pid = (request.query.get("project_id") or request.query.get("project") or "").strip()
         if not raw_pid:
-            return None, None, web.json_response(
+            return None, None, "", web.json_response(
                 {"ok": False, "source": "studio_api", "error": "缺少 project_id 参数"},
                 status=400,
             )
         if "\x00" in raw_pid or "/" in raw_pid or "\\" in raw_pid or ".." in raw_pid or raw_pid.startswith("-"):
-            return None, None, web.json_response(
+            return None, None, "", web.json_response(
                 {"ok": False, "source": "studio_api", "error": "非法的 project_id 参数"},
                 status=400,
             )
         proj = self.data_sources.resolve_allowed_project(raw_pid)
         if not proj or not proj.get("workdir"):
-            return None, None, web.json_response(
+            return None, None, "", web.json_response(
                 {"ok": False, "source": "studio_api", "error": "未找到对应的白名单项目"},
                 status=404,
             )
         root = Path(proj["workdir"])
         if not root.is_dir():
-            return None, None, web.json_response(
+            return None, None, "", web.json_response(
                 {"ok": False, "source": "studio_api", "error": "项目工作区目录不可访问"},
                 status=404,
             )
-        return proj, root, None
+        wt_id = ""
+        if allow_worktree and "worktree_id" in request.query:
+            raw_wt = request.query.get("worktree_id", "")
+            eff_root, wt_id, sc_wt, err_wt = _resolve_worktree_root(root, raw_wt)
+            if eff_root is None:
+                return None, None, "", web.json_response(
+                    {"ok": False, "source": "studio_api", "error": err_wt},
+                    status=sc_wt,
+                )
+            root = eff_root
+        return proj, root, wt_id, None
 
     # ------------------------------------------------------------------ GET /api/projects
     async def handle_get_projects(self, request: web.Request) -> web.Response:
@@ -544,7 +639,7 @@ class StudioWorkspaceFilesService:
         ok, sess, err, status_code = await self.auth_mgr.authenticate_request(request)
         if not ok or not sess:
             return studio_auth_error(err, status=status_code)
-        proj, root, err_resp = self._resolve_project_root(request)
+        proj, root, wt_id, err_resp = self._resolve_project_root(request)
         if err_resp is not None or proj is None or root is None:
             assert err_resp is not None
             return err_resp
@@ -663,6 +758,7 @@ class StudioWorkspaceFilesService:
         return web.json_response({
             "ok": True,
             "project_id": proj["id"],
+            "worktree_id": wt_id or None,
             "dir": redact_workspace_text(norm_dir),
             "truncated": truncated[0],
             "total": counter[0],
@@ -674,7 +770,7 @@ class StudioWorkspaceFilesService:
         ok, sess, err, status_code = await self.auth_mgr.authenticate_request(request)
         if not ok or not sess:
             return studio_auth_error(err, status=status_code)
-        proj, root, err_resp = self._resolve_project_root(request)
+        proj, root, wt_id, err_resp = self._resolve_project_root(request)
         if err_resp is not None or proj is None or root is None:
             assert err_resp is not None
             return err_resp
@@ -748,6 +844,7 @@ class StudioWorkspaceFilesService:
             return web.json_response({
                 "ok": True,
                 "project_id": proj["id"],
+                "worktree_id": wt_id or None,
                 "path": redact_workspace_text(norm_rel),
                 "is_binary": True,
                 "size": file_size,
@@ -773,6 +870,7 @@ class StudioWorkspaceFilesService:
         return web.json_response({
             "ok": True,
             "project_id": proj["id"],
+            "worktree_id": wt_id or None,
             "path": redact_workspace_text(norm_rel),
             "is_binary": False,
             "size": file_size,
@@ -827,7 +925,7 @@ class StudioWorkspaceFilesService:
         ok, sess, err, status_code = await self.auth_mgr.authenticate_request(request)
         if not ok or not sess:
             return studio_auth_error(err, status=status_code)
-        proj, root, err_resp = self._resolve_project_root(request)
+        proj, root, wt_id, err_resp = self._resolve_project_root(request)
         if err_resp is not None or proj is None or root is None:
             assert err_resp is not None
             return err_resp
@@ -863,6 +961,7 @@ class StudioWorkspaceFilesService:
             return web.json_response({
                 "ok": True,
                 "project_id": proj["id"],
+                "worktree_id": wt_id or None,
                 "is_git": False,
                 "scope": scope,
                 "path": redact_workspace_text(norm_rel),
@@ -973,6 +1072,7 @@ class StudioWorkspaceFilesService:
         return web.json_response({
             "ok": True,
             "project_id": proj["id"],
+            "worktree_id": wt_id or None,
             "is_git": True,
             "scope": scope,
             "path": redact_workspace_text(norm_rel),
@@ -1007,6 +1107,12 @@ class StudioWorkspaceFilesService:
                     status=404,
                 )
             pid = proj["id"]
+        wt_id = (request.query.get("worktree_id") or "").strip()
+        if wt_id and not studio_ipc.is_valid_worktree_id(wt_id):
+            return web.json_response(
+                {"ok": False, "source": "studio_api", "error": "非法的 worktree_id 格式"},
+                status=400,
+            )
 
         req_bot = (request.query.get("bot") or "").strip() or None
         ep = self._resolve_ipc_endpoint(req_bot)
@@ -1025,6 +1131,8 @@ class StudioWorkspaceFilesService:
             q_params["cid"] = cid
         if pid:
             q_params["project_id"] = pid
+        if wt_id:
+            q_params["worktree_id"] = wt_id
         qs = f"?{urllib.parse.urlencode(q_params)}" if q_params else ""
 
         sc, data = await self._ipc_request_json(
@@ -1054,16 +1162,22 @@ class StudioWorkspaceFilesService:
                 changes = []
                 for ch in (it.get("changes") or [])[:50]:
                     if isinstance(ch, dict):
+                        p_raw = str(ch.get("path") or "")
+                        if is_sensitive_rel_path(p_raw):
+                            continue
                         changes.append({
-                            "path": redact_workspace_text(ch.get("path") or ""),
+                            "path": redact_workspace_text(p_raw),
                             "action": _sanitize_slug(ch.get("action") or "modified", max_len=24),
                         })
+                raw_item_wt = str(it.get("worktree_id") or "").strip()
+                item_wt = raw_item_wt if studio_ipc.is_valid_worktree_id(raw_item_wt) else ""
                 # Explicitly omit `workdir`
                 out.append({
                     "entry_id": _sanitize_slug(it.get("entry_id") or "", max_len=64),
                     "ts": int(it.get("ts") or 0),
                     "cid": str(it.get("cid") or ""),
                     "project_id": _sanitize_slug(it.get("project_id") or "", max_len=64),
+                    "worktree_id": item_wt or None,
                     "prompt": redact_workspace_text(it.get("prompt") or "")[:120],
                     "truncated": bool(it.get("truncated", False)),
                     "changes_count": int(it.get("changes_count") or len(changes)),
@@ -1078,6 +1192,163 @@ class StudioWorkspaceFilesService:
             "bot": bot_h,
             "undo_stack": _clean_stack(data.get("undo_stack")),
             "redo_stack": _clean_stack(data.get("redo_stack")),
+        })
+
+    # ------------------------------------------------------------------ GET /api/undo/checkpoints/{entry_id}/diff
+    async def handle_get_undo_checkpoint_diff(self, request: web.Request) -> web.Response:
+        ok, sess, err, status_code = await self.auth_mgr.authenticate_request(request)
+        if not ok or not sess:
+            return studio_auth_error(err, status=status_code)
+        if sess.get("role") != "admin":
+            return studio_auth_error("只读权限（readonly）不可访问检查点 Diff", status=403)
+        for k in request.query.keys():
+            if k.strip().lower() in _FORBIDDEN_DIFF_CKPT_QUERY_PARAMS:
+                return web.json_response(
+                    {"ok": False, "source": "studio_api", "error": f"禁止传入受限查询参数: {k}"},
+                    status=400,
+                )
+
+        entry_id = str(request.match_info.get("entry_id") or "").strip()
+        if not studio_ipc.is_valid_undo_entry_id(entry_id):
+            return web.json_response(
+                {"ok": False, "source": "studio_api", "error": "无效的检查点 entry_id"},
+                status=400,
+            )
+
+        cid = (request.query.get("cid") or "").strip()
+        if cid and not studio_ipc.is_valid_cid(cid):
+            return web.json_response(
+                {"ok": False, "source": "studio_api", "error": "无效的会话 ID 格式"},
+                status=400,
+            )
+        pid = (request.query.get("project_id") or "").strip()
+        if pid:
+            if "\x00" in pid or "/" in pid or "\\" in pid or ".." in pid or pid.startswith("-"):
+                return web.json_response(
+                    {"ok": False, "source": "studio_api", "error": "非法的 project_id 参数"},
+                    status=400,
+                )
+            proj = self.data_sources.resolve_allowed_project(pid)
+            if not proj:
+                return web.json_response(
+                    {"ok": False, "source": "studio_api", "error": "未找到对应的白名单项目"},
+                    status=404,
+                )
+            pid = proj["id"]
+
+        req_bot = (request.query.get("bot") or "").strip() or None
+        ep = self._resolve_ipc_endpoint(req_bot)
+        if ep is None:
+            return web.json_response(
+                {"ok": False, "source": "upstream", "error": "目标 Bot Bridge IPC 离线，无法获取检查点 Diff"},
+                status=503,
+            )
+
+        bot_h, sock_p, tok = ep
+        q_params: dict[str, str] = {"entry_id": entry_id}
+        if cid:
+            q_params["cid"] = cid
+        if pid:
+            q_params["project_id"] = pid
+        qs = urllib.parse.urlencode(q_params)
+
+        sc, data = await self._ipc_request_json(
+            sock_path=sock_p,
+            token=tok,
+            method="GET",
+            path=f"/ipc/undo/diff?{qs}",
+            extra_headers={"X-Bridge-User-Id": str(sess["user_id"])},
+        )
+        if sc >= 400 or not data.get("ok"):
+            err_code = _sanitize_slug(data.get("code") or "", max_len=32)
+            out_err: dict[str, Any] = {
+                "ok": False,
+                "source": "upstream",
+                "error": redact_workspace_text(data.get("error") or "获取检查点 Diff 失败"),
+            }
+            if err_code:
+                out_err["code"] = err_code
+            return web.json_response(out_err, status=sc)
+
+        # Defense-in-depth Studio-side sensitive filter, redaction, and 256 KiB UTF-8 cap
+        files_clean: list[dict[str, Any]] = []
+        diff_chunks: list[str] = []
+        total_added = 0
+        total_deleted = 0
+        total_bytes = 0
+        truncated = bool(data.get("truncated", False))
+
+        for f_item in (data.get("files") or [])[:300]:
+            if not isinstance(f_item, dict):
+                continue
+            raw_p = str(f_item.get("path") or "").strip()
+            if not raw_p or is_sensitive_rel_path(raw_p):
+                continue
+            safe_p = redact_workspace_text(raw_p)
+            act = _sanitize_slug(f_item.get("action") or "modified", max_len=24) or "modified"
+            is_bin = bool(f_item.get("is_binary", False))
+            if is_bin:
+                files_clean.append({
+                    "path": safe_p,
+                    "action": act,
+                    "is_binary": True,
+                    "added": 0,
+                    "deleted": 0,
+                    "diff": "",
+                    "truncated": False,
+                    "missing_blob": bool(f_item.get("missing_blob", False)),
+                })
+                continue
+            added_n = max(0, int(f_item.get("added") or 0))
+            deleted_n = max(0, int(f_item.get("deleted") or 0))
+            total_added += added_n
+            total_deleted += deleted_n
+            f_diff_red = redact_workspace_text(str(f_item.get("diff") or ""))
+            rem = max(0, MAX_DIFF_BYTES - total_bytes)
+            f_trunc = bool(f_item.get("truncated", False))
+            if rem == 0 and f_diff_red:
+                f_diff_red = ""
+                f_trunc = True
+                truncated = True
+            else:
+                f_diff_red, did_t = truncate_utf8_bytes(f_diff_red, rem)
+                if did_t:
+                    f_trunc = True
+                    truncated = True
+                total_bytes += len(f_diff_red.encode("utf-8"))
+            if f_diff_red:
+                diff_chunks.append(f_diff_red)
+            files_clean.append({
+                "path": safe_p,
+                "action": act,
+                "is_binary": False,
+                "added": added_n,
+                "deleted": deleted_n,
+                "diff": f_diff_red,
+                "truncated": f_trunc,
+                "missing_blob": bool(f_item.get("missing_blob", False)),
+            })
+
+        combined_diff, comb_trunc = truncate_utf8_bytes("\n\n".join(diff_chunks), MAX_DIFF_BYTES)
+        if comb_trunc:
+            truncated = True
+        raw_wt_out = str(data.get("worktree_id") or "").strip()
+        wt_out = raw_wt_out if studio_ipc.is_valid_worktree_id(raw_wt_out) else None
+
+        return web.json_response({
+            "ok": True,
+            "bot": bot_h,
+            "entry_id": entry_id,
+            "ts": int(data.get("ts") or 0),
+            "cid": str(data.get("cid") or ""),
+            "project_id": _sanitize_slug(data.get("project_id") or "", max_len=64),
+            "worktree_id": wt_out,
+            "prompt": redact_workspace_text(data.get("prompt") or "")[:120],
+            "added": total_added,
+            "deleted": total_deleted,
+            "files": files_clean,
+            "diff": combined_diff,
+            "truncated": truncated,
         })
 
     # ------------------------------------------------------------------ POST /api/undo/apply & /api/undo/redo
@@ -1277,6 +1548,7 @@ class StudioWorkspaceFilesService:
             for a in (data.get("applied") or [])[:50]
             if isinstance(a, dict)
         ]
+        raw_wt_applied = str(data.get("worktree_id") or "").strip()
         return web.json_response({
             "ok": True,
             "action": "redo" if reverse else "undo",
@@ -1284,6 +1556,7 @@ class StudioWorkspaceFilesService:
             "entry_id": entry_id,
             "cid": str(data.get("cid") or ""),
             "project_id": _sanitize_slug(data.get("project_id") or "", max_len=64),
+            "worktree_id": raw_wt_applied if studio_ipc.is_valid_worktree_id(raw_wt_applied) else None,
             "applied": applied_clean,
             "remaining_undo": int(data.get("remaining_undo") or 0),
             "remaining_redo": int(data.get("remaining_redo") or 0),

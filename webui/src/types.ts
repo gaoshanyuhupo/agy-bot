@@ -790,6 +790,18 @@ export interface GatewayProbeResponse {
   message: string;
 }
 
+export interface SessionWorktreeInfo {
+  active: boolean;
+  worktree_id?: string;
+  branch?: string;
+  project_id?: string;
+  reason?: string;
+  created_at?: number;
+  dirty_count?: number;
+  commits_ahead?: number;
+  busy?: boolean;
+}
+
 export interface SessionSummaryItem {
   cid: string;
   title: string;
@@ -799,6 +811,7 @@ export interface SessionSummaryItem {
   source: string;
   bot: string;
   busy: boolean;
+  worktree?: SessionWorktreeInfo | null;
 }
 
 export interface SessionsResponse {
@@ -896,6 +909,7 @@ export interface ChatSendPayload {
   model?: string | null;
   effort?: string | null;
   sync_tg?: boolean;
+  worktree?: boolean;
   attachments?: string[];
   context_files?: string[];
   execution_mode?: ExecutionMode;
@@ -923,6 +937,7 @@ export interface ChatSendResponse {
   context_files?: string[];
   execution_mode?: ExecutionMode;
   interrupted_turn_id?: string | null;
+  worktree?: SessionWorktreeInfo | null;
 }
 
 export interface ChatAbortResponse {
@@ -956,6 +971,7 @@ export interface FileTreeNode {
 export interface FileTreeResponse {
   ok: boolean;
   project_id: string;
+  worktree_id?: string | null;
   dir: string;
   truncated: boolean;
   total: number;
@@ -965,6 +981,7 @@ export interface FileTreeResponse {
 export interface FileContentResponse {
   ok: boolean;
   project_id: string;
+  worktree_id?: string | null;
   path: string;
   is_binary: boolean;
   size: number;
@@ -983,6 +1000,7 @@ export interface GitDiffFileEntry {
 export interface FileDiffResponse {
   ok: boolean;
   project_id: string;
+  worktree_id?: string | null;
   is_git: boolean;
   scope: "all" | "staged" | "unstaged";
   path: string;
@@ -1001,6 +1019,7 @@ export interface UndoCheckpointItem {
   ts: number;
   cid: string;
   project_id: string;
+  worktree_id?: string | null;
   prompt: string;
   truncated: boolean;
   changes_count: number;
@@ -1023,9 +1042,135 @@ export interface UndoActionResponse {
   entry_id: string;
   cid: string;
   project_id: string;
+  worktree_id?: string | null;
   applied: UndoCheckpointChange[];
   remaining_undo: number;
   remaining_redo: number;
+}
+
+export interface CheckpointDiffFileItem {
+  path: string;
+  action: string;
+  is_binary: boolean;
+  added: number;
+  deleted: number;
+  diff: string;
+  truncated: boolean;
+  missing_blob?: boolean;
+}
+
+export interface CheckpointDiffResponse {
+  ok: boolean;
+  bot: string;
+  entry_id: string;
+  ts: number;
+  cid: string;
+  project_id: string;
+  worktree_id?: string | null;
+  prompt: string;
+  added: number;
+  deleted: number;
+  files: CheckpointDiffFileItem[];
+  diff: string;
+  truncated: boolean;
+}
+
+export interface WorktreeSummaryItem {
+  worktree_id: string;
+  project_id: string;
+  branch: string;
+  cid: string;
+  bot: string;
+  dirty_count: number;
+  commits_ahead: number;
+  busy: boolean;
+  created_at: number;
+}
+
+export interface WorktreesResponse {
+  ok: boolean;
+  project_id: string;
+  is_git: boolean;
+  worktrees: WorktreeSummaryItem[];
+}
+
+export interface WorktreeCleanupResponse {
+  ok: boolean;
+  project_id: string;
+  worktree_id: string;
+  branch: string;
+  branch_deleted: boolean;
+  cleaned: boolean;
+}
+
+export interface GitStatusResponse {
+  ok: boolean;
+  project_id: string;
+  worktree_id?: string | null;
+  is_git: boolean;
+  branch: string;
+  detached: boolean;
+  upstream: string;
+  ahead: number;
+  behind: number;
+  staged: string[];
+  unstaged: string[];
+  untracked: string[];
+  is_protected_branch: boolean;
+  has_remote: boolean;
+  gh_available: boolean;
+}
+
+export interface GitCommitPayload {
+  project_id: string;
+  worktree_id?: string | null;
+  message: string;
+  stage_mode: "all" | "staged" | "paths";
+  paths?: string[];
+}
+
+export interface GitCommitResponse {
+  ok: boolean;
+  project_id: string;
+  worktree_id?: string | null;
+  commit_sha: string;
+  full_sha: string;
+  branch: string;
+  files_committed: string[];
+}
+
+export interface GitPushPayload {
+  project_id: string;
+  worktree_id?: string | null;
+  confirm_protected?: boolean;
+}
+
+export interface GitPushResponse {
+  ok: boolean;
+  project_id: string;
+  worktree_id?: string | null;
+  remote: string;
+  branch: string;
+  output: string;
+}
+
+export interface GitPrPayload {
+  project_id: string;
+  worktree_id?: string | null;
+  title: string;
+  body?: string;
+  base?: string;
+  draft?: boolean;
+}
+
+export interface GitPrResponse {
+  ok: boolean;
+  project_id: string;
+  worktree_id?: string | null;
+  pr_url: string;
+  head: string;
+  base: string;
+  draft: boolean;
 }
 
 // Phase B M1: Bot Team Control Plane

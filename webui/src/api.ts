@@ -16,6 +16,7 @@ import type {
   ChatAbortResponse,
   ChatSendPayload,
   ChatSendResponse,
+  CheckpointDiffResponse,
   CostsResponse,
   EventStreamStatus,
   ExecutionMode,
@@ -28,6 +29,13 @@ import type {
   GatewayProbePayload,
   GatewayProbeResponse,
   GatewaysListResponse,
+  GitCommitPayload,
+  GitCommitResponse,
+  GitPrPayload,
+  GitPrResponse,
+  GitPushPayload,
+  GitPushResponse,
+  GitStatusResponse,
   GoogleAccountActivateResponse,
   GoogleAccountAddPayload,
   GoogleAccountMutationResponse,
@@ -69,6 +77,8 @@ import type {
   UploadAttachmentResponse,
   WorkbenchStateResponse,
   WorkbenchStateUpdatePayload,
+  WorktreeCleanupResponse,
+  WorktreesResponse,
 } from "./types";
 
 let csrfTokenMemory = "";
@@ -728,10 +738,12 @@ export function fetchProjects(): Promise<ProjectsResponse> {
 
 export function fetchFileTree(params: {
   project_id: string;
+  worktree_id?: string | null;
   dir?: string;
   depth?: number;
 }): Promise<FileTreeResponse> {
   const q = new URLSearchParams({ project_id: params.project_id });
+  if (params.worktree_id) q.set("worktree_id", params.worktree_id);
   if (params.dir) q.set("dir", params.dir);
   if (params.depth) q.set("depth", String(params.depth));
   return requestJson<FileTreeResponse>(`/api/files/tree?${q.toString()}`);
@@ -740,13 +752,16 @@ export function fetchFileTree(params: {
 export function fetchFileContent(
   projectId: string,
   path: string,
+  worktreeId?: string | null,
 ): Promise<FileContentResponse> {
   const q = new URLSearchParams({ project_id: projectId, path });
+  if (worktreeId) q.set("worktree_id", worktreeId);
   return requestJson<FileContentResponse>(`/api/files/content?${q.toString()}`);
 }
 
 export function fetchFileDiff(params: {
   project_id: string;
+  worktree_id?: string | null;
   scope?: "all" | "staged" | "unstaged";
   path?: string;
 }): Promise<FileDiffResponse> {
@@ -754,6 +769,7 @@ export function fetchFileDiff(params: {
     project_id: params.project_id,
     scope: params.scope || "all",
   });
+  if (params.worktree_id) q.set("worktree_id", params.worktree_id);
   if (params.path) q.set("path", params.path);
   return requestJson<FileDiffResponse>(`/api/files/diff?${q.toString()}`);
 }
@@ -762,13 +778,118 @@ export function fetchUndoCheckpoints(params?: {
   bot?: string;
   cid?: string | null;
   project_id?: string;
+  worktree_id?: string | null;
 }): Promise<UndoCheckpointsResponse> {
   const q = new URLSearchParams();
   if (params?.bot) q.set("bot", params.bot);
   if (params?.cid) q.set("cid", params.cid);
   if (params?.project_id) q.set("project_id", params.project_id);
+  if (params?.worktree_id) q.set("worktree_id", params.worktree_id);
   const qs = q.toString();
   return requestJson<UndoCheckpointsResponse>(`/api/undo/checkpoints${qs ? `?${qs}` : ""}`);
+}
+
+export function fetchCheckpointDiff(
+  entryId: string,
+  params?: {
+    bot?: string;
+    cid?: string | null;
+    project_id?: string;
+  },
+): Promise<CheckpointDiffResponse> {
+  const q = new URLSearchParams();
+  if (params?.bot) q.set("bot", params.bot);
+  if (params?.cid) q.set("cid", params.cid);
+  if (params?.project_id) q.set("project_id", params.project_id);
+  const qs = q.toString();
+  return requestJson<CheckpointDiffResponse>(
+    `/api/undo/checkpoints/${encodeURIComponent(entryId)}/diff${qs ? `?${qs}` : ""}`,
+  );
+}
+
+// P0 Coding Workbench Trio: Per-Session Worktrees & Safe Git Workflow
+export function fetchWorktrees(projectId: string): Promise<WorktreesResponse> {
+  const q = new URLSearchParams({ project_id: projectId });
+  return requestJson<WorktreesResponse>(`/api/worktrees?${q.toString()}`);
+}
+
+export function cleanupWorktree(
+  worktreeId: string,
+  payload: { project_id: string; force?: boolean },
+): Promise<WorktreeCleanupResponse> {
+  return requestJson<WorktreeCleanupResponse>(
+    `/api/worktrees/${encodeURIComponent(worktreeId)}/cleanup`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        project_id: payload.project_id,
+        force: Boolean(payload.force),
+      }),
+    },
+    true,
+  );
+}
+
+export function fetchGitStatus(params: {
+  project_id: string;
+  worktree_id?: string | null;
+}): Promise<GitStatusResponse> {
+  const q = new URLSearchParams({ project_id: params.project_id });
+  if (params.worktree_id) q.set("worktree_id", params.worktree_id);
+  return requestJson<GitStatusResponse>(`/api/git/status?${q.toString()}`);
+}
+
+export function gitCommit(payload: GitCommitPayload): Promise<GitCommitResponse> {
+  const body: Record<string, unknown> = {
+    project_id: payload.project_id,
+    message: payload.message,
+    stage_mode: payload.stage_mode,
+  };
+  if (payload.worktree_id) body.worktree_id = payload.worktree_id;
+  if (payload.stage_mode === "paths" && payload.paths) body.paths = payload.paths;
+  return requestJson<GitCommitResponse>(
+    "/api/git/commit",
+    {
+      method: "POST",
+      body: JSON.stringify(body),
+    },
+    true,
+  );
+}
+
+export function gitPush(payload: GitPushPayload): Promise<GitPushResponse> {
+  const body: Record<string, unknown> = {
+    project_id: payload.project_id,
+    confirm_protected: Boolean(payload.confirm_protected),
+  };
+  if (payload.worktree_id) body.worktree_id = payload.worktree_id;
+  return requestJson<GitPushResponse>(
+    "/api/git/push",
+    {
+      method: "POST",
+      body: JSON.stringify(body),
+    },
+    true,
+  );
+}
+
+export function gitCreatePr(payload: GitPrPayload): Promise<GitPrResponse> {
+  const body: Record<string, unknown> = {
+    project_id: payload.project_id,
+    title: payload.title,
+    body: payload.body ?? "",
+    draft: Boolean(payload.draft),
+  };
+  if (payload.worktree_id) body.worktree_id = payload.worktree_id;
+  if (payload.base && payload.base.trim()) body.base = payload.base.trim();
+  return requestJson<GitPrResponse>(
+    "/api/git/pr",
+    {
+      method: "POST",
+      body: JSON.stringify(body),
+    },
+    true,
+  );
 }
 
 export function applyUndoCheckpoint(payload: {

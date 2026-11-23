@@ -1,39 +1,56 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
+  Check,
   ChevronDown,
   ChevronRight,
+  ExternalLink,
   FileCode,
   FileText,
   Folder,
   FolderOpen,
+  GitBranch,
+  GitCommitHorizontal,
   GitCompare,
+  GitPullRequest,
   Loader2,
   Lock,
   Quote,
   RefreshCw,
   RotateCcw,
   RotateCw,
+  Trash2,
+  Upload,
   X,
 } from "lucide-react";
 import {
   StudioApiError,
   applyUndoCheckpoint,
+  cleanupWorktree,
+  fetchCheckpointDiff,
   fetchFileContent,
   fetchFileDiff,
   fetchFileTree,
+  fetchGitStatus,
   fetchProjects,
   fetchUndoCheckpoints,
+  fetchWorktrees,
+  gitCommit,
+  gitCreatePr,
+  gitPush,
   redoUndoCheckpoint,
 } from "../api";
 import type {
+  CheckpointDiffResponse,
   FileContentResponse,
   FileDiffResponse,
   FileTreeNode,
+  GitStatusResponse,
   StudioSession,
   UndoCheckpointItem,
   UndoCheckpointsResponse,
   WorkspaceProjectItem,
+  WorktreeSummaryItem,
 } from "../types";
 import { SafeMarkdown } from "./SafeMarkdown";
 
@@ -42,13 +59,19 @@ export interface FilesDiffPanelProps {
   selectedProject?: string;
   selectedBot?: string;
   activeCid?: string | null;
+  selectedWorktreeId?: string | null;
+  onWorktreeChange?: (worktreeId: string | null) => void;
   onProjectChange?: (projectId: string) => void;
   onQuoteToChat?: (snippet: string) => void;
   onClose?: () => void;
   onSessionRevoked?: (reason: string) => void;
 }
 
-type PanelTab = "files" | "diff" | "undo";
+type PanelTab = "files" | "diff" | "undo" | "git";
+
+function isSafeHttpsUrl(raw: string | null | undefined): raw is string {
+  return typeof raw === "string" && /^https:\/\/[^\s<>"]+$/i.test(raw.trim());
+}
 
 function formatFileSize(bytes: number | null): string {
   if (bytes == null || bytes < 0) return "";
@@ -86,11 +109,32 @@ function mergeDirChildren(
   });
 }
 
+function renderUnifiedDiffLines(diffText: string) {
+  const lines = diffText ? diffText.split("\n") : [];
+  return lines.map((line, i) => {
+    let cls = "text-slate-300";
+    if (line.startsWith("+") && !line.startsWith("+++")) {
+      cls = "bg-emerald-500/15 text-emerald-300";
+    } else if (line.startsWith("-") && !line.startsWith("---")) {
+      cls = "bg-rose-500/15 text-rose-300";
+    } else if (line.startsWith("@@") || line.startsWith("diff --git")) {
+      cls = "bg-sky-500/10 text-sky-300 font-semibold";
+    }
+    return (
+      <div key={i} className={`whitespace-pre px-1 ${cls}`}>
+        {line || " "}
+      </div>
+    );
+  });
+}
+
 export function FilesDiffPanel({
   session,
   selectedProject,
   selectedBot,
   activeCid,
+  selectedWorktreeId,
+  onWorktreeChange,
   onProjectChange,
   onQuoteToChat,
   onClose,
@@ -101,6 +145,16 @@ export function FilesDiffPanel({
   const [tab, setTab] = useState<PanelTab>("files");
   const [projects, setProjects] = useState<WorkspaceProjectItem[]>([]);
   const [projectId, setProjectId] = useState<string>(selectedProject || "");
+  const [worktreeId, setWorktreeId] = useState<string>(selectedWorktreeId || "");
+  const [worktrees, setWorktrees] = useState<WorktreeSummaryItem[]>([]);
+  const [worktreesLoading, setWorktreesLoading] = useState(false);
+  const [cleanupBusy, setCleanupBusy] = useState(false);
+  const [cleanupConfirm, setCleanupConfirm] = useState<{
+    worktreeId: string;
+    message: string;
+    dirtyCount?: number;
+    commitsAhead?: number;
+  } | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [noticeMsg, setNoticeMsg] = useState<string | null>(null);
 
@@ -123,10 +177,13 @@ export function FilesDiffPanel({
   const [diffData, setDiffData] = useState<FileDiffResponse | null>(null);
   const [diffLoading, setDiffLoading] = useState(false);
 
-  // Undo/Redo tab state
+  // Undo/Redo + Checkpoint Diff tab state
   const [undoData, setUndoData] = useState<UndoCheckpointsResponse | null>(null);
   const [undoLoading, setUndoLoading] = useState(false);
   const [undoBusyId, setUndoBusyId] = useState<string | null>(null);
+  const [expandedCkptIds, setExpandedCkptIds] = useState<Record<string, boolean>>({});
+  const [ckptDiffMap, setCkptDiffMap] = useState<Record<string, CheckpointDiffResponse>>({});
+  const [ckptDiffLoading, setCkptDiffLoading] = useState<Record<string, boolean>>({});
   const [conflictPrompt, setConflictPrompt] = useState<{
     action: "undo" | "redo";
     item: UndoCheckpointItem;
@@ -134,15 +191,40 @@ export function FilesDiffPanel({
     message: string;
   } | null>(null);
 
+  // Git Workflow tab state
+  const [gitStatus, setGitStatus] = useState<GitStatusResponse | null>(null);
+  const [gitStatusLoading, setGitStatusLoading] = useState(false);
+  const [commitMessage, setCommitMessage] = useState("");
+  const [stageMode, setStageMode] = useState<"all" | "staged" | "paths">("all");
+  const [selectedCommitPaths, setSelectedCommitPaths] = useState<Record<string, boolean>>({});
+  const [commitBusy, setCommitBusy] = useState(false);
+  const [pushBusy, setPushBusy] = useState(false);
+  const [protectedPushConfirm, setProtectedPushConfirm] = useState<{
+    branch: string;
+    message: string;
+  } | null>(null);
+  const [prTitle, setPrTitle] = useState("");
+  const [prBase, setPrBase] = useState("");
+  const [prBody, setPrBody] = useState("");
+  const [prDraft, setPrDraft] = useState(false);
+  const [prBusy, setPrBusy] = useState(false);
+  const [createdPrUrl, setCreatedPrUrl] = useState<string | null>(null);
+
   const mountedRef = useRef(true);
   const projectIdRef = useRef<string>(projectId);
   projectIdRef.current = projectId;
+  const worktreeIdRef = useRef<string>(worktreeId);
+  worktreeIdRef.current = worktreeId;
   const treeSeqRef = useRef(0);
   const dirSeqRef = useRef(0);
   const dirReqByPathRef = useRef<Record<string, number>>({});
   const fileSeqRef = useRef(0);
   const diffSeqRef = useRef(0);
   const undoSeqRef = useRef(0);
+  const ckptDiffSeqRef = useRef(0);
+  const ckptDiffReqByIdRef = useRef<Record<string, number>>({});
+  const worktreesSeqRef = useRef(0);
+  const gitStatusSeqRef = useRef(0);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -171,6 +253,16 @@ export function FilesDiffPanel({
     }
   }, [selectedProject, projectId]);
 
+  // Sync external selectedWorktreeId prop when switching sessions
+  useEffect(() => {
+    if (selectedWorktreeId !== undefined) {
+      const nextWt = selectedWorktreeId || "";
+      if (nextWt !== worktreeId) {
+        setWorktreeId(nextWt);
+      }
+    }
+  }, [selectedWorktreeId, worktreeId]);
+
   // Load allowed projects
   useEffect(() => {
     let cancelled = false;
@@ -194,9 +286,54 @@ export function FilesDiffPanel({
     };
   }, [handleAuthErr]);
 
+  const loadWorktrees = useCallback(async () => {
+    const reqSeq = ++worktreesSeqRef.current;
+    const reqProj = projectId;
+    if (!reqProj) {
+      setWorktrees([]);
+      setWorktreesLoading(false);
+      return;
+    }
+    setWorktreesLoading(true);
+    try {
+      const res = await fetchWorktrees(reqProj);
+      if (
+        !mountedRef.current ||
+        worktreesSeqRef.current !== reqSeq ||
+        projectIdRef.current !== reqProj
+      ) {
+        return;
+      }
+      const list = res.worktrees || [];
+      setWorktrees(list);
+      if (worktreeIdRef.current && !list.some((w) => w.worktree_id === worktreeIdRef.current)) {
+        setWorktreeId("");
+        onWorktreeChange?.(null);
+      }
+    } catch (err) {
+      if (
+        !mountedRef.current ||
+        worktreesSeqRef.current !== reqSeq ||
+        projectIdRef.current !== reqProj
+      ) {
+        return;
+      }
+      handleAuthErr(err);
+    } finally {
+      if (
+        mountedRef.current &&
+        worktreesSeqRef.current === reqSeq &&
+        projectIdRef.current === reqProj
+      ) {
+        setWorktreesLoading(false);
+      }
+    }
+  }, [projectId, handleAuthErr, onWorktreeChange]);
+
   const loadTree = useCallback(async () => {
     const reqSeq = ++treeSeqRef.current;
     const reqProj = projectId;
+    const reqWt = worktreeId;
     dirReqByPathRef.current = {};
     if (!reqProj) {
       setTreeEntries([]);
@@ -207,11 +344,16 @@ export function FilesDiffPanel({
     setTreeLoading(true);
     setErrorMsg(null);
     try {
-      const res = await fetchFileTree({ project_id: reqProj, depth: 2 });
+      const res = await fetchFileTree({
+        project_id: reqProj,
+        worktree_id: reqWt || undefined,
+        depth: 2,
+      });
       if (
         !mountedRef.current ||
         treeSeqRef.current !== reqSeq ||
-        projectIdRef.current !== reqProj
+        projectIdRef.current !== reqProj ||
+        worktreeIdRef.current !== reqWt
       ) {
         return;
       }
@@ -221,7 +363,8 @@ export function FilesDiffPanel({
       if (
         !mountedRef.current ||
         treeSeqRef.current !== reqSeq ||
-        projectIdRef.current !== reqProj
+        projectIdRef.current !== reqProj ||
+        worktreeIdRef.current !== reqWt
       ) {
         return;
       }
@@ -232,16 +375,18 @@ export function FilesDiffPanel({
       if (
         mountedRef.current &&
         treeSeqRef.current === reqSeq &&
-        projectIdRef.current === reqProj
+        projectIdRef.current === reqProj &&
+        worktreeIdRef.current === reqWt
       ) {
         setTreeLoading(false);
       }
     }
-  }, [projectId, handleAuthErr]);
+  }, [projectId, worktreeId, handleAuthErr]);
 
   const loadDiff = useCallback(async () => {
     const reqSeq = ++diffSeqRef.current;
     const reqProj = projectId;
+    const reqWt = worktreeId;
     if (!reqProj) {
       setDiffData(null);
       setDiffLoading(false);
@@ -252,13 +397,15 @@ export function FilesDiffPanel({
     try {
       const res = await fetchFileDiff({
         project_id: reqProj,
+        worktree_id: reqWt || undefined,
         scope: diffScope,
         path: diffPathFilter || undefined,
       });
       if (
         !mountedRef.current ||
         diffSeqRef.current !== reqSeq ||
-        projectIdRef.current !== reqProj
+        projectIdRef.current !== reqProj ||
+        worktreeIdRef.current !== reqWt
       ) {
         return;
       }
@@ -267,7 +414,8 @@ export function FilesDiffPanel({
       if (
         !mountedRef.current ||
         diffSeqRef.current !== reqSeq ||
-        projectIdRef.current !== reqProj
+        projectIdRef.current !== reqProj ||
+        worktreeIdRef.current !== reqWt
       ) {
         return;
       }
@@ -278,16 +426,18 @@ export function FilesDiffPanel({
       if (
         mountedRef.current &&
         diffSeqRef.current === reqSeq &&
-        projectIdRef.current === reqProj
+        projectIdRef.current === reqProj &&
+        worktreeIdRef.current === reqWt
       ) {
         setDiffLoading(false);
       }
     }
-  }, [projectId, diffScope, diffPathFilter, handleAuthErr]);
+  }, [projectId, worktreeId, diffScope, diffPathFilter, handleAuthErr]);
 
   const loadUndo = useCallback(async () => {
     const reqSeq = ++undoSeqRef.current;
     const reqProj = projectId;
+    const reqWt = worktreeId;
     if (isReadonly) {
       setUndoData(null);
       setUndoLoading(false);
@@ -300,11 +450,13 @@ export function FilesDiffPanel({
         bot: selectedBot || undefined,
         cid: activeCid || undefined,
         project_id: reqProj || undefined,
+        worktree_id: reqWt || undefined,
       });
       if (
         !mountedRef.current ||
         undoSeqRef.current !== reqSeq ||
-        projectIdRef.current !== reqProj
+        projectIdRef.current !== reqProj ||
+        worktreeIdRef.current !== reqWt
       ) {
         return;
       }
@@ -313,7 +465,8 @@ export function FilesDiffPanel({
       if (
         !mountedRef.current ||
         undoSeqRef.current !== reqSeq ||
-        projectIdRef.current !== reqProj
+        projectIdRef.current !== reqProj ||
+        worktreeIdRef.current !== reqWt
       ) {
         return;
       }
@@ -324,22 +477,76 @@ export function FilesDiffPanel({
       if (
         mountedRef.current &&
         undoSeqRef.current === reqSeq &&
-        projectIdRef.current === reqProj
+        projectIdRef.current === reqProj &&
+        worktreeIdRef.current === reqWt
       ) {
         setUndoLoading(false);
       }
     }
-  }, [isReadonly, selectedBot, activeCid, projectId, handleAuthErr]);
+  }, [isReadonly, selectedBot, activeCid, projectId, worktreeId, handleAuthErr]);
 
-  // Reset file preview and invalidate in-flight requests when project changes
+  const loadGitStatus = useCallback(async () => {
+    const reqSeq = ++gitStatusSeqRef.current;
+    const reqProj = projectId;
+    const reqWt = worktreeId;
+    if (!reqProj) {
+      setGitStatus(null);
+      setGitStatusLoading(false);
+      return;
+    }
+    setGitStatusLoading(true);
+    setErrorMsg(null);
+    try {
+      const res = await fetchGitStatus({
+        project_id: reqProj,
+        worktree_id: reqWt || undefined,
+      });
+      if (
+        !mountedRef.current ||
+        gitStatusSeqRef.current !== reqSeq ||
+        projectIdRef.current !== reqProj ||
+        worktreeIdRef.current !== reqWt
+      ) {
+        return;
+      }
+      setGitStatus(res);
+    } catch (err) {
+      if (
+        !mountedRef.current ||
+        gitStatusSeqRef.current !== reqSeq ||
+        projectIdRef.current !== reqProj ||
+        worktreeIdRef.current !== reqWt
+      ) {
+        return;
+      }
+      if (!handleAuthErr(err)) {
+        setErrorMsg(err instanceof Error ? err.message : "加载 Git 状态失败");
+      }
+    } finally {
+      if (
+        mountedRef.current &&
+        gitStatusSeqRef.current === reqSeq &&
+        projectIdRef.current === reqProj &&
+        worktreeIdRef.current === reqWt
+      ) {
+        setGitStatusLoading(false);
+      }
+    }
+  }, [projectId, worktreeId, handleAuthErr]);
+
+  // Reset state and invalidate all in-flight requests when project or worktree changes
   useEffect(() => {
     projectIdRef.current = projectId;
+    worktreeIdRef.current = worktreeId;
     treeSeqRef.current += 1;
     dirSeqRef.current += 1;
     dirReqByPathRef.current = {};
     fileSeqRef.current += 1;
     diffSeqRef.current += 1;
     undoSeqRef.current += 1;
+    ckptDiffSeqRef.current += 1;
+    ckptDiffReqByIdRef.current = {};
+    gitStatusSeqRef.current += 1;
     setSelectedFilePath("");
     setFileContent(null);
     setFileLoading(false);
@@ -352,7 +559,18 @@ export function FilesDiffPanel({
     setDiffLoading(false);
     setTreeLoading(false);
     setConflictPrompt(null);
-  }, [projectId]);
+    setExpandedCkptIds({});
+    setCkptDiffMap({});
+    setCkptDiffLoading({});
+    setCleanupConfirm(null);
+    setProtectedPushConfirm(null);
+    setSelectedCommitPaths({});
+    setCreatedPrUrl(null);
+  }, [projectId, worktreeId]);
+
+  useEffect(() => {
+    void loadWorktrees();
+  }, [loadWorktrees]);
 
   useEffect(() => {
     if (tab === "files") {
@@ -361,13 +579,16 @@ export function FilesDiffPanel({
       void loadDiff();
     } else if (tab === "undo") {
       void loadUndo();
+    } else if (tab === "git") {
+      void loadGitStatus();
     }
-  }, [tab, loadTree, loadDiff, loadUndo]);
+  }, [tab, loadTree, loadDiff, loadUndo, loadGitStatus]);
 
   const handleToggleDir = async (node: FileTreeNode) => {
     const nextOpen = !expandedDirs[node.path];
     setExpandedDirs((prev) => ({ ...prev, [node.path]: nextOpen }));
     const reqProj = projectId;
+    const reqWt = worktreeId;
     if (nextOpen && !node.children && reqProj) {
       const reqSeq = ++dirSeqRef.current;
       const reqTreeSeq = treeSeqRef.current;
@@ -376,12 +597,14 @@ export function FilesDiffPanel({
       try {
         const res = await fetchFileTree({
           project_id: reqProj,
+          worktree_id: reqWt || undefined,
           dir: node.path,
           depth: 2,
         });
         if (
           !mountedRef.current ||
           projectIdRef.current !== reqProj ||
+          worktreeIdRef.current !== reqWt ||
           treeSeqRef.current !== reqTreeSeq ||
           dirReqByPathRef.current[node.path] !== reqSeq
         ) {
@@ -392,6 +615,7 @@ export function FilesDiffPanel({
         if (
           !mountedRef.current ||
           projectIdRef.current !== reqProj ||
+          worktreeIdRef.current !== reqWt ||
           treeSeqRef.current !== reqTreeSeq ||
           dirReqByPathRef.current[node.path] !== reqSeq
         ) {
@@ -404,6 +628,7 @@ export function FilesDiffPanel({
         if (
           mountedRef.current &&
           projectIdRef.current === reqProj &&
+          worktreeIdRef.current === reqWt &&
           dirReqByPathRef.current[node.path] === reqSeq
         ) {
           setLoadingDirs((prev) => ({ ...prev, [node.path]: false }));
@@ -414,6 +639,7 @@ export function FilesDiffPanel({
 
   const handleOpenFile = async (relPath: string) => {
     const reqProj = projectId;
+    const reqWt = worktreeId;
     if (!reqProj) return;
     const reqSeq = ++fileSeqRef.current;
     setSelectedFilePath(relPath);
@@ -423,11 +649,12 @@ export function FilesDiffPanel({
     setFileLoading(true);
     setErrorMsg(null);
     try {
-      const res = await fetchFileContent(reqProj, relPath);
+      const res = await fetchFileContent(reqProj, relPath, reqWt || undefined);
       if (
         !mountedRef.current ||
         fileSeqRef.current !== reqSeq ||
-        projectIdRef.current !== reqProj
+        projectIdRef.current !== reqProj ||
+        worktreeIdRef.current !== reqWt
       ) {
         return;
       }
@@ -436,7 +663,8 @@ export function FilesDiffPanel({
       if (
         !mountedRef.current ||
         fileSeqRef.current !== reqSeq ||
-        projectIdRef.current !== reqProj
+        projectIdRef.current !== reqProj ||
+        worktreeIdRef.current !== reqWt
       ) {
         return;
       }
@@ -447,9 +675,254 @@ export function FilesDiffPanel({
       if (
         mountedRef.current &&
         fileSeqRef.current === reqSeq &&
-        projectIdRef.current === reqProj
+        projectIdRef.current === reqProj &&
+        worktreeIdRef.current === reqWt
       ) {
         setFileLoading(false);
+      }
+    }
+  };
+
+  const handleToggleCheckpointDiff = async (item: UndoCheckpointItem) => {
+    if (isReadonly) return;
+    const entryId = item.entry_id;
+    const nextOpen = !expandedCkptIds[entryId];
+    setExpandedCkptIds((prev) => ({ ...prev, [entryId]: nextOpen }));
+    if (!nextOpen || ckptDiffMap[entryId]) return;
+
+    const reqSeq = ++ckptDiffSeqRef.current;
+    const reqProj = projectId;
+    const reqWt = worktreeId;
+    ckptDiffReqByIdRef.current[entryId] = reqSeq;
+    setCkptDiffLoading((prev) => ({ ...prev, [entryId]: true }));
+    setErrorMsg(null);
+    try {
+      const res = await fetchCheckpointDiff(entryId, {
+        bot: selectedBot || undoData?.bot || undefined,
+        cid: item.cid || activeCid || undefined,
+        project_id: item.project_id || reqProj || undefined,
+      });
+      if (
+        !mountedRef.current ||
+        ckptDiffReqByIdRef.current[entryId] !== reqSeq ||
+        projectIdRef.current !== reqProj ||
+        worktreeIdRef.current !== reqWt
+      ) {
+        return;
+      }
+      setCkptDiffMap((prev) => ({ ...prev, [entryId]: res }));
+    } catch (err) {
+      if (
+        !mountedRef.current ||
+        ckptDiffReqByIdRef.current[entryId] !== reqSeq ||
+        projectIdRef.current !== reqProj ||
+        worktreeIdRef.current !== reqWt
+      ) {
+        return;
+      }
+      if (!handleAuthErr(err)) {
+        setErrorMsg(err instanceof Error ? err.message : "加载检查点 Diff 失败");
+      }
+    } finally {
+      if (
+        mountedRef.current &&
+        ckptDiffReqByIdRef.current[entryId] === reqSeq &&
+        projectIdRef.current === reqProj &&
+        worktreeIdRef.current === reqWt
+      ) {
+        setCkptDiffLoading((prev) => ({ ...prev, [entryId]: false }));
+      }
+    }
+  };
+
+  const handleCleanupWorktree = async (targetWtId: string, force = false) => {
+    const reqProj = projectIdRef.current;
+    const reqWt = worktreeIdRef.current;
+    if (isReadonly || !reqProj || !targetWtId) return;
+    setCleanupBusy(true);
+    setErrorMsg(null);
+    setNoticeMsg(null);
+    setCleanupConfirm(null);
+    try {
+      const res = await cleanupWorktree(targetWtId, {
+        project_id: reqProj,
+        force,
+      });
+      if (
+        !mountedRef.current ||
+        projectIdRef.current !== reqProj ||
+        worktreeIdRef.current !== reqWt
+      ) {
+        return;
+      }
+      setNoticeMsg(`已清理 Worktree ${res.worktree_id}（分支 ${res.branch}）`);
+      if (worktreeIdRef.current === targetWtId) {
+        setWorktreeId("");
+        onWorktreeChange?.(null);
+      }
+      await loadWorktrees();
+    } catch (err) {
+      if (!mountedRef.current) return;
+      if (handleAuthErr(err)) return;
+      if (projectIdRef.current !== reqProj || worktreeIdRef.current !== reqWt) return;
+      if (
+        err instanceof StudioApiError &&
+        err.status === 409 &&
+        (err.code === "worktree_dirty" || err.code === "worktree_unmerged") &&
+        !force
+      ) {
+        setCleanupConfirm({
+          worktreeId: targetWtId,
+          message: err.message,
+          dirtyCount:
+            typeof err.data?.dirty_count === "number" ? err.data.dirty_count : undefined,
+          commitsAhead:
+            typeof err.data?.commits_ahead === "number" ? err.data.commits_ahead : undefined,
+        });
+      } else {
+        setErrorMsg(err instanceof Error ? err.message : "清理 Worktree 失败");
+      }
+    } finally {
+      if (mountedRef.current) {
+        setCleanupBusy(false);
+      }
+    }
+  };
+
+  const handleGitCommitSubmit = async () => {
+    const reqProj = projectIdRef.current;
+    const reqWt = worktreeIdRef.current;
+    if (isReadonly || !reqProj || !commitMessage.trim()) return;
+    const chosenPaths = Object.entries(selectedCommitPaths)
+      .filter(([, checked]) => checked)
+      .map(([p]) => p);
+    if (stageMode === "paths" && chosenPaths.length === 0) {
+      setErrorMsg("请选择至少一个要提交的文件路径");
+      return;
+    }
+    setCommitBusy(true);
+    setErrorMsg(null);
+    setNoticeMsg(null);
+    try {
+      const res = await gitCommit({
+        project_id: reqProj,
+        worktree_id: reqWt || undefined,
+        message: commitMessage.trim(),
+        stage_mode: stageMode,
+        paths: stageMode === "paths" ? chosenPaths : undefined,
+      });
+      if (
+        !mountedRef.current ||
+        projectIdRef.current !== reqProj ||
+        worktreeIdRef.current !== reqWt
+      ) {
+        return;
+      }
+      setCommitMessage("");
+      setSelectedCommitPaths({});
+      setNoticeMsg(
+        `已提交 ${res.commit_sha}（${res.files_committed.length} 个文件 · 分支 ${res.branch || "HEAD"}）`,
+      );
+      await loadGitStatus();
+      void loadWorktrees();
+    } catch (err) {
+      if (!mountedRef.current) return;
+      if (handleAuthErr(err)) return;
+      if (projectIdRef.current !== reqProj || worktreeIdRef.current !== reqWt) return;
+      setErrorMsg(err instanceof Error ? err.message : "Git 提交失败");
+    } finally {
+      if (mountedRef.current) {
+        setCommitBusy(false);
+      }
+    }
+  };
+
+  const handleGitPushSubmit = async (confirmProtected = false) => {
+    const reqProj = projectIdRef.current;
+    const reqWt = worktreeIdRef.current;
+    if (isReadonly || !reqProj) return;
+    setPushBusy(true);
+    setErrorMsg(null);
+    setNoticeMsg(null);
+    setProtectedPushConfirm(null);
+    try {
+      const res = await gitPush({
+        project_id: reqProj,
+        worktree_id: reqWt || undefined,
+        confirm_protected: confirmProtected,
+      });
+      if (
+        !mountedRef.current ||
+        projectIdRef.current !== reqProj ||
+        worktreeIdRef.current !== reqWt
+      ) {
+        return;
+      }
+      setNoticeMsg(`已推送分支 ${res.branch} 到 ${res.remote}`);
+      await loadGitStatus();
+      void loadWorktrees();
+    } catch (err) {
+      if (!mountedRef.current) return;
+      if (handleAuthErr(err)) return;
+      if (projectIdRef.current !== reqProj || worktreeIdRef.current !== reqWt) return;
+      if (
+        err instanceof StudioApiError &&
+        err.status === 409 &&
+        err.code === "protected_branch" &&
+        !confirmProtected
+      ) {
+        setProtectedPushConfirm({
+          branch: String(err.data?.branch || gitStatus?.branch || "main"),
+          message: err.message,
+        });
+      } else {
+        setErrorMsg(err instanceof Error ? err.message : "Git 推送失败");
+      }
+    } finally {
+      if (mountedRef.current) {
+        setPushBusy(false);
+      }
+    }
+  };
+
+  const handleGitPrSubmit = async () => {
+    const reqProj = projectIdRef.current;
+    const reqWt = worktreeIdRef.current;
+    if (isReadonly || !reqProj || !prTitle.trim()) return;
+    setPrBusy(true);
+    setErrorMsg(null);
+    setNoticeMsg(null);
+    setCreatedPrUrl(null);
+    try {
+      const res = await gitCreatePr({
+        project_id: reqProj,
+        worktree_id: reqWt || undefined,
+        title: prTitle.trim(),
+        body: prBody,
+        base: prBase.trim() || undefined,
+        draft: prDraft,
+      });
+      if (
+        !mountedRef.current ||
+        projectIdRef.current !== reqProj ||
+        worktreeIdRef.current !== reqWt
+      ) {
+        return;
+      }
+      if (isSafeHttpsUrl(res.pr_url)) {
+        setCreatedPrUrl(res.pr_url);
+      }
+      setPrTitle("");
+      setPrBody("");
+      setNoticeMsg(`已创建 PR（${res.head} → ${res.base}）`);
+    } catch (err) {
+      if (!mountedRef.current) return;
+      if (handleAuthErr(err)) return;
+      if (projectIdRef.current !== reqProj || worktreeIdRef.current !== reqWt) return;
+      setErrorMsg(err instanceof Error ? err.message : "创建 PR 失败");
+    } finally {
+      if (mountedRef.current) {
+        setPrBusy(false);
       }
     }
   };
@@ -605,10 +1078,20 @@ export function FilesDiffPanel({
       );
     });
 
-  const diffLines = useMemo(() => {
-    if (!diffData?.diff) return [];
-    return diffData.diff.split("\n");
-  }, [diffData]);
+  const activeWorktreeObj = useMemo(
+    () => worktrees.find((w) => w.worktree_id === worktreeId) || null,
+    [worktrees, worktreeId],
+  );
+
+  const allGitChangedPaths = useMemo(() => {
+    if (!gitStatus) return [];
+    const merged = new Set<string>([
+      ...(gitStatus.staged || []),
+      ...(gitStatus.unstaged || []),
+      ...(gitStatus.untracked || []),
+    ]);
+    return Array.from(merged);
+  }, [gitStatus]);
 
   return (
     <div className="flex-1 min-h-0 flex flex-col bg-slate-950 text-slate-100">
@@ -617,21 +1100,27 @@ export function FilesDiffPanel({
         <div className="flex items-center justify-between gap-2">
           <div className="flex items-center gap-1.5 min-w-0">
             <FileCode className="w-4 h-4 text-sky-400 shrink-0" />
-            <span className="text-xs font-semibold truncate">工作区文件 & Diff</span>
+            <span className="text-xs font-semibold truncate">编码工作台 · Files / Diff / Git</span>
           </div>
           <div className="flex items-center gap-1">
             <button
               type="button"
               onClick={() => {
+                void loadWorktrees();
                 if (tab === "files") void loadTree();
                 else if (tab === "diff") void loadDiff();
-                else void loadUndo();
+                else if (tab === "undo") void loadUndo();
+                else void loadGitStatus();
               }}
               title="刷新"
               className="h-6 w-6 rounded border border-slate-800 bg-slate-950 hover:bg-slate-800 inline-flex items-center justify-center text-slate-300 cursor-pointer"
             >
               <RefreshCw
-                className={`w-3 h-3 ${treeLoading || diffLoading || undoLoading ? "animate-spin" : ""}`}
+                className={`w-3 h-3 ${
+                  treeLoading || diffLoading || undoLoading || gitStatusLoading || worktreesLoading
+                    ? "animate-spin"
+                    : ""
+                }`}
               />
             </button>
             {onClose && (
@@ -647,16 +1136,18 @@ export function FilesDiffPanel({
           </div>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
           <select
             value={projectId}
             onChange={(e) => {
               const next = e.target.value;
               setProjectId(next);
+              setWorktreeId("");
+              onWorktreeChange?.(null);
               onProjectChange?.(next);
             }}
             aria-label="工作区项目"
-            className="flex-1 h-7 rounded-md bg-slate-950 border border-slate-800 px-2 text-xs text-slate-200 focus:outline-none focus:border-sky-500"
+            className="flex-1 min-w-[120px] h-7 rounded-md bg-slate-950 border border-slate-800 px-2 text-xs text-slate-200 focus:outline-none focus:border-sky-500"
           >
             {projects.length === 0 && <option value="">暂无白名单项目</option>}
             {projects.map((p) => (
@@ -700,11 +1191,96 @@ export function FilesDiffPanel({
               }`}
             >
               <RotateCcw className="w-3 h-3" />
-              Undo
+              Checkpoints
+            </button>
+            <button
+              type="button"
+              onClick={() => setTab("git")}
+              className={`px-2 py-0.5 rounded cursor-pointer inline-flex items-center gap-1 ${
+                tab === "git"
+                  ? "bg-sky-600/30 text-sky-200 font-medium"
+                  : "text-slate-400 hover:text-slate-200"
+              }`}
+            >
+              <GitCommitHorizontal className="w-3 h-3" />
+              Git
             </button>
           </div>
         </div>
+
+        {/* Worktree Selector & Safe Cleanup Bar */}
+        {(worktrees.length > 0 || worktreeId) && (
+          <div className="flex items-center gap-1.5 pt-0.5">
+            <GitBranch className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+            <select
+              value={worktreeId}
+              onChange={(e) => {
+                const nextWt = e.target.value;
+                setWorktreeId(nextWt);
+                onWorktreeChange?.(nextWt || null);
+              }}
+              aria-label="隔离 Worktree"
+              className="flex-1 h-6 rounded bg-slate-950 border border-slate-800 px-1.5 text-[11px] font-mono text-emerald-200 focus:outline-none focus:border-emerald-500"
+            >
+              <option value="">主工作区 (main checkout)</option>
+              {worktrees.map((w) => (
+                <option key={w.worktree_id} value={w.worktree_id}>
+                  {w.worktree_id} ({w.branch}) · Δ{w.dirty_count} ↑{w.commits_ahead}
+                  {w.busy ? " [执行中]" : ""}
+                </option>
+              ))}
+            </select>
+            {worktreeId && !isReadonly && (
+              <button
+                type="button"
+                disabled={cleanupBusy || Boolean(activeWorktreeObj?.busy)}
+                onClick={() => void handleCleanupWorktree(worktreeId, false)}
+                title={
+                  activeWorktreeObj?.busy
+                    ? "会话正在执行中，暂不可清理"
+                    : "安全清理当前 Worktree"
+                }
+                className="h-6 px-2 rounded border border-rose-500/40 bg-rose-500/10 hover:bg-rose-500/20 disabled:opacity-40 text-rose-200 text-[11px] inline-flex items-center gap-1 shrink-0 cursor-pointer"
+              >
+                {cleanupBusy ? (
+                  <Loader2 className="w-3 h-3 animate-spin" />
+                ) : (
+                  <Trash2 className="w-3 h-3" />
+                )}
+                <span>清理</span>
+              </button>
+            )}
+          </div>
+        )}
       </div>
+
+      {/* Worktree Dirty/Unmerged 409 Force Confirm */}
+      {cleanupConfirm && !isReadonly && (
+        <div className="shrink-0 px-3 py-2 border-b border-amber-500/40 bg-amber-500/10 text-xs space-y-1.5">
+          <div className="font-semibold text-amber-200 flex items-center gap-1.5">
+            <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+            Worktree 存在未提交或未合并改动
+          </div>
+          <div className="text-[11px] text-amber-100/90">{cleanupConfirm.message}</div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              disabled={cleanupBusy}
+              onClick={() => void handleCleanupWorktree(cleanupConfirm.worktreeId, true)}
+              className="px-2 py-1 rounded bg-rose-600 hover:bg-rose-500 text-white text-[11px] font-medium cursor-pointer"
+            >
+              确认强制清理 (Force)
+            </button>
+            <button
+              type="button"
+              onClick={() => setCleanupConfirm(null)}
+              className="px-2 py-1 rounded border border-slate-700 bg-slate-900 text-slate-300 text-[11px] cursor-pointer"
+            >
+              取消
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Banners */}
       {errorMsg && (
@@ -913,30 +1489,16 @@ export function FilesDiffPanel({
               <div className="flex-1 min-h-0 overflow-auto p-2 font-mono text-[11px] leading-5">
                 {diffLoading ? (
                   <div className="py-8 text-center text-xs text-slate-400">计算 Diff 中…</div>
-                ) : diffLines.length === 0 ? (
+                ) : !diffData?.diff ? (
                   <div className="py-8 text-center text-xs text-slate-500">工作区干净，无 Diff 变更</div>
                 ) : (
                   <>
-                    {diffData?.truncated && (
+                    {diffData.truncated && (
                       <div className="mb-2 px-2 py-1 rounded bg-amber-500/15 text-amber-200 text-[11px]">
                         Diff 内容超过 256 KiB 上限，已安全截断
                       </div>
                     )}
-                    {diffLines.map((line, i) => {
-                      let cls = "text-slate-300";
-                      if (line.startsWith("+") && !line.startsWith("+++")) {
-                        cls = "bg-emerald-500/15 text-emerald-300";
-                      } else if (line.startsWith("-") && !line.startsWith("---")) {
-                        cls = "bg-rose-500/15 text-rose-300";
-                      } else if (line.startsWith("@@") || line.startsWith("diff --git")) {
-                        cls = "bg-sky-500/10 text-sky-300 font-semibold";
-                      }
-                      return (
-                        <div key={i} className={`whitespace-pre px-1 ${cls}`}>
-                          {line || " "}
-                        </div>
-                      );
-                    })}
+                    {renderUnifiedDiffLines(diffData.diff)}
                   </>
                 )}
               </div>
@@ -945,13 +1507,13 @@ export function FilesDiffPanel({
         </div>
       )}
 
-      {/* TAB 3: Undo / Redo Checkpoints */}
+      {/* TAB 3: Checkpoints (Turn-by-Turn Diff Viewer + Undo/Redo) */}
       {tab === "undo" && (
         <div className="flex-1 min-h-0 overflow-y-auto p-3 space-y-3">
           {isReadonly ? (
             <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-200 flex items-center gap-2">
               <Lock className="w-4 h-4 shrink-0" />
-              <span>只读权限（readonly）不可查看或执行工作区 Undo/Redo 回滚。</span>
+              <span>只读权限（readonly）不可查看检查点 Diff 或执行工作区 Undo/Redo 回滚。</span>
             </div>
           ) : (
             <>
@@ -1008,44 +1570,143 @@ export function FilesDiffPanel({
                 {(undoData?.undo_stack || []).length === 0 ? (
                   <div className="text-xs text-slate-500 py-2">暂无可撤销的检查点</div>
                 ) : (
-                  (undoData?.undo_stack || []).map((item) => (
-                    <div
-                      key={item.entry_id}
-                      className="rounded-lg border border-slate-800 bg-slate-900/70 p-2.5 space-y-1.5"
-                    >
-                      <div className="flex items-start justify-between gap-2">
-                        <div className="min-w-0">
-                          <div className="text-xs text-slate-100 truncate">
-                            {item.prompt || item.entry_id}
+                  (undoData?.undo_stack || []).map((item) => {
+                    const isExpanded = Boolean(expandedCkptIds[item.entry_id]);
+                    const isLoadingDiff = Boolean(ckptDiffLoading[item.entry_id]);
+                    const ckptDiff = ckptDiffMap[item.entry_id];
+                    return (
+                      <div
+                        key={item.entry_id}
+                        className="rounded-lg border border-slate-800 bg-slate-900/70 p-2.5 space-y-2"
+                      >
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="min-w-0">
+                            <div className="text-xs text-slate-100 truncate">
+                              {item.prompt || item.entry_id}
+                            </div>
+                            <div className="text-[10px] font-mono text-slate-500 flex items-center gap-1.5 flex-wrap">
+                              <span>{item.entry_id}</span>
+                              <span>· {formatTs(item.ts)}</span>
+                              <span>· {item.changes_count} 个文件</span>
+                              {item.worktree_id && (
+                                <span className="px-1 py-0.2 rounded bg-emerald-500/15 text-emerald-300">
+                                  wt:{item.worktree_id}
+                                </span>
+                              )}
+                            </div>
                           </div>
-                          <div className="text-[10px] font-mono text-slate-500">
-                            {item.entry_id} · {formatTs(item.ts)} · {item.changes_count} 个文件
-                          </div>
-                        </div>
-                        <button
-                          type="button"
-                          disabled={!item.is_top || undoBusyId !== null}
-                          onClick={() => void executeUndoAction("undo", item, false)}
-                          className="inline-flex items-center gap-1 px-2 py-1 rounded bg-sky-600 hover:bg-sky-500 disabled:opacity-40 text-white text-[11px] shrink-0 cursor-pointer"
-                        >
-                          <RotateCcw className="w-3 h-3" />
-                          {item.is_top ? "撤销" : "非栈顶"}
-                        </button>
-                      </div>
-                      {item.changes.length > 0 && (
-                        <div className="flex flex-wrap gap-1">
-                          {item.changes.slice(0, 6).map((ch, idx) => (
-                            <span
-                              key={idx}
-                              className="px-1.5 py-0.5 rounded bg-slate-950 border border-slate-800 text-[10px] font-mono text-slate-300"
+                          <div className="flex items-center gap-1 shrink-0">
+                            <button
+                              type="button"
+                              onClick={() => void handleToggleCheckpointDiff(item)}
+                              className="inline-flex items-center gap-1 px-2 py-1 rounded border border-slate-700 bg-slate-950 hover:bg-slate-800 text-slate-200 text-[11px] cursor-pointer"
                             >
-                              {ch.action}: {ch.path}
-                            </span>
-                          ))}
+                              {isExpanded ? (
+                                <ChevronDown className="w-3 h-3" />
+                              ) : (
+                                <ChevronRight className="w-3 h-3" />
+                              )}
+                              <span>Diff</span>
+                            </button>
+                            <button
+                              type="button"
+                              disabled={!item.is_top || undoBusyId !== null}
+                              onClick={() => void executeUndoAction("undo", item, false)}
+                              className="inline-flex items-center gap-1 px-2 py-1 rounded bg-sky-600 hover:bg-sky-500 disabled:opacity-40 text-white text-[11px] cursor-pointer"
+                            >
+                              <RotateCcw className="w-3 h-3" />
+                              {item.is_top ? "撤销" : "非栈顶"}
+                            </button>
+                          </div>
                         </div>
-                      )}
-                    </div>
-                  ))
+
+                        {item.changes.length > 0 && (
+                          <div className="flex flex-wrap gap-1">
+                            {item.changes.slice(0, 6).map((ch, idx) => (
+                              <span
+                                key={idx}
+                                className="px-1.5 py-0.5 rounded bg-slate-950 border border-slate-800 text-[10px] font-mono text-slate-300"
+                              >
+                                {ch.action}: {ch.path}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+
+                        {isExpanded && (
+                          <div className="pt-2 border-t border-slate-800/80 space-y-2">
+                            {isLoadingDiff ? (
+                              <div className="py-3 text-center text-[11px] text-slate-400 inline-flex items-center gap-1.5">
+                                <Loader2 className="w-3.5 h-3.5 animate-spin text-sky-400" />
+                                计算本轮快照 Diff 中…
+                              </div>
+                            ) : ckptDiff ? (
+                              <>
+                                <div className="flex items-center justify-between gap-2 text-[11px] font-mono">
+                                  <span className="text-slate-400">
+                                    共 {ckptDiff.files.length} 个文件
+                                  </span>
+                                  <span className="inline-flex items-center gap-2">
+                                    <span className="text-emerald-400">+{ckptDiff.added}</span>
+                                    <span className="text-rose-400">-{ckptDiff.deleted}</span>
+                                    {ckptDiff.truncated && (
+                                      <span className="px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 text-[10px]">
+                                        已截断 (256 KiB)
+                                      </span>
+                                    )}
+                                  </span>
+                                </div>
+                                <div className="space-y-2">
+                                  {ckptDiff.files.map((f) => (
+                                    <div
+                                      key={f.path}
+                                      className="rounded border border-slate-800 bg-slate-950 overflow-hidden"
+                                    >
+                                      <div className="px-2 py-1 bg-slate-900/90 border-b border-slate-800 flex items-center justify-between gap-2 text-[10px] font-mono">
+                                        <span className="truncate text-slate-200">
+                                          [{f.action}] {f.path}
+                                        </span>
+                                        <span className="inline-flex items-center gap-1.5 shrink-0">
+                                          {f.is_binary ? (
+                                            <span className="px-1 py-0.5 rounded bg-slate-800 text-amber-300">
+                                              binary
+                                            </span>
+                                          ) : (
+                                            <>
+                                              <span className="text-emerald-400">+{f.added}</span>
+                                              <span className="text-rose-400">-{f.deleted}</span>
+                                            </>
+                                          )}
+                                          {f.truncated && (
+                                            <span className="text-amber-300">truncated</span>
+                                          )}
+                                        </span>
+                                      </div>
+                                      {f.is_binary ? (
+                                        <div className="px-2 py-2 text-[11px] text-slate-500">
+                                          二进制文件变更，已隐藏原始字节。
+                                        </div>
+                                      ) : f.diff ? (
+                                        <div className="max-h-56 overflow-auto p-1.5 font-mono text-[10px] leading-4">
+                                          {renderUnifiedDiffLines(f.diff)}
+                                        </div>
+                                      ) : (
+                                        <div className="px-2 py-1.5 text-[11px] text-slate-500">
+                                          无文本差异内容
+                                        </div>
+                                      )}
+                                    </div>
+                                  ))}
+                                </div>
+                              </>
+                            ) : (
+                              <div className="text-[11px] text-slate-500">暂无 Diff 数据</div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })
                 )}
               </div>
 
@@ -1084,6 +1745,271 @@ export function FilesDiffPanel({
               </div>
             </>
           )}
+        </div>
+      )}
+
+      {/* TAB 4: Safe Git Workflow (Status / Commit / Push / Open PR) */}
+      {tab === "git" && (
+        <div className="flex-1 min-h-0 overflow-y-auto p-3 space-y-3">
+          {gitStatusLoading && !gitStatus ? (
+            <div className="py-8 text-center text-xs text-slate-400 inline-flex items-center gap-2 justify-center w-full">
+              <Loader2 className="w-4 h-4 animate-spin text-sky-400" />
+              加载 Git 状态中…
+            </div>
+          ) : gitStatus && !gitStatus.is_git ? (
+            <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4 text-xs text-slate-400 text-center">
+              当前目标目录不是 Git 仓库
+            </div>
+          ) : gitStatus ? (
+            <>
+              {/* Branch & Status Summary */}
+              <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-3 space-y-2">
+                <div className="flex items-center justify-between gap-2 flex-wrap">
+                  <div className="flex items-center gap-1.5 min-w-0">
+                    <GitBranch className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+                    <span className="font-mono text-xs text-slate-100 truncate">
+                      {gitStatus.detached ? `detached@${gitStatus.branch}` : gitStatus.branch || "HEAD"}
+                    </span>
+                    {gitStatus.is_protected_branch && (
+                      <span className="px-1.5 py-0.5 rounded bg-amber-500/15 border border-amber-500/35 text-amber-300 text-[10px]">
+                        受保护分支
+                      </span>
+                    )}
+                    {gitStatus.worktree_id && (
+                      <span className="px-1.5 py-0.5 rounded bg-emerald-500/15 border border-emerald-500/35 text-emerald-300 text-[10px] font-mono">
+                        wt:{gitStatus.worktree_id}
+                      </span>
+                    )}
+                  </div>
+                  <div className="text-[11px] font-mono text-slate-400 flex items-center gap-2">
+                    {gitStatus.upstream && <span>{gitStatus.upstream}</span>}
+                    <span>↑{gitStatus.ahead}</span>
+                    <span>↓{gitStatus.behind}</span>
+                  </div>
+                </div>
+                <div className="flex flex-wrap gap-2 text-[11px] font-mono text-slate-400">
+                  <span className="text-emerald-300">已暂存 {gitStatus.staged.length}</span>
+                  <span className="text-amber-300">已修改 {gitStatus.unstaged.length}</span>
+                  <span className="text-sky-300">未跟踪 {gitStatus.untracked.length}</span>
+                  <span>{gitStatus.has_remote ? "origin 已配置" : "无 origin 远端"}</span>
+                </div>
+              </div>
+
+              {isReadonly ? (
+                <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-200 flex items-center gap-2">
+                  <Lock className="w-4 h-4 shrink-0" />
+                  <span>只读权限（readonly）不可执行 Commit / Push / Open PR 写操作。</span>
+                </div>
+              ) : (
+                <>
+                  {/* Commit Form */}
+                  <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-3 space-y-2.5">
+                    <div className="text-xs font-semibold text-slate-200 flex items-center gap-1.5">
+                      <GitCommitHorizontal className="w-3.5 h-3.5 text-sky-400" />
+                      一键安全提交 (Commit)
+                    </div>
+                    <div className="inline-flex rounded-md border border-slate-800 bg-slate-950 p-0.5 text-[11px]">
+                      {(
+                        [
+                          { id: "all", label: "全部变更 (all)" },
+                          { id: "staged", label: "仅已暂存 (staged)" },
+                          { id: "paths", label: "指定文件 (paths)" },
+                        ] as const
+                      ).map((opt) => (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          onClick={() => setStageMode(opt.id)}
+                          className={`px-2 py-0.5 rounded cursor-pointer ${
+                            stageMode === opt.id
+                              ? "bg-sky-600/30 text-sky-200 font-medium"
+                              : "text-slate-400 hover:text-slate-200"
+                          }`}
+                        >
+                          {opt.label}
+                        </button>
+                      ))}
+                    </div>
+
+                    {stageMode === "paths" && (
+                      <div className="max-h-28 overflow-y-auto rounded border border-slate-800 bg-slate-950 p-1.5 space-y-1">
+                        {allGitChangedPaths.length === 0 ? (
+                          <div className="text-[11px] text-slate-500 px-1">无可选变更文件</div>
+                        ) : (
+                          allGitChangedPaths.map((fp) => (
+                            <label
+                              key={fp}
+                              className="flex items-center gap-2 px-1 py-0.5 rounded hover:bg-slate-800/60 text-[11px] font-mono text-slate-300 cursor-pointer"
+                            >
+                              <input
+                                type="checkbox"
+                                checked={Boolean(selectedCommitPaths[fp])}
+                                onChange={(e) =>
+                                  setSelectedCommitPaths((prev) => ({
+                                    ...prev,
+                                    [fp]: e.target.checked,
+                                  }))
+                                }
+                                className="rounded border-slate-700 bg-slate-900"
+                              />
+                              <span className="truncate">{fp}</span>
+                            </label>
+                          ))
+                        )}
+                      </div>
+                    )}
+
+                    <textarea
+                      rows={2}
+                      value={commitMessage}
+                      onChange={(e) => setCommitMessage(e.target.value)}
+                      placeholder="输入提交信息（将自动拦截敏感文件、软链与密钥）…"
+                      className="w-full rounded-lg border border-slate-800 bg-slate-950 px-2.5 py-1.5 text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-sky-500 resize-none"
+                    />
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        disabled={commitBusy || !commitMessage.trim()}
+                        onClick={() => void handleGitCommitSubmit()}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 disabled:opacity-40 text-white text-xs font-medium cursor-pointer"
+                      >
+                        {commitBusy ? (
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        ) : (
+                          <Check className="w-3.5 h-3.5" />
+                        )}
+                        <span>提交 (Commit)</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        disabled={pushBusy || gitStatus.detached || !gitStatus.has_remote}
+                        onClick={() => void handleGitPushSubmit(false)}
+                        title={
+                          gitStatus.detached
+                            ? "Detached HEAD 禁止推送"
+                            : !gitStatus.has_remote
+                              ? "未配置 origin 远端"
+                              : "安全推送到 origin（禁止 force push）"
+                        }
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-emerald-500/40 bg-emerald-500/15 hover:bg-emerald-500/25 disabled:opacity-40 text-emerald-200 text-xs font-medium cursor-pointer"
+                      >
+                        {pushBusy ? (
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        ) : (
+                          <Upload className="w-3.5 h-3.5" />
+                        )}
+                        <span>推送 (Push)</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Protected Branch 409 Confirmation Modal */}
+                  {protectedPushConfirm && (
+                    <div className="rounded-xl border border-amber-500/45 bg-amber-500/10 p-3 space-y-2 text-xs">
+                      <div className="font-semibold text-amber-200 flex items-center gap-1.5">
+                        <AlertTriangle className="w-4 h-4 shrink-0" />
+                        受保护分支推送二次确认 ({protectedPushConfirm.branch})
+                      </div>
+                      <p className="text-[11px] text-amber-100/90">
+                        {protectedPushConfirm.message}
+                      </p>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          disabled={pushBusy}
+                          onClick={() => void handleGitPushSubmit(true)}
+                          className="px-2.5 py-1 rounded bg-amber-500 hover:bg-amber-400 text-slate-950 text-[11px] font-semibold cursor-pointer"
+                        >
+                          确认推送至 {protectedPushConfirm.branch}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setProtectedPushConfirm(null)}
+                          className="px-2.5 py-1 rounded border border-slate-700 bg-slate-900 text-slate-300 text-[11px] cursor-pointer"
+                        >
+                          取消
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Open PR Form */}
+                  <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-3 space-y-2">
+                    <div className="text-xs font-semibold text-slate-200 flex items-center gap-1.5">
+                      <GitPullRequest className="w-3.5 h-3.5 text-violet-400" />
+                      发起 Pull Request (Open PR)
+                    </div>
+                    <input
+                      type="text"
+                      value={prTitle}
+                      onChange={(e) => setPrTitle(e.target.value)}
+                      placeholder="PR 标题（必填）"
+                      className="w-full h-8 rounded-lg border border-slate-800 bg-slate-950 px-2.5 text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-violet-500"
+                    />
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="text"
+                        value={prBase}
+                        onChange={(e) => setPrBase(e.target.value)}
+                        placeholder="目标基线分支（默认 main）"
+                        className="flex-1 h-7 rounded-lg border border-slate-800 bg-slate-950 px-2.5 text-xs font-mono text-slate-200 placeholder:text-slate-500 focus:outline-none focus:border-violet-500"
+                      />
+                      <label className="inline-flex items-center gap-1.5 text-[11px] text-slate-300 cursor-pointer shrink-0">
+                        <input
+                          type="checkbox"
+                          checked={prDraft}
+                          onChange={(e) => setPrDraft(e.target.checked)}
+                          className="rounded border-slate-700 bg-slate-900"
+                        />
+                        <span>Draft</span>
+                      </label>
+                    </div>
+                    <textarea
+                      rows={3}
+                      value={prBody}
+                      onChange={(e) => setPrBody(e.target.value)}
+                      placeholder="PR 说明（可选，通过 stdin --body-file - 安全传入）"
+                      className="w-full rounded-lg border border-slate-800 bg-slate-950 px-2.5 py-1.5 text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-violet-500 resize-none"
+                    />
+                    <div className="flex items-center justify-between gap-2 flex-wrap">
+                      <button
+                        type="button"
+                        disabled={
+                          prBusy ||
+                          !prTitle.trim() ||
+                          gitStatus.detached ||
+                          !gitStatus.has_remote ||
+                          !gitStatus.gh_available
+                        }
+                        onClick={() => void handleGitPrSubmit()}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-violet-600 hover:bg-violet-500 disabled:opacity-40 text-white text-xs font-medium cursor-pointer"
+                      >
+                        {prBusy ? (
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        ) : (
+                          <GitPullRequest className="w-3.5 h-3.5" />
+                        )}
+                        <span>创建 PR</span>
+                      </button>
+
+                      {isSafeHttpsUrl(createdPrUrl) && (
+                        <a
+                          href={createdPrUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center gap-1 text-xs text-sky-300 hover:text-sky-200 underline"
+                        >
+                          <span>查看已创建的 PR</span>
+                          <ExternalLink className="w-3 h-3" />
+                        </a>
+                      )}
+                    </div>
+                  </div>
+                </>
+              )}
+            </>
+          ) : null}
         </div>
       )}
     </div>

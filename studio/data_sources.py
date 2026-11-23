@@ -1939,6 +1939,27 @@ class StudioDataSources:
                             "bot": _sanitize_slug(entry.get("bot") or "", max_len=64),
                         }
 
+        wt_by_cid: dict[str, dict[str, Any]] = {}
+        try:
+            reg_wts = bot_bus.load_studio_worktrees(str(self.bus_dir))
+            for wt_id, wt_meta in reg_wts.items():
+                if not isinstance(wt_meta, dict) or not wt_meta.get("active"):
+                    continue
+                wt_cid = str(wt_meta.get("cid") or "").strip()
+                if not wt_cid:
+                    continue
+                pid_wt = str(wt_meta.get("project_id") or "").strip()
+                # Verify worktree directory still exists (non-symlink) if project is whitelisted
+                if pid_wt:
+                    proj_wt = self.resolve_allowed_project(pid_wt)
+                    if proj_wt and proj_wt.get("workdir"):
+                        ok_d, _p, _sc, _e = bot_bus.resolve_studio_worktree_dir(proj_wt["workdir"], wt_id)
+                        if not ok_d:
+                            continue
+                wt_by_cid[wt_cid] = bot_bus.sanitize_studio_worktree_meta(wt_meta)
+        except Exception:
+            pass
+
         items: list[dict[str, Any]] = []
         for row in raw_rows.values():
             clean_preview = redact_secrets_only(row.get("preview") or "", max_len=160).strip()
@@ -1951,7 +1972,7 @@ class StudioDataSources:
                 continue
             if q_low and (q_low not in clean_preview.lower() and q_low not in row["cid"].lower() and q_low not in row["project_id"].lower()):
                 continue
-            items.append({
+            sess_item: dict[str, Any] = {
                 "cid": row["cid"],
                 "title": title,
                 "preview": clean_preview,
@@ -1960,7 +1981,13 @@ class StudioDataSources:
                 "source": item_src,
                 "bot": item_bot,
                 "busy": studio_ipc.is_conversation_locked(self.bus_dir, row["cid"]),
-            })
+            }
+            bound_wt = wt_by_cid.get(row["cid"])
+            if bound_wt is not None:
+                sess_item["worktree"] = bound_wt
+                if not sess_item["project_id"] and bound_wt.get("project_id"):
+                    sess_item["project_id"] = str(bound_wt["project_id"])
+            items.append(sess_item)
 
         items.sort(key=lambda x: x["updated_at"], reverse=True)
         return {

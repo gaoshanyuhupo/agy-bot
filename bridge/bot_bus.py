@@ -18,7 +18,7 @@ import re
 import subprocess
 import time
 import uuid
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 HOME = os.path.expanduser("~")
 BUS_DIR = os.environ.get(
@@ -2497,6 +2497,466 @@ def cleanup_job_worktree(job_id: str, force: bool = False) -> Dict[str, Any]:
         "branch_deleted": branch_deleted,
         "worktree": wt_updated,
     }
+
+
+# ---------------------------------------------------------------------------
+# Studio Per-Session Isolated Git Worktree Helpers (Pillar 1)
+# ---------------------------------------------------------------------------
+
+STUDIO_WORKTREE_BRANCH_PREFIX = "agy-studio/"
+STUDIO_WORKTREE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$")
+_STUDIO_WORKTREES_FILENAME = "studio_worktrees.json"
+
+
+def is_valid_studio_worktree_id(raw: Any) -> bool:
+    """Strictly validate a Studio worktree slug (`^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$`)."""
+    if not isinstance(raw, str):
+        return False
+    if ".." in raw or "/" in raw or "\\" in raw or "\x00" in raw:
+        return False
+    return bool(STUDIO_WORKTREE_ID_RE.fullmatch(raw))
+
+
+def sanitize_studio_worktree_meta(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Return strictly allowlisted worktree metadata with ZERO host filesystem paths."""
+    if not isinstance(raw, dict):
+        return {"active": False}
+    out: Dict[str, Any] = {"active": bool(raw.get("active", False))}
+    wt_id = str(raw.get("worktree_id") or "").strip()
+    if wt_id and is_valid_studio_worktree_id(wt_id):
+        out["worktree_id"] = wt_id
+    branch = str(raw.get("branch") or "").strip()
+    if branch and not branch.startswith("/") and ".." not in branch:
+        out["branch"] = branch[:128]
+    project_id = str(raw.get("project_id") or "").strip()
+    if project_id and "/" not in project_id and "\\" not in project_id and ".." not in project_id:
+        out["project_id"] = project_id[:64]
+    cid = str(raw.get("cid") or "").strip()
+    if cid:
+        out["cid"] = cid[:64]
+    bot = str(raw.get("bot") or "").strip()
+    if bot:
+        out["bot"] = bot[:64]
+    reason = str(raw.get("reason") or "").strip()
+    if reason and not out["active"]:
+        out["reason"] = re.sub(r"[^a-zA-Z0-9_-]+", "_", reason)[:64]
+    if raw.get("created_at") is not None:
+        try:
+            out["created_at"] = int(raw["created_at"])
+        except (TypeError, ValueError):
+            pass
+    if raw.get("dirty_count") is not None:
+        try:
+            out["dirty_count"] = max(0, int(raw["dirty_count"]))
+        except (TypeError, ValueError):
+            pass
+    if raw.get("commits_ahead") is not None:
+        try:
+            out["commits_ahead"] = max(0, int(raw["commits_ahead"]))
+        except (TypeError, ValueError):
+            pass
+    if "busy" in raw:
+        out["busy"] = bool(raw.get("busy"))
+    return out
+
+
+def resolve_studio_worktree_dir(repo_root: str, wt_id: str) -> Tuple[bool, Optional[str], int, str]:
+    """Validate and resolve `<repo_root>/.worktrees/<wt_id>` rejecting symlinks and path escape.
+
+    Returns `(ok, resolved_path, http_status, error_message)`.
+    """
+    if not is_valid_studio_worktree_id(wt_id):
+        return False, None, 400, "非法的 worktree_id 格式"
+    if not repo_root or not os.path.isdir(repo_root):
+        return False, None, 404, "项目工作区目录不可访问"
+    repo_real = os.path.realpath(repo_root)
+    wt_root = os.path.join(repo_real, WORKTREE_DIR_NAME)
+    if os.path.islink(wt_root):
+        return False, None, 403, "禁止访问符号链接 worktree 目录"
+    if not os.path.exists(wt_root):
+        return False, None, 404, "未找到对应的 worktree"
+    if not os.path.isdir(wt_root):
+        return False, None, 404, "未找到对应的 worktree"
+    wt_root_real = os.path.realpath(wt_root)
+    if not wt_root_real.startswith(repo_real + os.sep):
+        return False, None, 403, "worktree 目录越界，已拒绝访问"
+
+    wt_dir = os.path.join(wt_root_real, wt_id)
+    if os.path.islink(wt_dir):
+        return False, None, 403, "禁止访问符号链接 worktree 目录"
+    if not os.path.exists(wt_dir):
+        return False, None, 404, "未找到对应的 worktree"
+    if not os.path.isdir(wt_dir):
+        return False, None, 404, "未找到对应的 worktree"
+    wt_real = os.path.realpath(wt_dir)
+    if not wt_real.startswith(wt_root_real + os.sep) or wt_real == wt_root_real:
+        return False, None, 403, "worktree 路径越界，已拒绝访问"
+    return True, wt_real, 200, ""
+
+
+def prepare_studio_worktree(
+    workdir: str,
+    wt_id: Optional[str] = None,
+    *,
+    project_id: str = "",
+) -> Dict[str, Any]:
+    """Create an isolated Studio session Git worktree `<repo>/.worktrees/<wt_id>` on `agy-studio/<wt_id>`.
+
+    Safely degrades (`active=False`, zero `.worktrees/` residue, zero host path leakage in sanitized output)
+    on non-Git directories or unborn/invalid HEAD. Writes `.worktrees/` ONLY to `<git-common-dir>/info/exclude`
+    and NEVER modifies `.gitignore`.
+    """
+    raw_wdir = os.path.realpath(os.path.expanduser(workdir)) if workdir else ""
+    if not raw_wdir or not os.path.isdir(raw_wdir):
+        return {"enabled": True, "active": False, "reason": "workdir_missing"}
+
+    ok_root, out_root, _err_root = _run_git(["rev-parse", "--show-toplevel"], cwd=raw_wdir)
+    if not ok_root or not out_root.strip():
+        return {"enabled": True, "active": False, "reason": "not_git_repo"}
+    repo_root = os.path.realpath(out_root.strip())
+
+    ok_head, out_head, _err_head = _run_git(["rev-parse", "--verify", "HEAD"], cwd=repo_root)
+    if not ok_head or not out_head.strip():
+        return {"enabled": True, "active": False, "reason": "unborn_or_invalid_head"}
+    base_commit = out_head.strip()
+
+    chosen_id = str(wt_id or "").strip() or f"wt-{uuid.uuid4().hex[:12]}"
+    if not is_valid_studio_worktree_id(chosen_id):
+        return {"enabled": True, "active": False, "reason": "invalid_worktree_id"}
+
+    branch = f"{STUDIO_WORKTREE_BRANCH_PREFIX}{chosen_id}"
+    wt_root = os.path.join(repo_root, WORKTREE_DIR_NAME)
+    if os.path.islink(wt_root):
+        return {"enabled": True, "active": False, "reason": "unsafe_worktree_root"}
+    wt_path = os.path.join(wt_root, chosen_id)
+    if os.path.islink(wt_path) or os.path.exists(wt_path):
+        return {"enabled": True, "active": False, "reason": "worktree_path_exists"}
+
+    if not _ensure_git_info_exclude(repo_root):
+        return {"enabled": True, "active": False, "reason": "git_exclude_failed"}
+
+    created_wt_root = False
+    try:
+        if not os.path.exists(wt_root):
+            os.makedirs(wt_root, exist_ok=True)
+            created_wt_root = True
+    except OSError:
+        return {"enabled": True, "active": False, "reason": "prepare_dir_failed"}
+
+    has_branch, _, _ = _run_git(["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"], cwd=repo_root)
+    if has_branch:
+        del_ok, _, _ = _run_git(["branch", "-d", branch], cwd=repo_root)
+        if not del_ok:
+            if created_wt_root:
+                try:
+                    os.rmdir(wt_root)
+                except OSError:
+                    pass
+            return {"enabled": True, "active": False, "reason": "branch_already_exists"}
+
+    ok_add, _, _err_add = _run_git(
+        ["worktree", "add", "-b", branch, wt_path, base_commit],
+        cwd=repo_root,
+        timeout=60.0,
+    )
+    if not ok_add:
+        if created_wt_root:
+            try:
+                os.rmdir(wt_root)
+            except OSError:
+                pass
+        return {"enabled": True, "active": False, "reason": "worktree_add_failed"}
+
+    return {
+        "enabled": True,
+        "active": True,
+        "worktree_id": chosen_id,
+        "project_id": project_id,
+        "path": os.path.realpath(wt_path),
+        "branch": branch,
+        "repo_root": repo_root,
+        "base_commit": base_commit,
+        "created_at": int(time.time()),
+    }
+
+
+def inspect_studio_worktree(
+    repo_root: str,
+    wt_id: str,
+    *,
+    base_commit: str = "",
+) -> Tuple[int, Dict[str, Any]]:
+    """Inspect a Studio worktree's branch, dirty file count, and commits ahead (zero host paths)."""
+    ok_res, wt_real, sc, err = resolve_studio_worktree_dir(repo_root, wt_id)
+    if not ok_res or not wt_real:
+        return sc, {"ok": False, "error": err}
+
+    ok_br, out_br, _ = _run_git(["symbolic-ref", "--quiet", "--short", "HEAD"], cwd=wt_real)
+    branch = out_br.strip() if ok_br and out_br.strip() else ""
+    if not branch:
+        ok_abr, out_abr, _ = _run_git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=wt_real)
+        branch = out_abr.strip() if ok_abr and out_abr.strip() else ""
+
+    ok_stat, out_stat, _ = _run_git(["status", "--porcelain=v1", "-uall"], cwd=wt_real)
+    dirty_count = len([ln for ln in out_stat.splitlines() if ln.strip()]) if ok_stat else 0
+
+    ref_base = base_commit.strip()
+    if not ref_base:
+        ok_mh, out_mh, _ = _run_git(["rev-parse", "--verify", "HEAD"], cwd=os.path.realpath(repo_root))
+        if ok_mh and out_mh.strip():
+            ref_base = out_mh.strip()
+
+    ok_rev = False
+    commits_ahead = 0
+    if ref_base:
+        ok_rev, out_rev, _ = _run_git(["rev-list", "--count", f"{ref_base}..HEAD"], cwd=wt_real)
+        if ok_rev:
+            try:
+                commits_ahead = max(0, int(out_rev.strip()))
+            except ValueError:
+                ok_rev = False
+
+    return 200, {
+        "ok": True,
+        "worktree_id": wt_id,
+        "branch": branch,
+        "dirty_count": dirty_count,
+        "commits_ahead": commits_ahead,
+        "ok_stat": ok_stat,
+        "ok_rev": ok_rev,
+    }
+
+
+def cleanup_studio_worktree(
+    repo_root: str,
+    wt_id: str,
+    *,
+    force: bool = False,
+    branch: str = "",
+    base_commit: str = "",
+) -> Tuple[int, Dict[str, Any]]:
+    """Safely remove a Studio worktree and its `agy-studio/<wt_id>` branch.
+
+    Refuses (`409`) dirty or unmerged worktrees unless `force=True`.
+    Never exposes host absolute paths in responses.
+    """
+    ok_res, wt_real, sc, err = resolve_studio_worktree_dir(repo_root, wt_id)
+    if not ok_res or not wt_real:
+        return sc, {"ok": False, "code": "invalid_worktree" if sc == 400 else ("unsafe_path" if sc == 403 else "not_found"), "error": err}
+
+    repo_real = os.path.realpath(repo_root)
+    sc_insp, insp = inspect_studio_worktree(repo_real, wt_id, base_commit=base_commit)
+    if sc_insp != 200:
+        return sc_insp, insp
+
+    actual_branch = str(insp.get("branch") or branch or f"{STUDIO_WORKTREE_BRANCH_PREFIX}{wt_id}").strip()
+    dirty_count = int(insp.get("dirty_count") or 0)
+    commits_ahead = int(insp.get("commits_ahead") or 0)
+
+    if not force:
+        if not insp.get("ok_stat"):
+            return 409, {
+                "ok": False,
+                "code": "worktree_inspection_failed",
+                "dirty_count": dirty_count,
+                "commits_ahead": commits_ahead,
+                "error": "无法检查 worktree 状态，请确认后使用 force=true 强制清理",
+            }
+        if dirty_count > 0:
+            return 409, {
+                "ok": False,
+                "code": "worktree_dirty",
+                "dirty_count": dirty_count,
+                "commits_ahead": commits_ahead,
+                "error": f"worktree 存在 {dirty_count} 个未提交变更，请先提交/丢弃或传 force=true 强制清理",
+            }
+        if not insp.get("ok_rev"):
+            return 409, {
+                "ok": False,
+                "code": "worktree_inspection_failed",
+                "dirty_count": dirty_count,
+                "commits_ahead": commits_ahead,
+                "error": "无法检查 worktree 提交历史，请确认后使用 force=true 强制清理",
+            }
+        if commits_ahead > 0:
+            merged = False
+            if actual_branch:
+                merged, _, _ = _run_git(["merge-base", "--is-ancestor", actual_branch, "HEAD"], cwd=repo_real)
+            if not merged:
+                return 409, {
+                    "ok": False,
+                    "code": "worktree_unmerged",
+                    "dirty_count": dirty_count,
+                    "commits_ahead": commits_ahead,
+                    "branch": actual_branch,
+                    "error": f"worktree 分支 {actual_branch} 存在 {commits_ahead} 个未合并提交，请先合并或传 force=true 强制清理",
+                }
+
+    rm_args = ["worktree", "remove", "--force", wt_real] if force else ["worktree", "remove", wt_real]
+    ok_rm, _, _err_rm = _run_git(rm_args, cwd=repo_real, timeout=30.0)
+    if not ok_rm:
+        return 500, {
+            "ok": False,
+            "code": "worktree_remove_failed",
+            "error": "删除 Git worktree 失败",
+        }
+
+    _run_git(["worktree", "prune"], cwd=repo_real, timeout=15.0)
+
+    branch_deleted = False
+    target_branch = f"{STUDIO_WORKTREE_BRANCH_PREFIX}{wt_id}"
+    if actual_branch.startswith(STUDIO_WORKTREE_BRANCH_PREFIX):
+        target_branch = actual_branch
+    has_br, _, _ = _run_git(["show-ref", "--verify", "--quiet", f"refs/heads/{target_branch}"], cwd=repo_real)
+    if has_br:
+        del_flag = "-D" if force else "-d"
+        ok_br, _, _ = _run_git(["branch", del_flag, target_branch], cwd=repo_real)
+        branch_deleted = bool(ok_br)
+
+    wt_root = os.path.join(repo_real, WORKTREE_DIR_NAME)
+    if os.path.isdir(wt_root) and not os.path.islink(wt_root):
+        try:
+            os.rmdir(wt_root)
+        except OSError:
+            pass
+
+    return 200, {
+        "ok": True,
+        "worktree_id": wt_id,
+        "branch": target_branch,
+        "branch_deleted": branch_deleted,
+        "cleaned": True,
+    }
+
+
+def studio_worktrees_registry_path(bus_dir: Optional[str] = None) -> str:
+    base = str(bus_dir or BUS_DIR)
+    return os.path.join(base, _STUDIO_WORKTREES_FILENAME)
+
+
+def _read_studio_worktrees_unlocked(reg_path: str) -> Dict[str, Dict[str, Any]]:
+    if not os.path.isfile(reg_path) or os.path.islink(reg_path):
+        return {}
+    try:
+        with open(reg_path, "r", encoding="utf-8", errors="replace") as fh:
+            doc = json.load(fh)
+    except Exception:
+        return {}
+    items = doc.get("worktrees") if isinstance(doc, dict) else None
+    if not isinstance(items, dict):
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for wt_id, meta in items.items():
+        if is_valid_studio_worktree_id(wt_id) and isinstance(meta, dict):
+            clean = sanitize_studio_worktree_meta(meta)
+            clean["worktree_id"] = wt_id
+            if meta.get("base_commit") and re.fullmatch(r"[0-9a-f]{7,40}", str(meta.get("base_commit"))):
+                clean["base_commit"] = str(meta["base_commit"])
+            if meta.get("scope_key"):
+                clean["scope_key"] = str(meta["scope_key"])[:128]
+            out[wt_id] = clean
+    return out
+
+
+def _write_studio_worktrees_unlocked(reg_path: str, items: Dict[str, Dict[str, Any]]) -> None:
+    payload = {"version": 1, "updated_at": int(time.time()), "worktrees": items}
+    raw = (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    tmp = f"{reg_path}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(raw)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, reg_path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def load_studio_worktrees(bus_dir: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+    """Read sanitized Studio worktree registry (`BUS_DIR/studio_worktrees.json`)."""
+    reg_path = studio_worktrees_registry_path(bus_dir)
+    return _read_studio_worktrees_unlocked(reg_path)
+
+
+def _mutate_studio_worktrees_atomic(
+    reg_path: str,
+    mutator: Callable[[Dict[str, Dict[str, Any]]], bool],
+) -> None:
+    """Atomically read-modify-write `studio_worktrees.json` inside a single `fcntl.flock(LOCK_EX)`."""
+    parent = os.path.dirname(reg_path)
+    os.makedirs(parent, exist_ok=True)
+    try:
+        os.chmod(parent, 0o700)
+    except OSError:
+        pass
+    lock_path = reg_path + ".lock"
+    lfd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lfd, fcntl.LOCK_EX)
+        try:
+            current = _read_studio_worktrees_unlocked(reg_path)
+            if mutator(current):
+                _write_studio_worktrees_unlocked(reg_path, current)
+        finally:
+            fcntl.flock(lfd, fcntl.LOCK_UN)
+    finally:
+        os.close(lfd)
+
+
+def _write_studio_worktrees_atomic(reg_path: str, items: Dict[str, Dict[str, Any]]) -> None:
+    def _replace_all(current: Dict[str, Dict[str, Any]]) -> bool:
+        current.clear()
+        current.update(items)
+        return True
+
+    _mutate_studio_worktrees_atomic(reg_path, _replace_all)
+
+
+def upsert_studio_worktree_meta(
+    wt_id: str,
+    meta: Dict[str, Any],
+    *,
+    bus_dir: Optional[str] = None,
+) -> None:
+    """Atomically upsert sanitized metadata for `wt_id` into `BUS_DIR/studio_worktrees.json`."""
+    if not is_valid_studio_worktree_id(wt_id):
+        return
+    reg_path = studio_worktrees_registry_path(bus_dir)
+    clean = sanitize_studio_worktree_meta(meta)
+    clean["worktree_id"] = wt_id
+    if meta.get("base_commit") and re.fullmatch(r"[0-9a-f]{7,40}", str(meta.get("base_commit"))):
+        clean["base_commit"] = str(meta["base_commit"])
+    if meta.get("scope_key"):
+        clean["scope_key"] = str(meta["scope_key"])[:128]
+
+    def _mutator(current: Dict[str, Dict[str, Any]]) -> bool:
+        current[wt_id] = clean
+        return True
+
+    _mutate_studio_worktrees_atomic(reg_path, _mutator)
+
+
+def remove_studio_worktree_meta(wt_id: str, *, bus_dir: Optional[str] = None) -> None:
+    """Atomically remove `wt_id` from `BUS_DIR/studio_worktrees.json`."""
+    if not is_valid_studio_worktree_id(wt_id):
+        return
+    reg_path = studio_worktrees_registry_path(bus_dir)
+    if not os.path.isfile(reg_path):
+        return
+
+    def _mutator(current: Dict[str, Dict[str, Any]]) -> bool:
+        if wt_id in current:
+            current.pop(wt_id, None)
+            return True
+        return False
+
+    _mutate_studio_worktrees_atomic(reg_path, _mutator)
 
 
 def format_worker_envelope(

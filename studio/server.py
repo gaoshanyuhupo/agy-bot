@@ -32,6 +32,7 @@ from .control_plane import StudioControlPlane
 from .data_sources import StudioDataSources
 from .event_hub import StudioEventHub
 from .gateway_service import GatewayService
+from .git_workflow import StudioGitWorkflowService
 from .google_accounts_service import StudioGoogleAccountsService
 from .room_service import StudioRoomService
 from .secrets_config_service import SecretsConfigService
@@ -48,6 +49,7 @@ ATTACHMENT_SERVICE_KEY: web.AppKey[StudioAttachmentService] = web.AppKey(
 EVENT_HUB_KEY: web.AppKey[StudioEventHub] = web.AppKey("event_hub", StudioEventHub)
 CONTROL_PLANE_KEY: web.AppKey[StudioControlPlane] = web.AppKey("control_plane", StudioControlPlane)
 WORKSPACE_FILES_KEY: web.AppKey[StudioWorkspaceFilesService] = web.AppKey("workspace_files", StudioWorkspaceFilesService)
+GIT_WORKFLOW_KEY: web.AppKey[StudioGitWorkflowService] = web.AppKey("git_workflow", StudioGitWorkflowService)
 BOT_CONTROL_KEY: web.AppKey[StudioBotControlService] = web.AppKey("bot_control", StudioBotControlService)
 ROOM_SERVICE_KEY: web.AppKey[StudioRoomService] = web.AppKey("room_service", StudioRoomService)
 ATTENTION_SERVICE_KEY: web.AppKey[StudioAttentionService] = web.AppKey("attention_service", StudioAttentionService)
@@ -275,6 +277,13 @@ def create_app(
         auth,
         chat_service.audit,
     )
+    git_workflow = StudioGitWorkflowService(
+        auth,
+        sources,
+        workspace_files,
+        secrets_config,
+        chat_service.audit,
+    )
     gateway_service = GatewayService(
         auth,
         secrets_config,
@@ -313,6 +322,7 @@ def create_app(
     app[EVENT_HUB_KEY] = event_hub
     app[CONTROL_PLANE_KEY] = control_plane
     app[WORKSPACE_FILES_KEY] = workspace_files
+    app[GIT_WORKFLOW_KEY] = git_workflow
     app[BOT_CONTROL_KEY] = bot_control
     app[ROOM_SERVICE_KEY] = room_service
     app[ATTENTION_SERVICE_KEY] = attention_service
@@ -649,9 +659,21 @@ def create_app(
     app.router.add_get("/api/files/tree", workspace_files.handle_get_tree)
     app.router.add_get("/api/files/content", workspace_files.handle_get_content)
     app.router.add_get("/api/files/diff", workspace_files.handle_get_diff)
+    app.router.add_get("/api/workspace/tree", workspace_files.handle_get_tree)
+    app.router.add_get("/api/workspace/file", workspace_files.handle_get_content)
+    app.router.add_get("/api/workspace/diff", workspace_files.handle_get_diff)
     app.router.add_get("/api/undo/checkpoints", workspace_files.handle_get_undo_checkpoints)
+    app.router.add_get("/api/undo/checkpoints/{entry_id}/diff", workspace_files.handle_get_undo_checkpoint_diff)
     app.router.add_post("/api/undo/apply", workspace_files.handle_apply_undo)
     app.router.add_post("/api/undo/redo", workspace_files.handle_apply_redo)
+
+    # P0 Coding Workbench Trio: Per-Session Worktrees & Safe Git Workflow (Status / Commit / Push / PR)
+    app.router.add_get("/api/worktrees", git_workflow.handle_get_worktrees)
+    app.router.add_post("/api/worktrees/{worktree_id}/cleanup", git_workflow.handle_cleanup_worktree)
+    app.router.add_get("/api/git/status", git_workflow.handle_git_status)
+    app.router.add_post("/api/git/commit", git_workflow.handle_git_commit)
+    app.router.add_post("/api/git/push", git_workflow.handle_git_push)
+    app.router.add_post("/api/git/pr", git_workflow.handle_git_pr)
 
     # Phase B M1: Bot Team Control Plane (Config, Profile/Rules/Soul/Skills & Safe Hot-Reload)
     app.router.add_get("/api/bots/{handle}/config", bot_control.handle_get_bot_config)

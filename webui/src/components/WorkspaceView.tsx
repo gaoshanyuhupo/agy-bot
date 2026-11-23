@@ -24,6 +24,7 @@ import {
   FileCode,
   Folder,
   FolderPlus,
+  GitBranch,
   Globe,
   Grid2x2,
   ListFilter,
@@ -77,6 +78,7 @@ import type {
   RoomLiveEvent,
   SessionSummaryItem,
   SessionUpdatedEvent,
+  SessionWorktreeInfo,
   StudioSession,
   WorkbenchCustomProjectItem,
   WorkbenchLayoutPrefs,
@@ -735,6 +737,7 @@ export interface ChatPaneProps {
   onBotChange?: (bot: string) => void;
   onProjectChange?: (projectId: string) => void;
   onActiveCidChange?: (cid: string | null) => void;
+  onActiveWorktreeChange?: (worktreeId: string | null) => void;
   onFocusPane?: (paneId: string) => void;
   extraHeaderActions?: ReactNode;
   customProjects?: CustomProjectItem[];
@@ -780,6 +783,7 @@ export function ChatPane({
   onBotChange,
   onProjectChange,
   onActiveCidChange,
+  onActiveWorktreeChange,
   onFocusPane,
   extraHeaderActions,
   customProjects: controlledCustomProjects,
@@ -963,6 +967,15 @@ export function ChatPane({
   const effectiveBotDisplayName = effectiveBotObj?.display_name || effectiveBot;
 
   const [activeCid, setActiveCid] = useState<string | null>(null);
+  const [worktreeEnabled, setWorktreeEnabled] = useState<boolean>(false);
+  const [activeWorktree, setActiveWorktree] = useState<SessionWorktreeInfo | null>(null);
+  const onActiveWorktreeChangeRef = useRef(onActiveWorktreeChange);
+  onActiveWorktreeChangeRef.current = onActiveWorktreeChange;
+  const syncActiveWorktree = useCallback((wt: SessionWorktreeInfo | null | undefined) => {
+    const clean = wt && wt.active && wt.worktree_id ? wt : null;
+    setActiveWorktree(clean);
+    onActiveWorktreeChangeRef.current?.(clean?.worktree_id || null);
+  }, []);
   const [messages, setMessages] = useState<ChatMessageItem[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [hasMoreHistory, setHasMoreHistory] = useState(false);
@@ -2350,6 +2363,9 @@ export function ChatPane({
         if (typeof d.conversation_id === "string" && d.conversation_id) {
           setActiveCidSynced(d.conversation_id);
         }
+        if (d.worktree && typeof d.worktree === "object") {
+          syncActiveWorktree(d.worktree as SessionWorktreeInfo);
+        }
         setStatusNotice(mode === "remote" ? "TG 实时同步中…" : "正在思考与执行…");
       });
 
@@ -2427,6 +2443,9 @@ export function ChatPane({
           typeof d.conversation_id === "string" && d.conversation_id ? d.conversation_id : null;
         if (resolvedCid) {
           setActiveCidSynced(resolvedCid);
+        }
+        if (d.worktree && typeof d.worktree === "object") {
+          syncActiveWorktree(d.worktree as SessionWorktreeInfo);
         }
         const finalResp = typeof d.response === "string" ? d.response : "";
         updateAssistantBubble((m) => ({
@@ -2684,6 +2703,7 @@ export function ChatPane({
       clearPendingQueue();
       resetStreamState();
       setActiveCidSynced(item.cid);
+      syncActiveWorktree(item.worktree || null);
       if (item.project_id) {
         setSelectedProject(item.project_id);
         onProjectChangeRef.current?.(item.project_id);
@@ -2787,6 +2807,7 @@ export function ChatPane({
       setProjectExpandOverrides((prev) => ({ ...prev, [targetGroupId]: true }));
     }
     setActiveCidSynced(null);
+    syncActiveWorktree(null);
     setMessages([]);
     setHasMoreHistory(false);
     setNextBefore(null);
@@ -2805,6 +2826,7 @@ export function ChatPane({
       onProjectChangeRef.current?.(nextProjectId);
     }
     setActiveCidSynced(null);
+    syncActiveWorktree(null);
     setMessages([]);
     setHasMoreHistory(false);
     setNextBefore(null);
@@ -3057,6 +3079,7 @@ export function ChatPane({
         model: selectedModel || undefined,
         effort: selectedEffort || undefined,
         sync_tg: !isReadonly,
+        worktree: !isReadonly && !activeCidRef.current && worktreeEnabled ? true : undefined,
         attachments: payload.attachmentIds.length > 0 ? payload.attachmentIds : undefined,
         context_files: payload.contextFiles.length > 0 ? payload.contextFiles : undefined,
         execution_mode: mode,
@@ -3073,6 +3096,14 @@ export function ChatPane({
       activeTurnIdRef.current = res.turn_id;
       setActiveTurnId(res.turn_id);
       if (res.cid) setActiveCidSynced(res.cid);
+      if (res.worktree) {
+        if (res.worktree.active) {
+          syncActiveWorktree(res.worktree);
+        } else if (res.worktree.reason) {
+          syncActiveWorktree(null);
+          setStatusNotice(`Worktree 已安全降级（${res.worktree.reason}），使用主工作区继续执行…`);
+        }
+      }
       attachStream(res.turn_id, res.bot || safeBotParam || "", sendGen, "local");
     } catch (err) {
       if (!mountedRef.current || genRef.current !== sendGen) {
@@ -3749,6 +3780,15 @@ export function ChatPane({
               ))}
             </select>
 
+            {!isTeamMode && activeWorktree?.active && activeWorktree.worktree_id && (
+              <span
+                title={`当前会话已绑定隔离 Worktree：${activeWorktree.branch || activeWorktree.worktree_id}`}
+                className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-emerald-500/15 border border-emerald-500/35 text-[10px] font-mono text-emerald-300 shrink-0 max-w-44 truncate"
+              >
+                <GitBranch className="w-3 h-3 shrink-0" />
+                <span className="truncate">{activeWorktree.worktree_id}</span>
+              </span>
+            )}
             {isTeamMode ? (
               <div className="flex items-center gap-1.5 flex-wrap min-w-0">
                 {teamRoomMeta.isMirrorMode ? (
@@ -4294,6 +4334,27 @@ export function ChatPane({
                           <AtSign className="w-3.5 h-3.5" />
                           <span className="hidden sm:inline">文件</span>
                         </button>
+                        {!activeCid && (
+                          <button
+                            type="button"
+                            disabled={interrupting || !resolvedBackendProject}
+                            onClick={() => setWorktreeEnabled((v) => !v)}
+                            title={
+                              worktreeEnabled
+                                ? "已开启独立 Git Worktree 隔离（首轮自动创建 agy-studio/<id> 分支）"
+                                : "为新会话启用独立 Git Worktree 隔离（不污染主工作区）"
+                            }
+                            aria-pressed={worktreeEnabled}
+                            className={`h-7 px-2 rounded-lg border text-xs inline-flex items-center gap-1 cursor-pointer disabled:opacity-40 ${
+                              worktreeEnabled
+                                ? "border-emerald-500/55 bg-emerald-500/15 text-emerald-200"
+                                : "border-slate-800 bg-slate-900/90 hover:bg-slate-800 hover:border-slate-700 text-slate-300 hover:text-slate-100"
+                            }`}
+                          >
+                            <GitBranch className="w-3.5 h-3.5" />
+                            <span className="hidden sm:inline">Worktree</span>
+                          </button>
+                        )}
                         <span
                           title={SUPPORTED_FORMATS_TOOLTIP}
                           className="hidden xl:inline text-[10px] text-slate-500 truncate ml-1 select-none"
@@ -5117,6 +5178,7 @@ export function WorkspaceView({
   const [layout, setLayout] = useState<StoredWorkbenchPrefs>(() => loadWorkbenchPrefs());
   const [filesDrawerOpen, setFilesDrawerOpen] = useState(false);
   const [paneActiveCids, setPaneActiveCids] = useState<Record<string, string | null>>({});
+  const [paneActiveWorktreeIds, setPaneActiveWorktreeIds] = useState<Record<string, string | null>>({});
   const [jobsAttentionSubTab, setJobsAttentionSubTab] = useState<Record<string, "attention" | "jobs">>({});
   const [lastFocusedChatPaneId, setLastFocusedChatPaneId] = useState<string>("pane-1");
   const [quoteMap, setQuoteMap] = useState<Record<string, PendingQuotePayload | null>>({});
@@ -5744,6 +5806,11 @@ export function WorkspaceView({
               onBotChange={(bot) => updatePane(primaryPane.id, { bot })}
               onProjectChange={(project) => updatePane(primaryPane.id, { project })}
               onActiveCidChange={(cid) => handlePaneActiveCidChange(primaryPane.id, cid)}
+              onActiveWorktreeChange={(wtId) =>
+                setPaneActiveWorktreeIds((prev) =>
+                  prev[primaryPane.id] === wtId ? prev : { ...prev, [primaryPane.id]: wtId },
+                )
+              }
               onFocusPane={setLastFocusedChatPaneId}
               customProjects={layout.customProjects}
               projectRenames={layout.projectRenames}
@@ -5800,6 +5867,12 @@ export function WorkspaceView({
                     : undefined
                 }
                 activeCid={paneActiveCids[primaryPane.id] || null}
+                selectedWorktreeId={paneActiveWorktreeIds[primaryPane.id] || null}
+                onWorktreeChange={(wtId) =>
+                  setPaneActiveWorktreeIds((prev) =>
+                    prev[primaryPane.id] === wtId ? prev : { ...prev, [primaryPane.id]: wtId },
+                  )
+                }
                 onProjectChange={(pid) => updatePane(primaryPane.id, { project: pid })}
                 onQuoteToChat={isReadonly ? undefined : handleQuoteToActiveChat}
                 onClose={() => setFilesDrawerOpen(false)}
@@ -5906,6 +5979,11 @@ export function WorkspaceView({
                       onBotChange={(bot) => updatePane(pane.id, { bot })}
                       onProjectChange={(project) => updatePane(pane.id, { project })}
                       onActiveCidChange={(cid) => handlePaneActiveCidChange(pane.id, cid)}
+                      onActiveWorktreeChange={(wtId) =>
+                        setPaneActiveWorktreeIds((prev) =>
+                          prev[pane.id] === wtId ? prev : { ...prev, [pane.id]: wtId },
+                        )
+                      }
                       onFocusPane={setLastFocusedChatPaneId}
                       customProjects={layout.customProjects}
                       projectRenames={layout.projectRenames}
@@ -5970,6 +6048,15 @@ export function WorkspaceView({
                       }
                       selectedBot={
                         pane.bot && pane.bot !== TEAM_TARGET_ID ? pane.bot : undefined
+                      }
+                      activeCid={paneActiveCids[lastFocusedChatPaneId] || null}
+                      selectedWorktreeId={paneActiveWorktreeIds[lastFocusedChatPaneId] || null}
+                      onWorktreeChange={(wtId) =>
+                        setPaneActiveWorktreeIds((prev) =>
+                          prev[lastFocusedChatPaneId] === wtId
+                            ? prev
+                            : { ...prev, [lastFocusedChatPaneId]: wtId },
+                        )
                       }
                       onProjectChange={(pid) => updatePane(pane.id, { project: pid })}
                       onQuoteToChat={isReadonly ? undefined : handleQuoteToActiveChat}

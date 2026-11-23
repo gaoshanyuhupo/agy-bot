@@ -22,6 +22,7 @@ import type {
   ChatMessageItem,
   ChatSendPayload,
   ChatSendResponse,
+  CheckpointDiffResponse,
   CostAgg,
   CostsResponse,
   DailyCostRow,
@@ -38,6 +39,13 @@ import type {
   GatewayProbePayload,
   GatewayProbeResponse,
   GatewaysListResponse,
+  GitCommitPayload,
+  GitCommitResponse,
+  GitPrPayload,
+  GitPrResponse,
+  GitPushPayload,
+  GitPushResponse,
+  GitStatusResponse,
   GoogleAccountActivateResponse,
   GoogleAccountAddPayload,
   GoogleAccountItem,
@@ -98,6 +106,9 @@ import type {
   WorkbenchStateResponse,
   WorkbenchStateUpdatePayload,
   WorkspaceProjectItem,
+  WorktreeCleanupResponse,
+  WorktreesResponse,
+  WorktreeSummaryItem,
 } from "../types";
 import {
   abortDemoTurn,
@@ -2464,9 +2475,35 @@ export async function sendChatTurn(payload: ChatSendPayload): Promise<ChatSendRe
   demoSessionMessages[cid].push(userMsg);
 
   const existingSession = demoSessions.find((s) => s.cid === cid);
+  let boundWorktree = existingSession?.worktree || null;
+  if (!boundWorktree && payload.worktree) {
+    const wtId = `wt-${Math.random().toString(16).slice(2, 10)}`;
+    boundWorktree = {
+      active: true,
+      worktree_id: wtId,
+      branch: `agy-studio/${wtId}`,
+      project_id: project,
+      created_at: nowSec(),
+      dirty_count: 1,
+      commits_ahead: 0,
+      busy: false,
+    };
+    demoWorktrees.unshift({
+      worktree_id: wtId,
+      project_id: project,
+      branch: `agy-studio/${wtId}`,
+      cid,
+      bot,
+      dirty_count: 1,
+      commits_ahead: 0,
+      busy: false,
+      created_at: nowSec(),
+    });
+  }
   if (existingSession) {
     existingSession.updated_at = isoAgo(0);
     existingSession.preview = payload.prompt.slice(0, 64);
+    if (boundWorktree) existingSession.worktree = boundWorktree;
   } else {
     demoSessions = [
       {
@@ -2478,6 +2515,7 @@ export async function sendChatTurn(payload: ChatSendPayload): Promise<ChatSendRe
         source: "web",
         bot,
         busy: false,
+        worktree: boundWorktree,
       },
       ...demoSessions,
     ];
@@ -2527,6 +2565,7 @@ export async function sendChatTurn(payload: ChatSendPayload): Promise<ChatSendRe
     context_files: payload.context_files,
     execution_mode: payload.execution_mode || "queue",
     interrupted_turn_id: null,
+    worktree: boundWorktree,
   };
 }
 
@@ -2548,8 +2587,29 @@ export async function fetchProjects(): Promise<ProjectsResponse> {
   return { ok: true, projects: DEMO_PROJECTS.map((p) => ({ ...p })) };
 }
 
+const demoWorktrees: WorktreeSummaryItem[] = [
+  {
+    worktree_id: "wt-demo-trio01",
+    project_id: "agy-studio-demo",
+    branch: "agy-studio/wt-demo-trio01",
+    cid: "demo_conv_main_001",
+    bot: "@example_main_bot",
+    dirty_count: 2,
+    commits_ahead: 1,
+    busy: false,
+    created_at: nowSec() - 1800,
+  },
+];
+
+let demoGitBranch = "agy-studio/wt-demo-trio01";
+let demoGitStaged: string[] = ["studio/workspace_files.py"];
+let demoGitUnstaged: string[] = ["webui/src/components/FilesDiffPanel.tsx"];
+let demoGitUntracked: string[] = [];
+let demoGitAhead = 1;
+
 export async function fetchFileTree(params: {
   project_id: string;
+  worktree_id?: string | null;
   dir?: string;
   depth?: number;
 }): Promise<FileTreeResponse> {
@@ -2562,6 +2622,7 @@ export async function fetchFileTree(params: {
     return {
       ok: true,
       project_id: params.project_id,
+      worktree_id: params.worktree_id || null,
       dir: params.dir,
       truncated: false,
       total: children.length,
@@ -2571,6 +2632,7 @@ export async function fetchFileTree(params: {
   return {
     ok: true,
     project_id: params.project_id,
+    worktree_id: params.worktree_id || null,
     dir: "",
     truncated: false,
     total: rootEntries.length,
@@ -2584,6 +2646,7 @@ export async function fetchFileTree(params: {
 export async function fetchFileContent(
   projectId: string,
   path: string,
+  worktreeId?: string | null,
 ): Promise<FileContentResponse> {
   await delay(25);
   requireAuth();
@@ -2595,6 +2658,7 @@ export async function fetchFileContent(
   return {
     ok: true,
     project_id: projectId,
+    worktree_id: worktreeId || null,
     path,
     is_binary: false,
     size: file.content.length,
@@ -2607,6 +2671,7 @@ export async function fetchFileContent(
 
 export async function fetchFileDiff(params: {
   project_id: string;
+  worktree_id?: string | null;
   scope?: "all" | "staged" | "unstaged";
   path?: string;
 }): Promise<FileDiffResponse> {
@@ -2621,6 +2686,7 @@ export async function fetchFileDiff(params: {
   return {
     ok: true,
     project_id: params.project_id,
+    worktree_id: params.worktree_id || null,
     is_git: true,
     scope,
     path: params.path || "",
@@ -2638,6 +2704,7 @@ export async function fetchUndoCheckpoints(params?: {
   bot?: string;
   cid?: string | null;
   project_id?: string;
+  worktree_id?: string | null;
 }): Promise<UndoCheckpointsResponse> {
   await delay(25);
   requireAuth();
@@ -2648,6 +2715,224 @@ export async function fetchUndoCheckpoints(params?: {
     bot: params?.bot || "@example_main_bot",
     undo_stack: demoUndoStack.map((u) => ({ ...u, changes: [...u.changes] })),
     redo_stack: demoRedoStack.map((r) => ({ ...r, changes: [...r.changes] })),
+  };
+}
+
+export async function fetchCheckpointDiff(
+  entryId: string,
+  params?: {
+    bot?: string;
+    cid?: string | null;
+    project_id?: string;
+  },
+): Promise<CheckpointDiffResponse> {
+  await delay(30);
+  requireAuth();
+  const item =
+    demoUndoStack.find((u) => u.entry_id === entryId) ||
+    demoRedoStack.find((r) => r.entry_id === entryId);
+  if (!item) {
+    throw new StudioApiError(`未找到检查点 ${entryId}`, 404, "studio_api");
+  }
+  const files = item.changes.map((ch) => {
+    const diffText = [
+      `--- a/${ch.path}`,
+      `+++ b/${ch.path}`,
+      "@@ -1,2 +1,3 @@",
+      " # demo checkpoint diff",
+      `-old_line = "${ch.action}"`,
+      `+new_line = "${ch.action}_updated"`,
+      "+verified = True",
+    ].join("\n");
+    return {
+      path: ch.path,
+      action: ch.action,
+      is_binary: false,
+      added: 2,
+      deleted: 1,
+      diff: diffText,
+      truncated: false,
+    };
+  });
+  return {
+    ok: true,
+    bot: params?.bot || "@example_main_bot",
+    entry_id: item.entry_id,
+    ts: item.ts,
+    cid: item.cid,
+    project_id: item.project_id,
+    worktree_id: item.worktree_id || null,
+    prompt: item.prompt,
+    added: files.reduce((acc, f) => acc + f.added, 0),
+    deleted: files.reduce((acc, f) => acc + f.deleted, 0),
+    files,
+    diff: files.map((f) => f.diff).join("\n\n"),
+    truncated: false,
+  };
+}
+
+export async function fetchWorktrees(projectId: string): Promise<WorktreesResponse> {
+  await delay(25);
+  requireAuth();
+  return {
+    ok: true,
+    project_id: projectId,
+    is_git: true,
+    worktrees: demoWorktrees
+      .filter((w) => w.project_id === projectId)
+      .map((w) => ({ ...w })),
+  };
+}
+
+export async function cleanupWorktree(
+  worktreeId: string,
+  payload: { project_id: string; force?: boolean },
+): Promise<WorktreeCleanupResponse> {
+  await delay(40);
+  requireAuth();
+  const idx = demoWorktrees.findIndex(
+    (w) => w.worktree_id === worktreeId && w.project_id === payload.project_id,
+  );
+  if (idx < 0) {
+    throw new StudioApiError("未找到对应的 worktree", 404, "studio_api");
+  }
+  const wt = demoWorktrees[idx];
+  if (wt.busy) {
+    throw new StudioApiError(
+      "关联会话正在执行中，暂不可清理 worktree（session_busy）",
+      409,
+      "studio_api",
+      undefined,
+      undefined,
+      "session_busy",
+    );
+  }
+  if (!payload.force && (wt.dirty_count > 0 || wt.commits_ahead > 0)) {
+    throw new StudioApiError(
+      `worktree 存在 ${wt.dirty_count} 个未提交变更与 ${wt.commits_ahead} 个未合并提交，请确认后强制清理`,
+      409,
+      "studio_api",
+      undefined,
+      undefined,
+      wt.dirty_count > 0 ? "worktree_dirty" : "worktree_unmerged",
+      undefined,
+      { dirty_count: wt.dirty_count, commits_ahead: wt.commits_ahead },
+    );
+  }
+  demoWorktrees.splice(idx, 1);
+  return {
+    ok: true,
+    project_id: payload.project_id,
+    worktree_id: worktreeId,
+    branch: wt.branch,
+    branch_deleted: true,
+    cleaned: true,
+  };
+}
+
+export async function fetchGitStatus(params: {
+  project_id: string;
+  worktree_id?: string | null;
+}): Promise<GitStatusResponse> {
+  await delay(25);
+  requireAuth();
+  const activeBranch = params.worktree_id
+    ? demoWorktrees.find((w) => w.worktree_id === params.worktree_id)?.branch ||
+      `agy-studio/${params.worktree_id}`
+    : demoGitBranch;
+  const isProtected = activeBranch === "main" || activeBranch === "master";
+  return {
+    ok: true,
+    project_id: params.project_id,
+    worktree_id: params.worktree_id || null,
+    is_git: true,
+    branch: activeBranch,
+    detached: false,
+    upstream: `origin/${activeBranch}`,
+    ahead: demoGitAhead,
+    behind: 0,
+    staged: [...demoGitStaged],
+    unstaged: [...demoGitUnstaged],
+    untracked: [...demoGitUntracked],
+    is_protected_branch: isProtected,
+    has_remote: true,
+    gh_available: true,
+  };
+}
+
+export async function gitCommit(payload: GitCommitPayload): Promise<GitCommitResponse> {
+  await delay(50);
+  requireAuth();
+  if (!payload.message.trim()) {
+    throw new StudioApiError("提交信息不能为空", 400, "studio_api");
+  }
+  const files =
+    payload.stage_mode === "paths"
+      ? payload.paths || []
+      : payload.stage_mode === "staged"
+        ? [...demoGitStaged]
+        : [...demoGitStaged, ...demoGitUnstaged, ...demoGitUntracked];
+  if (files.length === 0) {
+    throw new StudioApiError("暂存区没有可提交的变更", 400, "studio_api");
+  }
+  demoGitStaged = [];
+  if (payload.stage_mode === "all") {
+    demoGitUnstaged = [];
+    demoGitUntracked = [];
+  }
+  demoGitAhead += 1;
+  return {
+    ok: true,
+    project_id: payload.project_id,
+    worktree_id: payload.worktree_id || null,
+    commit_sha: "demo7f1",
+    full_sha: "demo7f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e",
+    branch: payload.worktree_id ? `agy-studio/${payload.worktree_id}` : demoGitBranch,
+    files_committed: files,
+  };
+}
+
+export async function gitPush(payload: GitPushPayload): Promise<GitPushResponse> {
+  await delay(60);
+  requireAuth();
+  const branch = payload.worktree_id ? `agy-studio/${payload.worktree_id}` : demoGitBranch;
+  if ((branch === "main" || branch === "master") && !payload.confirm_protected) {
+    throw new StudioApiError(
+      `分支 ${branch} 受保护，请二次确认后重试`,
+      409,
+      "studio_api",
+      undefined,
+      undefined,
+      "protected_branch",
+    );
+  }
+  demoGitAhead = 0;
+  return {
+    ok: true,
+    project_id: payload.project_id,
+    worktree_id: payload.worktree_id || null,
+    remote: "origin",
+    branch,
+    output: `To origin\n   0000000..demo7f1  ${branch} -> ${branch}`,
+  };
+}
+
+export async function gitCreatePr(payload: GitPrPayload): Promise<GitPrResponse> {
+  await delay(60);
+  requireAuth();
+  const head = payload.worktree_id ? `agy-studio/${payload.worktree_id}` : demoGitBranch;
+  const base = payload.base?.trim() || "main";
+  if (head === base) {
+    throw new StudioApiError("当前分支与目标基线分支相同，无法创建 PR", 400, "studio_api");
+  }
+  return {
+    ok: true,
+    project_id: payload.project_id,
+    worktree_id: payload.worktree_id || null,
+    pr_url: "https://github.com/example-org/agy-studio-demo/pull/42",
+    head,
+    base,
+    draft: Boolean(payload.draft),
   };
 }
 

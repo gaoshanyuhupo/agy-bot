@@ -16,6 +16,7 @@ Key Real-Time Architecture:
 """
 import collections
 import datetime
+import difflib
 import fcntl
 import hashlib
 import html as html_mod
@@ -740,6 +741,26 @@ class _JobQueue:
             self._entries = kept
         return removed
 
+    def has_pending_web_turn(self, *, cid=None, worktree_id=None):
+        """Non-blocking probe under `self._cond` ONLY for queued web turns targeting `cid` or `worktree_id`."""
+        with self._cond:
+            for ent in self._entries:
+                item = ent["item"]
+                payload = item[3] if isinstance(item, tuple) and len(item) >= 4 else None
+                if (
+                    isinstance(payload, tuple)
+                    and len(payload) == 2
+                    and payload[0] == "__WEB_TURN__"
+                    and isinstance(payload[1], dict)
+                ):
+                    req = payload[1]
+                    if cid and req.get("cid") == cid:
+                        return True
+                    wt = req.get("worktree_info")
+                    if worktree_id and isinstance(wt, dict) and wt.get("worktree_id") == worktree_id:
+                        return True
+        return False
+
     def cancel_bus_job(self, job_id):
         """Remove a queued `__BUS_JOB__` matching `job_id` without disturbing Telegram items or other jobs."""
         removed = False
@@ -975,6 +996,7 @@ turn_running_scope = None   # scope_key of currently executing interactive turn
 turn_running_chat = None    # chat_id of currently executing interactive turn
 turn_running_web_id = None  # turn_id if currently executing turn is a Web Studio IPC turn
 turn_running_cid = None     # conversation_id of currently executing interactive turn
+turn_running_worktree_id = None  # worktree_id if currently executing turn is isolated in a worktree
 turn_running_qid = None     # queue entry qid of currently executing worker job
 turn_gen = 0                # Monotonically increasing generation counter per run_agy turn
 turn_waiting_bg = False     # True while current turn finished intermediate step and waits on bg event
@@ -2654,7 +2676,7 @@ class AgySession:
 
     _eof_fallback_lock = threading.Lock()
 
-    def __init__(self, conv, mode, model, effort, project=None, workdir=None, scope_key=None, readonly=False, untrusted=False):
+    def __init__(self, conv, mode, model, effort, project=None, workdir=None, scope_key=None, readonly=False, untrusted=False, is_worktree=False):
         self.cid = conv
         self.readonly = bool(readonly)
         self.untrusted = bool(untrusted) or self.readonly
@@ -2664,6 +2686,7 @@ class AgySession:
         self.scope_key = scope_key or PRIMARY_SCOPE_KEY
         self.project = project
         self.workdir = workdir or WORKDIR
+        self.is_worktree = bool(is_worktree)
         self.bus_role = _current_bot_role()
         self.bus_enable = False if self.readonly else _desired_bus_enable(self.scope_key)
         self.spawned_at = time.time()
@@ -2689,7 +2712,7 @@ class AgySession:
         ]
         if self.mode == "auto" and not self.readonly:
             cmd.append("--dangerously-skip-permissions")
-        if self.project:
+        if self.project and not self.is_worktree:
             cmd += ["--project", self.project]
         if cli_model:
             cmd += ["--model", cli_model]
@@ -2835,12 +2858,14 @@ class AgySession:
     def is_alive(self):
         return self.proc is not None and self.proc.poll() is None and not self.eof_reached
 
-    def matches(self, conv, mode, model, effort, project=None, workdir=None, readonly=False, untrusted=False):
+    def matches(self, conv, mode, model, effort, project=None, workdir=None, readonly=False, untrusted=False, is_worktree=False):
         if not self.is_alive():
             return False
         if getattr(self, "readonly", False) != bool(readonly):
             return False
         if getattr(self, "untrusted", False) != (bool(untrusted) or bool(readonly)):
+            return False
+        if bool(getattr(self, "is_worktree", False)) != bool(is_worktree):
             return False
         eff_mode = "safe" if self.readonly else mode
         expected_bus = False if self.readonly else _desired_bus_enable(self.scope_key)
@@ -4975,14 +5000,17 @@ def _apply_checkpoint_changes(entry, reverse=False, force=False):
 
 
 # ---------------------------------------------------------------- core execution
-def _acquire_session(scope_key, conv, mode, model, effort, project, workdir, force_new=False, readonly=False, untrusted=False):
+def _acquire_session(scope_key, conv, mode, model, effort, project, workdir, force_new=False, readonly=False, untrusted=False, is_worktree=False):
     skey = scope_key or PRIMARY_SCOPE_KEY
     to_close = []
     same_conv_to_close = []
     with session_lock:
         existing = _session_pool.get(skey)
+        matches_kw = {"readonly": readonly, "untrusted": untrusted}
+        if is_worktree:
+            matches_kw["is_worktree"] = True
         if not force_new and existing is not None and existing.matches(
-            conv, mode, model, effort, project, workdir, readonly=readonly, untrusted=untrusted
+            conv, mode, model, effort, project, workdir, **matches_kw
         ):
             return existing, True
         if existing is not None:
@@ -5018,10 +5046,16 @@ def _acquire_session(scope_key, conv, mode, model, effort, project, workdir, for
         except Exception:
             pass
 
-    sess = AgySession(
-        conv, mode, model, effort,
-        project=project, workdir=workdir, scope_key=skey, readonly=readonly, untrusted=untrusted,
-    )
+    sess_kw = {
+        "project": project,
+        "workdir": workdir,
+        "scope_key": skey,
+        "readonly": readonly,
+        "untrusted": untrusted,
+    }
+    if is_worktree:
+        sess_kw["is_worktree"] = True
+    sess = AgySession(conv, mode, model, effort, **sess_kw)
     with session_lock:
         prev_raced = _session_pool.get(skey)
         if prev_raced is not None and prev_raced is not sess:
@@ -5232,6 +5266,7 @@ def _sleep_interruptible(seconds, *, my_turn_gen=None):
 def _execute_compact_on_session(
     scope_key, conv, mode, model, effort, project, workdir,
     instruction="", readonly=False, untrusted=None, my_turn_gen=None,
+    is_worktree=False,
 ):
     """Run `/compact` on `conv` while `turn_running` is held. Auto-retries once on transient OAuth hiccup."""
     if not conv:
@@ -5248,9 +5283,16 @@ def _execute_compact_on_session(
     for attempt in (1, 2):
         if cancel_requested or shutting_down or _is_turn_gen_preempted(my_turn_gen):
             return False, time.time() - t0, "cancelled"
+        acq_kw = {
+            "force_new": (attempt > 1),
+            "readonly": readonly,
+            "untrusted": is_untrusted,
+        }
+        if is_worktree:
+            acq_kw["is_worktree"] = True
         sess, reused_warm = _acquire_session(
             scope_key, conv, mode, model, effort, project, workdir,
-            force_new=(attempt > 1), readonly=readonly, untrusted=is_untrusted,
+            **acq_kw,
         )
         if cancel_requested or shutting_down or _is_turn_gen_preempted(my_turn_gen):
             invalidate_session("compact_cancelled", force=True, scope_key=scope_key)
@@ -5326,7 +5368,11 @@ def _execute_compact_on_session(
     return False, time.time() - t0, last_err
 
 
-def _maybe_post_turn_auto_compact(chat_id, conv, mode, model, effort, project=None, workdir=None, thread_id=None, scope_key=None):
+def _maybe_post_turn_auto_compact(
+    chat_id, conv, mode, model, effort,
+    project=None, workdir=None, thread_id=None, scope_key=None,
+    is_worktree=False,
+):
     """After a turn completes cleanly, proactively compact if active context crossed auto_compact_tokens."""
     if cancel_requested or shutting_down or not conv:
         return
@@ -5349,8 +5395,12 @@ def _maybe_post_turn_auto_compact(chat_id, conv, mode, model, effort, project=No
     )
     c_streamer.start()
     try:
+        compact_kw = {}
+        if is_worktree:
+            compact_kw["is_worktree"] = True
         ok, dur_s, err_str = _execute_compact_on_session(
-            scope_key, conv, mode, model, effort, project, workdir
+            scope_key, conv, mode, model, effort, project, workdir,
+            **compact_kw,
         )
     finally:
         c_streamer.stop()
@@ -5995,11 +6045,12 @@ def run_agy(
     override_effort=None,
     override_project=None,
     override_workdir=None,
+    override_worktree_info=None,
     sync_tg=False,
     claimed_turn_gen=None,
     claimed_qid=None,
 ):
-    global turn_running, turn_running_scope, turn_running_chat, turn_running_web_id, turn_running_cid, turn_running_qid
+    global turn_running, turn_running_scope, turn_running_chat, turn_running_web_id, turn_running_cid, turn_running_worktree_id, turn_running_qid
     global turn_gen, turn_waiting_bg, turn_waiting_bg_since, turn_preempted_gen, cancel_requested
 
     is_web_turn = event_sink is not None
@@ -6102,8 +6153,45 @@ def run_agy(
                     sc.pop("pending_undo_notice_cid", None)
 
     model = override_model or _resolve_effective_model(skey)
+    active_wt_info = (
+        dict(override_worktree_info)
+        if isinstance(override_worktree_info, dict) and override_worktree_info.get("active")
+        else None
+    )
+    active_wt_id = (
+        str(active_wt_info.get("worktree_id") or "").strip()
+        if active_wt_info is not None
+        else None
+    )
+    active_wt_sanitized = (
+        bot_bus.sanitize_studio_worktree_meta(active_wt_info)
+        if active_wt_info is not None
+        else (
+            bot_bus.sanitize_studio_worktree_meta(override_worktree_info)
+            if isinstance(override_worktree_info, dict) and override_worktree_info
+            else None
+        )
+    )
     workdir = WORKDIR
-    if wdir_raw:
+    wt_dir_valid = False
+    if active_wt_info:
+        raw_wt_path = str(active_wt_info.get("path") or "").strip()
+        if raw_wt_path:
+            expanded_wt_path = os.path.expanduser(raw_wt_path)
+            if not os.path.islink(expanded_wt_path):
+                wt_p = os.path.realpath(expanded_wt_path)
+                if os.path.isdir(wt_p):
+                    workdir = wt_p
+                    wt_dir_valid = True
+        if not wt_dir_valid:
+            log(
+                "Studio worktree %s missing/invalid at run_agy start; falling back to project workdir"
+                % (active_wt_id or "?")
+            )
+            active_wt_info = None
+            active_wt_id = None
+            active_wt_sanitized = {"active": False, "reason": "worktree_missing"}
+    if not wt_dir_valid and wdir_raw:
         rw = os.path.realpath(os.path.expanduser(wdir_raw))
         if os.path.isdir(rw):
             workdir = rw
@@ -6240,6 +6328,7 @@ def run_agy(
             turn_running_chat = chat_id
             turn_running_web_id = web_turn_id
             turn_running_cid = conv
+            turn_running_worktree_id = active_wt_id
             if claimed_qid is not None:
                 turn_running_qid = claimed_qid
             # Do NOT clear cancel_requested or turn_preempted_gen for a pre-claimed turn!
@@ -6257,6 +6346,7 @@ def run_agy(
             turn_running_chat = chat_id
             turn_running_web_id = web_turn_id
             turn_running_cid = conv
+            turn_running_worktree_id = active_wt_id
             turn_running_qid = claimed_qid
             turn_waiting_bg = False
             turn_waiting_bg_since = None
@@ -6273,6 +6363,7 @@ def run_agy(
                 turn_running_chat = None
                 turn_running_web_id = None
                 turn_running_cid = None
+                turn_running_worktree_id = None
                 turn_running_qid = None
                 turn_waiting_bg = False
                 turn_waiting_bg_since = None
@@ -6393,14 +6484,17 @@ def run_agy(
             )
 
         if is_web_turn:
-            _emit_web("turn_start", {
+            ts_payload = {
                 "turn_id": web_turn_id,
                 "conversation_id": conv,
                 "model": candidates[0] if candidates else model,
                 "effort": effort,
                 "project": project,
                 "untrusted": bool(turn_untrusted),
-            })
+            }
+            if active_wt_sanitized is not None:
+                ts_payload["worktree"] = active_wt_sanitized
+            _emit_web("turn_start", ts_payload)
             if conv:
                 _write_chat_sync_safe(conv, "running")
             if sync_tg_enabled:
@@ -6433,6 +6527,7 @@ def run_agy(
                 _execute_compact_on_session(
                     exec_skey, conv, mode, active_model, effort, project, workdir,
                     readonly=session_readonly, my_turn_gen=my_turn_gen,
+                    is_worktree=bool(active_wt_id),
                 )
                 streamer.set_status_override(None)
                 segment_start_line = get_transcript_line_count(conv)
@@ -6456,6 +6551,8 @@ def run_agy(
             }
             if turn_untrusted:
                 acq_kw["untrusted"] = True
+            if active_wt_id:
+                acq_kw["is_worktree"] = True
             sess, reused_warm = _acquire_session(
                 exec_skey, conv, mode, active_model, effort, project, workdir,
                 **acq_kw,
@@ -6902,6 +6999,7 @@ def run_agy(
                         _execute_compact_on_session(
                             exec_skey, conv, mode, active_model, effort, project, workdir,
                             readonly=session_readonly, my_turn_gen=my_turn_gen,
+                            is_worktree=bool(active_wt_id),
                         )
                     streamer.set_status_override(None)
                     step_buffers.clear()
@@ -7180,7 +7278,35 @@ def run_agy(
                 sc_w["conversation_id"] = res_cid
                 if isinstance(sc_w.get("last_turn"), dict):
                     sc_w["last_turn"]["conv"] = res_cid
+                if active_wt_info is not None and active_wt_id:
+                    bound_wt = dict(active_wt_info)
+                    bound_wt["cid"] = res_cid
+                    bound_wt["scope_key"] = exec_skey
+                    bound_wt["bot"] = _current_bot_handle()
+                    sc_w["worktree"] = bound_wt
+                    wt_map = state.setdefault("worktrees_by_cid", {})
+                    if isinstance(wt_map, dict):
+                        wt_map[res_cid] = bound_wt
+                elif isinstance(active_wt_sanitized, dict) and active_wt_sanitized.get("reason") == "worktree_missing":
+                    sc_w.pop("worktree", None)
+                    wt_map = state.get("worktrees_by_cid")
+                    if isinstance(wt_map, dict):
+                        wt_map.pop(res_cid, None)
             save_state()
+            if active_wt_info is not None and active_wt_id:
+                try:
+                    reg_wt = dict(active_wt_info)
+                    reg_wt["cid"] = res_cid
+                    reg_wt["scope_key"] = exec_skey
+                    reg_wt["bot"] = _current_bot_handle()
+                    bot_bus.upsert_studio_worktree_meta(active_wt_id, reg_wt, bus_dir=bot_bus.BUS_DIR)
+                except Exception as wreg_err:
+                    log("upsert_studio_worktree_meta error: %r" % wreg_err)
+                active_wt_sanitized = bot_bus.sanitize_studio_worktree_meta({
+                    **active_wt_info,
+                    "cid": res_cid,
+                    "bot": _current_bot_handle(),
+                })
             if sync_tg_enabled:
                 _align_dm_scope_after_web_turn(user_id, res_cid)
 
@@ -7191,7 +7317,7 @@ def run_agy(
                 if isinstance(sc_w.get("last_turn"), dict):
                     sc_w["last_turn"]["status"] = "SUCCESS"
             coalesced_resp = (result.get("response") or "").strip() or _latest_step_buffer_text(step_buffers)
-            _emit_web("done", {
+            done_coalesced_payload = {
                 "conversation_id": conv,
                 "response": coalesced_resp,
                 "status": "SUCCESS",
@@ -7199,7 +7325,10 @@ def run_agy(
                 "effort": effort,
                 "usage": result.get("usage") or {},
                 "duration_seconds": round(max(0.0, time.time() - started), 2),
-            })
+            }
+            if active_wt_sanitized is not None:
+                done_coalesced_payload["worktree"] = active_wt_sanitized
+            _emit_web("done", done_coalesced_payload)
             pending_chat_sync_status = "done"
             push_step_images(
                 chat_id, "", conv, started, before_files, sent_images,
@@ -7210,6 +7339,7 @@ def run_agy(
                 _maybe_post_turn_auto_compact(
                     chat_id, conv, mode, active_model, effort,
                     project=project, workdir=workdir, thread_id=norm_tid, scope_key=exec_skey,
+                    is_worktree=bool(active_wt_id),
                 )
             return
 
@@ -7242,7 +7372,7 @@ def run_agy(
         if is_web_turn:
             dur_sec = round(max(0.0, time.time() - started), 2)
             if status in ("SUCCESS", "WAITING"):
-                _emit_web("done", {
+                done_web_payload = {
                     "conversation_id": conv,
                     "response": resp,
                     "status": status,
@@ -7250,7 +7380,10 @@ def run_agy(
                     "effort": effort,
                     "usage": result.get("usage") or {},
                     "duration_seconds": dur_sec,
-                })
+                }
+                if active_wt_sanitized is not None:
+                    done_web_payload["worktree"] = active_wt_sanitized
+                _emit_web("done", done_web_payload)
                 if sync_tg_enabled:
                     if conv:
                         _align_dm_scope_after_web_turn(user_id, conv)
@@ -7341,6 +7474,7 @@ def run_agy(
                 _maybe_post_turn_auto_compact(
                     chat_id, conv, mode, active_model, effort,
                     project=project, workdir=workdir, thread_id=norm_tid, scope_key=exec_skey,
+                    is_worktree=bool(active_wt_id),
                 )
 
         elif status == "WAITING":
@@ -7455,6 +7589,7 @@ def run_agy(
                 turn_running_chat = None
                 turn_running_web_id = None
                 turn_running_cid = None
+                turn_running_worktree_id = None
                 turn_running_qid = None
                 turn_waiting_bg = False
                 turn_waiting_bg_since = None
@@ -8574,7 +8709,7 @@ def _execute_bus_job(job_id, *, claimed_turn_gen=None, claimed_qid=None):
             cmd += ["--model", cli_model]
         if cli_effort:
             cmd += ["--effort", cli_effort]
-        if exec_project:
+        if exec_project and not (wt_info and wt_info.get("active")):
             cmd += ["--project", exec_project]
         if resume_cid:
             cmd += ["--conversation", resume_cid]
@@ -9813,6 +9948,95 @@ def _studio_ipc_enqueue_turn(req):
     turn_id = f"turn-{uuid.uuid4().hex[:16]}"
     scope_key = f"web:{uid}:{cid or turn_id}"
     sync_tg = req.get("sync_tg") is True
+    raw_worktree_flag = req.get("worktree", False)
+    if not isinstance(raw_worktree_flag, bool):
+        return 400, {"ok": False, "error": "worktree 必须为布尔值（true/false）"}
+    want_worktree = raw_worktree_flag
+
+    # Snapshot any existing bound worktree for `cid` under state_lock ONLY (release before any git I/O).
+    bound_wt_info = None
+    if cid:
+        with state_lock:
+            wt_by_cid = state.get("worktrees_by_cid")
+            if isinstance(wt_by_cid, dict) and isinstance(wt_by_cid.get(cid), dict):
+                bound_wt_info = dict(wt_by_cid[cid])
+            if bound_wt_info is None:
+                sc_existing = (state.get("scopes") or {}).get(scope_key)
+                if isinstance(sc_existing, dict) and isinstance(sc_existing.get("worktree"), dict):
+                    bound_wt_info = dict(sc_existing["worktree"])
+
+    # Verify existing bound worktree still exists safely on disk (no symlinks)
+    worktree_info = None
+    if isinstance(bound_wt_info, dict) and bound_wt_info.get("active"):
+        b_root = str(bound_wt_info.get("repo_root") or "").strip()
+        b_wt_id = str(bound_wt_info.get("worktree_id") or "").strip()
+        if b_root and b_wt_id:
+            ok_wt_dir, wt_real_dir, _sc_wt, _err_wt = bot_bus.resolve_studio_worktree_dir(b_root, b_wt_id)
+            if ok_wt_dir and wt_real_dir:
+                worktree_info = dict(bound_wt_info)
+                worktree_info["path"] = wt_real_dir
+
+    # Prepare new isolated worktree OUTSIDE all locks (strictly zero git calls under state_lock / session_lock)
+    req_project = req.get("project")
+    resolved_proj_id = None
+    resolved_proj_workdir = None
+    if req_project:
+        for p in list_agy_projects():
+            if p.get("id") == req_project or p.get("name") == req_project:
+                resolved_proj_id = str(p.get("id") or "")
+                resolved_proj_workdir = str(p.get("workdir") or "")
+                break
+    elif worktree_info is None and want_worktree:
+        # Fallback to primary scope's configured project if caller omitted explicit project
+        cur_p = current_project(PRIMARY_SCOPE_KEY)
+        if cur_p:
+            for p in list_agy_projects():
+                if p.get("id") == cur_p or p.get("name") == cur_p:
+                    resolved_proj_id = str(p.get("id") or "")
+                    resolved_proj_workdir = str(p.get("workdir") or "")
+                    break
+
+    if worktree_info is None and want_worktree:
+        if resolved_proj_id and resolved_proj_workdir:
+            wt_slug = f"wt-{uuid.uuid4().hex[:12]}"
+            prep = bot_bus.prepare_studio_worktree(
+                resolved_proj_workdir,
+                wt_slug,
+                project_id=resolved_proj_id,
+            )
+            if prep.get("active"):
+                prep["scope_key"] = scope_key
+                prep["bot"] = _current_bot_handle()
+                if cid:
+                    prep["cid"] = cid
+                worktree_info = prep
+                with state_lock:
+                    sc_wt = _ensure_scope_locked(scope_key)
+                    sc_wt["worktree"] = dict(prep)
+                    if cid:
+                        wt_map = state.setdefault("worktrees_by_cid", {})
+                        if isinstance(wt_map, dict):
+                            wt_map[cid] = dict(prep)
+                save_state()
+                try:
+                    bot_bus.upsert_studio_worktree_meta(
+                        str(prep["worktree_id"]),
+                        prep,
+                        bus_dir=bot_bus.BUS_DIR,
+                    )
+                except Exception as wreg_err:
+                    log("upsert_studio_worktree_meta enqueue error: %r" % wreg_err)
+            else:
+                worktree_info = prep
+        else:
+            worktree_info = {"enabled": True, "active": False, "reason": "project_not_whitelisted"}
+
+    sanitized_wt = (
+        bot_bus.sanitize_studio_worktree_meta(worktree_info)
+        if isinstance(worktree_info, dict)
+        else None
+    )
+
     _studio_ipc_buffer.create_turn(
         turn_id,
         owner_user_id=uid,
@@ -9830,10 +10054,12 @@ def _studio_ipc_enqueue_turn(req):
         "scope_key": scope_key,
         "prompt": req["prompt"],
         "cid": cid,
-        "project": req.get("project"),
+        "project": resolved_proj_id or req.get("project"),
         "model": req.get("model"),
         "effort": req.get("effort"),
         "sync_tg": sync_tg,
+        "worktree": want_worktree,
+        "worktree_info": worktree_info,
         "priority": priority,
     }
 
@@ -9878,7 +10104,7 @@ def _studio_ipc_enqueue_turn(req):
                 if to_kill is not None:
                     close_session_async(to_kill, force=True)
 
-    return 202, {
+    resp_202 = {
         "ok": True,
         "turn_id": turn_id,
         "bot": _current_bot_handle(),
@@ -9887,6 +10113,9 @@ def _studio_ipc_enqueue_turn(req):
         "priority": priority,
         "interrupted_turn_id": interrupted_turn_id,
     }
+    if sanitized_wt is not None:
+        resp_202["worktree"] = sanitized_wt
+    return 202, resp_202
 
 
 def _studio_ipc_abort_turn(turn_id, user_id):
@@ -10266,39 +10495,177 @@ def _resolve_project_by_id_or_workdir():
     return by_id, by_real
 
 
+_IPC_SENSITIVE_EXACT_NAMES = frozenset({
+    ".env",
+    ".envrc",
+    "users.json",
+    "auth_users.json",
+    "sessions.json",
+    ".bao_credentials.json",
+    "auth.json",
+    "credentials.json",
+    "audit.jsonl",
+    "mcp_config.json",
+})
+_IPC_SENSITIVE_SUFFIXES = (
+    ".token",
+    ".secret",
+    ".pem",
+    ".key",
+    ".p12",
+    ".pfx",
+    ".db",
+    ".db-wal",
+    ".db-shm",
+    ".db-journal",
+    ".sqlite",
+    ".sqlite3",
+    ".sock",
+)
+_IPC_SENSITIVE_SUBSTRINGS = (
+    "id_rsa",
+    "id_ed25519",
+    "id_ecdsa",
+    "id_dsa",
+    ".sqlite",
+)
+_IPC_CHECKPOINT_DIFF_MAX_BYTES = 256 * 1024
+
+
+def _is_ipc_sensitive_rel_path(rel_path):
+    norm = str(rel_path or "").replace("\\", "/").strip("/")
+    if not norm:
+        return False
+    for part in norm.split("/"):
+        low = part.strip().lower()
+        if not low:
+            continue
+        if low == ".git" or low == ".env" or low.startswith(".env."):
+            return True
+        if low in _IPC_SENSITIVE_EXACT_NAMES:
+            return True
+        if any(low.endswith(suf) for suf in _IPC_SENSITIVE_SUFFIXES):
+            return True
+        if any(sub in low for sub in _IPC_SENSITIVE_SUBSTRINGS):
+            return True
+    return False
+
+
+def _redact_ipc_multiline(raw):
+    """Redact secrets and host paths from multiline diff content while preserving newlines."""
+    text = str(raw or "")
+    if not text:
+        return ""
+    for pat in _IPC_SECRET_PATTERNS:
+        text = pat.sub("[REDACTED]", text)
+    text = _IPC_HOST_PATH_RE.sub("[REDACTED]", text)
+    return text
+
+
+def _truncate_utf8_bytes_ipc(text, max_bytes):
+    raw = text.encode("utf-8")
+    if len(raw) <= max_bytes:
+        return text, False
+    return raw[:max_bytes].decode("utf-8", errors="ignore"), True
+
+
+def _resolve_checkpoint_workdir_owner(wdir, *, by_real):
+    """Resolve checkpoint `wdir` strictly to `(project_id, worktree_id, allowed)`.
+
+    Supports:
+    - Exact whitelisted project root -> `(pid, "", True)`
+    - Single-level `<proj_root>/.worktrees/<wt_id>` with non-symlink `.worktrees` and `<wt_id>` -> `(pid, wt_id, True)`
+    - Legacy default `WORKDIR` (or single-level `WORKDIR/.worktrees/<wt_id>`) -> `("", wt_id, True)`
+
+    Strictly rejects sibling-prefix spoofing such as `<proj_root>-evil/.worktrees/wt1` and any symlinked root.
+    """
+    raw = str(wdir or "").strip()
+    if not raw:
+        return "", "", False
+    if os.path.islink(raw):
+        return "", "", False
+    rw = os.path.realpath(raw)
+    if not rw:
+        return "", "", False
+    if rw in by_real:
+        return str(by_real[rw]), "", True
+
+    def _match_single_level_worktree(base_real):
+        wt_root_raw = os.path.join(base_real, bot_bus.WORKTREE_DIR_NAME)
+        if os.path.islink(wt_root_raw):
+            return None
+        wt_root_real = os.path.realpath(wt_root_raw)
+        if not wt_root_real.startswith(base_real + os.sep):
+            return None
+        prefix = wt_root_real + os.sep
+        if not rw.startswith(prefix):
+            return None
+        remainder = rw[len(prefix):]
+        if not remainder or "/" in remainder or "\\" in remainder or os.sep in remainder:
+            return None
+        if not studio_ipc.is_valid_worktree_id(remainder):
+            return None
+        wt_cand = os.path.join(wt_root_real, remainder)
+        if os.path.islink(wt_cand):
+            return None
+        if os.path.realpath(wt_cand) != rw:
+            return None
+        return remainder
+
+    for proj_real, pid in by_real.items():
+        matched_wt = _match_single_level_worktree(proj_real)
+        if matched_wt is not None:
+            return str(pid), matched_wt, True
+
+    default_real = os.path.realpath(WORKDIR)
+    if rw == default_real:
+        return "", "", True
+    matched_default_wt = _match_single_level_worktree(default_real)
+    if matched_default_wt is not None:
+        return "", matched_default_wt, True
+
+    return "", "", False
+
+
 def _sanitize_undo_entry_for_ipc(entry, *, by_real, is_top):
     wdir = str(entry.get("workdir") or "").strip()
-    rw = os.path.realpath(wdir) if wdir else ""
-    pid = by_real.get(rw, "")
+    pid, wt_id, _allowed = _resolve_checkpoint_workdir_owner(wdir, by_real=by_real)
     raw_changes = entry.get("changes") or []
     safe_changes = []
     for ch in raw_changes[:50]:
         if not isinstance(ch, dict):
             continue
-        rel = _redact_ipc_text(str(ch.get("path") or ""), max_len=200)
+        raw_rel = str(ch.get("path") or "")
+        if _is_ipc_sensitive_rel_path(raw_rel):
+            continue
+        rel = _redact_ipc_text(raw_rel, max_len=200)
         act = _sanitize_ipc_slug(ch.get("action") or "modified", max_len=24)
         safe_changes.append({"path": rel, "action": act})
-    return {
+    out = {
         "entry_id": _sanitize_ipc_slug(entry.get("id") or "", max_len=64),
         "ts": int(entry.get("ts") or 0),
         "cid": str(entry.get("conv") or ""),
         "project_id": _sanitize_ipc_slug(pid, max_len=64),
+        "worktree_id": _sanitize_ipc_slug(wt_id, max_len=64) if wt_id else "",
         "prompt": _redact_ipc_text(entry.get("prompt") or "", max_len=120),
         "truncated": bool(entry.get("truncated", False)),
-        "changes_count": len(raw_changes),
+        "changes_count": len(safe_changes),
         "changes": safe_changes,
         "is_top": bool(is_top),
     }
+    return out
 
 
-def _studio_ipc_list_undo(user_id, cid=None, project_id=None):
+def _studio_ipc_list_undo(user_id, cid=None, project_id=None, worktree_id=None):
     by_id, by_real = _resolve_project_by_id_or_workdir()
-    target_rw = None
+    target_pid = None
     if project_id:
         proj = by_id.get(project_id)
         if not proj:
             return 404, {"ok": False, "error": "未找到对应的白名单项目"}
-        target_rw = os.path.realpath(str(proj.get("workdir") or ""))
+        target_pid = str(proj.get("id") or project_id)
+    if worktree_id and not studio_ipc.is_valid_worktree_id(worktree_id):
+        return 400, {"ok": False, "error": "非法的 worktree_id 格式"}
 
     undo_out = []
     redo_out = []
@@ -10319,8 +10686,12 @@ def _studio_ipc_list_undo(user_id, cid=None, project_id=None):
                     if cid and ent_cid != cid:
                         continue
                     ent_wdir = str(ent.get("workdir") or "").strip()
-                    ent_rw = os.path.realpath(ent_wdir) if ent_wdir else ""
-                    if target_rw and ent_rw != target_rw:
+                    ent_pid, ent_wt_id, allowed = _resolve_checkpoint_workdir_owner(ent_wdir, by_real=by_real)
+                    if not allowed:
+                        continue
+                    if target_pid and ent_pid != target_pid:
+                        continue
+                    if worktree_id and ent_wt_id != worktree_id:
                         continue
                     bucket.append(
                         _sanitize_undo_entry_for_ipc(ent, by_real=by_real, is_top=(idx == top_idx))
@@ -10336,6 +10707,191 @@ def _studio_ipc_list_undo(user_id, cid=None, project_id=None):
     }
 
 
+def _studio_ipc_get_undo_diff(user_id, entry_id, cid=None, project_id=None):
+    """Compute sanitized per-file unified diff for an undo/redo checkpoint from `acb_undo` blobs."""
+    if not studio_ipc.is_valid_undo_entry_id(entry_id):
+        return 400, {"ok": False, "code": "invalid_entry_id", "error": "无效的检查点 entry_id"}
+    if cid and not studio_ipc.is_valid_cid(cid):
+        return 400, {"ok": False, "code": "invalid_cid", "error": "无效的会话 ID 格式"}
+
+    by_id, by_real = _resolve_project_by_id_or_workdir()
+    target_pid = None
+    if project_id:
+        proj = by_id.get(project_id)
+        if not proj:
+            return 404, {"ok": False, "code": "project_not_found", "error": "未找到对应的白名单项目"}
+        target_pid = str(proj.get("id") or project_id)
+
+    matched_entry = None
+    with state_lock:
+        scopes = state.get("scopes") or {}
+        for _skey, sc in scopes.items():
+            if not isinstance(sc, dict):
+                continue
+            for stack_name in ("undo_stack", "redo_stack"):
+                stk = sc.get(stack_name) or []
+                for ent in stk:
+                    if isinstance(ent, dict) and str(ent.get("id") or "") == entry_id:
+                        matched_entry = dict(ent)
+                        break
+                if matched_entry is not None:
+                    break
+            if matched_entry is not None:
+                break
+
+    if matched_entry is None:
+        return 404, {"ok": False, "code": "not_found", "error": "未找到对应的检查点"}
+
+    entry_cid = str(matched_entry.get("conv") or "").strip()
+    if cid and entry_cid != cid:
+        return 403, {"ok": False, "code": "cid_mismatch", "error": "检查点不属于指定会话"}
+
+    entry_wdir = str(matched_entry.get("workdir") or "").strip()
+    ent_pid, ent_wt_id, allowed = _resolve_checkpoint_workdir_owner(entry_wdir, by_real=by_real)
+    if not allowed:
+        return 403, {"ok": False, "code": "workdir_not_allowed", "error": "检查点工作目录不在白名单内"}
+    if target_pid and ent_pid != target_pid:
+        return 403, {"ok": False, "code": "project_mismatch", "error": "检查点不属于指定项目"}
+
+    raw_changes = matched_entry.get("changes") or []
+    files_out = []
+    combined_chunks = []
+    total_added = 0
+    total_deleted = 0
+    total_bytes = 0
+    truncated = bool(matched_entry.get("truncated", False))
+    wdir_exists = bool(entry_wdir and os.path.isdir(entry_wdir) and not os.path.islink(entry_wdir))
+
+    for ch in raw_changes[:300]:
+        if not isinstance(ch, dict):
+            continue
+        rel = str(ch.get("path") or "").strip()
+        if not rel or "\x00" in rel or "\\" in rel or os.path.isabs(rel) or rel.startswith("/"):
+            continue
+        parts = rel.split("/")
+        if any(p in ("", ".", "..") for p in parts):
+            continue
+        if _is_ipc_sensitive_rel_path(rel):
+            continue
+        # Reject symlinks recorded in modes or currently present on disk
+        pre_mode = ch.get("pre_mode")
+        post_mode = ch.get("post_mode")
+        if (isinstance(pre_mode, int) and stat.S_ISLNK(pre_mode)) or (
+            isinstance(post_mode, int) and stat.S_ISLNK(post_mode)
+        ):
+            continue
+        if wdir_exists and _safe_under_workdir(entry_wdir, rel) is None:
+            continue
+
+        act = _sanitize_ipc_slug(ch.get("action") or "modified", max_len=24) or "modified"
+        pre_sha1 = ch.get("pre_sha1")
+        post_sha1 = ch.get("post_sha1")
+        if pre_sha1 is not None and str(pre_sha1) != "":
+            if not studio_ipc.is_valid_sha1_hex(str(pre_sha1)):
+                return 400, {"ok": False, "code": "invalid_sha1", "error": "检查点包含非法的 pre_sha1 格式"}
+        if post_sha1 is not None and str(post_sha1) != "":
+            if not studio_ipc.is_valid_sha1_hex(str(post_sha1)):
+                return 400, {"ok": False, "code": "invalid_sha1", "error": "检查点包含非法的 post_sha1 格式"}
+
+        pre_bytes = b""
+        post_bytes = b""
+        missing_blob = False
+        if pre_sha1:
+            try:
+                pre_bytes = _undo_read_blob(str(pre_sha1))
+            except OSError:
+                missing_blob = True
+        if post_sha1:
+            try:
+                post_bytes = _undo_read_blob(str(post_sha1))
+            except OSError:
+                missing_blob = True
+
+        safe_rel = _redact_ipc_text(rel, max_len=200)
+        if b"\x00" in pre_bytes or b"\x00" in post_bytes:
+            files_out.append({
+                "path": safe_rel,
+                "action": act,
+                "is_binary": True,
+                "added": 0,
+                "deleted": 0,
+                "diff": "",
+                "truncated": False,
+                "missing_blob": missing_blob,
+            })
+            continue
+
+        pre_text = pre_bytes.decode("utf-8", errors="replace") if pre_bytes else ""
+        post_text = post_bytes.decode("utf-8", errors="replace") if post_bytes else ""
+        pre_lines = pre_text.splitlines()
+        post_lines = post_text.splitlines()
+        from_label = "/dev/null" if act == "created" else f"a/{rel}"
+        to_label = "/dev/null" if act == "deleted" else f"b/{rel}"
+        diff_lines = list(
+            difflib.unified_diff(
+                pre_lines,
+                post_lines,
+                fromfile=from_label,
+                tofile=to_label,
+                lineterm="",
+            )
+        )
+        added_cnt = sum(1 for ln in diff_lines if ln.startswith("+") and not ln.startswith("+++"))
+        deleted_cnt = sum(1 for ln in diff_lines if ln.startswith("-") and not ln.startswith("---"))
+        total_added += added_cnt
+        total_deleted += deleted_cnt
+
+        raw_file_diff = "\n".join(diff_lines)
+        redacted_file_diff = _redact_ipc_multiline(raw_file_diff)
+        file_trunc = False
+        remaining = max(0, _IPC_CHECKPOINT_DIFF_MAX_BYTES - total_bytes)
+        if remaining == 0 and redacted_file_diff:
+            redacted_file_diff = ""
+            file_trunc = True
+            truncated = True
+        else:
+            bounded_file_diff, did_trunc = _truncate_utf8_bytes_ipc(redacted_file_diff, remaining)
+            if did_trunc:
+                file_trunc = True
+                truncated = True
+            redacted_file_diff = bounded_file_diff
+            total_bytes += len(redacted_file_diff.encode("utf-8"))
+
+        if redacted_file_diff:
+            combined_chunks.append(redacted_file_diff)
+
+        files_out.append({
+            "path": safe_rel,
+            "action": act,
+            "is_binary": False,
+            "added": added_cnt,
+            "deleted": deleted_cnt,
+            "diff": redacted_file_diff,
+            "truncated": file_trunc,
+            "missing_blob": missing_blob,
+        })
+
+    combined_diff, comb_trunc = _truncate_utf8_bytes_ipc("\n\n".join(combined_chunks), _IPC_CHECKPOINT_DIFF_MAX_BYTES)
+    if comb_trunc:
+        truncated = True
+
+    return 200, {
+        "ok": True,
+        "bot": _current_bot_handle(),
+        "entry_id": entry_id,
+        "ts": int(matched_entry.get("ts") or 0),
+        "cid": entry_cid,
+        "project_id": _sanitize_ipc_slug(ent_pid, max_len=64),
+        "worktree_id": _sanitize_ipc_slug(ent_wt_id, max_len=64) if ent_wt_id else "",
+        "prompt": _redact_ipc_text(matched_entry.get("prompt") or "", max_len=120),
+        "added": total_added,
+        "deleted": total_deleted,
+        "files": files_out,
+        "diff": combined_diff,
+        "truncated": truncated,
+    }
+
+
 def _studio_ipc_apply_checkpoint(req, *, reverse=False):
     entry_id = str(req.get("entry_id") or "").strip()
     req_cid = req.get("cid")
@@ -10345,12 +10901,12 @@ def _studio_ipc_apply_checkpoint(req, *, reverse=False):
     other_key = "undo_stack" if reverse else "redo_stack"
 
     by_id, by_real = _resolve_project_by_id_or_workdir()
-    target_rw = None
+    target_pid = None
     if req_pid:
         proj = by_id.get(req_pid)
         if not proj:
             return 404, {"ok": False, "code": "project_not_found", "error": "未找到对应的白名单项目"}
-        target_rw = os.path.realpath(str(proj.get("workdir") or ""))
+        target_pid = str(proj.get("id") or req_pid)
 
     with _undo_apply_lock:
         # 1. Locate checkpoint under state_lock
@@ -10391,11 +10947,11 @@ def _studio_ipc_apply_checkpoint(req, *, reverse=False):
         if req_cid and entry_cid != req_cid:
             return 403, {"ok": False, "code": "cid_mismatch", "error": "检查点不属于指定会话"}
         entry_wdir = str(matched_entry.get("workdir") or "").strip()
-        entry_rw = os.path.realpath(entry_wdir) if entry_wdir else ""
-        if target_rw and entry_rw != target_rw:
-            return 403, {"ok": False, "code": "project_mismatch", "error": "检查点不属于指定项目"}
-        if entry_rw and entry_rw not in by_real and entry_rw != os.path.realpath(WORKDIR):
+        ent_pid, ent_wt_id, allowed_wdir = _resolve_checkpoint_workdir_owner(entry_wdir, by_real=by_real)
+        if not allowed_wdir:
             return 403, {"ok": False, "code": "workdir_not_allowed", "error": "检查点工作目录不在白名单内"}
+        if target_pid and ent_pid != target_pid:
+            return 403, {"ok": False, "code": "project_mismatch", "error": "检查点不属于指定项目"}
 
         # 2. Check active session lock & non-blocking ConversationLease
         with session_lock:
@@ -10404,6 +10960,7 @@ def _studio_ipc_apply_checkpoint(req, *, reverse=False):
                 and (
                     turn_running_scope == matched_skey
                     or (entry_cid and turn_running_cid == entry_cid)
+                    or (ent_wt_id and turn_running_worktree_id == ent_wt_id)
                 )
             )
         if busy_now or (entry_cid and _studio_ipc_buffer.find_active_turn_for_cid(entry_cid)):
@@ -10421,6 +10978,7 @@ def _studio_ipc_apply_checkpoint(req, *, reverse=False):
                 if turn_running and (
                     turn_running_scope == matched_skey
                     or (entry_cid and turn_running_cid == entry_cid)
+                    or (ent_wt_id and turn_running_worktree_id == ent_wt_id)
                 ):
                     return 409, {"ok": False, "code": "session_busy", "error": "会话正在执行中（session_busy）"}
 
@@ -10489,7 +11047,8 @@ def _studio_ipc_apply_checkpoint(req, *, reverse=False):
                 "bot": _current_bot_handle(),
                 "entry_id": entry_id,
                 "cid": entry_cid,
-                "project_id": _sanitize_ipc_slug(by_real.get(entry_rw, ""), max_len=64),
+                "project_id": _sanitize_ipc_slug(ent_pid, max_len=64),
+                "worktree_id": _sanitize_ipc_slug(ent_wt_id, max_len=64) if ent_wt_id else "",
                 "applied": [
                     {"action": _sanitize_ipc_slug(a, max_len=24), "path": _redact_ipc_text(p, max_len=200)}
                     for a, p in applied
@@ -10500,6 +11059,183 @@ def _studio_ipc_apply_checkpoint(req, *, reverse=False):
         finally:
             if conv_lease is not None:
                 conv_lease.release()
+
+
+def _studio_ipc_cleanup_worktree(req):
+    """Safely clean up a Studio session worktree with strict lock ordering (C5, C6).
+
+    Never holds `state_lock` or `session_lock` during blocking `git` calls and never nests
+    `job_q._cond` with `session_lock` or `state_lock` with `session_lock`.
+    If the associated session has an active turn, ALWAYS returns `409 session_busy` even with `force=True`.
+    """
+    wt_id = str(req.get("worktree_id") or "").strip()
+    if not studio_ipc.is_valid_worktree_id(wt_id):
+        return 400, {"ok": False, "code": "invalid_worktree_id", "error": "非法的 worktree_id 格式"}
+    pid = str(req.get("project_id") or "").strip()
+    raw_force = req.get("force", False)
+    if not isinstance(raw_force, bool):
+        return 400, {"ok": False, "code": "invalid_force", "error": "force 必须为布尔值"}
+    force = raw_force
+
+    by_id, _by_real = _resolve_project_by_id_or_workdir()
+    proj = by_id.get(pid)
+    if not proj or not proj.get("workdir"):
+        return 404, {"ok": False, "code": "project_not_found", "error": "未找到对应的白名单项目"}
+    repo_root = str(proj["workdir"])
+
+    ok_dir, wt_real, sc_dir, err_dir = bot_bus.resolve_studio_worktree_dir(repo_root, wt_id)
+    if not ok_dir or not wt_real:
+        code_map = {400: "invalid_worktree_id", 403: "unsafe_path", 404: "not_found"}
+        return sc_dir, {"ok": False, "code": code_map.get(sc_dir, "error"), "error": err_dir}
+
+    with _undo_apply_lock:
+        # 1. Snapshot matching scope/cid bindings under state_lock ONLY (release immediately).
+        bound_scopes = set()
+        bound_cids = set()
+        branch_hint = ""
+        base_commit_hint = ""
+        with state_lock:
+            for skey, sc in (state.get("scopes") or {}).items():
+                if not isinstance(sc, dict):
+                    continue
+                wt = sc.get("worktree")
+                if isinstance(wt, dict) and str(wt.get("worktree_id") or "") == wt_id:
+                    bound_scopes.add(skey)
+                    c = str(wt.get("cid") or sc.get("conversation_id") or "").strip()
+                    if c:
+                        bound_cids.add(c)
+                    if wt.get("branch") and not branch_hint:
+                        branch_hint = str(wt["branch"])
+                    if wt.get("base_commit") and not base_commit_hint:
+                        base_commit_hint = str(wt["base_commit"])
+            for cid_k, wt in (state.get("worktrees_by_cid") or {}).items():
+                if isinstance(wt, dict) and str(wt.get("worktree_id") or "") == wt_id:
+                    bound_cids.add(str(cid_k))
+                    if wt.get("scope_key"):
+                        bound_scopes.add(str(wt["scope_key"]))
+                    if wt.get("branch") and not branch_hint:
+                        branch_hint = str(wt["branch"])
+                    if wt.get("base_commit") and not base_commit_hint:
+                        base_commit_hint = str(wt["base_commit"])
+
+        # Also check shared registry for cid/base_commit metadata
+        reg_meta = bot_bus.load_studio_worktrees(bot_bus.BUS_DIR).get(wt_id)
+        if isinstance(reg_meta, dict):
+            if reg_meta.get("cid"):
+                bound_cids.add(str(reg_meta["cid"]))
+            if reg_meta.get("branch") and not branch_hint:
+                branch_hint = str(reg_meta["branch"])
+            if reg_meta.get("base_commit") and not base_commit_hint:
+                base_commit_hint = str(reg_meta["base_commit"])
+
+        # 2. Check active turn under session_lock ONLY (never nested with state_lock or job_q._cond).
+        with session_lock:
+            busy_now = bool(
+                turn_running
+                and (
+                    turn_running_worktree_id == wt_id
+                    or (turn_running_scope in bound_scopes)
+                    or (turn_running_cid and turn_running_cid in bound_cids)
+                )
+            )
+        if busy_now:
+            return 409, {
+                "ok": False,
+                "code": "session_busy",
+                "error": "关联会话正在执行中，暂不可清理 worktree（session_busy）",
+            }
+        for c in bound_cids:
+            if _studio_ipc_buffer.find_active_turn_for_cid(c):
+                return 409, {
+                    "ok": False,
+                    "code": "session_busy",
+                    "error": "关联会话已有排队或执行中的轮次（session_busy）",
+                }
+        if job_q.has_pending_web_turn(worktree_id=wt_id) or any(
+            job_q.has_pending_web_turn(cid=c) for c in bound_cids
+        ):
+            return 409, {
+                "ok": False,
+                "code": "session_busy",
+                "error": "关联会话仍有排队中的轮次（session_busy）",
+            }
+
+        # 3. Acquire cross-process ConversationLease for every bound cid (serializes turn/undo/cleanup).
+        leases = []
+        try:
+            for c in sorted(bound_cids):
+                if studio_ipc.is_valid_cid(c):
+                    lease = studio_ipc.ConversationLease.try_acquire(bot_bus.BUS_DIR, c)
+                    if lease is None:
+                        return 409, {
+                            "ok": False,
+                            "code": "session_busy",
+                            "error": "关联会话已被其他进程占用（session_busy）",
+                        }
+                    leases.append(lease)
+
+            # Re-verify session_lock & pop any idle warm AgySession whose cwd is inside this worktree.
+            warm_to_close = []
+            with session_lock:
+                if turn_running and (
+                    turn_running_worktree_id == wt_id
+                    or (turn_running_scope in bound_scopes)
+                    or (turn_running_cid and turn_running_cid in bound_cids)
+                ):
+                    return 409, {
+                        "ok": False,
+                        "code": "session_busy",
+                        "error": "关联会话正在执行中，暂不可清理 worktree（session_busy）",
+                    }
+                for sk_k, s_obj in list(_session_pool.items()):
+                    s_wdir = os.path.realpath(str(getattr(s_obj, "workdir", "") or ""))
+                    if s_wdir == wt_real or s_wdir.startswith(wt_real + os.sep):
+                        _session_pool.pop(sk_k, None)
+                        warm_to_close.append(s_obj)
+
+            # Close evicted idle warm sessions OUTSIDE session_lock before running git worktree remove.
+            for old_s in warm_to_close:
+                try:
+                    old_s.close(force=False)
+                except Exception:
+                    pass
+
+            # 4. Run blocking git cleanup strictly OUTSIDE state_lock and session_lock.
+            sc_clean, res_clean = bot_bus.cleanup_studio_worktree(
+                repo_root,
+                wt_id,
+                force=force,
+                branch=branch_hint,
+                base_commit=base_commit_hint,
+            )
+            if sc_clean != 200:
+                return sc_clean, res_clean
+
+            # 5. Purge worktree metadata from Bridge state and shared registry.
+            with state_lock:
+                for _skey, sc in (state.get("scopes") or {}).items():
+                    if isinstance(sc, dict) and isinstance(sc.get("worktree"), dict):
+                        if str(sc["worktree"].get("worktree_id") or "") == wt_id:
+                            sc.pop("worktree", None)
+                wt_map = state.get("worktrees_by_cid")
+                if isinstance(wt_map, dict):
+                    for cid_k in list(wt_map.keys()):
+                        ent_wt = wt_map.get(cid_k)
+                        if isinstance(ent_wt, dict) and str(ent_wt.get("worktree_id") or "") == wt_id:
+                            wt_map.pop(cid_k, None)
+            save_state()
+            try:
+                bot_bus.remove_studio_worktree_meta(wt_id, bus_dir=bot_bus.BUS_DIR)
+            except Exception:
+                pass
+            return 200, {
+                **res_clean,
+                "project_id": _sanitize_ipc_slug(pid, max_len=64),
+                "bot": _current_bot_handle(),
+            }
+        finally:
+            for lease in leases:
+                lease.release()
 
 
 def _studio_ipc_apply_undo(req):
@@ -11208,6 +11944,11 @@ def _execute_web_turn(web_req, *, claimed_turn_gen=None, claimed_qid=None):
                 override_workdir = p.get("workdir")
                 project = p.get("id")
                 break
+    wt_info = web_req.get("worktree_info")
+    if isinstance(wt_info, dict) and wt_info.get("active") and wt_info.get("path"):
+        wt_p = str(wt_info["path"])
+        if os.path.isdir(wt_p) and not os.path.islink(wt_p):
+            override_workdir = os.path.realpath(wt_p)
 
     def _sink(ev_type, payload):
         _studio_ipc_buffer.append(turn_id, ev_type, payload)
@@ -11227,6 +11968,7 @@ def _execute_web_turn(web_req, *, claimed_turn_gen=None, claimed_qid=None):
             override_effort=web_req.get("effort"),
             override_project=project,
             override_workdir=override_workdir,
+            override_worktree_info=wt_info,
             sync_tg=(web_req.get("sync_tg") is True),
             claimed_turn_gen=claimed_turn_gen,
             claimed_qid=claimed_qid,
@@ -11265,8 +12007,10 @@ def _start_studio_ipc():
             cancel_job_fn=_studio_ipc_cancel_job,
             run_schedule_fn=_studio_ipc_run_schedule,
             list_undo_fn=_studio_ipc_list_undo,
+            diff_undo_fn=_studio_ipc_get_undo_diff,
             apply_undo_fn=_studio_ipc_apply_undo,
             apply_redo_fn=_studio_ipc_apply_redo,
+            cleanup_worktree_fn=_studio_ipc_cleanup_worktree,
             get_bot_config_fn=_studio_ipc_get_bot_config,
             update_bot_config_fn=_studio_ipc_update_bot_config,
             reload_bot_fn=_studio_ipc_reload_bot,
@@ -11304,7 +12048,7 @@ def _stop_studio_ipc():
 
 
 def worker():
-    global turn_running, turn_running_scope, turn_running_chat, turn_running_web_id, turn_running_cid, turn_running_qid
+    global turn_running, turn_running_scope, turn_running_chat, turn_running_web_id, turn_running_cid, turn_running_worktree_id, turn_running_qid
     global turn_gen, turn_waiting_bg, turn_waiting_bg_since, turn_preempted_gen, cancel_requested
 
     while True:
@@ -11331,6 +12075,7 @@ def worker():
         # Compute effective claim scope before acquiring session_lock (zero lock nesting with job_q._cond).
         claim_scope = skey
         claim_web_id = None
+        claim_wt_id = None
         if is_chat_item and isinstance(prompt[1], dict):
             meta_pre = prompt[1]
             if str(meta_pre.get("user_role") or "admin") == "readonly":
@@ -11338,6 +12083,9 @@ def worker():
                 claim_scope = f"{skey}:ro:{ro_uid if ro_uid is not None else 'guest'}"
         elif is_web_item and isinstance(prompt[1], dict):
             claim_web_id = prompt[1].get("turn_id")
+            _wt_pre = prompt[1].get("worktree_info")
+            if isinstance(_wt_pre, dict) and _wt_pre.get("active") and _wt_pre.get("worktree_id"):
+                claim_wt_id = str(_wt_pre["worktree_id"])
         elif is_bus_item:
             claim_scope = f"bus:{prompt[1]}"
 
@@ -11352,6 +12100,7 @@ def worker():
             turn_running_chat = chat_id
             turn_running_web_id = claim_web_id
             turn_running_cid = None
+            turn_running_worktree_id = claim_wt_id
             turn_running_qid = qid
             turn_waiting_bg = False
             turn_waiting_bg_since = None
@@ -11497,6 +12246,7 @@ def worker():
                     turn_running_chat = None
                     turn_running_web_id = None
                     turn_running_cid = None
+                    turn_running_worktree_id = None
                     turn_running_qid = None
                     turn_waiting_bg = False
                     turn_waiting_bg_since = None

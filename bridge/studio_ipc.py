@@ -191,8 +191,41 @@ _ACCOUNT_ID_IPC_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
 _FORBIDDEN_ACCOUNT_ID_IPC_NAMES = frozenset({".", "..", "__proto__", "constructor", "prototype"})
 _VALID_IPC_PRIORITIES = frozenset({"normal", "urgent"})
 UNDO_ENTRY_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+WORKTREE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$")
+SHA1_HEX_RE = re.compile(r"^[0-9a-f]{40}$")
 ROOM_ID_IPC_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,31}$")
 ATTENTION_ID_IPC_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{1,63}$")
+_FORBIDDEN_CHAT_SEND_IPC_KEYS = frozenset({
+    "workdir",
+    "cwd",
+    "worktree_path",
+    "root",
+    "dir_abs",
+    "abs_path",
+    "ipc_sock",
+})
+_FORBIDDEN_WORKTREE_CLEANUP_IPC_KEYS = frozenset({
+    "workdir",
+    "cwd",
+    "worktree_path",
+    "root",
+    "path",
+    "repo_root",
+    "branch",
+    "ipc_sock",
+    "role",
+    "cmd",
+    "command",
+    "shell",
+    "script",
+})
+_ALLOWED_WORKTREE_CLEANUP_IPC_KEYS = frozenset({
+    "user_id",
+    "actor_username",
+    "worktree_id",
+    "project_id",
+    "force",
+})
 _IPC_INVISIBLE_FORMAT_RE = re.compile(r"[\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]")
 _IPC_FULLWIDTH_TAG_TRANS = str.maketrans(
     {
@@ -267,6 +300,22 @@ def is_valid_undo_entry_id(raw: Any) -> bool:
     if not isinstance(raw, str):
         return False
     return bool(UNDO_ENTRY_ID_RE.fullmatch(raw))
+
+
+def is_valid_worktree_id(raw: Any) -> bool:
+    """Strictly validate a worktree slug (`^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$`)."""
+    if not isinstance(raw, str):
+        return False
+    if ".." in raw or "/" in raw or "\\" in raw or "\x00" in raw:
+        return False
+    return bool(WORKTREE_ID_RE.fullmatch(raw))
+
+
+def is_valid_sha1_hex(raw: Any) -> bool:
+    """Strictly validate a 40-char lowercase hexadecimal SHA-1 digest."""
+    if not isinstance(raw, str):
+        return False
+    return bool(SHA1_HEX_RE.fullmatch(raw))
 
 
 def _find_forbidden_ipc_key(obj: Any, forbidden: frozenset[str], *, depth: int = 0) -> str | None:
@@ -1088,12 +1137,54 @@ class _StudioIPCHandler(http.server.BaseHTTPRequestHandler):
                     return
                 cid_arg = raw_cid
             raw_pid = ((qs.get("project_id") or [""])[0]).strip()[:128] or None
+            raw_wt = ((qs.get("worktree_id") or [""])[0]).strip()
+            wt_arg: str | None = None
+            if raw_wt:
+                if not is_valid_worktree_id(raw_wt):
+                    self._send_json(400, {"ok": False, "error": "非法的 worktree_id 格式"})
+                    return
+                wt_arg = raw_wt
             try:
-                sc_u, resp_u = self.ipc.list_undo_fn(uid, cid_arg, raw_pid)
+                if wt_arg is not None:
+                    try:
+                        sc_u, resp_u = self.ipc.list_undo_fn(uid, cid_arg, raw_pid, worktree_id=wt_arg)  # type: ignore[call-arg]
+                    except TypeError:
+                        sc_u, resp_u = self.ipc.list_undo_fn(uid, cid_arg, raw_pid)
+                else:
+                    sc_u, resp_u = self.ipc.list_undo_fn(uid, cid_arg, raw_pid)
             except Exception as exc:
                 self._send_json(500, {"ok": False, "error": f"undo_list failed: {type(exc).__name__}"})
                 return
             self._send_json(int(sc_u), resp_u)
+            return
+
+        if path == "/ipc/undo/diff":
+            raw_uid = (qs.get("user_id") or [self.headers.get("X-Bridge-User-Id") or ""])[0]
+            ok_u, uid, err_u = self._authorize_admin_user(raw_uid)
+            if not ok_u or uid is None:
+                self._send_json(403, {"ok": False, "error": err_u, "source": "bridge_ipc"})
+                return
+            if self.ipc.diff_undo_fn is None:
+                self._send_json(501, {"ok": False, "error": "undo_diff 未启用"})
+                return
+            entry_id = ((qs.get("entry_id") or [""])[0]).strip()
+            if not is_valid_undo_entry_id(entry_id):
+                self._send_json(400, {"ok": False, "error": "无效的检查点 entry_id"})
+                return
+            raw_cid = ((qs.get("cid") or [""])[0]).strip()
+            cid_arg_d: str | None = None
+            if raw_cid:
+                if not is_valid_cid(raw_cid):
+                    self._send_json(400, {"ok": False, "error": "无效的会话 ID 格式"})
+                    return
+                cid_arg_d = raw_cid
+            raw_pid_d = ((qs.get("project_id") or [""])[0]).strip()[:128] or None
+            try:
+                sc_d, resp_d = self.ipc.diff_undo_fn(uid, entry_id, cid_arg_d, raw_pid_d)
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": f"undo_diff failed: {type(exc).__name__}"})
+                return
+            self._send_json(int(sc_d), resp_d)
             return
 
         if path == "/ipc/chat/active":
@@ -1322,6 +1413,10 @@ class _StudioIPCHandler(http.server.BaseHTTPRequestHandler):
             body.pop(bad_k, None)
 
         if path == "/ipc/chat/send":
+            bad_k = _find_forbidden_ipc_key(body, _FORBIDDEN_CHAT_SEND_IPC_KEYS)
+            if bad_k is not None:
+                self._send_json(400, {"ok": False, "error": f"禁止传入受限字段: {bad_k}"})
+                return
             prompt = body.get("prompt")
             if not isinstance(prompt, str) or not prompt.strip():
                 self._send_json(400, {"ok": False, "error": "prompt 不能为空"})
@@ -1329,6 +1424,14 @@ class _StudioIPCHandler(http.server.BaseHTTPRequestHandler):
             if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
                 self._send_json(413, {"ok": False, "error": "prompt 超过 32 KiB 上限"})
                 return
+
+            worktree = False
+            if "worktree" in body:
+                raw_wt = body.get("worktree")
+                if not isinstance(raw_wt, bool):
+                    self._send_json(400, {"ok": False, "error": "worktree 必须为布尔值（true/false）"})
+                    return
+                worktree = raw_wt
 
             sync_tg = False
             if "sync_tg" in body:
@@ -1378,6 +1481,7 @@ class _StudioIPCHandler(http.server.BaseHTTPRequestHandler):
                 "model": str(body.get("model") or "").strip()[:160] or None,
                 "effort": str(body.get("effort") or "").strip().lower()[:16] or None,
                 "sync_tg": sync_tg,
+                "worktree": worktree,
                 "priority": priority_val,
                 "interrupt_current": interrupt_current,
             }
@@ -1385,6 +1489,45 @@ class _StudioIPCHandler(http.server.BaseHTTPRequestHandler):
                 status_code, resp_payload = self.ipc.enqueue_turn_fn(req)
             except Exception as exc:
                 self._send_json(500, {"ok": False, "error": f"enqueue failed: {type(exc).__name__}"})
+                return
+            self._send_json(int(status_code), resp_payload)
+            return
+
+        if path == "/ipc/worktrees/cleanup":
+            bad_k = _find_forbidden_ipc_key(body, _FORBIDDEN_WORKTREE_CLEANUP_IPC_KEYS)
+            if bad_k is not None:
+                self._send_json(400, {"ok": False, "error": f"禁止传入受限字段: {bad_k}"})
+                return
+            unknown = set(body.keys()) - _ALLOWED_WORKTREE_CLEANUP_IPC_KEYS
+            if unknown:
+                self._send_json(400, {"ok": False, "error": f"不支持的字段: {sorted(unknown)[0]}"})
+                return
+            wt_id = str(body.get("worktree_id") or "").strip()
+            if not is_valid_worktree_id(wt_id):
+                self._send_json(400, {"ok": False, "error": "非法的 worktree_id 格式"})
+                return
+            pid_wt = str(body.get("project_id") or "").strip()
+            if not pid_wt or "/" in pid_wt or "\\" in pid_wt or ".." in pid_wt or "\x00" in pid_wt:
+                self._send_json(400, {"ok": False, "error": "非法的 project_id 参数"})
+                return
+            raw_force_wt = body.get("force", False)
+            if not isinstance(raw_force_wt, bool):
+                self._send_json(400, {"ok": False, "error": "force 必须为布尔值"})
+                return
+            if self.ipc.cleanup_worktree_fn is None:
+                self._send_json(501, {"ok": False, "error": "worktree_cleanup 未启用"})
+                return
+            req_wt = {
+                "user_id": uid,
+                "actor_username": str(body.get("actor_username") or "")[:64],
+                "worktree_id": wt_id,
+                "project_id": pid_wt[:128],
+                "force": raw_force_wt,
+            }
+            try:
+                status_code, resp_payload = self.ipc.cleanup_worktree_fn(req_wt)
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": f"worktree_cleanup failed: {type(exc).__name__}"})
                 return
             self._send_json(int(status_code), resp_payload)
             return
@@ -1743,9 +1886,11 @@ class StudioIPCServer:
         abort_turn_fn: Callable[[str, int], tuple[int, dict[str, Any]]],
         cancel_job_fn: Callable[[str, int], tuple[int, dict[str, Any]]] | None = None,
         run_schedule_fn: Callable[[str, int], tuple[int, dict[str, Any]]] | None = None,
-        list_undo_fn: Callable[[int, str | None, str | None], tuple[int, dict[str, Any]]] | None = None,
+        list_undo_fn: Callable[..., tuple[int, dict[str, Any]]] | None = None,
+        diff_undo_fn: Callable[[int, str, str | None, str | None], tuple[int, dict[str, Any]]] | None = None,
         apply_undo_fn: Callable[[dict[str, Any]], tuple[int, dict[str, Any]]] | None = None,
         apply_redo_fn: Callable[[dict[str, Any]], tuple[int, dict[str, Any]]] | None = None,
+        cleanup_worktree_fn: Callable[[dict[str, Any]], tuple[int, dict[str, Any]]] | None = None,
         get_bot_config_fn: Callable[[], dict[str, Any]] | None = None,
         update_bot_config_fn: Callable[[dict[str, Any]], tuple[int, dict[str, Any]]] | None = None,
         reload_bot_fn: Callable[[int], tuple[int, dict[str, Any]]] | None = None,
@@ -1777,8 +1922,10 @@ class StudioIPCServer:
         self.cancel_job_fn = cancel_job_fn
         self.run_schedule_fn = run_schedule_fn
         self.list_undo_fn = list_undo_fn
+        self.diff_undo_fn = diff_undo_fn
         self.apply_undo_fn = apply_undo_fn
         self.apply_redo_fn = apply_redo_fn
+        self.cleanup_worktree_fn = cleanup_worktree_fn
         self.get_bot_config_fn = get_bot_config_fn
         self.update_bot_config_fn = update_bot_config_fn
         self.reload_bot_fn = reload_bot_fn
