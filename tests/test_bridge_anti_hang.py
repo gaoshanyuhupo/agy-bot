@@ -1860,7 +1860,6 @@ class TestUrgentPreemptionAndDequeueRace(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             bridge = _load_isolated_bridge(tmp, extra_env={"AGY_BUS_FAST_CHAT": "0"})
             scope_a = f"{GROUP_CHAT_ID}:{TOPIC_A}"
-            scope_b = f"{GROUP_CHAT_ID}:{TOPIC_B}"
 
             sess_a = _FakeAgySession([], cid="conv-c5-a")
             with bridge.session_lock:
