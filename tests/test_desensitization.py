@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -274,6 +275,12 @@ class TestSanitizedRuntimeBehavior(unittest.TestCase):
     def test_hooks_json_commands_run_with_custom_home(self):
         hooks_data = json.loads((REPO_ROOT / "hooks" / "hooks.json").read_text(encoding="utf-8"))
         with tempfile.TemporaryDirectory() as fake_home:
+            hooks_dir = Path(fake_home) / ".gemini" / "config" / "hooks"
+            hooks_dir.mkdir(parents=True, exist_ok=True)
+            for script in (REPO_ROOT / "hooks").glob("*.py"):
+                shutil.copy2(script, hooks_dir / script.name)
+
+            executed_commands: list[str] = []
             for _group, phases in hooks_data.items():
                 if not isinstance(phases, dict):
                     continue
@@ -281,16 +288,30 @@ class TestSanitizedRuntimeBehavior(unittest.TestCase):
                     if not isinstance(entries, list):
                         continue
                     for entry in entries:
-                        out = subprocess.check_output(
-                            ["sh", "-c", entry["command"]],
-                            env={
-                                "HOME": fake_home,
-                                "AGY_INTERNAL_OBSERVER": "1",
-                                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-                            },
-                            text=True,
+                        handlers = (
+                            entry["hooks"]
+                            if isinstance(entry, dict) and isinstance(entry.get("hooks"), list)
+                            else [entry]
                         )
-                        self.assertEqual("{}", out.strip())
+                        for handler in handlers:
+                            cmd = handler["command"]
+                            executed_commands.append(cmd)
+                            out = subprocess.check_output(
+                                ["sh", "-c", cmd],
+                                input="{}",
+                                env={
+                                    "HOME": fake_home,
+                                    "AGY_INTERNAL_OBSERVER": "1",
+                                    "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                                },
+                                text=True,
+                            )
+                            self.assertEqual("{}", out.strip())
+
+            self.assertTrue(
+                any("taint_outbound_guard.py" in cmd for cmd in executed_commands),
+                f"Expected taint_outbound_guard.py to be executed, got: {executed_commands}",
+            )
 
     def test_hook_scripts_derive_state_file_from_home(self):
         with tempfile.TemporaryDirectory() as fake_home:
@@ -300,8 +321,8 @@ class TestSanitizedRuntimeBehavior(unittest.TestCase):
             }
             code = (
                 "import sys; sys.path.insert(0, 'hooks'); "
-                "import claude_mem_hook_gate as g, rehydrate_after_compact as r; "
-                "print(g.SHIM_STATE_FILE); print(g.BUN_BIN); print(r.SHIM_STATE_FILE)"
+                "import claude_mem_hook_gate as g, rehydrate_after_compact as r, taint_outbound_guard as t; "
+                "print(g.SHIM_STATE_FILE); print(g.BUN_BIN); print(r.SHIM_STATE_FILE); print(t.TAINT_FILE)"
             )
             out = subprocess.check_output(
                 [sys.executable, "-c", code],
@@ -309,7 +330,7 @@ class TestSanitizedRuntimeBehavior(unittest.TestCase):
                 env=env,
                 text=True,
             ).splitlines()
-            self.assertEqual(3, len(out))
+            self.assertEqual(4, len(out))
             for line in out:
                 self.assertTrue(line.startswith(fake_home + "/"), f"Expected path under {fake_home}, got {line}")
 
