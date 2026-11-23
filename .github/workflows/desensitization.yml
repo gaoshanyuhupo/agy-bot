@@ -28,6 +28,9 @@ jobs:
             bridge/requirements.txt
             studio/requirements.txt
 
+      - name: Run strict public-release & Git history desensitization audit
+        run: python3 scripts/security_audit.py --mode public-release --check-history
+
       - name: Install dependencies and Ruff
         run: |
           python3 -m pip install -r bridge/requirements.txt -r studio/requirements.txt
@@ -35,9 +38,6 @@ jobs:
 
       - name: Run Ruff lint gate
         run: ruff check --no-cache .
-
-      - name: Run strict public-release & Git history desensitization audit
-        run: python3 scripts/security_audit.py --mode public-release --check-history
 
   test-matrix:
     runs-on: ubuntu-latest
