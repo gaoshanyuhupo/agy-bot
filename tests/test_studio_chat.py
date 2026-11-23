@@ -728,6 +728,7 @@ class TestPAC2C3C4StudioChatEndToEnd(unittest.IsolatedAsyncioTestCase):
         self.sources = StudioDataSources(
             bus_dir=self.bus_dir,
             brain_root=self.brain_root,
+            summaries_db=self.root / "summaries.db",
             meta_file=self.meta_file,
         )
         self.app = create_app(

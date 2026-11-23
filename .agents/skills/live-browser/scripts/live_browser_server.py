@@ -31,12 +31,14 @@ from pathlib import Path
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import time
 from typing import Any, Iterable
 import urllib.parse
+import uuid
 
 try:
     from aiohttp import FormData, MultipartReader, WSMsgType, web
@@ -68,6 +70,64 @@ CONFIG_DIR = Path(os.environ.get("AGY_LIVE_BROWSER_CONFIG_DIR", str(Path.home() 
 CONFIG_FILE = CONFIG_DIR / "config.json"
 PROFILES_FILE = CONFIG_DIR / "profiles.json"
 LOCAL_TOKEN_FILE = CONFIG_DIR / "local.token"
+SYNC_SCREENSHOTS_DIR = Path(
+    os.environ.get("AGY_LIVE_BROWSER_SYNC_SHOTS_DIR", str(CONFIG_DIR / "sync_screenshots"))
+)
+SYNC_SHOT_MAX_FILES_PER_OWNER = 12
+SYNC_SHOT_MAX_TOTAL_FILES = 32
+SYNC_SHOT_TTL_SECONDS = 1800.0
+SETTLE_RECAPTURE_DELAY_SECONDS = 0.35
+_MUTATING_HUMAN_ACTIONS = frozenset(
+    {
+        "click",
+        "dblclick",
+        "rightclick",
+        "mouseup",
+        "wheel",
+        "type",
+        "press",
+        "clear_field",
+        "goto",
+        "back",
+        "forward",
+        "reload",
+        "switch_tab",
+        "new_tab",
+        "close_tab",
+    }
+)
+_MUTATING_AI_ACTIONS = frozenset({"goto", "click", "fill", "type", "press", "scroll"})
+_SENSITIVE_QUERY_KEYS = frozenset(
+    {
+        "token",
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "auth",
+        "authorization",
+        "api_key",
+        "apikey",
+        "key",
+        "secret",
+        "client_secret",
+        "password",
+        "passwd",
+        "pwd",
+        "sig",
+        "signature",
+        "code",
+        "session",
+        "session_id",
+        "sid",
+        "jwt",
+        "cookie",
+        "credential",
+        "credentials",
+        "state",
+    }
+)
+_OPAQUE_SECRET_VAL_RE = re.compile(r"^[A-Za-z0-9._~+/-]{24,}={0,2}$")
+_SAFE_OWNER_SEG_RE = re.compile(r"^[A-Za-z0-9_-]{1,48}$")
 PROFILES_DATA_DIR = Path(
     os.environ.get("AGY_LIVE_BROWSER_PROFILES_DIR", str(Path.home() / ".local/share/camoufox-profiles"))
 )
@@ -1724,6 +1784,287 @@ def _load_auth_context() -> tuple[
     return bots, id_map, allowed_set, by_bot, roles
 
 
+def _get_sync_screenshots_root() -> Path:
+    env_override = os.environ.get("AGY_LIVE_BROWSER_SYNC_SHOTS_DIR", "").strip()
+    if env_override:
+        return Path(env_override).expanduser()
+    return SYNC_SCREENSHOTS_DIR
+
+
+def _sanitize_event_text(raw: Any, max_len: int = 600) -> str:
+    """Strip control chars, normalize whitespace, and enforce a strict upper bound."""
+    s = str(raw or "")
+    s = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    if len(s) > max_len:
+        s = s[: max(1, max_len - 1)].rstrip() + "…"
+    return s
+
+
+def _sanitize_event_url(raw_url: Any, max_len: int = 400) -> str:
+    """Strip credentials and redact sensitive query/fragment tokens from URLs before emitting events."""
+    s = _sanitize_event_text(raw_url, max_len=2048)
+    if not s:
+        return ""
+    try:
+        parts = urllib.parse.urlsplit(s)
+    except Exception:
+        return s[:max_len]
+    scheme = (parts.scheme or "").lower()
+    if scheme not in ("http", "https", "about"):
+        return s[:max_len]
+    # Strip embedded userinfo from netloc
+    netloc = parts.netloc
+    if "@" in netloc:
+        netloc = netloc.rsplit("@", 1)[-1]
+
+    def _redact_pairs(qs: str) -> str:
+        if not qs:
+            return ""
+        pairs = urllib.parse.parse_qsl(qs, keep_blank_values=True)
+        if not pairs:
+            return "[REDACTED]" if _OPAQUE_SECRET_VAL_RE.match(qs) else qs
+        cleaned: list[tuple[str, str]] = []
+        for k, v in pairs:
+            kl = k.strip().lower()
+            is_sensitive_key = kl in _SENSITIVE_QUERY_KEYS or any(
+                tok in kl for tok in ("token", "secret", "key", "auth", "pass", "sig", "jwt", "cookie", "session")
+            )
+            if is_sensitive_key or (v and _OPAQUE_SECRET_VAL_RE.match(v)):
+                cleaned.append((k, "[REDACTED]"))
+            else:
+                cleaned.append((k, v[:80]))
+        return urllib.parse.urlencode(cleaned, safe="[]")
+
+    clean_query = _redact_pairs(parts.query)
+    clean_frag = parts.fragment
+    if clean_frag and ("=" in clean_frag or _OPAQUE_SECRET_VAL_RE.match(clean_frag)):
+        clean_frag = _redact_pairs(clean_frag)
+    rebuilt = urllib.parse.urlunsplit((parts.scheme, netloc, parts.path, clean_query, clean_frag))
+    if len(rebuilt) > max_len:
+        rebuilt = rebuilt[: max(1, max_len - 1)] + "…"
+    return rebuilt
+
+
+def _sanitize_event_tabs(tabs: Any, *, max_tabs: int = 10) -> list[dict[str, Any]]:
+    if not isinstance(tabs, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for idx, t in enumerate(tabs[:max_tabs]):
+        if not isinstance(t, dict):
+            continue
+        raw_idx = t.get("index", idx)
+        tab_idx = int(raw_idx) if (isinstance(raw_idx, int) and not isinstance(raw_idx, bool)) else idx
+        out.append(
+            {
+                "index": tab_idx,
+                "title": _sanitize_event_text(t.get("title") or "", max_len=100),
+                "url": _sanitize_event_url(t.get("url") or "", max_len=200),
+                "active": bool(t.get("active")),
+            }
+        )
+    return out
+
+
+def _ensure_private_dir(path: Path) -> Path | None:
+    """Create/verify a non-symlink directory with mode 0700 (fail-closed on symlink)."""
+    if path.is_symlink():
+        log.warning("Refusing symlink sync screenshot directory: %s", path)
+        return None
+    try:
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if path.is_symlink() or not path.is_dir():
+            return None
+        os.chmod(path, 0o700)
+        return path
+    except OSError as exc:
+        log.warning("Failed to prepare sync screenshot dir %s: %s", path, exc)
+        return None
+
+
+def _cleanup_sync_screenshots(owner_dir: Path | None = None) -> None:
+    """Enforce deterministic TTL, per-owner count cap, and global count cap on sync screenshots."""
+    root = _get_sync_screenshots_root()
+    if root.is_symlink() or not root.is_dir():
+        return
+    now = time.time()
+    all_shots: list[tuple[float, str, Path]] = []
+    try:
+        subdirs = [d for d in root.iterdir() if d.is_dir() and not d.is_symlink()]
+    except OSError:
+        return
+
+    for sub in subdirs:
+        sub_shots: list[tuple[float, str, Path]] = []
+        try:
+            entries = list(sub.iterdir())
+        except OSError:
+            continue
+        for fp in entries:
+            if fp.is_symlink() or not fp.is_file():
+                continue
+            name = fp.name
+            try:
+                st = fp.lstat()
+            except OSError:
+                continue
+            if name.endswith(".tmp"):
+                if (now - st.st_mtime) > 60.0:
+                    try:
+                        fp.unlink()
+                    except OSError:
+                        pass
+                continue
+            if not name.endswith(".jpg"):
+                continue
+            if SYNC_SHOT_TTL_SECONDS > 0 and (now - st.st_mtime) > SYNC_SHOT_TTL_SECONDS:
+                try:
+                    fp.unlink()
+                except OSError:
+                    pass
+                continue
+            sub_shots.append((st.st_mtime, name, fp))
+
+        sub_shots.sort(key=lambda item: (item[0], item[1]))
+        cap_owner = max(1, int(SYNC_SHOT_MAX_FILES_PER_OWNER))
+        while len(sub_shots) > cap_owner:
+            _, _, victim = sub_shots.pop(0)
+            try:
+                victim.unlink()
+            except OSError:
+                pass
+        all_shots.extend(sub_shots)
+
+    all_shots.sort(key=lambda item: (item[0], item[1]))
+    cap_total = max(1, int(SYNC_SHOT_MAX_TOTAL_FILES))
+    while len(all_shots) > cap_total:
+        _, _, victim = all_shots.pop(0)
+        try:
+            victim.unlink()
+        except OSError:
+            pass
+
+
+def _save_sync_screenshot(
+    jpeg_bytes: bytes | None,
+    bot_key: str,
+    owner_uid: int,
+    *,
+    session_gen: int,
+    takeover_gen: int,
+    active: bool,
+) -> str | None:
+    """Atomically persist a 0600 sync screenshot inside an isolated 0700 per-owner directory."""
+    if not jpeg_bytes or not isinstance(jpeg_bytes, (bytes, bytearray)):
+        return None
+    if not bot_key or isinstance(owner_uid, bool) or not isinstance(owner_uid, int) or owner_uid <= 0:
+        return None
+    safe_bkey = re.sub(r"[^A-Za-z0-9_-]+", "", str(bot_key).strip())
+    if not safe_bkey or not _SAFE_OWNER_SEG_RE.fullmatch(safe_bkey):
+        return None
+
+    root = _ensure_private_dir(_get_sync_screenshots_root())
+    if root is None:
+        return None
+    real_root = os.path.realpath(str(root))
+    owner_seg = f"{safe_bkey}_{owner_uid}"
+    owner_dir = _ensure_private_dir(root / owner_seg)
+    if owner_dir is None:
+        return None
+    real_owner = os.path.realpath(str(owner_dir))
+    try:
+        if os.path.commonpath([real_root, real_owner]) != real_root or real_owner == real_root:
+            return None
+    except ValueError:
+        return None
+
+    tag = "tk" if active else "ai"
+    ts_ms = int(time.time() * 1000)
+    fname = f"shot_s{int(session_gen)}_t{int(takeover_gen)}_{tag}_{ts_ms}_{uuid.uuid4().hex[:6]}.jpg"
+    final_path = owner_dir / fname
+    tmp_path = owner_dir / f".{fname}.{os.getpid()}.tmp"
+    try:
+        fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(bytes(jpeg_bytes))
+                fh.flush()
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+        os.chmod(str(tmp_path), 0o600)
+        os.replace(str(tmp_path), str(final_path))
+        os.chmod(str(final_path), 0o600)
+        real_final = os.path.realpath(str(final_path))
+        if os.path.commonpath([real_owner, real_final]) != real_owner:
+            try:
+                final_path.unlink()
+            except OSError:
+                pass
+            return None
+        _cleanup_sync_screenshots(owner_dir=owner_dir)
+        return real_final
+    except Exception as exc:
+        log.warning("Failed to save sync screenshot: %s", exc)
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+        return None
+
+
+def _load_bot_bus_module() -> Any | None:
+    """Load `bot_bus` from sibling repo `bridge/` or `AGY_BRIDGE_DIR` without hardcoding handles."""
+    if "bot_bus" in sys.modules:
+        return sys.modules["bot_bus"]
+    candidates = [
+        Path(__file__).resolve().parents[4] / "bridge",
+        Path(os.environ.get("AGY_BRIDGE_DIR", str(Path.home() / "agy-tg-bridge"))),
+    ]
+    for cand in candidates:
+        if (cand / "bot_bus.py").is_file():
+            if str(cand) not in sys.path:
+                sys.path.insert(0, str(cand))
+            break
+    try:
+        import bot_bus  # type: ignore
+
+        return bot_bus
+    except Exception as exc:
+        log.warning("bot_bus module unavailable for takeover event emission: %s", exc)
+        return None
+
+
+def _resolve_target_bot_for_bus(bot_key: str) -> tuple[str | None, int | None]:
+    """Deterministically resolve `(roster_handle, bot_id)` from `bot_key` via credentials + roster (fail-closed)."""
+    if not bot_key:
+        return None, None
+    bots_by_key, _, _, _, _ = _load_auth_context()
+    token = str(bots_by_key.get(bot_key) or "").strip()
+    if ":" not in token:
+        return None, None
+    raw_bid = token.split(":", 1)[0].strip()
+    if not raw_bid.isascii() or not raw_bid.isdigit():
+        return None, None
+    bot_id = int(raw_bid)
+    if bot_id <= 0:
+        return None, None
+    bus = _load_bot_bus_module()
+    if bus is None or not hasattr(bus, "resolve_bot_by_id"):
+        return None, None
+    entry = bus.resolve_bot_by_id(bot_id)
+    if not isinstance(entry, dict):
+        return None, None
+    handle = str(entry.get("handle") or "").strip().lstrip("@").lower()
+    if not handle:
+        return None, None
+    return handle, bot_id
+
+
 def _resolve_private_chat_id(
     allowed_or_bot_key: Iterable[int] | str | None,
     preferred_user_id: int | None = None,
@@ -3195,6 +3536,9 @@ class LiveBrowserHub:
         self._hd_pending: bool = False
         self._meta_changed_pending: bool = False
         self._meta_task: asyncio.Task[None] | None = None
+        self._settle_task: asyncio.Task[None] | None = None
+        self._wait_human_waiters: int = 0
+        self._last_sync_snapshot: dict[str, Any] | None = None
 
         # Native Playwright page event state (zero page JS injection)
         self._attached_pages: set[int] = set()
@@ -3251,6 +3595,9 @@ class LiveBrowserHub:
         if self._meta_task and not self._meta_task.done() and self._meta_task is not cur_task:
             tasks.append(self._meta_task)
         self._meta_task = None
+        if self._settle_task and not self._settle_task.done() and self._settle_task is not cur_task:
+            tasks.append(self._settle_task)
+        self._settle_task = None
         for t in tasks:
             t.cancel()
         if tasks:
@@ -4177,6 +4524,207 @@ class LiveBrowserHub:
                         log.debug("Fallback mouse.up(%s) error: %s", btn, exc)
         return released
 
+    def _schedule_settle_recapture(
+        self,
+        expected_session_gen: int,
+        expected_tab_rev: int,
+        *,
+        refresh_tg: bool = True,
+        delay_seconds: float | None = None,
+    ) -> asyncio.Task[None] | None:
+        """Schedule a debounced lock-free settle recapture guarded by `(session_gen, _tab_select_rev)`."""
+        if self.engine_mode != "async_hosted" or self.ctx is None:
+            return None
+        if self.session_gen != expected_session_gen or self._tab_select_rev != expected_tab_rev:
+            return None
+        prev = self._settle_task
+        if prev is not None and not prev.done():
+            prev.cancel()
+        delay = SETTLE_RECAPTURE_DELAY_SECONDS if delay_seconds is None else max(0.0, float(delay_seconds))
+
+        async def _runner() -> None:
+            try:
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                if (
+                    self.engine_mode != "async_hosted"
+                    or self.ctx is None
+                    or self.session_gen != expected_session_gen
+                    or self._tab_select_rev != expected_tab_rev
+                ):
+                    return
+                await self._capture_once(force_broadcast=True)
+                if (
+                    self.engine_mode != "async_hosted"
+                    or self.ctx is None
+                    or self.session_gen != expected_session_gen
+                    or self._tab_select_rev != expected_tab_rev
+                ):
+                    return
+                await self._catchup_lagging_viewers(send_state=True)
+                if refresh_tg:
+                    await self.tg.tick_updates(force=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.debug("Settle recapture skipped: %s", exc)
+
+        try:
+            task = asyncio.create_task(_runner())
+        except RuntimeError:
+            return None
+        self._settle_task = task
+        self._track_bg_task(task)
+        return task
+
+    async def _capture_page_summary_bounded(
+        self,
+        expected_session_gen: int,
+        expected_tab_rev: int,
+    ) -> str:
+        """Capture bounded sanitized visible page text (lock-free, generation-guarded)."""
+        if (
+            self.engine_mode != "async_hosted"
+            or self.ctx is None
+            or self.session_gen != expected_session_gen
+            or self._tab_select_rev != expected_tab_rev
+        ):
+            return ""
+        page = self._current_page()
+        if page is None or not hasattr(page, "evaluate"):
+            return ""
+        try:
+            raw_txt = await asyncio.wait_for(
+                page.evaluate(
+                    "() => (document.body && document.body.innerText || '').trim().slice(0, 1200)"
+                ),
+                timeout=0.8,
+            )
+            if (
+                self.engine_mode != "async_hosted"
+                or self.session_gen != expected_session_gen
+                or self._tab_select_rev != expected_tab_rev
+            ):
+                return ""
+            return _sanitize_event_text(raw_txt or "", max_len=600)
+        except Exception:
+            return ""
+
+    async def _collect_sync_snapshot(
+        self,
+        *,
+        owner_bot_key: str,
+        owner_uid: int,
+        session_gen: int,
+        takeover_gen: int,
+        active: bool,
+    ) -> dict[str, Any]:
+        """Persist fresh sync screenshot and collect sanitized bounded page state."""
+        tab_rev = self._tab_select_rev
+        shot_path = _save_sync_screenshot(
+            self.latest_jpeg,
+            owner_bot_key,
+            owner_uid,
+            session_gen=session_gen,
+            takeover_gen=takeover_gen,
+            active=active,
+        )
+        page_summary = await self._capture_page_summary_bounded(session_gen, tab_rev)
+        snap = {
+            "session_gen": int(session_gen),
+            "takeover_gen": int(takeover_gen),
+            "active": bool(active),
+            "screenshot_path": shot_path or "",
+            "url": _sanitize_event_url(self.url, max_len=400),
+            "title": _sanitize_event_text(self.title, max_len=160),
+            "tabs": _sanitize_event_tabs(self.tabs),
+            "page_summary": page_summary,
+            "ts": time.time(),
+        }
+        self._last_sync_snapshot = snap
+        return snap
+
+    async def _emit_takeover_bus_event(
+        self,
+        *,
+        active: bool,
+        session_gen: int,
+        takeover_gen: int,
+        reason: str,
+        source: str,
+        owner_hint: tuple[str, int | None] | None,
+        wait_human_active: bool,
+        engine_mode: str,
+    ) -> dict[str, Any] | None:
+        """Persist sync screenshot and atomically enqueue `live_browser_takeover_event` (fail-closed)."""
+        if not owner_hint or not owner_hint[0]:
+            log.info("Takeover bus event skipped (no verified session owner)")
+            return None
+        owner_bot_key = str(owner_hint[0]).strip()
+        raw_uid = owner_hint[1]
+        if isinstance(raw_uid, bool) or not isinstance(raw_uid, int) or raw_uid <= 0:
+            log.info("Takeover bus event skipped (invalid owner_uid=%r)", raw_uid)
+            return None
+        owner_uid = int(raw_uid)
+        live_role = _check_live_user_role(owner_bot_key, owner_uid)
+        if live_role != "admin":
+            log.warning(
+                "Takeover bus event blocked (RBAC not admin: bot=%s uid=%s role=%s)",
+                owner_bot_key,
+                owner_uid,
+                live_role,
+            )
+            return None
+
+        snap = await self._collect_sync_snapshot(
+            owner_bot_key=owner_bot_key,
+            owner_uid=owner_uid,
+            session_gen=session_gen,
+            takeover_gen=takeover_gen,
+            active=active,
+        )
+
+        target_handle, target_bot_id = _resolve_target_bot_for_bus(owner_bot_key)
+        if not target_handle or not target_bot_id:
+            log.warning(
+                "Takeover bus event fail-closed: unable to uniquely resolve bot_key=%r via roster.json",
+                owner_bot_key,
+            )
+            return None
+
+        bus = _load_bot_bus_module()
+        if bus is None or not hasattr(bus, "enqueue_live_browser_takeover_event"):
+            log.warning("Takeover bus event fail-closed: bot_bus unavailable")
+            return None
+
+        event = {
+            "type": "live_browser_takeover_event",
+            "session_gen": int(session_gen),
+            "takeover_gen": int(takeover_gen),
+            "active": bool(active),
+            "reason": _sanitize_event_text(reason, max_len=240),
+            "source": _sanitize_event_text(source or "unknown", max_len=48),
+            "owner_uid": owner_uid,
+            "chat_id": owner_uid,
+            "owner_bot": target_handle,
+            "owner_bot_id": int(target_bot_id),
+            "owner_bot_key": owner_bot_key,
+            "wait_human_active": bool(wait_human_active),
+            "engine_mode": _sanitize_event_text(engine_mode, max_len=32),
+            "screenshot_path": snap["screenshot_path"],
+            "url": snap["url"],
+            "title": snap["title"],
+            "tabs": snap["tabs"],
+            "page_summary": snap["page_summary"],
+            "ts": snap["ts"],
+        }
+        try:
+            bus.enqueue_live_browser_takeover_event(target_handle, event)
+            return event
+        except Exception as exc:
+            log.warning("Failed to enqueue live_browser_takeover_event to @%s: %s", target_handle, exc)
+            return None
+
     async def set_takeover(
         self,
         active: bool,
@@ -4188,6 +4736,8 @@ class LiveBrowserHub:
         actor: tuple[str, int] | None = None,
         card_message_id: int | None = None,
         require_card: bool = False,
+        source: str = "",
+        emit_bus_event: bool = True,
     ) -> tuple[bool, str, int, int]:
         want_active = bool(active)
         async with self._takeover_lock:
@@ -4216,6 +4766,11 @@ class LiveBrowserHub:
                         return False, "当前用户未授权或权限已撤销", self.session_gen, self.takeover_gen
                     if not self._viewer_can_control_takeover(a_bot, a_uid, live_role):
                         return False, "🔒 当前浏览器会话由其他 Bot/用户持有，无权接管或释放", self.session_gen, self.takeover_gen
+
+            prev_takeover = bool(self.takeover)
+            prev_owner = self.takeover_owner or self.session_owner
+            wait_human_active = self._wait_human_waiters > 0
+            snap_engine_mode = self.engine_mode
 
             self.mark_active()
             if want_active:
@@ -4263,8 +4818,33 @@ class LiveBrowserHub:
                 self.ai_allowed_event.set()
             res_sgen = self.session_gen
             res_tgen = self.takeover_gen
+            res_tab_rev = self._tab_select_rev
+            state_changed = want_active != prev_takeover
+            event_owner: tuple[str, int | None] | None = (
+                actor
+                if actor is not None
+                else (self.takeover_owner if want_active else (prev_owner or self.session_owner))
+            )
+            eff_reason = self.takeover_reason if want_active else (reason or "人类已完成接管并交还给 AI")
+            eff_source = source or ("tg_card" if require_card else ("miniapp_ws" if actor is not None else "internal"))
+
+        # Lock-free post-transition frame sync, settle recapture, TG card force refresh & bus wakeup
         await self.broadcast_state()
-        asyncio.create_task(self.tg.tick_updates(force=True))
+        if self.engine_mode == "async_hosted" and self.ctx is not None and self.session_gen == res_sgen:
+            await self._capture_once(force_broadcast=True)
+            self._schedule_settle_recapture(res_sgen, res_tab_rev, refresh_tg=True)
+        self._track_bg_task(asyncio.create_task(self.tg.tick_updates(force=True)))
+        if state_changed and emit_bus_event and snap_engine_mode != "idle":
+            await self._emit_takeover_bus_event(
+                active=want_active,
+                session_gen=res_sgen,
+                takeover_gen=res_tgen,
+                reason=eff_reason,
+                source=eff_source,
+                owner_hint=event_owner,
+                wait_human_active=wait_human_active,
+                engine_mode=snap_engine_mode,
+            )
         return True, "ok", res_sgen, res_tgen
 
     async def release_takeover_on_disconnect(
@@ -4288,6 +4868,12 @@ class LiveBrowserHub:
         if not had_admin_role:
             return False
         released = False
+        rel_sgen = 0
+        rel_tgen = 0
+        rel_tab_rev = 0
+        rel_owner: tuple[str, int] | None = None
+        rel_wait_human_active = False
+        rel_engine_mode = "idle"
         async with self._takeover_lock:
             if not self.takeover:
                 return False
@@ -4305,6 +4891,8 @@ class LiveBrowserHub:
             if self._has_eligible_admin_viewer(t_bot, int(t_uid)):
                 return False
             # Perform formal takeover release atomically while holding `_takeover_lock`
+            rel_wait_human_active = self._wait_human_waiters > 0
+            rel_engine_mode = self.engine_mode
             self.mark_active()
             self.takeover_gen += 1
             self.takeover = False
@@ -4338,9 +4926,27 @@ class LiveBrowserHub:
                 reason,
             )
             released = True
+            rel_sgen = self.session_gen
+            rel_tgen = self.takeover_gen
+            rel_tab_rev = self._tab_select_rev
+            rel_owner = (t_bot, int(t_uid))
         if released:
             await self.broadcast_state()
-            asyncio.create_task(self.tg.tick_updates(force=True))
+            if self.engine_mode == "async_hosted" and self.ctx is not None and self.session_gen == rel_sgen:
+                await self._capture_once(force_broadcast=True)
+                self._schedule_settle_recapture(rel_sgen, rel_tab_rev, refresh_tg=True)
+            self._track_bg_task(asyncio.create_task(self.tg.tick_updates(force=True)))
+            if rel_engine_mode != "idle" and rel_owner is not None:
+                await self._emit_takeover_bus_event(
+                    active=False,
+                    session_gen=rel_sgen,
+                    takeover_gen=rel_tgen,
+                    reason=reason,
+                    source="disconnect_auto_release",
+                    owner_hint=rel_owner,
+                    wait_human_active=rel_wait_human_active,
+                    engine_mode=rel_engine_mode,
+                )
         return released
 
     async def wait_until_ai_allowed(self, timeout: float = 900.0) -> None:
@@ -6435,6 +7041,10 @@ class LiveBrowserHub:
                         log.info("Idle timeout reached, releasing hosted browser")
                         await self.stop_hosted(notify_finished=True)
                     await asyncio.sleep(self._compute_capture_sleep(has_viewers, changed, time.monotonic()))
+                elif self.engine_mode == "sync_external":
+                    if self.viewers:
+                        await self._catchup_lagging_viewers(send_state=True)
+                    await asyncio.sleep(0.25)
                 else:
                     await asyncio.sleep(0.4)
             except asyncio.CancelledError:
@@ -6454,6 +7064,7 @@ class LiveBrowserHub:
                 if (now - last_cleanup) >= 60.0:
                     last_cleanup = now
                     self._cleanup_transfer_dir(force_all=False)
+                    _cleanup_sync_screenshots()
                     await self._cleanup_pending_filechoosers_async(page_id=-1)
                 await asyncio.sleep(1.2)
             except asyncio.CancelledError:
@@ -6703,6 +7314,12 @@ class LiveBrowserHub:
         exec_state: dict[str, Any] | None = None,
     ) -> None:
         post_exec_cleanup_task: asyncio.Task[Any] | None = None
+        post_capture_needed = False
+        post_capture_force = False
+        post_broadcast_state = False
+        post_schedule_settle = False
+        post_sgen = 0
+        post_tab_rev = 0
         async with self._exec_lock:
             if not await self._enforce_human_cmd_live_auth_locked(cmd):
                 await self._send_tab_cmd_rejected(cmd, "unauthorized")
@@ -6755,10 +7372,10 @@ class LiveBrowserHub:
                         except Exception as exc:
                             log.debug("Post-mousedown fallback mouse.up(%s) error: %s", button, exc)
                 if self._is_human_cmd_still_valid(cmd, check_live_rbac=True):
-                    await self._capture_once()
-                return
-
-            if act == "mouseup":
+                    post_capture_needed = True
+                    post_sgen = self.session_gen
+                    post_tab_rev = self._tab_select_rev
+            elif act == "mouseup":
                 x = float(cmd.get("x", 0))
                 y = float(cmd.get("y", 0))
                 button = str(cmd.get("button") or "left")
@@ -6772,23 +7389,25 @@ class LiveBrowserHub:
                 self._mouse_buttons_down.discard(button)
                 await page.mouse.up(button=button)
                 if self._is_human_cmd_still_valid(cmd, check_live_rbac=True):
-                    await self._capture_once()
-                    if self._is_human_cmd_still_valid(cmd, check_live_rbac=True):
-                        await self.broadcast_state()
-                return
-
-            if act == "rightclick":
+                    post_capture_needed = True
+                    post_capture_force = True
+                    post_broadcast_state = True
+                    post_schedule_settle = True
+                    post_sgen = self.session_gen
+                    post_tab_rev = self._tab_select_rev
+            elif act == "rightclick":
                 x = float(cmd.get("x", 0))
                 y = float(cmd.get("y", 0))
                 self.cursor = {"x": x, "y": y, "actor": "human", "kind": "rightclick", "ts": time.time()}
                 await page.mouse.click(x, y, button="right")
                 if self._is_human_cmd_still_valid(cmd, check_live_rbac=True):
-                    await self._capture_once()
-                    if self._is_human_cmd_still_valid(cmd, check_live_rbac=True):
-                        await self.broadcast_state()
-                return
-
-            if act in ("click", "dblclick"):
+                    post_capture_needed = True
+                    post_capture_force = True
+                    post_broadcast_state = True
+                    post_schedule_settle = True
+                    post_sgen = self.session_gen
+                    post_tab_rev = self._tab_select_rev
+            elif act in ("click", "dblclick"):
                 x = float(cmd.get("x", 0))
                 y = float(cmd.get("y", 0))
                 self.cursor = {"x": x, "y": y, "actor": "human", "kind": act, "ts": time.time()}
@@ -7050,10 +7669,44 @@ class LiveBrowserHub:
                 if tab_cmd_id:
                     self._queue_pending_tab_cmd_id(tab_cmd_id)
 
-            if post_exec_cleanup_task is None and self._is_human_cmd_still_valid(cmd, check_live_rbac=True):
-                await self._capture_once()
-                if self._is_human_cmd_still_valid(cmd, check_live_rbac=True):
-                    await self.broadcast_state()
+            if (
+                post_exec_cleanup_task is None
+                and not post_capture_needed
+                and self._is_human_cmd_still_valid(cmd, check_live_rbac=True)
+            ):
+                post_capture_needed = True
+                # Preserve static pixel-identical dedup on immediate `switch_tab` while still
+                # running delayed settle recapture and forced TG Live Card refresh.
+                post_capture_force = act in _MUTATING_HUMAN_ACTIONS and act != "switch_tab"
+                post_broadcast_state = True
+                post_schedule_settle = act in _MUTATING_HUMAN_ACTIONS
+                post_sgen = self.session_gen
+                post_tab_rev = self._tab_select_rev
+
+        # Post-action capture, state broadcast, settle recapture, and TG live card refresh run
+        # strictly OUTSIDE `_exec_lock` to eliminate lock contention / deadlocks.
+        if (
+            post_capture_needed
+            and post_exec_cleanup_task is None
+            and self.session_gen == post_sgen
+            and self._tab_select_rev == post_tab_rev
+            and self._is_human_cmd_still_valid(cmd, check_live_rbac=True)
+        ):
+            await self._capture_once(force_broadcast=post_capture_force)
+            if (
+                post_broadcast_state
+                and self.session_gen == post_sgen
+                and self._tab_select_rev == post_tab_rev
+                and self._is_human_cmd_still_valid(cmd, check_live_rbac=True)
+            ):
+                await self.broadcast_state()
+            if (
+                post_schedule_settle
+                and self.session_gen == post_sgen
+                and self._tab_select_rev == post_tab_rev
+            ):
+                self._schedule_settle_recapture(post_sgen, post_tab_rev, refresh_tg=True)
+                self._track_bg_task(asyncio.create_task(self.tg.tick_updates(force=True)))
 
         # Await deduplicated fail-closed close/teardown strictly AFTER releasing `_exec_lock`
         # so `_stop_hosted_locked()` can acquire `_exec_lock` to release held mouse buttons with zero deadlock!
@@ -7180,37 +7833,45 @@ class LiveBrowserHub:
                     **_safe_action_state(active_sgen),
                 }
 
-            ok_tk, err_tk, tk_sgen, tk_tgen = await self.set_takeover(
-                True,
-                reason=reason,
-                owner=self.session_owner,
-                expected_session_gen=active_sgen,
-                actor=actor_arg,
-            )
-            if not ok_tk:
-                raise PermissionError(err_tk)
-
+            self._wait_human_waiters += 1
             try:
-                await asyncio.wait_for(self.ai_allowed_event.wait(), timeout=timeout)
-            except (asyncio.TimeoutError, TimeoutError):
-                # Clean up ONLY the exact (session_gen, takeover_gen) we acquired so a concurrent
-                # newer session or newer takeover generation is never clobbered.
-                await self.set_takeover(
-                    False,
-                    reason=f"等待人工交还超时（{timeout:g}s），已自动清理接管状态",
-                    expected_session_gen=tk_sgen,
-                    expected_takeover_gen=tk_tgen,
+                ok_tk, err_tk, tk_sgen, tk_tgen = await self.set_takeover(
+                    True,
+                    reason=reason,
+                    owner=self.session_owner,
+                    expected_session_gen=active_sgen,
+                    actor=actor_arg,
+                    source="wait_human",
+                    emit_bus_event=False,
                 )
-                return {
-                    "ok": False,
-                    "resumed": False,
-                    "timeout": True,
-                    "owner_bound": owner_bound,
-                    "card_sent": card_sent,
-                    "card_error": card_error,
-                    "error": f"等待人工交还超时（{timeout:g}s）",
-                    **_safe_action_state(tk_sgen),
-                }
+                if not ok_tk:
+                    raise PermissionError(err_tk)
+
+                try:
+                    await asyncio.wait_for(self.ai_allowed_event.wait(), timeout=timeout)
+                except (asyncio.TimeoutError, TimeoutError):
+                    # Clean up ONLY the exact (session_gen, takeover_gen) we acquired so a concurrent
+                    # newer session or newer takeover generation is never clobbered.
+                    await self.set_takeover(
+                        False,
+                        reason=f"等待人工交还超时（{timeout:g}s），已自动清理接管状态",
+                        expected_session_gen=tk_sgen,
+                        expected_takeover_gen=tk_tgen,
+                        source="wait_human_timeout",
+                        emit_bus_event=False,
+                    )
+                    return {
+                        "ok": False,
+                        "resumed": False,
+                        "timeout": True,
+                        "owner_bound": owner_bound,
+                        "card_sent": card_sent,
+                        "card_error": card_error,
+                        "error": f"等待人工交还超时（{timeout:g}s）",
+                        **_safe_action_state(tk_sgen),
+                    }
+            finally:
+                self._wait_human_waiters = max(0, self._wait_human_waiters - 1)
 
             if self.engine_mode == "idle" or self.session_gen != tk_sgen:
                 return {
@@ -7234,13 +7895,46 @@ class LiveBrowserHub:
                     **self._redacted_state_dict(),
                 }
 
-            await self._capture_once()
+            await self._capture_once(force_broadcast=True)
+            self._schedule_settle_recapture(tk_sgen, self._tab_select_rev, refresh_tg=True)
+            self._track_bg_task(asyncio.create_task(self.tg.tick_updates(force=True)))
+
+            sync_shot_path = ""
+            page_summary = ""
+            cached_snap = self._last_sync_snapshot
+            if (
+                isinstance(cached_snap, dict)
+                and cached_snap.get("session_gen") == tk_sgen
+                and cached_snap.get("takeover_gen") == self.takeover_gen
+                and cached_snap.get("active") is False
+            ):
+                sync_shot_path = str(cached_snap.get("screenshot_path") or "")
+                page_summary = str(cached_snap.get("page_summary") or "")
+            else:
+                if self.session_owner is not None:
+                    o_bot, o_uid = self.session_owner
+                    if o_bot and o_uid is not None and not isinstance(o_uid, bool) and int(o_uid) > 0:
+                        sync_shot_path = (
+                            _save_sync_screenshot(
+                                self.latest_jpeg,
+                                o_bot,
+                                int(o_uid),
+                                session_gen=tk_sgen,
+                                takeover_gen=self.takeover_gen,
+                                active=False,
+                            )
+                            or ""
+                        )
+                page_summary = await self._capture_page_summary_bounded(tk_sgen, self._tab_select_rev)
+
             return {
                 "ok": True,
                 "resumed": True,
                 "owner_bound": owner_bound,
                 "card_sent": card_sent,
                 "card_error": card_error,
+                "screenshot_path": sync_shot_path,
+                "page_summary": page_summary,
                 **_safe_action_state(tk_sgen),
             }
 
@@ -7423,12 +8117,17 @@ class LiveBrowserHub:
                             raise ValueError(f"Unknown AI action: {action}")
                         break
 
-            await self._capture_once()
+            is_mutating_ai = action in _MUTATING_AI_ACTIONS
+            cap_sgen = self.session_gen
+            cap_tab_rev = self._tab_select_rev
+            await self._capture_once(force_broadcast=is_mutating_ai)
+            if is_mutating_ai and self.session_gen == cap_sgen and self._tab_select_rev == cap_tab_rev:
+                self._schedule_settle_recapture(cap_sgen, cap_tab_rev, refresh_tg=True)
         finally:
             # Decrement ai_busy_count BEFORE broadcasting final state so clients see `ai_busy=False`
             self.ai_busy_count = max(0, self.ai_busy_count - 1)
             await self.broadcast_state()
-        asyncio.create_task(self.tg.tick_updates(force=False))
+        self._track_bg_task(asyncio.create_task(self.tg.tick_updates(force=(action in _MUTATING_AI_ACTIONS))))
         if _should_redact_tg_state(active_sgen):
             return {"ok": True, **result_data, **self._redacted_state_dict()}
         return {"ok": True, **result_data, "url": self.url, "title": self.title}
@@ -7538,6 +8237,8 @@ async def _ws_launch_or_switch(
                 expected_session_gen=started_sgen,
                 expected_takeover_gen=started_tgen,
                 actor=actor,
+                source="miniapp_start",
+                emit_bus_event=False,
             )
     except (PermissionError, ValueError, KeyError, FileNotFoundError, RuntimeError, TimeoutError) as exc:
         await _ws_send_json(ws, {"type": "toast", "message": str(exc)})
@@ -7913,6 +8614,7 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                     expected_session_gen=cli_sgen,
                     expected_takeover_gen=cli_tgen,
                     actor=(bot_key, user_id),
+                    source="miniapp_ws",
                 )
                 if not ok_tk and not req_id:
                     await _ws_send_json(ws, {"type": "toast", "message": err_tk})
@@ -9073,6 +9775,7 @@ async def internal_takeover(request: web.Request) -> web.Response:
         actor=actor_arg,
         card_message_id=auth_ctx.get("message_id"),
         require_card=bool(auth_ctx.get("from_card")),
+        source=str(auth_ctx.get("source") or ("tg_card" if auth_ctx.get("from_card") else "internal_takeover")),
     )
     if not ok_tk:
         return web.json_response({"ok": False, "error": err_tk}, status=403)
@@ -9537,6 +10240,8 @@ async def internal_config(request: web.Request) -> web.Response:
             reason=reason_txt,
             expected_session_gen=rb_sgen,
             expected_takeover_gen=rb_tgen,
+            source="rollback_takeover",
+            emit_bus_event=False,
         )
 
     if "public_url" in body:
@@ -9569,6 +10274,7 @@ async def internal_config(request: web.Request) -> web.Response:
             actor=actor_arg,
             card_message_id=auth_ctx.get("message_id"),
             require_card=bool(auth_ctx.get("from_card")),
+            source=str(auth_ctx.get("source") or ("tg_card" if auth_ctx.get("from_card") else "internal_config")),
         )
         if not ok_tk:
             err_msg = "当前操作未获授权，请前往私聊查看与操作" if is_group_scope else err_tk

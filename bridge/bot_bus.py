@@ -559,6 +559,106 @@ def resolve_target_bot(query: str, roster: Optional[List[Dict[str, Any]]] = None
     raise ValueError(f"Unknown or ambiguous bot '{query}'. Known bots: {known}")
 
 
+def resolve_bot_by_id(bot_id: Any) -> Optional[Dict[str, Any]]:
+    """Deterministically resolve a unique bot roster entry by numeric Telegram `bot_id` (fail-closed).
+
+    Returns the merged bot view dict ONLY when exactly one unique normalized handle in `roster.json`
+    matches the strict positive integer `bot_id`. Returns `None` on invalid ID, 0 matches, or >1 ambiguous matches.
+    """
+    if isinstance(bot_id, bool) or bot_id is None:
+        return None
+    if isinstance(bot_id, int):
+        target_id = bot_id
+    elif isinstance(bot_id, str):
+        raw = bot_id.strip()
+        if not raw or not raw.isascii() or not raw.isdigit():
+            return None
+        target_id = int(raw)
+    else:
+        return None
+    if target_id <= 0:
+        return None
+
+    now = time.time()
+    with _bus_lock():
+        roster = _read_json(ROSTER_FILE, {"bots": {}})
+        cfg = _load_team_config_unlocked()
+    r_bots = roster.get("bots") if isinstance(roster, dict) else {}
+    if not isinstance(r_bots, dict):
+        return None
+    c_bots = cfg.get("bots") if isinstance(cfg, dict) else {}
+    team_mirror = cfg.get("mirror") if isinstance(cfg.get("mirror"), dict) else {}
+
+    matches: List[Dict[str, Any]] = []
+    seen_handles: set[str] = set()
+    for raw_h, raw_entry in r_bots.items():
+        if not isinstance(raw_entry, dict):
+            continue
+        raw_bid = raw_entry.get("bot_id")
+        if isinstance(raw_bid, bool) or raw_bid is None:
+            continue
+        try:
+            bid_int = int(raw_bid)
+        except (TypeError, ValueError):
+            continue
+        if bid_int != target_id:
+            continue
+        norm_h = normalize_handle(str(raw_entry.get("handle") or raw_h or ""))
+        if not norm_h or norm_h in seen_handles:
+            continue
+        seen_handles.add(norm_h)
+        matches.append(_merge_bot_view(norm_h, raw_entry, (c_bots or {}).get(norm_h), now, team_mirror=team_mirror))
+
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def enqueue_live_browser_takeover_event(target_bot: str, event: Dict[str, Any]) -> str:
+    """Atomically enqueue a validated `live_browser_takeover_event` packet onto `target_bot`'s inbox."""
+    norm_target = normalize_handle(target_bot)
+    if not norm_target:
+        raise ValueError("Target bot handle is required")
+    if not isinstance(event, dict):
+        raise ValueError("Event payload must be a dict")
+    raw_uid = event.get("owner_uid")
+    raw_cid = event.get("chat_id")
+    if (
+        isinstance(raw_uid, bool)
+        or not isinstance(raw_uid, int)
+        or raw_uid <= 0
+        or isinstance(raw_cid, bool)
+        or not isinstance(raw_cid, int)
+        or raw_cid != raw_uid
+    ):
+        raise ValueError("live_browser_takeover_event requires chat_id == owner_uid > 0")
+    raw_sgen = event.get("session_gen")
+    raw_tgen = event.get("takeover_gen")
+    if (
+        isinstance(raw_sgen, bool)
+        or not isinstance(raw_sgen, int)
+        or raw_sgen < 0
+        or isinstance(raw_tgen, bool)
+        or not isinstance(raw_tgen, int)
+        or raw_tgen < 0
+    ):
+        raise ValueError("live_browser_takeover_event requires non-negative integer session_gen and takeover_gen")
+    if not isinstance(event.get("active"), bool):
+        raise ValueError("live_browser_takeover_event requires boolean active")
+
+    packet = dict(event)
+    packet["type"] = "live_browser_takeover_event"
+    packet["owner_bot"] = norm_target
+    packet["owner_uid"] = raw_uid
+    packet["chat_id"] = raw_cid
+    packet["thread_id"] = None
+    packet["session_gen"] = raw_sgen
+    packet["takeover_gen"] = raw_tgen
+    packet.setdefault("ts", time.time())
+    with _bus_lock():
+        return _drop_inbox_packet_unlocked(norm_target, packet)
+
+
 # ---------------------------------------------------------------- inbox packets & jobs
 def _job_path(job_id: str) -> str:
     safe_id = re.sub(r"[^a-zA-Z0-9_.-]+", "", job_id)

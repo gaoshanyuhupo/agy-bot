@@ -284,7 +284,7 @@ class TestSanitizedRuntimeBehavior(unittest.TestCase):
             for _group, phases in hooks_data.items():
                 if not isinstance(phases, dict):
                     continue
-                for _phase, entries in phases.items():
+                for phase, entries in phases.items():
                     if not isinstance(entries, list):
                         continue
                     for entry in entries:
@@ -296,7 +296,7 @@ class TestSanitizedRuntimeBehavior(unittest.TestCase):
                         for handler in handlers:
                             cmd = handler["command"]
                             executed_commands.append(cmd)
-                            out = subprocess.check_output(
+                            res = subprocess.run(
                                 ["sh", "-c", cmd],
                                 input="{}",
                                 env={
@@ -304,9 +304,23 @@ class TestSanitizedRuntimeBehavior(unittest.TestCase):
                                     "AGY_INTERNAL_OBSERVER": "1",
                                     "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
                                 },
+                                capture_output=True,
                                 text=True,
                             )
-                            self.assertEqual("{}", out.strip())
+                            self.assertEqual(
+                                0,
+                                res.returncode,
+                                f"Hook command failed (phase={phase}): {cmd}\nstderr={res.stderr}",
+                            )
+                            out = res.stdout
+                            if phase == "PreToolUse" or "taint_outbound_guard.py" in cmd:
+                                self.assertEqual(
+                                    "",
+                                    out.strip(),
+                                    f"PreToolUse pass-through must emit empty output, got: {out!r}",
+                                )
+                            else:
+                                self.assertEqual("{}", out.strip())
 
             self.assertTrue(
                 any("taint_outbound_guard.py" in cmd for cmd in executed_commands),

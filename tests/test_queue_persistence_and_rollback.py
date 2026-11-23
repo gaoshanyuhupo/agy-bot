@@ -556,6 +556,121 @@ class TestHotReloadSelfCheckAndAutoRollback(unittest.TestCase):
             self.assertEqual([(111, "after failed reload")], consumed_prompts)
             self.assertFalse(t.is_alive())
 
+    def test_c9b_sync_live_dual_hooks_canary_zero_write_abort_auto_rollback_and_verify_hooks(self):
+        """C9b: Pre-deploy canary aborts with 0 bytes written; post-deploy failure auto-rollbacks; verify-hooks is read-only."""
+        if not (SCRIPTS_DIR / "sync_live.py").is_file():
+            self.skipTest("scripts/sync_live.py is private-only and absent in public export")
+        with tempfile.TemporaryDirectory(prefix="sync_live_c9b_") as tmp:
+            root = Path(tmp)
+            fake_repo = root / "repo"
+            fake_home = root / "home"
+            live_hooks_dir = fake_home / ".gemini/config/hooks"
+            live_bridge_dir = fake_home / "agy-tg-bridge"
+            backup_root = fake_home / ".gemini/antigravity-cli/cache/deploy_backups"
+            live_hooks_dir.mkdir(parents=True)
+            live_bridge_dir.mkdir(parents=True)
+            (fake_repo / "hooks").mkdir(parents=True)
+            (fake_repo / "bridge").mkdir(parents=True)
+
+            # Seed repo candidate hooks + memory_guard
+            shutil.copy2(REPO_ROOT / "hooks/hooks.json", fake_repo / "hooks/hooks.json")
+            shutil.copy2(REPO_ROOT / "hooks/taint_outbound_guard.py", fake_repo / "hooks/taint_outbound_guard.py")
+            shutil.copy2(BRIDGE_DIR / "memory_guard.py", fake_repo / "bridge/memory_guard.py")
+
+            # Seed pre-existing live hooks (V1)
+            live_hooks_json = fake_home / ".gemini/config/hooks.json"
+            live_guard_py = live_hooks_dir / "taint_outbound_guard.py"
+            v1_hooks_content = json.dumps({"taint-outbound-guard": {"enabled": False, "PreToolUse": []}}, indent=2) + "\n"
+            v1_guard_content = "# LIVE_V1_GUARD\nprint('')\n"
+            live_hooks_json.write_text(v1_hooks_content, encoding="utf-8")
+            live_guard_py.write_text(v1_guard_content, encoding="utf-8")
+
+            env_patch = {
+                "AGY_LIVE_HOME": str(fake_home),
+                "AGY_DEPLOY_BACKUP_DIR": str(backup_root),
+                "AGY_DEPLOY_BACKUP_KEEP": "5",
+            }
+            with mock.patch.dict(os.environ, env_patch, clear=False):
+                import sync_live  # noqa: E402
+
+                importlib.reload(sync_live)
+                sync_live.REPO_ROOT = fake_repo
+                sync_live.HOME = fake_home
+                sync_live.MAPPINGS = [
+                    ("hooks/hooks.json", live_hooks_json, "file", True),
+                    ("hooks/taint_outbound_guard.py", live_guard_py, "file", True),
+                    ("bridge/memory_guard.py", live_bridge_dir / "memory_guard.py", "file", True),
+                ]
+
+                ns = type(
+                    "Args",
+                    (),
+                    {"systemd": False, "reload_bridges": False, "no_reload": True, "verify": False, "verify_timeout": 5},
+                )()
+
+                # 1. Pre-deploy isolated canary FAILS -> exit != 0, 0 bytes written to ~/.gemini/config/
+                pre_fail_res = {"status": "fail", "ok": False, "summary": "candidate emitted {}"}
+                with (
+                    mock.patch.object(sync_live, "audit_secrets", return_value=0),
+                    mock.patch.object(sync_live, "_run_hooks_canary", return_value=pre_fail_res) as m_canary,
+                ):
+                    rc_pre = sync_live.cmd_deploy(ns)
+                self.assertEqual(1, rc_pre)
+                m_canary.assert_called_once()
+                self.assertFalse(m_canary.call_args.kwargs["live_mode"])
+                # Strictly 0 bytes written to live ~/.gemini/config/
+                self.assertEqual(v1_hooks_content, live_hooks_json.read_text(encoding="utf-8"))
+                self.assertEqual(v1_guard_content, live_guard_py.read_text(encoding="utf-8"))
+                self.assertFalse((live_bridge_dir / "memory_guard.py").exists())
+
+                # 2. Pre-deploy passes, Post-deploy live canary FAILS -> auto-rollback restores V1 completely!
+                canary_seq = [
+                    {"status": "pass", "ok": True, "summary": "pre ok"},
+                    {"status": "fail", "ok": False, "summary": "live hooks broken"},
+                ]
+                with (
+                    mock.patch.object(sync_live, "audit_secrets", return_value=0),
+                    mock.patch.object(sync_live, "_run_hooks_canary", side_effect=canary_seq) as m_canary2,
+                    mock.patch.object(sync_live, "_touch_reload_sentinels") as m_touch,
+                ):
+                    rc_post = sync_live.cmd_deploy(ns)
+                self.assertEqual(1, rc_post)
+                self.assertEqual(2, m_canary2.call_count)
+                self.assertFalse(m_canary2.call_args_list[0].kwargs["live_mode"])
+                self.assertTrue(m_canary2.call_args_list[1].kwargs["live_mode"])
+                m_touch.assert_not_called()
+                # Restored to exact V1 contents & newly deployed bridge/memory_guard.py removed!
+                self.assertEqual(v1_hooks_content, live_hooks_json.read_text(encoding="utf-8"))
+                self.assertEqual(v1_guard_content, live_guard_py.read_text(encoding="utf-8"))
+                self.assertFalse((live_bridge_dir / "memory_guard.py").exists())
+
+                # 3. `verify-hooks` (both --candidate and default live mode) is strictly read-only & reports disabled state
+                disabled_live_res = {
+                    "status": "disabled",
+                    "ok": True,
+                    "mode": "live",
+                    "guard_enabled": False,
+                    "hooks_json": str(live_hooks_json),
+                    "agy_version": "1.5.14",
+                    "summary": "[DISABLED] taint-outbound-guard.enabled=false",
+                    "cases": [{"name": "tainted_blocked_deny", "status": "disabled", "duration_s": 0.0}],
+                }
+                vh_live_args = type("VH", (), {"candidate": False, "require_enabled": False, "agy_bin": None, "json": True})()
+                import io as _io
+                import contextlib as _ctx
+                buf = _io.StringIO()
+                with (
+                    mock.patch.object(sync_live, "_run_hooks_canary", return_value=disabled_live_res),
+                    _ctx.redirect_stdout(buf),
+                ):
+                    rc_vh = sync_live.cmd_verify_hooks(vh_live_args)
+                self.assertEqual(0, rc_vh)
+                parsed_vh = json.loads(buf.getvalue())
+                self.assertEqual("disabled", parsed_vh["status"])
+                self.assertFalse(parsed_vh["guard_enabled"])
+                # Zero writes to live hooks.json
+                self.assertEqual(v1_hooks_content, live_hooks_json.read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()

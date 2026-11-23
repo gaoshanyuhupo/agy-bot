@@ -11,7 +11,8 @@ CRITICAL INVARIANTS:
 - NEVER skips when `AGY_INTERNAL_OBSERVER=1` (scheduled/unattended tasks set it alongside taint).
 - Fail-Closed on tainted sessions: malformed stdin JSON, unavailable `memory_guard`, or evaluation
   exceptions emit `{"decision": "deny", "reason": "..."}` with exit code 0.
-- Clean sessions and whitelisted safe calls strictly emit `{}` (NEVER `{"decision": "allow"}`).
+- Clean sessions and whitelisted safe calls strictly emit empty stdout (`""`) with exit code 0
+  (NEVER `{}` and NEVER `{"decision": "allow"}`).
 """
 
 from __future__ import annotations
@@ -195,12 +196,14 @@ def _inspect_context_for_taint(
 
 
 def _emit_deny(reason: str) -> int:
-    print(json.dumps({"decision": "deny", "reason": reason}, ensure_ascii=False))
+    clean_reason = str(reason or "").strip() or "[taint-outbound-guard] Blocked high-risk tool call"
+    print(json.dumps({"decision": "deny", "reason": clean_reason}, ensure_ascii=False))
     return 0
 
 
 def _emit_pass() -> int:
-    print("{}")
+    # Empty stdout + exit 0 is the verified zero-false-block, zero-downgrade pass-through
+    # contract for Antigravity CLI >= 1.5.14 PreToolUse hooks (never emit `{}` or `allow`).
     return 0
 
 

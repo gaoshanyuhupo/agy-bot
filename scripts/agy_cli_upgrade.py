@@ -617,15 +617,26 @@ def run_upgrade(
             "update_invoked": True,
         }
 
-    # 4. Run `verify_gate.py --scope bridge` unless --skip-verify
+    # 4. Run `verify_gate.py --scope bridge --with-hooks-canary --agy-bin <agy_bin>` unless --skip-verify
     verify_result: Dict[str, Any] = {"skipped": bool(skip_verify)}
     if not skip_verify:
         gate_script = verify_gate_script or default_verify_gate_script()
         verify_env = os.environ.copy()
         verify_env["AGY_CLI_DISABLE_AUTO_UPDATE"] = "1"
+        verify_env["AGY_TG_AGY_BIN"] = str(agy_bin)
+        verify_env["AGY_BIN"] = str(agy_bin)
+        verify_env.pop("AGY_VERIFY_GATE_NESTED", None)
         try:
             vres = subprocess.run(
-                [sys.executable, str(gate_script), "--scope", "bridge"],
+                [
+                    sys.executable,
+                    str(gate_script),
+                    "--scope",
+                    "bridge",
+                    "--with-hooks-canary",
+                    "--agy-bin",
+                    str(agy_bin),
+                ],
                 capture_output=True,
                 text=True,
                 timeout=verify_timeout,
@@ -647,6 +658,8 @@ def run_upgrade(
             "skipped": False,
             "exit_code": vres.returncode,
             "passed": vres.returncode == 0,
+            "agy_bin": str(agy_bin),
+            "with_hooks_canary": True,
         }
         if vres.returncode != 0:
             detail = (vres.stderr or vres.stdout or f"exit {vres.returncode}").strip()

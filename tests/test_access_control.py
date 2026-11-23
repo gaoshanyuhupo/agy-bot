@@ -66,6 +66,20 @@ class TestAccessControlMatrix(unittest.TestCase):
             self.assertEqual("admin", bridge2._get_user_role(-1001234567890, {"id": 111}))
             self.assertEqual("denied", bridge2._get_user_role(-1001234567890, {"id": 222}))
 
+            # extract_user_id MUST reject booleans so True/False never coerce to 1/0
+            self.assertIsNone(_ac.extract_user_id({"id": True}))
+            self.assertIsNone(_ac.extract_user_id({"id": False}))
+            self.assertEqual(111, _ac.extract_user_id({"id": 111}))
+            self.assertEqual(
+                "denied",
+                _ac.resolve_user_role(
+                    -1001234567890,
+                    {"id": True},
+                    allowed_chats=[-1001234567890],
+                    admin_users=[1],
+                ),
+            )
+
     def test_admin_readonly_and_group_readonly_modes(self):
         with tempfile.TemporaryDirectory() as tmp:
             bridge, _ac = _load_isolated_bridge(
@@ -141,6 +155,11 @@ class TestRbacEnforcementAndSessionIsolation(unittest.TestCase):
                     "/cancel",
                     "/get .env",
                     "/cost reset 1d",
+                    "/guard",
+                    "/guard status",
+                    "/guard off",
+                    "/guard on",
+                    "/guard check",
                 ):
                     sent_texts.clear()
                     bridge.handle_message({

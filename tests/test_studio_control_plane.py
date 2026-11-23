@@ -1773,12 +1773,12 @@ class TestPAC5AndC7FrontendAndProtectedHygiene(unittest.TestCase):
 
         # Verify protected files have zero modifications relative to HEAD
         # (skip during export_public pre-commit verification when synced files are not yet committed;
-        # post-commit verification & CI always run with AGY_EXPORT_PUBLIC_VERIFY unset).
+        # under verify_gate.py, step_git_hygiene_and_protected enforces `--allow-protected` for static/index.html
+        # while google_browser.py remains unconditionally 0-diff).
         if os.environ.get("AGY_EXPORT_PUBLIC_VERIFY") != "1":
-            protected = [
-                ".agents/skills/google-profile/scripts/google_browser.py",
-                ".agents/skills/live-browser/scripts/static/index.html",
-            ]
+            protected = [".agents/skills/google-profile/scripts/google_browser.py"]
+            if os.environ.get("AGY_VERIFY_GATE_ALLOW_PROTECTED") != "1":
+                protected.append(".agents/skills/live-browser/scripts/static/index.html")
             res = subprocess.run(
                 ["git", "-C", str(REPO_ROOT), "diff", "--name-only", "HEAD", "--", *protected],
                 capture_output=True,

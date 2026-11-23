@@ -2057,9 +2057,9 @@
       updateCursorInverseScale();
 
       clearTimeout(cursorFadeTimer);
-      if (!keepVisible && gestureMode !== 'trackpad') {
+      if (!keepVisible && !state.takeover && gestureMode !== 'trackpad') {
         cursorFadeTimer = setTimeout(() => {
-          if (gestureMode !== 'trackpad') {
+          if (!state.takeover && gestureMode !== 'trackpad') {
             remoteCursorEl.classList.add('faded');
           }
         }, 3500);
@@ -3203,6 +3203,10 @@
       clearPendingUrlGoto();
       state.takeover = false;
       prevTakeoverState = false;
+      clearTimeout(cursorFadeTimer);
+      remoteCursorEl.classList.add('hidden');
+      remoteCursorEl.classList.remove('faded');
+      humanCursorState.visible = false;
       closeDialogSheet();
       closeUploadSheet();
       closeMoreSheet();
@@ -3543,7 +3547,9 @@
 
       if (!state.running) {
         setAllConnDots('dot');
+        clearTimeout(cursorFadeTimer);
         remoteCursorEl.classList.add('hidden');
+        remoteCursorEl.classList.remove('faded');
         humanCursorState.visible = false;
         if (aiCursorEl) aiCursorEl.classList.add('hidden');
         aiCursorState.visible = false;
@@ -3557,6 +3563,20 @@
       // Sync Telegram Closing Confirmation during active human takeover
       if (!!state.takeover !== prevTakeoverState) {
         prevTakeoverState = !!state.takeover;
+        clearTimeout(cursorFadeTimer);
+        if (state.takeover) {
+          if (humanCursorState.visible) {
+            remoteCursorEl.classList.remove('faded', 'hidden');
+          }
+        } else if (gestureMode !== 'trackpad' && humanCursorState.visible) {
+          remoteCursorEl.classList.add('faded');
+          cursorFadeTimer = setTimeout(() => {
+            if (!state.takeover && gestureMode !== 'trackpad') {
+              remoteCursorEl.classList.add('hidden');
+              humanCursorState.visible = false;
+            }
+          }, 3500);
+        }
         try {
           if (state.takeover) {
             if (typeof tg?.enableClosingConfirmation === 'function') tg.enableClosingConfirmation();
@@ -3932,8 +3952,8 @@
         // AI cursor uses its own `#ai-cursor` element and NEVER overwrites human/trackpad cursor!
         const pos = positionAiCursor(c.x || 0, c.y || 0);
         spawnClickRing(pos.localX, pos.localY, 'ai');
-      } else if (gestureMode !== 'trackpad' && c.kind !== 'move') {
-        positionHumanCursor(c.x || 0, c.y || 0, 'human', false);
+      } else if (gestureMode !== 'trackpad') {
+        positionHumanCursor(c.x || 0, c.y || 0, c.kind === 'down' ? 'drag' : 'human', !!state.takeover);
       }
     }
 
@@ -4401,6 +4421,15 @@
           t: Date.now()
         };
 
+        // Keep human cursor tracking finger immediately during takeover across interact/drag/trackpad
+        if (state.takeover && state.running) {
+          if (startRemote && (gestureMode === 'interact' || gestureMode === 'drag')) {
+            positionArrowCursor(startRemote.x, startRemote.y, gestureMode === 'drag' ? 'drag' : 'human', true);
+          } else if (gestureMode === 'trackpad') {
+            positionArrowCursor(trackpadX, trackpadY, trackpadHolding ? 'drag' : 'human', true);
+          }
+        }
+
         // Direct Drag mode: defer touch mousedown via pendingDrag so a 2nd finger joining for pinch/pan leaks 0 mousedown/mouseup
         if (gestureMode === 'drag' && state.takeover && startRemote && startedInteractive) {
           if (e.pointerType === 'mouse') {
@@ -4727,6 +4756,9 @@
               gestureStart.lastX = e.clientX;
               gestureStart.lastY = e.clientY;
               gestureStart.lastValidRemote = curPt;
+              if (state.takeover && state.running) {
+                positionArrowCursor(curPt.x, curPt.y, 'drag', true);
+              }
             }
             if ((Date.now() - gestureStart.t) >= DRAG_COMMIT_GRACE_MS) {
               commitPendingDrag();
@@ -4744,6 +4776,15 @@
             }
           }
           return;
+        }
+
+        // Interact mode: keep local human cursor following finger even during < 7px micro-jitter (no remote move yet)
+        if (gestureMode === 'interact' && state.takeover && state.running) {
+          const curPtPre = clientToRemoteCoords(e.clientX, e.clientY);
+          if (curPtPre) {
+            gestureStart.lastValidRemote = curPtPre;
+            positionArrowCursor(curPtPre.x, curPtPre.y, 'human', true);
+          }
         }
 
         if (!gestureStart.moved) return;
@@ -4790,8 +4831,13 @@
           camera.cy = gestureStart.startCy - dyTotal / eff;
           applyCamera(true);
         } else if (state.takeover && state.running && gestureStart.startedInteractive === true && !gestureStart.longPressed && canDispatchRemoteInput()) {
-          // Reject single-finger scroll starting or landing in black letterbox bars
-          if (!gestureStart.startRemote || !clientToRemoteCoords(e.clientX, e.clientY)) return;
+          // Reject single-finger scroll/move starting or landing in black letterbox bars
+          const curPt = clientToRemoteCoords(e.clientX, e.clientY);
+          if (!gestureStart.startRemote || !curPt) return;
+
+          gestureStart.lastValidRemote = curPt;
+          positionArrowCursor(curPt.x, curPt.y, 'human', true);
+          sendRemoteMoveThrottled(curPt.x, curPt.y, 40);
 
           // Two-finger join grace / deadzone for touch: never leak wheel on small jitter (<14px) before 2nd finger lands
           if (!gestureStart.scrollCommitted) {
@@ -4838,7 +4884,7 @@
       });
       if (!sent) return false;
       lastTapInfo = isSecondTap ? { t: 0, x: 0, y: 0 } : { t: now, x, y };
-      positionArrowCursor(x, y, 'human', gestureMode === 'trackpad');
+      positionArrowCursor(x, y, 'human', gestureMode === 'trackpad' || !!state.takeover);
       spawnClickRing(localX, localY, 'human');
       return true;
     }

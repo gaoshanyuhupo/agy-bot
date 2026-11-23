@@ -42,7 +42,7 @@ def extract_user_id(from_user) -> Optional[int]:
     if not isinstance(from_user, dict):
         return None
     raw_id = from_user.get("id")
-    if raw_id is None or raw_id == "":
+    if raw_id is None or raw_id == "" or isinstance(raw_id, bool):
         return None
     try:
         return int(raw_id)
@@ -134,6 +134,10 @@ def is_authorized(
     return role in ("admin", "readonly")
 
 
+_ADMIN_ONLY_COMMANDS = frozenset({
+    "/guard",
+})
+
 _ALWAYS_READONLY_COMMANDS = frozenset({
     "/start",
     "/help",
@@ -183,12 +187,17 @@ _READONLY_CALLBACK_EXACT = frozenset({
 
 def is_command_allowed_for_role(role: str, cmd: str, raw_rest: str = "") -> Tuple[bool, str]:
     """Check whether `role` may execute slash command `cmd` with arguments `raw_rest`."""
+    c = (cmd or "").strip().lower()
+    if c in _ADMIN_ONLY_COMMANDS:
+        if role == "admin":
+            return True, ""
+        return False, (c if role == "readonly" else "unauthorized")
+
     if role == "admin":
         return True, ""
     if role != "readonly":
         return False, "unauthorized"
 
-    c = (cmd or "").strip().lower()
     rest = (raw_rest or "").strip()
     sub = rest.split()[0].lower() if rest else ""
 

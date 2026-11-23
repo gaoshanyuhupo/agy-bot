@@ -830,8 +830,12 @@ class TestAgyCliUpgradeScript(unittest.TestCase):
             self.assertFalse(calls[1][2])
             # Post --version: guard=1
             self.assertEqual("1", calls[2][1].get("AGY_CLI_DISABLE_AUTO_UPDATE"))
-            # verify_gate --scope bridge: guard=1
+            # verify_gate --scope bridge --with-hooks-canary --agy-bin <agy_bin>: guard=1
             self.assertEqual("1", calls[3][1].get("AGY_CLI_DISABLE_AUTO_UPDATE"))
+            self.assertIn("--with-hooks-canary", calls[3][0])
+            self.assertIn("--agy-bin", calls[3][0])
+            self.assertEqual(str(agy_bin), calls[3][0][calls[3][0].index("--agy-bin") + 1])
+            self.assertEqual(str(agy_bin), calls[3][1].get("AGY_TG_AGY_BIN"))
             self.assertFalse(calls[3][2])
 
             # 3. verify_gate failure returns non-zero with explicit rollback command
@@ -1024,6 +1028,64 @@ class TestAgyCliUpgradeScript(unittest.TestCase):
         self.assertTrue(os.access(script_path, os.X_OK), "scripts/agy_cli_upgrade.py must have +x permission")
         txt = script_path.read_text(encoding="utf-8")
         self.assertNotIn("/home/" + "ubuntu", txt)
+
+    def test_c9a_upgrade_post_verify_locks_target_agy_bin_and_fails_on_broken_pretool_protocol(self):
+        """C9a: Upgraded --agy-bin breaking PreToolUse protocol MUST fail post-upgrade verification."""
+        with tempfile.TemporaryDirectory(prefix="agy_upg_c9a_") as tmp:
+            root = Path(tmp)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            backup_dir = root / "backups"
+            agy_bin = bin_dir / "agy"
+            # Fake `agy` whose `update` replaces itself with a broken v2 that denies all tools with empty reason!
+            v1_script = (
+                f"#!{sys.executable}\n"
+                "import pathlib, sys\n"
+                "if '--version' in sys.argv:\n"
+                "    print('1.5.14')\n"
+                "    sys.exit(0)\n"
+                "if 'update' in sys.argv:\n"
+                "    p = pathlib.Path(__file__)\n"
+                "    p.write_text("
+                f"        '#!{sys.executable}\\n'\n"
+                "        'import json, sys\\n'\n"
+                "        'if \"--version\" in sys.argv: print(\"1.5.99-broken\"); sys.exit(0)\\n'\n"
+                "        'print(json.dumps({\"event\":\"step_update\",\"step_update\":{\"step_type\":\"tool\",\"state\":\"ERROR\",\"tool_name\":\"run_command\",\"tool_info\":{\"error\":{\"type\":\"TOOL_ERROR\",\"message\":\"tool call denied by pre-tool hook:\"}}}}))\\n'\n"
+                "        'print(json.dumps({\"event\":\"result\",\"result\":{\"status\":\"SUCCESS\",\"response\":\"denied\"}}))\\n'\n"
+                "    , encoding='utf-8')\n"
+                "    p.chmod(0o755)\n"
+                "    sys.exit(0)\n"
+                "sys.exit(1)\n"
+            )
+            agy_bin.write_text(v1_script, encoding="utf-8")
+            agy_bin.chmod(0o755)
+
+            # Lightweight gate stub that delegates directly to real verify_gate.run_hooks_agy_canary locked to --agy-bin
+            gate_stub = root / "gate_canary_stub.py"
+            gate_stub.write_text(
+                f"import sys\n"
+                f"sys.path.insert(0, {str(SCRIPTS_DIR)!r})\n"
+                "import verify_gate\n"
+                "assert '--with-hooks-canary' in sys.argv\n"
+                "assert '--agy-bin' in sys.argv\n"
+                "target_bin = sys.argv[sys.argv.index('--agy-bin') + 1]\n"
+                f"res = verify_gate.run_hooks_agy_canary(root=verify_gate.Path({str(REPO_ROOT)!r}), agy_bin=target_bin, live_mode=False, require_enabled=True)\n"
+                "if not res['ok']:\n"
+                "    sys.stderr.write(res['summary'] + '\\n')\n"
+                "    sys.exit(1)\n"
+                "sys.exit(0)\n",
+                encoding="utf-8",
+            )
+
+            rc, res = agy_cli_upgrade.run_upgrade(
+                agy_bin=agy_bin,
+                backup_dir=backup_dir,
+                verify_gate_script=gate_stub,
+            )
+            self.assertNotEqual(0, rc)
+            self.assertEqual("verify_gate", res["stage"])
+            self.assertEqual("1.5.99-broken", res["after_version"])
+            self.assertIn("--rollback", res["rollback_command"])
 
 
 if __name__ == "__main__":
