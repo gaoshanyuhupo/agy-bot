@@ -469,6 +469,80 @@ class TestHotReloadSelfCheckAndAutoRollback(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 bridge._perform_lkg_rollback(crumb_after, "second_failure")
 
+    def test_restore_lkg_files_removes_extra_new_modules_and_recovers_self_check(self):
+        """P1-CheckC-1: LKG rollback must clean newly added .py modules not in LKG so self-check & re-snapshot recover."""
+        with tempfile.TemporaryDirectory(prefix="lkg_extra_cleanup_") as tmp:
+            bridge, _ = _load_isolated_bridge(tmp)
+            fake_runtime = Path(tmp) / "runtime_bridge"
+            lkg_dir = Path(tmp) / "rollback_lkg"
+            fake_runtime.mkdir()
+
+            # 1. Seed pre-split single-file v1 bridge.py and capture pre_deploy LKG snapshot
+            v1_bridge = (
+                "#!/usr/bin/env python3\n"
+                "import json, sys\n"
+                "VERSION = 'v1-monolith'\n"
+                "if '--self-check' in sys.argv:\n"
+                "    print(json.dumps({'status': 'ok', 'version': VERSION}))\n"
+                "    sys.exit(0)\n"
+            )
+            (fake_runtime / "bridge.py").write_text(v1_bridge, encoding="utf-8")
+            ok_snap, _ = bridge._snapshot_lkg(
+                src_dir=str(fake_runtime),
+                lkg_dir=str(lkg_dir),
+                pre_deploy=True,
+            )
+            self.assertTrue(ok_snap)
+            self.assertEqual(["bridge.py"], bridge._runtime_py_files(str(lkg_dir)))
+
+            # 2. Deploy 5 P1 .py files with a syntax error injected into job_queue.py
+            extra_modules = (
+                "job_queue.py",
+                "agent_driver.py",
+                "live_streamer.py",
+                "studio_ipc_handlers.py",
+            )
+            (fake_runtime / "bridge.py").write_text("VERSION = 'v2-p1'\n", encoding="utf-8")
+            (fake_runtime / "job_queue.py").write_text("def broken_job_queue(:\n    pass\n", encoding="utf-8")
+            (fake_runtime / "agent_driver.py").write_text("DRIVER_VERSION = 'v2-p1'\n", encoding="utf-8")
+            (fake_runtime / "live_streamer.py").write_text("STREAMER_VERSION = 'v2-p1'\n", encoding="utf-8")
+            (fake_runtime / "studio_ipc_handlers.py").write_text("IPC_VERSION = 'v2-p1'\n", encoding="utf-8")
+
+            ok_pre, detail_pre = bridge._pre_reload_self_check(bridge_dir=str(fake_runtime))
+            self.assertFalse(ok_pre)
+            self.assertIn("job_queue.py", detail_pre)
+
+            # 3. Restore LKG files -> must restore bridge.py to v1 AND remove all 4 extra .py modules
+            ok_restore, restore_msg = bridge._restore_lkg_files(
+                lkg_dir=str(lkg_dir),
+                dst_dir=str(fake_runtime),
+            )
+            self.assertTrue(ok_restore, restore_msg)
+            self.assertTrue(restore_msg.startswith("restored "), restore_msg)
+            self.assertIn("removed 4 extra file(s)", restore_msg)
+            self.assertEqual(["bridge.py"], bridge._runtime_py_files(str(fake_runtime)))
+            for extra_fn in extra_modules:
+                self.assertFalse((fake_runtime / extra_fn).exists(), f"{extra_fn} should be removed")
+            self.assertEqual(v1_bridge, (fake_runtime / "bridge.py").read_text(encoding="utf-8"))
+
+            # 4. _pre_reload_self_check must now recover to True on the restored v1 runtime
+            ok_post, detail_post = bridge._pre_reload_self_check(bridge_dir=str(fake_runtime))
+            self.assertTrue(ok_post, detail_post)
+            self.assertEqual("v1-monolith", json.loads(detail_post)["version"])
+
+            # 5. Subsequent healthy LKG refresh must not re-capture any deleted new modules
+            ok_snap2, _ = bridge._snapshot_lkg(
+                src_dir=str(fake_runtime),
+                lkg_dir=str(lkg_dir),
+                pre_deploy=False,
+                preserve_pending_pre_deploy=False,
+            )
+            self.assertTrue(ok_snap2)
+            self.assertEqual(["bridge.py"], bridge._runtime_py_files(str(lkg_dir)))
+            lkg_meta = json.loads((lkg_dir / ".lkg_meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(["bridge.py"], lkg_meta["files"])
+            self.assertFalse(lkg_meta["pre_deploy"])
+
     def test_sync_live_deploy_backup_lkg_auto_rollback_and_manual_rollback(self):
         if not (SCRIPTS_DIR / "sync_live.py").is_file():
             self.skipTest("scripts/sync_live.py is private-only and absent in public export")
@@ -482,7 +556,7 @@ class TestHotReloadSelfCheckAndAutoRollback(unittest.TestCase):
 
             # Seed fake repo with minimal valid files matching subset of MAPPINGS
             (fake_repo / "bridge").mkdir(parents=True)
-            for fname in ("bridge.py", "memory_guard.py", "formatting.py", "access_control.py", "model_failover.py", "cost_usage.py", "scheduler.py", "bot_bus.py", "bot_bus_mcp.py", "github_webhook.py", "gateway_adapter.py", "studio_ipc.py", "google_accounts.py", "bot_profiles.py", "claude_mem_mcp_proxy.py"):
+            for fname in ("bridge.py", "job_queue.py", "agent_driver.py", "live_streamer.py", "studio_ipc_handlers.py", "memory_guard.py", "formatting.py", "access_control.py", "model_failover.py", "cost_usage.py", "scheduler.py", "bot_bus.py", "bot_bus_mcp.py", "github_webhook.py", "gateway_adapter.py", "studio_ipc.py", "google_accounts.py", "bot_profiles.py", "claude_mem_mcp_proxy.py"):
                 shutil.copy2(BRIDGE_DIR / fname, fake_repo / "bridge" / fname)
 
             # Seed pre-existing live files (version v1)
@@ -502,6 +576,10 @@ class TestHotReloadSelfCheckAndAutoRollback(unittest.TestCase):
                 sync_live.HOME = fake_home
                 sync_live.MAPPINGS = [
                     ("bridge/bridge.py", live_bridge / "bridge.py", "file", True),
+                    ("bridge/job_queue.py", live_bridge / "job_queue.py", "file", True),
+                    ("bridge/agent_driver.py", live_bridge / "agent_driver.py", "file", True),
+                    ("bridge/live_streamer.py", live_bridge / "live_streamer.py", "file", True),
+                    ("bridge/studio_ipc_handlers.py", live_bridge / "studio_ipc_handlers.py", "file", True),
                     ("bridge/memory_guard.py", live_bridge / "memory_guard.py", "file", True),
                     ("bridge/formatting.py", live_bridge / "formatting.py", "file", True),
                     ("bridge/access_control.py", live_bridge / "access_control.py", "file", True),
