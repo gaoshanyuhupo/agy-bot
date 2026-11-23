@@ -31,7 +31,6 @@ from pathlib import Path
 import re
 import secrets
 import shutil
-import stat
 import subprocess
 import sys
 import tempfile
