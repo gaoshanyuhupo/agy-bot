@@ -293,6 +293,12 @@ QUALITY_PRESETS: dict[str, dict[str, Any]] = {
     },
 }
 
+# Human-click hold duration (ms) & WS stale-input self-heal throttle intervals
+HUMAN_CLICK_HOLD_DELAY_MS = 45
+STALE_INPUT_STATE_RESYNC_COOLDOWN_SECONDS = 0.8
+STALE_INPUT_TOAST_COOLDOWN_SECONDS = 2.0
+_CONTINUOUS_INPUT_ACTIONS = frozenset({"move", "wheel"})
+
 _BRIDGE_DIR = Path(os.environ.get("AGY_TG_BRIDGE_DIR", str(Path.home() / "agy-tg-bridge")))
 _IGNORED_ENV_SUFFIXES = (
     ".bak",
@@ -4272,6 +4278,41 @@ class LiveBrowserHub:
             self.viewers.discard(ws)
             self.viewer_meta.pop(ws, None)
 
+    @staticmethod
+    def _normalize_named_owner(
+        raw: tuple[str, int | None] | None,
+    ) -> tuple[str, int] | None:
+        """Return canonical `(bot_key, positive_uid)` iff `raw` is a valid named owner, else `None`."""
+        if raw is None or not isinstance(raw, tuple) or len(raw) != 2:
+            return None
+        b, u = raw
+        if not isinstance(b, str) or not b or u is None or isinstance(u, bool):
+            return None
+        try:
+            uid_int = int(u)
+        except (TypeError, ValueError):
+            return None
+        if uid_int <= 0:
+            return None
+        return (b, uid_int)
+
+    @staticmethod
+    def _callable_accepts_kwarg(fn: Any, kwarg: str) -> bool:
+        """Return True iff callable `fn` accepts keyword argument `kwarg` (or **kwargs)."""
+        try:
+            sig = inspect.signature(fn)
+        except (TypeError, ValueError):
+            return True
+        for param in sig.parameters.values():
+            if param.kind == inspect.Parameter.VAR_KEYWORD:
+                return True
+            if param.name == kwarg and param.kind in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            ):
+                return True
+        return False
+
     async def broadcast_json_to_owners(
         self,
         obj: dict[str, Any],
@@ -4280,6 +4321,7 @@ class LiveBrowserHub:
         owner_uid: int | None,
         require_admin: bool = True,
         expected_session_gen: int | None = None,
+        expected_takeover_gen: int | None = None,
     ) -> None:
         """Broadcast sensitive resource notifications ONLY to live-authorized explicit `(owner_bot, owner_uid)` viewers."""
         if (
@@ -4293,11 +4335,24 @@ class LiveBrowserHub:
         snap_gen = self.session_gen if expected_session_gen is None else expected_session_gen
         if self.session_gen != snap_gen:
             return
+        if expected_takeover_gen is not None:
+            if (
+                not self.takeover
+                or self.takeover_gen != expected_takeover_gen
+                or self._normalize_named_owner(self.takeover_owner) != (owner_bot, int(owner_uid))
+            ):
+                return
         snap_owner = self.session_owner
         payload = json.dumps(obj, ensure_ascii=False)
         stale: list[web.WebSocketResponse] = []
         for ws in list(self.viewers):
             if self.session_gen != snap_gen or self.session_owner != snap_owner:
+                break
+            if expected_takeover_gen is not None and (
+                not self.takeover
+                or self.takeover_gen != expected_takeover_gen
+                or self._normalize_named_owner(self.takeover_owner) != (owner_bot, int(owner_uid))
+            ):
                 break
             if ws.closed:
                 stale.append(ws)
@@ -4314,6 +4369,12 @@ class LiveBrowserHub:
                 continue
             meta["role"] = live_role
             if self.session_gen != snap_gen or self.session_owner != snap_owner:
+                break
+            if expected_takeover_gen is not None and (
+                not self.takeover
+                or self.takeover_gen != expected_takeover_gen
+                or self._normalize_named_owner(self.takeover_owner) != (owner_bot, int(owner_uid))
+            ):
                 break
             if require_admin and live_role != "admin":
                 continue
@@ -5018,30 +5079,105 @@ class LiveBrowserHub:
                     )
                     if not ok_v:
                         return False, msg_v, self.session_gen, self.takeover_gen
+                    if not self._viewer_can_control_takeover(a_bot, a_uid, "admin"):
+                        return False, "🔒 当前浏览器会话由其他 Bot/用户持有，无权接管或释放", self.session_gen, self.takeover_gen
                 else:
                     live_role = _check_live_user_role(a_bot, a_uid)
                     if live_role != "admin":
                         return False, "当前用户未授权或权限已撤销", self.session_gen, self.takeover_gen
                     if not self._viewer_can_control_takeover(a_bot, a_uid, live_role):
                         return False, "🔒 当前浏览器会话由其他 Bot/用户持有，无权接管或释放", self.session_gen, self.takeover_gen
+                if want_active and owner is not None:
+                    norm_actor = self._normalize_named_owner(actor)
+                    norm_owner = self._normalize_named_owner(owner)
+                    if norm_actor is None or norm_owner != norm_actor:
+                        return False, "🔒 接管属主与当前操作者不匹配，已拒绝请求", self.session_gen, self.takeover_gen
 
             prev_takeover = bool(self.takeover)
             prev_owner = self.takeover_owner or self.session_owner
             wait_human_active = self._wait_human_waiters > 0
             snap_engine_mode = self.engine_mode
 
-            self.mark_active()
             if want_active:
-                self.takeover_gen += 1
-                self.takeover = True
-                self.takeover_owner = owner if owner is not None else self.session_owner
-                self.takeover_reason = reason or "人工接管中（AI 已挂起等待）"
-                self.ai_allowed_event.clear()
-                # Barrier: wait for any in-flight AI action under `_exec_lock` to complete
-                async with self._exec_lock:
-                    pass
-                log.info("Takeover ENABLED (gen=%d owner=%s): %s", self.takeover_gen, self.takeover_owner, self.takeover_reason)
+                cur_named = self._normalize_named_owner(self.takeover_owner)
+                target_owner = (
+                    owner
+                    if owner is not None
+                    else (actor if actor is not None else self.session_owner)
+                )
+                req_named = self._normalize_named_owner(target_owner)
+                if prev_takeover:
+                    if cur_named is not None:
+                        if req_named != cur_named or (
+                            self.session_owner is not None
+                            and self._normalize_named_owner(self.session_owner) != cur_named
+                        ):
+                            return (
+                                False,
+                                "🔒 当前接管由其他已验证属主持有，拒绝越权接管或抹除属主",
+                                self.session_gen,
+                                self.takeover_gen,
+                            )
+                        # Same named owner: re-verify live admin RBAC (even on internal actor=None calls)
+                        live_owner_role = _check_live_user_role(cur_named[0], cur_named[1])
+                        if live_owner_role != "admin":
+                            return (
+                                False,
+                                "当前接管属主权限已撤销或降级，拒绝保持接管",
+                                self.session_gen,
+                                self.takeover_gen,
+                            )
+                        # Idempotent same-owner preserve-gen path: keep takeover_gen & takeover_owner intact
+                        self.mark_active()
+                        self.takeover = True
+                        self.takeover_owner = cur_named
+                        self.takeover_reason = reason or self.takeover_reason or "人工接管中（AI 已挂起等待）"
+                        self.ai_allowed_event.clear()
+                        async with self._exec_lock:
+                            pass
+                        log.info(
+                            "Takeover IDEMPOTENT (gen=%d owner=%s): %s",
+                            self.takeover_gen,
+                            self.takeover_owner,
+                            self.takeover_reason,
+                        )
+                    elif req_named is not None:
+                        # Existing ownerless takeover cannot be mixed with or hijacked by a named owner
+                        return (
+                            False,
+                            "🔒 当前接管为无主状态，拒绝具名属主混用接管",
+                            self.session_gen,
+                            self.takeover_gen,
+                        )
+                    else:
+                        # Ownerless -> Ownerless NEVER reuses the named same-owner preserve-gen path
+                        self.mark_active()
+                        self.takeover_gen += 1
+                        self.takeover = True
+                        self.takeover_owner = target_owner
+                        self.takeover_reason = reason or "人工接管中（AI 已挂起等待）"
+                        self.ai_allowed_event.clear()
+                        async with self._exec_lock:
+                            pass
+                        log.info(
+                            "Takeover ENABLED (gen=%d owner=%s): %s",
+                            self.takeover_gen,
+                            self.takeover_owner,
+                            self.takeover_reason,
+                        )
+                else:
+                    self.mark_active()
+                    self.takeover_gen += 1
+                    self.takeover = True
+                    self.takeover_owner = target_owner
+                    self.takeover_reason = reason or "人工接管中（AI 已挂起等待）"
+                    self.ai_allowed_event.clear()
+                    # Barrier: wait for any in-flight AI action under `_exec_lock` to complete
+                    async with self._exec_lock:
+                        pass
+                    log.info("Takeover ENABLED (gen=%d owner=%s): %s", self.takeover_gen, self.takeover_owner, self.takeover_reason)
             else:
+                self.mark_active()
                 # 1. Advance takeover generation & disallow new human inputs immediately
                 self.takeover_gen += 1
                 self.takeover = False
@@ -7525,6 +7661,45 @@ class LiveBrowserHub:
             except Exception as exc:
                 log.warning("Human input execution error: %s", exc)
 
+    async def _human_mouse_move_then_click_locked(
+        self,
+        page: Any,
+        cmd: dict[str, Any],
+        *,
+        x: float,
+        y: float,
+        act: str,
+        button: str = "left",
+        click_count: int = 1,
+    ) -> bool:
+        """Human-only mouse click helper under `_exec_lock`: move -> reverify auth/gen -> delayed click."""
+        move_fn = getattr(page.mouse, "move", None)
+        if callable(move_fn):
+            await move_fn(x, y)
+        # Re-verify session/takeover generation, ownership, page identity & live admin RBAC after async move!
+        if not await self._enforce_human_cmd_live_auth_locked(cmd):
+            return False
+        if self._current_page() is not page:
+            return False
+        if act == "dblclick":
+            dbl_fn = page.mouse.dblclick
+            if self._callable_accepts_kwarg(dbl_fn, "delay"):
+                await dbl_fn(x, y, delay=HUMAN_CLICK_HOLD_DELAY_MS)
+            else:
+                await dbl_fn(x, y)
+        else:
+            click_fn = page.mouse.click
+            click_kwargs: dict[str, Any] = {}
+            if act == "rightclick":
+                click_kwargs["button"] = "right"
+            elif not (click_count == 1 and button == "left"):
+                click_kwargs["button"] = button
+                click_kwargs["click_count"] = click_count
+            if self._callable_accepts_kwarg(click_fn, "delay"):
+                click_kwargs["delay"] = HUMAN_CLICK_HOLD_DELAY_MS
+            await click_fn(x, y, **click_kwargs)
+        return True
+
     async def _execute_human_cmd_async(self, cmd: dict[str, Any]) -> None:
         act = cmd.get("action")
         tab_cmd_id = (
@@ -7532,7 +7707,13 @@ class LiveBrowserHub:
             if act in ("switch_tab", "new_tab", "close_tab")
             else None
         )
-        exec_state: dict[str, Any] = {"orig_page": None, "orig_ctx": None}
+        exec_state: dict[str, Any] = {
+            "orig_page": None,
+            "orig_ctx": None,
+            "orig_sgen": None,
+            "orig_tgen": None,
+            "orig_owner": None,
+        }
         try:
             await self._execute_human_cmd_async_impl(cmd, exec_state=exec_state)
         except Exception as exc:
@@ -7563,6 +7744,42 @@ class LiveBrowserHub:
                             except Exception as cap_exc:
                                 log.debug("Post-error recovery capture failed for %s: %s", tab_cmd_id, cap_exc)
                 return
+            if act in ("click", "dblclick", "rightclick"):
+                # Safe log ONLY (never log raw exception text that may contain file paths, tokens or URL query params)
+                log.warning(
+                    "Human %s execution failed (error_type=%s, session_gen=%d, takeover_gen=%d)",
+                    act,
+                    type(exc).__name__,
+                    self.session_gen,
+                    self.takeover_gen,
+                )
+                # Send generic sanitized failure toast ONLY if original owner, (session_gen, takeover_gen) & live admin RBAC still match!
+                orig_sgen = exec_state.get("orig_sgen")
+                orig_tgen = exec_state.get("orig_tgen")
+                orig_owner = exec_state.get("orig_owner")
+                if (
+                    self.engine_mode == "async_hosted"
+                    and self.takeover
+                    and orig_owner is not None
+                    and orig_sgen is not None
+                    and orig_tgen is not None
+                    and self.session_gen == orig_sgen
+                    and self.takeover_gen == orig_tgen
+                    and self._normalize_named_owner(self.takeover_owner) == orig_owner
+                    and self._has_verified_session_owner()
+                    and self._normalize_named_owner(self.session_owner) == orig_owner
+                    and await self._enforce_human_cmd_live_auth_locked(cmd)
+                    and _check_live_user_role(orig_owner[0], orig_owner[1]) == "admin"
+                ):
+                    await self.broadcast_json_to_owners(
+                        {"type": "toast", "message": "点击操作未成功，请重试或刷新画面"},
+                        owner_bot=orig_owner[0],
+                        owner_uid=orig_owner[1],
+                        require_admin=True,
+                        expected_session_gen=orig_sgen,
+                        expected_takeover_gen=orig_tgen,
+                    )
+                return
             raise
 
     async def _execute_human_cmd_async_impl(
@@ -7589,6 +7806,9 @@ class LiveBrowserHub:
             if exec_state is not None:
                 exec_state["orig_page"] = page
                 exec_state["orig_ctx"] = self.ctx
+                exec_state["orig_sgen"] = self.session_gen
+                exec_state["orig_tgen"] = self.takeover_gen
+                exec_state["orig_owner"] = self._normalize_named_owner(self.takeover_owner)
             act = cmd.get("action")
             tab_cmd_id = (
                 _sanitize_tab_cmd_id(cmd.get("cmd_id"))
@@ -7657,7 +7877,10 @@ class LiveBrowserHub:
                 x = float(cmd.get("x", 0))
                 y = float(cmd.get("y", 0))
                 self.cursor = {"x": x, "y": y, "actor": "human", "kind": "rightclick", "ts": time.time()}
-                await page.mouse.click(x, y, button="right")
+                if not await self._human_mouse_move_then_click_locked(
+                    page, cmd, x=x, y=y, act="rightclick", button="right", click_count=1
+                ):
+                    return
                 if self._is_human_cmd_still_valid(cmd, check_live_rbac=True):
                     post_capture_needed = True
                     post_capture_force = True
@@ -7670,7 +7893,10 @@ class LiveBrowserHub:
                 y = float(cmd.get("y", 0))
                 self.cursor = {"x": x, "y": y, "actor": "human", "kind": act, "ts": time.time()}
                 if act == "dblclick":
-                    await page.mouse.dblclick(x, y)
+                    if not await self._human_mouse_move_then_click_locked(
+                        page, cmd, x=x, y=y, act="dblclick"
+                    ):
+                        return
                 else:
                     try:
                         click_count = int(cmd.get("click_count") or 1)
@@ -7680,10 +7906,10 @@ class LiveBrowserHub:
                     button = str(cmd.get("button") or "left")
                     if button not in ("left", "right", "middle"):
                         button = "left"
-                    if click_count == 1 and button == "left":
-                        await page.mouse.click(x, y)
-                    else:
-                        await page.mouse.click(x, y, button=button, click_count=click_count)
+                    if not await self._human_mouse_move_then_click_locked(
+                        page, cmd, x=x, y=y, act="click", button=button, click_count=click_count
+                    ):
+                        return
                 # Re-verify live RBAC & generations before querying focused DOM element!
                 if not await self._enforce_human_cmd_live_auth_locked(cmd):
                     return
@@ -8571,6 +8797,8 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
         user_id = int(info["user_id"])
         role = str(info.get("role") or "admin")
         had_admin_role = role == "admin"
+        last_stale_state_resync_ts: float | None = None
+        last_stale_toast_ts: float | None = None
         hub.viewers.add(ws)
         hub.viewer_meta[ws] = {"user_id": user_id, "bot_key": bot_key, "role": role, "last_frame_seq": 0}
         hub.mark_active()
@@ -9294,9 +9522,71 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                         {"type": "tab_cmd_ack", "cmd_id": tab_cmd_id, "status": "rejected", "reason": reason},
                     )
 
+                async def _handle_stale_input(reason: str) -> None:
+                    nonlocal last_stale_state_resync_ts, last_stale_toast_ts
+                    if tab_cmd_id:
+                        await _send_tab_reject(reason)
+                        return
+                    if ws.closed:
+                        return
+                    if not await _require_live_auth():
+                        return
+                    if (
+                        role != "admin"
+                        or hub.engine_mode not in ("async_hosted", "sync_external")
+                        or not hub._has_verified_session_owner()
+                        or not hub._viewer_can_read_session(bot_key, user_id, role)
+                        or not hub._viewer_can_control_takeover(bot_key, user_id, role)
+                    ):
+                        return
+                    now_mono = time.monotonic()
+                    if (
+                        last_stale_state_resync_ts is None
+                        or (now_mono - last_stale_state_resync_ts) >= STALE_INPUT_STATE_RESYNC_COOLDOWN_SECONDS
+                    ):
+                        cur_v_seq = int((hub.viewer_meta.get(ws) or {}).get("last_frame_seq", 0))
+                        resync_state = hub.state_dict_for_viewer(
+                            bot_key, user_id, role, viewer_frame_seq=cur_v_seq
+                        )
+                        if (
+                            not ws.closed
+                            and role == "admin"
+                            and hub.engine_mode in ("async_hosted", "sync_external")
+                            and hub._has_verified_session_owner()
+                            and hub._viewer_can_read_session(bot_key, user_id, role)
+                            and hub._viewer_can_control_takeover(bot_key, user_id, role)
+                        ):
+                            last_stale_state_resync_ts = now_mono
+                            await _ws_send_json(ws, resync_state)
+                    if raw_action not in _CONTINUOUS_INPUT_ACTIONS and not ws.closed:
+                        if (
+                            last_stale_toast_ts is None
+                            or (now_mono - last_stale_toast_ts) >= STALE_INPUT_TOAST_COOLDOWN_SECONDS
+                        ):
+                            if not await _require_live_auth():
+                                return
+                            if (
+                                role == "admin"
+                                and hub.engine_mode in ("async_hosted", "sync_external")
+                                and hub._has_verified_session_owner()
+                                and hub._viewer_can_read_session(bot_key, user_id, role)
+                                and hub._viewer_can_control_takeover(bot_key, user_id, role)
+                            ):
+                                last_stale_toast_ts = now_mono
+                                await _ws_send_json(
+                                    ws,
+                                    {"type": "toast", "message": "状态已同步最新会话，请重试操作"},
+                                )
+
                 if not await _require_live_admin("操作浏览器"):
                     if ws.closed:
                         break
+                    continue
+                if hub.engine_mode not in ("async_hosted", "sync_external"):
+                    await _send_tab_reject("idle")
+                    continue
+                if not hub._viewer_can_control_takeover(bot_key, user_id, role):
+                    await _ws_send_json(ws, {"type": "toast", "message": "🔒 当前接管控制权属于其他 Bot/用户"})
                     continue
                 if not hub.takeover:
                     await ws.send_str(
@@ -9304,20 +9594,18 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                     )
                     await _send_tab_reject("no_takeover")
                     continue
-                if not hub._viewer_can_control_takeover(bot_key, user_id, role):
-                    await _ws_send_json(ws, {"type": "toast", "message": "🔒 当前接管控制权属于其他 Bot/用户"})
-                    continue
-                if hub.engine_mode not in ("async_hosted", "sync_external"):
-                    await _send_tab_reject("idle")
-                    continue
                 # STRICT generation requirement: missing or stale `session_gen` / `takeover_gen` MUST be dropped, NEVER auto-filled!
                 cli_sgen = _parse_strict_int(data.get("session_gen"))
                 cli_tgen = _parse_strict_int(data.get("takeover_gen"))
                 if cli_sgen is None or cli_sgen != hub.session_gen:
-                    await _send_tab_reject("stale_session")
+                    await _handle_stale_input("stale_session")
+                    if ws.closed:
+                        break
                     continue
                 if cli_tgen is None or cli_tgen != hub.takeover_gen:
-                    await _send_tab_reject("stale_takeover")
+                    await _handle_stale_input("stale_takeover")
+                    if ws.closed:
+                        break
                     continue
 
                 clean_payload = {
@@ -10023,6 +10311,11 @@ async def internal_takeover(request: web.Request) -> web.Response:
         return web.json_response({"ok": False, "error": err_ctrl}, status=403)
     active = _parse_bool_flag(body.get("active", True))
     reason = str(body.get("reason") or "")
+    exp_tgen: int | None = None
+    if body.get("expected_takeover_gen") is not None:
+        exp_tgen = _parse_strict_int(body.get("expected_takeover_gen"))
+        if exp_tgen is None:
+            return web.json_response({"ok": False, "error": "Invalid expected_takeover_gen"}, status=400)
     actor_arg = (auth_ctx["bot_key"], auth_ctx["chat_id"]) if auth_ctx.get("is_tg") else None
     exp_gen = auth_ctx.get("expected_gen")
     ok_tk, err_tk, _, _ = await hub.set_takeover(
@@ -10030,6 +10323,7 @@ async def internal_takeover(request: web.Request) -> web.Response:
         reason=reason,
         owner=(owner if active else None),
         expected_session_gen=exp_gen,
+        expected_takeover_gen=exp_tgen,
         actor=actor_arg,
         card_message_id=auth_ctx.get("message_id"),
         require_card=bool(auth_ctx.get("from_card")),

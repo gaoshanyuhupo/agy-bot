@@ -1979,5 +1979,417 @@ class TestTelegram429FloodWaitAndBackoffContract(unittest.TestCase):
             asyncio.run(_scenario())
 
 
+class TestTakeoverStabilityContractC1C2(unittest.TestCase):
+    """Contract C1 & C2: Same-owner takeover idempotency / gen preservation + CAS / cross-owner / RBAC / timeout invariants."""
+
+    def setUp(self) -> None:
+        self._orig_env = dict(os.environ)
+        os.environ.clear()
+        os.environ.update(_clean_agy_env())
+        self.auth_ws = _TestAuthWorkspace()
+        self.auth_ws.write_env(
+            "main",
+            token=BOT_MAIN_TOKEN,
+            allowed=[ADMIN_UID_A, ADMIN_UID_B],
+            admins=[ADMIN_UID_A, ADMIN_UID_B],
+        )
+        self.auth_ws.write_env(
+            "sg",
+            token=BOT_SG_TOKEN,
+            allowed=[ADMIN_UID_B],
+            admins=[ADMIN_UID_B],
+        )
+        self._orig_bridge_dir = srv._BRIDGE_DIR
+        self._orig_profiles_data_dir = srv.PROFILES_DATA_DIR
+        self._orig_config_dir = srv.CONFIG_DIR
+        self._orig_profiles_file = srv.PROFILES_FILE
+        self._orig_web = srv.web
+        self._orig_form_data = srv.FormData
+        srv._BRIDGE_DIR = self.auth_ws.bridge_dir
+        srv.PROFILES_DATA_DIR = self.auth_ws.root / "profiles-data"
+        srv.CONFIG_DIR = self.auth_ws.root / "config"
+        srv.PROFILES_FILE = srv.CONFIG_DIR / "profiles.json"
+        if srv.web is None:
+            srv.web = _FAKE_WEB  # type: ignore[assignment]
+        if srv.FormData is None:
+            srv.FormData = _FakeFormData  # type: ignore[assignment]
+        os.environ["AGY_GOOGLE_SKILL_SCRIPTS"] = ""
+        os.environ["AGY_LIVE_BROWSER_REQUIRE_PINNED"] = ""
+
+    def tearDown(self) -> None:
+        srv._BRIDGE_DIR = self._orig_bridge_dir
+        srv.PROFILES_DATA_DIR = self._orig_profiles_data_dir
+        srv.CONFIG_DIR = self._orig_config_dir
+        srv.PROFILES_FILE = self._orig_profiles_file
+        srv.web = self._orig_web
+        srv.FormData = self._orig_form_data
+        self.auth_ws.cleanup()
+        os.environ.clear()
+        os.environ.update(self._orig_env)
+
+    def test_c1_same_owner_idempotent_takeover_and_wait_human_preserves_gen_and_allows_inflight_input(self) -> None:
+        async def _scenario() -> None:
+            hub = srv.LiveBrowserHub({"public_url": "https://live.example"}, LOCAL_TOKEN)
+            hub.engine_mode = "async_hosted"
+            hub.session_gen = 5
+            hub.takeover_gen = 1
+            hub.session_owner = ("main", ADMIN_UID_A)
+            page = _FakeAsyncPage(url="https://app.example/dashboard", title="Dashboard")
+            click_calls: list[tuple] = []
+
+            async def _fake_click(x: float, y: float, **kw: object) -> None:
+                click_calls.append((x, y, kw))
+
+            page.mouse.click = _fake_click  # type: ignore[attr-defined]
+            hub.ctx = types.SimpleNamespace(pages=[page])
+            hub.latest_jpeg = b"\xff\xd8\xff\xe0JPEG"
+            hub.tg.http = _FakeTGHttp(status=200, payload={"ok": True, "result": {"message_id": 501}})
+
+            bus_emits: list[dict[str, object]] = []
+
+            async def _spy_emit(**kw: object) -> dict[str, object]:
+                bus_emits.append(dict(kw))
+                return dict(kw)
+
+            hub._emit_takeover_bus_event = _spy_emit  # type: ignore[method-assign]
+
+            # 1. Initial False -> True takeover increments takeover_gen to G=2
+            ok1, _, sgen1, g = await hub.set_takeover(
+                True, reason="initial", owner=("main", ADMIN_UID_A), actor=("main", ADMIN_UID_A), source="miniapp_ws"
+            )
+            self.assertTrue(ok1)
+            self.assertEqual(5, sgen1)
+            self.assertEqual(2, g)
+            self.assertEqual(("main", ADMIN_UID_A), hub.takeover_owner)
+            self.assertEqual(1, len(bus_emits))
+
+            # 2. Same-owner duplicate WS set_takeover(True) preserves takeover_gen == G & emits 0 duplicate bus events
+            ok2, _, _, g2 = await hub.set_takeover(
+                True, reason="dup ws", owner=("main", ADMIN_UID_A), actor=("main", ADMIN_UID_A), source="miniapp_ws"
+            )
+            self.assertTrue(ok2)
+            self.assertEqual(g, g2, "Duplicate WS set_takeover(True) by same owner MUST preserve takeover_gen")
+            self.assertEqual(("main", ADMIN_UID_A), hub.takeover_owner)
+            self.assertEqual(1, len(bus_emits), "Duplicate same-owner takeover MUST NOT emit duplicate bus event")
+
+            # 3. Same-owner internal HTTP /internal/takeover preserves takeover_gen == G & owner
+            r_int = await srv.internal_takeover(
+                _make_req(
+                    hub,
+                    {
+                        "active": True,
+                        "bot": "main",
+                        "user_id": ADMIN_UID_A,
+                        "chat_id": ADMIN_UID_A,
+                        "source": "tg_cmd",
+                        "reason": "dup internal",
+                    },
+                )  # type: ignore[arg-type]
+            )
+            self.assertEqual(200, r_int.status)
+            self.assertEqual(g, hub.takeover_gen)
+            self.assertEqual(("main", ADMIN_UID_A), hub.takeover_owner)
+            self.assertEqual(1, len(bus_emits))
+
+            # 4. Triggering wait_human while same owner already holds takeover preserves takeover_gen == G
+            #    AND an in-flight human input carrying takeover_gen == G executes cleanly (0 false stale_takeover)!
+            inflight_done = asyncio.Event()
+
+            async def _run_inflight_then_handback() -> None:
+                while hub._wait_human_waiters == 0:
+                    await asyncio.sleep(0.01)
+                self.assertEqual(g, hub.takeover_gen, "wait_human MUST preserve same-owner takeover_gen")
+                self.assertEqual(("main", ADMIN_UID_A), hub.takeover_owner)
+                await hub._execute_human_cmd_async(
+                    {
+                        "action": "click",
+                        "x": 120.0,
+                        "y": 240.0,
+                        "_session_gen": 5,
+                        "_takeover_gen": g,
+                        "_bot_key": "main",
+                        "_user_id": ADMIN_UID_A,
+                    }
+                )
+                inflight_done.set()
+                await hub.set_takeover(False, reason="done", actor=("main", ADMIN_UID_A), source="miniapp_ws")
+
+            task_hb = asyncio.create_task(_run_inflight_then_handback())
+            res_wh = await hub.execute_ai_action(
+                {"action": "wait_human", "timeout": 5.0, "notify": False},
+                auth_ctx={"is_tg": False},
+            )
+            await task_hb
+            self.assertTrue(inflight_done.is_set())
+            self.assertTrue(res_wh["ok"])
+            self.assertTrue(res_wh["resumed"])
+            self.assertEqual(1, len(click_calls), "In-flight click carrying preserved takeover_gen=G MUST execute")
+            self.assertEqual((120.0, 240.0), (click_calls[0][0], click_calls[0][1]))
+            await hub._cancel_and_await_bg_tasks()
+
+        asyncio.run(_scenario())
+
+    def test_c2_takeover_cas_cross_owner_ownerless_rbac_and_timeout_invariants(self) -> None:
+        async def _scenario() -> None:
+            hub = srv.LiveBrowserHub({"public_url": "https://live.example"}, LOCAL_TOKEN)
+            hub.engine_mode = "async_hosted"
+            hub.session_gen = 8
+            hub.takeover_gen = 3
+            hub.session_owner = ("main", ADMIN_UID_A)
+            hub.latest_jpeg = b"\xff\xd8\xff\xe0JPEG"
+            hub.tg.http = _FakeTGHttp(status=200, payload={"ok": True, "result": {"message_id": 601}})
+
+            ok_init, _, _, g = await hub.set_takeover(
+                True, reason="init", owner=("main", ADMIN_UID_A), actor=("main", ADMIN_UID_A), source="miniapp_ws"
+            )
+            self.assertTrue(ok_init)
+            self.assertEqual(4, g)
+
+            # (a) Same-owner wrong expected_takeover_gen = G-1 -> fail-closed reject with 0 state mutation
+            ok_cas, _, s_cas, t_cas = await hub.set_takeover(
+                True,
+                reason="stale cas",
+                owner=("main", ADMIN_UID_A),
+                expected_takeover_gen=g - 1,
+                actor=("main", ADMIN_UID_A),
+                source="miniapp_ws",
+            )
+            self.assertFalse(ok_cas)
+            self.assertEqual(8, s_cas)
+            self.assertEqual(g, t_cas)
+            self.assertEqual(g, hub.takeover_gen)
+            self.assertEqual(("main", ADMIN_UID_A), hub.takeover_owner)
+
+            r_int_cas = await srv.internal_takeover(
+                _make_req(
+                    hub,
+                    {
+                        "active": True,
+                        "bot": "main",
+                        "user_id": ADMIN_UID_A,
+                        "chat_id": ADMIN_UID_A,
+                        "source": "tg_cmd",
+                        "expected_takeover_gen": g - 1,
+                    },
+                )  # type: ignore[arg-type]
+            )
+            self.assertEqual(403, r_int_cas.status)
+            self.assertEqual(g, hub.takeover_gen)
+
+            # (b) Cross-owner & ownerless mismatch MUST NOT reuse idempotent path, hijack or erase owner
+            for label, call_kw in (
+                ("cross-bot actor", {"owner": ("sg", ADMIN_UID_B), "actor": ("sg", ADMIN_UID_B)}),
+                ("same-bot other user actor", {"owner": ("main", ADMIN_UID_B), "actor": ("main", ADMIN_UID_B)}),
+                ("internal cross-bot owner", {"owner": ("sg", ADMIN_UID_B), "actor": None}),
+                ("internal same-bot other user", {"owner": ("main", ADMIN_UID_B), "actor": None}),
+                ("internal bot-only ownerless tuple", {"owner": ("main", None), "actor": None}),
+            ):
+                ok_x, _, _, t_x = await hub.set_takeover(True, reason=label, **call_kw)
+                self.assertFalse(ok_x, f"{label} MUST fail-closed")
+                self.assertEqual(g, t_x)
+                self.assertEqual(g, hub.takeover_gen)
+                self.assertEqual(("main", ADMIN_UID_A), hub.takeover_owner, f"{label} MUST NOT overwrite owner")
+
+            # Named takeover on unowned session + internal owner=None MUST NOT erase named takeover_owner
+            hub.session_owner = None
+            ok_erase, _, _, t_erase = await hub.set_takeover(True, reason="try erase", owner=None, actor=None)
+            self.assertFalse(ok_erase)
+            self.assertEqual(g, t_erase)
+            self.assertEqual(("main", ADMIN_UID_A), hub.takeover_owner)
+            hub.session_owner = ("main", ADMIN_UID_A)
+
+            # Ownerless takeover vs named request MUST fail-closed; ownerless -> ownerless MUST NOT preserve gen
+            hub.takeover_owner = None
+            ok_mix_actor, _, _, _ = await hub.set_takeover(
+                True, reason="named over ownerless", owner=("main", ADMIN_UID_A), actor=("main", ADMIN_UID_A)
+            )
+            self.assertFalse(ok_mix_actor)
+            ok_mix_int, _, _, _ = await hub.set_takeover(
+                True, reason="internal named over ownerless", owner=("main", ADMIN_UID_A), actor=None
+            )
+            self.assertFalse(ok_mix_int)
+            hub.session_owner = None
+            t_before_ownerless = hub.takeover_gen
+            ok_ol, _, _, t_after_ownerless = await hub.set_takeover(True, reason="ownerless dup", owner=None, actor=None)
+            self.assertTrue(ok_ol)
+            self.assertEqual(t_before_ownerless + 1, t_after_ownerless, "Ownerless->ownerless MUST NOT preserve takeover_gen")
+            self.assertIsNone(hub.takeover_owner)
+
+            # Restore named takeover for (c) RBAC downgrade & revocation tests
+            hub.session_owner = ("main", ADMIN_UID_A)
+            hub.takeover = False
+            hub.takeover_owner = None
+            ok_re, _, _, g_rbac = await hub.set_takeover(
+                True, reason="reacquire", owner=("main", ADMIN_UID_A), actor=("main", ADMIN_UID_A)
+            )
+            self.assertTrue(ok_re)
+
+            # (c) Owner live RBAC downgraded to readonly OR denied: BOTH actor & internal calls MUST fail-closed
+            for bad_role in ("readonly", "denied"):
+                if bad_role == "readonly":
+                    self.auth_ws.write_env(
+                        "main",
+                        token=BOT_MAIN_TOKEN,
+                        allowed=[ADMIN_UID_A, ADMIN_UID_B],
+                        admins=[ADMIN_UID_B],
+                        readonly=[ADMIN_UID_A],
+                    )
+                else:
+                    self.auth_ws.write_env(
+                        "main",
+                        token=BOT_MAIN_TOKEN,
+                        allowed=[ADMIN_UID_B],
+                        admins=[ADMIN_UID_B],
+                    )
+                ok_act_bad, _, _, _ = await hub.set_takeover(
+                    True, reason=f"actor {bad_role}", owner=("main", ADMIN_UID_A), actor=("main", ADMIN_UID_A)
+                )
+                self.assertFalse(ok_act_bad, f"actor call under {bad_role} MUST fail-closed")
+                ok_int_bad, _, _, _ = await hub.set_takeover(
+                    True, reason=f"internal {bad_role}", owner=("main", ADMIN_UID_A), actor=None
+                )
+                self.assertFalse(ok_int_bad, f"internal call under {bad_role} MUST re-check live RBAC and fail-closed")
+                self.assertEqual(g_rbac, hub.takeover_gen)
+
+            # Restore admin RBAC for (d) monotonic release / disconnect / revocation / timeout invariants
+            self.auth_ws.write_env(
+                "main",
+                token=BOT_MAIN_TOKEN,
+                allowed=[ADMIN_UID_A, ADMIN_UID_B],
+                admins=[ADMIN_UID_A, ADMIN_UID_B],
+            )
+
+            # (d1) Normal release increments takeover_gen
+            ok_rel, _, _, g_after_rel = await hub.set_takeover(False, reason="release", actor=("main", ADMIN_UID_A))
+            self.assertTrue(ok_rel)
+            self.assertEqual(g_rbac + 1, g_after_rel)
+            self.assertFalse(hub.takeover)
+
+            # (d2) Disconnect auto-release increments takeover_gen
+            ok_tk2, _, _, g_tk2 = await hub.set_takeover(True, owner=("main", ADMIN_UID_A), actor=("main", ADMIN_UID_A))
+            self.assertTrue(ok_tk2)
+            rel_disc = await hub.release_takeover_on_disconnect("main", ADMIN_UID_A, had_admin_role=True)
+            self.assertTrue(rel_disc)
+            self.assertEqual(g_tk2 + 1, hub.takeover_gen)
+            self.assertFalse(hub.takeover)
+
+            # (d3) Execution-boundary RBAC revocation increments takeover_gen
+            ok_tk3, _, _, g_tk3 = await hub.set_takeover(True, owner=("main", ADMIN_UID_A), actor=("main", ADMIN_UID_A))
+            self.assertTrue(ok_tk3)
+            await hub._revoke_actor_on_exec_boundary("main", ADMIN_UID_A, "denied")
+            self.assertEqual(g_tk3 + 1, hub.takeover_gen)
+            self.assertFalse(hub.takeover)
+
+            # (d4) Same-gen wait_human timeout cleanup strictly increments takeover_gen
+            ok_tk4, _, _, g_tk4 = await hub.set_takeover(True, owner=("main", ADMIN_UID_A), actor=("main", ADMIN_UID_A))
+            self.assertTrue(ok_tk4)
+            r_to = await srv.internal_action(
+                _make_req(
+                    hub,
+                    {
+                        "action": "wait_human",
+                        "bot": "main",
+                        "user_id": ADMIN_UID_A,
+                        "chat_id": ADMIN_UID_A,
+                        "source": "tg_cmd",
+                        "timeout": 0.04,
+                        "notify": False,
+                    },
+                )  # type: ignore[arg-type]
+            )
+            self.assertEqual(408, r_to.status)
+            self.assertFalse(hub.takeover)
+            self.assertEqual(g_tk4 + 1, hub.takeover_gen, "Same-gen wait_human timeout cleanup MUST increment takeover_gen")
+
+            # (d5) Cross-gen / owner-switch race during wait_human returns 408/409, preserves User B takeover & leaks 0 fields
+            hub.session_gen = 20
+            hub.takeover_gen = 10
+            hub.session_owner = ("main", ADMIN_UID_A)
+            hub.url = "https://user-a.example/page"
+            hub.title = "User A"
+            ok_tk5, _, _, g_tk5 = await hub.set_takeover(True, owner=("main", ADMIN_UID_A), actor=("main", ADMIN_UID_A))
+            self.assertTrue(ok_tk5)
+
+            async def _switch_to_user_b_and_timeout(coro, timeout):
+                coro.close()
+                hub.session_gen = 21
+                hub.takeover_gen = 15
+                hub.session_owner = ("sg", ADMIN_UID_B)
+                hub.takeover = True
+                hub.takeover_owner = ("sg", ADMIN_UID_B)
+                hub.url = "https://secret-user-b.example/private?token=SECRET_B"
+                hub.title = "Secret User B"
+                hub.ai_allowed_event.clear()
+                raise asyncio.TimeoutError()
+
+            with mock.patch("asyncio.wait_for", side_effect=_switch_to_user_b_and_timeout):
+                r_xto = await srv.internal_action(
+                    _make_req(
+                        hub,
+                        {
+                            "action": "wait_human",
+                            "bot": "main",
+                            "user_id": ADMIN_UID_A,
+                            "chat_id": ADMIN_UID_A,
+                            "source": "tg_cmd",
+                            "timeout": 0.5,
+                            "notify": False,
+                        },
+                    )  # type: ignore[arg-type]
+                )
+            self.assertEqual(408, r_xto.status)
+            d_xto = _resp_json(r_xto)
+            self.assertNotIn("secret-user-b.example", json.dumps(d_xto))
+            self.assertNotIn("Secret User B", json.dumps(d_xto))
+            self.assertEqual(21, hub.session_gen)
+            self.assertEqual(15, hub.takeover_gen)
+            self.assertTrue(hub.takeover)
+            self.assertEqual(("sg", ADMIN_UID_B), hub.takeover_owner)
+
+            # Cross-gen wakeup (session switched to User B and ai_allowed_event set) -> 409 + 0 User B leak!
+            hub.session_gen = 30
+            hub.takeover_gen = 20
+            hub.session_owner = ("main", ADMIN_UID_A)
+            hub.takeover = False
+            hub.takeover_owner = None
+            hub.ai_allowed_event.set()
+
+            async def _switch_to_user_b_and_wake(coro, timeout):
+                coro.close()
+                hub.session_gen = 31
+                hub.takeover_gen = 25
+                hub.session_owner = ("sg", ADMIN_UID_B)
+                hub.takeover = True
+                hub.takeover_owner = ("sg", ADMIN_UID_B)
+                hub.url = "https://secret-user-b.example/wake"
+                hub.title = "Secret User B Wake"
+                return True
+
+            with mock.patch("asyncio.wait_for", side_effect=_switch_to_user_b_and_wake):
+                r_xwake = await srv.internal_action(
+                    _make_req(
+                        hub,
+                        {
+                            "action": "wait_human",
+                            "bot": "main",
+                            "user_id": ADMIN_UID_A,
+                            "chat_id": ADMIN_UID_A,
+                            "source": "tg_cmd",
+                            "timeout": 0.5,
+                            "notify": False,
+                        },
+                    )  # type: ignore[arg-type]
+                )
+            self.assertEqual(409, r_xwake.status)
+            d_xwake = _resp_json(r_xwake)
+            self.assertNotIn("secret-user-b.example", json.dumps(d_xwake))
+            self.assertNotIn("Secret User B Wake", json.dumps(d_xwake))
+            self.assertTrue(hub.takeover)
+            self.assertEqual(("sg", ADMIN_UID_B), hub.takeover_owner)
+            await hub._cancel_and_await_bg_tasks()
+
+        asyncio.run(_scenario())
+
+
 if __name__ == "__main__":
     unittest.main()

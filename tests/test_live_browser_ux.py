@@ -58,8 +58,8 @@ class _FakeMouse:
     async def click(self, x: float, y: float, **kwargs) -> None:
         self.events.append(("click", x, y, kwargs))
 
-    async def dblclick(self, x: float, y: float) -> None:
-        self.events.append(("dblclick", x, y))
+    async def dblclick(self, x: float, y: float, **kwargs) -> None:
+        self.events.append(("dblclick", x, y, kwargs) if kwargs else ("dblclick", x, y))
 
     async def wheel(self, dx: float, dy: float) -> None:
         self.events.append(("wheel", dx, dy))
@@ -433,8 +433,16 @@ class TestStreamingMouseProtocolAndNativePageEvents(unittest.TestCase):
             self.assertIn(("move", 55.0, 66.0), page.mouse.events)
             self.assertIn(("down", "left"), page.mouse.events)
             self.assertIn(("up", "left"), page.mouse.events)
-            self.assertIn(("click", 200.0, 210.0, {"button": "right"}), page.mouse.events)
-            self.assertIn(("click", 300.0, 310.0, {"button": "left", "click_count": 2}), page.mouse.events)
+            self.assertIn(("move", 200.0, 210.0), page.mouse.events)
+            self.assertIn(
+                ("click", 200.0, 210.0, {"button": "right", "delay": srv.HUMAN_CLICK_HOLD_DELAY_MS}),
+                page.mouse.events,
+            )
+            self.assertIn(("move", 300.0, 310.0), page.mouse.events)
+            self.assertIn(
+                ("click", 300.0, 310.0, {"button": "left", "click_count": 2, "delay": srv.HUMAN_CLICK_HOLD_DELAY_MS}),
+                page.mouse.events,
+            )
 
         asyncio.run(_scenario())
 
@@ -11359,6 +11367,592 @@ function createWebViewInstance(useWebCrypto) {
                 )
 
             asyncio.run(_scenario())
+
+
+class TestTakeoverClickStabilityContractC3ToC6(unittest.TestCase):
+    """Contracts C3–C6: WS stale-input self-heal/throttle, 5-role zero-leak matrix, human click TOCTOU & exception resilience."""
+
+    def test_c3_ws_stale_input_self_heal_throttle_and_tab_cmd_ack_compat(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bdir = Path(tmp)
+            tok_main = "100001:EXAMPLE_MAIN_TOK_C3_RESYNC_12345"
+            (bdir / ".env").write_text(
+                f"AGY_TG_BOT_TOKEN={tok_main}\n"
+                "AGY_TG_ALLOWED_CHATS=111\n"
+                "AGY_TG_ADMIN_USERS=111\n",
+                encoding="utf-8",
+            )
+
+            async def _scenario() -> None:
+                hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "sec-tok")
+                hub.engine_mode = "async_hosted"
+                hub.ctx = _FakeCtx([_FakePage("https://app.example/home", "Home")])
+                hub.url = "https://app.example/home"
+                hub.title = "Home"
+                hub.session_gen = 7
+                hub.takeover_gen = 4
+                hub.session_owner = ("main", 111)
+                hub.takeover = True
+                hub.takeover_owner = ("main", 111)
+
+                fake_ws_type = types.SimpleNamespace(TEXT="TEXT", CLOSE="CLOSE")
+                req = types.SimpleNamespace(app={"hub": hub}, remote="127.0.0.1")
+
+                # 1. High-frequency flood (20 stale move/wheel) under fixed low positive monotonic clock:
+                #    - 0 enqueued, 0 executed, NEVER auto-filled
+                #    - First stale event triggers resync state immediately even at low uptime (0.05s; None sentinel!)
+                #    - Flood throttled to 1 state resync push (no amplification storm) & 0 toasts!
+                clock_val = [0.05]
+
+                def _fake_mono() -> float:
+                    return clock_val[0]
+
+                flood_msgs: list[dict[str, Any]] = [
+                    {"type": "auth", "initData": _signed_init_data(tok_main, 111)},
+                ]
+                for i in range(10):
+                    flood_msgs.append({"type": "input", "action": "move", "x": i, "y": i, "session_gen": 6, "takeover_gen": 4})
+                    flood_msgs.append({"type": "input", "action": "wheel", "dx": 0, "dy": 50, "session_gen": 7, "takeover_gen": 3})
+
+                enqueued: list[dict[str, Any]] = []
+
+                async def _spy_put(item: dict[str, Any]) -> None:
+                    enqueued.append(dict(item))
+
+                ws_flood = _FakeWSViewer(flood_msgs)
+                with (
+                    mock.patch.object(srv, "_BRIDGE_DIR", bdir),
+                    mock.patch.object(srv, "WSMsgType", fake_ws_type),
+                    mock.patch.object(srv, "web", types.SimpleNamespace(WebSocketResponse=lambda **_kw: ws_flood)),
+                    mock.patch.object(srv.time, "monotonic", side_effect=_fake_mono),
+                    mock.patch.object(hub.input_queue, "put", side_effect=_spy_put),
+                ):
+                    await srv.handle_ws(req)  # type: ignore[arg-type]
+
+                self.assertEqual([], enqueued, "All 20 stale move/wheel events MUST be dropped (0 enqueued)")
+                flood_states = [m for m in ws_flood.sent_json if m.get("type") == "state"]
+                # 1 initial handshake state + 1 throttled stale-resync state (NOT 21!)
+                self.assertEqual(2, len(flood_states), f"Expected 1 initial + 1 throttled resync state, got {len(flood_states)}")
+                self.assertEqual(7, flood_states[1]["session_gen"])
+                self.assertEqual(4, flood_states[1]["takeover_gen"])
+                flood_toasts = [m for m in ws_flood.sent_json if m.get("type") == "toast"]
+                self.assertEqual([], flood_toasts, "High-frequency move/wheel stale inputs MUST emit 0 toast")
+
+                # 2. Discrete stale inputs (click/type/press) across cooldown windows + tab_cmd_id compat:
+                hub.takeover = True
+                hub.takeover_owner = ("main", 111)
+                hub.takeover_gen = 4
+                enqueued.clear()
+
+                class _ClockSteppingWS(_FakeWSViewer):
+                    def __init__(self, steps: list[tuple[float, dict[str, Any]]]) -> None:
+                        super().__init__([m for _, m in steps])
+                        self._times = [t for t, _ in steps]
+
+                    async def receive(self):
+                        if self._times:
+                            clock_val[0] = self._times.pop(0)
+                        return await super().receive()
+
+                    def __aiter__(self):
+                        return self
+
+                    async def __anext__(self):
+                        if not self._incoming or self.closed:
+                            raise StopAsyncIteration
+                        if self._times:
+                            clock_val[0] = self._times.pop(0)
+                        return await super().__anext__()
+
+                ws_discrete = _ClockSteppingWS(
+                    [
+                        (10.0, {"type": "auth", "initData": _signed_init_data(tok_main, 111)}),
+                        # t=10.1: first stale click -> 1 resync state + 1 sanitized toast
+                        (10.1, {"type": "input", "action": "click", "x": 10, "y": 20, "session_gen": 7, "takeover_gen": 3}),
+                        # t=10.2: second stale type within cooldown -> throttled (0 extra state, 0 extra toast)
+                        (10.2, {"type": "input", "action": "type", "text": "abc", "session_gen": 6, "takeover_gen": 4}),
+                        # t=11.0: past state cooldown (0.8s) but within toast cooldown (2.0s) -> +1 state, 0 extra toast
+                        (11.0, {"type": "input", "action": "press", "key": "Enter", "session_gen": 7, "takeover_gen": 2}),
+                        # t=12.5: past both cooldowns -> +1 state, +1 toast
+                        (12.5, {"type": "input", "action": "click", "x": 30, "y": 40, "session_gen": 6, "takeover_gen": 2}),
+                        # tab_cmd_id preserves existing tab_cmd_ack semantics unchanged
+                        (
+                            12.6,
+                            {
+                                "type": "input",
+                                "action": "switch_tab",
+                                "index": 0,
+                                "cmd_id": "tc-c3-compat",
+                                "session_gen": 7,
+                                "takeover_gen": 2,
+                            },
+                        ),
+                    ]
+                )
+                with (
+                    mock.patch.object(srv, "_BRIDGE_DIR", bdir),
+                    mock.patch.object(srv, "WSMsgType", fake_ws_type),
+                    mock.patch.object(srv, "web", types.SimpleNamespace(WebSocketResponse=lambda **_kw: ws_discrete)),
+                    mock.patch.object(srv.time, "monotonic", side_effect=_fake_mono),
+                    mock.patch.object(hub.input_queue, "put", side_effect=_spy_put),
+                ):
+                    await srv.handle_ws(req)  # type: ignore[arg-type]
+
+                self.assertEqual([], enqueued, "All stale discrete inputs MUST be dropped (0 enqueued)")
+                disc_states = [m for m in ws_discrete.sent_json if m.get("type") == "state"]
+                # 1 initial handshake + 3 resyncs (at t=10.1, 11.0, 12.5; throttled at 10.2; tab_cmd_id does not resync)
+                self.assertEqual(4, len(disc_states))
+                disc_toasts = [m for m in ws_discrete.sent_json if m.get("type") == "toast"]
+                # 2 sanitized discrete toasts (at t=10.1 and t=12.5)
+                self.assertEqual(2, len(disc_toasts))
+                for tmsg in disc_toasts:
+                    self.assertNotIn("app.example", tmsg.get("message", ""))
+                tab_acks = [m for m in ws_discrete.sent_json if m.get("type") == "tab_cmd_ack"]
+                self.assertEqual(
+                    [{"type": "tab_cmd_ack", "cmd_id": "tc-c3-compat", "status": "rejected", "reason": "stale_takeover"}],
+                    tab_acks,
+                )
+
+            asyncio.run(_scenario())
+
+    def test_c4_ws_stale_input_five_role_zero_leak_redteam_matrix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bdir = Path(tmp)
+            tok_main = "100001:EXAMPLE_MAIN_TOK_C4_MAT_12345"
+            tok_sg = "200002:EXAMPLE_SG_TOK_C4_MAT_67890"
+            (bdir / ".env").write_text(
+                f"AGY_TG_BOT_TOKEN={tok_main}\n"
+                "AGY_TG_ALLOWED_CHATS=111,112\n"
+                "AGY_TG_ADMIN_USERS=111\n"
+                "AGY_TG_READONLY_USERS=112\n",
+                encoding="utf-8",
+            )
+            (bdir / ".env.sg").write_text(
+                f"AGY_TG_BOT_TOKEN={tok_sg}\n"
+                "AGY_TG_ALLOWED_CHATS=222,223\n"
+                "AGY_TG_ADMIN_USERS=222\n"
+                "AGY_TG_READONLY_USERS=223\n",
+                encoding="utf-8",
+            )
+
+            async def _scenario() -> None:
+                hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18796, "public_url": ""}, "sec-tok")
+                hub.engine_mode = "async_hosted"
+                hub.ctx = _FakeCtx([_FakePage("https://private-tenant-a.example/vault?k=secret", "Vault A")])
+                hub.url = "https://private-tenant-a.example/vault?k=secret"
+                hub.title = "Vault A"
+                hub.active_profile = "secret-profile-a"
+                hub.tabs = [{"index": 0, "url": hub.url, "title": "Vault A", "active": True}]
+                hub.session_gen = 9
+                hub.takeover_gen = 5
+                hub.session_owner = ("main", 111)
+                hub.takeover = True
+                hub.takeover_owner = ("main", 111)
+                hub.tg.retire_cards = mock.AsyncMock()  # type: ignore[method-assign]
+
+                fake_ws_type = types.SimpleNamespace(TEXT="TEXT", CLOSE="CLOSE")
+                req = types.SimpleNamespace(app={"hub": hub}, remote="127.0.0.1")
+                stale_cmds = [
+                    {"type": "input", "action": "click", "x": 10, "y": 10, "session_gen": 8, "takeover_gen": 4},
+                    {"type": "input", "action": "type", "text": "x", "session_gen": 9, "takeover_gen": 4},
+                    {"type": "input", "action": "move", "x": 15, "y": 25, "session_gen": 8, "takeover_gen": 5},
+                ]
+
+                def _assert_no_private_leak(ws: _FakeWSViewer, label: str, *, allow_initial_owner_state: bool = False) -> None:
+                    states = [m for m in ws.sent_json if m.get("type") == "state"]
+                    post_states = states[1:] if allow_initial_owner_state else states
+                    for st in post_states:
+                        st_dump = json.dumps(st, ensure_ascii=False)
+                        self.assertNotIn("private-tenant-a.example", st_dump, f"{label} leaked private URL in state")
+                        self.assertNotIn("Vault A", st_dump, f"{label} leaked private title in state")
+                        self.assertNotIn("secret-profile-a", st_dump, f"{label} leaked active_profile in state")
+                    # NEVER push an extra resync state after initial handshake for unauthorized/revoked/idle viewers
+                    self.assertLessEqual(len(states), 1, f"{label} MUST receive 0 post-handshake state resync pushes")
+                    self.assertEqual([], [m for m in ws.sent_json if m.get("type") == "tab_cmd_ack"], f"{label} MUST get 0 tab_cmd_ack")
+                    for t in [m for m in ws.sent_json if m.get("type") == "toast"]:
+                        self.assertNotIn("状态已同步", t.get("message", ""), f"{label} MUST NOT get privileged resync toast")
+                        self.assertNotIn("private-tenant-a.example", t.get("message", ""))
+
+                enqueued: list[dict[str, Any]] = []
+
+                async def _spy_put(item: dict[str, Any]) -> None:
+                    enqueued.append(dict(item))
+
+                # Roles (1) cross-bot admin, (2) cross-bot readonly, (3) same-bot readonly without read access
+                for label, tok, uid in (
+                    ("(1) cross-bot admin (sg, 222)", tok_sg, 222),
+                    ("(2) cross-bot readonly (sg, 223)", tok_sg, 223),
+                    ("(3) same-bot readonly (main, 112)", tok_main, 112),
+                ):
+                    ws_r = _FakeWSViewer([{"type": "auth", "initData": _signed_init_data(tok, uid)}, *stale_cmds])
+                    with (
+                        mock.patch.object(srv, "_BRIDGE_DIR", bdir),
+                        mock.patch.object(srv, "WSMsgType", fake_ws_type),
+                        mock.patch.object(srv, "web", types.SimpleNamespace(WebSocketResponse=lambda **_kw: ws_r)),
+                        mock.patch.object(hub.input_queue, "put", side_effect=_spy_put),
+                    ):
+                        await srv.handle_ws(req)  # type: ignore[arg-type]
+                    _assert_no_private_leak(ws_r, label)
+
+                # Role (4a) former owner downgraded to readonly after handshake
+                # Role (4b) former owner revoked (denied) after handshake
+                orig_role = srv._check_live_user_role
+                for target_role, label in (
+                    ("readonly", "(4a) former owner downgraded to readonly"),
+                    ("denied", "(4b) former owner revoked to denied"),
+                ):
+                    hub.takeover = True
+                    hub.takeover_owner = ("main", 111)
+                    calls = [0]
+
+                    def _flip_role(bk: str, uid: int, _target: str = target_role) -> str:
+                        if bk == "main" and uid == 111:
+                            calls[0] += 1
+                            return _target if calls[0] >= 3 else "admin"
+                        return orig_role(bk, uid)
+
+                    ws_rev = _FakeWSViewer([{"type": "auth", "initData": _signed_init_data(tok_main, 111)}, *stale_cmds])
+                    with (
+                        mock.patch.object(srv, "_BRIDGE_DIR", bdir),
+                        mock.patch.object(srv, "WSMsgType", fake_ws_type),
+                        mock.patch.object(srv, "web", types.SimpleNamespace(WebSocketResponse=lambda **_kw: ws_rev)),
+                        mock.patch.object(srv, "_check_live_user_role", side_effect=_flip_role),
+                        mock.patch.object(hub.input_queue, "put", side_effect=_spy_put),
+                    ):
+                        await srv.handle_ws(req)  # type: ignore[arg-type]
+                    _assert_no_private_leak(ws_rev, label, allow_initial_owner_state=True)
+                    if target_role == "denied":
+                        self.assertEqual([], [m for m in ws_rev.sent_json if m.get("type") == "toast"])
+
+                # Role (5) session stopped -> ownerless idle: former owner & other admin get 0 resync state & 0 toast
+                await hub._stop_hosted_locked(notify_finished=False)
+                self.assertEqual("idle", hub.engine_mode)
+                self.assertIsNone(hub.session_owner)
+                for label, tok, uid in (
+                    ("(5a) idle former owner (main, 111)", tok_main, 111),
+                    ("(5b) idle other admin (sg, 222)", tok_sg, 222),
+                ):
+                    ws_idle = _FakeWSViewer([{"type": "auth", "initData": _signed_init_data(tok, uid)}, *stale_cmds])
+                    with (
+                        mock.patch.object(srv, "_BRIDGE_DIR", bdir),
+                        mock.patch.object(srv, "WSMsgType", fake_ws_type),
+                        mock.patch.object(srv, "web", types.SimpleNamespace(WebSocketResponse=lambda **_kw: ws_idle)),
+                        mock.patch.object(hub.input_queue, "put", side_effect=_spy_put),
+                    ):
+                        await srv.handle_ws(req)  # type: ignore[arg-type]
+                    _assert_no_private_leak(ws_idle, label)
+                    self.assertEqual([], [m for m in ws_idle.sent_json if m.get("type") == "toast"], f"{label} MUST get 0 toast in idle")
+
+                self.assertEqual([], enqueued, "All 5 unauthorized/revoked/idle roles MUST produce 0 enqueued inputs")
+
+            asyncio.run(_scenario())
+
+    def test_c5_human_click_move_reverify_delay_and_midflight_toctou_races(self) -> None:
+        async def _scenario() -> None:
+            hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "tok")
+            hub.engine_mode = "async_hosted"
+            hub.session_gen = 3
+            hub.takeover_gen = 2
+            hub.session_owner = ("main", 111)
+            hub.takeover = True
+            hub.takeover_owner = ("main", 111)
+            hub.tg.tick_updates = mock.AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+            # (a1) Standard _FakeMouse: click (1x, 2x), dblclick, rightclick ALL move first & pass delay=45
+            page = _FakePage()
+            hub.ctx = _FakeCtx([page])
+            with mock.patch.object(srv, "_check_live_user_role", return_value="admin"):
+                base_meta = {"_session_gen": 3, "_takeover_gen": 2, "_bot_key": "main", "_user_id": 111}
+                await hub._execute_human_cmd_async({"action": "click", "x": 10, "y": 20, **base_meta})
+                await hub._execute_human_cmd_async({"action": "click", "x": 30, "y": 40, "click_count": 2, **base_meta})
+                await hub._execute_human_cmd_async({"action": "dblclick", "x": 50, "y": 60, **base_meta})
+                await hub._execute_human_cmd_async({"action": "rightclick", "x": 70, "y": 80, **base_meta})
+
+            self.assertEqual(
+                [
+                    ("move", 10.0, 20.0),
+                    ("click", 10.0, 20.0, {"delay": srv.HUMAN_CLICK_HOLD_DELAY_MS}),
+                    ("move", 30.0, 40.0),
+                    ("click", 30.0, 40.0, {"button": "left", "click_count": 2, "delay": srv.HUMAN_CLICK_HOLD_DELAY_MS}),
+                    ("move", 50.0, 60.0),
+                    ("dblclick", 50.0, 60.0, {"delay": srv.HUMAN_CLICK_HOLD_DELAY_MS}),
+                    ("move", 70.0, 80.0),
+                    ("click", 70.0, 80.0, {"button": "right", "delay": srv.HUMAN_CLICK_HOLD_DELAY_MS}),
+                ],
+                page.mouse.events,
+            )
+
+            # (a2) Compatibility with legacy mock lacking `move` AND legacy mock whose `dblclick(x, y)` rejects `delay`
+            class _LegacyMockMouse:
+                def __init__(self) -> None:
+                    self.events: list[tuple] = []
+
+                async def click(self, x: float, y: float, **_kw) -> None:
+                    self.events.append(("click", x, y))
+
+                async def dblclick(self, x: float, y: float) -> None:
+                    self.events.append(("dblclick_nodelay", x, y))
+
+            legacy_page = _FakePage()
+            legacy_page.mouse = _LegacyMockMouse()  # type: ignore[assignment]
+            hub.ctx = _FakeCtx([legacy_page])
+            with mock.patch.object(srv, "_check_live_user_role", return_value="admin"):
+                await hub._execute_human_cmd_async({"action": "click", "x": 11, "y": 22, **base_meta})
+                await hub._execute_human_cmd_async({"action": "dblclick", "x": 33, "y": 44, **base_meta})
+            self.assertEqual([("click", 11.0, 22.0), ("dblclick_nodelay", 33.0, 44.0)], legacy_page.mouse.events)
+
+            # (b) 4 mid-flight TOCTOU race classes during suspended `await page.mouse.move(x, y)`:
+            #     (1) takeover_gen bumped, (2) session_gen bumped, (3) takeover off / owner switch, (4) live RBAC revoked/downgraded
+            race_cases = [
+                ("takeover_gen_bump", "click"),
+                ("session_gen_bump", "dblclick"),
+                ("takeover_closed", "rightclick"),
+                ("owner_switched", "click"),
+                ("rbac_downgraded", "dblclick"),
+                ("rbac_revoked", "rightclick"),
+            ]
+            for race_kind, action_name in race_cases:
+                move_entered = asyncio.Event()
+                release_move = asyncio.Event()
+                live_role_state = ["admin"]
+
+                class _SlowClickMouse:
+                    def __init__(self) -> None:
+                        self.events: list[tuple] = []
+
+                    async def move(self, x: float, y: float) -> None:
+                        self.events.append(("move", x, y))
+                        move_entered.set()
+                        await release_move.wait()
+
+                    async def click(self, x: float, y: float, **kw) -> None:
+                        self.events.append(("click", x, y, kw))
+
+                    async def dblclick(self, x: float, y: float, **kw) -> None:
+                        self.events.append(("dblclick", x, y, kw))
+
+                    async def up(self, button: str = "left") -> None:
+                        self.events.append(("up", button))
+
+                slow_page = _FakePage()
+                slow_page.mouse = _SlowClickMouse()  # type: ignore[assignment]
+                hub.ctx = _FakeCtx([slow_page])
+                hub.engine_mode = "async_hosted"
+                hub.session_gen = 10
+                hub.takeover_gen = 5
+                hub.session_owner = ("main", 111)
+                hub.takeover = True
+                hub.takeover_owner = ("main", 111)
+
+                with mock.patch.object(srv, "_check_live_user_role", side_effect=lambda _b, _u: live_role_state[0]):
+                    task_cmd = asyncio.create_task(
+                        hub._execute_human_cmd_async(
+                            {
+                                "action": action_name,
+                                "x": 99.0,
+                                "y": 88.0,
+                                "_session_gen": 10,
+                                "_takeover_gen": 5,
+                                "_bot_key": "main",
+                                "_user_id": 111,
+                            }
+                        )
+                    )
+                    await asyncio.wait_for(move_entered.wait(), timeout=1.0)
+                    if race_kind == "takeover_gen_bump":
+                        hub.takeover_gen += 1
+                    elif race_kind == "session_gen_bump":
+                        hub.session_gen += 1
+                    elif race_kind == "takeover_closed":
+                        hub.takeover = False
+                        hub.takeover_owner = None
+                    elif race_kind == "owner_switched":
+                        hub.takeover_owner = ("sg", 222)
+                    elif race_kind == "rbac_downgraded":
+                        live_role_state[0] = "readonly"
+                    elif race_kind == "rbac_revoked":
+                        live_role_state[0] = "denied"
+                    release_move.set()
+                    await task_cmd
+
+                self.assertEqual(
+                    [("move", 99.0, 88.0)],
+                    slow_page.mouse.events,
+                    f"Race {race_kind} during {action_name} MUST execute 0 click/dblclick after move!",
+                )
+            await hub._cancel_and_await_bg_tasks()
+
+        asyncio.run(_scenario())
+
+    def test_c6_click_exception_resilience_sanitized_toast_and_zero_crosstalk(self) -> None:
+        async def _scenario() -> None:
+            hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "tok")
+            hub.engine_mode = "async_hosted"
+            hub.session_gen = 12
+            hub.takeover_gen = 4
+            hub.session_owner = ("main", 111)
+            hub.takeover = True
+            hub.takeover_owner = ("main", 111)
+            hub.tg.tick_updates = mock.AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+            ws_owner_a = _FakeWSViewer()
+            ws_user_b = _FakeWSViewer()
+            hub.viewers.update({ws_owner_a, ws_user_b})  # type: ignore[arg-type]
+            hub.viewer_meta[ws_owner_a] = {"bot_key": "main", "user_id": 111, "role": "admin"}
+            hub.viewer_meta[ws_user_b] = {"bot_key": "sg", "user_id": 222, "role": "admin"}
+
+            sensitive_err = (
+                "Playwright error at /var/private/.secrets/profile.json "
+                "https://bank.example/auth?access_token=SUPER_SECRET_TOK_999&key=LEAK_KEY"
+            )
+            fail_mode = ["click"]
+            successful_clicks: list[tuple[float, float]] = []
+            cmd_done = asyncio.Event()
+            roles = {("main", 111): "admin", ("sg", 222): "admin"}
+
+            class _FlakyMouse:
+                async def move(self, x: float, y: float) -> None:
+                    if fail_mode[0] == "move":
+                        raise RuntimeError(sensitive_err)
+                    if fail_mode[0] == "move_then_switch_b":
+                        hub.session_gen = 13
+                        hub.takeover_gen = 9
+                        hub.session_owner = ("sg", 222)
+                        hub.takeover_owner = ("sg", 222)
+                        raise RuntimeError(sensitive_err)
+                    if fail_mode[0] == "move_then_revoke_a":
+                        roles[("main", 111)] = "denied"
+                        raise RuntimeError(sensitive_err)
+
+                async def click(self, x: float, y: float, **_kw) -> None:
+                    if fail_mode[0] == "click":
+                        raise RuntimeError(sensitive_err)
+                    successful_clicks.append((x, y))
+                    cmd_done.set()
+
+                async def dblclick(self, x: float, y: float, **_kw) -> None:
+                    raise RuntimeError(sensitive_err)
+
+                async def up(self, button: str = "left") -> None:
+                    pass
+
+            page = _FakePage()
+            page.mouse = _FlakyMouse()  # type: ignore[assignment]
+            hub.ctx = _FakeCtx([page])
+
+            input_task = asyncio.create_task(hub._input_loop())
+            try:
+                with (
+                    mock.patch.object(srv, "_check_live_user_role", side_effect=lambda bk, uid: roles.get((bk, uid), "denied")),
+                    self.assertLogs(srv.log.name, level="WARNING") as log_cap,
+                ):
+                    # (a1) Exception in click -> generic sanitized toast ONLY to owner A, 0 to User B, 0 secret in toast or logs
+                    fail_mode[0] = "click"
+                    await hub.input_queue.put(
+                        {
+                            "action": "click",
+                            "x": 50,
+                            "y": 60,
+                            "_session_gen": 12,
+                            "_takeover_gen": 4,
+                            "_bot_key": "main",
+                            "_user_id": 111,
+                        }
+                    )
+                    # Follow-up valid click proves _input_loop survived and did not stall!
+                    await asyncio.sleep(0.05)
+                    fail_mode[0] = "ok"
+                    await hub.input_queue.put(
+                        {
+                            "action": "click",
+                            "x": 70,
+                            "y": 80,
+                            "_session_gen": 12,
+                            "_takeover_gen": 4,
+                            "_bot_key": "main",
+                            "_user_id": 111,
+                        }
+                    )
+                    await asyncio.wait_for(cmd_done.wait(), timeout=2.0)
+
+                    self.assertEqual([(70.0, 80.0)], successful_clicks)
+                    toasts_a = [m for m in ws_owner_a.sent_json if m.get("type") == "toast"]
+                    toasts_b = [m for m in ws_user_b.sent_json if m.get("type") == "toast"]
+                    self.assertEqual(1, len(toasts_a), "Authorized owner A must receive 1 generic failure toast")
+                    self.assertEqual([], toasts_b, "User B must receive 0 toasts")
+                    for needle in ("SUPER_SECRET_TOK_999", "LEAK_KEY", "/var/private/.secrets", "bank.example"):
+                        self.assertNotIn(needle, toasts_a[0]["message"], "Toast MUST NOT leak raw exception data")
+                        self.assertNotIn(needle, "\n".join(log_cap.output), "Logs MUST NOT leak raw exception data")
+
+                    # (b1) Exception while session/owner switches to User B -> 0 toasts to BOTH A and B; loop stays alive for B!
+                    ws_owner_a.sent_json.clear()
+                    ws_user_b.sent_json.clear()
+                    cmd_done.clear()
+                    fail_mode[0] = "move_then_switch_b"
+                    await hub.input_queue.put(
+                        {
+                            "action": "click",
+                            "x": 11,
+                            "y": 22,
+                            "_session_gen": 12,
+                            "_takeover_gen": 4,
+                            "_bot_key": "main",
+                            "_user_id": 111,
+                        }
+                    )
+                    await asyncio.sleep(0.05)
+                    self.assertEqual([], [m for m in ws_owner_a.sent_json if m.get("type") == "toast"])
+                    self.assertEqual([], [m for m in ws_user_b.sent_json if m.get("type") == "toast"])
+
+                    # User B's subsequent valid click runs cleanly!
+                    fail_mode[0] = "ok"
+                    await hub.input_queue.put(
+                        {
+                            "action": "click",
+                            "x": 150,
+                            "y": 160,
+                            "_session_gen": 13,
+                            "_takeover_gen": 9,
+                            "_bot_key": "sg",
+                            "_user_id": 222,
+                        }
+                    )
+                    await asyncio.wait_for(cmd_done.wait(), timeout=2.0)
+                    self.assertEqual((150.0, 160.0), successful_clicks[-1])
+
+                    # (b2) Exception while owner A's live RBAC is revoked -> 0 toasts to BOTH A and B
+                    hub.session_gen = 14
+                    hub.takeover_gen = 10
+                    hub.session_owner = ("main", 111)
+                    hub.takeover = True
+                    hub.takeover_owner = ("main", 111)
+                    roles[("main", 111)] = "admin"
+                    ws_owner_a.sent_json.clear()
+                    ws_user_b.sent_json.clear()
+                    fail_mode[0] = "move_then_revoke_a"
+                    await hub.input_queue.put(
+                        {
+                            "action": "dblclick",
+                            "x": 33,
+                            "y": 44,
+                            "_session_gen": 14,
+                            "_takeover_gen": 10,
+                            "_bot_key": "main",
+                            "_user_id": 111,
+                        }
+                    )
+                    await asyncio.sleep(0.05)
+                    self.assertEqual([], [m for m in ws_owner_a.sent_json if m.get("type") == "toast"])
+                    self.assertEqual([], [m for m in ws_user_b.sent_json if m.get("type") == "toast"])
+            finally:
+                input_task.cancel()
+                try:
+                    await input_task
+                except asyncio.CancelledError:
+                    pass
+                await hub._cancel_and_await_bg_tasks()
+
+        asyncio.run(_scenario())
 
 
 if __name__ == "__main__":

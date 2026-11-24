@@ -744,11 +744,13 @@ class TestFix4BotResolutionStorageAndEvents(unittest.TestCase):
                         mock.patch.object(srv, "_load_bot_bus_module", return_value=bot_bus),
                         mock.patch.object(srv, "_check_live_user_role", return_value="admin"),
                     ):
-                        # 1. False -> True emits 1 event; duplicate True -> True emits 0 events
+                        # 1. False -> True emits 1 event; duplicate True -> True emits 0 events AND preserves takeover_gen/owner (C1)
                         ok1, _, _, tgen1 = await hub.set_takeover(True, reason="user click", actor=("main", ADMIN_UID_A), source="miniapp_ws")
                         self.assertTrue(ok1)
                         ok2, _, _, tgen2 = await hub.set_takeover(True, reason="dup", actor=("main", ADMIN_UID_A), source="miniapp_ws")
                         self.assertTrue(ok2)
+                        self.assertEqual(tgen1, tgen2, "Same-owner idempotent True->True MUST preserve takeover_gen")
+                        self.assertEqual(("main", ADMIN_UID_A), hub.takeover_owner)
                         pkts = bot_bus.pop_inbox_packets("alpha_bot")
                         self.assertEqual(1, len(pkts), "Idempotent True->True must not emit duplicate event")
                         self.assertTrue(pkts[0]["active"])
