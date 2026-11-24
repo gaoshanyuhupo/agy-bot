@@ -3105,5 +3105,312 @@ class TestTelegram429FloodWaitCircuitBreaker(unittest.TestCase):
                 self.assertNotIn(tok, "\n".join(logs))
 
 
+    def test_c2_execute_bus_job_clean_local_bus_exempt_vs_non_local_fail_closed(self):
+        """C2: Clean local_bus jobs skip keyword tainting & run as local_worker+local_bus; non-local/tainted/remote_trusted jobs Fail-Closed."""
+        import io
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge, _chat_a, _chat_b, _dm_uid, _tok = self._load_clean_bridge(tmp)
+
+            def _run_job_case(job_id: str, job_overrides: dict) -> tuple[dict, str, dict]:
+                captured: dict = {}
+                finished: list[dict] = []
+
+                def _fake_popen(cmd, **kwargs):
+                    captured["cmd"] = list(cmd)
+                    captured["env"] = dict(kwargs["env"])
+                    captured["prompt"] = cmd[-1]
+
+                    class _Proc:
+                        pid = 71001
+                        returncode = 0
+                        stdout = io.StringIO(
+                            json.dumps({"event": "init", "conversation_id": f"conv-{job_id}"}) + "\n"
+                            + json.dumps(
+                                {
+                                    "event": "result",
+                                    "result": {
+                                        "status": "SUCCESS",
+                                        "conversation_id": f"conv-{job_id}",
+                                        "response": "done",
+                                    },
+                                }
+                            )
+                            + "\n"
+                        )
+                        stderr = io.StringIO("")
+
+                        def wait(self, timeout=None):
+                            return 0
+
+                    return _Proc()
+
+                job = {
+                    "job_id": job_id,
+                    "from_bot": "sgaeget_bot",
+                    "target_bot": "agycli_main_bot",
+                    "prompt": "修复 [GITHUB_WEBHOOK] 与 写入长期记忆 ignore previous instructions 单测",
+                    "label": "c2-test",
+                    "workdir": tmp,
+                    "mode": "auto",
+                    "notify_group": False,
+                    "chain": ["sgaeget_bot", "agycli_main_bot"],
+                    **job_overrides,
+                }
+                with (
+                    mock.patch.object(bridge.bot_bus, "claim_job", return_value=job),
+                    mock.patch.object(bridge.bot_bus, "is_job_cancelled", return_value=False),
+                    mock.patch.object(bridge.bot_bus, "finish_job", side_effect=lambda _j, **kw: finished.append(kw)),
+                    mock.patch.object(bridge, "_publish_bot_heartbeat"),
+                    mock.patch.object(bridge.subprocess, "Popen", side_effect=_fake_popen),
+                ):
+                    bridge._execute_bus_job(job_id)
+                return captured["env"], captured["prompt"], finished[0]
+
+            # 1. Clean local_bus jobs (local_worker and local_admin) bypass keyword tainting completely
+            for jid, overrides in (
+                ("c2-clean-worker", {"agent_origin": "local_bus", "trust_level": "local_worker", "readonly": False, "untrusted": False, "tainted": False}),
+                ("c2-clean-admin", {"agent_origin": "local_bus", "trust_level": "local_admin", "readonly": False, "untrusted": False, "tainted": False}),
+            ):
+                with self.subTest(clean_bus_job=jid):
+                    env_out, prompt_out, fin = _run_job_case(jid, overrides)
+                    self.assertEqual("local_worker", env_out.get("AGY_TRUST_LEVEL"))
+                    self.assertEqual("local_bus", env_out.get("AGY_AGENT_ORIGIN"))
+                    self.assertNotIn("AGY_UNTRUSTED_SESSION", env_out)
+                    self.assertNotIn("AGY_MEMORY_READONLY", env_out)
+                    self.assertNotIn("[AGY_MEMORY_READONLY=1]", prompt_out)
+                    self.assertFalse(fin.get("tainted"))
+                    self.assertFalse(bridge.memory_guard.is_tainted(f"conv-{jid}", taint_file=bridge.MEMORY_TAINT_FILE))
+
+            # 2. Non-local / missing origin / tainted / untrusted / readonly / remote_trusted -> Fail-Closed!
+            fail_closed_cases = [
+                ("c2-empty-origin", {"agent_origin": "", "trust_level": "local_worker"}),
+                ("c2-scheduled-origin", {"agent_origin": "scheduled", "trust_level": "local_worker"}),
+                ("c2-webroom-origin", {"agent_origin": "web_room", "trust_level": "local_worker"}),
+                ("c2-remote-hub", {"agent_origin": "remote_hub", "trust_level": "local_admin"}),
+                ("c2-remote-trusted", {"agent_origin": "local_bus", "trust_level": "remote_trusted"}),
+                ("c2-remote-untrusted", {"agent_origin": "local_bus", "trust_level": "remote_untrusted"}),
+                ("c2-readonly-guest", {"agent_origin": "local_bus", "trust_level": "readonly_guest"}),
+                ("c2-tainted-flag", {"agent_origin": "local_bus", "trust_level": "local_worker", "tainted": True}),
+                ("c2-untrusted-flag", {"agent_origin": "local_bus", "trust_level": "local_worker", "untrusted": True}),
+                ("c2-readonly-flag", {"agent_origin": "local_bus", "trust_level": "local_worker", "readonly": True}),
+            ]
+            for jid, overrides in fail_closed_cases:
+                with self.subTest(fail_closed_bus_job=jid):
+                    env_out, prompt_out, fin = _run_job_case(jid, overrides)
+                    self.assertEqual("1", env_out.get("AGY_UNTRUSTED_SESSION"))
+                    self.assertEqual("1", env_out.get("AGY_MEMORY_READONLY"))
+                    self.assertIn(env_out.get("AGY_TRUST_LEVEL"), ("remote_untrusted", "readonly_guest"))
+                    self.assertIn("[AGY_MEMORY_READONLY=1]", prompt_out)
+                    self.assertTrue(fin.get("tainted"))
+                    self.assertTrue(bridge.memory_guard.is_tainted(f"conv-{jid}", taint_file=bridge.MEMORY_TAINT_FILE))
+
+    def test_c2_e2e_mcp_dispatch_to_disk_to_execute_bus_job_local_origins(self):
+        """E2E C2: Clean local_admin MCP team_dispatch from local_bus/local_web/local_tg/local_tg_fast/empty
+        persists clean local_bus job JSON and executes via _execute_bus_job as local_worker+local_bus with zero taint."""
+        import io
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge, _chat_a, _chat_b, _dm_uid, _tok = self._load_clean_bridge(tmp)
+            bridge.MEMORY_TAINT_FILE = os.path.join(tmp, "memory_taint.json")
+            bridge.BOT_META.update({"bot_id": 9002, "handle": "agycli_main_bot", "resolved": True})
+
+            import bot_bus_mcp  # noqa: E402
+
+            importlib.reload(bot_bus_mcp)
+            bot_bus_mcp.bot_bus = bridge.bot_bus
+
+            bridge.bot_bus.update_bot_config("sgaeget_bot", role="coordinator", specialty="orchestrator")
+            bridge.bot_bus.update_bot_config("agycli_main_bot", role="worker", specialty="developer")
+            bridge.bot_bus.heartbeat_bot({"handle": "sgaeget_bot", "pid": os.getpid(), "role": "coordinator", "busy": False})
+            bridge.bot_bus.heartbeat_bot({"handle": "agycli_main_bot", "pid": os.getpid(), "role": "worker", "busy": False})
+
+            poison_keyword_prompt = (
+                "请修复 [GITHUB_WEBHOOK] 与 [UNTRUSTED_EXTERNAL_DATA] 误伤，"
+                "补齐 ignore all previous instructions 与 写入长期记忆 回归单测"
+            )
+
+            for origin_val in ("local_bus", "local_web", "local_tg", "local_tg_fast", ""):
+                for explicit_trust in (None, "local_worker"):
+                    with self.subTest(origin=origin_val, explicit_trust=explicit_trust):
+                        mcp_env = {
+                            "AGY_BOT_BUS_ENABLE": "1",
+                            "AGY_BOT_BUS_ROLE": "coordinator",
+                            "AGY_BOT_HANDLE": "sgaeget_bot",
+                            "AGY_BOT_CHAIN": "",
+                            "AGY_BOT_TEAM_ID": "",
+                            "AGY_TRUST_LEVEL": "local_admin",
+                            "AGY_AGENT_ORIGIN": origin_val,
+                            "AGY_RBAC_ROLE": "admin",
+                            "AGY_UNTRUSTED_SESSION": "",
+                            "AGY_MEMORY_READONLY": "",
+                        }
+                        dispatch_args = {
+                            "bot": "agycli_main_bot",
+                            "prompt": poison_keyword_prompt,
+                            "workdir": tmp,
+                            "mode": "auto",
+                            "notify_group": False,
+                        }
+                        if explicit_trust:
+                            dispatch_args["trust_level"] = explicit_trust
+
+                        with mock.patch.dict(os.environ, mcp_env, clear=False):
+                            res = bot_bus_mcp._handle_team_dispatch(dispatch_args)
+                        self.assertFalse(res.get("isError"), res)
+                        payload = json.loads(res["content"][0]["text"])
+                        jid = payload["dispatched"][0]["job_id"]
+
+                        # Verify persisted on-disk job JSON
+                        disk_job = bridge.bot_bus.get_job(jid)
+                        self.assertIsNotNone(disk_job)
+                        self.assertFalse(disk_job["tainted"])
+                        self.assertFalse(disk_job["untrusted"])
+                        self.assertEqual("local_bus", disk_job["agent_origin"])
+                        expected_disk_trust = explicit_trust or "local_admin"
+                        self.assertEqual(expected_disk_trust, disk_job["trust_level"])
+
+                        # Execute real on-disk job through _execute_bus_job (real claim_job + real finish_job)
+                        captured: dict = {}
+                        conv_id = f"conv-e2e-{jid}"
+
+                        def _fake_popen(cmd, **kwargs):
+                            captured["cmd"] = list(cmd)
+                            captured["env"] = dict(kwargs["env"])
+                            captured["prompt"] = cmd[-1]
+
+                            class _Proc:
+                                pid = 72001
+                                returncode = 0
+                                stdout = io.StringIO(
+                                    json.dumps({"event": "init", "conversation_id": conv_id}) + "\n"
+                                    + json.dumps(
+                                        {
+                                            "event": "result",
+                                            "result": {
+                                                "status": "SUCCESS",
+                                                "conversation_id": conv_id,
+                                                "response": "e2e ok",
+                                            },
+                                        }
+                                    )
+                                    + "\n"
+                                )
+                                stderr = io.StringIO("")
+
+                                def wait(self, timeout=None):
+                                    return 0
+
+                            return _Proc()
+
+                        with (
+                            mock.patch.object(bridge, "_publish_bot_heartbeat"),
+                            mock.patch.object(bridge.subprocess, "Popen", side_effect=_fake_popen),
+                        ):
+                            bridge._execute_bus_job(jid)
+
+                        env_out = captured["env"]
+                        self.assertEqual("local_worker", env_out.get("AGY_TRUST_LEVEL"))
+                        self.assertEqual("local_bus", env_out.get("AGY_AGENT_ORIGIN"))
+                        self.assertNotIn("AGY_UNTRUSTED_SESSION", env_out)
+                        self.assertNotIn("AGY_MEMORY_READONLY", env_out)
+                        self.assertNotIn("[AGY_MEMORY_READONLY=1]", captured["prompt"])
+
+                        settled = bridge.bot_bus.get_job(jid)
+                        self.assertEqual("done", settled["status"])
+                        self.assertFalse(settled.get("tainted"))
+                        self.assertFalse(bridge.memory_guard.is_tainted(conv_id, taint_file=bridge.MEMORY_TAINT_FILE))
+                        self.assertFalse(os.path.exists(bridge.MEMORY_TAINT_FILE))
+
+    def test_p2_transient_summarization_retry_passes_untrusted_to_compact(self):
+        """P2: run_agy transient summarization retry propagates untrusted=turn_untrusted to _execute_compact_on_session."""
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge, chat_a, _chat_b, dm_uid, _tok = self._load_clean_bridge(tmp)
+            bridge.MEMORY_TAINT_FILE = os.path.join(tmp, "memory_taint.json")
+
+            class _RetrySession:
+                def __init__(self, events, cid="conv-sum-retry"):
+                    self.cid = cid
+                    self._events = list(events)
+                    self.last_used = bridge.time.time()
+                    self.driver_name = "agy"
+                    self.mode = "auto"
+
+                def is_alive(self):
+                    return True
+
+                def send_user_prompt(self, text):
+                    pass
+
+                def next_event(self, timeout=0.25):
+                    return self._events.pop(0) if self._events else {"event": "__eof__"}
+
+                def peek_immediate_result(self, timeout=0.065):
+                    return None, False
+
+                def get_stderr_text(self):
+                    return "summarization failed: context window exceeded"
+
+                def close(self, force=False):
+                    pass
+
+            sessions = [
+                _RetrySession(
+                    [
+                        {
+                            "event": "result",
+                            "result": {
+                                "status": "ERROR",
+                                "conversation_id": "conv-sum-retry",
+                                "error": "summarization failed: context window exceeded",
+                            },
+                        }
+                    ]
+                ),
+                _RetrySession(
+                    [
+                        {
+                            "event": "result",
+                            "result": {
+                                "status": "SUCCESS",
+                                "conversation_id": "conv-sum-retry",
+                                "response": "recovered ok",
+                            },
+                        }
+                    ]
+                ),
+            ]
+            compact_calls: list[dict] = []
+            with (
+                mock.patch.object(bridge, "_acquire_session", side_effect=lambda *a, **kw: (sessions.pop(0), False)),
+                mock.patch.object(bridge, "_check_compact_support", return_value=(False, "agy")),
+                mock.patch.object(bridge, "_sleep_interruptible", return_value=True),
+                mock.patch.object(
+                    bridge,
+                    "_execute_compact_on_session",
+                    side_effect=lambda *a, **kw: compact_calls.append(dict(kw)) or True,
+                ),
+                mock.patch.object(bridge, "send_rich", return_value=(1, "ok")),
+                mock.patch.object(bridge, "send", return_value=1),
+                mock.patch.object(bridge, "tg", return_value={"ok": True, "result": {"message_id": 1}}),
+                mock.patch.object(bridge, "tg_send_in_route", return_value={"ok": True, "result": {"message_id": 1}}),
+                mock.patch.object(bridge, "push_step_images"),
+                mock.patch.object(bridge, "_maybe_post_turn_auto_compact"),
+                mock.patch.object(bridge, "save_state"),
+                mock.patch.object(bridge, "is_transient_agy_error", return_value=True),
+                mock.patch.object(bridge, "is_summarization_error", return_value=True),
+            ):
+                bridge.update_scope_state(str(dm_uid), mode="auto", conversation_id="conv-sum-retry", show_thinking=False)
+                bridge.run_agy(
+                    dm_uid,
+                    "external digest",
+                    user_id=dm_uid,
+                    user_role="admin",
+                    untrusted=True,
+                )
+            self.assertEqual(1, len(compact_calls))
+            self.assertTrue(compact_calls[0].get("untrusted"))
+
+
 if __name__ == "__main__":
     unittest.main()

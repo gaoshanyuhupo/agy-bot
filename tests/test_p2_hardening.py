@@ -443,7 +443,17 @@ class TestC2CrossAgentTaintAndMonotonicAttenuation(unittest.TestCase):
             self.assertEqual(1, retried["retry_count"])
 
     def test_execute_bus_job_tainted_prompt_marks_cid_and_propagates_batch_done(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        scrub_keys = (
+            "AGY_UNTRUSTED_SESSION",
+            "AGY_MEMORY_READONLY",
+            "AGY_TRUST_LEVEL",
+            "AGY_MAX_RUNTIME_MODE",
+            "AGY_RBAC_ROLE",
+            "AGY_BOT_TEAM_ID",
+            "AGY_AGENT_ORIGIN",
+        )
+        clean_env = {k: v for k, v in os.environ.items() if k not in scrub_keys}
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, clean_env, clear=True):
             bridge = _load_isolated_bridge(tmp)
             _seed_online_team(bridge.bot_bus)
 
@@ -668,20 +678,139 @@ class TestC4BotBusMcpRoleFailClosed(unittest.TestCase):
                 "AGY_MEMORY_READONLY": "1",
                 "AGY_RBAC_ROLE": "admin",
             }
+            # C6: Untrusted / external session MUST be hard-denied at bot_bus_mcp boundary (0 jobs enqueued)
             with mock.patch.dict(os.environ, env, clear=False):
-                res = bot_bus_mcp._handle_team_dispatch(
-                    {"bot": "worker_bot", "prompt": "check logs", "mode": "auto"}
-                )
-            self.assertFalse(res.get("isError"), res)
-            dispatched = json.loads(res["content"][0]["text"])["dispatched"]
-            job = bot_bus.get_job(dispatched[0]["job_id"])
-            self.assertEqual("team-ops", job["team_id"])
-            self.assertEqual("remote_hub", job["agent_origin"])
-            self.assertEqual("remote_untrusted", job["trust_level"])
-            self.assertTrue(job["untrusted"])
-            self.assertTrue(job["tainted"])
-            self.assertEqual("auto", job["mode"])
-            self.assertEqual("", job["max_runtime_mode"])
+                with self.assertRaises(PermissionError) as ctx:
+                    bot_bus_mcp._handle_team_dispatch(
+                        {
+                            "bot": "worker_bot",
+                            "prompt": "check logs",
+                            "mode": "auto",
+                            "agent_origin": "local_bus",
+                            "trust_level": "local_worker",
+                            "untrusted": False,
+                            "readonly": False,
+                        }
+                    )
+                self.assertIn("PRIVILEGE_ESCALATION_DENIED", str(ctx.exception))
+                replies: list[dict[str, object]] = []
+                with mock.patch.object(bot_bus_mcp, "_send_json", side_effect=replies.append):
+                    bot_bus_mcp._handle_request(
+                        {
+                            "id": 99,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "team_dispatch",
+                                "arguments": {"bot": "worker_bot", "prompt": "check logs", "agent_origin": "local_bus"},
+                            },
+                        }
+                    )
+                self.assertEqual(1, len(replies))
+                self.assertTrue(replies[0]["result"]["isError"])
+                self.assertIn("PRIVILEGE_ESCALATION_DENIED", replies[0]["result"]["content"][0]["text"])
+            self.assertEqual([], bot_bus.pop_inbox_packets("worker_bot"))
+
+    def test_c6_bot_bus_mcp_hard_denies_all_untrusted_external_and_remote_trusted_envs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bot_bus, bot_bus_mcp = _load_isolated_bus(tmp)
+            _seed_online_team(bot_bus)
+
+            # Seed one clean historical job for retry attempts
+            clean_env = {
+                "AGY_BOT_BUS_ENABLE": "1",
+                "AGY_BOT_BUS_ROLE": "coordinator",
+                "AGY_BOT_HANDLE": "coord_bot",
+                "AGY_BOT_CHAIN": "",
+                "AGY_BOT_TEAM_ID": "",
+                "AGY_TRUST_LEVEL": "local_admin",
+                "AGY_AGENT_ORIGIN": "local_bus",
+                "AGY_UNTRUSTED_SESSION": "",
+                "AGY_MEMORY_READONLY": "",
+                "AGY_RBAC_ROLE": "admin",
+            }
+            with mock.patch.dict(os.environ, clean_env, clear=False):
+                base_job = bot_bus.dispatch_assignments(
+                    "coord_bot", [{"bot": "worker_bot", "prompt": "baseline task", "mode": "auto"}]
+                )["jobs"][0]
+            _ = bot_bus.pop_inbox_packets("worker_bot")
+
+            blocked_envs = [
+                ("untrusted_flag", {"AGY_UNTRUSTED_SESSION": "1"}),
+                ("memory_readonly_flag", {"AGY_MEMORY_READONLY": "1"}),
+                ("rbac_readonly", {"AGY_RBAC_ROLE": "readonly"}),
+                ("trust_readonly_guest", {"AGY_TRUST_LEVEL": "readonly_guest"}),
+                ("trust_remote_untrusted", {"AGY_TRUST_LEVEL": "remote_untrusted"}),
+                ("trust_remote_trusted", {"AGY_TRUST_LEVEL": "remote_trusted"}),
+                ("origin_webhook", {"AGY_AGENT_ORIGIN": "webhook"}),
+                ("origin_github_webhook", {"AGY_AGENT_ORIGIN": "github_webhook"}),
+                ("origin_scheduled", {"AGY_AGENT_ORIGIN": "scheduled"}),
+                ("origin_scheduled_handoff", {"AGY_AGENT_ORIGIN": "scheduled_handoff"}),
+                ("origin_web_room", {"AGY_AGENT_ORIGIN": "web_room"}),
+                ("origin_remote_hub", {"AGY_AGENT_ORIGIN": "remote_hub"}),
+                ("origin_remote_hermes", {"AGY_AGENT_ORIGIN": "remote_hermes"}),
+            ]
+            for label, overrides in blocked_envs:
+                with self.subTest(blocked_env=label):
+                    env = {**clean_env, **overrides}
+                    with mock.patch.dict(os.environ, env, clear=False):
+                        # 1) team_dispatch with forged local_bus/local_worker/untrusted=False/readonly=False
+                        with self.assertRaises(PermissionError) as c_disp:
+                            bot_bus_mcp._handle_team_dispatch(
+                                {
+                                    "bot": "worker_bot",
+                                    "prompt": "launder",
+                                    "agent_origin": "local_bus",
+                                    "trust_level": "local_worker",
+                                    "untrusted": False,
+                                    "readonly": False,
+                                }
+                            )
+                        self.assertIn("PRIVILEGE_ESCALATION_DENIED", str(c_disp.exception))
+
+                        # 2) team_job(action="retry")
+                        with self.assertRaises(PermissionError) as c_retry:
+                            bot_bus_mcp._handle_team_job(
+                                {"action": "retry", "job_id": base_job["job_id"], "prompt_override": "launder"}
+                            )
+                        self.assertIn("PRIVILEGE_ESCALATION_DENIED", str(c_retry.exception))
+
+                        # 3) team_broadcast
+                        with self.assertRaises(PermissionError) as c_bc:
+                            bot_bus_mcp._handle_team_broadcast({"message": "untrusted notice", "chat_id": -1001234567890})
+                        self.assertIn("PRIVILEGE_ESCALATION_DENIED", str(c_bc.exception))
+
+                        # 4) End-to-end JSON-RPC tools/call returns isError: true with PRIVILEGE_ESCALATION_DENIED
+                        replies: list[dict[str, object]] = []
+                        with mock.patch.object(bot_bus_mcp, "_send_json", side_effect=replies.append):
+                            bot_bus_mcp._handle_request(
+                                {
+                                    "id": 1,
+                                    "method": "tools/call",
+                                    "params": {
+                                        "name": "team_dispatch",
+                                        "arguments": {
+                                            "bot": "worker_bot",
+                                            "prompt": "launder",
+                                            "agent_origin": "local_bus",
+                                            "trust_level": "local_worker",
+                                        },
+                                    },
+                                }
+                            )
+                            bot_bus_mcp._handle_request(
+                                {
+                                    "id": 2,
+                                    "method": "tools/call",
+                                    "params": {
+                                        "name": "team_job",
+                                        "arguments": {"action": "retry", "job_id": base_job["job_id"]},
+                                    },
+                                }
+                            )
+                        for rep in replies:
+                            self.assertTrue(rep["result"]["isError"])
+                            self.assertIn("PRIVILEGE_ESCALATION_DENIED", rep["result"]["content"][0]["text"])
+                    self.assertEqual([], bot_bus.pop_inbox_packets("worker_bot"))
 
 
 class TestC5WorktreeStrictFailClosedAndSymlinkContainment(unittest.TestCase):
@@ -1504,22 +1633,16 @@ class TestQaRound1BlockersP0AndP1Regressions(unittest.TestCase):
                 self.assertEqual("remote_hub", retried_direct["agent_origin"])
                 self.assertEqual("team-alpha", retried_direct["team_id"])
 
-                mcp_res = bot_bus_mcp._handle_team_job(
-                    {
-                        "action": "retry",
-                        "job_id": clean_job["job_id"],
-                        "prompt_override": "mcp retry laundering attempt",
-                    }
-                )
-                self.assertFalse(mcp_res.get("isError"), mcp_res)
-                mcp_retried_id = json.loads(mcp_res["content"][0]["text"])["retried"]["job_id"]
-                mcp_retried = bot_bus.get_job(mcp_retried_id)
-                self.assertTrue(mcp_retried["tainted"])
-                self.assertTrue(mcp_retried["untrusted"])
-                self.assertEqual("remote_untrusted", mcp_retried["trust_level"])
-                self.assertEqual("", mcp_retried["max_runtime_mode"])
-                self.assertEqual("auto", mcp_retried["mode"])
-                self.assertEqual("remote_hub", mcp_retried["agent_origin"])
+                # C6: MCP retry from untrusted/remote session is hard-denied (PRIVILEGE_ESCALATION_DENIED)
+                with self.assertRaises(PermissionError) as ctx_mcp_untr_retry:
+                    bot_bus_mcp._handle_team_job(
+                        {
+                            "action": "retry",
+                            "job_id": clean_job["job_id"],
+                            "prompt_override": "mcp retry laundering attempt",
+                        }
+                    )
+                self.assertIn("PRIVILEGE_ESCALATION_DENIED", str(ctx_mcp_untr_retry.exception))
 
     def test_p0_2_team_and_origin_spoofing_blocked_and_remote_origin_auto_downgraded(self):
         import agent_driver  # noqa: E402
@@ -1589,29 +1712,22 @@ class TestQaRound1BlockersP0AndP1Regressions(unittest.TestCase):
 
                 self.assertEqual([], bot_bus.pop_inbox_packets("worker_bot"))
 
-                # Valid dispatch under remote_hub auto-downgrades even when caller asks for auto + local_admin
-                ok_res = bot_bus_mcp._handle_team_dispatch(
-                    {
-                        "assignments": [
-                            {
-                                "bot": "worker_bot",
-                                "prompt": "legit remote request",
-                                "mode": "auto",
-                                "trust_level": "local_admin",
-                            }
-                        ]
-                    }
-                )
-                self.assertFalse(ok_res.get("isError"), ok_res)
-                jid = json.loads(ok_res["content"][0]["text"])["dispatched"][0]["job_id"]
-                job = bot_bus.get_job(jid)
-                self.assertEqual("team-alpha", job["team_id"])
-                self.assertEqual("remote_hub", job["agent_origin"])
-                self.assertEqual("remote_untrusted", job["trust_level"])
-                self.assertTrue(job["untrusted"])
-                self.assertTrue(job["tainted"])
-                self.assertEqual("", job["max_runtime_mode"])
-                self.assertEqual("auto", job["mode"])
+                # C6: Even a seemingly valid dispatch under remote_hub is hard-denied at bot_bus_mcp boundary (0 jobs enqueued)
+                with self.assertRaises(PermissionError) as c8:
+                    bot_bus_mcp._handle_team_dispatch(
+                        {
+                            "assignments": [
+                                {
+                                    "bot": "worker_bot",
+                                    "prompt": "legit remote request",
+                                    "mode": "auto",
+                                    "trust_level": "local_admin",
+                                }
+                            ]
+                        }
+                    )
+                self.assertIn("PRIVILEGE_ESCALATION_DENIED", str(c8.exception))
+                self.assertEqual([], bot_bus.pop_inbox_packets("worker_bot"))
 
             # 2) agent_driver.build_session_security_context downgrades trust_level for remote* agent_origin
             #    while preserving auto/allow_skip_permissions for non-readonly sessions

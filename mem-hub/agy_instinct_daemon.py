@@ -151,10 +151,13 @@ _FALLBACK_MARKERS = (
     "[REPO_WATCH_DELTA",
     "[GITHUB_WEBHOOK",
     "[BENCHMARK_DIGEST",
+    "[PRECHECK_TRUNCATED",
+    "[UNTRUSTED_EXTERNAL_DATA",
     "UNTRUSTED_WARNING",
     "不可信外部数据",
     "[EXTERNAL_UNTRUSTED",
     "[ACB_READONLY_GUEST",
+    "[UNTRUSTED_WEB_ROOM_MESSAGE",
 )
 _FALLBACK_POISON_RE = re.compile(
     r"(?i)(?:ignore\s+(?:all\s+|any\s+)?previous\s+instructions|"
@@ -234,9 +237,10 @@ def _classify_harvest_turn(
     Returns:
       - `("session_taint", reason)` if a `USER_INPUT` carries an untrusted external source marker
         (e.g. `[BENCHMARK_DIGEST]`, `UNTRUSTED_WARNING`, `[GITHUB_WEBHOOK`, `[ACB_READONLY_GUEST`)
-      - `("turn_skip", reason)` if the turn has a poisoned external/orphaned tool result (or a
-        prompt-injection payload in user text) without poisoning the entire session (`memory_taint.json`)
-      - `("clean", "")` if safe to harvest
+      - `("turn_skip", reason)` if the turn has a poisoned external/orphaned tool result
+        without poisoning the entire session (`memory_taint.json`)
+      - `("clean", "")` if safe to harvest (normal `USER_INPUT` without untrusted source markers
+        is NEVER skipped merely for mentioning memory/rule keywords)
     """
     for st in turn_steps:
         if st.get("type") == "USER_INPUT":
@@ -245,14 +249,10 @@ def _classify_harvest_turn(
                 res = _MEMORY_GUARD.inspect_text(raw_txt)
                 if res.get("markers"):
                     return "session_taint", ",".join(res.get("reasons", [])[:4]) or "untrusted_marker"
-                if res.get("poison_rules"):
-                    return "turn_skip", ",".join(res.get("reasons", [])[:4]) or "poison_user_text"
             else:
                 for m in _FALLBACK_MARKERS:
                     if m in raw_txt:
                         return "session_taint", f"marker:{m}"
-                if _FALLBACK_POISON_RE.search(raw_txt):
-                    return "turn_skip", "poison:fallback"
 
     ws_list = list(workspace_paths) if workspace_paths else [str(WORKSPACE_DIR)]
     if _MEMORY_GUARD is not None and hasattr(_MEMORY_GUARD, "inspect_turn_external_steps"):

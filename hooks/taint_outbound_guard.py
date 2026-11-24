@@ -125,19 +125,17 @@ def _record_block() -> None:
         pass
 
 
-def _is_owner_direct_session() -> bool:
-    """Return True ONLY when process-level env explicitly indicates a clean Owner direct channel."""
-    if _MEMORY_GUARD is not None:
+def _is_owner_trusted_session() -> bool:
+    """Return True ONLY when process-level env explicitly indicates a clean Owner direct
+    or clean local_bus worker session (Fail-Closed on any untrusted/readonly/external conflict)."""
+    if _MEMORY_GUARD is not None and hasattr(_MEMORY_GUARD, "is_owner_trusted_env"):
         try:
-            return bool(_MEMORY_GUARD.is_owner_direct_env())
+            return bool(_MEMORY_GUARD.is_owner_trusted_env())
         except Exception:
             return False
-    trust = os.environ.get("AGY_TRUST_LEVEL", "").strip().lower()
-    if trust != "local_admin":
-        return False
     if (
-        os.environ.get("AGY_UNTRUSTED_SESSION") == "1"
-        or os.environ.get("AGY_MEMORY_READONLY") == "1"
+        os.environ.get("AGY_UNTRUSTED_SESSION", "").strip() == "1"
+        or os.environ.get("AGY_MEMORY_READONLY", "").strip() == "1"
         or os.environ.get("AGY_RBAC_ROLE", "").strip().lower() == "readonly"
     ):
         return False
@@ -153,7 +151,17 @@ def _is_owner_direct_session() -> bool:
         "remote_batch_done",
     ):
         return False
-    return True
+    trust = os.environ.get("AGY_TRUST_LEVEL", "").strip().lower()
+    if trust == "local_admin":
+        return True
+    if trust == "local_worker" and orig == "local_bus":
+        return True
+    return False
+
+
+def _is_owner_direct_session() -> bool:
+    """Compatibility alias for `_is_owner_trusted_session()`."""
+    return _is_owner_trusted_session()
 
 
 def _read_tail_steps_with_meta(
@@ -337,12 +345,19 @@ def _extract_raw_transcript_path(raw_stdin: str) -> str:
 
 
 def main() -> int:
+    # Permanent Owner exemption: authenticated Owner direct (`local_admin`) and clean local
+    # Coordinator Bus worker (`local_worker` + `local_bus`) sessions with zero untrusted/readonly/
+    # external conflicts bypass anti-poisoning blocking completely (strictly empty stdout `""`, rc=0).
+    # Note: `AGY_INTERNAL_OBSERVER=1` NEVER bypasses this guard on its own.
+    if _is_owner_trusted_session():
+        return _emit_pass()
+
     env_untrusted = (
         os.environ.get("AGY_UNTRUSTED_SESSION") == "1"
         or os.environ.get("AGY_MEMORY_READONLY") == "1"
     )
     turn_taint_only = os.environ.get("AGY_TURN_TAINT_ONLY") == "1"
-    owner_direct = _is_owner_direct_session()
+    owner_direct = False
     tainted = env_untrusted
     taint_scope = "owner_turn" if (env_untrusted and turn_taint_only) else "session"
     cid = ""

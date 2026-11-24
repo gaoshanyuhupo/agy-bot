@@ -757,6 +757,24 @@ def _is_remote_origin(origin: Any) -> bool:
     return str(origin or "").strip().lower().startswith("remote")
 
 
+def _is_external_agent_origin(origin: Any) -> bool:
+    orig = str(origin or "").strip().lower()
+    if not orig:
+        return False
+    try:
+        import memory_guard as _mg  # type: ignore
+
+        return bool(_mg.is_external_agent_origin(orig))
+    except Exception:
+        try:
+            from bridge import memory_guard as _mg  # type: ignore
+
+            return bool(_mg.is_external_agent_origin(orig))
+        except Exception:
+            # Fail-closed if memory_guard cannot be imported
+            return orig not in ("local_bus", "local_tg", "local_web", "local_tg_fast")
+
+
 def _text_has_untrusted_taint(text: str) -> bool:
     if not text:
         return False
@@ -1196,10 +1214,20 @@ def dispatch_assignments(
         _record_dispatch_window_unlocked(now, len(resolved_specs), eff_window_max)
 
         job_ids = [f"job-{uuid.uuid4().hex[:10]}" for _ in resolved_specs]
+        explicit_local_admin_parent = (
+            bool(trust_candidates)
+            and eff_parent_trust == "local_admin"
+            and (not eff_parent_untr)
+            and (not eff_parent_tainted)
+            and (not eff_parent_ro)
+            and (not _is_external_agent_origin(env_origin))
+            and (not _is_external_agent_origin(arg_p_origin))
+            and (not _is_external_agent_origin(eff_origin))
+        )
         for idx, ((spec, target, spec_team, child_origin), jid) in enumerate(zip(resolved_specs, job_ids)):
             prompt_str = str(spec.get("prompt") or "").strip()
-            prompt_tainted = _text_has_untrusted_taint(prompt_str)
             child_is_remote = _is_remote_origin(child_origin)
+            child_is_external = _is_external_agent_origin(child_origin)
             child_ro = bool(eff_parent_ro) or bool(spec.get("readonly", False))
             raw_child_trust = spec.get("trust_level") or trust_level or eff_parent_trust
             child_trust = _min_trust_level(eff_parent_trust, raw_child_trust)
@@ -1209,6 +1237,16 @@ def dispatch_assignments(
                 child_trust = "readonly_guest"
             if child_trust == "readonly_guest":
                 child_ro = True
+            clean_local_admin_dispatch = (
+                explicit_local_admin_parent
+                and child_origin == "local_bus"
+                and (not child_is_external)
+                and (not child_ro)
+                and (not bool(spec.get("untrusted", False)))
+                and (not bool(spec.get("tainted", False)))
+                and child_trust in ("local_admin", "local_worker")
+            )
+            prompt_tainted = False if clean_local_admin_dispatch else _text_has_untrusted_taint(prompt_str)
             child_untr = (
                 bool(eff_parent_untr)
                 or bool(spec.get("untrusted", False))

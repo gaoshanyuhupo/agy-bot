@@ -23,11 +23,13 @@ from typing import Any, Dict, FrozenSet, List
 
 try:
     import bot_bus
+    import memory_guard
 except ImportError:
     _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
     if _THIS_DIR not in sys.path:
         sys.path.insert(0, _THIS_DIR)
     import bot_bus
+    import memory_guard
 
 _STDOUT_LOCK = threading.Lock()
 _STDIN_EOF = threading.Event()
@@ -330,10 +332,11 @@ def _session_security_env() -> Dict[str, Any]:
     env_agent_origin = os.environ.get("AGY_AGENT_ORIGIN", "").strip().lower()
     norm_env_trust = bot_bus._normalize_trust_level(env_trust_level) if env_trust_level else ""
     env_trust_is_ro = norm_env_trust == "readonly_guest"
-    env_trust_is_untr = (
+    env_trust_is_non_local = (
         bool(norm_env_trust)
-        and bot_bus.TRUST_ORDER.get(norm_env_trust, 0) <= bot_bus.TRUST_ORDER["remote_untrusted"]
+        and bot_bus.TRUST_ORDER.get(norm_env_trust, 0) < bot_bus.TRUST_ORDER["local_worker"]
     )
+    env_origin_is_external = memory_guard.is_external_agent_origin(env_agent_origin)
     env_readonly = (
         os.environ.get("AGY_RBAC_ROLE", "").strip().lower() == "readonly"
         or env_trust_is_ro
@@ -341,9 +344,9 @@ def _session_security_env() -> Dict[str, Any]:
     env_untrusted = (
         os.environ.get("AGY_UNTRUSTED_SESSION", "").strip() == "1"
         or os.environ.get("AGY_MEMORY_READONLY", "").strip() == "1"
-        or env_agent_origin.startswith("remote")
+        or env_origin_is_external
         or env_readonly
-        or env_trust_is_untr
+        or env_trust_is_non_local
     )
     env_max_mode = os.environ.get("AGY_MAX_RUNTIME_MODE", "").strip().lower()
     if env_readonly:
@@ -354,8 +357,28 @@ def _session_security_env() -> Dict[str, Any]:
         "agent_origin": env_agent_origin,
         "untrusted": env_untrusted,
         "readonly": env_readonly,
+        "external_origin": env_origin_is_external,
+        "non_local_trust": env_trust_is_non_local,
         "max_runtime_mode": env_max_mode,
     }
+
+
+def _assert_dispatch_allowed(sec: Dict[str, Any], *, action: str) -> None:
+    """Fail-closed hard block preventing untrusted/external/readonly/non-local sessions from
+    dispatching, retrying, or broadcasting onto the trusted local Coordinator Bus."""
+    if sec.get("readonly") or sec.get("untrusted") or sec.get("external_origin") or sec.get("non_local_trust"):
+        reasons: List[str] = []
+        if sec.get("readonly"):
+            reasons.append("readonly")
+        if sec.get("external_origin"):
+            reasons.append(f"external_origin={sec.get('agent_origin')!r}")
+        if sec.get("non_local_trust"):
+            reasons.append(f"non_local_trust={sec.get('trust_level')!r}")
+        if not reasons:
+            reasons.append("untrusted_session")
+        raise PermissionError(
+            f"PRIVILEGE_ESCALATION_DENIED: untrusted/external/non-local session cannot perform {action} ({', '.join(reasons)})"
+        )
 
 
 def _enforce_bound_dispatch_fields(
@@ -372,10 +395,10 @@ def _enforce_bound_dispatch_fields(
             )
         entry["team_id"] = env_team_id
     raw_origin = str(entry.get("agent_origin") or "").strip().lower()
-    if env_agent_origin.startswith("remote"):
-        if raw_origin and not raw_origin.startswith("remote"):
+    if memory_guard.is_external_agent_origin(env_agent_origin):
+        if raw_origin and not memory_guard.is_external_agent_origin(raw_origin):
             raise PermissionError(
-                f"PRIVILEGE_ESCALATION_DENIED: cannot override remote agent_origin {env_agent_origin!r} with {raw_origin!r}"
+                f"PRIVILEGE_ESCALATION_DENIED: cannot override external agent_origin {env_agent_origin!r} with {raw_origin!r}"
             )
         entry["agent_origin"] = raw_origin or env_agent_origin
 
@@ -452,6 +475,7 @@ def _handle_team_dispatch(args: Dict[str, Any]) -> Dict[str, Any]:
         return _tool_text("AGY_BOT_HANDLE missing in session environment.", is_error=True)
 
     sec = _session_security_env()
+    _assert_dispatch_allowed(sec, action="team_dispatch")
     env_team_id = sec["team_id"]
     env_trust_level = sec["trust_level"]
     env_agent_origin = sec["agent_origin"]
@@ -464,9 +488,9 @@ def _handle_team_dispatch(args: Dict[str, Any]) -> Dict[str, Any]:
             f"PRIVILEGE_ESCALATION_DENIED: team_id override rejected ({req_team_id!r} != {env_team_id!r})"
         )
     req_origin = str(args.get("agent_origin") or "").strip().lower()
-    if env_agent_origin.startswith("remote") and req_origin and not req_origin.startswith("remote"):
+    if memory_guard.is_external_agent_origin(env_agent_origin) and req_origin and not memory_guard.is_external_agent_origin(req_origin):
         raise PermissionError(
-            f"PRIVILEGE_ESCALATION_DENIED: cannot override remote agent_origin {env_agent_origin!r} with {req_origin!r}"
+            f"PRIVILEGE_ESCALATION_DENIED: cannot override external agent_origin {env_agent_origin!r} with {req_origin!r}"
         )
 
     assignments = _build_assignment_list(args)
@@ -479,7 +503,11 @@ def _handle_team_dispatch(args: Dict[str, Any]) -> Dict[str, Any]:
         notify_group = int(origin["origin_chat_id"] or 0) < 0
 
     eff_team_id = env_team_id or req_team_id
-    eff_origin = req_origin or env_agent_origin
+    eff_origin = (
+        "local_bus"
+        if (not req_origin and env_agent_origin in ("", "local_bus", "local_tg", "local_web", "local_tg_fast"))
+        else (req_origin or env_agent_origin)
+    )
 
     created = bot_bus.dispatch_assignments(
         me,
@@ -549,6 +577,8 @@ def _handle_team_job(args: Dict[str, Any]) -> Dict[str, Any]:
         return _tool_text(bot_bus.summarize_job_brief(job))
 
     if action == "cancel":
+        sec = _session_security_env()
+        _assert_dispatch_allowed(sec, action="team_job(cancel)")
         job = bot_bus.cancel_job(jid, requester_bot=me, reason=str(args.get("reason") or "cancelled_by_coordinator"))
         if not job:
             return _tool_text(f"Job not found: {jid}", is_error=True)
@@ -556,8 +586,7 @@ def _handle_team_job(args: Dict[str, Any]) -> Dict[str, Any]:
 
     if action == "retry":
         sec = _session_security_env()
-        if sec["readonly"]:
-            raise PermissionError("PRIVILEGE_ESCALATION_DENIED: readonly session cannot retry jobs")
+        _assert_dispatch_allowed(sec, action="team_job(retry)")
         job = bot_bus.retry_job(
             jid,
             requester_bot=me,
@@ -573,6 +602,8 @@ def _handle_team_job(args: Dict[str, Any]) -> Dict[str, Any]:
         return _tool_text({"retried": bot_bus.summarize_job_brief(job)})
 
     if action == "cleanup_worktree":
+        sec = _session_security_env()
+        _assert_dispatch_allowed(sec, action="team_job(cleanup_worktree)")
         force = bool(args.get("force", False))
         res = bot_bus.cleanup_job_worktree(jid, force=force)
         return _tool_text(res, is_error=not bool(res.get("ok")))
@@ -581,6 +612,8 @@ def _handle_team_job(args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _handle_team_broadcast(args: Dict[str, Any]) -> Dict[str, Any]:
+    sec = _session_security_env()
+    _assert_dispatch_allowed(sec, action="team_broadcast")
     msg = str(args.get("message") or "").strip()
     if not msg:
         return _tool_text("`message` cannot be empty.", is_error=True)
@@ -607,6 +640,8 @@ def _handle_team_broadcast(args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _handle_group_say(args: Dict[str, Any]) -> Dict[str, Any]:
+    sec = _session_security_env()
+    _assert_dispatch_allowed(sec, action="group_say")
     msg = str(args.get("message") or "").strip()
     if not msg:
         return _tool_text("`message` cannot be empty.", is_error=True)
@@ -687,10 +722,19 @@ def _handle_request(req: Dict[str, Any]) -> None:
             return
         role = _bus_role()
         if not _bus_enabled() or role == "disabled":
-            _reply_ok(
-                req_id,
-                _tool_text("`acb-team` is disabled on this session.", is_error=True),
-            )
+            if os.environ.get("AGY_RBAC_ROLE", "").strip().lower() == "readonly":
+                _reply_ok(
+                    req_id,
+                    _tool_text(
+                        "PRIVILEGE_ESCALATION_DENIED: `acb-team` is disabled on readonly session.",
+                        is_error=True,
+                    ),
+                )
+            else:
+                _reply_ok(
+                    req_id,
+                    _tool_text("`acb-team` is disabled on this session.", is_error=True),
+                )
             return
         tname = params.get("name") or ""
         if tname not in _allowed_tool_names():

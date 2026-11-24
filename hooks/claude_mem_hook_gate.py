@@ -70,10 +70,13 @@ _FALLBACK_MARKERS = (
     "[REPO_WATCH_DELTA",
     "[GITHUB_WEBHOOK",
     "[BENCHMARK_DIGEST",
+    "[PRECHECK_TRUNCATED",
+    "[UNTRUSTED_EXTERNAL_DATA",
     "UNTRUSTED_WARNING",
     "不可信外部数据",
     "[EXTERNAL_UNTRUSTED",
     "[ACB_READONLY_GUEST",
+    "[UNTRUSTED_WEB_ROOM_MESSAGE",
 )
 _FALLBACK_POISON_RE = re.compile(
     r"(?i)(?:ignore\s+(?:all\s+|any\s+)?previous\s+instructions|"
@@ -154,19 +157,17 @@ def _record_block() -> None:
         _MEMORY_GUARD.record_guard_block(1)
 
 
-def _is_owner_direct_session() -> bool:
-    """Return True ONLY when process-level env explicitly indicates a clean Owner direct channel."""
-    if _MEMORY_GUARD is not None and hasattr(_MEMORY_GUARD, "is_owner_direct_env"):
+def _is_owner_trusted_session() -> bool:
+    """Return True ONLY when process-level env explicitly indicates a clean Owner direct
+    or clean local_bus worker session (Fail-Closed on any untrusted/readonly/external conflict)."""
+    if _MEMORY_GUARD is not None and hasattr(_MEMORY_GUARD, "is_owner_trusted_env"):
         try:
-            return bool(_MEMORY_GUARD.is_owner_direct_env())
+            return bool(_MEMORY_GUARD.is_owner_trusted_env())
         except Exception:
             return False
-    trust = os.environ.get("AGY_TRUST_LEVEL", "").strip().lower()
-    if trust != "local_admin":
-        return False
     if (
-        os.environ.get("AGY_UNTRUSTED_SESSION") == "1"
-        or os.environ.get("AGY_MEMORY_READONLY") == "1"
+        os.environ.get("AGY_UNTRUSTED_SESSION", "").strip() == "1"
+        or os.environ.get("AGY_MEMORY_READONLY", "").strip() == "1"
         or os.environ.get("AGY_RBAC_ROLE", "").strip().lower() == "readonly"
     ):
         return False
@@ -182,7 +183,17 @@ def _is_owner_direct_session() -> bool:
         "remote_batch_done",
     ):
         return False
-    return True
+    trust = os.environ.get("AGY_TRUST_LEVEL", "").strip().lower()
+    if trust == "local_admin":
+        return True
+    if trust == "local_worker" and orig == "local_bus":
+        return True
+    return False
+
+
+def _is_owner_direct_session() -> bool:
+    """Compatibility alias for `_is_owner_trusted_session()`."""
+    return _is_owner_trusted_session()
 
 
 def _inspect_payload_and_steps(
@@ -581,18 +592,20 @@ def main() -> int:
             return 0
 
         cid = str(payload.get("conversationId") or payload.get("session_id") or "").strip()
+        owner_trusted = _is_owner_trusted_session()
         env_untrusted = (
             os.environ.get("AGY_UNTRUSTED_SESSION") == "1"
             or os.environ.get("AGY_MEMORY_READONLY") == "1"
         )
         turn_taint_only = os.environ.get("AGY_TURN_TAINT_ONLY") == "1"
-        if env_untrusted and cid and not turn_taint_only:
-            _mark_cid_tainted(cid, "env_untrusted_session", event)
+        if not owner_trusted:
+            if env_untrusted and cid and not turn_taint_only:
+                _mark_cid_tainted(cid, "env_untrusted_session", event)
 
-        if event in ("session-init", "summarize") and (env_untrusted or _is_cid_tainted(cid)):
-            _record_block()
-            print("{}")
-            return 0
+            if event in ("session-init", "summarize") and (env_untrusted or _is_cid_tainted(cid)):
+                _record_block()
+                print("{}")
+                return 0
 
         inv_num = payload.get("invocationNum")
         if event == "session-init" and isinstance(inv_num, int) and inv_num > 0:
@@ -600,23 +613,23 @@ def main() -> int:
             return 0
 
         tpath = str(payload.get("transcriptPath") or payload.get("transcript_path") or "")
-        owner_direct = _is_owner_direct_session()
         tail_steps, truncated = (
             _read_tail_steps_with_meta(tpath, max_bytes=65536, expand_to_user_input=True)
-            if tpath
+            if tpath and (not owner_trusted or event in ("session-init", "summarize"))
             else ([], False)
         )
 
-        is_untrusted, untrusted_reason = _inspect_payload_and_steps(
-            payload, tail_steps, owner_direct=owner_direct, truncated=truncated
-        )
-        if is_untrusted:
-            if cid and not owner_direct and not turn_taint_only:
-                _mark_cid_tainted(cid, untrusted_reason, event)
-            if event in ("session-init", "summarize"):
-                _record_block()
-                print("{}")
-                return 0
+        if not owner_trusted:
+            is_untrusted, untrusted_reason = _inspect_payload_and_steps(
+                payload, tail_steps, owner_direct=False, truncated=truncated
+            )
+            if is_untrusted:
+                if cid and not turn_taint_only:
+                    _mark_cid_tainted(cid, untrusted_reason, event)
+                if event in ("session-init", "summarize"):
+                    _record_block()
+                    print("{}")
+                    return 0
 
         if event in ("session-init", "summarize"):
             prompt_text = _extract_prompt_text(payload, tail_steps)

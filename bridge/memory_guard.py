@@ -5074,6 +5074,18 @@ _UNSAFE_WORKSPACE_ROOTS = frozenset(
 
 _LOCAL_NO_IO_TOOLS = frozenset({"update_steps", "ask_question"})
 
+_LOCAL_READ_ONLY_PATH_TOOLS = frozenset(
+    {
+        "read_file",
+        "view_file",
+        "view_file_outline",
+        "view_code_item",
+        "list_dir",
+        "find_by_name",
+        "grep_search",
+    }
+)
+
 _LOCAL_PATH_TOOLS = frozenset(
     {
         "read_file",
@@ -5242,21 +5254,77 @@ def is_external_agent_origin(agent_origin: Any) -> bool:
     return orig.startswith("remote") or orig in _EXTERNAL_AGENT_ORIGINS
 
 
-def is_owner_direct_env(env: Optional[Dict[str, str]] = None) -> bool:
-    """Return True ONLY when process-level env explicitly marks a clean Owner direct session (`AGY_TRUST_LEVEL=local_admin`)."""
+def is_owner_trusted_env(env: Optional[Dict[str, str]] = None) -> bool:
+    """Return True ONLY when process-level env explicitly indicates a clean Owner direct
+    session (`AGY_TRUST_LEVEL=local_admin`) or a clean local Coordinator Bus worker dispatch
+    (`AGY_TRUST_LEVEL=local_worker` and `AGY_AGENT_ORIGIN=local_bus`), with zero untrusted,
+    readonly, or external-origin signals present (Fail-Closed on any conflict)."""
     e = os.environ if env is None else env
-    trust = str(e.get("AGY_TRUST_LEVEL") or "").strip().lower()
-    if trust != "local_admin":
-        return False
     if str(e.get("AGY_UNTRUSTED_SESSION") or "").strip() == "1":
         return False
     if str(e.get("AGY_MEMORY_READONLY") or "").strip() == "1":
         return False
     if str(e.get("AGY_RBAC_ROLE") or "").strip().lower() == "readonly":
         return False
-    if is_external_agent_origin(e.get("AGY_AGENT_ORIGIN")):
+    origin = str(e.get("AGY_AGENT_ORIGIN") or "").strip().lower()
+    if is_external_agent_origin(origin):
         return False
-    return True
+    trust = str(e.get("AGY_TRUST_LEVEL") or "").strip().lower()
+    if trust == "local_admin":
+        return True
+    if trust == "local_worker" and origin == "local_bus":
+        return True
+    return False
+
+
+def is_owner_direct_env(env: Optional[Dict[str, str]] = None) -> bool:
+    """Compatibility alias converged onto `is_owner_trusted_env()`."""
+    return is_owner_trusted_env(env)
+
+
+def resolve_trusted_local_readonly_roots(
+    *,
+    home_dir: Optional[str] = None,
+) -> Tuple[str, ...]:
+    """Resolve realpath roots for trusted local read-only host directories
+    (Bot profiles dir and local Antigravity brain transcript dir)."""
+    eff_home = _effective_home(home_dir)
+    try:
+        home_real = os.path.realpath(eff_home).replace("\\", "/").rstrip("/")
+    except Exception:
+        home_real = eff_home.replace("\\", "/").rstrip("/")
+    home_parent = os.path.dirname(home_real).rstrip("/") if home_real else ""
+
+    raw_candidates: List[str] = []
+    env_bots = os.environ.get("AGY_BOT_PROFILES_DIR", "").strip()
+    if env_bots:
+        raw_candidates.append(env_bots)
+    raw_candidates.append(os.path.join(eff_home, ".config", "agy-tg-bridge", "bots"))
+    env_brain = os.environ.get("AGY_BRAIN_ROOT", "").strip()
+    if env_brain:
+        raw_candidates.append(env_brain)
+    raw_candidates.append(os.path.join(eff_home, ".gemini", "antigravity-cli", "brain"))
+
+    roots: List[str] = []
+    seen: set[str] = set()
+    for raw in raw_candidates:
+        s = _HOME_VAR_RE.sub(eff_home, raw)
+        if s == "~":
+            s = eff_home
+        elif s.startswith("~/"):
+            s = eff_home + s[1:]
+        if not os.path.isabs(s):
+            continue
+        try:
+            rp = os.path.realpath(s).replace("\\", "/").rstrip("/")
+        except Exception:
+            continue
+        if not rp or rp in _UNSAFE_WORKSPACE_ROOTS or rp == home_real or (home_parent and rp == home_parent):
+            continue
+        if rp not in seen:
+            seen.add(rp)
+            roots.append(rp)
+    return tuple(roots)
 
 
 def resolve_trusted_workspace_roots(
@@ -7131,7 +7199,10 @@ def classify_tool_call_origin(
     args = tool_args if isinstance(tool_args, dict) else {}
 
     if norm in _LOCAL_PATH_TOOLS:
-        if not roots:
+        is_read_only = norm in _LOCAL_READ_ONLY_PATH_TOOLS
+        ro_roots = resolve_trusted_local_readonly_roots(home_dir=home_dir) if is_read_only else ()
+        allowed_roots = tuple(dict.fromkeys(list(roots) + list(ro_roots))) if is_read_only else roots
+        if not allowed_roots:
             return "external"
         path_vals: List[str] = []
         for key in _LOCAL_PATH_ARG_KEYS:
@@ -7139,10 +7210,18 @@ def classify_tool_call_origin(
             if isinstance(val, str) and val.strip():
                 path_vals.append(val.strip())
         if not path_vals:
-            if norm in _LOCAL_PATH_TOOLS_OPTIONAL_CWD and cwd and is_path_in_trusted_workspaces(cwd, roots, cwd=cwd, home_dir=home_dir):
+            if norm in _LOCAL_PATH_TOOLS_OPTIONAL_CWD and cwd and is_path_in_trusted_workspaces(cwd, allowed_roots, cwd=cwd, home_dir=home_dir):
                 return "local"
             return "external"
-        if all(is_path_in_trusted_workspaces(p, roots, cwd=cwd, home_dir=home_dir) for p in path_vals):
+        if all(
+            is_path_in_trusted_workspaces(p, roots, cwd=cwd, home_dir=home_dir)
+            or (
+                is_read_only
+                and is_path_in_trusted_workspaces(p, ro_roots, cwd=cwd, home_dir=home_dir)
+                and not _is_sensitive_credential_target(p, cwd=cwd, home_dir=home_dir)
+            )
+            for p in path_vals
+        ):
             return "local"
         return "external"
 
@@ -7255,12 +7334,26 @@ def _extract_tool_call_id(obj: Dict[str, Any]) -> str:
     return ""
 
 
+def _unwrap_single_json_string(val: Any) -> Any:
+    """Decode at most ONE layer of JSON double-quoted string (real agy 1.5.16 transcript args)."""
+    if isinstance(val, str) and len(val) >= 2 and val.startswith('"') and val.endswith('"'):
+        try:
+            decoded = json.loads(val)
+        except (ValueError, TypeError):
+            return val
+        if isinstance(decoded, str):
+            return decoded
+    return val
+
+
 def _extract_tool_call_name_and_args(obj: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     name = str(obj.get("tool_name") or obj.get("toolName") or obj.get("name") or "").strip()
     raw_args = obj.get("args")
     if not isinstance(raw_args, dict):
         raw_args = obj.get("arguments")
-    args = raw_args if isinstance(raw_args, dict) else {}
+    if not isinstance(raw_args, dict):
+        return name, {}
+    args = {k: _unwrap_single_json_string(v) for k, v in raw_args.items()}
     return name, args
 
 

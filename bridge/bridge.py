@@ -3954,11 +3954,14 @@ def _execute_compact_on_session(
             % compact_eng
         )
         return False, time.time() - t0, f"driver '{compact_eng}' does not support /compact"
-    is_untrusted = bool(
-        untrusted
-        or readonly
-        or (conv and memory_guard.is_tainted(conv, taint_file=MEMORY_TAINT_FILE))
-    )
+    if untrusted is False:
+        is_untrusted = bool(readonly)
+    else:
+        is_untrusted = bool(
+            untrusted
+            or readonly
+            or (conv and memory_guard.is_tainted(conv, taint_file=MEMORY_TAINT_FILE))
+        )
     slash_cmd = "/compact" if not (instruction and instruction.strip()) else ("/compact " + instruction.strip())
     last_err = ""
 
@@ -4470,15 +4473,15 @@ def _run_fast_group_reply(
             else ""
         )
         is_ext_origin = memory_guard.is_external_agent_origin(agent_origin)
-        explicit_low_trust = (
-            bool(norm_tl)
-            and agent_driver.TRUST_ORDER.get(norm_tl, 0) <= agent_driver.TRUST_ORDER["remote_untrusted"]
-        )
-        history_ext_markers = _detect_external_history_markers(history_block)
+        explicit_non_owner_trust = bool(norm_tl) and norm_tl != "local_admin"
         fast_readonly = (user_role == "readonly") or (norm_tl == "readonly_guest")
-        fast_untrusted = bool(
-            fast_readonly or untrusted or is_ext_origin or explicit_low_trust or history_ext_markers
+        is_fast_owner_direct = (
+            (not fast_readonly)
+            and (not untrusted)
+            and (not is_ext_origin)
+            and (not explicit_non_owner_trust)
         )
+        fast_untrusted = not is_fast_owner_direct
         default_fast_trust = "readonly_guest" if fast_readonly else ("remote_untrusted" if fast_untrusted else "local_admin")
         eff_fast_trust = norm_tl or default_fast_trust
         if fast_readonly:
@@ -4987,41 +4990,28 @@ def run_agy(
             _sc_prof_w["last_seen_checkpoints"] = int(_cur_conv_ckpts or 0)
             _sc_prof_w.pop("profile_reinject_needed", None)
 
-    # Plan A (C1/C2): Trust-channel routing.
-    # - Trusted Owner direct (`local_admin` & non-external channel & clean conv) skips keyword tainting completely.
-    # - Non-Owner (`readonly_guest`, explicit `untrusted=True`, low `trust_level`, external `agent_origin`,
-    #   or already-tainted `conv`) is Fail-Closed session-tainted; scan pure untrusted payload BEFORE system blocks.
+    # Trust-channel routing (Owner direct permanently exempt; non-Owner 100% Fail-Closed).
+    # - Authenticated Owner direct (`user_role != readonly`, `untrusted=False`, non-external origin,
+    #   and explicit `norm_explicit_trust` if set MUST be `"local_admin"` — explicitly excluding
+    #   `remote_trusted`, `remote_untrusted`, `readonly_guest`) NEVER taints or downgrades on group
+    #   history markers/keywords or stale `memory_taint.json` entries.
+    # - Any non-Owner turn is Fail-Closed session-tainted; scan pure untrusted payload BEFORE system blocks.
     is_external_origin = memory_guard.is_external_agent_origin(agent_origin)
-    explicit_low_trust = (
-        bool(norm_explicit_trust)
-        and agent_driver.TRUST_ORDER.get(norm_explicit_trust, 0) <= agent_driver.TRUST_ORDER["remote_untrusted"]
-    )
-    conv_already_tainted = bool(conv and memory_guard.is_tainted(conv, taint_file=MEMORY_TAINT_FILE))
+    explicit_non_owner_trust = bool(norm_explicit_trust) and norm_explicit_trust != "local_admin"
     is_owner_direct = (
         (not session_readonly)
         and (not untrusted)
         and (not is_external_origin)
-        and (not explicit_low_trust)
-        and (not conv_already_tainted)
+        and (not explicit_non_owner_trust)
     )
     owner_history_turn_taint = False
     persist_sticky_taint = True
     if is_owner_direct:
-        history_external_markers = _detect_external_history_markers(history_block)
-        if history_external_markers:
-            # P1-1: Group history contains external untrusted markers (e.g. [GITHUB_WEBHOOK], [REMOTE_AGENT_UNTRUSTED]).
-            # Enforce full turn-level untrusted boundary + PreToolUse/memory protection for THIS turn,
-            # WITHOUT permanently locking the Owner's conversation on subsequent clean turns.
-            turn_untrusted = True
-            owner_history_turn_taint = True
-            persist_sticky_taint = False
-            taint_reason = ",".join(f"history_marker:{m}" for m in history_external_markers[:4])
-            taint_source = "bridge:group_history_external"
-        else:
-            turn_untrusted = False
-            taint_reason = ""
-            taint_source = ""
+        turn_untrusted = False
+        taint_reason = ""
+        taint_source = ""
     else:
+        conv_already_tainted = bool(conv and memory_guard.is_tainted(conv, taint_file=MEMORY_TAINT_FILE))
         turn_untrusted = True
         untrusted_payload = "\n\n".join(x for x in (history_block, str(base_prompt or "")) if x)
         prompt_taint = memory_guard.inspect_text(untrusted_payload)
@@ -5037,12 +5027,15 @@ def run_agy(
             ]
             taint_reason = ",".join(reasons[:4]) or "untrusted_external_channel"
             taint_source = f"bridge:{agent_origin}" if agent_origin else "bridge:external"
-        elif is_external_origin or untrusted or explicit_low_trust:
+        elif is_external_origin or untrusted or explicit_non_owner_trust:
             taint_reason = str(agent_origin or norm_explicit_trust or "untrusted_channel")
             taint_source = f"bridge:{agent_origin}" if agent_origin else "bridge:external"
-        else:
+        elif conv_already_tainted:
             taint_reason = "sticky_tainted_conv"
             taint_source = "bridge:sticky"
+        else:
+            taint_reason = "untrusted_channel"
+            taint_source = "bridge:external"
 
     if turn_untrusted:
         if conv and persist_sticky_taint:
@@ -5283,7 +5276,7 @@ def run_agy(
                     )
                     _execute_compact_on_session(
                         exec_skey, conv, mode, active_model, effort, project, workdir,
-                        readonly=session_readonly, my_turn_gen=my_turn_gen,
+                        readonly=session_readonly, untrusted=turn_untrusted, my_turn_gen=my_turn_gen,
                         is_worktree=bool(active_wt_id),
                     )
                     streamer.set_status_override(None)
@@ -5762,7 +5755,7 @@ def run_agy(
                         )
                         _execute_compact_on_session(
                             exec_skey, conv, mode, active_model, effort, project, workdir,
-                            readonly=session_readonly, my_turn_gen=my_turn_gen,
+                            readonly=session_readonly, untrusted=turn_untrusted, my_turn_gen=my_turn_gen,
                             is_worktree=bool(active_wt_id),
                         )
                     streamer.set_status_override(None)
@@ -7626,16 +7619,21 @@ def _execute_bus_job(job_id, *, claimed_turn_gen=None, claimed_qid=None):
             worktree_info=wt_info,
         )
 
-        # C2: Inspect pure untrusted job envelope BEFORE concatenating trusted system Profile/boundary blocks
+        # C2: Clean local_bus dispatch exemption vs Fail-Closed non-local/tainted Bus job boundary.
         job_readonly = bool(job.get("readonly", False))
         job_team_id = agent_driver.validate_team_id(job.get("team_id") or "")
-        job_origin = str(job.get("agent_origin") or "local_bus").strip().lower() or "local_bus"
-        is_remote_origin = job_origin.startswith("remote")
+        raw_job_origin = str(job.get("agent_origin") or "").strip().lower()
+        is_ext_origin = memory_guard.is_external_agent_origin(raw_job_origin)
+        is_remote_origin = raw_job_origin.startswith("remote") or is_ext_origin
         raw_job_trust = str(job.get("trust_level") or "").strip()
         default_job_trust = (
             "readonly_guest"
             if job_readonly
-            else ("remote_untrusted" if (job_tainted or is_remote_origin) else "local_worker")
+            else (
+                "remote_untrusted"
+                if (job_tainted or is_remote_origin or raw_job_origin != "local_bus")
+                else "local_worker"
+            )
         )
         job_trust = agent_driver.normalize_trust_level(raw_job_trust, default=default_job_trust)
         if is_remote_origin:
@@ -7645,16 +7643,24 @@ def _execute_bus_job(job_id, *, claimed_turn_gen=None, claimed_qid=None):
         if job_trust == "readonly_guest":
             job_readonly = True
 
-        prompt_scan = memory_guard.inspect_text(raw_job_envelope)
-        has_remote_marker = any(m in raw_job_envelope for m in bot_bus.REMOTE_UNTRUSTED_MARKERS)
-        conv_tainted = bool(resume_cid and memory_guard.is_tainted(resume_cid, taint_file=MEMORY_TAINT_FILE))
-        if (
-            is_remote_origin
-            or prompt_scan.get("untrusted")
-            or has_remote_marker
-            or conv_tainted
-            or agent_driver.TRUST_ORDER.get(job_trust, 0) <= agent_driver.TRUST_ORDER["remote_untrusted"]
-        ):
+        owner_exempt = (
+            raw_job_origin == "local_bus"
+            and job_trust in ("local_worker", "local_admin")
+            and (not job_readonly)
+            and (not bool(job.get("untrusted", False)))
+            and (not bool(job.get("tainted", False)))
+            and (not is_ext_origin)
+        )
+        job_origin = raw_job_origin if raw_job_origin else "unknown_bus"
+        prompt_scan = {"untrusted": False, "reasons": []}
+        if owner_exempt:
+            # Clean local Coordinator Bus dispatch: never keyword-taint, never downgrade trust,
+            # never write memory_taint.json, execute with clean `local_worker` + `local_bus` env.
+            job_tainted = False
+            job_trust = "local_worker"
+            job_origin = "local_bus"
+        else:
+            prompt_scan = memory_guard.inspect_text(raw_job_envelope)
             job_tainted = True
 
         full_prompt = raw_job_envelope
