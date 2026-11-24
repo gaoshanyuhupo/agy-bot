@@ -11954,6 +11954,173 @@ class TestTakeoverClickStabilityContractC3ToC6(unittest.TestCase):
 
         asyncio.run(_scenario())
 
+    def test_d3_backlog1_page_identity_toctou_both_playwright_and_xtest(self) -> None:
+        """Phase 1 Backlog #1 + D3(f): mid-move tab switch or page close MUST abort click/mousedown on BOTH page.mouse & XTest."""
+        async def _scenario() -> None:
+            # (1) Playwright page.mouse path (x11_display=None): tab switch & page close during suspended move
+            for mutation in ("switch_tab", "close_page"):
+                for act_name in ("click", "dblclick", "rightclick", "mousedown"):
+                    move_entered = asyncio.Event()
+                    release_move = asyncio.Event()
+
+                    class _SlowPWMouse:
+                        def __init__(self) -> None:
+                            self.events: list[tuple] = []
+
+                        async def move(self, x: float, y: float) -> None:
+                            self.events.append(("move", x, y))
+                            move_entered.set()
+                            await release_move.wait()
+
+                        async def click(self, x: float, y: float, **kw: Any) -> None:
+                            self.events.append(("click", x, y, kw))
+
+                        async def dblclick(self, x: float, y: float, **kw: Any) -> None:
+                            self.events.append(("dblclick", x, y, kw))
+
+                        async def down(self, button: str = "left") -> None:
+                            self.events.append(("down", button))
+
+                        async def up(self, button: str = "left") -> None:
+                            self.events.append(("up", button))
+
+                    page_a = _FakePage("https://app.example/a", "A")
+                    page_b = _FakePage("https://app.example/b", "B")
+                    page_a_closed = [False]
+                    page_a.is_closed = lambda _c=page_a_closed: _c[0]  # type: ignore[attr-defined]
+                    page_b.is_closed = lambda: False  # type: ignore[attr-defined]
+                    page_a.mouse = _SlowPWMouse()  # type: ignore[assignment]
+
+                    hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "tok")
+                    hub.engine_mode = "async_hosted"
+                    hub.x11_display = None
+                    hub.ctx = _FakeCtx([page_a, page_b])
+                    hub.active_tab_index = 0
+                    hub.session_gen = 21
+                    hub.takeover_gen = 4
+                    hub.session_owner = ("main", 111)
+                    hub.takeover = True
+                    hub.takeover_owner = ("main", 111)
+                    hub.tg.tick_updates = mock.AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+                    with mock.patch.object(srv, "_check_live_user_role", return_value="admin"):
+                        task = asyncio.create_task(
+                            hub._execute_human_cmd_async(
+                                {
+                                    "action": act_name,
+                                    "x": 60.0,
+                                    "y": 70.0,
+                                    "_session_gen": 21,
+                                    "_takeover_gen": 4,
+                                    "_bot_key": "main",
+                                    "_user_id": 111,
+                                }
+                            )
+                        )
+                        await asyncio.wait_for(move_entered.wait(), timeout=1.0)
+                        if mutation == "switch_tab":
+                            hub.active_tab_index = 1
+                        else:
+                            page_a_closed[0] = True
+                        release_move.set()
+                        await task
+
+                    self.assertEqual(
+                        [("move", 60.0, 70.0)],
+                        page_a.mouse.events,
+                        f"Playwright path {mutation}/{act_name} MUST emit 0 click/dblclick/down after page changed",
+                    )
+                    self.assertEqual([], page_b.mouse.events)
+                    await hub._cancel_and_await_bg_tasks()
+
+            # (2) X11 XTest path (x11_display=':99'): tab switch & page close during suspended XTest move
+            for mutation in ("switch_tab", "close_page"):
+                for act_name in ("click", "dblclick", "rightclick", "mousedown"):
+                    move_entered = asyncio.Event()
+                    release_move = asyncio.Event()
+                    x11_calls: list[tuple[Any, ...]] = []
+
+                    page_a = _FakePage("https://app.example/a", "A")
+                    page_b = _FakePage("https://app.example/b", "B")
+                    page_a_closed = [False]
+                    page_a.is_closed = lambda _c=page_a_closed: _c[0]  # type: ignore[attr-defined]
+                    page_b.is_closed = lambda: False  # type: ignore[attr-defined]
+
+                    async def _fake_eval(expr: str, *_a: Any) -> Any:
+                        if "mozInnerScreenX" in expr:
+                            return {
+                                "mozInnerScreenX": 10,
+                                "mozInnerScreenY": 80,
+                                "innerWidth": 1000,
+                                "innerHeight": 600,
+                                "devicePixelRatio": 1.0,
+                            }
+                        return None
+
+                    page_a.evaluate = _fake_eval  # type: ignore[method-assign]
+
+                    hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "tok")
+                    hub.engine_mode = "async_hosted"
+                    hub.x11_display = ":99"
+                    hub.ctx = _FakeCtx([page_a, page_b])
+                    hub.active_tab_index = 0
+                    hub.session_gen = 22
+                    hub.takeover_gen = 5
+                    hub.session_owner = ("main", 111)
+                    hub.takeover = True
+                    hub.takeover_owner = ("main", 111)
+                    hub.tg.tick_updates = mock.AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+                    async def _fake_scr(_disp: str | None) -> tuple[int, int]:
+                        return (1920, 1080)
+
+                    async def _slow_x11_move(disp: str | None, sx: int, sy: int) -> bool:
+                        x11_calls.append(("move", disp, sx, sy))
+                        move_entered.set()
+                        await release_move.wait()
+                        return True
+
+                    async def _spy_x11_btn(disp: str | None, btn: int, is_press: bool) -> bool:
+                        x11_calls.append(("button", disp, btn, is_press))
+                        return True
+
+                    hub._x11_pointer.ensure_screen_size_async = _fake_scr  # type: ignore[method-assign]
+                    hub._x11_pointer.move_async = _slow_x11_move  # type: ignore[method-assign]
+                    hub._x11_pointer.button_async = _spy_x11_btn  # type: ignore[method-assign]
+
+                    with mock.patch.object(srv, "_check_live_user_role", return_value="admin"):
+                        task = asyncio.create_task(
+                            hub._execute_human_cmd_async(
+                                {
+                                    "action": act_name,
+                                    "x": 60.0,
+                                    "y": 70.0,
+                                    "_session_gen": 22,
+                                    "_takeover_gen": 5,
+                                    "_bot_key": "main",
+                                    "_user_id": 111,
+                                }
+                            )
+                        )
+                        await asyncio.wait_for(move_entered.wait(), timeout=1.0)
+                        if mutation == "switch_tab":
+                            hub.active_tab_index = 1
+                        else:
+                            page_a_closed[0] = True
+                        release_move.set()
+                        await task
+
+                    self.assertEqual(
+                        [("move", ":99", 70, 150)],
+                        x11_calls,
+                        f"XTest path {mutation}/{act_name} MUST emit 0 XTest button events after page changed",
+                    )
+                    self.assertEqual([], page_a.mouse.events)
+                    self.assertEqual([], page_b.mouse.events)
+                    await hub._cancel_and_await_bg_tasks()
+
+        asyncio.run(_scenario())
+
 
 if __name__ == "__main__":
     unittest.main()

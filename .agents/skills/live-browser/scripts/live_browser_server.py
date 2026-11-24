@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict
+import ctypes
 import fcntl
 import hashlib
 import hmac
@@ -34,6 +35,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from typing import Any, Iterable
 import urllib.parse
@@ -293,8 +295,29 @@ QUALITY_PRESETS: dict[str, dict[str, Any]] = {
     },
 }
 
-# Human-click hold duration (ms) & WS stale-input self-heal throttle intervals
+# Human-click hold duration (ms), X11 XTest pointer bounds, post-click burst & WS stale-input throttle
 HUMAN_CLICK_HOLD_DELAY_MS = 45
+HUMAN_DBLCLICK_GAP_MS = 35
+X11_WHEEL_PIXELS_PER_NOTCH = 120.0
+X11_WHEEL_MAX_STEPS_PER_CMD = 12
+POST_CLICK_BURST_INTERVAL_SECONDS = 0.11  # ~9 FPS (8-10 FPS window)
+POST_CLICK_BURST_DURATION_SECONDS = 2.4   # 2-3s bounded window
+POST_CLICK_BURST_MAX_FRAMES = 22          # hard frame upper bound per burst window
+_POST_CLICK_BURST_ACTIONS = frozenset({"click", "dblclick", "rightclick", "mouseup"})
+_LOCAL_X11_DISPLAY_RE = re.compile(r"\A:[0-9]+(?:\.[0-9]+)?\Z")
+_X11_BUTTON_MAP: dict[str, int] = {"left": 1, "middle": 2, "right": 3}
+_X11_BUTTON_NAMES: dict[int, str] = {1: "left", 2: "middle", 3: "right"}
+_X11_WHEEL_UP_BTN = 4
+_X11_WHEEL_DOWN_BTN = 5
+_X11_WHEEL_LEFT_BTN = 6
+_X11_WHEEL_RIGHT_BTN = 7
+_X11_CONTENT_GEOM_JS = """() => ({
+    mozInnerScreenX: window.mozInnerScreenX,
+    mozInnerScreenY: window.mozInnerScreenY,
+    innerWidth: window.innerWidth,
+    innerHeight: window.innerHeight,
+    devicePixelRatio: window.devicePixelRatio,
+})"""
 STALE_INPUT_STATE_RESYNC_COOLDOWN_SECONDS = 0.8
 STALE_INPUT_TOAST_COOLDOWN_SECONDS = 2.0
 _CONTINUOUS_INPUT_ACTIONS = frozenset({"move", "wheel"})
@@ -2223,6 +2246,403 @@ def _check_live_user_role(bot_key: str, user_id: int) -> str:
     return _check_live_user_role_from_ctx(bot_key, user_id, _load_auth_context())
 
 
+def is_valid_local_x11_display(display: Any) -> bool:
+    """Strictly allow local X11 display names (`:N` or `:N.S`); reject host/TCP/newline SSRF inputs."""
+    return isinstance(display, str) and bool(_LOCAL_X11_DISPLAY_RE.fullmatch(display))
+
+
+def _parse_finite_coord(raw: Any) -> float | None:
+    """Parse a finite int/float coordinate strictly (rejects bool, None, str, NaN, +/-Inf, OverflowError)."""
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    try:
+        val = float(raw)
+    except OverflowError:
+        return None
+    if not math.isfinite(val):
+        return None
+    return val
+
+
+def _validate_mouse_button(raw: Any, *, default: str = "left") -> str | None:
+    """Validate mouse button name strictly (`left` | `right` | `middle`); fail-closed on invalid values."""
+    if raw is None or raw == "":
+        return default
+    if isinstance(raw, str) and raw in _X11_BUTTON_MAP:
+        return raw
+    return None
+
+
+def _compute_clamped_x11_coords(
+    geom: Any,
+    css_x: float | None,
+    css_y: float | None,
+    scr_w: int,
+    scr_h: int,
+) -> tuple[int, int] | None:
+    """Convert CSS viewport coords `(css_x, css_y)` to physical X11 screen coords clamped strictly
+    to the intersection of the browser content rect and X11 root screen `[0, scr_w-1] x [0, scr_h-1]`.
+
+    Returns `None` (fail-closed) when DOM geometry is missing/invalid, screen dims <= 0, or
+    the content rect / root screen intersection is empty.
+    """
+    if not isinstance(geom, dict):
+        return None
+    if isinstance(scr_w, bool) or isinstance(scr_h, bool) or not isinstance(scr_w, int) or not isinstance(scr_h, int):
+        return None
+    if scr_w <= 0 or scr_h <= 0:
+        return None
+    inner_x = _parse_finite_coord(geom.get("mozInnerScreenX"))
+    inner_y = _parse_finite_coord(geom.get("mozInnerScreenY"))
+    inner_w = _parse_finite_coord(geom.get("innerWidth"))
+    inner_h = _parse_finite_coord(geom.get("innerHeight"))
+    dpr = _parse_finite_coord(geom.get("devicePixelRatio"))
+    if (
+        inner_x is None
+        or inner_y is None
+        or inner_w is None
+        or inner_h is None
+        or dpr is None
+        or inner_w <= 0.0
+        or inner_h <= 0.0
+        or dpr <= 0.0
+    ):
+        return None
+
+    ox_f = inner_x * dpr
+    oy_f = inner_y * dpr
+    rw_f = inner_w * dpr
+    rh_f = inner_h * dpr
+    if not (
+        math.isfinite(ox_f)
+        and math.isfinite(oy_f)
+        and math.isfinite(rw_f)
+        and math.isfinite(rh_f)
+    ):
+        return None
+
+    origin_x = int(round(ox_f))
+    origin_y = int(round(oy_f))
+    rect_w = int(round(rw_f))
+    rect_h = int(round(rh_f))
+    if rect_w <= 0 or rect_h <= 0:
+        return None
+
+    min_x = max(0, origin_x)
+    min_y = max(0, origin_y)
+    max_x = min(scr_w - 1, origin_x + rect_w - 1)
+    max_y = min(scr_h - 1, origin_y + rect_h - 1)
+    if min_x > max_x or min_y > max_y:
+        return None
+
+    if css_x is not None and not math.isfinite(css_x):
+        return None
+    if css_y is not None and not math.isfinite(css_y):
+        return None
+    eff_x = (inner_w * 0.5) if css_x is None else max(0.0, min(inner_w, css_x))
+    eff_y = (inner_h * 0.5) if css_y is None else max(0.0, min(inner_h, css_y))
+    scaled_x = (inner_x + eff_x) * dpr
+    scaled_y = (inner_y + eff_y) * dpr
+    if not math.isfinite(scaled_x):
+        sx = max_x if scaled_x > 0.0 else min_x
+    else:
+        sx = max(min_x, min(max_x, int(round(scaled_x))))
+    if not math.isfinite(scaled_y):
+        sy = max_y if scaled_y > 0.0 else min_y
+    else:
+        sy = max(min_y, min(max_y, int(round(scaled_y))))
+    return (sx, sy)
+
+
+def _compute_x11_wheel_steps(dx: float, dy: float) -> list[tuple[int, int]]:
+    """Convert validated finite wheel deltas into bounded `(x11_button, step_count)` pairs."""
+    steps: list[tuple[int, int]] = []
+    cap = max(1, int(X11_WHEEL_MAX_STEPS_PER_CMD))
+    notch = max(1.0, float(X11_WHEEL_PIXELS_PER_NOTCH))
+    if dy != 0.0:
+        btn_y = _X11_WHEEL_DOWN_BTN if dy > 0.0 else _X11_WHEEL_UP_BTN
+        cnt_y = min(cap, max(1, int(round(abs(dy) / notch))))
+        steps.append((btn_y, cnt_y))
+    if dx != 0.0:
+        btn_x = _X11_WHEEL_RIGHT_BTN if dx > 0.0 else _X11_WHEEL_LEFT_BTN
+        cnt_x = min(cap, max(1, int(round(abs(dx) / notch))))
+        steps.append((btn_x, cnt_x))
+    return steps
+
+
+def _configure_x11_ffi(x11_lib: Any, xtst_lib: Any) -> None:
+    """Explicitly configure 64-bit safe ctypes `argtypes` & `restype` for libX11 & libXtst."""
+    x11_lib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    x11_lib.XOpenDisplay.restype = ctypes.c_void_p
+
+    x11_lib.XCloseDisplay.argtypes = [ctypes.c_void_p]
+    x11_lib.XCloseDisplay.restype = ctypes.c_int
+
+    x11_lib.XFlush.argtypes = [ctypes.c_void_p]
+    x11_lib.XFlush.restype = ctypes.c_int
+
+    x11_lib.XDefaultScreen.argtypes = [ctypes.c_void_p]
+    x11_lib.XDefaultScreen.restype = ctypes.c_int
+
+    x11_lib.XDisplayWidth.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    x11_lib.XDisplayWidth.restype = ctypes.c_int
+
+    x11_lib.XDisplayHeight.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    x11_lib.XDisplayHeight.restype = ctypes.c_int
+
+    xtst_lib.XTestQueryExtension.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_int),
+    ]
+    xtst_lib.XTestQueryExtension.restype = ctypes.c_int
+
+    xtst_lib.XTestFakeMotionEvent.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_ulong,
+    ]
+    xtst_lib.XTestFakeMotionEvent.restype = ctypes.c_int
+
+    xtst_lib.XTestFakeButtonEvent.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint,
+        ctypes.c_int,
+        ctypes.c_ulong,
+    ]
+    xtst_lib.XTestFakeButtonEvent.restype = ctypes.c_int
+
+
+class X11XTestPointerEngine:
+    """Thread-safe, lazy-loaded ctypes X11 XTest pointer engine for authenticated human takeover ONLY.
+
+    Security & FFI invariants:
+      - Never loads libX11/libXtst unless a valid local display (`^:\\d+(?:\\.\\d+)?$`) is requested.
+      - All `Display*` parameters and `XOpenDisplay.restype` are `ctypes.c_void_p` (64-bit aarch64 safe).
+      - Serializes all Xlib/XTest calls on a single `Display*` via an explicit `threading.Lock`.
+      - Guarantees idempotent `XFlush` + `XCloseDisplay` (0 leaks, 0 double-close) on stop/switch/error.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._x11: Any | None = None
+        self._xtst: Any | None = None
+        self._dpy: Any | None = None
+        self._display_name: str | None = None
+        self._screen: int = 0
+        self._scr_w: int = 0
+        self._scr_h: int = 0
+
+    @property
+    def active_display(self) -> str | None:
+        with self._lock:
+            return self._display_name
+
+    def _load_libs_locked(self) -> bool:
+        if self._x11 is not None and self._xtst is not None:
+            return True
+        try:
+            x11_lib = ctypes.CDLL("libX11.so.6")
+            xtst_lib = ctypes.CDLL("libXtst.so.6")
+            _configure_x11_ffi(x11_lib, xtst_lib)
+        except Exception as exc:
+            log.debug("X11/XTest library load unavailable (error_type=%s)", type(exc).__name__)
+            return False
+        self._x11 = x11_lib
+        self._xtst = xtst_lib
+        return True
+
+    def _close_locked(self) -> None:
+        dpy = self._dpy
+        x11 = self._x11
+        self._dpy = None
+        self._display_name = None
+        self._screen = 0
+        self._scr_w = 0
+        self._scr_h = 0
+        if dpy and x11 is not None:
+            try:
+                x11.XFlush(dpy)
+            except Exception:
+                pass
+            try:
+                x11.XCloseDisplay(dpy)
+            except Exception:
+                pass
+
+    def _ensure_open_locked(self, display: str | None) -> bool:
+        if not is_valid_local_x11_display(display):
+            return False
+        assert isinstance(display, str)
+        if self._dpy and self._display_name == display and self._scr_w > 0 and self._scr_h > 0:
+            return True
+        if self._dpy and self._display_name != display:
+            self._close_locked()
+        if not self._load_libs_locked():
+            return False
+        assert self._x11 is not None and self._xtst is not None
+        dpy = None
+        try:
+            dpy = self._x11.XOpenDisplay(display.encode("ascii"))
+            if not dpy:
+                return False
+            ev_b = ctypes.c_int(0)
+            err_b = ctypes.c_int(0)
+            maj = ctypes.c_int(0)
+            min_v = ctypes.c_int(0)
+            has_xtest = self._xtst.XTestQueryExtension(
+                dpy,
+                ctypes.byref(ev_b),
+                ctypes.byref(err_b),
+                ctypes.byref(maj),
+                ctypes.byref(min_v),
+            )
+            if not has_xtest:
+                try:
+                    self._x11.XFlush(dpy)
+                except Exception:
+                    pass
+                try:
+                    self._x11.XCloseDisplay(dpy)
+                except Exception:
+                    pass
+                return False
+            scr = int(self._x11.XDefaultScreen(dpy))
+            sw = int(self._x11.XDisplayWidth(dpy, scr))
+            sh = int(self._x11.XDisplayHeight(dpy, scr))
+            if sw <= 0 or sh <= 0:
+                try:
+                    self._x11.XFlush(dpy)
+                except Exception:
+                    pass
+                try:
+                    self._x11.XCloseDisplay(dpy)
+                except Exception:
+                    pass
+                return False
+            self._dpy = dpy
+            self._display_name = display
+            self._screen = scr
+            self._scr_w = sw
+            self._scr_h = sh
+            return True
+        except Exception as exc:
+            log.debug("X11 display open failed (error_type=%s)", type(exc).__name__)
+            if dpy:
+                try:
+                    self._x11.XCloseDisplay(dpy)
+                except Exception:
+                    pass
+            return False
+
+    def close(self) -> None:
+        with self._lock:
+            self._close_locked()
+
+    async def close_async(self) -> None:
+        await asyncio.to_thread(self.close)
+
+    def ensure_screen_size(self, display: str | None) -> tuple[int, int] | None:
+        with self._lock:
+            if not self._ensure_open_locked(display):
+                return None
+            return (self._scr_w, self._scr_h)
+
+    async def ensure_screen_size_async(self, display: str | None) -> tuple[int, int] | None:
+        return await asyncio.to_thread(self.ensure_screen_size, display)
+
+    def move(self, display: str | None, sx: int, sy: int) -> bool:
+        with self._lock:
+            if not self._ensure_open_locked(display):
+                return False
+            assert self._x11 is not None and self._xtst is not None and self._dpy is not None
+            try:
+                res = self._xtst.XTestFakeMotionEvent(self._dpy, self._screen, int(sx), int(sy), 0)
+                if not res:
+                    self._close_locked()
+                    return False
+                self._x11.XFlush(self._dpy)
+                return True
+            except Exception as exc:
+                log.debug("X11 move failed (error_type=%s)", type(exc).__name__)
+                self._close_locked()
+                return False
+
+    async def move_async(self, display: str | None, sx: int, sy: int) -> bool:
+        return await asyncio.to_thread(self.move, display, sx, sy)
+
+    def button(self, display: str | None, button_num: int, is_press: bool) -> bool:
+        if button_num not in (1, 2, 3, 4, 5, 6, 7):
+            return False
+        with self._lock:
+            if not self._ensure_open_locked(display):
+                return False
+            assert self._x11 is not None and self._xtst is not None and self._dpy is not None
+            try:
+                res = self._xtst.XTestFakeButtonEvent(self._dpy, int(button_num), 1 if is_press else 0, 0)
+                if not res:
+                    self._close_locked()
+                    return False
+                self._x11.XFlush(self._dpy)
+                return True
+            except Exception as exc:
+                log.debug("X11 button event failed (btn=%d, error_type=%s)", button_num, type(exc).__name__)
+                self._close_locked()
+                return False
+
+    async def button_async(self, display: str | None, button_num: int, is_press: bool) -> bool:
+        return await asyncio.to_thread(self.button, display, button_num, is_press)
+
+    def release_button(self, display: str | None, button_num: int) -> bool:
+        """Best-effort X11 button release for cleanup: never tears down handle on a single error so
+        subsequent held buttons in the same cleanup sweep can still be released."""
+        if button_num not in (1, 2, 3):
+            return False
+        with self._lock:
+            target_disp = display if is_valid_local_x11_display(display) else self._display_name
+            if not self._ensure_open_locked(target_disp):
+                return False
+            assert self._x11 is not None and self._xtst is not None and self._dpy is not None
+            res = self._xtst.XTestFakeButtonEvent(self._dpy, int(button_num), 0, 0)
+            self._x11.XFlush(self._dpy)
+            return bool(res)
+
+    async def release_button_async(self, display: str | None, button_num: int) -> bool:
+        return await asyncio.to_thread(self.release_button, display, button_num)
+
+    def wheel_steps(self, display: str | None, steps: list[tuple[int, int]]) -> bool:
+        if not steps:
+            return True
+        with self._lock:
+            if not self._ensure_open_locked(display):
+                return False
+            assert self._x11 is not None and self._xtst is not None and self._dpy is not None
+            try:
+                for btn_num, count in steps:
+                    if btn_num not in (_X11_WHEEL_UP_BTN, _X11_WHEEL_DOWN_BTN, _X11_WHEEL_LEFT_BTN, _X11_WHEEL_RIGHT_BTN):
+                        return False
+                    bounded = min(max(0, int(count)), int(X11_WHEEL_MAX_STEPS_PER_CMD))
+                    for _ in range(bounded):
+                        r_down = self._xtst.XTestFakeButtonEvent(self._dpy, int(btn_num), 1, 0)
+                        r_up = self._xtst.XTestFakeButtonEvent(self._dpy, int(btn_num), 0, 0)
+                        if not (r_down and r_up):
+                            self._close_locked()
+                            return False
+                self._x11.XFlush(self._dpy)
+                return True
+            except Exception as exc:
+                log.debug("X11 wheel failed (error_type=%s)", type(exc).__name__)
+                self._close_locked()
+                return False
+
+    async def wheel_steps_async(self, display: str | None, steps: list[tuple[int, int]]) -> bool:
+        return await asyncio.to_thread(self.wheel_steps, display, steps)
+
+
 XCLIP_BIN = shutil.which("xclip") or "/usr/bin/xclip"
 
 
@@ -3782,6 +4202,7 @@ class LiveBrowserHub:
         self.ai_status: str = ""
         self.cursor: dict[str, Any] = {}
         self.x11_display: str | None = None
+        self._x11_pointer: X11XTestPointerEngine = X11XTestPointerEngine()
         self._last_x11_clip: str = ""
         self.latest_clip: dict[str, Any] = {}
 
@@ -3801,6 +4222,10 @@ class LiveBrowserHub:
         self._meta_changed_pending: bool = False
         self._meta_task: asyncio.Task[None] | None = None
         self._settle_task: asyncio.Task[None] | None = None
+        self._burst_task: asyncio.Task[None] | None = None
+        self._burst_deadline_ts: float | None = None
+        self._burst_frames_remaining: int = 0
+        self._burst_binding: tuple[int, int, int, tuple[str, int]] | None = None
         self._wait_human_waiters: int = 0
         self._last_sync_snapshot: dict[str, Any] | None = None
 
@@ -3825,6 +4250,7 @@ class LiveBrowserHub:
         self.takeover_gen: int = 0
         self.takeover_owner: tuple[str, int | None] | None = None
         self._mouse_buttons_down: set[str] = set()
+        self._x11_buttons_down: set[int] = set()
         self._sync_buttons_down: set[str] = set()
         self._takeover_lock = asyncio.Lock()
         self._exec_lock = asyncio.Lock()
@@ -3862,6 +4288,12 @@ class LiveBrowserHub:
         if self._settle_task and not self._settle_task.done() and self._settle_task is not cur_task:
             tasks.append(self._settle_task)
         self._settle_task = None
+        if self._burst_task and not self._burst_task.done() and self._burst_task is not cur_task:
+            tasks.append(self._burst_task)
+        self._burst_task = None
+        self._burst_deadline_ts = None
+        self._burst_frames_remaining = 0
+        self._burst_binding = None
         for t in tasks:
             t.cancel()
         if tasks:
@@ -3887,6 +4319,10 @@ class LiveBrowserHub:
                 t.cancel()
         try:
             await asyncio.wait_for(self.stop_hosted(notify_finished=False), timeout=3.5)
+        except Exception:
+            pass
+        try:
+            await self._x11_pointer.close_async()
         except Exception:
             pass
         await self._cancel_and_await_bg_tasks()
@@ -4282,19 +4718,22 @@ class LiveBrowserHub:
     def _normalize_named_owner(
         raw: tuple[str, int | None] | None,
     ) -> tuple[str, int] | None:
-        """Return canonical `(bot_key, positive_uid)` iff `raw` is a valid named owner, else `None`."""
+        """Return canonical `(bot_key.strip(), positive_uid)` iff `raw` is a valid named owner, else `None`.
+
+        Strictly requires `isinstance(u, int) and not isinstance(u, bool) and u > 0` (rejects bool,
+        float, str, 0, negative ints, None) and non-empty stripped string `bot_key`.
+        """
         if raw is None or not isinstance(raw, tuple) or len(raw) != 2:
             return None
         b, u = raw
-        if not isinstance(b, str) or not b or u is None or isinstance(u, bool):
+        if not isinstance(b, str):
             return None
-        try:
-            uid_int = int(u)
-        except (TypeError, ValueError):
+        b_clean = b.strip()
+        if not b_clean:
             return None
-        if uid_int <= 0:
+        if isinstance(u, bool) or not isinstance(u, int) or u <= 0:
             return None
-        return (b, uid_int)
+        return (b_clean, u)
 
     @staticmethod
     def _callable_accepts_kwarg(fn: Any, kwarg: str) -> bool:
@@ -4821,11 +5260,33 @@ class LiveBrowserHub:
             pass
 
     async def _release_held_mouse_buttons_locked(self, target_page: Any | None = None) -> list[str]:
-        """Server-side fallback releasing any held mouse buttons (caller MUST hold `self._exec_lock`)."""
+        """Server-side fallback releasing any held X11 & Playwright mouse buttons (caller MUST hold `self._exec_lock`)."""
         released: list[str] = []
-        buttons = list(self._mouse_buttons_down)
+        pw_buttons = list(self._mouse_buttons_down)
         self._mouse_buttons_down.clear()
-        if buttons and self.engine_mode == "async_hosted":
+        x11_buttons = sorted(self._x11_buttons_down)
+        self._x11_buttons_down.clear()
+
+        # Always release held X11 buttons first — even when page is None/closed or an earlier release raises.
+        if x11_buttons:
+            disp = self.x11_display or self._x11_pointer.active_display
+            for btn_num in x11_buttons:
+                try:
+                    ok_rel = await asyncio.wait_for(
+                        self._x11_pointer.release_button_async(disp, btn_num),
+                        timeout=1.5,
+                    )
+                    if ok_rel:
+                        released.append(_X11_BUTTON_NAMES.get(btn_num, f"x11:{btn_num}"))
+                except Exception as exc:
+                    log.debug(
+                        "Fallback X11 button release error (btn=%d, error_type=%s, session_gen=%d)",
+                        btn_num,
+                        type(exc).__name__,
+                        self.session_gen,
+                    )
+
+        if pw_buttons and self.engine_mode == "async_hosted":
             page = target_page if target_page is not None else self._current_page()
             if page is not None:
                 is_closed_fn = getattr(page, "is_closed", None)
@@ -4835,13 +5296,171 @@ class LiveBrowserHub:
                             return released
                     except Exception:
                         pass
-                for btn in buttons:
+                for btn in pw_buttons:
                     try:
                         await asyncio.wait_for(page.mouse.up(button=btn), timeout=1.5)
                         released.append(btn)
                     except Exception as exc:
                         log.debug("Fallback mouse.up(%s) error: %s", btn, exc)
         return released
+
+    def _cancel_post_click_burst(self) -> None:
+        """Synchronously cancel and clear any active post-click recapture burst window."""
+        task = self._burst_task
+        self._burst_task = None
+        self._burst_deadline_ts = None
+        self._burst_frames_remaining = 0
+        self._burst_binding = None
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _has_live_admin_viewer_for_owner(self, owner_bot: str, owner_uid: int) -> bool:
+        """Return True iff at least one open WS viewer matches `(owner_bot, owner_uid)` with live admin RBAC."""
+        for ws in list(self.viewers):
+            if getattr(ws, "closed", False):
+                continue
+            meta = self.viewer_meta.get(ws) or {}
+            bkey = str(meta.get("bot_key") or "")
+            uid = meta.get("user_id")
+            if isinstance(uid, bool) or not isinstance(uid, int) or uid <= 0:
+                continue
+            if bkey != owner_bot or uid != owner_uid:
+                continue
+            if _check_live_user_role(bkey, uid) == "admin":
+                return True
+        return False
+
+    def _schedule_post_click_burst(
+        self,
+        expected_session_gen: int,
+        expected_takeover_gen: int,
+        expected_tab_rev: int,
+        owner: tuple[str, int] | None,
+    ) -> asyncio.Task[None] | None:
+        """Start or renew a single-flight, bounded high-frequency WS-only recapture burst (~8-10 FPS for 2-3s).
+
+        Strict invariants:
+          - Never spawns concurrent duplicate burst tasks on rapid repeated clicks (renews in place).
+          - Strictly bounded by BOTH frame cap (`POST_CLICK_BURST_MAX_FRAMES`) and monotonic deadline
+            (never uses `0.0` sentinel or negative offsets; works at low positive uptime like `0.05`).
+          - Immediately aborts on any `(session_gen, takeover_gen, _tab_select_rev)` change, stop,
+            takeover release, viewer disconnect, owner change, or live RBAC revocation/downgrade.
+          - Pushes WS frames lock-free (`_capture_once`) ONLY; NEVER invokes `tg.tick_updates`.
+        """
+        if (
+            self.engine_mode != "async_hosted"
+            or self.ctx is None
+            or not self.takeover
+            or not self.viewers
+        ):
+            return None
+        if (
+            self.session_gen != expected_session_gen
+            or self.takeover_gen != expected_takeover_gen
+            or self._tab_select_rev != expected_tab_rev
+        ):
+            return None
+        norm_owner = self._normalize_named_owner(owner)
+        if norm_owner is None:
+            return None
+        if (
+            self._normalize_named_owner(self.session_owner) != norm_owner
+            or self._normalize_named_owner(self.takeover_owner) != norm_owner
+        ):
+            return None
+        if _check_live_user_role(norm_owner[0], norm_owner[1]) != "admin":
+            return None
+        if not self._has_live_admin_viewer_for_owner(norm_owner[0], norm_owner[1]):
+            return None
+
+        now_mono = time.monotonic()
+        new_deadline = now_mono + max(0.0, float(POST_CLICK_BURST_DURATION_SECONDS))
+        max_frames = max(1, int(POST_CLICK_BURST_MAX_FRAMES))
+        binding = (expected_session_gen, expected_takeover_gen, expected_tab_rev, norm_owner)
+
+        existing = self._burst_task
+        if existing is not None and not existing.done():
+            if self._burst_binding == binding:
+                self._burst_deadline_ts = new_deadline
+                self._burst_frames_remaining = max_frames
+                return existing
+            existing.cancel()
+
+        self._burst_binding = binding
+        self._burst_deadline_ts = new_deadline
+        self._burst_frames_remaining = max_frames
+
+        def _burst_still_valid() -> bool:
+            if (
+                self.engine_mode != "async_hosted"
+                or self.ctx is None
+                or not self.takeover
+                or not self.viewers
+                or self.session_gen != expected_session_gen
+                or self.takeover_gen != expected_takeover_gen
+                or self._tab_select_rev != expected_tab_rev
+                or self._burst_binding != binding
+            ):
+                return False
+            if (
+                self._normalize_named_owner(self.session_owner) != norm_owner
+                or self._normalize_named_owner(self.takeover_owner) != norm_owner
+            ):
+                return False
+            if _check_live_user_role(norm_owner[0], norm_owner[1]) != "admin":
+                return False
+            if not self._has_live_admin_viewer_for_owner(norm_owner[0], norm_owner[1]):
+                return False
+            return True
+
+        async def _burst_runner() -> None:
+            my_task = asyncio.current_task()
+            try:
+                while True:
+                    if not _burst_still_valid():
+                        return
+                    if self._burst_frames_remaining <= 0:
+                        return
+                    cur_deadline = self._burst_deadline_ts
+                    if cur_deadline is None or time.monotonic() >= cur_deadline:
+                        return
+                    interval = max(0.005, float(POST_CLICK_BURST_INTERVAL_SECONDS))
+                    await asyncio.sleep(interval)
+                    if not _burst_still_valid():
+                        return
+                    if self._burst_frames_remaining <= 0:
+                        return
+                    cur_deadline = self._burst_deadline_ts
+                    if cur_deadline is None or time.monotonic() >= cur_deadline:
+                        return
+                    self._burst_frames_remaining -= 1
+                    await self._capture_once(force_broadcast=False, nonblocking_meta=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.debug(
+                    "Post-click recapture burst aborted (error_type=%s, session_gen=%d, takeover_gen=%d)",
+                    type(exc).__name__,
+                    self.session_gen,
+                    self.takeover_gen,
+                )
+            finally:
+                if self._burst_task is my_task:
+                    self._burst_task = None
+                    self._burst_deadline_ts = None
+                    self._burst_frames_remaining = 0
+                    self._burst_binding = None
+
+        try:
+            task = asyncio.create_task(_burst_runner())
+        except RuntimeError:
+            self._burst_deadline_ts = None
+            self._burst_frames_remaining = 0
+            self._burst_binding = None
+            return None
+        self._burst_task = task
+        self._track_bg_task(task)
+        return task
 
     def _schedule_settle_recapture(
         self,
@@ -5183,6 +5802,7 @@ class LiveBrowserHub:
                 self.takeover = False
                 self.takeover_owner = None
                 self.takeover_reason = ""
+                self._cancel_post_click_burst()
                 # 2. Drain queued stale human inputs
                 self._drain_input_queue()
                 # 3. Acquire execution barrier so in-flight human cmd finishes, then release held mouse buttons
@@ -5292,6 +5912,7 @@ class LiveBrowserHub:
             self.takeover = False
             self.takeover_owner = None
             self.takeover_reason = ""
+            self._cancel_post_click_burst()
             self._drain_input_queue()
             async with self._exec_lock:
                 await self._release_held_mouse_buttons_locked()
@@ -6223,8 +6844,10 @@ class LiveBrowserHub:
         self.takeover_reason = ""
         self._sync_lease_id = None
         self._mouse_buttons_down.clear()
+        self._x11_buttons_down.clear()
         self._sync_buttons_down.clear()
         self._pending_sync_extracts.clear()
+        self._cancel_post_click_burst()
 
     async def _stop_hosted_locked(self, *, notify_finished: bool = True) -> None:
         if self.engine_mode != "async_hosted":
@@ -6238,6 +6861,8 @@ class LiveBrowserHub:
         fd = self.lock_fd
         ephemeral_dir = self._ephemeral_dir
         held_buttons = list(self._mouse_buttons_down)
+        held_x11_buttons = sorted(self._x11_buttons_down)
+        old_x11_display = self.x11_display or self._x11_pointer.active_display
 
         self.session_gen += 1
         self.takeover_gen += 1
@@ -6250,20 +6875,53 @@ class LiveBrowserHub:
         self._clear_session_caches()
         self.ai_allowed_event.set()
 
-        # 2. Release any held mouse buttons on the detached page under a bounded execution barrier
-        if held_buttons and old_page is not None:
+        # 2. Release any held X11 & Playwright mouse buttons under a bounded execution barrier.
+        #    Always wait for `_exec_lock` if locked or if an X11 display handle is active so in-flight
+        #    XTest actions (e.g. click/mousedown mid-button_async) converge BEFORE `close_async()`.
+        if (
+            held_x11_buttons
+            or (held_buttons and old_page is not None)
+            or self._exec_lock.locked()
+            or self._x11_pointer.active_display is not None
+        ):
             async def _release_held_buttons() -> None:
                 async with self._exec_lock:
-                    for btn in held_buttons:
+                    extra_x11_buttons = sorted(self._x11_buttons_down)
+                    self._x11_buttons_down.clear()
+                    all_x11_buttons = sorted(set(held_x11_buttons) | set(extra_x11_buttons))
+                    extra_pw_buttons = list(self._mouse_buttons_down)
+                    self._mouse_buttons_down.clear()
+                    all_pw_buttons = list(dict.fromkeys([*held_buttons, *extra_pw_buttons]))
+                    eff_x11_display = old_x11_display or self._x11_pointer.active_display
+                    for btn_num in all_x11_buttons:
                         try:
-                            await asyncio.wait_for(old_page.mouse.up(button=btn), timeout=1.5)
+                            await asyncio.wait_for(
+                                self._x11_pointer.release_button_async(eff_x11_display, btn_num),
+                                timeout=1.5,
+                            )
                         except Exception as exc:
-                            log.debug("Stop fallback mouse.up(%s) error: %s", btn, exc)
+                            log.debug(
+                                "Stop fallback X11 release button=%d error (error_type=%s)",
+                                btn_num,
+                                type(exc).__name__,
+                            )
+                    if old_page is not None:
+                        for btn in all_pw_buttons:
+                            try:
+                                await asyncio.wait_for(old_page.mouse.up(button=btn), timeout=1.5)
+                            except Exception as exc:
+                                log.debug("Stop fallback mouse.up(%s) error: %s", btn, exc)
 
             try:
                 await asyncio.wait_for(_release_held_buttons(), timeout=2.5)
             except Exception as exc:
-                log.warning("Bounded stop mouse.up release timed out/failed: %s", exc)
+                log.warning("Bounded stop mouse.up release timed out/failed (error_type=%s)", type(exc).__name__)
+
+        # 2b. Idempotently flush & close X11 display handle after releasing held X11 buttons
+        try:
+            await asyncio.wait_for(self._x11_pointer.close_async(), timeout=1.5)
+        except Exception as exc:
+            log.debug("X11 pointer close error on stop (error_type=%s)", type(exc).__name__)
 
         # 3. Retire all cards for `old_gen` with strictly stateless finished copy
         await self.tg.retire_cards(session_gen=old_gen, mark_finished=notify_finished, final_jpeg=final_jpeg)
@@ -7481,18 +8139,26 @@ class LiveBrowserHub:
         act = cmd.get("action")
         meta_key = self._cmd_meta_key(cmd)
         if act == "wheel":
-            dx = float(cmd.get("dx", 0))
-            dy = float(cmd.get("dy", 0))
+            dx_first = _parse_finite_coord(cmd["dx"]) if "dx" in cmd else 0.0
+            dy_first = _parse_finite_coord(cmd["dy"]) if "dy" in cmd else 0.0
+            if dx_first is None or dy_first is None:
+                return cmd
+            dx = dx_first
+            dy = dy_first
             while not self.input_queue.empty():
                 nxt = self.input_queue._queue[0]  # peek
                 if nxt.get("action") == "wheel" and self._cmd_meta_key(nxt) == meta_key:
+                    nxt_dx = _parse_finite_coord(nxt["dx"]) if "dx" in nxt else 0.0
+                    nxt_dy = _parse_finite_coord(nxt["dy"]) if "dy" in nxt else 0.0
+                    if nxt_dx is None or nxt_dy is None:
+                        break
                     self.input_queue.get_nowait()
-                    dx += float(nxt.get("dx", 0))
-                    dy += float(nxt.get("dy", 0))
+                    dx += nxt_dx
+                    dy += nxt_dy
                 else:
                     break
             out = {"action": "wheel", "dx": dx, "dy": dy}
-            for mk in ("_session_gen", "_takeover_gen", "_bot_key", "_user_id"):
+            for mk in ("_session_gen", "_takeover_gen", "_bot_key", "_user_id", "x", "y"):
                 if mk in cmd:
                     out[mk] = cmd[mk]
             return out
@@ -7509,30 +8175,60 @@ class LiveBrowserHub:
 
     def _is_human_cmd_still_valid(self, cmd: dict[str, Any], *, check_live_rbac: bool = True) -> bool:
         """Re-verify session/takeover generation, owner & live admin RBAC before executing any dequeued human input."""
-        if "_session_gen" in cmd and cmd["_session_gen"] != self.session_gen:
-            return False
-        if "_takeover_gen" in cmd:
-            if not self.takeover or cmd["_takeover_gen"] != self.takeover_gen:
+        if "_session_gen" in cmd:
+            sg = cmd["_session_gen"]
+            if isinstance(sg, bool) or not isinstance(sg, int) or sg != self.session_gen:
                 return False
-        if "_bot_key" in cmd:
-            bkey = str(cmd.get("_bot_key") or "")
-            uid = int(cmd.get("_user_id") or 0)
+        if "_takeover_gen" in cmd:
+            tg = cmd["_takeover_gen"]
+            if isinstance(tg, bool) or not isinstance(tg, int) or not self.takeover or tg != self.takeover_gen:
+                return False
+        if "_bot_key" in cmd or "_user_id" in cmd:
+            cmd_owner = self._normalize_named_owner((cmd.get("_bot_key"), cmd.get("_user_id")))
+            if cmd_owner is None:
+                return False
+            bkey, uid = cmd_owner
             if self.takeover_owner is not None:
-                t_bot, t_uid = self.takeover_owner
-                if bkey != t_bot:
-                    return False
-                if t_uid is None or uid != int(t_uid):
+                t_owner = self._normalize_named_owner(self.takeover_owner)
+                if t_owner is None or t_owner != cmd_owner:
                     return False
             if self.session_owner is not None:
-                s_bot, s_uid = self.session_owner
-                if bkey != s_bot:
-                    return False
-                if s_uid is None or uid != int(s_uid):
+                s_owner = self._normalize_named_owner(self.session_owner)
+                if s_owner is None or s_owner != cmd_owner:
                     return False
             if check_live_rbac:
                 live_role = _check_live_user_role(bkey, uid)
                 if live_role != "admin":
                     return False
+        return True
+
+    def _is_human_cmd_strictly_authenticated(self, cmd: dict[str, Any]) -> bool:
+        """Strict fail-closed human takeover auth gate required before ANY X11 XTest execution.
+
+        Requires explicit valid `_session_gen`, `_takeover_gen`, `_bot_key`, `_user_id`, active
+        `takeover`, matching verified `session_owner` & `takeover_owner`, and live `admin` RBAC.
+        """
+        if self.engine_mode != "async_hosted" or not self.takeover:
+            return False
+        if "_session_gen" not in cmd or "_takeover_gen" not in cmd:
+            return False
+        sg = cmd.get("_session_gen")
+        tg = cmd.get("_takeover_gen")
+        if isinstance(sg, bool) or not isinstance(sg, int) or sg != self.session_gen:
+            return False
+        if isinstance(tg, bool) or not isinstance(tg, int) or tg != self.takeover_gen:
+            return False
+        cmd_owner = self._normalize_named_owner((cmd.get("_bot_key"), cmd.get("_user_id")))
+        if cmd_owner is None:
+            return False
+        if not self._has_verified_session_owner():
+            return False
+        if self._normalize_named_owner(self.session_owner) != cmd_owner:
+            return False
+        if self._normalize_named_owner(self.takeover_owner) != cmd_owner:
+            return False
+        if _check_live_user_role(cmd_owner[0], cmd_owner[1]) != "admin":
+            return False
         return True
 
     async def _revoke_actor_on_exec_boundary(self, bkey: str, uid: int, live_role: str) -> None:
@@ -7554,6 +8250,7 @@ class LiveBrowserHub:
                 self.takeover = False
                 self.takeover_owner = None
                 self.takeover_reason = ""
+                self._cancel_post_click_burst()
                 self._drain_input_queue()
                 self.ai_allowed_event.set()
                 try:
@@ -7566,8 +8263,10 @@ class LiveBrowserHub:
         if not self._is_human_cmd_still_valid(cmd, check_live_rbac=False):
             return False
         if "_bot_key" in cmd:
-            bkey = str(cmd.get("_bot_key") or "")
-            uid = int(cmd.get("_user_id") or 0)
+            cmd_owner = self._normalize_named_owner((cmd.get("_bot_key"), cmd.get("_user_id")))
+            if cmd_owner is None:
+                return False
+            bkey, uid = cmd_owner
             live_role = _check_live_user_role(bkey, uid)
             if live_role != "admin":
                 if self._exec_lock.locked():
@@ -7661,6 +8360,72 @@ class LiveBrowserHub:
             except Exception as exc:
                 log.warning("Human input execution error: %s", exc)
 
+    async def _reverify_human_pointer_page_locked(
+        self,
+        cmd: dict[str, Any],
+        page: Any,
+        *,
+        require_x11_auth: bool = False,
+    ) -> bool:
+        """Re-verify live auth, generation, ownership, and page identity on the main event loop."""
+        if not await self._enforce_human_cmd_live_auth_locked(cmd):
+            return False
+        if require_x11_auth and not self._is_human_cmd_strictly_authenticated(cmd):
+            return False
+        if self._current_page() is not page or self._is_page_closed(page):
+            return False
+        return True
+
+    async def _resolve_x11_screen_coords_locked(
+        self,
+        page: Any,
+        css_x: float | None,
+        css_y: float | None,
+        cmd: dict[str, Any],
+    ) -> tuple[str, tuple[str, int, int] | None]:
+        """Resolve clamped X11 screen coordinates for an authenticated human takeover command.
+
+        Returns:
+          - `("ok", (display, sx, sy))`: valid local display + DOM geometry + clamped coords
+          - `("fallback", None)`: offline (`x11_display is None`), invalid display/geom, or X11 unavailable
+          - `("abort", None)`: forged/unauthenticated cmd or mid-flight TOCTOU auth/page failure (fail-closed)
+        """
+        disp = self.x11_display
+        if disp is None:
+            return ("fallback", None)
+        if not self._is_human_cmd_strictly_authenticated(cmd):
+            return ("abort", None)
+        if not is_valid_local_x11_display(disp):
+            return ("fallback", None)
+        eval_fn = getattr(page, "evaluate", None)
+        if not callable(eval_fn):
+            return ("fallback", None)
+        try:
+            geom = await asyncio.wait_for(eval_fn(_X11_CONTENT_GEOM_JS), timeout=0.6)
+        except Exception as exc:
+            log.debug(
+                "X11 content geometry eval failed (error_type=%s, session_gen=%d, takeover_gen=%d)",
+                type(exc).__name__,
+                self.session_gen,
+                self.takeover_gen,
+            )
+            if not await self._reverify_human_pointer_page_locked(cmd, page, require_x11_auth=True):
+                return ("abort", None)
+            return ("fallback", None)
+        if not await self._reverify_human_pointer_page_locked(cmd, page, require_x11_auth=True):
+            return ("abort", None)
+        if not isinstance(geom, dict):
+            return ("fallback", None)
+        scr_dims = await self._x11_pointer.ensure_screen_size_async(disp)
+        if not await self._reverify_human_pointer_page_locked(cmd, page, require_x11_auth=True):
+            return ("abort", None)
+        if scr_dims is None:
+            return ("fallback", None)
+        coords = _compute_clamped_x11_coords(geom, css_x, css_y, scr_dims[0], scr_dims[1])
+        if coords is None:
+            return ("fallback", None)
+        return ("ok", (disp, coords[0], coords[1]))
+
     async def _human_mouse_move_then_click_locked(
         self,
         page: Any,
@@ -7672,14 +8437,86 @@ class LiveBrowserHub:
         button: str = "left",
         click_count: int = 1,
     ) -> bool:
-        """Human-only mouse click helper under `_exec_lock`: move -> reverify auth/gen -> delayed click."""
+        """Human-only mouse click helper under `_exec_lock`: move -> reverify auth/gen/page -> delayed click.
+
+        Uses X11 XTest when `x11_display` is set and human takeover auth is strictly verified,
+        with fail-closed TOCTOU guards and graceful fallback to `page.mouse.*`.
+        """
+        if _parse_finite_coord(x) is None or _parse_finite_coord(y) is None:
+            return False
+        valid_btn = _validate_mouse_button(button, default="left")
+        if valid_btn is None:
+            return False
+
+        # When x11_display is set, enforce strict human takeover authentication before either XTest or fallback.
+        if self.x11_display is not None:
+            status, resolved = await self._resolve_x11_screen_coords_locked(page, x, y, cmd)
+            if status == "abort":
+                return False
+            if status == "ok" and resolved is not None:
+                disp, sx, sy = resolved
+                x11_btn = _X11_BUTTON_MAP[valid_btn]
+                moved_ok = await self._x11_pointer.move_async(disp, sx, sy)
+                if not await self._reverify_human_pointer_page_locked(cmd, page, require_x11_auth=True):
+                    return False
+                if moved_ok:
+                    eff_count = 2 if act == "dblclick" else max(1, min(3, int(click_count)))
+                    x11_failed_before_press = False
+                    for idx in range(eff_count):
+                        if idx > 0:
+                            await asyncio.sleep(HUMAN_DBLCLICK_GAP_MS / 1000.0)
+                            if not await self._reverify_human_pointer_page_locked(cmd, page, require_x11_auth=True):
+                                return False
+                        pressed_ok = await self._x11_pointer.button_async(disp, x11_btn, True)
+                        if not pressed_ok:
+                            if idx == 0:
+                                x11_failed_before_press = True
+                                break
+                            return False
+                        self._x11_buttons_down.add(x11_btn)
+                        try:
+                            if self.engine_mode == "async_hosted":
+                                await asyncio.sleep(HUMAN_CLICK_HOLD_DELAY_MS / 1000.0)
+                        finally:
+                            if x11_btn in self._x11_buttons_down:
+                                rel_disp = self.x11_display or self._x11_pointer.active_display
+                                if rel_disp is not None:
+                                    try:
+                                        rel_ok = await asyncio.wait_for(
+                                            self._x11_pointer.release_button_async(rel_disp, x11_btn),
+                                            timeout=1.5,
+                                        )
+                                        if rel_ok:
+                                            self._x11_buttons_down.discard(x11_btn)
+                                    except Exception as rel_exc:
+                                        log.debug(
+                                            "X11 click release error (btn=%d, error_type=%s, session_gen=%d)",
+                                            x11_btn,
+                                            type(rel_exc).__name__,
+                                            self.session_gen,
+                                        )
+                                    finally:
+                                        if self.x11_display is None and self.engine_mode != "async_hosted":
+                                            try:
+                                                await asyncio.wait_for(
+                                                    self._x11_pointer.close_async(),
+                                                    timeout=1.5,
+                                                )
+                                            except Exception:
+                                                pass
+                                elif self.engine_mode != "async_hosted":
+                                    self._x11_buttons_down.discard(x11_btn)
+                    if not x11_failed_before_press:
+                        return True
+                    # Fall through to Playwright fallback only if 0 X11 presses landed and auth/page still valid
+                    if not await self._reverify_human_pointer_page_locked(cmd, page, require_x11_auth=True):
+                        return False
+
         move_fn = getattr(page.mouse, "move", None)
         if callable(move_fn):
             await move_fn(x, y)
         # Re-verify session/takeover generation, ownership, page identity & live admin RBAC after async move!
-        if not await self._enforce_human_cmd_live_auth_locked(cmd):
-            return False
-        if self._current_page() is not page:
+        if not await self._reverify_human_pointer_page_locked(cmd, page):
             return False
         if act == "dblclick":
             dbl_fn = page.mouse.dblclick
@@ -7692,8 +8529,8 @@ class LiveBrowserHub:
             click_kwargs: dict[str, Any] = {}
             if act == "rightclick":
                 click_kwargs["button"] = "right"
-            elif not (click_count == 1 and button == "left"):
-                click_kwargs["button"] = button
+            elif not (click_count == 1 and valid_btn == "left"):
+                click_kwargs["button"] = valid_btn
                 click_kwargs["click_count"] = click_count
             if self._callable_accepts_kwarg(click_fn, "delay"):
                 click_kwargs["delay"] = HUMAN_CLICK_HOLD_DELAY_MS
@@ -7793,8 +8630,11 @@ class LiveBrowserHub:
         post_capture_force = False
         post_broadcast_state = False
         post_schedule_settle = False
+        post_schedule_burst = False
         post_sgen = 0
+        post_tgen = 0
         post_tab_rev = 0
+        post_owner: tuple[str, int] | None = None
         async with self._exec_lock:
             if not await self._enforce_human_cmd_live_auth_locked(cmd):
                 await self._send_tab_cmd_rejected(cmd, "unauthorized")
@@ -7820,81 +8660,238 @@ class LiveBrowserHub:
             )
 
             if act == "move":
-                x = float(cmd.get("x", 0))
-                y = float(cmd.get("y", 0))
+                x = _parse_finite_coord(cmd.get("x"))
+                y = _parse_finite_coord(cmd.get("y"))
+                if x is None or y is None:
+                    return
+                if self.x11_display is not None:
+                    status, resolved = await self._resolve_x11_screen_coords_locked(page, x, y, cmd)
+                    if status == "abort":
+                        return
+                    self.cursor = {"x": x, "y": y, "actor": "human", "kind": "move", "ts": time.time()}
+                    if status == "ok" and resolved is not None:
+                        disp, sx, sy = resolved
+                        if await self._x11_pointer.move_async(disp, sx, sy):
+                            return
+                        if not await self._reverify_human_pointer_page_locked(cmd, page, require_x11_auth=True):
+                            return
+                    await page.mouse.move(x, y)
+                    return
                 self.cursor = {"x": x, "y": y, "actor": "human", "kind": "move", "ts": time.time()}
                 await page.mouse.move(x, y)
                 return
 
             if act == "mousedown":
-                x = float(cmd.get("x", 0))
-                y = float(cmd.get("y", 0))
-                button = str(cmd.get("button") or "left")
-                if button not in ("left", "right", "middle"):
-                    button = "left"
-                self.cursor = {"x": x, "y": y, "actor": "human", "kind": "down", "ts": time.time()}
-                await page.mouse.move(x, y)
-                # Re-verify takeover/session generation & live RBAC after async mouse.move before pressing down
-                if not await self._enforce_human_cmd_live_auth_locked(cmd):
+                x = _parse_finite_coord(cmd.get("x"))
+                y = _parse_finite_coord(cmd.get("y"))
+                if x is None or y is None:
                     return
-                pressed = False
-                try:
-                    self._mouse_buttons_down.add(button)
-                    await page.mouse.down(button=button)
-                    pressed = True
-                finally:
-                    if pressed and not self._is_human_cmd_still_valid(cmd, check_live_rbac=True):
-                        self._mouse_buttons_down.discard(button)
-                        try:
-                            await asyncio.wait_for(page.mouse.up(button=button), timeout=1.5)
-                        except Exception as exc:
-                            log.debug("Post-mousedown fallback mouse.up(%s) error: %s", button, exc)
-                if self._is_human_cmd_still_valid(cmd, check_live_rbac=True):
+                button = _validate_mouse_button(cmd.get("button"), default="left")
+                if button is None:
+                    return
+                handled_x11_down = False
+                if self.x11_display is not None:
+                    status, resolved = await self._resolve_x11_screen_coords_locked(page, x, y, cmd)
+                    if status == "abort":
+                        return
+                    self.cursor = {"x": x, "y": y, "actor": "human", "kind": "down", "ts": time.time()}
+                    if status == "ok" and resolved is not None:
+                        disp, sx, sy = resolved
+                        x11_btn = _X11_BUTTON_MAP[button]
+                        moved_ok = await self._x11_pointer.move_async(disp, sx, sy)
+                        if not await self._reverify_human_pointer_page_locked(cmd, page, require_x11_auth=True):
+                            return
+                        if moved_ok:
+                            pressed_x11 = await self._x11_pointer.button_async(disp, x11_btn, True)
+                            if pressed_x11:
+                                self._x11_buttons_down.add(x11_btn)
+                                handled_x11_down = True
+                                if (
+                                    not self._is_human_cmd_strictly_authenticated(cmd)
+                                    or self._current_page() is not page
+                                    or self._is_page_closed(page)
+                                ):
+                                    rel_disp = self.x11_display or self._x11_pointer.active_display
+                                    if rel_disp is not None:
+                                        try:
+                                            rel_ok = await asyncio.wait_for(
+                                                self._x11_pointer.release_button_async(rel_disp, x11_btn),
+                                                timeout=1.5,
+                                            )
+                                            if rel_ok:
+                                                self._x11_buttons_down.discard(x11_btn)
+                                        except Exception as exc:
+                                            log.debug(
+                                                "Post-mousedown fallback X11 release error (btn=%d, error_type=%s)",
+                                                x11_btn,
+                                                type(exc).__name__,
+                                            )
+                                        finally:
+                                            if self.x11_display is None and self.engine_mode != "async_hosted":
+                                                try:
+                                                    await asyncio.wait_for(
+                                                        self._x11_pointer.close_async(),
+                                                        timeout=1.5,
+                                                    )
+                                                except Exception:
+                                                    pass
+                                    elif self.engine_mode != "async_hosted":
+                                        self._x11_buttons_down.discard(x11_btn)
+                                    return
+                    if not handled_x11_down and not await self._reverify_human_pointer_page_locked(
+                        cmd, page, require_x11_auth=True
+                    ):
+                        return
+                if not handled_x11_down:
+                    self.cursor = {"x": x, "y": y, "actor": "human", "kind": "down", "ts": time.time()}
+                    await page.mouse.move(x, y)
+                    # Re-verify takeover/session generation, page identity & live RBAC after async move before pressing down
+                    if not await self._reverify_human_pointer_page_locked(cmd, page):
+                        return
+                    pressed = False
+                    try:
+                        self._mouse_buttons_down.add(button)
+                        await page.mouse.down(button=button)
+                        pressed = True
+                    finally:
+                        if pressed and (
+                            not self._is_human_cmd_still_valid(cmd, check_live_rbac=True)
+                            or self._current_page() is not page
+                        ):
+                            self._mouse_buttons_down.discard(button)
+                            try:
+                                await asyncio.wait_for(page.mouse.up(button=button), timeout=1.5)
+                            except Exception as exc:
+                                log.debug("Post-mousedown fallback mouse.up(%s) error: %s", button, exc)
+                if self._is_human_cmd_still_valid(cmd, check_live_rbac=True) and self._current_page() is page:
                     post_capture_needed = True
                     post_sgen = self.session_gen
+                    post_tgen = self.takeover_gen
                     post_tab_rev = self._tab_select_rev
+                    post_owner = self._normalize_named_owner(self.takeover_owner)
             elif act == "mouseup":
-                x = float(cmd.get("x", 0))
-                y = float(cmd.get("y", 0))
-                button = str(cmd.get("button") or "left")
-                if button not in ("left", "right", "middle"):
-                    button = "left"
-                self.cursor = {"x": x, "y": y, "actor": "human", "kind": "up", "ts": time.time()}
-                await page.mouse.move(x, y)
-                was_held = button in self._mouse_buttons_down
-                if not was_held and not await self._enforce_human_cmd_live_auth_locked(cmd):
+                x = _parse_finite_coord(cmd.get("x"))
+                y = _parse_finite_coord(cmd.get("y"))
+                if x is None or y is None:
                     return
-                self._mouse_buttons_down.discard(button)
-                await page.mouse.up(button=button)
-                if self._is_human_cmd_still_valid(cmd, check_live_rbac=True):
+                button = _validate_mouse_button(cmd.get("button"), default="left")
+                if button is None:
+                    return
+                x11_btn = _X11_BUTTON_MAP[button]
+                was_held_x11 = x11_btn in self._x11_buttons_down
+                was_held_pw = button in self._mouse_buttons_down
+                if (self.x11_display is not None or was_held_x11) and not self._is_human_cmd_strictly_authenticated(cmd):
+                    return
+                handled_x11_up = False
+                if was_held_x11:
+                    try:
+                        if self.x11_display is not None and self._is_human_cmd_strictly_authenticated(cmd):
+                            self.cursor = {"x": x, "y": y, "actor": "human", "kind": "up", "ts": time.time()}
+                            status, resolved = await self._resolve_x11_screen_coords_locked(page, x, y, cmd)
+                            if status == "ok" and resolved is not None:
+                                disp, sx, sy = resolved
+                                await self._x11_pointer.move_async(disp, sx, sy)
+                    finally:
+                        if x11_btn in self._x11_buttons_down:
+                            rel_disp = self.x11_display or self._x11_pointer.active_display
+                            if rel_disp is not None:
+                                try:
+                                    rel_ok = await asyncio.wait_for(
+                                        self._x11_pointer.release_button_async(rel_disp, x11_btn),
+                                        timeout=1.5,
+                                    )
+                                    if rel_ok:
+                                        self._x11_buttons_down.discard(x11_btn)
+                                except Exception as exc:
+                                    log.debug(
+                                        "X11 mouseup release error (btn=%d, error_type=%s, session_gen=%d)",
+                                        x11_btn,
+                                        type(exc).__name__,
+                                        self.session_gen,
+                                    )
+                                finally:
+                                    if self.x11_display is None and self.engine_mode != "async_hosted":
+                                        try:
+                                            await asyncio.wait_for(
+                                                self._x11_pointer.close_async(),
+                                                timeout=1.5,
+                                            )
+                                        except Exception:
+                                            pass
+                            elif self.engine_mode != "async_hosted":
+                                self._x11_buttons_down.discard(x11_btn)
+                    handled_x11_up = True
+                elif self.x11_display is not None and not was_held_pw:
+                    status, resolved = await self._resolve_x11_screen_coords_locked(page, x, y, cmd)
+                    if status == "abort":
+                        return
+                    self.cursor = {"x": x, "y": y, "actor": "human", "kind": "up", "ts": time.time()}
+                    if status == "ok" and resolved is not None:
+                        disp, sx, sy = resolved
+                        moved_ok = await self._x11_pointer.move_async(disp, sx, sy)
+                        if not await self._reverify_human_pointer_page_locked(cmd, page, require_x11_auth=True):
+                            return
+                        if moved_ok and await self._x11_pointer.button_async(disp, x11_btn, False):
+                            handled_x11_up = True
+                    if not handled_x11_up and not await self._reverify_human_pointer_page_locked(
+                        cmd, page, require_x11_auth=True
+                    ):
+                        return
+                if not handled_x11_up:
+                    self.cursor = {"x": x, "y": y, "actor": "human", "kind": "up", "ts": time.time()}
+                    await page.mouse.move(x, y)
+                    if not was_held_pw and not await self._reverify_human_pointer_page_locked(cmd, page):
+                        return
+                    self._mouse_buttons_down.discard(button)
+                    await page.mouse.up(button=button)
+                if self._is_human_cmd_still_valid(cmd, check_live_rbac=True) and self._current_page() is page:
                     post_capture_needed = True
                     post_capture_force = True
                     post_broadcast_state = True
                     post_schedule_settle = True
+                    post_schedule_burst = True
                     post_sgen = self.session_gen
+                    post_tgen = self.takeover_gen
                     post_tab_rev = self._tab_select_rev
+                    post_owner = self._normalize_named_owner(self.takeover_owner)
             elif act == "rightclick":
-                x = float(cmd.get("x", 0))
-                y = float(cmd.get("y", 0))
+                x = _parse_finite_coord(cmd.get("x"))
+                y = _parse_finite_coord(cmd.get("y"))
+                if x is None or y is None:
+                    return
+                if "button" in cmd and _validate_mouse_button(cmd.get("button"), default="right") is None:
+                    return
+                if self.x11_display is not None and not self._is_human_cmd_strictly_authenticated(cmd):
+                    return
                 self.cursor = {"x": x, "y": y, "actor": "human", "kind": "rightclick", "ts": time.time()}
                 if not await self._human_mouse_move_then_click_locked(
                     page, cmd, x=x, y=y, act="rightclick", button="right", click_count=1
                 ):
                     return
-                if self._is_human_cmd_still_valid(cmd, check_live_rbac=True):
+                if self._is_human_cmd_still_valid(cmd, check_live_rbac=True) and self._current_page() is page:
                     post_capture_needed = True
                     post_capture_force = True
                     post_broadcast_state = True
                     post_schedule_settle = True
+                    post_schedule_burst = True
                     post_sgen = self.session_gen
+                    post_tgen = self.takeover_gen
                     post_tab_rev = self._tab_select_rev
+                    post_owner = self._normalize_named_owner(self.takeover_owner)
             elif act in ("click", "dblclick"):
-                x = float(cmd.get("x", 0))
-                y = float(cmd.get("y", 0))
+                x = _parse_finite_coord(cmd.get("x"))
+                y = _parse_finite_coord(cmd.get("y"))
+                if x is None or y is None:
+                    return
+                button = _validate_mouse_button(cmd.get("button"), default="left")
+                if button is None:
+                    return
+                if self.x11_display is not None and not self._is_human_cmd_strictly_authenticated(cmd):
+                    return
                 self.cursor = {"x": x, "y": y, "actor": "human", "kind": act, "ts": time.time()}
                 if act == "dblclick":
                     if not await self._human_mouse_move_then_click_locked(
-                        page, cmd, x=x, y=y, act="dblclick"
+                        page, cmd, x=x, y=y, act="dblclick", button=button
                     ):
                         return
                 else:
@@ -7903,15 +8900,12 @@ class LiveBrowserHub:
                     except (TypeError, ValueError):
                         click_count = 1
                     click_count = max(1, min(3, click_count))
-                    button = str(cmd.get("button") or "left")
-                    if button not in ("left", "right", "middle"):
-                        button = "left"
                     if not await self._human_mouse_move_then_click_locked(
                         page, cmd, x=x, y=y, act="click", button=button, click_count=click_count
                     ):
                         return
-                # Re-verify live RBAC & generations before querying focused DOM element!
-                if not await self._enforce_human_cmd_live_auth_locked(cmd):
+                # Re-verify live RBAC, page identity & generations before querying focused DOM element!
+                if not await self._reverify_human_pointer_page_locked(cmd, page):
                     return
                 # Detect if the user just clicked an editable input/textarea/contenteditable on the page
                 try:
@@ -7934,7 +8928,7 @@ class LiveBrowserHub:
                         ),
                         timeout=0.6,
                     )
-                    if focus_info and await self._enforce_human_cmd_live_auth_locked(cmd):
+                    if focus_info and await self._reverify_human_pointer_page_locked(cmd, page):
                         owner_bot, owner_uid = self._effective_resource_owner()
                         if owner_bot is not None and owner_uid is not None:
                             await self.broadcast_json_to_owners(
@@ -7947,7 +8941,41 @@ class LiveBrowserHub:
                 except Exception:
                     pass
             elif act == "wheel":
-                await page.mouse.wheel(float(cmd.get("dx", 0)), float(cmd.get("dy", 0)))
+                dx = _parse_finite_coord(cmd["dx"]) if "dx" in cmd else 0.0
+                dy = _parse_finite_coord(cmd["dy"]) if "dy" in cmd else 0.0
+                if dx is None or dy is None:
+                    return
+                wx: float | None = None
+                wy: float | None = None
+                if "x" in cmd or "y" in cmd:
+                    wx = _parse_finite_coord(cmd.get("x"))
+                    wy = _parse_finite_coord(cmd.get("y"))
+                    if wx is None or wy is None:
+                        return
+                else:
+                    cur_x = _parse_finite_coord(self.cursor.get("x"))
+                    cur_y = _parse_finite_coord(self.cursor.get("y"))
+                    if cur_x is not None and cur_y is not None:
+                        wx, wy = cur_x, cur_y
+                handled_x11_wheel = False
+                if self.x11_display is not None:
+                    status, resolved = await self._resolve_x11_screen_coords_locked(page, wx, wy, cmd)
+                    if status == "abort":
+                        return
+                    if status == "ok" and resolved is not None:
+                        disp, sx, sy = resolved
+                        steps = _compute_x11_wheel_steps(dx, dy)
+                        moved_ok = await self._x11_pointer.move_async(disp, sx, sy)
+                        if not await self._reverify_human_pointer_page_locked(cmd, page, require_x11_auth=True):
+                            return
+                        if moved_ok and await self._x11_pointer.wheel_steps_async(disp, steps):
+                            handled_x11_wheel = True
+                    if not handled_x11_wheel and not await self._reverify_human_pointer_page_locked(
+                        cmd, page, require_x11_auth=True
+                    ):
+                        return
+                if not handled_x11_wheel:
+                    await page.mouse.wheel(dx, dy)
             elif act == "type":
                 text = str(cmd.get("text", ""))
                 if cmd.get("replace"):
@@ -8011,7 +9039,7 @@ class LiveBrowserHub:
                 pages_vis = self._visible_pages(cur_ctx)
                 if 0 <= idx < len(pages_vis):
                     target_page: Any | None = pages_vis[idx]
-                    if self._mouse_buttons_down and target_page is not page:
+                    if (self._mouse_buttons_down or self._x11_buttons_down) and target_page is not page:
                         await self._release_held_mouse_buttons_locked(target_page=page)
                         if not await self._enforce_human_cmd_live_auth_locked(cmd) or self.ctx is not cur_ctx:
                             await self._send_tab_cmd_rejected(cmd, "unauthorized")
@@ -8038,6 +9066,7 @@ class LiveBrowserHub:
                         if target_page in pages_after:
                             self.active_tab_index = pages_after.index(target_page)
                             self._tab_select_rev += 1
+                            self._cancel_post_click_burst()
                             if tab_cmd_id:
                                 self._queue_pending_tab_cmd_id(tab_cmd_id)
                         else:
@@ -8053,7 +9082,7 @@ class LiveBrowserHub:
             elif act == "new_tab":
                 orig_page = page
                 if self.ctx:
-                    if self._mouse_buttons_down:
+                    if self._mouse_buttons_down or self._x11_buttons_down:
                         await self._release_held_mouse_buttons_locked(target_page=page)
                         if not await self._enforce_human_cmd_live_auth_locked(cmd) or not self.ctx:
                             await self._send_tab_cmd_rejected(cmd, "unauthorized")
@@ -8113,6 +9142,7 @@ class LiveBrowserHub:
                                 if np in pages_now:
                                     self.active_tab_index = pages_now.index(np)
                                     self._tab_select_rev += 1
+                                    self._cancel_post_click_burst()
                                     if tab_cmd_id:
                                         self._queue_pending_tab_cmd_id(tab_cmd_id)
                                 else:
@@ -8129,7 +9159,7 @@ class LiveBrowserHub:
                 if self.ctx and len(pages_vis) > 1 and 0 <= idx < len(pages_vis):
                     cur_ctx = self.ctx
                     target_page = pages_vis[idx]
-                    if self._mouse_buttons_down:
+                    if self._mouse_buttons_down or self._x11_buttons_down:
                         await self._release_held_mouse_buttons_locked(target_page=page)
                         if not await self._enforce_human_cmd_live_auth_locked(cmd) or self.ctx is not cur_ctx:
                             await self._send_tab_cmd_rejected(cmd, "unauthorized")
@@ -8150,6 +9180,7 @@ class LiveBrowserHub:
                         rem_pages = self._visible_pages(cur_ctx)
                         self.active_tab_index = max(0, min(self.active_tab_index, len(rem_pages) - 1)) if rem_pages else 0
                         self._tab_select_rev += 1
+                        self._cancel_post_click_burst()
                 if tab_cmd_id:
                     self._queue_pending_tab_cmd_id(tab_cmd_id)
 
@@ -8164,8 +9195,11 @@ class LiveBrowserHub:
                 post_capture_force = act in _MUTATING_HUMAN_ACTIONS and act != "switch_tab"
                 post_broadcast_state = True
                 post_schedule_settle = act in _MUTATING_HUMAN_ACTIONS
+                post_schedule_burst = act in _POST_CLICK_BURST_ACTIONS
                 post_sgen = self.session_gen
+                post_tgen = self.takeover_gen
                 post_tab_rev = self._tab_select_rev
+                post_owner = self._normalize_named_owner(self.takeover_owner)
 
         # Post-action capture, state broadcast, settle recapture, and TG live card refresh run
         # strictly OUTSIDE `_exec_lock` to eliminate lock contention / deadlocks.
@@ -8191,6 +9225,14 @@ class LiveBrowserHub:
             ):
                 self._schedule_settle_recapture(post_sgen, post_tab_rev, refresh_tg=True)
                 self._track_bg_task(asyncio.create_task(self.tg.tick_updates(force=True)))
+            if (
+                post_schedule_burst
+                and self.session_gen == post_sgen
+                and self.takeover_gen == post_tgen
+                and self._tab_select_rev == post_tab_rev
+                and self._is_human_cmd_still_valid(cmd, check_live_rbac=True)
+            ):
+                self._schedule_post_click_burst(post_sgen, post_tgen, post_tab_rev, post_owner)
 
         # Await deduplicated fail-closed close/teardown strictly AFTER releasing `_exec_lock`
         # so `_stop_hosted_locked()` can acquire `_exec_lock` to release held mouse buttons with zero deadlock!
@@ -9644,6 +10686,8 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
         if authenticated:
             hub.viewers.discard(ws)
             hub.viewer_meta.pop(ws, None)
+            if not hub.viewers:
+                hub._cancel_post_click_burst()
             snap_sgen = hub.session_gen
             snap_tgen = hub.takeover_gen
             log.info("Mini App viewer disconnected (user=%s, bot=%s, remaining=%d)", user_id, bot_key, len(hub.viewers))
@@ -9657,7 +10701,7 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                 expected_session_gen=snap_sgen,
                 expected_takeover_gen=snap_tgen,
             )
-            if not released and had_admin_role and hub._mouse_buttons_down:
+            if not released and had_admin_role and (hub._mouse_buttons_down or hub._x11_buttons_down):
                 cur_owner = hub.takeover_owner
                 if (
                     cur_owner is not None
