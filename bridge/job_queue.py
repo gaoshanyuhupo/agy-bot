@@ -391,6 +391,10 @@ class _JobQueue:
         with self._cond:
             return not self._entries
 
+    def is_idle(self):
+        with self._cond:
+            return (not self._entries) and (not self._dispatched)
+
     def task_done(self, qid=None):
         with self._cond:
             if qid is not None:

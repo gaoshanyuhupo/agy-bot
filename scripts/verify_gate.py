@@ -71,6 +71,7 @@ BRIDGE_TEST_FILES: Tuple[str, ...] = (
     "tests/test_queue_persistence_and_rollback.py",
     "tests/test_scheduler.py",
     "tests/test_memory_guard_and_dream.py",
+    "tests/test_p2_hardening.py",
     "tests/test_pretool_guard_defenses.py",
     "tests/test_taint_outbound_guard.py",
 )
@@ -78,6 +79,7 @@ BRIDGE_TEST_FILES: Tuple[str, ...] = (
 SECURITY_TEST_FILES: Tuple[str, ...] = (
     "tests/test_bot_isolation.py",
     "tests/test_bot_isolation_hooks.py",
+    "tests/test_p2_hardening.py",
     "tests/test_pretool_guard_defenses.py",
     "tests/test_security_audit_webui.py",
     "tests/test_taint_outbound_guard.py",

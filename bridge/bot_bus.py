@@ -35,6 +35,7 @@ THREADS_FILE = os.path.join(BUS_DIR, "threads.json")
 LOOP_GUARD_FILE = os.path.join(BUS_DIR, "loop_guard.json")
 MENTION_CHAINS_FILE = os.path.join(BUS_DIR, "mention_chains.json")
 ORIGIN_CTX_FILE = os.path.join(BUS_DIR, "origin_context.json")
+DISPATCH_WINDOW_FILE = os.path.join(BUS_DIR, "dispatch_window.json")
 
 VALID_ROLES = ("coordinator", "worker", "peer")
 MODEL_MODE_DEFAULT = "default"
@@ -42,6 +43,45 @@ MODEL_MODE_FOLLOW = "follow"
 MODEL_MODE_CUSTOM = "custom"
 VALID_MODEL_MODES = (MODEL_MODE_DEFAULT, MODEL_MODE_FOLLOW, MODEL_MODE_CUSTOM)
 TERMINAL_STATUSES = frozenset({"done", "error", "cancelled"})
+JOB_ERROR_CODES = frozenset(
+    {
+        "OK",
+        "WORKTREE_PREPARE_FAILED",
+        "WORKER_ZOMBIE_REAPED",
+        "BUDGET_EXCEEDED",
+        "RETRY_LIMIT_EXCEEDED",
+        "TAINT_POLICY_DENIED",
+        "PRIVILEGE_ESCALATION_DENIED",
+        "CANCELLED_LOCAL",
+        "CANCELLED_BY_COORDINATOR",
+        "TIMEOUT",
+        "DRIVER_SPAWN_FAILED",
+        "AGENT_EXEC_ERROR",
+        "UNKNOWN_DRIVER",
+    }
+)
+DEFAULT_BATCH_MAX_USD = 2.5
+DEFAULT_BATCH_MAX_JOBS = 8
+DEFAULT_MAX_RETRIES = 3
+DEFAULT_WINDOW_MAX_JOBS_10M = 30
+DEFAULT_JOB_MAX_RUNTIME_SEC = 2100.0
+_DISPATCH_WINDOW_SECONDS = 600.0
+TRUST_ORDER: Dict[str, int] = {
+    "local_admin": 4,
+    "local_worker": 3,
+    "remote_trusted": 2,
+    "remote_untrusted": 1,
+    "readonly_guest": 0,
+}
+_TRUST_BY_RANK: Dict[int, str] = {r: k for k, r in TRUST_ORDER.items()}
+TEAM_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,63}$")
+JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+REMOTE_UNTRUSTED_MARKERS: Tuple[str, ...] = (
+    "[REMOTE_AGENT_UNTRUSTED",
+    "[REMOTE_HUB_MESSAGE",
+    "[REMOTE_AGENT_PAYLOAD",
+    "[REMOTE_HANDOFF",
+)
 FAN_OUT_MAX = 8
 DEFAULT_MAX_HOPS = 2
 ONLINE_TTL_SECONDS = 45.0
@@ -660,9 +700,123 @@ def enqueue_live_browser_takeover_event(target_bot: str, event: Dict[str, Any]) 
 
 
 # ---------------------------------------------------------------- inbox packets & jobs
+def validate_team_id(team_id: Any) -> str:
+    """Strictly validate `team_id` (`""` or `^[a-z0-9][a-z0-9_-]{1,63}$`; rejects traversal chars)."""
+    if team_id is None or team_id == "":
+        return ""
+    if not isinstance(team_id, str):
+        raise ValueError(f"Invalid team_id type: {type(team_id).__name__}")
+    if "." in team_id or "/" in team_id or "\\" in team_id or "\x00" in team_id:
+        raise ValueError(f"Unsafe team_id value: {team_id!r}")
+    if not TEAM_ID_RE.fullmatch(team_id):
+        raise ValueError(f"Invalid team_id format: {team_id!r} (expected ^[a-z0-9][a-z0-9_-]{{1,63}}$)")
+    return team_id
+
+
+def validate_job_id(job_id: Any) -> str:
+    """Strictly validate `job_id` against path traversal and illegal characters (fail-closed)."""
+    if not isinstance(job_id, str) or not job_id:
+        raise ValueError(f"Invalid job_id: {job_id!r}")
+    if ".." in job_id or "/" in job_id or "\\" in job_id or "\x00" in job_id or job_id in (".", ".."):
+        raise ValueError(f"Unsafe job_id path traversal rejected: {job_id!r}")
+    if not JOB_ID_RE.fullmatch(job_id):
+        raise ValueError(f"Invalid job_id format: {job_id!r}")
+    return job_id
+
+
+def _normalize_trust_level(level: Any, *, default: str = "local_admin") -> str:
+    if level is None:
+        return default
+    raw = str(level).strip().lower()
+    if not raw:
+        return default
+    if raw in TRUST_ORDER:
+        return raw
+    return "readonly_guest"
+
+
+def _min_trust_level(a: Any, b: Any, *, default: str = "remote_untrusted") -> str:
+    na = _normalize_trust_level(a, default=default)
+    nb = _normalize_trust_level(b, default=default)
+    return _TRUST_BY_RANK[min(TRUST_ORDER[na], TRUST_ORDER[nb])]
+
+
+def _min_runtime_mode(a: Optional[str], b: Optional[str], *, default: str = "") -> str:
+    vals: List[str] = []
+    for raw in (a, b):
+        s = str(raw or "").strip().lower()
+        if not s:
+            continue
+        vals.append("auto" if s == "auto" else "safe")
+    if not vals:
+        return default
+    return "safe" if "safe" in vals else "auto"
+
+
+def _is_remote_origin(origin: Any) -> bool:
+    return str(origin or "").strip().lower().startswith("remote")
+
+
+def _text_has_untrusted_taint(text: str) -> bool:
+    if not text:
+        return False
+    if any(marker in text for marker in REMOTE_UNTRUSTED_MARKERS):
+        return True
+    try:
+        import memory_guard as _mg  # type: ignore
+
+        return bool(_mg.inspect_text(text).get("untrusted"))
+    except Exception:
+        return False
+
+
+def _read_proc_stat_info(pid: int, proc_root: str = "/proc") -> Tuple[Optional[str], Optional[str]]:
+    """Read `(state, starttime)` from `<proc_root>/<pid>/stat` (post-comm index 19 == field 22)."""
+    stat_path = os.path.join(proc_root, str(pid), "stat")
+    try:
+        with open(stat_path, "r", encoding="utf-8", errors="ignore") as fh:
+            raw = fh.read()
+    except OSError:
+        return None, None
+    idx = raw.rfind(")")
+    if idx < 0:
+        return None, None
+    rest = raw[idx + 2 :].split()
+    if len(rest) <= 19:
+        return None, None
+    return rest[0], rest[19]
+
+
+def _read_proc_euid(pid: int, proc_root: str = "/proc") -> Optional[int]:
+    """Read effective UID from `<proc_root>/<pid>/status` (`Uid:` line), or None."""
+    status_path = os.path.join(proc_root, str(pid), "status")
+    try:
+        with open(status_path, "r", encoding="utf-8", errors="ignore") as fh:
+            raw = fh.read()
+    except OSError:
+        return None
+    for line in raw.splitlines():
+        if line.startswith("Uid:"):
+            parts = line.split()
+            try:
+                if len(parts) >= 3:
+                    return int(parts[2])
+                if len(parts) == 2:
+                    return int(parts[1])
+            except ValueError:
+                return None
+            return None
+    return None
+
+
 def _job_path(job_id: str) -> str:
-    safe_id = re.sub(r"[^a-zA-Z0-9_.-]+", "", job_id)
-    return os.path.join(JOBS_DIR, f"{safe_id}.json")
+    clean_id = validate_job_id(job_id)
+    jobs_root = os.path.realpath(JOBS_DIR)
+    candidate = os.path.join(JOBS_DIR, f"{clean_id}.json")
+    cand_real = os.path.realpath(candidate)
+    if not cand_real.startswith(jobs_root + os.sep):
+        raise ValueError(f"Job path escapes JOBS_DIR: {job_id!r}")
+    return candidate
 
 
 _PKT_SEQ = 0
@@ -829,6 +983,22 @@ def _prune_old_jobs_unlocked(limit: int = JOB_RETENTION_LIMIT) -> None:
                 pass
 
 
+def _record_dispatch_window_unlocked(now: float, count: int, max_jobs_10m: int) -> None:
+    """Enforce and record 10-minute rolling job dispatch rate limit under `_bus_lock()`."""
+    data = _read_json(DISPATCH_WINDOW_FILE, {"events": []})
+    events = data.get("events") if isinstance(data, dict) else []
+    if not isinstance(events, list):
+        events = []
+    cutoff = now - _DISPATCH_WINDOW_SECONDS
+    recent = [float(ts) for ts in events if isinstance(ts, (int, float)) and float(ts) >= cutoff]
+    if len(recent) + count > max_jobs_10m:
+        raise ValueError(
+            f"BUDGET_EXCEEDED: 10-minute dispatch window limit exceeded ({len(recent)} + {count} > {max_jobs_10m})"
+        )
+    recent.extend([now] * count)
+    _atomic_write_json(DISPATCH_WINDOW_FILE, {"events": recent})
+
+
 def dispatch_assignments(
     from_bot: str,
     assignments: List[Dict[str, Any]],
@@ -840,6 +1010,22 @@ def dispatch_assignments(
     parent_chain: Optional[Iterable[str]] = None,
     default_notify_group: bool = False,
     wake_on_async: bool = False,
+    team_id: str = "",
+    agent_origin: str = "",
+    trust_level: str = "",
+    parent_trust_level: str = "",
+    parent_agent_origin: str = "",
+    parent_readonly: Optional[bool] = None,
+    parent_untrusted: Optional[bool] = None,
+    parent_tainted: Optional[bool] = None,
+    parent_max_runtime_mode: str = "",
+    batch_budget_usd: Optional[float] = None,
+    max_batch_usd: Optional[float] = None,
+    max_batch_jobs: Optional[int] = None,
+    max_window_jobs_10m: Optional[int] = None,
+    retry_count: int = 0,
+    max_retries: Optional[int] = None,
+    parent_job_id: str = "",
 ) -> Dict[str, Any]:
     """Validate and enqueue 1..FAN_OUT_MAX delegation jobs atomically onto target bot inboxes."""
     sender = normalize_handle(from_bot)
@@ -847,8 +1033,115 @@ def dispatch_assignments(
         raise ValueError("Sender bot handle could not be determined")
     if not assignments or not isinstance(assignments, list):
         raise ValueError("At least one assignment is required")
-    if len(assignments) > FAN_OUT_MAX:
-        raise ValueError(f"Too many fan-out assignments ({len(assignments)} > {FAN_OUT_MAX})")
+
+    # C2: Fail-closed if caller/parent session is readonly (monotonic OR with env)
+    env_rbac_ro = os.environ.get("AGY_RBAC_ROLE", "").strip().lower() == "readonly"
+    env_p_trust = os.environ.get("AGY_TRUST_LEVEL", "").strip()
+    arg_p_trust = str(parent_trust_level or "").strip()
+    arg_trust = str(trust_level or "").strip()
+    eff_parent_ro = bool(parent_readonly) or env_rbac_ro
+    for _raw_t in (arg_p_trust, env_p_trust, arg_trust):
+        if _raw_t and _normalize_trust_level(_raw_t) == "readonly_guest":
+            eff_parent_ro = True
+    if eff_parent_ro:
+        raise PermissionError("PRIVILEGE_ESCALATION_DENIED: readonly session cannot dispatch assignments")
+
+    # C8b + P0-2: Strict team_id whitelist & monotonic env team binding
+    env_team_id = validate_team_id(os.environ.get("AGY_BOT_TEAM_ID", "").strip())
+    arg_team_id = validate_team_id(team_id)
+    if env_team_id and arg_team_id and arg_team_id != env_team_id:
+        raise PermissionError(
+            f"PRIVILEGE_ESCALATION_DENIED: cross-team dispatch rejected ({arg_team_id!r} != {env_team_id!r})"
+        )
+    clean_team_id = env_team_id or arg_team_id
+
+    # C7: Retry, batch size, and budget limits
+    eff_max_retries = DEFAULT_MAX_RETRIES if max_retries is None else max(0, int(max_retries))
+    eff_retry_count = max(0, int(retry_count or 0))
+    if eff_retry_count > eff_max_retries:
+        raise ValueError(
+            f"RETRY_LIMIT_EXCEEDED: retry_count={eff_retry_count} exceeds max_retries={eff_max_retries}"
+        )
+
+    eff_max_jobs = DEFAULT_BATCH_MAX_JOBS if max_batch_jobs is None else max(1, int(max_batch_jobs))
+    job_cap = min(FAN_OUT_MAX, eff_max_jobs)
+    if len(assignments) > job_cap:
+        raise ValueError(f"BUDGET_EXCEEDED: Too many fan-out assignments ({len(assignments)} > {job_cap})")
+
+    cap_usd = DEFAULT_BATCH_MAX_USD if max_batch_usd is None else float(max_batch_usd)
+    eff_budget_usd = cap_usd if batch_budget_usd is None else float(batch_budget_usd)
+    if eff_budget_usd <= 0 or eff_budget_usd > cap_usd:
+        raise ValueError(
+            f"BUDGET_EXCEEDED: batch_budget_usd={eff_budget_usd} outside allowed range (0, {cap_usd}]"
+        )
+    est_total_usd = 0.0
+    for spec in assignments:
+        if isinstance(spec, dict) and spec.get("estimated_usd") is not None:
+            est_total_usd += max(0.0, float(spec["estimated_usd"]))
+    if est_total_usd > eff_budget_usd:
+        raise ValueError(
+            f"BUDGET_EXCEEDED: estimated batch cost ${est_total_usd:.4f} exceeds budget ${eff_budget_usd:.4f}"
+        )
+
+    if max_window_jobs_10m is not None:
+        eff_window_max = max(1, int(max_window_jobs_10m))
+    else:
+        raw_wm = os.environ.get("AGY_BOT_BUS_WINDOW_MAX_JOBS_10M", "").strip()
+        try:
+            eff_window_max = max(1, int(raw_wm)) if raw_wm else DEFAULT_WINDOW_MAX_JOBS_10M
+        except ValueError:
+            eff_window_max = DEFAULT_WINDOW_MAX_JOBS_10M
+
+    # P0-2: Monotonic agent_origin resolution (remote* cannot be downgraded to non-remote)
+    env_origin = os.environ.get("AGY_AGENT_ORIGIN", "").strip().lower()
+    arg_p_origin = str(parent_agent_origin or "").strip().lower()
+    arg_origin = str(agent_origin or "").strip().lower()
+    if _is_remote_origin(env_origin):
+        if arg_origin and not _is_remote_origin(arg_origin):
+            raise PermissionError(
+                f"PRIVILEGE_ESCALATION_DENIED: cannot override remote agent_origin {env_origin!r} with {arg_origin!r}"
+            )
+        eff_origin = arg_origin if _is_remote_origin(arg_origin) else env_origin
+    elif _is_remote_origin(arg_p_origin):
+        if arg_origin and not _is_remote_origin(arg_origin):
+            raise PermissionError(
+                f"PRIVILEGE_ESCALATION_DENIED: cannot override remote agent_origin {arg_p_origin!r} with {arg_origin!r}"
+            )
+        eff_origin = arg_origin if _is_remote_origin(arg_origin) else arg_p_origin
+    else:
+        eff_origin = arg_origin or arg_p_origin or env_origin or "local_bus"
+    parent_is_remote = _is_remote_origin(eff_origin)
+
+    # C2: Parent taint & trust ceiling calculation (monotonic OR / min attenuation with env)
+    env_untr = (
+        os.environ.get("AGY_UNTRUSTED_SESSION", "").strip() == "1"
+        or os.environ.get("AGY_MEMORY_READONLY", "").strip() == "1"
+    )
+    eff_parent_untr = bool(parent_untrusted) or env_untr or parent_is_remote
+    eff_parent_tainted = bool(parent_tainted) or eff_parent_untr
+
+    trust_candidates: List[str] = []
+    if arg_p_trust:
+        trust_candidates.append(_normalize_trust_level(arg_p_trust))
+    if env_p_trust:
+        trust_candidates.append(_normalize_trust_level(env_p_trust))
+    if trust_candidates:
+        eff_parent_trust = trust_candidates[0]
+        for cand in trust_candidates[1:]:
+            eff_parent_trust = _min_trust_level(eff_parent_trust, cand)
+    else:
+        eff_parent_trust = "remote_untrusted" if (eff_parent_untr or eff_parent_tainted) else "local_admin"
+
+    if eff_parent_untr or eff_parent_tainted or parent_is_remote:
+        eff_parent_trust = _min_trust_level(eff_parent_trust, "remote_untrusted")
+    if TRUST_ORDER[eff_parent_trust] <= TRUST_ORDER["remote_untrusted"]:
+        eff_parent_untr = True
+        eff_parent_tainted = True
+
+    env_max_mode = os.environ.get("AGY_MAX_RUNTIME_MODE", "").strip().lower()
+    eff_parent_max_mode = _min_runtime_mode(parent_max_runtime_mode, env_max_mode, default="")
+    if eff_parent_untr or eff_parent_tainted:
+        eff_parent_max_mode = "safe"
 
     chain = [normalize_handle(c) for c in (parent_chain or []) if normalize_handle(c)]
     if not chain or chain[-1] != sender:
@@ -877,6 +1170,18 @@ def dispatch_assignments(
             prompt = str(spec.get("prompt") or "").strip()
             if not prompt:
                 raise ValueError(f"Assignment #{idx + 1} prompt cannot be empty")
+            raw_spec_team = validate_team_id(spec.get("team_id") or "")
+            if clean_team_id and raw_spec_team and raw_spec_team != clean_team_id:
+                raise PermissionError(
+                    f"PRIVILEGE_ESCALATION_DENIED: assignment team_id {raw_spec_team!r} does not match bound team_id {clean_team_id!r}"
+                )
+            spec_team = clean_team_id or raw_spec_team
+            raw_spec_origin = str(spec.get("agent_origin") or "").strip().lower()
+            if parent_is_remote and raw_spec_origin and not _is_remote_origin(raw_spec_origin):
+                raise PermissionError(
+                    f"PRIVILEGE_ESCALATION_DENIED: assignment cannot override remote agent_origin {eff_origin!r} with {raw_spec_origin!r}"
+                )
+            spec_origin = raw_spec_origin or eff_origin or "local_bus"
             target = resolve_target_bot(target_q, roster=roster)
             th = target["handle"]
             if th == sender:
@@ -885,10 +1190,56 @@ def dispatch_assignments(
                 raise ValueError(f"Cycle detected in delegation chain ({' -> '.join(chain)} -> {th})")
             if not target["online"]:
                 raise ValueError(f"Target bot @{th} is currently offline")
-            resolved_specs.append((spec, target))
+            resolved_specs.append((spec, target, spec_team, spec_origin))
+
+        # Check & record 10-minute sliding window AFTER spec validation so invalid specs don't burn quota
+        _record_dispatch_window_unlocked(now, len(resolved_specs), eff_window_max)
 
         job_ids = [f"job-{uuid.uuid4().hex[:10]}" for _ in resolved_specs]
-        for idx, ((spec, target), jid) in enumerate(zip(resolved_specs, job_ids)):
+        for idx, ((spec, target, spec_team, child_origin), jid) in enumerate(zip(resolved_specs, job_ids)):
+            prompt_str = str(spec.get("prompt") or "").strip()
+            prompt_tainted = _text_has_untrusted_taint(prompt_str)
+            child_is_remote = _is_remote_origin(child_origin)
+            child_ro = bool(eff_parent_ro) or bool(spec.get("readonly", False))
+            raw_child_trust = spec.get("trust_level") or trust_level or eff_parent_trust
+            child_trust = _min_trust_level(eff_parent_trust, raw_child_trust)
+            if child_is_remote:
+                child_trust = _min_trust_level(child_trust, "remote_untrusted")
+            if child_ro:
+                child_trust = "readonly_guest"
+            child_untr = (
+                bool(eff_parent_untr)
+                or bool(spec.get("untrusted", False))
+                or bool(spec.get("tainted", False))
+                or child_ro
+                or child_is_remote
+                or prompt_tainted
+                or (TRUST_ORDER[child_trust] <= TRUST_ORDER["remote_untrusted"])
+            )
+            child_tainted = bool(eff_parent_tainted) or bool(spec.get("tainted", False)) or child_untr
+            if child_untr and not child_ro:
+                child_trust = _min_trust_level(child_trust, "remote_untrusted")
+
+            spec_max_mode = str(spec.get("max_runtime_mode") or "").strip().lower()
+            eff_max_mode = _min_runtime_mode(eff_parent_max_mode, spec_max_mode, default="")
+            if child_ro or child_untr:
+                eff_max_mode = "safe"
+
+            req_mode = str(spec.get("mode") or "").strip().lower()
+            if eff_max_mode:
+                final_mode = _min_runtime_mode(eff_max_mode, req_mode, default=eff_max_mode)
+            else:
+                final_mode = req_mode
+
+            wt_enabled = bool(spec.get("worktree", False))
+            if "worktree_strict" in spec and spec.get("worktree_strict") is not None:
+                wt_strict = bool(spec.get("worktree_strict"))
+            else:
+                wt_strict = wt_enabled
+
+            child_retryable = bool(spec.get("retryable", True))
+            job_max_rt = float(spec.get("max_runtime_sec") or DEFAULT_JOB_MAX_RUNTIME_SEC)
+
             job = {
                 "job_id": jid,
                 "group_id": group_id,
@@ -897,18 +1248,23 @@ def dispatch_assignments(
                 "batch_job_ids": list(job_ids),
                 "wake_on_async": bool(wake_on_async),
                 "batch_notified": False,
+                "batch_notified_at": 0.0,
+                "batch_acked": False,
+                "batch_acked_at": 0.0,
+                "batch_replay_count": 0,
                 "label": str(spec.get("label") or "")[:120],
                 "from_bot": sender,
                 "target_bot": target["handle"],
-                "prompt": str(spec.get("prompt") or "").strip(),
+                "prompt": prompt_str,
                 "project": str(spec.get("project") or ""),
                 "workdir": str(spec.get("workdir") or ""),
                 "model": str(spec.get("model") or ""),
                 "effort": str(spec.get("effort") or ""),
-                "mode": str(spec.get("mode") or ""),
+                "mode": final_mode,
                 "thread_key": str(spec.get("thread_key") or ""),
                 "resume_cid": str(spec.get("resume_cid") or ""),
-                "worktree": bool(spec.get("worktree", False)),
+                "worktree": wt_enabled,
+                "worktree_strict": wt_strict,
                 "worktree_info": {},
                 "notify_group": bool(spec.get("notify_group", default_notify_group)),
                 "origin_scope_key": origin_scope_key or "",
@@ -917,6 +1273,18 @@ def dispatch_assignments(
                 "origin_msg_id": int(origin_msg_id or 0),
                 "chain": list(chain) + [target["handle"]],
                 "depth": len(chain),
+                "team_id": spec_team,
+                "agent_origin": child_origin,
+                "trust_level": child_trust,
+                "tainted": bool(child_tainted),
+                "untrusted": bool(child_untr),
+                "readonly": bool(child_ro),
+                "max_runtime_mode": eff_max_mode,
+                "retryable": child_retryable,
+                "retry_count": eff_retry_count,
+                "parent_job_id": str(parent_job_id or ""),
+                "batch_budget_usd": eff_budget_usd,
+                "max_runtime_sec": job_max_rt,
                 "status": "queued",
                 "cancel_requested": False,
                 "cancel_reason": "",
@@ -925,17 +1293,29 @@ def dispatch_assignments(
                 "started_at": 0.0,
                 "finished_at": 0.0,
                 "worker_pid": 0,
+                "worker_starttime": "",
+                "worker_euid": -1,
                 "worker_cid": "",
                 "progress": "",
                 "result_text": "",
                 "error": "",
+                "error_code": "",
                 "artifacts": [],
                 "usage": {},
             }
             _atomic_write_json(_job_path(jid), job)
             _drop_inbox_packet_unlocked(
                 target["handle"],
-                {"type": "job", "job_id": jid, "from_bot": sender, "created_at": now},
+                {
+                    "type": "job",
+                    "job_id": jid,
+                    "from_bot": sender,
+                    "team_id": spec_team,
+                    "agent_origin": child_origin,
+                    "trust_level": child_trust,
+                    "tainted": bool(child_tainted),
+                    "created_at": now,
+                },
             )
             created_jobs.append(job)
 
@@ -973,7 +1353,15 @@ def list_jobs(limit: int = 20, status: Optional[str] = None, bot: Optional[str] 
     return jobs[: max(1, int(limit))]
 
 
-def claim_job(job_id: str, worker_handle: str, worker_pid: int) -> Optional[Dict[str, Any]]:
+def claim_job(
+    job_id: str,
+    worker_handle: str,
+    worker_pid: int,
+    *,
+    worker_starttime: Optional[str] = None,
+    worker_euid: Optional[int] = None,
+    proc_root: str = "/proc",
+) -> Optional[Dict[str, Any]]:
     norm = normalize_handle(worker_handle)
     fp = _job_path(job_id)
     with _bus_lock():
@@ -988,14 +1376,93 @@ def claim_job(job_id: str, worker_handle: str, worker_pid: int) -> Optional[Dict
             job["status"] = "cancelled"
             job["finished_at"] = time.time()
             job["error"] = job.get("cancel_reason") or "cancelled before start"
+            job["error_code"] = job.get("error_code") or "CANCELLED_BY_COORDINATOR"
             _atomic_write_json(fp, job)
             _maybe_notify_batch_done_unlocked(job)
             return None
+        pid = int(worker_pid or os.getpid())
+        eff_st = worker_starttime
+        if eff_st is None:
+            _state, eff_st = _read_proc_stat_info(pid, proc_root=proc_root)
+        eff_euid = worker_euid
+        if eff_euid is None:
+            eff_euid = _read_proc_euid(pid, proc_root=proc_root)
+            if eff_euid is None and pid == os.getpid():
+                eff_euid = os.geteuid()
         job["status"] = "running"
         job["started_at"] = time.time()
-        job["worker_pid"] = int(worker_pid or os.getpid())
+        job["worker_pid"] = pid
+        job["worker_starttime"] = str(eff_st or "")
+        job["worker_euid"] = int(eff_euid) if eff_euid is not None else -1
+        job.setdefault("max_runtime_sec", DEFAULT_JOB_MAX_RUNTIME_SEC)
         _atomic_write_json(fp, job)
         return dict(job)
+
+
+def reap_zombie_jobs(
+    now: Optional[float] = None,
+    grace_sec: float = 15.0,
+    proc_root: str = "/proc",
+) -> List[str]:
+    """Reap orphaned/dead/reused-PID/zombie/timed-out `running` jobs atomically under `_bus_lock()`.
+
+    CRITICAL SAFETY INVARIANT:
+    - Never sends `os.kill` signals (especially never touches a reused PID whose `starttime` or `euid` mismatches).
+    - Marks reaped jobs `status="error"`, `error_code="WORKER_ZOMBIE_REAPED"`, and notifies `batch_done` once.
+    """
+    eff_now = time.time() if now is None else float(now)
+    eff_grace = max(0.0, float(grace_sec or 0.0))
+    reaped: List[str] = []
+
+    with _bus_lock():
+        try:
+            files = sorted(fn for fn in os.listdir(JOBS_DIR) if fn.endswith(".json") and not fn.endswith(".tmp"))
+        except OSError:
+            return []
+
+        for fn in files:
+            fp = os.path.join(JOBS_DIR, fn)
+            job = _read_json(fp, None)
+            if not isinstance(job, dict) or job.get("status") != "running":
+                continue
+            started_at = float(job.get("started_at") or job.get("created_at") or 0.0)
+            elapsed = eff_now - started_at
+            if elapsed < eff_grace:
+                continue
+
+            pid = int(job.get("worker_pid") or 0)
+            recorded_st = str(job.get("worker_starttime") or "").strip()
+            raw_euid = job.get("worker_euid")
+            recorded_euid = int(raw_euid) if isinstance(raw_euid, int) and not isinstance(raw_euid, bool) else -1
+            max_rt = float(job.get("max_runtime_sec") or DEFAULT_JOB_MAX_RUNTIME_SEC)
+
+            state, cur_st = _read_proc_stat_info(pid, proc_root=proc_root) if pid > 1 else (None, None)
+            cur_euid = _read_proc_euid(pid, proc_root=proc_root) if pid > 1 else None
+
+            reason = ""
+            if pid <= 1 or cur_st is None:
+                reason = "worker_pid_missing"
+            elif state in ("Z", "X"):
+                reason = f"worker_process_state_{state}"
+            elif recorded_st and str(cur_st) != recorded_st:
+                reason = "worker_pid_reused_starttime_mismatch"
+            elif recorded_euid >= 0 and (cur_euid is None or int(cur_euid) != recorded_euid):
+                reason = "worker_pid_euid_mismatch"
+            elif max_rt > 0 and elapsed > max_rt:
+                reason = f"worker_max_runtime_exceeded ({int(elapsed)}s > {int(max_rt)}s)"
+
+            if not reason:
+                continue
+
+            job["status"] = "error"
+            job["error_code"] = "WORKER_ZOMBIE_REAPED"
+            job["error"] = f"WORKER_ZOMBIE_REAPED: {reason}"
+            job["finished_at"] = eff_now
+            _atomic_write_json(fp, job)
+            _maybe_notify_batch_done_unlocked(job)
+            reaped.append(str(job.get("job_id") or fn[:-5]))
+
+    return reaped
 
 
 def update_job(job_id: str, **fields: Any) -> Optional[Dict[str, Any]]:
@@ -1028,8 +1495,12 @@ def _maybe_notify_batch_done_unlocked(settled_job: Dict[str, Any]) -> None:
         batch_jobs.append(j)
 
     now = time.time()
+    any_tainted = any(bool(j.get("tainted") or j.get("untrusted")) for j in batch_jobs)
     for j in batch_jobs:
         j["batch_notified"] = True
+        j["batch_notified_at"] = now
+        j["batch_acked"] = False
+        j.setdefault("batch_replay_count", 0)
         _atomic_write_json(_job_path(j["job_id"]), j)
 
     sender = settled_job.get("from_bot") or ""
@@ -1045,9 +1516,198 @@ def _maybe_notify_batch_done_unlocked(settled_job: Dict[str, Any]) -> None:
             "origin_chat_id": int(settled_job.get("origin_chat_id") or 0),
             "origin_thread_id": settled_job.get("origin_thread_id"),
             "chain": list(settled_job.get("chain") or []),
+            "tainted": any_tainted,
+            "team_id": settled_job.get("team_id") or "",
+            "agent_origin": settled_job.get("agent_origin") or "local_bus",
+            "trust_level": settled_job.get("trust_level") or "local_admin",
             "created_at": now,
         },
     )
+
+
+def mark_batch_wakeup_acked(job_ids: Iterable[str]) -> int:
+    """Atomically mark `batch_acked=True` and `batch_acked_at` for the given jobs under `_bus_lock()`."""
+    clean_ids: List[str] = []
+    seen: set[str] = set()
+    for raw_id in job_ids or ():
+        try:
+            jid = validate_job_id(str(raw_id or "").strip())
+        except ValueError:
+            continue
+        if jid not in seen:
+            seen.add(jid)
+            clean_ids.append(jid)
+    if not clean_ids:
+        return 0
+
+    acked = 0
+    now = time.time()
+    with _bus_lock():
+        for jid in clean_ids:
+            fp = _job_path(jid)
+            job = _read_json(fp, None)
+            if not isinstance(job, dict):
+                continue
+            if job.get("batch_acked"):
+                continue
+            job["batch_acked"] = True
+            job["batch_acked_at"] = now
+            _atomic_write_json(fp, job)
+            acked += 1
+    return acked
+
+
+def requeue_unacked_batch_done(
+    for_bot: str,
+    *,
+    now: Optional[float] = None,
+    min_age_sec: float = 90.0,
+    max_age_sec: float = 1800.0,
+    max_replays: int = 2,
+    exclude_group_ids: Optional[Iterable[str]] = None,
+) -> List[str]:
+    """Re-deliver unacked `batch_done` notifications for `for_bot` after restart/crash loss.
+
+    Scans terminal jobs owned by `for_bot` with `wake_on_async=True`, `batch_notified=True`,
+    `batch_acked=False`, `batch_replay_count < max_replays`, and age within `[min_age_sec, max_age_sec]`.
+    Deduplicates by `group_id`, skips any `group_id` listed in `exclude_group_ids` or already waiting
+    as a `batch_done` packet inside `INBOX_DIR/<for_bot>/`, atomically increments `batch_replay_count`
+    and refreshes `batch_notified_at`, and re-drops a `batch_done` packet into `for_bot`'s inbox.
+    """
+    target = normalize_handle(for_bot or "")
+    if not target:
+        return []
+    eff_now = time.time() if now is None else float(now)
+    eff_min = max(0.0, float(min_age_sec))
+    eff_max = max(eff_min, float(max_age_sec))
+    eff_max_replays = max(0, int(max_replays))
+    if eff_max_replays <= 0:
+        return []
+
+    replayed_groups: List[str] = []
+    with _bus_lock():
+        excluded_groups: set[str] = {
+            str(g).strip() for g in (exclude_group_ids or ()) if str(g).strip()
+        }
+        bot_inbox = os.path.join(INBOX_DIR, target)
+        if os.path.isdir(bot_inbox):
+            try:
+                for pfn in os.listdir(bot_inbox):
+                    if not (pfn.endswith(".json") and not pfn.endswith(".tmp")):
+                        continue
+                    pkt = _read_json(os.path.join(bot_inbox, pfn), None)
+                    if isinstance(pkt, dict) and pkt.get("type") == "batch_done":
+                        pgid = str(pkt.get("group_id") or "").strip()
+                        if pgid:
+                            excluded_groups.add(pgid)
+            except OSError:
+                pass
+
+        try:
+            files = sorted(fn for fn in os.listdir(JOBS_DIR) if fn.endswith(".json") and not fn.endswith(".tmp"))
+        except OSError:
+            return []
+
+        groups: Dict[str, List[Dict[str, Any]]] = {}
+        for fn in files:
+            job = _read_json(os.path.join(JOBS_DIR, fn), None)
+            if not isinstance(job, dict):
+                continue
+            if normalize_handle(str(job.get("from_bot") or "")) != target:
+                continue
+            if not job.get("wake_on_async") or not job.get("batch_notified"):
+                continue
+            if job.get("batch_acked"):
+                continue
+            if job.get("status") not in TERMINAL_STATUSES:
+                continue
+            gid = str(job.get("group_id") or job.get("job_id") or "").strip()
+            if not gid or gid in excluded_groups:
+                continue
+            groups.setdefault(gid, []).append(job)
+
+        for gid in sorted(groups.keys()):
+            if gid in excluded_groups:
+                continue
+            seed = groups[gid][0]
+            raw_jids = list(seed.get("batch_job_ids") or [j.get("job_id") for j in groups[gid] if j.get("job_id")])
+            batch_jids: List[str] = []
+            seen_j: set[str] = set()
+            for rj in raw_jids:
+                try:
+                    cj = validate_job_id(str(rj or "").strip())
+                except ValueError:
+                    continue
+                if cj not in seen_j:
+                    seen_j.add(cj)
+                    batch_jids.append(cj)
+            if not batch_jids:
+                continue
+
+            batch_jobs: List[Dict[str, Any]] = []
+            eligible = True
+            for jid in batch_jids:
+                bj = _read_json(_job_path(jid), None)
+                if not isinstance(bj, dict):
+                    eligible = False
+                    break
+                if bj.get("status") not in TERMINAL_STATUSES:
+                    eligible = False
+                    break
+                if not bj.get("wake_on_async") or not bj.get("batch_notified") or bj.get("batch_acked"):
+                    eligible = False
+                    break
+                batch_jobs.append(bj)
+            if not eligible or not batch_jobs:
+                continue
+
+            rep = batch_jobs[0]
+            eff_gid = str(rep.get("group_id") or gid).strip()
+            if eff_gid in excluded_groups:
+                continue
+
+            replay_count = max(int(bj.get("batch_replay_count") or 0) for bj in batch_jobs)
+            if replay_count >= eff_max_replays:
+                continue
+            notified_at = max(
+                float(bj.get("batch_notified_at") or bj.get("finished_at") or 0.0) for bj in batch_jobs
+            )
+            if notified_at <= 0.0:
+                continue
+            age = eff_now - notified_at
+            if age < eff_min or age > eff_max:
+                continue
+
+            next_replay = replay_count + 1
+            any_tainted = any(bool(bj.get("tainted") or bj.get("untrusted")) for bj in batch_jobs)
+            for bj in batch_jobs:
+                bj["batch_replay_count"] = next_replay
+                bj["batch_notified_at"] = eff_now
+                _atomic_write_json(_job_path(bj["job_id"]), bj)
+
+            _drop_inbox_packet_unlocked(
+                target,
+                {
+                    "type": "batch_done",
+                    "group_id": eff_gid,
+                    "job_ids": batch_jids,
+                    "origin_scope_key": rep.get("origin_scope_key") or "",
+                    "origin_chat_id": int(rep.get("origin_chat_id") or 0),
+                    "origin_thread_id": rep.get("origin_thread_id"),
+                    "chain": list(rep.get("chain") or []),
+                    "tainted": any_tainted,
+                    "team_id": rep.get("team_id") or "",
+                    "agent_origin": rep.get("agent_origin") or "local_bus",
+                    "trust_level": rep.get("trust_level") or "local_admin",
+                    "replayed": True,
+                    "replay_count": next_replay,
+                    "created_at": eff_now,
+                },
+            )
+            excluded_groups.add(eff_gid)
+            replayed_groups.append(eff_gid)
+
+    return replayed_groups
 
 
 def finish_job(
@@ -1056,6 +1716,8 @@ def finish_job(
     status: str,
     result_text: str = "",
     error: str = "",
+    error_code: str = "",
+    tainted: Optional[bool] = None,
     worker_cid: str = "",
     artifacts: Optional[List[str]] = None,
     usage: Optional[Dict[str, Any]] = None,
@@ -1075,6 +1737,18 @@ def finish_job(
             job["result_text"] = result_text
         if error:
             job["error"] = error
+        clean_code = str(error_code or "").strip().upper()
+        if not clean_code:
+            if status == "done":
+                clean_code = "OK"
+            elif status == "cancelled":
+                clean_code = "CANCELLED_LOCAL" if "local" in str(error or "").lower() else "CANCELLED_BY_COORDINATOR"
+            else:
+                clean_code = "AGENT_EXEC_ERROR"
+        job["error_code"] = clean_code
+        if tainted is True:
+            job["tainted"] = True
+            job["untrusted"] = True
         if worker_cid:
             job["worker_cid"] = worker_cid
         if artifacts is not None:
@@ -1084,6 +1758,35 @@ def finish_job(
         if worktree_info is not None:
             job["worktree_info"] = dict(worktree_info)
         _atomic_write_json(fp, job)
+
+        # C7: Cumulative batch cost circuit breaker — auto-cancel remaining queued siblings
+        batch_ids = list(job.get("batch_job_ids") or [job["job_id"]])
+        budget_limit = float(job.get("batch_budget_usd") or DEFAULT_BATCH_MAX_USD)
+        if budget_limit > 0 and len(batch_ids) > 1:
+            total_usd = 0.0
+            siblings: List[Tuple[str, Dict[str, Any]]] = []
+            for bid in batch_ids:
+                bj = job if bid == job["job_id"] else _read_json(_job_path(bid), None)
+                if isinstance(bj, dict):
+                    try:
+                        total_usd += float((bj.get("usage") or {}).get("usd") or 0.0)
+                    except (TypeError, ValueError):
+                        pass
+                    if bid != job["job_id"]:
+                        siblings.append((bid, bj))
+            if total_usd > budget_limit:
+                for bid, sib in siblings:
+                    if sib.get("status") == "queued":
+                        sib["status"] = "cancelled"
+                        sib["cancel_requested"] = True
+                        sib["cancel_reason"] = "BUDGET_EXCEEDED"
+                        sib["error_code"] = "BUDGET_EXCEEDED"
+                        sib["error"] = (
+                            f"BUDGET_EXCEEDED: cumulative batch cost ${total_usd:.4f} exceeded ${budget_limit:.4f}"
+                        )
+                        sib["finished_at"] = now
+                        _atomic_write_json(_job_path(bid), sib)
+
         _maybe_notify_batch_done_unlocked(job)
         return dict(job)
 
@@ -1105,6 +1808,9 @@ def cancel_job(job_id: str, requester_bot: str = "", reason: str = "cancelled") 
             job["status"] = "cancelled"
             job["finished_at"] = time.time()
             job["error"] = reason
+            job["error_code"] = (
+                "CANCELLED_LOCAL" if "local" in str(reason or "").lower() else "CANCELLED_BY_COORDINATOR"
+            )
             _atomic_write_json(fp, job)
             _maybe_notify_batch_done_unlocked(job)
         else:
@@ -1164,6 +1870,10 @@ def dispatch_jobs_in_dir(
                     "batch_job_ids": list(job_ids),
                     "wake_on_async": False,
                     "batch_notified": False,
+                    "batch_notified_at": 0.0,
+                    "batch_acked": False,
+                    "batch_acked_at": 0.0,
+                    "batch_replay_count": 0,
                     "label": str(spec.get("label") or "")[:120],
                     "from_bot": sender,
                     "target_bot": th,
@@ -1226,6 +1936,96 @@ def dispatch_jobs_in_dir(
     return {"group_id": group_id, "jobs": created_jobs}
 
 
+def _drop_inbox_packet_in_dir_unlocked(inbox_dir: str, target_handle: str, packet: Dict[str, Any]) -> str:
+    """Drop an inbox packet into an explicit `inbox_dir/<target_handle>/` under the caller's bus lock."""
+    global _PKT_SEQ
+    norm = normalize_handle(target_handle)
+    bot_inbox = os.path.join(inbox_dir, norm)
+    os.makedirs(bot_inbox, mode=0o700, exist_ok=True)
+    wm_path = os.path.join(inbox_dir, ".last_pkt_ns")
+    inbox_key = os.path.realpath(inbox_dir)
+    prev_ns = _LAST_PKT_NS_BY_DIR.get(inbox_key, 0)
+    try:
+        with open(wm_path, "r", encoding="utf-8") as wf:
+            raw_wm = wf.read().strip()
+        if raw_wm.isdigit() and int(raw_wm) > prev_ns:
+            prev_ns = int(raw_wm)
+    except OSError:
+        pass
+    now_ns = time.time_ns()
+    mono_ns = now_ns if now_ns > prev_ns else (prev_ns + 1)
+    os.makedirs(inbox_dir, mode=0o700, exist_ok=True)
+    tmp_wm = f"{wm_path}.{os.getpid()}.{uuid.uuid4().hex[:6]}.tmp"
+    with open(tmp_wm, "w", encoding="utf-8") as wf:
+        wf.write(str(mono_ns))
+    os.chmod(tmp_wm, 0o600)
+    os.replace(tmp_wm, wm_path)
+    _LAST_PKT_NS_BY_DIR[inbox_key] = mono_ns
+    _PKT_SEQ = (_PKT_SEQ + 1) % 1_000_000
+    pkt_name = f"{mono_ns:020d}_{_PKT_SEQ:06d}_{uuid.uuid4().hex[:8]}.json"
+    pkt_path = os.path.join(bot_inbox, pkt_name)
+    _atomic_write_json(pkt_path, packet)
+    return pkt_path
+
+
+def _maybe_notify_batch_done_in_dir_unlocked(
+    bus_dir: str,
+    settled_job: Dict[str, Any],
+    *,
+    now: Optional[float] = None,
+) -> None:
+    """Check if all sibling jobs in `bus_dir` are terminal and emit `batch_done` atomically under lock."""
+    if not settled_job.get("wake_on_async") or settled_job.get("batch_notified"):
+        return
+    jobs_dir = os.path.join(bus_dir, "jobs")
+    inbox_dir = os.path.join(bus_dir, "inbox")
+    job_ids = list(settled_job.get("batch_job_ids") or [settled_job["job_id"]])
+    batch_jobs: List[Dict[str, Any]] = []
+    for jid in job_ids:
+        clean_jid = validate_job_id(jid)
+        j = (
+            settled_job
+            if clean_jid == settled_job.get("job_id")
+            else _read_json(os.path.join(jobs_dir, f"{clean_jid}.json"), None)
+        )
+        if not isinstance(j, dict) or j.get("status") not in TERMINAL_STATUSES:
+            return
+        if j.get("batch_notified"):
+            return
+        batch_jobs.append(j)
+
+    eff_now = time.time() if now is None else float(now)
+    any_tainted = any(bool(j.get("tainted") or j.get("untrusted")) for j in batch_jobs)
+    for j in batch_jobs:
+        j["batch_notified"] = True
+        j["batch_notified_at"] = eff_now
+        j["batch_acked"] = False
+        j.setdefault("batch_replay_count", 0)
+        _atomic_write_json(os.path.join(jobs_dir, f"{validate_job_id(j['job_id'])}.json"), j)
+
+    sender = normalize_handle(str(settled_job.get("from_bot") or ""))
+    if not sender:
+        return
+    _drop_inbox_packet_in_dir_unlocked(
+        inbox_dir,
+        sender,
+        {
+            "type": "batch_done",
+            "group_id": settled_job.get("group_id"),
+            "job_ids": job_ids,
+            "origin_scope_key": settled_job.get("origin_scope_key") or "",
+            "origin_chat_id": int(settled_job.get("origin_chat_id") or 0),
+            "origin_thread_id": settled_job.get("origin_thread_id"),
+            "chain": list(settled_job.get("chain") or []),
+            "tainted": any_tainted,
+            "team_id": settled_job.get("team_id") or "",
+            "agent_origin": settled_job.get("agent_origin") or "local_bus",
+            "trust_level": settled_job.get("trust_level") or "local_admin",
+            "created_at": eff_now,
+        },
+    )
+
+
 def cancel_job_in_dir(
     bus_dir: str,
     job_id: str,
@@ -1233,12 +2033,12 @@ def cancel_job_in_dir(
     reason: str = "cancelled_by_studio",
 ) -> Tuple[Optional[Dict[str, Any]], bool]:
     """Atomically cancel a job in an explicit `bus_dir`. Returns `(job_dict_or_none, already_terminal)`."""
+    clean_id = validate_job_id(job_id)
     bdir = os.path.abspath(bus_dir)
     jobs_dir = os.path.join(bdir, "jobs")
     lock_file = os.path.join(bdir, "bus.lock")
     os.makedirs(bdir, mode=0o700, exist_ok=True)
-    safe_id = re.sub(r"[^a-zA-Z0-9_.-]+", "", job_id)
-    fp = os.path.join(jobs_dir, f"{safe_id}.json")
+    fp = os.path.join(jobs_dir, f"{clean_id}.json")
     if not os.path.isfile(fp):
         return None, False
 
@@ -1254,19 +2054,143 @@ def cancel_job_in_dir(
             job["cancel_requested"] = True
             job["cancel_reason"] = reason
             if st == "queued":
+                now = time.time()
                 job["status"] = "cancelled"
-                job["finished_at"] = time.time()
+                job["finished_at"] = now
                 job["error"] = reason
-            _atomic_write_json(fp, job)
+                job["error_code"] = (
+                    "CANCELLED_LOCAL" if "local" in str(reason or "").lower() else "CANCELLED_BY_COORDINATOR"
+                )
+                _atomic_write_json(fp, job)
+                _maybe_notify_batch_done_in_dir_unlocked(bdir, job, now=now)
+            else:
+                _atomic_write_json(fp, job)
             return dict(job), False
         finally:
             fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
 
 
-def retry_job(job_id: str, requester_bot: str, prompt_override: str = "") -> Dict[str, Any]:
+def retry_job(
+    job_id: str,
+    requester_bot: str,
+    prompt_override: str = "",
+    *,
+    force_non_idempotent: bool = False,
+    max_retries: Optional[int] = None,
+    caller_team_id: Optional[str] = None,
+    caller_agent_origin: Optional[str] = None,
+    caller_trust_level: Optional[str] = None,
+    caller_readonly: Optional[bool] = None,
+    caller_untrusted: Optional[bool] = None,
+    caller_tainted: Optional[bool] = None,
+    caller_max_runtime_mode: Optional[str] = None,
+) -> Dict[str, Any]:
+    # P0-1: Read current session security context (caller args monotonically intersected with env)
+    env_rbac_ro = os.environ.get("AGY_RBAC_ROLE", "").strip().lower() == "readonly"
+    env_untr = (
+        os.environ.get("AGY_UNTRUSTED_SESSION", "").strip() == "1"
+        or os.environ.get("AGY_MEMORY_READONLY", "").strip() == "1"
+    )
+    env_trust = os.environ.get("AGY_TRUST_LEVEL", "").strip()
+    env_team_id = validate_team_id(os.environ.get("AGY_BOT_TEAM_ID", "").strip())
+    env_origin = os.environ.get("AGY_AGENT_ORIGIN", "").strip().lower()
+    env_max_mode = os.environ.get("AGY_MAX_RUNTIME_MODE", "").strip().lower()
+
+    arg_caller_team = validate_team_id(caller_team_id or "")
+    if env_team_id and arg_caller_team and arg_caller_team != env_team_id:
+        raise PermissionError(
+            f"PRIVILEGE_ESCALATION_DENIED: caller team_id {arg_caller_team!r} does not match bound team_id {env_team_id!r}"
+        )
+    eff_caller_team = env_team_id or arg_caller_team
+
+    arg_caller_trust = str(caller_trust_level or "").strip()
+    eff_caller_ro = bool(caller_readonly) or env_rbac_ro
+    for _raw_t in (arg_caller_trust, env_trust):
+        if _raw_t and _normalize_trust_level(_raw_t) == "readonly_guest":
+            eff_caller_ro = True
+    if eff_caller_ro:
+        raise PermissionError("PRIVILEGE_ESCALATION_DENIED: readonly session cannot retry jobs")
+
     prev = get_job(job_id)
     if not prev:
         raise ValueError(f"Job not found: {job_id}")
+
+    prev_team_id = validate_team_id(prev.get("team_id") or "")
+    if eff_caller_team and prev_team_id != eff_caller_team:
+        raise PermissionError(
+            f"PRIVILEGE_ESCALATION_DENIED: cross-team retry rejected (session team_id={eff_caller_team!r}, job team_id={prev_team_id!r})"
+        )
+    eff_team_id = eff_caller_team or prev_team_id
+
+    if prev.get("retryable") is False and not force_non_idempotent:
+        raise ValueError(
+            f"Job {job_id} is marked non-idempotent (retryable=False); refusing retry without force_non_idempotent=True"
+        )
+    next_retry_count = int(prev.get("retry_count") or 0) + 1
+    eff_max_retries = DEFAULT_MAX_RETRIES if max_retries is None else max(0, int(max_retries))
+    if next_retry_count > eff_max_retries:
+        raise ValueError(
+            f"RETRY_LIMIT_EXCEEDED: job {job_id} retry {next_retry_count} exceeds max_retries={eff_max_retries}"
+        )
+
+    prev_origin = str(prev.get("agent_origin") or "local_bus").strip().lower() or "local_bus"
+    arg_caller_origin = str(caller_agent_origin or "").strip().lower()
+    if _is_remote_origin(env_origin):
+        eff_caller_origin = arg_caller_origin if _is_remote_origin(arg_caller_origin) else env_origin
+    else:
+        eff_caller_origin = arg_caller_origin or env_origin
+
+    if _is_remote_origin(eff_caller_origin):
+        eff_origin = eff_caller_origin
+    elif _is_remote_origin(prev_origin):
+        eff_origin = prev_origin
+    else:
+        eff_origin = prev_origin or eff_caller_origin or "local_bus"
+
+    prev_ro = bool(prev.get("readonly", False))
+    eff_ro = prev_ro or eff_caller_ro
+
+    eff_caller_untr = bool(caller_untrusted) or env_untr or _is_remote_origin(eff_caller_origin)
+    eff_caller_tainted = bool(caller_tainted) or eff_caller_untr
+    prev_untr = (
+        bool(prev.get("untrusted", False))
+        or bool(prev.get("tainted", False))
+        or prev_ro
+        or _is_remote_origin(prev_origin)
+    )
+    prev_tainted = bool(prev.get("tainted", False)) or prev_untr
+
+    eff_untr = prev_untr or eff_caller_untr or eff_ro or _is_remote_origin(eff_origin)
+    eff_tainted = prev_tainted or eff_caller_tainted or eff_untr
+
+    prev_trust = _normalize_trust_level(
+        prev.get("trust_level"),
+        default=("readonly_guest" if prev_ro else ("remote_untrusted" if prev_untr else "local_admin")),
+    )
+    eff_trust = prev_trust
+    for _raw_t in (arg_caller_trust, env_trust):
+        if _raw_t:
+            eff_trust = _min_trust_level(eff_trust, _raw_t)
+    if eff_ro:
+        eff_trust = "readonly_guest"
+    elif eff_untr or eff_tainted or _is_remote_origin(eff_origin):
+        eff_trust = _min_trust_level(eff_trust, "remote_untrusted")
+    if TRUST_ORDER[eff_trust] <= TRUST_ORDER["remote_untrusted"]:
+        eff_untr = True
+        eff_tainted = True
+
+    prev_max_mode = str(prev.get("max_runtime_mode") or "").strip().lower()
+    caller_eff_max_mode = _min_runtime_mode(caller_max_runtime_mode, env_max_mode, default="")
+    eff_max_mode = _min_runtime_mode(prev_max_mode, caller_eff_max_mode, default="")
+    if eff_ro or eff_untr or eff_tainted:
+        eff_max_mode = "safe"
+
+    raw_prev_mode = str(prev.get("mode") or "").strip().lower()
+    eff_mode = _min_runtime_mode(eff_max_mode, raw_prev_mode, default=eff_max_mode) if eff_max_mode else raw_prev_mode
+
+    wt_enabled = bool(prev.get("worktree"))
+    wt_strict = bool(prev.get("worktree_strict", wt_enabled))
+
     spec = {
         "bot": prev.get("target_bot"),
         "prompt": prompt_override.strip() or prev.get("prompt") or "",
@@ -1275,11 +2199,21 @@ def retry_job(job_id: str, requester_bot: str, prompt_override: str = "") -> Dic
         "workdir": prev.get("workdir") or "",
         "model": prev.get("model") or "",
         "effort": prev.get("effort") or "",
-        "mode": prev.get("mode") or "",
+        "mode": eff_mode,
         "thread_key": prev.get("thread_key") or "",
         "resume_cid": prev.get("worker_cid") or prev.get("resume_cid") or "",
-        "worktree": bool(prev.get("worktree")),
+        "worktree": wt_enabled,
+        "worktree_strict": wt_strict,
         "notify_group": bool(prev.get("notify_group")),
+        "team_id": eff_team_id,
+        "agent_origin": eff_origin,
+        "trust_level": eff_trust,
+        "tainted": eff_tainted,
+        "untrusted": eff_untr,
+        "readonly": eff_ro,
+        "max_runtime_mode": eff_max_mode,
+        "retryable": bool(prev.get("retryable", True)),
+        "max_runtime_sec": float(prev.get("max_runtime_sec") or DEFAULT_JOB_MAX_RUNTIME_SEC),
     }
     res = dispatch_assignments(
         requester_bot or prev.get("from_bot") or "",
@@ -1288,6 +2222,20 @@ def retry_job(job_id: str, requester_bot: str, prompt_override: str = "") -> Dic
         origin_chat_id=int(prev.get("origin_chat_id") or 0),
         origin_thread_id=prev.get("origin_thread_id"),
         origin_msg_id=int(prev.get("origin_msg_id") or 0) or None,
+        default_notify_group=bool(prev.get("notify_group", False)),
+        wake_on_async=bool(prev.get("wake_on_async", True)),
+        team_id=eff_team_id,
+        agent_origin=eff_origin,
+        parent_trust_level=eff_trust,
+        parent_agent_origin=eff_origin,
+        parent_readonly=eff_ro,
+        parent_untrusted=eff_untr,
+        parent_tainted=eff_tainted,
+        parent_max_runtime_mode=eff_max_mode,
+        batch_budget_usd=prev.get("batch_budget_usd"),
+        retry_count=next_retry_count,
+        max_retries=eff_max_retries,
+        parent_job_id=job_id,
     )
     return res["jobs"][0]
 
@@ -1300,10 +2248,18 @@ def wait_for_jobs(
     """Wait until all `job_ids` settle or `timeout_sec` elapses.
 
     Returns `(jobs_list, all_settled)`. If `cancel_check()` returns True, returns early
-    after requesting cancellation on unfinished jobs.
+    after requesting cancellation on unfinished jobs. Periodically reaps zombie jobs every 5s.
     """
     deadline = time.time() + max(1.0, float(timeout_sec))
+    last_reap = 0.0
     while True:
+        now = time.time()
+        if (now - last_reap) >= 5.0:
+            last_reap = now
+            try:
+                reap_zombie_jobs(now=now)
+            except Exception:
+                pass
         jobs = [get_job(jid) or {"job_id": jid, "status": "error", "error": "missing"} for jid in job_ids]
         if all(j.get("status") in TERMINAL_STATUSES for j in jobs):
             return jobs, True
@@ -1316,7 +2272,7 @@ def wait_for_jobs(
                         pass
             jobs = [get_job(jid) or {"job_id": jid, "status": "cancelled"} for jid in job_ids]
             return jobs, False
-        if time.time() >= deadline:
+        if now >= deadline:
             return jobs, False
         time.sleep(0.25)
 
@@ -2153,6 +3109,39 @@ def prepare_job_worktree(workdir: str, job_id: str) -> Dict[str, Any]:
     wt_root = os.path.join(repo_root, WORKTREE_DIR_NAME)
     wt_path = os.path.join(wt_root, safe_id)
 
+    # C5: Fail-closed symlink & containment checks before creating or writing anything
+    if os.path.islink(wt_root) or os.path.islink(wt_path):
+        return {
+            "enabled": True,
+            "active": False,
+            "pruned": False,
+            "repo_root": repo_root,
+            "base_commit": base_commit,
+            "branch": branch,
+            "reason": "unsafe_worktree_path",
+        }
+    if os.path.exists(wt_root):
+        wt_root_real_pre = os.path.realpath(wt_root)
+        if not wt_root_real_pre.startswith(repo_root + os.sep):
+            return {
+                "enabled": True,
+                "active": False,
+                "pruned": False,
+                "repo_root": repo_root,
+                "base_commit": base_commit,
+                "branch": branch,
+                "reason": "unsafe_worktree_path",
+            }
+
+    created_wt_root = False
+
+    def _cleanup_empty_wt_root() -> None:
+        if created_wt_root and os.path.isdir(wt_root) and not os.path.islink(wt_root):
+            try:
+                os.rmdir(wt_root)
+            except OSError:
+                pass
+
     try:
         if not _ensure_git_info_exclude(repo_root):
             return {
@@ -2163,8 +3152,11 @@ def prepare_job_worktree(workdir: str, job_id: str) -> Dict[str, Any]:
                 "base_commit": base_commit,
                 "reason": "git_exclude_failed",
             }
-        os.makedirs(wt_root, exist_ok=True)
+        if not os.path.exists(wt_root):
+            os.makedirs(wt_root, exist_ok=True)
+            created_wt_root = True
     except OSError as exc:
+        _cleanup_empty_wt_root()
         return {
             "enabled": True,
             "active": False,
@@ -2175,7 +3167,28 @@ def prepare_job_worktree(workdir: str, job_id: str) -> Dict[str, Any]:
             "detail": repr(exc)[:300],
         }
 
+    wt_root_real = os.path.realpath(wt_root)
+    wt_path_real = os.path.realpath(wt_path)
+    if (
+        os.path.islink(wt_root)
+        or os.path.islink(wt_path)
+        or not wt_root_real.startswith(repo_root + os.sep)
+        or not wt_path_real.startswith(wt_root_real + os.sep)
+        or wt_path_real == wt_root_real
+    ):
+        _cleanup_empty_wt_root()
+        return {
+            "enabled": True,
+            "active": False,
+            "pruned": False,
+            "repo_root": repo_root,
+            "base_commit": base_commit,
+            "branch": branch,
+            "reason": "unsafe_worktree_path",
+        }
+
     if os.path.exists(wt_path):
+        _cleanup_empty_wt_root()
         return {
             "enabled": True,
             "active": False,
@@ -2191,6 +3204,7 @@ def prepare_job_worktree(workdir: str, job_id: str) -> Dict[str, Any]:
         # Only prune stale leftover branch if it has no unmerged commits
         del_ok, _, _ = _run_git(["branch", "-d", branch], cwd=repo_root)
         if not del_ok:
+            _cleanup_empty_wt_root()
             return {
                 "enabled": True,
                 "active": False,
@@ -2207,6 +3221,7 @@ def prepare_job_worktree(workdir: str, job_id: str) -> Dict[str, Any]:
         timeout=60.0,
     )
     if not ok_add:
+        _cleanup_empty_wt_root()
         return {
             "enabled": True,
             "active": False,
@@ -3037,6 +4052,26 @@ def summarize_job_brief(job: Dict[str, Any]) -> Dict[str, Any]:
         out["result"] = job["result_text"]
     if job.get("error"):
         out["error"] = job["error"]
+    if job.get("error_code"):
+        out["error_code"] = str(job["error_code"])
+    if job.get("team_id"):
+        out["team_id"] = str(job["team_id"])
+    if job.get("agent_origin"):
+        out["agent_origin"] = str(job["agent_origin"])
+    if job.get("trust_level"):
+        out["trust_level"] = str(job["trust_level"])
+    if job.get("tainted"):
+        out["tainted"] = True
+    if job.get("untrusted"):
+        out["untrusted"] = True
+    if job.get("readonly"):
+        out["readonly"] = True
+    if job.get("max_runtime_mode"):
+        out["max_runtime_mode"] = str(job["max_runtime_mode"])
+    if "retryable" in job:
+        out["retryable"] = bool(job.get("retryable", True))
+    if job.get("batch_budget_usd") is not None:
+        out["batch_budget_usd"] = float(job["batch_budget_usd"])
     if job.get("artifacts"):
         out["artifacts"] = list(job["artifacts"])
     if job.get("usage"):

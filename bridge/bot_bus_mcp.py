@@ -41,6 +41,7 @@ COORDINATOR_INSTRUCTIONS = (
     "  * Developer worker: code implementation, refactoring, local deploy/sync, Git commits, tags, and releases.\n"
     "  * Tester worker: unit/security/regression verification, post-release checks, and collecting/summarizing post-release GitHub Issues, PRs, CI status, and external feedback.\n"
     "- `team_dispatch` defaults to `wait=false` (non-blocking async with automatic `batch_done` wake-up). Keep `wait=false` for normal dev, release, test, and collection tasks so you stay immediately idle for new user instructions; on `batch_done`, verify results and asynchronously chain the next stage (e.g., Dev -> Test/Feedback) or report to the user. Pass `wait=true` only for tiny <15s read-only checks.\n"
+    "- Permission `mode` guidance: for trusted workers performing dev or read-only QA tasks that need `run_command` (e.g. `unittest`, `ruff`, `verify_gate.py`), omit `mode` or use `mode=\"auto\"`; reserve `mode=\"safe\"` strictly for restricted/untrusted tasks that do not require shell command execution (headless `mode=\"safe\"` omits `--dangerously-skip-permissions` and aborts if `run_command` requires interactive approval).\n"
     "- Keep workdirs/files partitioned, or pass `worktree: true` on `team_dispatch` when multiple workers need to edit the same Git repository concurrently in isolated worktrees/branches; after verification/merge, call `team_job(action=\"cleanup_worktree\", job_id=...)` to clean up.\n"
     "- Inspect, cancel, retry, or clean up worktrees for background worker jobs via `team_job`; send plain status notices via `team_broadcast`."
 )
@@ -60,17 +61,26 @@ _COORDINATOR_TOOLS: FrozenSet[str] = frozenset(
 _WORKER_TOOLS: FrozenSet[str] = frozenset({"team_roster", "group_say"})
 
 
+_VALID_BUS_ROLES: FrozenSet[str] = frozenset({"coordinator", "peer", "worker"})
+
+
 def _bus_enabled() -> bool:
-    return os.environ.get("AGY_BOT_BUS_ENABLE", "").strip() == "1"
+    if os.environ.get("AGY_BOT_BUS_ENABLE", "").strip() != "1":
+        return False
+    if os.environ.get("AGY_RBAC_ROLE", "").strip().lower() == "readonly":
+        return False
+    if not _my_handle():
+        return False
+    return True
 
 
 def _bus_role() -> str:
     if not _bus_enabled():
         return "disabled"
     raw = os.environ.get("AGY_BOT_BUS_ROLE", "").strip().lower()
-    if raw in ("coordinator", "peer", "worker"):
+    if raw in _VALID_BUS_ROLES:
         return raw
-    return "coordinator"
+    return "disabled"
 
 
 def _allowed_tool_names() -> FrozenSet[str]:
@@ -198,7 +208,10 @@ def _tool_schemas() -> List[Dict[str, Any]]:
                                 "workdir": {"type": "string"},
                                 "model": {"type": "string"},
                                 "effort": {"type": "string"},
-                                "mode": {"type": "string"},
+                                "mode": {
+                                    "type": "string",
+                                    "description": "Optional permission mode (auto|safe). Omit or use 'auto' for trusted workers that run commands (e.g. unittest/ruff/verify_gate.py); use 'safe' only for restricted/untrusted tasks that do not need run_command.",
+                                },
                                 "thread_key": {"type": "string"},
                                 "worktree": {"type": "boolean"},
                             },
@@ -210,7 +223,16 @@ def _tool_schemas() -> List[Dict[str, Any]]:
                     "workdir": {"type": "string", "description": "Optional workspace path override."},
                     "model": {"type": "string", "description": "Optional model slug override."},
                     "effort": {"type": "string", "description": "Optional effort override (low|medium|high|xhigh|max)."},
-                    "mode": {"type": "string", "description": "Optional permission mode (auto|safe)."},
+                    "mode": {
+                        "type": "string",
+                        "description": (
+                            "Optional permission mode (auto|safe). For trusted workers running commands "
+                            "(e.g. unittest/ruff/verify_gate.py) in read-only QA or dev tasks, omit `mode` "
+                            "or use `mode=\"auto\"`; only use `mode=\"safe\"` for restricted/untrusted tasks "
+                            "that do not require `run_command` (headless `mode=\"safe\"` omits "
+                            "`--dangerously-skip-permissions` and aborts if a command awaits interactive approval)."
+                        ),
+                    },
                     "thread_key": {
                         "type": "string",
                         "description": "Optional persistent worker thread key to resume multi-turn state across dispatches.",
@@ -302,13 +324,82 @@ def _handle_team_roster(args: Dict[str, Any]) -> Dict[str, Any]:
     })
 
 
+def _session_security_env() -> Dict[str, Any]:
+    env_team_id = os.environ.get("AGY_BOT_TEAM_ID", "").strip()
+    env_trust_level = os.environ.get("AGY_TRUST_LEVEL", "").strip()
+    env_agent_origin = os.environ.get("AGY_AGENT_ORIGIN", "").strip().lower()
+    env_untrusted = (
+        os.environ.get("AGY_UNTRUSTED_SESSION", "").strip() == "1"
+        or os.environ.get("AGY_MEMORY_READONLY", "").strip() == "1"
+        or env_agent_origin.startswith("remote")
+    )
+    env_readonly = os.environ.get("AGY_RBAC_ROLE", "").strip().lower() == "readonly"
+    env_max_mode = os.environ.get("AGY_MAX_RUNTIME_MODE", "").strip().lower()
+    if env_readonly or env_untrusted:
+        env_max_mode = "safe"
+    return {
+        "team_id": env_team_id,
+        "trust_level": env_trust_level,
+        "agent_origin": env_agent_origin,
+        "untrusted": env_untrusted,
+        "readonly": env_readonly,
+        "max_runtime_mode": env_max_mode,
+    }
+
+
+def _enforce_bound_dispatch_fields(
+    entry: Dict[str, Any],
+    *,
+    env_team_id: str,
+    env_agent_origin: str,
+) -> None:
+    raw_tid = str(entry.get("team_id") or "").strip()
+    if env_team_id:
+        if raw_tid and raw_tid != env_team_id:
+            raise PermissionError(
+                f"PRIVILEGE_ESCALATION_DENIED: team_id override rejected ({raw_tid!r} != {env_team_id!r})"
+            )
+        entry["team_id"] = env_team_id
+    raw_origin = str(entry.get("agent_origin") or "").strip().lower()
+    if env_agent_origin.startswith("remote"):
+        if raw_origin and not raw_origin.startswith("remote"):
+            raise PermissionError(
+                f"PRIVILEGE_ESCALATION_DENIED: cannot override remote agent_origin {env_agent_origin!r} with {raw_origin!r}"
+            )
+        entry["agent_origin"] = raw_origin or env_agent_origin
+
+
 def _build_assignment_list(args: Dict[str, Any]) -> List[Dict[str, Any]]:
+    env_team_id = os.environ.get("AGY_BOT_TEAM_ID", "").strip()
+    env_agent_origin = os.environ.get("AGY_AGENT_ORIGIN", "").strip().lower()
     raw_items = args.get("assignments")
     shared_defaults = {
         k: args[k]
-        for k in ("label", "project", "workdir", "model", "effort", "mode", "thread_key", "worktree")
+        for k in (
+            "label",
+            "project",
+            "workdir",
+            "model",
+            "effort",
+            "mode",
+            "thread_key",
+            "worktree",
+            "worktree_strict",
+            "retryable",
+            "team_id",
+            "trust_level",
+            "agent_origin",
+            "readonly",
+            "untrusted",
+            "max_runtime_mode",
+        )
         if args.get(k) not in (None, "")
     }
+    _enforce_bound_dispatch_fields(
+        shared_defaults,
+        env_team_id=env_team_id,
+        env_agent_origin=env_agent_origin,
+    )
     if isinstance(raw_items, list) and raw_items:
         out = []
         for item in raw_items:
@@ -316,6 +407,11 @@ def _build_assignment_list(args: Dict[str, Any]) -> List[Dict[str, Any]]:
                 raise ValueError("Each entry in `assignments` must be an object")
             merged = dict(shared_defaults)
             merged.update({k: v for k, v in item.items() if v not in (None, "")})
+            _enforce_bound_dispatch_fields(
+                merged,
+                env_team_id=env_team_id,
+                env_agent_origin=env_agent_origin,
+            )
             out.append(merged)
         return out
 
@@ -330,6 +426,11 @@ def _build_assignment_list(args: Dict[str, Any]) -> List[Dict[str, Any]]:
         entry = dict(shared_defaults)
         entry["bot"] = t
         entry["prompt"] = prompt
+        _enforce_bound_dispatch_fields(
+            entry,
+            env_team_id=env_team_id,
+            env_agent_origin=env_agent_origin,
+        )
         out.append(entry)
     return out
 
@@ -339,6 +440,24 @@ def _handle_team_dispatch(args: Dict[str, Any]) -> Dict[str, Any]:
     if not me:
         return _tool_text("AGY_BOT_HANDLE missing in session environment.", is_error=True)
 
+    sec = _session_security_env()
+    env_team_id = sec["team_id"]
+    env_trust_level = sec["trust_level"]
+    env_agent_origin = sec["agent_origin"]
+    env_untrusted = sec["untrusted"]
+    env_readonly = sec["readonly"]
+
+    req_team_id = str(args.get("team_id") or "").strip()
+    if env_team_id and req_team_id and req_team_id != env_team_id:
+        raise PermissionError(
+            f"PRIVILEGE_ESCALATION_DENIED: team_id override rejected ({req_team_id!r} != {env_team_id!r})"
+        )
+    req_origin = str(args.get("agent_origin") or "").strip().lower()
+    if env_agent_origin.startswith("remote") and req_origin and not req_origin.startswith("remote"):
+        raise PermissionError(
+            f"PRIVILEGE_ESCALATION_DENIED: cannot override remote agent_origin {env_agent_origin!r} with {req_origin!r}"
+        )
+
     assignments = _build_assignment_list(args)
     wait = bool(args.get("wait", False))
     timeout_sec = max(10.0, min(1500.0, float(args.get("timeout_sec", 600) or 600)))
@@ -347,6 +466,9 @@ def _handle_team_dispatch(args: Dict[str, Any]) -> Dict[str, Any]:
         notify_group = bool(args.get("notify_group"))
     else:
         notify_group = int(origin["origin_chat_id"] or 0) < 0
+
+    eff_team_id = env_team_id or req_team_id
+    eff_origin = req_origin or env_agent_origin
 
     created = bot_bus.dispatch_assignments(
         me,
@@ -358,6 +480,15 @@ def _handle_team_dispatch(args: Dict[str, Any]) -> Dict[str, Any]:
         parent_chain=origin["parent_chain"],
         default_notify_group=notify_group,
         wake_on_async=not wait,
+        team_id=eff_team_id,
+        agent_origin=eff_origin,
+        parent_trust_level=env_trust_level,
+        parent_agent_origin=env_agent_origin,
+        parent_untrusted=env_untrusted,
+        parent_tainted=env_untrusted,
+        parent_readonly=env_readonly,
+        parent_max_runtime_mode=sec["max_runtime_mode"],
+        batch_budget_usd=args.get("batch_budget_usd"),
     )
     job_ids = [j["job_id"] for j in created["jobs"]]
 
@@ -413,7 +544,21 @@ def _handle_team_job(args: Dict[str, Any]) -> Dict[str, Any]:
         return _tool_text({"cancelled": bot_bus.summarize_job_brief(job)})
 
     if action == "retry":
-        job = bot_bus.retry_job(jid, requester_bot=me, prompt_override=str(args.get("prompt_override") or ""))
+        sec = _session_security_env()
+        if sec["readonly"]:
+            raise PermissionError("PRIVILEGE_ESCALATION_DENIED: readonly session cannot retry jobs")
+        job = bot_bus.retry_job(
+            jid,
+            requester_bot=me,
+            prompt_override=str(args.get("prompt_override") or ""),
+            caller_team_id=sec["team_id"],
+            caller_agent_origin=sec["agent_origin"],
+            caller_trust_level=sec["trust_level"],
+            caller_readonly=sec["readonly"],
+            caller_untrusted=sec["untrusted"],
+            caller_tainted=sec["untrusted"],
+            caller_max_runtime_mode=sec["max_runtime_mode"],
+        )
         return _tool_text({"retried": bot_bus.summarize_job_brief(job)})
 
     if action == "cleanup_worktree":
@@ -529,7 +674,8 @@ def _handle_request(req: Dict[str, Any]) -> None:
     if method == "tools/call":
         if req_id is None:
             return
-        if not _bus_enabled():
+        role = _bus_role()
+        if not _bus_enabled() or role == "disabled":
             _reply_ok(
                 req_id,
                 _tool_text("`acb-team` is disabled on this session.", is_error=True),
@@ -539,7 +685,7 @@ def _handle_request(req: Dict[str, Any]) -> None:
         if tname not in _allowed_tool_names():
             _reply_ok(
                 req_id,
-                _tool_text(f"Tool `{tname}` is not permitted for role `{_bus_role()}`.", is_error=True),
+                _tool_text(f"Tool `{tname}` is not permitted for role `{role}`.", is_error=True),
             )
             return
         args = params.get("arguments") or {}

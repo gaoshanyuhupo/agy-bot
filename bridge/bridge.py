@@ -14,7 +14,6 @@ Key Real-Time Architecture:
     and auto-push referenced/generated images via `sendPhoto`
 - Persistent warm `--input-format stream-json --output-format stream-json` process pool
 """
-import collections
 import datetime
 import fcntl
 import hashlib
@@ -23,7 +22,6 @@ import json
 import math
 import os
 import py_compile
-import queue
 import random
 import re
 import shlex
@@ -4621,13 +4619,15 @@ def run_agy(
             _sc_prof_w.pop("profile_reinject_needed", None)
 
     prompt_taint = memory_guard.inspect_text(effective_prompt)
+    remote_markers_hit = [m for m in bot_bus.REMOTE_UNTRUSTED_MARKERS if m in effective_prompt]
     conv_already_tainted = bool(conv and memory_guard.is_tainted(conv, taint_file=MEMORY_TAINT_FILE))
-    turn_untrusted = session_readonly or conv_already_tainted or prompt_taint["untrusted"]
+    turn_untrusted = session_readonly or conv_already_tainted or prompt_taint["untrusted"] or bool(remote_markers_hit)
     if session_readonly:
         taint_reason = "readonly_guest"
         taint_source = "bridge:readonly"
-    elif prompt_taint["untrusted"]:
-        taint_reason = ",".join(prompt_taint["reasons"][:4]) or "untrusted_prompt"
+    elif prompt_taint["untrusted"] or remote_markers_hit:
+        reasons = list(prompt_taint.get("reasons") or []) + [f"marker:{m}" for m in remote_markers_hit if f"marker:{m}" not in (prompt_taint.get("reasons") or [])]
+        taint_reason = ",".join(reasons[:4]) or "untrusted_prompt"
         taint_source = "bridge:prompt"
     elif conv_already_tainted:
         taint_reason = "sticky_tainted_conv"
@@ -6911,6 +6911,90 @@ def _summarize_conv_usage(cid, started_ts, skip_steps=0):
     return out
 
 
+def _extract_tool_step_error(su):
+    """Extract a concise diagnostic string from a tool `step_update` error or hook denial."""
+    if not isinstance(su, dict) or su.get("step_type") != "tool":
+        return ""
+    tname = str(su.get("tool_name") or "tool").strip() or "tool"
+    state = str(su.get("state") or "").strip().upper()
+    tinfo = su.get("tool_info") if isinstance(su.get("tool_info"), dict) else {}
+
+    candidates = []
+    for container in (tinfo, su):
+        if not isinstance(container, dict):
+            continue
+        err_obj = container.get("error")
+        if isinstance(err_obj, dict):
+            for k in ("message", "reason", "detail"):
+                if err_obj.get(k):
+                    candidates.append(str(err_obj.get(k)).strip())
+        elif isinstance(err_obj, str) and err_obj.strip():
+            candidates.append(err_obj.strip())
+        for k in ("denial_reason", "denied_reason", "error_message"):
+            if container.get(k):
+                candidates.append(str(container.get(k)).strip())
+
+    if not candidates and state in ("ERROR", "DENIED", "FAILED"):
+        for container in (tinfo, su):
+            if not isinstance(container, dict):
+                continue
+            for k in ("reason", "message", "output"):
+                val = container.get(k)
+                if isinstance(val, str) and val.strip():
+                    candidates.append(val.strip())
+                    break
+        if not candidates:
+            candidates.append(f"state={state}")
+
+    for msg in candidates:
+        if msg:
+            snippet = msg[:240]
+            if snippet.lower().startswith(f"{tname.lower()}:"):
+                return snippet
+            return f"{tname}: {snippet}"
+    return ""
+
+
+def _summarize_denied_actions(denied_actions):
+    """Build a short diagnostic summary from `result_ev['denied_actions']`."""
+    if not isinstance(denied_actions, list) or not denied_actions:
+        return ""
+    parts = []
+    for item in denied_actions[:5]:
+        if isinstance(item, dict):
+            act = str(item.get("action") or item.get("tool_name") or item.get("tool") or "action").strip()
+            rsn = str(item.get("reason") or item.get("error") or item.get("message") or "").strip()
+            parts.append(f"{act} ({rsn[:120]})" if rsn else act)
+        elif item:
+            parts.append(str(item).strip()[:120])
+    if not parts:
+        return ""
+    suffix = f" (+{len(denied_actions) - 5} more)" if len(denied_actions) > 5 else ""
+    return ", ".join(parts) + suffix
+
+
+def _format_headless_bus_failure_diag(kind, exec_mode, denied_actions, finished_reason, last_tool_error):
+    """Format a readable diagnostic error message for headless Bus WAITING or empty-SUCCESS exits."""
+    if kind == "WAITING":
+        parts = [
+            f"headless Bus job entered WAITING state (non-interactive; cannot approve tool prompt; exec_mode={exec_mode})"
+        ]
+    else:
+        parts = [f"headless Bus job exited with status=SUCCESS but empty response (exec_mode={exec_mode})"]
+    denied_summary = _summarize_denied_actions(denied_actions)
+    if denied_summary:
+        parts.append(f"denied_actions=[{denied_summary}]")
+    if finished_reason:
+        parts.append(f"finished_reason={finished_reason}")
+    if last_tool_error:
+        parts.append(f"last_tool_error={last_tool_error}")
+    if str(exec_mode or "").strip().lower() == "safe":
+        parts.append(
+            "mode=safe omits --dangerously-skip-permissions so headless run_command aborts waiting for interactive approval"
+        )
+    return "; ".join(parts)
+
+
 def _execute_bus_job(job_id, *, claimed_turn_gen=None, claimed_qid=None):
     global turn_running, turn_running_scope, turn_running_chat, turn_running_qid, cancel_requested, _active_bus_job_id
     my_handle = _current_bot_handle()
@@ -7024,21 +7108,34 @@ def _execute_bus_job(job_id, *, claimed_turn_gen=None, claimed_qid=None):
     final_status = "error"
     final_text = ""
     err_msg = ""
+    err_code = "AGENT_EXEC_ERROR"
     new_cid = resume_cid
     artifacts = []
     usage = {}
+    job_tainted = bool(job.get("tainted", False)) or bool(job.get("untrusted", False)) or bool(job.get("readonly", False))
 
     try:
-        if job.get("worktree") and exec_workdir and os.path.isdir(exec_workdir):
-            try:
-                wt_info = bot_bus.prepare_job_worktree(exec_workdir, job_id)
-                bot_bus.update_job(job_id, worktree_info=wt_info)
-                if wt_info.get("active") and wt_info.get("path") and os.path.isdir(wt_info["path"]):
-                    exec_workdir = wt_info["path"]
-            except Exception as wte:
-                log("Bus job %s worktree prepare failed: %r" % (job_id, wte))
-                wt_info = {"enabled": True, "active": False, "pruned": False, "reason": repr(wte)}
-                bot_bus.update_job(job_id, worktree_info=wt_info)
+        # C5: Strict worktree isolation (fail-closed by default when worktree=True)
+        wt_enabled = bool(job.get("worktree", False))
+        wt_strict = bool(job.get("worktree_strict", True)) if wt_enabled else False
+        if wt_enabled:
+            if exec_workdir and os.path.isdir(exec_workdir):
+                try:
+                    wt_info = bot_bus.prepare_job_worktree(exec_workdir, job_id)
+                except Exception as wte:
+                    log("Bus job %s worktree prepare failed: %r" % (job_id, wte))
+                    wt_info = {"enabled": True, "active": False, "pruned": False, "reason": repr(wte)}
+            else:
+                wt_info = {"enabled": True, "active": False, "pruned": False, "reason": "workdir_missing"}
+            bot_bus.update_job(job_id, worktree_info=wt_info)
+            if wt_info.get("active") and wt_info.get("path") and os.path.isdir(wt_info["path"]):
+                exec_workdir = wt_info["path"]
+            elif wt_strict:
+                final_status = "error"
+                err_code = "WORKTREE_PREPARE_FAILED"
+                err_msg = f"WORKTREE_PREPARE_FAILED: {wt_info.get('reason') or 'prepare_failed'}"
+                log("Bus job %s aborted fail-closed: %s" % (job_id, err_msg))
+                return
 
         before_files = snapshot_workspace_files(workdir=exec_workdir)
         before_outbox = snapshot_workspace_files(workdir=BOT_OUTBOX_DIR) if os.path.isdir(BOT_OUTBOX_DIR) else {}
@@ -7061,37 +7158,67 @@ def _execute_bus_job(job_id, *, claimed_turn_gen=None, claimed_qid=None):
             except Exception:
                 pass
 
+        # C2: Inspect prompt & job metadata for taint / monotonic privilege attenuation
+        job_readonly = bool(job.get("readonly", False))
+        job_team_id = agent_driver.validate_team_id(job.get("team_id") or "")
+        job_origin = str(job.get("agent_origin") or "local_bus").strip().lower() or "local_bus"
+        is_remote_origin = job_origin.startswith("remote")
+        raw_job_trust = str(job.get("trust_level") or "").strip()
+        default_job_trust = (
+            "readonly_guest"
+            if job_readonly
+            else ("remote_untrusted" if (job_tainted or is_remote_origin) else "local_worker")
+        )
+        job_trust = agent_driver.normalize_trust_level(raw_job_trust, default=default_job_trust)
+        if is_remote_origin:
+            job_trust = agent_driver.min_trust_level(job_trust, "remote_untrusted")
+        if job_readonly:
+            job_trust = "readonly_guest"
+        if job_trust == "readonly_guest":
+            job_readonly = True
+
+        prompt_scan = memory_guard.inspect_text(full_prompt)
+        has_remote_marker = any(m in full_prompt for m in bot_bus.REMOTE_UNTRUSTED_MARKERS)
+        conv_tainted = bool(resume_cid and memory_guard.is_tainted(resume_cid, taint_file=MEMORY_TAINT_FILE))
+        if (
+            is_remote_origin
+            or prompt_scan.get("untrusted")
+            or has_remote_marker
+            or conv_tainted
+            or agent_driver.TRUST_ORDER.get(job_trust, 0) <= agent_driver.TRUST_ORDER["remote_untrusted"]
+        ):
+            job_tainted = True
+
+        job_untrusted = bool(job_tainted or job_readonly)
+        job_max_mode = str(job.get("max_runtime_mode") or "").strip().lower()
+        if job_untrusted:
+            job_trust = agent_driver.min_trust_level(
+                job_trust,
+                "readonly_guest" if job_readonly else "remote_untrusted",
+            )
+            exec_mode = "safe"
+            job_max_mode = "safe"
+            if "[AGY_MEMORY_READONLY=1]" not in full_prompt:
+                full_prompt = memory_guard.build_untrusted_memory_boundary() + "\n\n" + full_prompt
+            if resume_cid:
+                memory_guard.mark_tainted(
+                    resume_cid,
+                    reason=",".join(prompt_scan.get("reasons", [])[:4]) or "bus_job_tainted",
+                    source=f"bus_job:{job_id}",
+                    taint_file=MEMORY_TAINT_FILE,
+                )
+        elif job_max_mode:
+            exec_mode = agent_driver.min_runtime_mode(exec_mode, job_max_mode, default=exec_mode)
+
         exec_plan = _resolve_exec_target(exec_model, exec_effort)
-        cli_model = exec_plan["cli_model"]
-        cli_effort = exec_plan["cli_effort"]
-
-        cmd = [
-            AGY_BIN,
-            "--input-format", "text",
-            "--output-format", "stream-json",
-            "--print-timeout", PRINT_TIMEOUT,
-        ]
-        if exec_mode == "auto":
-            cmd.append("--dangerously-skip-permissions")
-        if cli_model:
-            cmd += ["--model", cli_model]
-        if cli_effort:
-            cmd += ["--effort", cli_effort]
-        if exec_project and not (wt_info and wt_info.get("active")):
-            cmd += ["--project", exec_project]
-        if resume_cid:
-            cmd += ["--conversation", resume_cid]
-        cmd += ["-p", full_prompt]
-
-        env = dict(os.environ)
-        _apply_exec_env(env, exec_plan)
-        _apply_agy_auto_update_env(env)
-        env["PATH"] = os.path.join(HOME, ".local/bin") + ":" + env.get("PATH", "")
-        env.setdefault("HOME", HOME)
-        env["AGY_OUTBOX_DIR"] = BOT_OUTBOX_DIR
         _bus_eff_role = _current_bot_role()
-        _inject_bot_isolation_env(env, handle=my_handle, role=_bus_eff_role)
-        if mirror_chat and int(mirror_chat) < 0:
+        if job_readonly or job_untrusted:
+            worker_skey = f"bus:{job_id}"
+            eff_bus_enable = False
+            eff_bus_role = _bus_eff_role
+            eff_chat_id = 0
+            eff_thread_id = None
+        elif mirror_chat and int(mirror_chat) < 0:
             worker_skey = scope_key_for(mirror_chat, mirror_thread)
             bot_bus.set_origin_context(
                 worker_skey,
@@ -7102,18 +7229,16 @@ def _execute_bus_job(job_id, *, claimed_turn_gen=None, claimed_qid=None):
                 mention_hop=0,
                 chain_id=str(job.get("chain_id") or ""),
             )
-            env["AGY_BOT_BUS_ENABLE"] = "1"
-            if _bus_eff_role != "coordinator":
-                env["AGY_BOT_BUS_ROLE"] = "worker"
-            env["AGY_BOT_CHAT_ID"] = str(mirror_chat)
-            env["AGY_BOT_THREAD_ID"] = str(mirror_thread) if mirror_thread is not None else ""
-            env["AGY_BOT_SCOPE_KEY"] = worker_skey
-            env["AGY_BOT_ORIGIN_MSG_ID"] = str(origin_msg_id or 0)
-            env["AGY_BOT_MENTION_HOP"] = "0"
+            eff_bus_enable = True
+            eff_bus_role = "coordinator" if _bus_eff_role == "coordinator" else "worker"
+            eff_chat_id = int(mirror_chat)
+            eff_thread_id = mirror_thread
         else:
-            env["AGY_BOT_BUS_ENABLE"] = "0"
-        env["AGY_BOT_HANDLE"] = my_handle
-        env["AGY_BOT_CHAIN"] = ",".join(job.get("chain") or [])
+            worker_skey = f"bus:{job_id}"
+            eff_bus_enable = False
+            eff_bus_role = _bus_eff_role
+            eff_chat_id = 0
+            eff_thread_id = None
 
         with session_lock:
             turn_running = True
@@ -7136,129 +7261,144 @@ def _execute_bus_job(job_id, *, claimed_turn_gen=None, claimed_qid=None):
             log("Bus job %s cancelled before Popen (reason=%s)" % (job_id, aborted_reason))
             final_status = "cancelled"
             err_msg = aborted_reason
+            err_code = "CANCELLED_LOCAL" if aborted_reason == "cancelled_local" else "CANCELLED_BY_COORDINATOR"
             usage = _summarize_conv_usage(new_cid, started_ts, skip_steps=skip_steps)
             return
 
         log("Starting Bus job %s (from=@%s, model=%s, cwd=%s, conv=%s)" % (
             job_id, from_bot, exec_model or "default", exec_workdir, (resume_cid or "new")[:8]
         ))
-        proc = subprocess.Popen(
-            cmd,
-            cwd=exec_workdir,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            env=env,
-            start_new_session=True,
-        )
-        ev_q = queue.Queue()
-        stderr_tail = collections.deque(maxlen=60)
 
-        def _read_out():
-            try:
-                for line in proc.stdout:
-                    s = line.strip()
-                    if not s:
-                        continue
-                    try:
-                        ev_q.put(json.loads(s))
-                    except Exception:
-                        pass
-            finally:
-                ev_q.put({"event": "__eof__"})
-
-        def _read_err():
-            try:
-                for line in proc.stderr:
-                    stderr_tail.append(line)
-            except Exception:
-                pass
-
-        threading.Thread(target=_read_out, daemon=True).start()
-        threading.Thread(target=_read_err, daemon=True).start()
-
-        step_buffers = {}
-        turn_tool_texts = []
         last_prog_ts = 0.0
-        result_ev = None
-        aborted_reason = ""
+        last_tool_error = ""
 
-        while True:
-            if shutting_down or cancel_requested or bot_bus.is_job_cancelled(job_id):
-                aborted_reason = "shutdown" if shutting_down else ("cancelled_local" if cancel_requested else "cancelled_by_coordinator")
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-                break
-            try:
-                ev = ev_q.get(timeout=0.25)
-            except queue.Empty:
-                continue
+        def _bus_cancel_check():
+            if shutting_down:
+                return "shutdown"
+            if cancel_requested:
+                return "cancelled_local"
+            if bot_bus.is_job_cancelled(job_id):
+                return "cancelled_by_coordinator"
+            return None
 
+        def _on_bus_event(ev):
+            nonlocal new_cid, last_prog_ts, last_tool_error
             kind = ev.get("event")
-            if kind == "__eof__":
-                break
             if kind == "init":
                 cid = ev.get("conversation_id")
                 if cid:
                     new_cid = cid
                     bot_profiles.register_cid_owner(str(cid), my_handle, bus_dir=bot_bus.BUS_DIR)
-                continue
-            if kind == "step_update":
+                    if job_tainted:
+                        memory_guard.mark_tainted(
+                            str(cid),
+                            reason="bus_job_tainted",
+                            source=f"bus_job:{job_id}",
+                            taint_file=MEMORY_TAINT_FILE,
+                        )
+            elif kind == "step_update":
                 su = ev.get("step_update") or {}
-                st = su.get("step_type")
-                skind = su.get("state")
-                sidx = su.get("step_index", 0)
-                if st == "tool":
+                if su.get("step_type") == "tool":
                     tname = su.get("tool_name") or ""
-                    tinfo = su.get("tool_info")
-                    if tname or tinfo:
-                        try:
-                            turn_tool_texts.append(tname + " " + json.dumps(tinfo or {}, ensure_ascii=False)[:3000])
-                        except Exception:
-                            pass
-                    if skind == "ACTIVE" and (time.time() - last_prog_ts) >= 1.5:
+                    if su.get("state") == "ACTIVE" and (time.time() - last_prog_ts) >= 1.5:
                         last_prog_ts = time.time()
                         bot_bus.update_job(job_id, progress=f"running tool: {tname}")
+                    tool_err = _extract_tool_step_error(su)
+                    if tool_err:
+                        last_tool_error = tool_err
                     bus_empty_deny = _detect_empty_pretool_hook_denial(ev)
                     if bus_empty_deny is not None:
+                        if not tool_err:
+                            d_tname = str(bus_empty_deny.get("tool_name") or tname or "tool")
+                            d_msg = str(bus_empty_deny.get("message") or "PreToolUse hook denied")[:240]
+                            last_tool_error = f"{d_tname}: {d_msg}"
                         log(
                             "ALERT: Bus job %s detected empty-reason PreToolUse hook denial on tool=%s (agy=%s); "
                             "never auto-mutating hooks.json"
                             % (job_id, bus_empty_deny.get("tool_name"), _get_agy_cli_version_cached())
                         )
-                elif st == "agent_response":
-                    delta = su.get("text_delta") or ""
-                    if delta:
-                        step_buffers[sidx] = step_buffers.get(sidx, "") + delta
-            elif kind == "result":
-                result_ev = ev.get("result") or ev
-                break
 
-        try:
-            proc.wait(timeout=5)
-        except Exception:
-            pass
+        run_res = agent_driver.run_one_shot_session(
+            full_prompt,
+            mode=exec_mode,
+            model=exec_model,
+            effort=exec_effort,
+            project=exec_project,
+            workdir=exec_workdir,
+            scope_key=worker_skey,
+            resume_cid=resume_cid,
+            readonly=job_readonly,
+            untrusted=job_untrusted,
+            is_worktree=bool(wt_info and wt_info.get("active")),
+            trust_level=job_trust,
+            team_id=job_team_id,
+            agent_origin=job_origin,
+            max_runtime_mode=job_max_mode or None,
+            bus_role=eff_bus_role,
+            bus_enable=eff_bus_enable,
+            origin_msg_id=origin_msg_id,
+            bot_chain=job.get("chain") or [],
+            mention_hop=0,
+            bot_handle=my_handle,
+            chat_id=eff_chat_id,
+            thread_id=eff_thread_id,
+            exec_plan=exec_plan,
+            cancel_check=_bus_cancel_check,
+            on_event=_on_bus_event,
+            timeout_sec=float(job.get("max_runtime_sec") or 0.0) or None,
+            host=sys.modules[__name__],
+        )
+        proc = run_res["proc"]
+        result_ev = run_res["result_ev"]
+        step_buffers = run_res["step_buffers"]
+        stderr_tail = run_res["stderr_tail"]
+        aborted_reason = run_res["aborted_reason"]
+        timed_out = bool(run_res.get("timed_out"))
+        if run_res.get("new_cid"):
+            new_cid = run_res["new_cid"]
 
-        if aborted_reason:
+        if timed_out:
+            final_status = "error"
+            err_msg = "timeout"
+            err_code = "TIMEOUT"
+        elif aborted_reason:
             final_status = "cancelled"
             err_msg = aborted_reason
+            err_code = "CANCELLED_LOCAL" if aborted_reason == "cancelled_local" else "CANCELLED_BY_COORDINATOR"
         elif result_ev is not None:
             new_cid = result_ev.get("conversation_id") or new_cid
+            if new_cid and job_tainted:
+                memory_guard.mark_tainted(
+                    str(new_cid),
+                    reason="bus_job_tainted",
+                    source=f"bus_job:{job_id}",
+                    taint_file=MEMORY_TAINT_FILE,
+                )
             st = result_ev.get("status")
             resp = (result_ev.get("response") or "").strip()
             if not resp and step_buffers:
                 resp = _latest_step_buffer_text(step_buffers)
-            if st == "SUCCESS":
-                final_status = "done"
-                final_text = resp or "(completed with empty text)"
+            denied_actions = result_ev.get("denied_actions") or []
+            finished_reason = str(result_ev.get("finished_reason") or "").strip()
+            if st == "WAITING":
+                final_status = "error"
+                err_code = "AGENT_EXEC_ERROR"
+                err_msg = _format_headless_bus_failure_diag(
+                    "WAITING", exec_mode, denied_actions, finished_reason, last_tool_error
+                )
+                final_text = resp
+            elif st == "SUCCESS":
+                if resp:
+                    final_status = "done"
+                    err_code = "OK"
+                    final_text = resp
+                else:
+                    final_status = "error"
+                    err_code = "AGENT_EXEC_ERROR"
+                    err_msg = _format_headless_bus_failure_diag(
+                        "EMPTY_SUCCESS", exec_mode, denied_actions, finished_reason, last_tool_error
+                    )
+                    final_text = ""
             else:
                 raw_err = str(result_ev.get("error") or resp or f"status={st}")
                 rc = proc.returncode if proc else -1
@@ -7285,15 +7425,18 @@ def _execute_bus_job(job_id, *, claimed_turn_gen=None, claimed_qid=None):
                     ))
                     final_status = "done"
                     err_msg = ""
+                    err_code = "OK"
                     final_text = sanitized_text
                 else:
                     final_status = "error"
                     err_msg = raw_err
+                    err_code = "AGENT_EXEC_ERROR"
                     final_text = resp
         else:
             rc = proc.returncode if proc else -1
             err_msg = f"agy exited ({rc}): {''.join(stderr_tail)[-600:]}"
             final_status = "error"
+            err_code = "AGENT_EXEC_ERROR"
 
         if new_cid and thread_key:
             bot_bus.thread_set(from_bot, my_handle, thread_key, new_cid)
@@ -7312,10 +7455,23 @@ def _execute_bus_job(job_id, *, claimed_turn_gen=None, claimed_qid=None):
         artifacts.sort()
         usage = _summarize_conv_usage(new_cid, started_ts, skip_steps=skip_steps)
 
+    except agent_driver.UnknownDriverError as ude:
+        log("Bus job %s unknown driver: %r" % (job_id, ude))
+        final_status = "error"
+        err_msg = repr(ude)
+        err_code = "UNKNOWN_DRIVER"
+        usage = _summarize_conv_usage(new_cid, started_ts, skip_steps=skip_steps)
+    except OSError as ose:
+        log("Bus job %s spawn/OS error: %r" % (job_id, ose))
+        final_status = "error"
+        err_msg = repr(ose)
+        err_code = "DRIVER_SPAWN_FAILED"
+        usage = _summarize_conv_usage(new_cid, started_ts, skip_steps=skip_steps)
     except Exception as e:
         log("Bus job %s exception: %r" % (job_id, e))
         final_status = "error"
         err_msg = repr(e)
+        err_code = "AGENT_EXEC_ERROR"
         usage = _summarize_conv_usage(new_cid, started_ts, skip_steps=skip_steps)
     finally:
         with session_lock:
@@ -7427,6 +7583,8 @@ def _execute_bus_job(job_id, *, claimed_turn_gen=None, claimed_qid=None):
             status=final_status,
             result_text=final_text,
             error=err_msg,
+            error_code=err_code,
+            tainted=True if job_tainted else None,
             worker_cid=new_cid or "",
             artifacts=artifacts,
             usage=usage,
@@ -7879,6 +8037,54 @@ def _handle_live_browser_takeover_event(pkt):
     return True
 
 
+_pending_batch_wakeup_lock = threading.Lock()
+_pending_batch_wakeup_acks = {}  # group_id -> list[str] of job_ids awaiting worker execution ACK
+_BATCH_WAKEUP_MEM_BOUNDARY_BODY = "\n".join(memory_guard.build_untrusted_memory_boundary().splitlines()[1:])
+_BATCH_WAKEUP_HEADER_RE = re.compile(
+    r"\A\s*"
+    r"(?:\[REMOTE_AGENT_UNTRUSTED\s+source=batch_done\s+group=[^\s\]]+\]\s*)?"
+    r"(?:\[AGY_MEMORY_READONLY=1\](?:\n(?:"
+    + re.escape(_BATCH_WAKEUP_MEM_BOUNDARY_BODY)
+    + r"))?\s*)?"
+    r"\[ACB_TEAM_ASYNC_DONE\s+group=([^\s\]]+)(?:\s+jobs=([^\]]+))?\]"
+)
+
+
+def _extract_batch_wakeup_job_ids(prompt):
+    """Extract pending `batch_done` job IDs from a queued wake prompt (supports restart recovery)."""
+    if not isinstance(prompt, str) or "[ACB_TEAM_ASYNC_DONE " not in prompt:
+        return []
+    m = _BATCH_WAKEUP_HEADER_RE.match(prompt)
+    if not m:
+        return []
+    gid = (m.group(1) or "").strip()
+    raw_jobs = (m.group(2) or "").strip()
+    jids = []
+    if gid:
+        with _pending_batch_wakeup_lock:
+            cached = _pending_batch_wakeup_acks.pop(gid, None)
+        if isinstance(cached, list):
+            jids.extend(cached)
+    if raw_jobs:
+        for tok in raw_jobs.split(","):
+            clean = tok.strip()
+            if clean and clean not in jids:
+                jids.append(clean)
+    return jids
+
+
+def _ack_batch_wakeup_from_prompt(prompt):
+    """Mark `batch_done` jobs ACKed when `worker()` actually dequeues and starts the wake turn."""
+    jids = _extract_batch_wakeup_job_ids(prompt)
+    if not jids:
+        return 0
+    try:
+        return bot_bus.mark_batch_wakeup_acked(jids)
+    except Exception as ack_err:
+        log("mark_batch_wakeup_acked failed in worker: %r" % ack_err)
+        return 0
+
+
 def _handle_bot_bus_packet(pkt):
     """Dispatch a single Bot Bus inbox packet."""
     ptype = pkt.get("type")
@@ -8071,9 +8277,26 @@ def _handle_bot_bus_packet(pkt):
         c_id = int(pkt.get("origin_chat_id") or PRIMARY_CHAT_ID or 0)
         t_id = _normalize_thread_id(pkt.get("origin_thread_id"))
         skey = pkt.get("origin_scope_key") or scope_key_for(c_id, t_id)
-        jids = pkt.get("job_ids") or []
+        jids = [str(x).strip() for x in (pkt.get("job_ids") or []) if str(x).strip()]
+        gid = str(pkt.get("group_id") or "unknown").strip() or "unknown"
         if not bot_bus.loop_guard_allow(skey):
-            log("BotLoopGuard blocked automated async wake for %s" % skey)
+            log("BotLoopGuard blocked automated async wake for %s (group=%s, jobs=%s)" % (skey, gid, jids))
+            try:
+                bot_bus.mark_batch_wakeup_acked(jids)
+            except Exception as ack_err:
+                log("mark_batch_wakeup_acked failed on loop_guard block: %r" % ack_err)
+            if c_id:
+                jlist = ", ".join(jids) if jids else "(none)"
+                notice = (
+                    "⚠️ 异步子任务批次已完工，但自动唤醒触发防循环限流（BotLoopGuard），已跳过自动续跑。\n"
+                    f"• group_id: {gid}\n"
+                    f"• job_ids: {jlist}\n"
+                    "请手动查看结果或发送下一步指令继续。"
+                )
+                try:
+                    tg_send_in_route("sendMessage", c_id, thread_id=t_id, text=notice)
+                except Exception as tg_err:
+                    log("BotLoopGuard fallback notice failed: %r" % tg_err)
             return
         jobs = [bot_bus.get_job(jid) for jid in jids if bot_bus.get_job(jid)]
         briefs = [bot_bus.summarize_job_brief(j) for j in jobs]
@@ -8087,15 +8310,36 @@ def _handle_bot_bus_packet(pkt):
         else:
             delivery_note = "- 注意：`group_delivered=false`，Worker 未在群内直接交付结果，请由你汇总关键结论给用户；\n"
         if c_id:
+            batch_tainted = bool(pkt.get("tainted")) or any(
+                bool(j.get("tainted") or j.get("untrusted")) for j in jobs
+            )
+            taint_prefix = (
+                f"[REMOTE_AGENT_UNTRUSTED source=batch_done group={gid}]\n"
+                f"{memory_guard.build_untrusted_memory_boundary()}\n\n"
+                if batch_tainted
+                else ""
+            )
+            jobs_attr = f" jobs={','.join(jids)}" if jids else ""
             wake_prompt = (
-                f"[ACB_TEAM_ASYNC_DONE group={pkt.get('group_id')}]\n"
+                f"{taint_prefix}"
+                f"[ACB_TEAM_ASYNC_DONE group={gid}{jobs_attr}]\n"
                 f"你此前异步分派的团队子任务已全部落定。请验收以下结果：\n"
                 f"{delivery_note}"
                 f"- 如后续仍需接力下一步（例如开发/发版完成后，异步派发测试进行验证或采集发版后 Issue/PR/CI 反馈），"
                 f"请直接用 `team_dispatch`（默认 `wait=false`）异步派发并向用户简报当前进展后立即结束本轮；\n"
                 f"- 如全流程已闭环，请向用户简洁汇报最终结论；请勿再次重复派发完全相同的已完成任务：\n\n{brief_json}"
             )
+            if jids:
+                with _pending_batch_wakeup_lock:
+                    if len(_pending_batch_wakeup_acks) >= 256:
+                        _pending_batch_wakeup_acks.pop(next(iter(_pending_batch_wakeup_acks)), None)
+                    _pending_batch_wakeup_acks[gid] = list(jids)
             job_q.put((c_id, t_id, skey, wake_prompt))
+        elif jids:
+            try:
+                bot_bus.mark_batch_wakeup_acked(jids)
+            except Exception as ack_err:
+                log("mark_batch_wakeup_acked failed for unroutable batch_done: %r" % ack_err)
     elif ptype == "live_browser_takeover_event":
         _handle_live_browser_takeover_event(pkt)
 
@@ -8104,6 +8348,9 @@ def _bot_bus_loop():
     """Poll Bot Bus inbox packets (job, broadcast, scheduled_handoff, async batch_done) & publish heartbeats."""
     last_hb = 0.0
     last_id_retry = 0.0
+    last_reap = 0.0
+    last_unacked_replay = 0.0
+    startup_replay_checked = False
     while not shutting_down:
         now = time.time()
         if not BOT_META.get("resolved") and (now - last_id_retry) >= 20.0:
@@ -8121,13 +8368,56 @@ def _bot_bus_loop():
                 and now >= _cmd_reg_next_retry_ts
             ):
                 register_bot_commands()
+        if (now - last_reap) >= 30.0:
+            last_reap = now
+            try:
+                reaped = bot_bus.reap_zombie_jobs(now=now)
+                if reaped:
+                    log("Reaped zombie Bot Bus job(s): %s" % ", ".join(reaped))
+            except Exception as re_err:
+                log("reap_zombie_jobs error: %r" % re_err)
 
+        my_handle = _current_bot_handle()
+        packets = []
         try:
-            packets = bot_bus.pop_inbox_packets(_current_bot_handle())
+            packets = bot_bus.pop_inbox_packets(my_handle)
             for pkt in packets:
                 _handle_bot_bus_packet(pkt)
         except Exception as e:
             log("bot_bus_loop error: %r" % e)
+
+        if my_handle and not packets:
+            try:
+                with session_lock:
+                    is_busy = turn_running
+                if not is_busy and job_q.is_idle():
+                    if not startup_replay_checked:
+                        with _pending_batch_wakeup_lock:
+                            pending_gids = tuple(_pending_batch_wakeup_acks.keys())
+                        replayed = bot_bus.requeue_unacked_batch_done(
+                            my_handle,
+                            now=now,
+                            min_age_sec=2.0,
+                            exclude_group_ids=pending_gids,
+                        )
+                        startup_replay_checked = True
+                        last_unacked_replay = now
+                        if replayed:
+                            log("Startup replayed unacked batch_done group(s): %s" % ", ".join(replayed))
+                    elif (now - last_unacked_replay) >= 60.0:
+                        with _pending_batch_wakeup_lock:
+                            pending_gids = tuple(_pending_batch_wakeup_acks.keys())
+                        replayed = bot_bus.requeue_unacked_batch_done(
+                            my_handle,
+                            now=now,
+                            min_age_sec=90.0,
+                            exclude_group_ids=pending_gids,
+                        )
+                        last_unacked_replay = now
+                        if replayed:
+                            log("Replayed unacked batch_done group(s): %s" % ", ".join(replayed))
+            except Exception as rep_err:
+                log("requeue_unacked_batch_done error: %r" % rep_err)
         time.sleep(0.35)
 
 
@@ -8350,6 +8640,8 @@ def worker():
                     claimed_qid=qid,
                 )
             else:
+                if isinstance(prompt, str):
+                    _ack_batch_wakeup_from_prompt(prompt)
                 run_agy(
                     chat_id,
                     prompt,

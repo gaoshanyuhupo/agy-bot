@@ -87,6 +87,15 @@ CORPUS_TOOLS: frozenset[str] = frozenset(
         "reprime_corpus",
     }
 )
+MUTATING_CORPUS_TOOLS: frozenset[str] = frozenset(
+    {
+        "build_corpus",
+        "prime_corpus",
+        "rebuild_corpus",
+        "reprime_corpus",
+    }
+)
+ALL_WRITE_TOOLS: frozenset[str] = SCOPED_WRITE_TOOLS | MUTATING_CORPUS_TOOLS
 ALL_KNOWN_TOOLS: frozenset[str] = (
     SCOPED_READ_TOOLS
     | SCOPED_WRITE_TOOLS
@@ -362,6 +371,21 @@ def evaluate_mcp_tool_call(
         }
 
     expected_project = f"bot-{handle}"
+
+    # Highest-priority readonly/untrusted write gate (applies equally to Worker AND Coordinator)
+    is_readonly_or_tainted = (
+        str(eff_env.get("AGY_MEMORY_READONLY") or "").strip() == "1"
+        or str(eff_env.get("AGY_UNTRUSTED_SESSION") or "").strip() == "1"
+        or str(eff_env.get("AGY_RBAC_ROLE") or "").strip().lower() == "readonly"
+    )
+    if is_readonly_or_tainted and (tname in ALL_WRITE_TOOLS or tname not in ALL_KNOWN_TOOLS):
+        return {
+            "action": "short_circuit",
+            "result": _tool_result(
+                f"[claude-mem-proxy] MEMORY_READONLY_BLOCKED: tool '{tname}' is forbidden in readonly/untrusted session (role={role}).",
+                is_error=True,
+            ),
+        }
 
     # Coordinator: full read visibility across all bots & shared projects; default writes to own project
     if is_coordinator:

@@ -226,7 +226,7 @@ _ALLOWED_WORKTREE_CLEANUP_IPC_KEYS = frozenset({
     "project_id",
     "force",
 })
-_IPC_INVISIBLE_FORMAT_RE = re.compile(r"[\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]")
+_IPC_INVISIBLE_FORMAT_RE = re.compile(r"[\u00ad\u034f\u061c\u180e\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufe00-\ufe0f\ufeff]")
 _IPC_FULLWIDTH_TAG_TRANS = str.maketrans(
     {
         "\uff3b": "[",  # ［
@@ -242,7 +242,7 @@ _IPC_FULLWIDTH_TAG_TRANS = str.maketrans(
     }
 )
 _IPC_FORGED_TAG_RE = re.compile(
-    r"\[(?=\s*/?\s*(?:ACB_|REPO_WATCH_|BENCHMARK_|UNTRUSTED_|SILENT\b|NO_HANDOFF_|AGY_MEMORY_READONLY))",
+    r"\[(?=\s*/?\s*(?:ACB_TEAM_|ACB_|REPO_WATCH_|BENCHMARK_|UNTRUSTED_|SILENT\b|NO_HANDOFF_|AGY_MEMORY_READONLY|REMOTE_AGENT_UNTRUSTED|REMOTE_HUB_MESSAGE|REMOTE_AGENT_PAYLOAD|REMOTE_HANDOFF|TEAM_HUB_|MCP_))",
     re.IGNORECASE,
 )
 _IPC_ROOM_ENVELOPE_HEADER_RE = re.compile(r"^\[UNTRUSTED_WEB_ROOM_MESSAGE [^\[\]\r\n]+\]$")
@@ -1753,6 +1753,16 @@ class _StudioIPCHandler(http.server.BaseHTTPRequestHandler):
                 return
             # Defense-in-depth neutralization of forged control tags on Bridge side
             safe_prompt = _neutralize_room_ipc_prompt(prompt)
+            raw_team_id = str(body.get("team_id") or "").strip()
+            if raw_team_id and (
+                "." in raw_team_id
+                or "/" in raw_team_id
+                or "\\" in raw_team_id
+                or "\x00" in raw_team_id
+                or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{1,63}", raw_team_id)
+            ):
+                self._send_json(400, {"ok": False, "error": "非法的 team_id 格式"})
+                return
             req_room = {
                 "user_id": uid,
                 "actor_username": str(body.get("actor_username") or "")[:64],
@@ -1763,6 +1773,11 @@ class _StudioIPCHandler(http.server.BaseHTTPRequestHandler):
                 "project": str(body.get("project") or "").strip()[:128] or None,
                 "priority": room_priority,
                 "interrupt_current": raw_room_ic,
+                "trust_level": str(body.get("trust_level") or "").strip()[:32] or None,
+                "readonly": bool(body.get("readonly", False)),
+                "untrusted": bool(body.get("untrusted", False)),
+                "team_id": raw_team_id,
+                "agent_origin": str(body.get("agent_origin") or "").strip()[:64],
             }
             try:
                 status_code, resp_payload = self.ipc.room_turn_fn(req_room)

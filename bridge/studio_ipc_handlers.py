@@ -2213,6 +2213,11 @@ def _studio_ipc_room_turn(req):
         "chain_id": str(req.get("chain_id") or ""),
         "hop": int(req.get("hop") or 0),
         "project": req.get("project"),
+        "trust_level": req.get("trust_level"),
+        "readonly": bool(req.get("readonly", False)),
+        "untrusted": bool(req.get("untrusted", False)),
+        "team_id": str(req.get("team_id") or ""),
+        "agent_origin": str(req.get("agent_origin") or ""),
         "done_ev": done_ev,
         "result_box": result_box,
     }
@@ -2253,6 +2258,47 @@ def _studio_ipc_room_turn(req):
     }
 
 
+def _resolve_room_turn_effective_role(room_req, host=None):
+    """Compute monotonically downgraded `(user_role, team_id, trust_level)` for `_execute_room_turn`."""
+    bb = _mod("bot_bus", _default_bot_bus, host=host)
+    team_id = bb.validate_team_id(room_req.get("team_id") or "")
+    raw_trust = room_req.get("trust_level")
+    raw_origin = str(room_req.get("agent_origin") or "").strip().lower()
+    req_readonly = bool(room_req.get("readonly", False))
+    req_untrusted = bool(room_req.get("untrusted", False))
+    prompt_str = str(room_req.get("prompt") or "")
+
+    has_remote_marker = any(m in prompt_str for m in bb.REMOTE_UNTRUSTED_MARKERS)
+    is_remote_origin = bool(raw_origin and raw_origin.startswith("remote"))
+
+    # Default trust for local Studio IPC room turns (already authenticated as admin at IPC boundary)
+    if raw_trust is None or str(raw_trust).strip() == "":
+        eff_trust = "readonly_guest" if req_readonly else ("remote_untrusted" if (req_untrusted or is_remote_origin or has_remote_marker) else "local_admin")
+    else:
+        eff_trust = bb._normalize_trust_level(raw_trust, default="readonly_guest")
+
+    if req_readonly:
+        eff_trust = "readonly_guest"
+    elif req_untrusted or is_remote_origin or has_remote_marker:
+        eff_trust = bb._min_trust_level(eff_trust, "remote_untrusted")
+
+    # Monotonic downgrade: any remote, untrusted, or non-local_admin/local_worker source downgrades to readonly
+    trust_rank = bb.TRUST_ORDER.get(eff_trust, 0)
+    if (
+        req_readonly
+        or req_untrusted
+        or is_remote_origin
+        or has_remote_marker
+        or trust_rank < bb.TRUST_ORDER["local_worker"]
+    ):
+        eff_role = "readonly"
+    else:
+        req_role = str(room_req.get("user_role") or "").strip().lower()
+        eff_role = "readonly" if req_role == "readonly" else "admin"
+
+    return eff_role, team_id, eff_trust
+
+
 def _execute_room_turn(room_req, *, claimed_turn_gen=None, claimed_qid=None):
     h = _h()
     turn_id = room_req["turn_id"]
@@ -2289,12 +2335,13 @@ def _execute_room_turn(room_req, *, claimed_turn_gen=None, claimed_qid=None):
             final_resp["error"] = str(data.get("error") or ev_type)
 
     try:
+        eff_role, _team_id, _eff_trust = _resolve_room_turn_effective_role(room_req, host=h)
         h.run_agy(
             0,
             room_req["prompt"],
             thread_id=None,
             scope_key=scope_key,
-            user_role="admin",
+            user_role=eff_role,
             user_id=uid,
             event_sink=_room_sink,
             web_turn_id=turn_id,

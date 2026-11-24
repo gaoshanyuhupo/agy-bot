@@ -46,11 +46,12 @@ import dataclasses
 import json
 import os
 import queue
+import re
 import signal
 import subprocess
 import threading
 import time
-from typing import Any, Dict, FrozenSet, List, Optional, Sequence
+from typing import Any, Callable, Dict, FrozenSet, List, Optional, Sequence
 
 _host = None
 
@@ -299,25 +300,116 @@ def _kill_process_tree(root_pid, term_timeout=2.0, proc_root="/proc", proc=None,
 # ---------------------------------------------------------------- Driver Capabilities & Security Boundary
 SIGNAL_TERMINATION_EXIT_CODES = frozenset({-15, 143, -2, 130})
 
+TRUST_ORDER: Dict[str, int] = {
+    "local_admin": 4,
+    "local_worker": 3,
+    "remote_trusted": 2,
+    "remote_untrusted": 1,
+    "readonly_guest": 0,
+}
+_TRUST_BY_RANK: Dict[int, str] = {rank: name for name, rank in TRUST_ORDER.items()}
+
+TEAM_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,63}$")
+
 _READONLY_FORBIDDEN_CLI_FLAGS = frozenset(
     {
         "--dangerously-skip-permissions",
         "--allow-dangerously-skip-permissions",
         "--dangerously-bypass-approvals-and-sandbox",
+        "--dangerously-allow-all",
         "--yolo",
         "-y",
         "--full-auto",
         "--auto-approve",
+        "--accept-edits",
+    }
+)
+
+_READONLY_FORBIDDEN_APPROVAL_VALS = frozenset(
+    {
+        "yolo",
+        "never",
+        "auto_edit",
+        "auto-edit",
+        "full-auto",
+        "auto",
+        "bypass",
+        "on-failure",
+        "always",
+    }
+)
+
+_READONLY_ALLOWED_SANDBOX_VALS = frozenset({"read-only", "readonly"})
+_READONLY_ALLOWED_PERMISSION_MODES = frozenset({"plan", "default", "readonly"})
+_READONLY_ALLOWED_TOOLS = frozenset(
+    {
+        "read",
+        "glob",
+        "grep",
+        "ls",
+        "read_file",
+        "list_dir",
+        "find_by_name",
+        "grep_search",
+        "view_file",
+        "view_file_outline",
+        "view_code_item",
     }
 )
 
 _READONLY_FORBIDDEN_CLI_KV_FLAGS: Dict[str, FrozenSet[str]] = {
-    "--approval-mode": frozenset({"yolo", "never", "auto_edit", "auto-edit", "full-auto"}),
-    "--permission-mode": frozenset({"bypasspermissions", "dontask", "acceptedits"}),
-    "--ask-for-approval": frozenset({"never"}),
-    "-a": frozenset({"never"}),
-    "--sandbox": frozenset({"danger-full-access"}),
+    "--approval-mode": _READONLY_FORBIDDEN_APPROVAL_VALS,
+    "--permission-mode": frozenset({"bypasspermissions", "dontask", "acceptedits", "auto", "yolo", "fullauto"}),
+    "--ask-for-approval": _READONLY_FORBIDDEN_APPROVAL_VALS,
+    "-a": _READONLY_FORBIDDEN_APPROVAL_VALS,
+    "--sandbox": frozenset({"danger-full-access", "workspace-write"}),
+    "-s": frozenset({"danger-full-access", "workspace-write"}),
 }
+
+
+def validate_team_id(team_id: Any) -> str:
+    """Strictly validate `team_id` (`""` or `^[a-z0-9][a-z0-9_-]{1,63}$`, no traversal chars)."""
+    if team_id is None or team_id == "":
+        return ""
+    if not isinstance(team_id, str):
+        raise ValueError(f"Invalid team_id type: {type(team_id).__name__}")
+    if "." in team_id or "/" in team_id or "\\" in team_id or "\x00" in team_id:
+        raise ValueError(f"Unsafe team_id value: {team_id!r}")
+    if not TEAM_ID_RE.fullmatch(team_id):
+        raise ValueError(f"Invalid team_id format: {team_id!r} (expected ^[a-z0-9][a-z0-9_-]{{1,63}}$)")
+    return team_id
+
+
+def normalize_trust_level(level: Any, *, default: str = "remote_untrusted") -> str:
+    """Normalize a trust level against `TRUST_ORDER` (fail-closed to `readonly_guest` on unknown explicit value)."""
+    if level is None:
+        return default
+    raw = str(level).strip().lower()
+    if not raw:
+        return default
+    if raw in TRUST_ORDER:
+        return raw
+    return "readonly_guest"
+
+
+def min_trust_level(a: Any, b: Any, *, default: str = "remote_untrusted") -> str:
+    """Return the monotonically lower trust level between `a` and `b` according to `TRUST_ORDER`."""
+    na = normalize_trust_level(a, default=default)
+    nb = normalize_trust_level(b, default=default)
+    return _TRUST_BY_RANK[min(TRUST_ORDER[na], TRUST_ORDER[nb])]
+
+
+def min_runtime_mode(a: Optional[str], b: Optional[str], *, default: str = "safe") -> str:
+    """Return the monotonically stricter runtime mode (`safe` < `auto`)."""
+    present: List[str] = []
+    for raw in (a, b):
+        s = str(raw or "").strip().lower()
+        if not s:
+            continue
+        present.append("auto" if s == "auto" else "safe")
+    if not present:
+        return default
+    return "safe" if "safe" in present else "auto"
 
 
 class UnknownDriverError(ValueError):
@@ -357,6 +449,9 @@ class SessionSecurityContext:
     bus_role: str
     rbac_role: str
     allow_skip_permissions: bool
+    trust_level: str = "local_admin"
+    team_id: str = ""
+    agent_origin: str = "local_bus"
 
 
 def build_session_security_context(
@@ -367,20 +462,48 @@ def build_session_security_context(
     untrusted: bool = False,
     bus_role: Optional[str] = None,
     bus_enable: Optional[bool] = None,
+    trust_level: Optional[str] = None,
+    team_id: str = "",
+    agent_origin: str = "local_bus",
+    max_runtime_mode: Optional[str] = None,
     host=None,
 ) -> SessionSecurityContext:
     """Compute canonical fail-closed security context shared by every Agent Driver.
 
     Invariants (never overridable by driver subclasses):
-    - `readonly=True` ALWAYS forces `effective_mode="safe"`, `allow_skip_permissions=False`,
-      `bus_enable=False`, `rbac_role="readonly"`, and `untrusted=True`.
-    - `untrusted=True` ALWAYS marks the session untrusted so observer/readonly memory env vars
-      are injected.
+    - `readonly=True` or `trust_level="readonly_guest"` ALWAYS forces `effective_mode="safe"`,
+      `allow_skip_permissions=False`, `bus_enable=False`, `rbac_role="readonly"`, and `untrusted=True`.
+    - `untrusted=True`, `trust_level <= "remote_untrusted"`, or `agent_origin.startswith("remote")`
+      ALWAYS forces `trust_level <= "remote_untrusted"`, `untrusted=True`, `effective_mode="safe"`,
+      `allow_skip_permissions=False`, and injects observer/readonly memory env vars.
+    - `team_id` is strictly validated against `TEAM_ID_RE` (raises `ValueError` on invalid/traversal input).
     """
+    clean_team_id = validate_team_id(team_id)
+    clean_origin = str(agent_origin or "local_bus").strip().lower() or "local_bus"
+    is_remote_origin = clean_origin.startswith("remote")
+
     ro = bool(readonly)
-    untr = bool(untrusted) or ro
-    eff_mode = "safe" if ro else mode
-    allow_skip = (eff_mode == "auto") and (not ro)
+    untr = bool(untrusted) or ro or is_remote_origin
+
+    default_trust = "readonly_guest" if ro else ("remote_untrusted" if untr else "local_admin")
+    eff_trust = normalize_trust_level(trust_level, default=default_trust)
+    if ro:
+        eff_trust = min_trust_level(eff_trust, "readonly_guest")
+    if untr or is_remote_origin:
+        eff_trust = min_trust_level(eff_trust, "remote_untrusted")
+    if eff_trust == "readonly_guest":
+        ro = True
+        untr = True
+    if TRUST_ORDER[eff_trust] <= TRUST_ORDER["remote_untrusted"]:
+        untr = True
+
+    if ro or untr:
+        eff_mode = "safe"
+    elif max_runtime_mode:
+        eff_mode = min_runtime_mode(mode, max_runtime_mode, default="safe")
+    else:
+        eff_mode = mode if mode is not None else "safe"
+    allow_skip = (eff_mode == "auto") and (not ro) and (not untr)
 
     if bus_role is not None:
         eff_bus_role = str(bus_role)
@@ -404,39 +527,160 @@ def build_session_security_context(
         bus_role=eff_bus_role,
         rbac_role="readonly" if ro else "admin",
         allow_skip_permissions=allow_skip,
+        trust_level=eff_trust,
+        team_id=clean_team_id,
+        agent_origin=clean_origin,
     )
 
 
+def _check_readonly_config_kv(raw_kv: str, display_tok: str) -> None:
+    """Validate `-c` / `--config` key=value settings against readonly/untrusted security policy."""
+    s = str(raw_kv or "").strip()
+    if "=" not in s:
+        raise ValueError(f"Forbidden config CLI flag in readonly/untrusted session: {display_tok!r}")
+    k_raw, v_raw = s.split("=", 1)
+    key = k_raw.strip().lower().replace("-", "_")
+    val = v_raw.strip().strip("'\"").strip().lower()
+    if key in ("sandbox_mode", "sandbox"):
+        if val not in _READONLY_ALLOWED_SANDBOX_VALS:
+            raise ValueError(f"Forbidden sandbox config in readonly/untrusted session: {display_tok!r}")
+    elif key in ("approval_policy", "approval_mode", "ask_for_approval"):
+        if val in _READONLY_FORBIDDEN_APPROVAL_VALS or not val:
+            raise ValueError(f"Forbidden approval config in readonly/untrusted session: {display_tok!r}")
+    elif key in ("permission_mode",):
+        norm_pm = val.replace("-", "").replace("_", "")
+        if norm_pm not in _READONLY_ALLOWED_PERMISSION_MODES:
+            raise ValueError(f"Forbidden permission_mode config in readonly/untrusted session: {display_tok!r}")
+    elif key in (
+        "dangerously_skip_permissions",
+        "allow_dangerously_skip_permissions",
+        "dangerously_bypass_approvals_and_sandbox",
+        "full_auto",
+        "yolo",
+        "auto_approve",
+    ):
+        if val not in ("false", "0", "no", "off"):
+            raise ValueError(f"Forbidden bypass config in readonly/untrusted session: {display_tok!r}")
+    elif key in ("allowed_tools", "allowedtools", "tools"):
+        _check_readonly_allowed_tools(val, display_tok)
+
+
+def _check_readonly_allowed_tools(raw_tools: str, display_tok: str) -> None:
+    """Reject any non-readonly/mutating/shell tool in `--allowedTools` / `--tools`."""
+    tokens = [t.strip() for t in re.split(r"[,\s]+", str(raw_tools or "").strip()) if t.strip()]
+    if not tokens:
+        raise ValueError(f"Forbidden empty tool allowlist flag in readonly/untrusted session: {display_tok!r}")
+    for item in tokens:
+        base = item.split("(", 1)[0].strip().lower()
+        if base not in _READONLY_ALLOWED_TOOLS:
+            raise ValueError(
+                f"Forbidden mutating/exec tool {item!r} in readonly/untrusted session: {display_tok!r}"
+            )
+
+
 def enforce_readonly_cli_args(cmd: Sequence[str], sec_ctx: SessionSecurityContext) -> List[str]:
-    """Fail-closed guard ensuring readonly sessions NEVER receive auto-approval CLI flags."""
+    """Fail-closed guard ensuring readonly/untrusted sessions NEVER receive bypass or write-enabling CLI flags."""
     args = list(cmd)
-    if not sec_ctx.readonly:
+    if not (sec_ctx.readonly or sec_ctx.untrusted or not sec_ctx.allow_skip_permissions):
         return args
     n = len(args)
-    for i, tok in enumerate(args):
+    i = 0
+    while i < n:
+        tok = args[i]
         low = str(tok or "").strip().lower()
         if not low:
+            i += 1
             continue
+        # Do not inspect the free-text prompt payload following `-p` / `--prompt`
+        if low in ("-p", "--prompt"):
+            i += 2
+            continue
+        if low.startswith("-p=") or low.startswith("--prompt="):
+            i += 1
+            continue
+
         if low in _READONLY_FORBIDDEN_CLI_FLAGS:
-            raise ValueError(f"Forbidden permission-bypass CLI flag in readonly session: {tok!r}")
+            raise ValueError(f"Forbidden permission-bypass CLI flag in readonly/untrusted session: {tok!r}")
+
         flag, eq, val = low.partition("=")
         if eq:
             flag_s = flag.strip()
-            val_s = val.strip()
+            val_s = val.strip().strip("'\"")
             if flag_s in _READONLY_FORBIDDEN_CLI_FLAGS:
-                raise ValueError(f"Forbidden permission-bypass CLI flag in readonly session: {tok!r}")
-            forbidden_vals = _READONLY_FORBIDDEN_CLI_KV_FLAGS.get(flag_s)
-            if forbidden_vals is not None and val_s in forbidden_vals:
-                raise ValueError(f"Forbidden permission-bypass CLI flag in readonly session: {tok!r}")
-        else:
-            forbidden_vals = _READONLY_FORBIDDEN_CLI_KV_FLAGS.get(low)
-            if forbidden_vals is not None and i + 1 < n:
-                next_tok = args[i + 1]
-                next_low = str(next_tok or "").strip().lower()
-                if next_low in forbidden_vals:
-                    raise ValueError(
-                        f"Forbidden permission-bypass CLI flag in readonly session: {tok!r} {next_tok!r}"
-                    )
+                raise ValueError(f"Forbidden permission-bypass CLI flag in readonly/untrusted session: {tok!r}")
+            if flag_s in ("--sandbox", "-s"):
+                if val_s not in _READONLY_ALLOWED_SANDBOX_VALS:
+                    raise ValueError(f"Forbidden sandbox CLI flag in readonly/untrusted session: {tok!r}")
+            elif flag_s in ("--ask-for-approval", "-a", "--approval-mode"):
+                if val_s in _READONLY_FORBIDDEN_APPROVAL_VALS or not val_s:
+                    raise ValueError(f"Forbidden approval CLI flag in readonly/untrusted session: {tok!r}")
+            elif flag_s == "--permission-mode":
+                norm_pm = val_s.replace("-", "").replace("_", "")
+                if norm_pm not in _READONLY_ALLOWED_PERMISSION_MODES:
+                    raise ValueError(f"Forbidden permission-mode CLI flag in readonly/untrusted session: {tok!r}")
+            elif flag_s in ("--config", "-c"):
+                _check_readonly_config_kv(str(tok).split("=", 1)[1], str(tok))
+            elif flag_s.startswith("-c") and len(flag_s) > 2:
+                _check_readonly_config_kv(str(tok)[2:], str(tok))
+            elif flag_s in ("--allowedtools", "--allowed-tools", "--tools"):
+                _check_readonly_allowed_tools(val_s, str(tok))
+            i += 1
+            continue
+
+        # Two-token flags
+        if low in ("--sandbox", "-s"):
+            next_tok = args[i + 1] if i + 1 < n else ""
+            next_low = str(next_tok or "").strip().strip("'\"").lower()
+            if next_low not in _READONLY_ALLOWED_SANDBOX_VALS:
+                raise ValueError(
+                    f"Forbidden sandbox CLI flag in readonly/untrusted session: {tok!r} {next_tok!r}"
+                )
+            i += 2
+            continue
+        if low in ("--ask-for-approval", "-a", "--approval-mode"):
+            next_tok = args[i + 1] if i + 1 < n else ""
+            next_low = str(next_tok or "").strip().strip("'\"").lower()
+            if next_low in _READONLY_FORBIDDEN_APPROVAL_VALS or not next_low:
+                raise ValueError(
+                    f"Forbidden approval CLI flag in readonly/untrusted session: {tok!r} {next_tok!r}"
+                )
+            i += 2
+            continue
+        if low == "--permission-mode":
+            next_tok = args[i + 1] if i + 1 < n else ""
+            norm_pm = str(next_tok or "").strip().strip("'\"").lower().replace("-", "").replace("_", "")
+            if norm_pm not in _READONLY_ALLOWED_PERMISSION_MODES:
+                raise ValueError(
+                    f"Forbidden permission-mode CLI flag in readonly/untrusted session: {tok!r} {next_tok!r}"
+                )
+            i += 2
+            continue
+        if low in ("--config", "-c"):
+            next_tok = args[i + 1] if i + 1 < n else ""
+            _check_readonly_config_kv(str(next_tok or ""), f"{tok!r} {next_tok!r}")
+            i += 2
+            continue
+        if low in ("--allowedtools", "--allowed-tools", "--tools"):
+            next_tok = args[i + 1] if i + 1 < n else ""
+            _check_readonly_allowed_tools(str(next_tok or ""), f"{tok!r} {next_tok!r}")
+            i += 2
+            continue
+
+        # Attached short-flag forms: `-sworkspace-write`, `-anever`, `-capproval_policy=never`
+        if low.startswith("-s") and len(low) > 2:
+            attached = low[2:].lstrip("=").strip("'\"")
+            if attached not in _READONLY_ALLOWED_SANDBOX_VALS:
+                raise ValueError(f"Forbidden short sandbox CLI flag in readonly/untrusted session: {tok!r}")
+        elif low.startswith("-a") and len(low) > 2:
+            attached = low[2:].lstrip("=").strip("'\"")
+            if attached in _READONLY_FORBIDDEN_APPROVAL_VALS or not attached:
+                raise ValueError(f"Forbidden short approval CLI flag in readonly/untrusted session: {tok!r}")
+        elif low.startswith("-c") and len(low) > 2:
+            attached_raw = str(tok)[2:].lstrip("=")
+            if "=" in attached_raw:
+                _check_readonly_config_kv(attached_raw, str(tok))
+
+        i += 1
     return args
 
 
@@ -447,13 +691,20 @@ def build_base_session_env(
     base_env: Optional[Dict[str, str]] = None,
     exec_plan: Optional[Dict[str, Any]] = None,
     apply_agy_auto_update: bool = False,
+    origin_msg_id: int = 0,
+    bot_chain: Optional[Sequence[str]] = None,
+    mention_hop: int = 0,
+    bot_handle: Optional[str] = None,
+    chat_id: Optional[int] = None,
+    thread_id: Optional[int] = None,
     host=None,
 ) -> Dict[str, str]:
     """Build hardened child-process environment shared by all Agent Drivers.
 
     Security-critical variables (`AGY_CLI_DISABLE_AUTO_UPDATE`, bot isolation env,
-    `AGY_BOT_BUS_ENABLE`, `AGY_RBAC_ROLE`, and untrusted readonly-memory flags) are
-    applied AFTER `exec_plan` so gateway/model overrides can never weaken isolation.
+    `AGY_BOT_BUS_ENABLE`, `AGY_RBAC_ROLE`, `AGY_TRUST_LEVEL`, `AGY_BOT_TEAM_ID`,
+    `AGY_AGENT_ORIGIN`, and untrusted readonly-memory flags) are applied AFTER
+    `exec_plan` so gateway/model overrides can never weaken isolation.
     """
     env = dict(os.environ if base_env is None else base_env)
 
@@ -475,19 +726,25 @@ def build_base_session_env(
     if outbox:
         env["AGY_OUTBOX_DIR"] = str(outbox)
 
-    parse_sk = _host_attr("parse_scope_key", None, host=host)
-    if callable(parse_sk):
-        origin_chat, origin_tid = parse_sk(scope_key)
+    if chat_id is not None:
+        origin_chat, origin_tid = int(chat_id or 0), thread_id
     else:
-        origin_chat, origin_tid = 0, None
+        parse_sk = _host_attr("parse_scope_key", None, host=host)
+        if callable(parse_sk):
+            origin_chat, origin_tid = parse_sk(scope_key)
+        else:
+            origin_chat, origin_tid = 0, None
 
     env["AGY_BOT_BUS_ENABLE"] = "1" if sec_ctx.bus_enable else "0"
 
     inject_iso = _host_attr("_inject_bot_isolation_env", None, host=host)
     handle_fn = _host_attr("_current_bot_handle", None, host=host)
+    eff_handle = str(bot_handle) if bot_handle is not None else (handle_fn() if callable(handle_fn) else "")
     if callable(inject_iso):
-        bot_handle = handle_fn() if callable(handle_fn) else ""
-        inject_iso(env, handle=bot_handle, role=sec_ctx.bus_role)
+        inject_iso(env, handle=eff_handle, role=sec_ctx.bus_role)
+    elif eff_handle:
+        env["AGY_BOT_HANDLE"] = eff_handle
+        env["AGY_BOT_BUS_ROLE"] = sec_ctx.bus_role
 
     bot_inst_id = _host_attr("BOT_INSTANCE_ID", None, host=host)
     if bot_inst_id is not None:
@@ -495,8 +752,12 @@ def build_base_session_env(
     env["AGY_BOT_SCOPE_KEY"] = str(scope_key)
     env["AGY_BOT_CHAT_ID"] = str(origin_chat or 0)
     env["AGY_BOT_THREAD_ID"] = str(origin_tid) if origin_tid is not None else ""
-    env["AGY_BOT_CHAIN"] = ""
-    env["AGY_BOT_MENTION_HOP"] = "0"
+    env["AGY_BOT_ORIGIN_MSG_ID"] = str(int(origin_msg_id or 0))
+    env["AGY_BOT_CHAIN"] = ",".join(str(x) for x in (bot_chain or ()) if str(x).strip())
+    env["AGY_BOT_MENTION_HOP"] = str(max(0, int(mention_hop or 0)))
+    env["AGY_BOT_TEAM_ID"] = sec_ctx.team_id
+    env["AGY_AGENT_ORIGIN"] = sec_ctx.agent_origin
+    env["AGY_TRUST_LEVEL"] = sec_ctx.trust_level
     env["AGY_RBAC_ROLE"] = sec_ctx.rbac_role
 
     if sec_ctx.untrusted:
@@ -505,6 +766,265 @@ def build_base_session_env(
         env["AGY_MEMORY_READONLY"] = "1"
 
     return env
+
+
+def run_one_shot_session(
+    prompt: str,
+    *,
+    mode: Optional[str] = "safe",
+    model: Optional[str] = None,
+    effort: Optional[str] = None,
+    project: Optional[str] = None,
+    workdir: Optional[str] = None,
+    scope_key: str = "bus:oneshot",
+    resume_cid: str = "",
+    readonly: bool = False,
+    untrusted: bool = False,
+    is_worktree: bool = False,
+    trust_level: Optional[str] = None,
+    team_id: str = "",
+    agent_origin: str = "local_bus",
+    max_runtime_mode: Optional[str] = None,
+    bus_role: Optional[str] = None,
+    bus_enable: Optional[bool] = None,
+    origin_msg_id: int = 0,
+    bot_chain: Optional[Sequence[str]] = None,
+    mention_hop: int = 0,
+    bot_handle: Optional[str] = None,
+    chat_id: Optional[int] = None,
+    thread_id: Optional[int] = None,
+    exec_plan: Optional[Dict[str, Any]] = None,
+    cancel_check: Optional[Callable[[], Optional[str]]] = None,
+    on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
+    timeout_sec: Optional[float] = None,
+    term_timeout: float = 2.0,
+    driver: Optional[str] = None,
+    registry: Optional["DriverRegistry"] = None,
+    host=None,
+) -> Dict[str, Any]:
+    """Execute a hardened one-shot CLI turn through the shared driver security boundary.
+
+    Enforces:
+    - Unknown driver fail-closed validation via `DriverRegistry`.
+    - `SessionSecurityContext` monotonic downgrade (`readonly`/`untrusted` force `bus_enable=False`,
+      `effective_mode="safe"`, `allow_skip_permissions=False`, and isolation env vars).
+    - `enforce_readonly_cli_args(cmd, sec_ctx)` prior to spawn.
+    - `build_base_session_env(...)` with `AGY_CLI_DISABLE_AUTO_UPDATE`, bot isolation, and trust/team vars.
+    - PID-reuse-safe `_kill_process_tree(pid, ..., expected_root_starttime=...)` on cancel/timeout.
+    """
+    h = _resolve_host(host)
+    reg = registry if registry is not None else default_registry
+    reg.get_driver(driver)
+
+    eff_ro = bool(readonly)
+    eff_untr = bool(untrusted) or eff_ro
+    eff_bus_enable = False if (eff_ro or eff_untr) else bus_enable
+    eff_max_mode = "safe" if (eff_ro or eff_untr) else max_runtime_mode
+
+    sec_ctx = build_session_security_context(
+        mode,
+        scope_key=scope_key,
+        readonly=eff_ro,
+        untrusted=eff_untr,
+        bus_role=bus_role,
+        bus_enable=eff_bus_enable,
+        trust_level=trust_level,
+        team_id=team_id,
+        agent_origin=agent_origin,
+        max_runtime_mode=eff_max_mode,
+        host=h,
+    )
+
+    if exec_plan is None:
+        resolve_exec = getattr(h, "_resolve_exec_target", None) if h is not None else None
+        if callable(resolve_exec):
+            exec_plan = resolve_exec(model, effort)
+        else:
+            exec_plan = {
+                "kind": "native",
+                "cli_model": model,
+                "cli_effort": effort,
+                "env_set": {},
+                "gateway_id": None,
+                "upstream_model": None,
+                "effort": effort,
+                "signature": ("native", model or "", effort or ""),
+            }
+
+    cli_model = exec_plan.get("cli_model")
+    cli_effort = exec_plan.get("cli_effort")
+    agy_bin = _host_attr("AGY_BIN", os.path.join(os.path.expanduser("~"), ".local/bin/agy"), host=h)
+    print_timeout = _host_attr("PRINT_TIMEOUT", "30m", host=h)
+    exec_workdir = workdir or _host_attr("WORKDIR", os.getcwd(), host=h)
+
+    cmd: List[str] = [
+        agy_bin,
+        "--input-format", "text",
+        "--output-format", "stream-json",
+        "--print-timeout", print_timeout,
+    ]
+    if sec_ctx.allow_skip_permissions:
+        cmd.append("--dangerously-skip-permissions")
+    if cli_model:
+        cmd += ["--model", cli_model]
+    if cli_effort:
+        cmd += ["--effort", cli_effort]
+    if project and not is_worktree:
+        cmd += ["--project", project]
+    if resume_cid:
+        cmd += ["--conversation", resume_cid]
+    cmd += ["-p", prompt]
+    cmd = enforce_readonly_cli_args(cmd, sec_ctx)
+
+    env = build_base_session_env(
+        sec_ctx,
+        scope_key=scope_key,
+        exec_plan=exec_plan,
+        apply_agy_auto_update=True,
+        origin_msg_id=origin_msg_id,
+        bot_chain=bot_chain,
+        mention_hop=mention_hop,
+        bot_handle=bot_handle,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        host=h,
+    )
+
+    subproc_mod = getattr(h, "subprocess", subprocess) if h is not None else subprocess
+    thread_mod = getattr(h, "threading", threading) if h is not None else threading
+    read_st = getattr(h, "_read_proc_starttime", _read_proc_starttime) if h is not None else _read_proc_starttime
+    kill_tree = getattr(h, "_kill_process_tree", _kill_process_tree) if h is not None else _kill_process_tree
+
+    proc = subproc_mod.Popen(
+        cmd,
+        cwd=exec_workdir,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+        env=env,
+        start_new_session=True,
+    )
+    proc_pid = getattr(proc, "pid", None)
+    proc_starttime = read_st(proc_pid) if proc_pid is not None else None
+    ev_q: "queue.Queue[Dict[str, Any]]" = queue.Queue()
+    stderr_tail: "collections.deque[str]" = collections.deque(maxlen=60)
+
+    def _read_out() -> None:
+        stream = getattr(proc, "stdout", None)
+        try:
+            if stream is not None:
+                for line in stream:
+                    s = line.strip()
+                    if not s:
+                        continue
+                    try:
+                        ev_q.put(json.loads(s))
+                    except Exception:
+                        pass
+        finally:
+            ev_q.put({"event": "__eof__"})
+
+    def _read_err() -> None:
+        stream = getattr(proc, "stderr", None)
+        try:
+            if stream is not None:
+                for line in stream:
+                    stderr_tail.append(line)
+        except Exception:
+            pass
+
+    thread_mod.Thread(target=_read_out, daemon=True).start()
+    thread_mod.Thread(target=_read_err, daemon=True).start()
+
+    step_buffers: Dict[Any, str] = {}
+    turn_tool_texts: List[str] = []
+    result_ev: Optional[Dict[str, Any]] = None
+    aborted_reason = ""
+    timed_out = False
+    new_cid = resume_cid
+    deadline = (time.monotonic() + float(timeout_sec)) if timeout_sec and float(timeout_sec) > 0 else None
+
+    def _terminate_tree() -> None:
+        if proc_pid is not None:
+            kill_tree(
+                proc_pid,
+                term_timeout=term_timeout,
+                proc=proc,
+                expected_root_starttime=proc_starttime or "__unavailable__",
+            )
+
+    while True:
+        if cancel_check is not None:
+            c_reason = cancel_check()
+            if c_reason:
+                aborted_reason = str(c_reason)
+                _terminate_tree()
+                break
+        if deadline is not None and time.monotonic() >= deadline:
+            timed_out = True
+            aborted_reason = "timeout"
+            _terminate_tree()
+            break
+        try:
+            ev = ev_q.get(timeout=0.25)
+        except queue.Empty:
+            continue
+
+        kind = ev.get("event")
+        if kind == "__eof__":
+            break
+        if kind == "init":
+            cid = ev.get("conversation_id")
+            if cid:
+                new_cid = cid
+        elif kind == "step_update":
+            su = ev.get("step_update") or {}
+            st = su.get("step_type")
+            sidx = su.get("step_index", 0)
+            if st == "tool":
+                tname = su.get("tool_name") or ""
+                tinfo = su.get("tool_info")
+                if tname or tinfo:
+                    try:
+                        turn_tool_texts.append(tname + " " + json.dumps(tinfo or {}, ensure_ascii=False)[:3000])
+                    except Exception:
+                        pass
+            elif st == "agent_response":
+                delta = su.get("text_delta") or ""
+                if delta:
+                    step_buffers[sidx] = step_buffers.get(sidx, "") + delta
+        elif kind == "result":
+            result_ev = ev.get("result") or ev
+            if on_event is not None:
+                on_event(ev)
+            break
+
+        if on_event is not None:
+            on_event(ev)
+
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        pass
+
+    return {
+        "proc": proc,
+        "returncode": getattr(proc, "returncode", None),
+        "sec_ctx": sec_ctx,
+        "cmd": cmd,
+        "env": env,
+        "proc_starttime": proc_starttime,
+        "result_ev": result_ev,
+        "step_buffers": step_buffers,
+        "stderr_tail": stderr_tail,
+        "aborted_reason": aborted_reason,
+        "timed_out": timed_out,
+        "new_cid": new_cid,
+        "turn_tool_texts": turn_tool_texts,
+    }
 
 
 # ---------------------------------------------------------------- Abstract Session & Protocol Helpers
