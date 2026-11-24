@@ -233,7 +233,16 @@ class TestBotBusWorktreeIsolation(unittest.TestCase):
                 bot_bus.heartbeat_bot({"handle": h, "pid": os.getpid(), "role": role, "busy": False})
 
             # Schema & coordinator instructions checks
-            with mock.patch.dict(os.environ, {"AGY_BOT_BUS_ENABLE": "1", "AGY_BOT_BUS_ROLE": "coordinator"}, clear=False):
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "AGY_BOT_BUS_ENABLE": "1",
+                    "AGY_BOT_BUS_ROLE": "coordinator",
+                    "AGY_BOT_HANDLE": "bot_one",
+                    "AGY_RBAC_ROLE": "",
+                },
+                clear=False,
+            ):
                 schemas = {t["name"]: t for t in bot_bus_mcp._tool_schemas()}
             td_props = schemas["team_dispatch"]["inputSchema"]["properties"]
             self.assertIn("worktree", td_props)

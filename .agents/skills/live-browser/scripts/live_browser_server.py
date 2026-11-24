@@ -305,6 +305,20 @@ POST_CLICK_BURST_DURATION_SECONDS = 2.4   # 2-3s bounded window
 POST_CLICK_BURST_MAX_FRAMES = 22          # hard frame upper bound per burst window
 _POST_CLICK_BURST_ACTIONS = frozenset({"click", "dblclick", "rightclick", "mouseup"})
 _LOCAL_X11_DISPLAY_RE = re.compile(r"\A:[0-9]+(?:\.[0-9]+)?\Z")
+X11_VIRTUAL_DISPLAY_ENV = "CAMOUFOX_VIRTUAL_DISPLAY_SIZE"
+X11_MIN_SCREEN_WIDTH = 64
+X11_MIN_SCREEN_HEIGHT = 64
+X11_MAX_SCREEN_CLIP_DRIFT_PX = 2
+X11_MIN_VIRTUAL_WIDTH = 1920
+X11_MIN_VIRTUAL_HEIGHT = 1080
+X11_DEFAULT_VIRTUAL_WIDTH = 2560
+X11_DEFAULT_VIRTUAL_HEIGHT = 1600
+X11_MAX_VIRTUAL_WIDTH = 7680
+X11_MAX_VIRTUAL_HEIGHT = 4320
+X11_VIRTUAL_WINDOW_PAD_W = 160
+X11_VIRTUAL_WINDOW_PAD_H = 240
+X11_VIRTUAL_DISPLAY_DEPTH = 24
+_X11_VIRTUAL_DISPLAY_SIZE_RE = re.compile(r"\A([1-9][0-9]{1,4})x([1-9][0-9]{1,4})x(24)\Z")
 _X11_BUTTON_MAP: dict[str, int] = {"left": 1, "middle": 2, "right": 3}
 _X11_BUTTON_NAMES: dict[int, str] = {1: "left", 2: "middle", 3: "right"}
 _X11_WHEEL_UP_BTN = 4
@@ -2251,6 +2265,65 @@ def is_valid_local_x11_display(display: Any) -> bool:
     return isinstance(display, str) and bool(_LOCAL_X11_DISPLAY_RE.fullmatch(display))
 
 
+def parse_virtual_display_size(raw: Any) -> tuple[int, int, int] | None:
+    """Strictly validate a `WxHx24` Xvfb virtual display geometry string."""
+    if not isinstance(raw, str):
+        return None
+    m = _X11_VIRTUAL_DISPLAY_SIZE_RE.fullmatch(raw)
+    if not m:
+        return None
+    w = int(m.group(1))
+    h = int(m.group(2))
+    depth = int(m.group(3))
+    if (
+        w < X11_MIN_SCREEN_WIDTH
+        or h < X11_MIN_SCREEN_HEIGHT
+        or w > X11_MAX_VIRTUAL_WIDTH
+        or h > X11_MAX_VIRTUAL_HEIGHT
+        or depth != X11_VIRTUAL_DISPLAY_DEPTH
+    ):
+        return None
+    return (w, h, depth)
+
+
+def compute_virtual_display_size(
+    window: Any = None,
+    *,
+    base_env_value: str | None = None,
+) -> str:
+    """Compute a validated `WxHx24` `CAMOUFOX_VIRTUAL_DISPLAY_SIZE` value for Xvfb.
+
+    Guarantees at least `X11_DEFAULT_VIRTUAL_WIDTH x X11_DEFAULT_VIRTUAL_HEIGHT x 24`
+    (>= 1920x1080x24, covering 2560x1440 Windows fingerprints and 2x DPR windows),
+    auto-expands with chrome/border padding for larger configured windows, honors larger
+    valid operator overrides, and strictly rejects malformed/degenerate geometries.
+    """
+    req_w = max(X11_MIN_VIRTUAL_WIDTH, X11_DEFAULT_VIRTUAL_WIDTH)
+    req_h = max(X11_MIN_VIRTUAL_HEIGHT, X11_DEFAULT_VIRTUAL_HEIGHT)
+
+    if isinstance(window, (list, tuple)) and len(window) == 2:
+        parsed_w = _parse_finite_coord(window[0])
+        parsed_h = _parse_finite_coord(window[1])
+        if parsed_w is not None and parsed_h is not None:
+            win_w = int(round(parsed_w))
+            win_h = int(round(parsed_h))
+            if win_w > 0 and win_h > 0:
+                req_w = max(req_w, win_w + X11_VIRTUAL_WINDOW_PAD_W)
+                req_h = max(req_h, win_h + X11_VIRTUAL_WINDOW_PAD_H)
+
+    parsed_env = parse_virtual_display_size(base_env_value.strip() if isinstance(base_env_value, str) else None)
+    if parsed_env is not None:
+        req_w = max(req_w, parsed_env[0])
+        req_h = max(req_h, parsed_env[1])
+
+    eff_w = min(X11_MAX_VIRTUAL_WIDTH, max(X11_MIN_VIRTUAL_WIDTH, req_w))
+    eff_h = min(X11_MAX_VIRTUAL_HEIGHT, max(X11_MIN_VIRTUAL_HEIGHT, req_h))
+    result = f"{eff_w}x{eff_h}x{X11_VIRTUAL_DISPLAY_DEPTH}"
+    if parse_virtual_display_size(result) is None:
+        raise ValueError(f"Invalid computed virtual display size: {result!r}")
+    return result
+
+
 def _parse_finite_coord(raw: Any) -> float | None:
     """Parse a finite int/float coordinate strictly (rejects bool, None, str, NaN, +/-Inf, OverflowError)."""
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
@@ -2273,6 +2346,29 @@ def _validate_mouse_button(raw: Any, *, default: str = "left") -> str | None:
     return None
 
 
+def _is_valid_x11_dom_geom(geom: Any) -> bool:
+    """Return True when DOM content geometry contains valid positive finite metrics."""
+    if not isinstance(geom, dict):
+        return False
+    inner_x = _parse_finite_coord(geom.get("mozInnerScreenX"))
+    inner_y = _parse_finite_coord(geom.get("mozInnerScreenY"))
+    inner_w = _parse_finite_coord(geom.get("innerWidth"))
+    inner_h = _parse_finite_coord(geom.get("innerHeight"))
+    dpr = _parse_finite_coord(geom.get("devicePixelRatio"))
+    if (
+        inner_x is None
+        or inner_y is None
+        or inner_w is None
+        or inner_h is None
+        or dpr is None
+        or inner_w <= 0.0
+        or inner_h <= 0.0
+        or dpr <= 0.0
+    ):
+        return False
+    return all(math.isfinite(v) for v in (inner_x * dpr, inner_y * dpr, inner_w * dpr, inner_h * dpr))
+
+
 def _compute_clamped_x11_coords(
     geom: Any,
     css_x: float | None,
@@ -2283,14 +2379,19 @@ def _compute_clamped_x11_coords(
     """Convert CSS viewport coords `(css_x, css_y)` to physical X11 screen coords clamped strictly
     to the intersection of the browser content rect and X11 root screen `[0, scr_w-1] x [0, scr_h-1]`.
 
-    Returns `None` (fail-closed) when DOM geometry is missing/invalid, screen dims <= 0, or
-    the content rect / root screen intersection is empty.
+    Returns `None` (fail-closed) when:
+      - DOM geometry is missing/invalid;
+      - X11 root screen dims are degenerate (`< 64x64`, e.g. Camoufox default `1x1` Xvfb);
+      - the content rect / root screen intersection is empty; or
+      - an in-viewport target point falls outside `[0, scr_w-1] x [0, scr_h-1]` (`scaled_x >= scr_w`
+        or `scaled_y >= scr_h`) with clamping deviation > `X11_MAX_SCREEN_CLIP_DRIFT_PX` (2px),
+        preventing silent off-target clicks.
     """
     if not isinstance(geom, dict):
         return None
     if isinstance(scr_w, bool) or isinstance(scr_h, bool) or not isinstance(scr_w, int) or not isinstance(scr_h, int):
         return None
-    if scr_w <= 0 or scr_h <= 0:
+    if scr_w < X11_MIN_SCREEN_WIDTH or scr_h < X11_MIN_SCREEN_HEIGHT:
         return None
     inner_x = _parse_finite_coord(geom.get("mozInnerScreenX"))
     inner_y = _parse_finite_coord(geom.get("mozInnerScreenY"))
@@ -2351,6 +2452,25 @@ def _compute_clamped_x11_coords(
         sy = max_y if scaled_y > 0.0 else min_y
     else:
         sy = max(min_y, min(max_y, int(round(scaled_y))))
+
+    # Fail-safe against undersized Xvfb screens: never silently clamp an in-viewport target
+    # that extends past the right/bottom edge of the X11 root screen by > 2px.
+    in_viewport_x = css_x is None or (0.0 <= css_x <= inner_w)
+    in_viewport_y = css_y is None or (0.0 <= css_y <= inner_h)
+    if (
+        in_viewport_x
+        and math.isfinite(scaled_x)
+        and scaled_x >= scr_w
+        and abs(scaled_x - sx) > X11_MAX_SCREEN_CLIP_DRIFT_PX
+    ):
+        return None
+    if (
+        in_viewport_y
+        and math.isfinite(scaled_y)
+        and scaled_y >= scr_h
+        and abs(scaled_y - sy) > X11_MAX_SCREEN_CLIP_DRIFT_PX
+    ):
+        return None
     return (sx, sy)
 
 
@@ -4202,6 +4322,8 @@ class LiveBrowserHub:
         self.ai_status: str = ""
         self.cursor: dict[str, Any] = {}
         self.x11_display: str | None = None
+        self.x11_screen_size: list[int] | None = None
+        self.last_human_input_backend: str = ""
         self._x11_pointer: X11XTestPointerEngine = X11XTestPointerEngine()
         self._last_x11_clip: str = ""
         self.latest_clip: dict[str, Any] = {}
@@ -4643,6 +4765,28 @@ class LiveBrowserHub:
             "direct_app_url": self.config.get("direct_app_url") or "",
             "viewers": len(self.viewers),
             "profiles": [],
+        }
+
+    def _x11_diagnostics_dict(self) -> dict[str, Any]:
+        """Return safe read-only X11/human-input diagnostic fields for authorized `/internal/status` callers."""
+        disp = self.x11_display if is_valid_local_x11_display(self.x11_display) else None
+        raw_scr = self.x11_screen_size
+        scr: list[int] | None = None
+        if (
+            isinstance(raw_scr, (list, tuple))
+            and len(raw_scr) == 2
+            and all(isinstance(v, int) and not isinstance(v, bool) and v > 0 for v in raw_scr)
+        ):
+            scr = [int(raw_scr[0]), int(raw_scr[1])]
+        backend = (
+            self.last_human_input_backend
+            if self.last_human_input_backend in ("x11_xtest", "playwright_fallback", "")
+            else ""
+        )
+        return {
+            "x11_display": disp,
+            "x11_screen_size": scr,
+            "last_human_input_backend": backend,
         }
 
     def _sanitize_state_for_readonly(self, st: dict[str, Any]) -> dict[str, Any]:
@@ -6799,6 +6943,41 @@ class LiveBrowserHub:
 
     # ---------------- Hosted AsyncCamoufox Lifecycle ----------------
 
+    @staticmethod
+    async def _shield_cleanup_async(coro: Any, *, timeout: float, label: str) -> None:
+        """Run an async cleanup coroutine shielded from outer cancellation with a hard timeout."""
+        task = asyncio.create_task(coro)
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+        except BaseException as cleanup_exc:
+            if task.done():
+                if not task.cancelled():
+                    try:
+                        _ = task.exception()
+                    except BaseException:
+                        pass
+            else:
+                def _consume_deferred_exc(done_task: asyncio.Task[Any]) -> None:
+                    if done_task.cancelled():
+                        return
+                    try:
+                        exc = done_task.exception()
+                    except BaseException:
+                        return
+                    if exc is not None:
+                        log.debug(
+                            "Deferred cleanup error (%s, error_type=%s)",
+                            label,
+                            type(exc).__name__,
+                        )
+
+                task.add_done_callback(_consume_deferred_exc)
+            log.warning(
+                "Cleanup %s interrupted or failed (error_type=%s)",
+                label,
+                type(cleanup_exc).__name__,
+            )
+
     def _clear_session_caches(self) -> None:
         """Clear all frame/URL/title/clipboard/cursor/tab caches so stale data never leaks across sessions."""
         self.latest_jpeg = None
@@ -6810,6 +6989,8 @@ class LiveBrowserHub:
         self.cursor = {}
         self.ai_status = ""
         self.x11_display = None
+        self.x11_screen_size = None
+        self.last_human_input_backend = ""
         self.active_profile = ""
         self.active_profile_dir = None
         self.active_pinned = False
@@ -7134,12 +7315,24 @@ class LiveBrowserHub:
                             raise PermissionError("启动准备期间管理员权限已撤销，已中止启动（fail-closed）")
 
                     kwargs, egress_summary = build_camoufox_kwargs(spec, user_data_dir)
+                    vd_size = compute_virtual_display_size(
+                        kwargs.get("window") or spec.get("window"),
+                        base_env_value=os.environ.get(X11_VIRTUAL_DISPLAY_ENV),
+                    )
 
                     from camoufox.async_api import AsyncCamoufox
 
-                    cm = AsyncCamoufox(**kwargs)
-                    ctx = await cm.__aenter__()
-                    cm_entered = True
+                    prev_vd_env = os.environ.get(X11_VIRTUAL_DISPLAY_ENV)
+                    os.environ[X11_VIRTUAL_DISPLAY_ENV] = vd_size
+                    try:
+                        cm = AsyncCamoufox(**kwargs)
+                        ctx = await cm.__aenter__()
+                        cm_entered = True
+                    finally:
+                        if prev_vd_env is None:
+                            os.environ.pop(X11_VIRTUAL_DISPLAY_ENV, None)
+                        else:
+                            os.environ[X11_VIRTUAL_DISPLAY_ENV] = prev_vd_env
 
                     # Fail-closed: install non-pinned Google navigation guard + page listeners BEFORE
                     # activating the session or navigating any page!
@@ -7162,6 +7355,11 @@ class LiveBrowserHub:
 
                     resolved_display = resolve_camoufox_display(ctx, user_data_dir)
                     initial_x11_clip = await read_x11_clipboard_async(resolved_display)
+                    resolved_screen_size: list[int] | None = None
+                    if is_valid_local_x11_display(resolved_display):
+                        scr_dims = await self._x11_pointer.ensure_screen_size_async(resolved_display)
+                        if scr_dims is not None:
+                            resolved_screen_size = [int(scr_dims[0]), int(scr_dims[1])]
 
                     # Pre-publish startup guard gate: if any popup/new page failed guard installation
                     # during startup, abort directly inside the current `_engine_lock` without re-entering!
@@ -7184,19 +7382,28 @@ class LiveBrowserHub:
                             or resolved_owner_check != (a_bot, a_uid)
                         ):
                             raise PermissionError("会话发布前管理员权限已撤销或状态/代次/归属已变更，已中止启动（fail-closed）")
-                except Exception:
+                except BaseException:
+                    await self._shield_cleanup_async(
+                        self._x11_pointer.close_async(),
+                        timeout=1.5,
+                        label="start_hosted.x11_pointer.close",
+                    )
                     if ctx is not None:
                         self._startup_guard_failed_ctx.discard(id(ctx))
                     if cm_entered and cm is not None:
-                        try:
-                            await cm.__aexit__(None, None, None)
-                        except Exception as close_exc:
-                            log.warning("Error closing AsyncCamoufox after guard/start failure: %s", close_exc)
+                        await self._shield_cleanup_async(
+                            cm.__aexit__(None, None, None),
+                            timeout=5.0,
+                            label="start_hosted.camoufox.__aexit__",
+                        )
                     try:
                         fcntl.flock(fd, fcntl.LOCK_UN)
                     except Exception:
                         pass
-                    os.close(fd)
+                    try:
+                        os.close(fd)
+                    except Exception:
+                        pass
                     if ephemeral_dir is not None and ephemeral_dir.exists():
                         shutil.rmtree(ephemeral_dir, ignore_errors=True)
                     raise
@@ -7229,8 +7436,24 @@ class LiveBrowserHub:
 
                 self.ai_status = "已启动安全浏览器"
                 self.x11_display = resolved_display
+                self.x11_screen_size = resolved_screen_size
+                self.last_human_input_backend = ""
                 self._last_x11_clip = initial_x11_clip
-                log.info("Resolved Camoufox X11 display=%s", self.x11_display)
+                screen_label = (
+                    f"{resolved_screen_size[0]}x{resolved_screen_size[1]}"
+                    if resolved_screen_size is not None
+                    else "unknown"
+                )
+                log.info("Resolved Camoufox X11 display=%s screen=%s", self.x11_display, screen_label)
+                if resolved_screen_size is not None and (
+                    resolved_screen_size[0] < X11_MIN_SCREEN_WIDTH
+                    or resolved_screen_size[1] < X11_MIN_SCREEN_HEIGHT
+                ):
+                    log.warning(
+                        "Camoufox X11 virtual display %s has degenerate screen size %s; human pointer will fall back to Playwright",
+                        self.x11_display,
+                        screen_label,
+                    )
 
                 self.active_tab_index = max(0, len(self._visible_pages(ctx)) - 1)
                 self._tab_select_rev += 1
@@ -7695,12 +7918,55 @@ class LiveBrowserHub:
             return
         cap_gen = self.session_gen
         if not self.x11_display:
-            self.x11_display = resolve_camoufox_display(self.ctx, self.active_profile_dir)
-            if self.x11_display:
-                init_clip = await read_x11_clipboard_async(self.x11_display)
-                if self.engine_mode == "async_hosted" and self.session_gen == cap_gen:
-                    self._last_x11_clip = init_clip
-                return
+            resolved_disp = resolve_camoufox_display(self.ctx, self.active_profile_dir)
+            if resolved_disp:
+                scr_dims: tuple[int, int] | None = None
+                probed = False
+                async with self._exec_lock:
+                    if (
+                        self.engine_mode != "async_hosted"
+                        or self.session_gen != cap_gen
+                        or self.ctx is None
+                    ):
+                        return
+                    if not self.x11_display:
+                        if is_valid_local_x11_display(resolved_disp):
+                            try:
+                                scr_dims = await self._x11_pointer.ensure_screen_size_async(resolved_disp)
+                            except BaseException:
+                                if (
+                                    self.engine_mode != "async_hosted"
+                                    or self.session_gen != cap_gen
+                                    or self.ctx is None
+                                ):
+                                    await self._shield_cleanup_async(
+                                        self._x11_pointer.close_async(),
+                                        timeout=1.5,
+                                        label="clipboard_probe.x11_close",
+                                    )
+                                raise
+                            if (
+                                self.engine_mode != "async_hosted"
+                                or self.session_gen != cap_gen
+                                or self.ctx is None
+                            ):
+                                await self._shield_cleanup_async(
+                                    self._x11_pointer.close_async(),
+                                    timeout=1.5,
+                                    label="clipboard_probe.x11_close",
+                                )
+                                return
+                        self.x11_display = resolved_disp
+                        if scr_dims is not None:
+                            self.x11_screen_size = [int(scr_dims[0]), int(scr_dims[1])]
+                        probed = True
+                if probed:
+                    init_clip = await read_x11_clipboard_async(resolved_disp)
+                    if self.engine_mode == "async_hosted" and self.session_gen == cap_gen and self.ctx is not None:
+                        self._last_x11_clip = init_clip
+                        scr_label = f"{scr_dims[0]}x{scr_dims[1]}" if scr_dims is not None else "unknown"
+                        log.info("Resolved Camoufox X11 display=%s screen=%s", self.x11_display, scr_label)
+                    return
         if not self.x11_display:
             return
         clip = await read_x11_clipboard_async(self.x11_display)
@@ -8421,10 +8687,35 @@ class LiveBrowserHub:
             return ("abort", None)
         if scr_dims is None:
             return ("fallback", None)
+        self.x11_screen_size = [int(scr_dims[0]), int(scr_dims[1])]
         coords = _compute_clamped_x11_coords(geom, css_x, css_y, scr_dims[0], scr_dims[1])
         if coords is None:
+            if scr_dims[0] < X11_MIN_SCREEN_WIDTH or scr_dims[1] < X11_MIN_SCREEN_HEIGHT:
+                log.warning(
+                    "X11 root screen too small for pointer dispatch (display=%s, screen=%dx%d); falling back to Playwright",
+                    disp,
+                    scr_dims[0],
+                    scr_dims[1],
+                )
+            elif _is_valid_x11_dom_geom(geom):
+                log.warning(
+                    "X11 screen %dx%d cannot accurately cover viewport target on display=%s; falling back to Playwright",
+                    scr_dims[0],
+                    scr_dims[1],
+                    disp,
+                )
             return ("fallback", None)
         return ("ok", (disp, coords[0], coords[1]))
+
+    def _set_last_human_input_backend(self, backend: str, cmd: dict[str, Any]) -> None:
+        """Record the last human pointer backend only while the command's hosted session is still active."""
+        if self.engine_mode != "async_hosted":
+            return
+        cmd_sgen = cmd.get("_session_gen")
+        if isinstance(cmd_sgen, bool) or not isinstance(cmd_sgen, int) or cmd_sgen != self.session_gen:
+            return
+        if backend in ("x11_xtest", "playwright_fallback"):
+            self.last_human_input_backend = backend
 
     async def _human_mouse_move_then_click_locked(
         self,
@@ -8507,6 +8798,7 @@ class LiveBrowserHub:
                                 elif self.engine_mode != "async_hosted":
                                     self._x11_buttons_down.discard(x11_btn)
                     if not x11_failed_before_press:
+                        self._set_last_human_input_backend("x11_xtest", cmd)
                         return True
                     # Fall through to Playwright fallback only if 0 X11 presses landed and auth/page still valid
                     if not await self._reverify_human_pointer_page_locked(cmd, page, require_x11_auth=True):
@@ -8535,6 +8827,7 @@ class LiveBrowserHub:
             if self._callable_accepts_kwarg(click_fn, "delay"):
                 click_kwargs["delay"] = HUMAN_CLICK_HOLD_DELAY_MS
             await click_fn(x, y, **click_kwargs)
+        self._set_last_human_input_backend("playwright_fallback", cmd)
         return True
 
     async def _execute_human_cmd_async(self, cmd: dict[str, Any]) -> None:
@@ -8672,13 +8965,16 @@ class LiveBrowserHub:
                     if status == "ok" and resolved is not None:
                         disp, sx, sy = resolved
                         if await self._x11_pointer.move_async(disp, sx, sy):
+                            self._set_last_human_input_backend("x11_xtest", cmd)
                             return
                         if not await self._reverify_human_pointer_page_locked(cmd, page, require_x11_auth=True):
                             return
                     await page.mouse.move(x, y)
+                    self._set_last_human_input_backend("playwright_fallback", cmd)
                     return
                 self.cursor = {"x": x, "y": y, "actor": "human", "kind": "move", "ts": time.time()}
                 await page.mouse.move(x, y)
+                self._set_last_human_input_backend("playwright_fallback", cmd)
                 return
 
             if act == "mousedown":
@@ -8706,6 +9002,7 @@ class LiveBrowserHub:
                             if pressed_x11:
                                 self._x11_buttons_down.add(x11_btn)
                                 handled_x11_down = True
+                                self._set_last_human_input_backend("x11_xtest", cmd)
                                 if (
                                     not self._is_human_cmd_strictly_authenticated(cmd)
                                     or self._current_page() is not page
@@ -8753,6 +9050,7 @@ class LiveBrowserHub:
                         self._mouse_buttons_down.add(button)
                         await page.mouse.down(button=button)
                         pressed = True
+                        self._set_last_human_input_backend("playwright_fallback", cmd)
                     finally:
                         if pressed and (
                             not self._is_human_cmd_still_valid(cmd, check_live_rbac=True)
@@ -8821,6 +9119,7 @@ class LiveBrowserHub:
                             elif self.engine_mode != "async_hosted":
                                 self._x11_buttons_down.discard(x11_btn)
                     handled_x11_up = True
+                    self._set_last_human_input_backend("x11_xtest", cmd)
                 elif self.x11_display is not None and not was_held_pw:
                     status, resolved = await self._resolve_x11_screen_coords_locked(page, x, y, cmd)
                     if status == "abort":
@@ -8833,6 +9132,7 @@ class LiveBrowserHub:
                             return
                         if moved_ok and await self._x11_pointer.button_async(disp, x11_btn, False):
                             handled_x11_up = True
+                            self._set_last_human_input_backend("x11_xtest", cmd)
                     if not handled_x11_up and not await self._reverify_human_pointer_page_locked(
                         cmd, page, require_x11_auth=True
                     ):
@@ -8844,6 +9144,7 @@ class LiveBrowserHub:
                         return
                     self._mouse_buttons_down.discard(button)
                     await page.mouse.up(button=button)
+                    self._set_last_human_input_backend("playwright_fallback", cmd)
                 if self._is_human_cmd_still_valid(cmd, check_live_rbac=True) and self._current_page() is page:
                     post_capture_needed = True
                     post_capture_force = True
@@ -8970,12 +9271,14 @@ class LiveBrowserHub:
                             return
                         if moved_ok and await self._x11_pointer.wheel_steps_async(disp, steps):
                             handled_x11_wheel = True
+                            self._set_last_human_input_backend("x11_xtest", cmd)
                     if not handled_x11_wheel and not await self._reverify_human_pointer_page_locked(
                         cmd, page, require_x11_auth=True
                     ):
                         return
                 if not handled_x11_wheel:
                     await page.mouse.wheel(dx, dy)
+                    self._set_last_human_input_backend("playwright_fallback", cmd)
             elif act == "type":
                 text = str(cmd.get("text", ""))
                 if cmd.get("replace"):
@@ -11210,6 +11513,7 @@ async def internal_status(request: web.Request) -> web.Response:
         state = hub._sanitize_state_for_readonly(state)
         return web.json_response({"ok": True, **state})
     state = hub.state_dict(include_profiles=True, include_account=True)
+    state.update(hub._x11_diagnostics_dict())
     return web.json_response({"ok": True, **state})
 
 

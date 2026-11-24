@@ -86,7 +86,12 @@ class TestBotBusTeamWorkflow(unittest.TestCase):
             _bot_bus, bot_bus_mcp = self._load_isolated_bus(tmp)
             with mock.patch.dict(
                 os.environ,
-                {"AGY_BOT_BUS_ENABLE": "1", "AGY_BOT_BUS_ROLE": "coordinator"},
+                {
+                    "AGY_BOT_BUS_ENABLE": "1",
+                    "AGY_BOT_BUS_ROLE": "coordinator",
+                    "AGY_BOT_HANDLE": "bot_one",
+                    "AGY_RBAC_ROLE": "",
+                },
                 clear=False,
             ):
                 schemas = {t["name"]: t for t in bot_bus_mcp._tool_schemas()}
