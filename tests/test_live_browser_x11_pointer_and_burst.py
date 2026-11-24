@@ -1001,9 +1001,23 @@ class TestPhase2X11XTestPointerAndBurstContractD1ToD8(unittest.TestCase):
 
             hub._exec_lock.acquire = _spy_exec_acquire  # type: ignore[method-assign]
 
+            burst_release = asyncio.Event()
+            orig_sleep = asyncio.sleep
+
+            async def _gated_burst_sleep(delay: float, result: Any = None) -> Any:
+                if (
+                    hub._burst_task is not None
+                    and asyncio.current_task() is hub._burst_task
+                    and not burst_release.is_set()
+                ):
+                    await burst_release.wait()
+                    return result
+                return await orig_sleep(delay, result)
+
             with (
                 mock.patch.object(srv, "_check_live_user_role", return_value="admin"),
                 mock.patch.object(srv.time, "monotonic", side_effect=_mono),
+                mock.patch.object(srv.asyncio, "sleep", side_effect=_gated_burst_sleep),
                 mock.patch.object(srv, "POST_CLICK_BURST_INTERVAL_SECONDS", 0.03),
                 mock.patch.object(srv, "POST_CLICK_BURST_DURATION_SECONDS", 2.4),
                 mock.patch.object(srv, "POST_CLICK_BURST_MAX_FRAMES", 4),
@@ -1020,16 +1034,16 @@ class TestPhase2X11XTestPointerAndBurstContractD1ToD8(unittest.TestCase):
 
                 # Drain the 10 per-action tg.tick_updates tasks scheduled synchronously at action end,
                 # then verify the burst loop itself triggers ZERO additional tg.tick_updates calls!
-                await asyncio.sleep(0)
+                await orig_sleep(0)
                 tg_count_before_burst = len(tg_ticks)
                 self.assertEqual(10, tg_count_before_burst)
-                # Clear lock observations from the concurrent 10-click loop (where another task held
-                # _exec_lock while the lock-free burst could wake on slower CI runners) so post-loop
-                # burst captures are verified cleanly alongside the direct acquire spy.
+                # Clear lock observations from the 10 discrete actions before releasing the burst
+                # barrier so all 4 bounded burst captures are verified lock-free deterministically.
                 page.lock_states_during_screenshot.clear()
-                # Let bounded 4-frame burst finish naturally
+                # Release barrier and let bounded 4-frame burst finish naturally
                 burst_ref = hub._burst_task
                 self.assertIsNotNone(burst_ref)
+                burst_release.set()
                 await asyncio.wait_for(burst_ref, timeout=2.0)
 
                 self.assertEqual(
