@@ -490,8 +490,17 @@ class TestC6ClaudeMemMcpProxy(unittest.TestCase):
                 "    sys.stdout.flush()\n",
                 encoding="utf-8",
             )
+            scrub_keys = {
+                "AGY_UNTRUSTED_SESSION",
+                "AGY_MEMORY_READONLY",
+                "AGY_TRUST_LEVEL",
+                "AGY_MAX_RUNTIME_MODE",
+                "AGY_RBAC_ROLE",
+                "AGY_BOT_TEAM_ID",
+                "AGY_AGENT_ORIGIN",
+            }
             env = {
-                **os.environ,
+                **{k: v for k, v in os.environ.items() if k not in scrub_keys},
                 "AGY_BOT_HANDLE": "worker_a",
                 "AGY_BOT_BUS_ROLE": "worker",
                 "AGY_BOT_PROFILES_DIR": str(profiles),

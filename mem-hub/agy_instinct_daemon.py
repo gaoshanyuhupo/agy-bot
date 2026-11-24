@@ -208,6 +208,72 @@ def _inspect_step(step: dict[str, Any]) -> tuple[bool, str]:
     return _inspect_text(json.dumps(step, ensure_ascii=False))
 
 
+def _split_steps_into_turns(steps: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Group transcript steps into per-turn slices bounded by `USER_INPUT`."""
+    turns: list[list[dict[str, Any]]] = []
+    cur: list[dict[str, Any]] = []
+    for st in steps:
+        if st.get("type") == "USER_INPUT":
+            if cur:
+                turns.append(cur)
+            cur = [st]
+        else:
+            cur.append(st)
+    if cur:
+        turns.append(cur)
+    return turns
+
+
+def _classify_harvest_turn(
+    turn_steps: list[dict[str, Any]],
+    *,
+    workspace_paths: list[str] | None = None,
+) -> tuple[str, str]:
+    """Classify a single transcript turn for instinct harvesting.
+
+    Returns:
+      - `("session_taint", reason)` if a `USER_INPUT` carries an untrusted external source marker
+        (e.g. `[BENCHMARK_DIGEST]`, `UNTRUSTED_WARNING`, `[GITHUB_WEBHOOK`, `[ACB_READONLY_GUEST`)
+      - `("turn_skip", reason)` if the turn has a poisoned external/orphaned tool result (or a
+        prompt-injection payload in user text) without poisoning the entire session (`memory_taint.json`)
+      - `("clean", "")` if safe to harvest
+    """
+    for st in turn_steps:
+        if st.get("type") == "USER_INPUT":
+            raw_txt = str(st.get("content") or "")
+            if _MEMORY_GUARD is not None:
+                res = _MEMORY_GUARD.inspect_text(raw_txt)
+                if res.get("markers"):
+                    return "session_taint", ",".join(res.get("reasons", [])[:4]) or "untrusted_marker"
+                if res.get("poison_rules"):
+                    return "turn_skip", ",".join(res.get("reasons", [])[:4]) or "poison_user_text"
+            else:
+                for m in _FALLBACK_MARKERS:
+                    if m in raw_txt:
+                        return "session_taint", f"marker:{m}"
+                if _FALLBACK_POISON_RE.search(raw_txt):
+                    return "turn_skip", "poison:fallback"
+
+    ws_list = list(workspace_paths) if workspace_paths else [str(WORKSPACE_DIR)]
+    if _MEMORY_GUARD is not None and hasattr(_MEMORY_GUARD, "inspect_turn_external_steps"):
+        ext_res = _MEMORY_GUARD.inspect_turn_external_steps(
+            turn_steps,
+            cwd=str(WORKSPACE_DIR),
+            workspace_paths=ws_list,
+        )
+        if ext_res.get("untrusted"):
+            return "turn_skip", ",".join(ext_res.get("reasons", [])[:4]) or "untrusted_external_tool"
+        return "clean", ""
+
+    for st in turn_steps:
+        if st.get("type") in ("USER_INPUT", "PLANNER_RESPONSE", "CHECKPOINT", "SYSTEM_MESSAGE"):
+            continue
+        is_bad, bad_reason = _inspect_step(st)
+        if is_bad:
+            return "turn_skip", bad_reason or "untrusted_step"
+    return "clean", ""
+
+
 def _validate_instinct_candidate(inst: dict[str, Any], *, is_existing: bool = False) -> tuple[bool, str]:
     if _MEMORY_GUARD is not None:
         return _MEMORY_GUARD.validate_instinct_candidate(inst, is_existing=is_existing)
@@ -460,6 +526,7 @@ def harvest_transcripts(state: dict[str, Any]) -> tuple[int, bool]:
         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         tainted_now = False
 
+        parsed_steps: list[dict[str, Any]] = []
         for raw in lines[start_idx:]:
             raw = raw.strip()
             if not raw:
@@ -468,74 +535,84 @@ def harvest_transcripts(state: dict[str, Any]) -> tuple[int, bool]:
                 step = json.loads(raw)
             except json.JSONDecodeError:
                 continue
-            if not isinstance(step, dict):
-                continue
+            if isinstance(step, dict):
+                parsed_steps.append(step)
 
-            is_bad, bad_reason = _inspect_step(step)
-            if is_bad:
+        for turn_steps in _split_steps_into_turns(parsed_steps):
+            verdict, bad_reason = _classify_harvest_turn(turn_steps)
+            if verdict == "session_taint":
                 _mark_cid_tainted(cid, bad_reason or "untrusted_step", "instinct_daemon:harvest")
                 tainted_cids.add(cid)
                 state["poison_blocked_count"] = int(state.get("poison_blocked_count") or 0) + 1
                 _record_guard_block(1)
                 tainted_now = True
-                log.warning("Blocked tainted/poisoned transcript %s at step (%s)", cid[:12], bad_reason)
+                new_obs.clear()
+                log.warning("Blocked tainted/poisoned transcript %s at turn (%s)", cid[:12], bad_reason)
                 break
+            if verdict == "turn_skip":
+                state["poison_blocked_count"] = int(state.get("poison_blocked_count") or 0) + 1
+                _record_guard_block(1)
+                log.info("Skipped single tainted external turn in transcript %s (%s)", cid[:12], bad_reason)
+                continue
 
-            stype = step.get("type")
-            ts = step.get("created_at") or now_iso
+            for step in turn_steps:
+                stype = step.get("type")
+                ts = step.get("created_at") or now_iso
 
-            if stype == "USER_INPUT":
-                raw_content = str(step.get("content") or "")
-                if "<STATELESS_TASK" in raw_content:
-                    continue
-                user_txt = scrub_secrets(unwrap_user_request(raw_content))
-                if not user_txt or user_txt.startswith("/compact") or "<STATELESS_TASK" in user_txt:
-                    continue
-                if CORRECTION_RE.search(user_txt):
-                    saw_correction = True
-                new_obs.append(
-                    {
-                        "timestamp": ts,
-                        "event": "user_prompt",
-                        "session": cid[:8],
-                        "input": user_txt[:1200],
-                        "project_id": "global",
-                        "project_name": "agy-workspace",
-                    }
-                )
-            elif stype == "PLANNER_RESPONSE":
-                tcalls = step.get("tool_calls") or []
-                if isinstance(tcalls, list):
-                    for tc in tcalls[:6]:
-                        if not isinstance(tc, dict):
-                            continue
-                        tname = str(tc.get("name") or tc.get("tool_name") or "tool")
-                        targs = scrub_secrets(json.dumps(tc.get("arguments") or tc.get("args") or {}, ensure_ascii=False))
-                        new_obs.append(
-                            {
-                                "timestamp": ts,
-                                "event": "tool_start",
-                                "session": cid[:8],
-                                "tool": tname,
-                                "input": targs[:800],
-                                "project_id": "global",
-                                "project_name": "agy-workspace",
-                            }
-                        )
-                resp_txt = scrub_secrets(str(step.get("content") or "").strip())
-                if resp_txt:
+                if stype == "USER_INPUT":
+                    raw_content = str(step.get("content") or "")
+                    if "<STATELESS_TASK" in raw_content:
+                        continue
+                    user_txt = scrub_secrets(unwrap_user_request(raw_content))
+                    if not user_txt or user_txt.startswith("/compact") or "<STATELESS_TASK" in user_txt:
+                        continue
+                    if CORRECTION_RE.search(user_txt):
+                        saw_correction = True
                     new_obs.append(
                         {
                             "timestamp": ts,
-                            "event": "assistant_reply",
+                            "event": "user_prompt",
                             "session": cid[:8],
-                            "output": resp_txt[:800],
+                            "input": user_txt[:1200],
                             "project_id": "global",
                             "project_name": "agy-workspace",
                         }
                     )
+                elif stype == "PLANNER_RESPONSE":
+                    tcalls = step.get("tool_calls") or []
+                    if isinstance(tcalls, list):
+                        for tc in tcalls[:6]:
+                            if not isinstance(tc, dict):
+                                continue
+                            tname = str(tc.get("name") or tc.get("tool_name") or "tool")
+                            targs = scrub_secrets(json.dumps(tc.get("arguments") or tc.get("args") or {}, ensure_ascii=False))
+                            new_obs.append(
+                                {
+                                    "timestamp": ts,
+                                    "event": "tool_start",
+                                    "session": cid[:8],
+                                    "tool": tname,
+                                    "input": targs[:800],
+                                    "project_id": "global",
+                                    "project_name": "agy-workspace",
+                                }
+                            )
+                    resp_txt = scrub_secrets(str(step.get("content") or "").strip())
+                    if resp_txt:
+                        new_obs.append(
+                            {
+                                "timestamp": ts,
+                                "event": "assistant_reply",
+                                "session": cid[:8],
+                                "output": resp_txt[:800],
+                                "project_id": "global",
+                                "project_name": "agy-workspace",
+                            }
+                        )
 
         offsets[cid] = total
+        if tainted_now:
+            continue
         if new_obs:
             lock_p = _obs_lock_path()
             lock_p.parent.mkdir(parents=True, exist_ok=True)
@@ -1032,6 +1109,7 @@ def harvest_transcripts_per_bot(
 
         new_obs: list[dict[str, Any]] = []
         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        parsed_steps: list[dict[str, Any]] = []
         for raw in lines[start_idx:]:
             raw = raw.strip()
             if not raw:
@@ -1040,10 +1118,12 @@ def harvest_transcripts_per_bot(
                 step = json.loads(raw)
             except json.JSONDecodeError:
                 continue
-            if not isinstance(step, dict):
-                continue
-            is_bad, bad_reason = _inspect_step(step)
-            if is_bad:
+            if isinstance(step, dict):
+                parsed_steps.append(step)
+
+        for turn_steps in _split_steps_into_turns(parsed_steps):
+            verdict, bad_reason = _classify_harvest_turn(turn_steps)
+            if verdict == "session_taint":
                 _mark_cid_tainted(cid, bad_reason or "untrusted_step", "instinct_daemon:per_bot")
                 tainted_cids.add(cid)
                 state["poison_blocked_count"] = int(state.get("poison_blocked_count") or 0) + 1
@@ -1051,43 +1131,49 @@ def harvest_transcripts_per_bot(
                 tainted_skipped += 1
                 new_obs.clear()
                 break
+            if verdict == "turn_skip":
+                state["poison_blocked_count"] = int(state.get("poison_blocked_count") or 0) + 1
+                _record_guard_block(1)
+                tainted_skipped += 1
+                continue
 
-            stype = step.get("type")
-            ts = step.get("created_at") or now_iso
-            if stype == "USER_INPUT":
-                raw_content = str(step.get("content") or "")
-                if "<STATELESS_TASK" in raw_content:
-                    continue
-                user_txt = scrub_secrets(unwrap_user_request(raw_content))
-                if not user_txt or user_txt.startswith("/compact") or "<STATELESS_TASK" in user_txt:
-                    continue
-                if CORRECTION_RE.search(user_txt):
-                    saw_correction_bots.add(owner_handle)
-                new_obs.append(
-                    {
-                        "timestamp": ts,
-                        "event": "user_prompt",
-                        "session": cid[:8],
-                        "input": user_txt[:1200],
-                        "project_id": f"bot-{owner_handle}",
-                        "project_name": f"bot-{owner_handle}",
-                        "bot": owner_handle,
-                    }
-                )
-            elif stype == "PLANNER_RESPONSE":
-                resp_txt = scrub_secrets(str(step.get("content") or "").strip())
-                if resp_txt:
+            for step in turn_steps:
+                stype = step.get("type")
+                ts = step.get("created_at") or now_iso
+                if stype == "USER_INPUT":
+                    raw_content = str(step.get("content") or "")
+                    if "<STATELESS_TASK" in raw_content:
+                        continue
+                    user_txt = scrub_secrets(unwrap_user_request(raw_content))
+                    if not user_txt or user_txt.startswith("/compact") or "<STATELESS_TASK" in user_txt:
+                        continue
+                    if CORRECTION_RE.search(user_txt):
+                        saw_correction_bots.add(owner_handle)
                     new_obs.append(
                         {
                             "timestamp": ts,
-                            "event": "assistant_reply",
+                            "event": "user_prompt",
                             "session": cid[:8],
-                            "output": resp_txt[:800],
+                            "input": user_txt[:1200],
                             "project_id": f"bot-{owner_handle}",
                             "project_name": f"bot-{owner_handle}",
                             "bot": owner_handle,
                         }
                     )
+                elif stype == "PLANNER_RESPONSE":
+                    resp_txt = scrub_secrets(str(step.get("content") or "").strip())
+                    if resp_txt:
+                        new_obs.append(
+                            {
+                                "timestamp": ts,
+                                "event": "assistant_reply",
+                                "session": cid[:8],
+                                "output": resp_txt[:800],
+                                "project_id": f"bot-{owner_handle}",
+                                "project_name": f"bot-{owner_handle}",
+                                "bot": owner_handle,
+                            }
+                        )
 
         offsets[cid] = total
         if new_obs:

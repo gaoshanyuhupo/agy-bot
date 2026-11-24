@@ -328,18 +328,29 @@ def _session_security_env() -> Dict[str, Any]:
     env_team_id = os.environ.get("AGY_BOT_TEAM_ID", "").strip()
     env_trust_level = os.environ.get("AGY_TRUST_LEVEL", "").strip()
     env_agent_origin = os.environ.get("AGY_AGENT_ORIGIN", "").strip().lower()
+    norm_env_trust = bot_bus._normalize_trust_level(env_trust_level) if env_trust_level else ""
+    env_trust_is_ro = norm_env_trust == "readonly_guest"
+    env_trust_is_untr = (
+        bool(norm_env_trust)
+        and bot_bus.TRUST_ORDER.get(norm_env_trust, 0) <= bot_bus.TRUST_ORDER["remote_untrusted"]
+    )
+    env_readonly = (
+        os.environ.get("AGY_RBAC_ROLE", "").strip().lower() == "readonly"
+        or env_trust_is_ro
+    )
     env_untrusted = (
         os.environ.get("AGY_UNTRUSTED_SESSION", "").strip() == "1"
         or os.environ.get("AGY_MEMORY_READONLY", "").strip() == "1"
         or env_agent_origin.startswith("remote")
+        or env_readonly
+        or env_trust_is_untr
     )
-    env_readonly = os.environ.get("AGY_RBAC_ROLE", "").strip().lower() == "readonly"
     env_max_mode = os.environ.get("AGY_MAX_RUNTIME_MODE", "").strip().lower()
-    if env_readonly or env_untrusted:
+    if env_readonly:
         env_max_mode = "safe"
     return {
         "team_id": env_team_id,
-        "trust_level": env_trust_level,
+        "trust_level": norm_env_trust or env_trust_level,
         "agent_origin": env_agent_origin,
         "untrusted": env_untrusted,
         "readonly": env_readonly,

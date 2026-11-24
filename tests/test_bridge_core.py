@@ -2650,7 +2650,16 @@ class TestCoordinatorFirstTurnPrefix(unittest.TestCase):
                 mock.patch.object(bridge, "_record_and_relay_bot_group_msg"),
                 mock.patch.object(bridge, "_maybe_post_turn_auto_compact"),
             ):
-                bridge.run_agy(chat_id, untrusted_input, scope_key=skey_clean, user_role="admin", user_id=123456)
+                bridge.run_agy(
+                    chat_id,
+                    untrusted_input,
+                    scope_key=skey_clean,
+                    user_role="admin",
+                    user_id=123456,
+                    untrusted=True,
+                    trust_level="remote_untrusted",
+                    agent_origin="github_webhook",
+                )
 
             self.assertEqual(1, len(dirty_prompts))
             self.assertTrue(dirty_prompts[0].startswith("[AGY_MEMORY_READONLY=1]"))

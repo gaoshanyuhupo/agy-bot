@@ -1140,7 +1140,7 @@ def dispatch_assignments(
 
     env_max_mode = os.environ.get("AGY_MAX_RUNTIME_MODE", "").strip().lower()
     eff_parent_max_mode = _min_runtime_mode(parent_max_runtime_mode, env_max_mode, default="")
-    if eff_parent_untr or eff_parent_tainted:
+    if eff_parent_ro:
         eff_parent_max_mode = "safe"
 
     chain = [normalize_handle(c) for c in (parent_chain or []) if normalize_handle(c)]
@@ -1207,6 +1207,8 @@ def dispatch_assignments(
                 child_trust = _min_trust_level(child_trust, "remote_untrusted")
             if child_ro:
                 child_trust = "readonly_guest"
+            if child_trust == "readonly_guest":
+                child_ro = True
             child_untr = (
                 bool(eff_parent_untr)
                 or bool(spec.get("untrusted", False))
@@ -1222,7 +1224,7 @@ def dispatch_assignments(
 
             spec_max_mode = str(spec.get("max_runtime_mode") or "").strip().lower()
             eff_max_mode = _min_runtime_mode(eff_parent_max_mode, spec_max_mode, default="")
-            if child_ro or child_untr:
+            if child_ro:
                 eff_max_mode = "safe"
 
             req_mode = str(spec.get("mode") or "").strip().lower()
@@ -2175,6 +2177,10 @@ def retry_job(
         eff_trust = "readonly_guest"
     elif eff_untr or eff_tainted or _is_remote_origin(eff_origin):
         eff_trust = _min_trust_level(eff_trust, "remote_untrusted")
+    if eff_trust == "readonly_guest":
+        eff_ro = True
+        eff_untr = True
+        eff_tainted = True
     if TRUST_ORDER[eff_trust] <= TRUST_ORDER["remote_untrusted"]:
         eff_untr = True
         eff_tainted = True
@@ -2182,7 +2188,7 @@ def retry_job(
     prev_max_mode = str(prev.get("max_runtime_mode") or "").strip().lower()
     caller_eff_max_mode = _min_runtime_mode(caller_max_runtime_mode, env_max_mode, default="")
     eff_max_mode = _min_runtime_mode(prev_max_mode, caller_eff_max_mode, default="")
-    if eff_ro or eff_untr or eff_tainted:
+    if eff_ro:
         eff_max_mode = "safe"
 
     raw_prev_mode = str(prev.get("mode") or "").strip().lower()
@@ -2226,9 +2232,9 @@ def retry_job(
         wake_on_async=bool(prev.get("wake_on_async", True)),
         team_id=eff_team_id,
         agent_origin=eff_origin,
-        parent_trust_level=eff_trust,
+        parent_trust_level=("remote_untrusted" if eff_ro else eff_trust),
         parent_agent_origin=eff_origin,
-        parent_readonly=eff_ro,
+        parent_readonly=eff_caller_ro,
         parent_untrusted=eff_untr,
         parent_tainted=eff_tainted,
         parent_max_runtime_mode=eff_max_mode,

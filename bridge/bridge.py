@@ -2687,6 +2687,69 @@ def _sanitize_recovered_response(raw_resp, raw_err, *fallbacks):
     return ""
 
 
+def _extract_planner_entry_text(obj):
+    if not isinstance(obj, dict):
+        return ""
+    for key in ("content", "response", "text"):
+        val = obj.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+        if isinstance(val, list):
+            chunks = []
+            for blk in val:
+                if isinstance(blk, str) and blk.strip():
+                    chunks.append(blk.strip())
+                elif isinstance(blk, dict):
+                    t = blk.get("text") or blk.get("content")
+                    if isinstance(t, str) and t.strip():
+                        chunks.append(t.strip())
+            if chunks:
+                return "\n".join(chunks).strip()
+    return ""
+
+
+def _recover_turn_reply_from_transcript(cid, start_line=0):
+    """Recover the latest non-empty PLANNER_RESPONSE text from current turn's transcript slice."""
+    if not cid:
+        return ""
+    tpath = os.path.join(BRAIN_ROOT, str(cid), ".system_generated/logs/transcript.jsonl")
+    if not os.path.isfile(tpath):
+        return ""
+    try:
+        with open(tpath, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+    except Exception:
+        return ""
+    start_idx = max(0, int(start_line or 0))
+    objs = []
+    for raw in lines[start_idx:]:
+        s = raw.strip()
+        if not s:
+            continue
+        try:
+            obj = json.loads(s)
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            objs.append(obj)
+    if not objs:
+        return ""
+    fallback_with_tools = ""
+    for obj in reversed(objs):
+        if obj.get("type") != "PLANNER_RESPONSE":
+            continue
+        if str(obj.get("status") or "").strip().upper() in ("ERROR", "CANCELLED"):
+            continue
+        txt = _extract_planner_entry_text(obj)
+        if not txt:
+            continue
+        if not obj.get("tool_calls"):
+            return txt
+        if not fallback_with_tools:
+            fallback_with_tools = txt
+    return fallback_with_tools
+
+
 def get_turn_details(cid, start_line=0):
     """Extract thinking chains and tool calls from transcript.jsonl starting at start_line."""
     if not cid:
@@ -3511,6 +3574,238 @@ def _format_empty_pretool_denial_alert(tool_name, agy_version=None):
     )
 
 
+def _denied_actions_are_hook_blocks(denied_actions):
+    """Return True when denied_actions indicate PreToolUse/security hook blocks rather than safe-mode approval."""
+    if not isinstance(denied_actions, list) or not denied_actions:
+        return False
+    for item in denied_actions:
+        if isinstance(item, dict):
+            raw = " ".join(
+                str(item.get(k) or "") for k in ("reason", "error", "message")
+            ).lower()
+        else:
+            raw = str(item or "").lower()
+        if any(
+            kw in raw
+            for kw in (
+                "pre-tool hook",
+                "pretooluse",
+                "hook_denied",
+                "taint-outbound-guard",
+                "bot-isolation-guard",
+                "guard",
+            )
+        ):
+            return True
+    return False
+
+
+def _format_denied_actions_reply(denied_actions, *, mode=None, readonly=False):
+    """Format a clear Chinese explanation when a turn finishes empty due to denied_actions."""
+    lines = ["🔒 本轮操作被拦截，未能生成正文回复："]
+    items = denied_actions if isinstance(denied_actions, list) else []
+    for item in items[:6]:
+        if isinstance(item, dict):
+            act = str(item.get("action") or item.get("tool_name") or item.get("tool") or "未知操作").strip()
+            rsn = str(item.get("reason") or item.get("error") or item.get("message") or "").strip()
+            if rsn:
+                lines.append(f"• `{act}`：{rsn[:240]}")
+            else:
+                lines.append(f"• `{act}`：未返回具体拦截原因")
+        elif item:
+            lines.append(f"• {str(item).strip()[:240]}")
+    if len(items) > 6:
+        lines.append(f"• （另有 {len(items) - 6} 项被拦截）")
+    if readonly:
+        lines.append("\n当前会话为只读访客模式（readonly），受限工具调用已自动禁止。")
+    elif _denied_actions_are_hook_blocks(items):
+        lines.append("\n提示：上述拦截由安全护栏（PreToolUse Hook）触发，并非 `/mode safe` 审批模式导致。")
+    elif str(mode or "").strip().lower() == "safe":
+        lines.append("\n提示：当前会话处于 `/mode safe` 手动确认模式，如需自动放行可执行 `/mode auto` 后重试。")
+    return "\n".join(lines)
+
+
+_EMPTY_REPLY_CONTINUATION_PROMPT = (
+    "你上一轮任务已执行完成，但未输出任何文字回复。"
+    "请直接基于上一轮已完成的上下文，用清晰简明的中文总结执行结果或直接回答用户的问题，"
+    "无需重复执行已完成的操作。"
+)
+EMPTY_REPLY_CONTINUATION_TIMEOUT = float(
+    os.environ.get("AGY_EMPTY_REPLY_CONTINUATION_TIMEOUT", "45") or 45
+)
+
+
+def _attempt_empty_reply_continuation(
+    sess,
+    *,
+    conv,
+    exec_skey,
+    mode,
+    active_model,
+    effort,
+    project,
+    workdir,
+    readonly,
+    untrusted,
+    is_worktree,
+    my_turn_gen,
+):
+    """Send at most 1 continuation prompt to the same session when SUCCESS produced empty text."""
+    if cancel_requested or shutting_down or _is_turn_gen_preempted(my_turn_gen):
+        return "", None
+    target_sess = sess
+    if target_sess is None or not target_sess.is_alive():
+        if not conv:
+            return "", None
+        try:
+            acq_kw = {"force_new": True, "readonly": bool(readonly)}
+            if untrusted:
+                acq_kw["untrusted"] = True
+            if is_worktree:
+                acq_kw["is_worktree"] = True
+            target_sess, _ = _acquire_session(
+                exec_skey, conv, mode, active_model, effort, project, workdir, **acq_kw
+            )
+        except Exception as exc:
+            log("Empty-reply continuation re-acquire failed: %r" % exc)
+            return "", None
+
+    def _invalidate_cont_session(reason_label):
+        try:
+            invalidate_session(reason_label, force=True, scope_key=exec_skey)
+        except Exception:
+            pass
+        if target_sess is not None:
+            try:
+                target_sess.close(force=True)
+            except Exception:
+                pass
+
+    cont_start_line = get_transcript_line_count(conv or getattr(target_sess, "cid", None))
+    try:
+        target_sess.send_user_prompt(_EMPTY_REPLY_CONTINUATION_PROMPT)
+    except Exception as exc:
+        log("Empty-reply continuation send_user_prompt failed: %r" % exc)
+        _invalidate_cont_session("empty_reply_continuation_send_error")
+        return "", None
+
+    cont_buffers = {}
+    cont_result = None
+    aborted_reason = None
+    cont_timeout = max(5.0, float(EMPTY_REPLY_CONTINUATION_TIMEOUT or 45.0))
+    if TURN_SILENCE_TIMEOUT > 0:
+        cont_timeout = min(cont_timeout, float(TURN_SILENCE_TIMEOUT))
+    deadline = time.time() + cont_timeout
+    while True:
+        if cancel_requested:
+            aborted_reason = "empty_reply_continuation_cancelled"
+            break
+        if shutting_down:
+            aborted_reason = "empty_reply_continuation_shutdown"
+            break
+        if _is_turn_gen_preempted(my_turn_gen):
+            aborted_reason = "empty_reply_continuation_preempted"
+            break
+        rem = deadline - time.time()
+        if rem <= 0:
+            log("Empty-reply continuation timed out after %.1fs" % cont_timeout)
+            aborted_reason = "empty_reply_continuation_timeout"
+            break
+        ev = target_sess.next_event(timeout=min(0.25, rem))
+        if ev is None:
+            continue
+        kind = ev.get("event")
+        if kind == "__eof__":
+            aborted_reason = "empty_reply_continuation_eof"
+            break
+        if kind == "step_update":
+            su = ev.get("step_update") or {}
+            if su.get("step_type") == "agent_response":
+                delta = su.get("text_delta") or ""
+                if delta:
+                    sidx = su.get("step_index", 0)
+                    cont_buffers[sidx] = cont_buffers.get(sidx, "") + delta
+        elif kind == "result":
+            cont_result = ev.get("result") or ev
+            break
+
+    if aborted_reason is not None:
+        _invalidate_cont_session(aborted_reason)
+
+    cont_resp = ""
+    if isinstance(cont_result, dict):
+        cont_resp = (cont_result.get("response") or "").strip()
+    if not cont_resp and cont_buffers:
+        cont_resp = _latest_step_buffer_text(cont_buffers)
+    eff_cid = (
+        (cont_result.get("conversation_id") if isinstance(cont_result, dict) else None)
+        or conv
+        or getattr(target_sess, "cid", None)
+    )
+    if not cont_resp and eff_cid:
+        cont_resp = _recover_turn_reply_from_transcript(eff_cid, cont_start_line)
+    return cont_resp, cont_result
+
+
+def _build_empty_success_fallback_summary(
+    cid,
+    start_line=0,
+    *,
+    before_files=None,
+    workdir=None,
+    turn_tool_texts=None,
+    finished_reason=None,
+    started=None,
+    attempted_continuation=False,
+):
+    """Build a readable Chinese execution summary when a SUCCESS turn still has empty text."""
+    _th_list, tc_list, _ = get_turn_details(cid, start_line)
+    tool_names = []
+    for tc in tc_list or []:
+        if isinstance(tc, dict):
+            nm = str(tc.get("name") or tc.get("tool_name") or tc.get("tool") or "").strip()
+            if nm:
+                tool_names.append(nm)
+    if not tool_names and turn_tool_texts:
+        for raw_tt in turn_tool_texts:
+            nm = str(raw_tt or "").strip().split(" ", 1)[0].strip()
+            if nm:
+                tool_names.append(nm)
+
+    changed_files = []
+    if isinstance(before_files, dict):
+        active_wdir = workdir or current_workdir()
+        try:
+            cur_files = snapshot_workspace_files(workdir=active_wdir)
+            changed_files = sorted(
+                os.path.relpath(fp, active_wdir)
+                for fp, mtime in cur_files.items()
+                if fp not in before_files or mtime > before_files.get(fp, 0)
+            )
+        except Exception:
+            changed_files = []
+
+    comp_note = "（已自动尝试 1 次续写补偿，仍未返回正文）" if attempted_continuation else ""
+    lines = [f"⚠️ 本轮任务已执行结束，但模型未返回正文回复{comp_note}。"]
+    if tool_names:
+        uniq = list(dict.fromkeys(tool_names))
+        shown = ", ".join(f"`{n}`" for n in uniq[:8])
+        more = f" 等共 {len(tool_names)} 次调用" if len(tool_names) > len(uniq[:8]) else f"（共 {len(tool_names)} 次调用）"
+        lines.append(f"• 已执行工具：{shown}{more}")
+    if changed_files:
+        shown_f = ", ".join(f"`{fn}`" for fn in changed_files[:6])
+        more_f = f" (+{len(changed_files) - 6})" if len(changed_files) > 6 else ""
+        lines.append(f"• 变更文件：{shown_f}{more_f}")
+    meta_parts = ["status=SUCCESS"]
+    if finished_reason:
+        meta_parts.append(f"reason={finished_reason}")
+    if started is not None:
+        meta_parts.append(f"耗时 {max(0.0, time.time() - float(started)):.1f}s")
+    lines.append(f"• 执行状态：{' · '.join(meta_parts)}")
+    lines.append("可直接回复追问，或发送 `/retry` 重新生成回复。")
+    return "\n".join(lines)
+
+
 def _compute_workspace_diff_and_footer(
     result,
     before_files,
@@ -3523,6 +3818,8 @@ def _compute_workspace_diff_and_footer(
     step_text="",
     workdir=None,
     fallback_from=None,
+    mode=None,
+    readonly=False,
 ):
     dur = time.time() - started
     denied = result.get("denied_actions") or []
@@ -3555,7 +3852,18 @@ def _compute_workspace_diff_and_footer(
 
     suffix = []
     if denied:
-        suffix.append("🔒 Denied: " + ", ".join(d.get("action", "?") for d in denied) + " (/mode auto to approve)")
+        denied_names = []
+        for d in denied[:5]:
+            if isinstance(d, dict):
+                nm = str(d.get("action") or d.get("tool_name") or d.get("tool") or "?").strip()
+                denied_names.append(nm or "?")
+            elif d:
+                denied_names.append(str(d).strip()[:60])
+        more_d = f" (+{len(denied) - 5})" if len(denied) > 5 else ""
+        mode_hint = ""
+        if not readonly and str(mode or "").strip().lower() == "safe" and not _denied_actions_are_hook_blocks(denied):
+            mode_hint = "（safe 模式，可 /mode auto 放行）"
+        suffix.append("🔒 已拦截: " + ", ".join(denied_names) + more_d + mode_hint)
     if finished_reason == "print_timeout":
         suffix.append("⏰ Timeout reached (partial)")
     usage_kw = {"model": model, "effort": effort}
@@ -4097,6 +4405,20 @@ def _describe_active_busy_task():
     return True, "上一条任务", pending
 
 
+def _detect_external_history_markers(history_block: str) -> list:
+    """Detect untrusted external source markers embedded inside group `history_block`."""
+    if not history_block:
+        return []
+    hits = []
+    for m in memory_guard.UNTRUSTED_SOURCE_MARKERS:
+        if m in history_block and m not in hits:
+            hits.append(m)
+    for m in bot_bus.REMOTE_UNTRUSTED_MARKERS:
+        if m in history_block and m not in hits:
+            hits.append(m)
+    return hits
+
+
 def _run_fast_group_reply(
     chat_id,
     prompt_text,
@@ -4108,6 +4430,9 @@ def _run_fast_group_reply(
     busy_desc="",
     user_role="admin",
     user_id=None,
+    untrusted=False,
+    trust_level=None,
+    agent_origin=None,
 ):
     """Isolated read-only fast-reply lane that never mutates `turn_running`, `state`, or `undo`."""
     norm_tid = _normalize_thread_id(thread_id)
@@ -4137,9 +4462,40 @@ def _run_fast_group_reply(
             advance_cursor=True,
         )
         history_section = f"{history_block}\n\n" if history_block else ""
-        ro_prefix = (access_control.build_readonly_prompt_prefix(user_id) + "\n\n") if user_role == "readonly" else ""
+
+        raw_tl = str(trust_level or "").strip()
+        norm_tl = (
+            agent_driver.normalize_trust_level(raw_tl, default="readonly_guest")
+            if raw_tl
+            else ""
+        )
+        is_ext_origin = memory_guard.is_external_agent_origin(agent_origin)
+        explicit_low_trust = (
+            bool(norm_tl)
+            and agent_driver.TRUST_ORDER.get(norm_tl, 0) <= agent_driver.TRUST_ORDER["remote_untrusted"]
+        )
+        history_ext_markers = _detect_external_history_markers(history_block)
+        fast_readonly = (user_role == "readonly") or (norm_tl == "readonly_guest")
+        fast_untrusted = bool(
+            fast_readonly or untrusted or is_ext_origin or explicit_low_trust or history_ext_markers
+        )
+        default_fast_trust = "readonly_guest" if fast_readonly else ("remote_untrusted" if fast_untrusted else "local_admin")
+        eff_fast_trust = norm_tl or default_fast_trust
+        if fast_readonly:
+            eff_fast_trust = agent_driver.min_trust_level(eff_fast_trust, "readonly_guest")
+        if fast_untrusted:
+            eff_fast_trust = agent_driver.min_trust_level(eff_fast_trust, "remote_untrusted")
+        eff_fast_origin = str(agent_origin or "").strip().lower() or "local_tg_fast"
+
+        ro_prefix = (access_control.build_readonly_prompt_prefix(user_id) + "\n\n") if fast_readonly else ""
+        boundary_prefix = (
+            (memory_guard.build_untrusted_memory_boundary() + "\n\n")
+            if (fast_untrusted and not fast_readonly)
+            else ""
+        )
         fast_prompt = (
             f"{ro_prefix}"
+            f"{boundary_prefix}"
             f"[ACB_FAST_GROUP_CHAT bot=@{my_handle}]\n"
             f"你当前正在后台串行执行耗时任务（{busy_desc or '进行中'}），现在通过【只读快答旁路】响应群内的一条简短提问/点名。\n"
             f"- 严禁修改任何工作区文件或执行写入/提交/部署命令（当前为只读安全模式）。\n"
@@ -4170,11 +4526,16 @@ def _run_fast_group_reply(
         _inject_bot_isolation_env(env, handle=my_handle, role=_current_bot_role())
         env["AGY_BOT_BUS_ENABLE"] = "0"
         env["AGY_INTERNAL_OBSERVER"] = "1"
-        fast_inspect = memory_guard.inspect_text(fast_prompt)
-        fast_untrusted = (user_role == "readonly") or fast_inspect["untrusted"]
+        env["AGY_RBAC_ROLE"] = "readonly" if fast_readonly else "admin"
+        env["AGY_TRUST_LEVEL"] = eff_fast_trust
+        env["AGY_AGENT_ORIGIN"] = eff_fast_origin
+        env.pop("AGY_TURN_TAINT_ONLY", None)
         if fast_untrusted:
             env["AGY_UNTRUSTED_SESSION"] = "1"
             env["AGY_MEMORY_READONLY"] = "1"
+        else:
+            env.pop("AGY_UNTRUSTED_SESSION", None)
+            env.pop("AGY_MEMORY_READONLY", None)
 
         rc, raw_out, raw_err = _run_subprocess_group(
             cmd,
@@ -4200,10 +4561,9 @@ def _run_fast_group_reply(
                 if fast_cid:
                     bot_profiles.register_cid_owner(str(fast_cid), my_handle, bus_dir=bot_bus.BUS_DIR)
                 if fast_untrusted and fast_cid:
-                    reason = "readonly_fast_reply" if user_role == "readonly" else ",".join(fast_inspect["reasons"][:4])
                     memory_guard.mark_tainted(
                         str(fast_cid),
-                        reason=reason or "fast_untrusted",
+                        reason="readonly_fast_reply",
                         source="bridge:fast_group_reply",
                         taint_file=MEMORY_TAINT_FILE,
                     )
@@ -4394,6 +4754,9 @@ def run_agy(
     sync_tg=False,
     claimed_turn_gen=None,
     claimed_qid=None,
+    trust_level=None,
+    untrusted=False,
+    agent_origin=None,
 ):
     global turn_running, turn_running_scope, turn_running_chat, turn_running_web_id, turn_running_cid, turn_running_worktree_id, turn_running_qid
     global turn_gen, turn_waiting_bg, turn_waiting_bg_since, turn_preempted_gen, cancel_requested
@@ -4444,7 +4807,13 @@ def run_agy(
 
     norm_tid = _normalize_thread_id(thread_id)
     skey = scope_key or scope_key_for(chat_id, norm_tid)
-    session_readonly = (user_role == "readonly")
+    raw_trust_level = str(trust_level or "").strip()
+    norm_explicit_trust = (
+        agent_driver.normalize_trust_level(raw_trust_level, default="readonly_guest")
+        if raw_trust_level
+        else ""
+    )
+    session_readonly = (user_role == "readonly") or (norm_explicit_trust == "readonly_guest")
     exec_skey = f"{skey}:ro:{user_id if user_id is not None else 'guest'}" if session_readonly else skey
 
     if not session_readonly and not is_web_turn:
@@ -4581,7 +4950,6 @@ def run_agy(
         _need_reinject = bool(_sc_prof.get("profile_reinject_needed"))
     _should_inject_profile = bool(
         _prof_block
-        and "[ACB_BOT_PROFILE " not in (prompt or "")
         and (conv is None or _need_reinject or _prev_prof_rev != _cur_prof_rev)
     )
     if _should_inject_profile:
@@ -4598,6 +4966,7 @@ def run_agy(
         prompt_parts.append(_build_coordinator_first_turn_prefix())
     if undo_notice:
         prompt_parts.append(undo_notice)
+    history_block = ""
     if chat_id and int(chat_id) < 0 and not (prompt or "").lstrip().startswith("/"):
         history_block = bot_bus.format_unseen_group_history(
             int(chat_id),
@@ -4618,33 +4987,72 @@ def run_agy(
             _sc_prof_w["last_seen_checkpoints"] = int(_cur_conv_ckpts or 0)
             _sc_prof_w.pop("profile_reinject_needed", None)
 
-    prompt_taint = memory_guard.inspect_text(effective_prompt)
-    remote_markers_hit = [m for m in bot_bus.REMOTE_UNTRUSTED_MARKERS if m in effective_prompt]
+    # Plan A (C1/C2): Trust-channel routing.
+    # - Trusted Owner direct (`local_admin` & non-external channel & clean conv) skips keyword tainting completely.
+    # - Non-Owner (`readonly_guest`, explicit `untrusted=True`, low `trust_level`, external `agent_origin`,
+    #   or already-tainted `conv`) is Fail-Closed session-tainted; scan pure untrusted payload BEFORE system blocks.
+    is_external_origin = memory_guard.is_external_agent_origin(agent_origin)
+    explicit_low_trust = (
+        bool(norm_explicit_trust)
+        and agent_driver.TRUST_ORDER.get(norm_explicit_trust, 0) <= agent_driver.TRUST_ORDER["remote_untrusted"]
+    )
     conv_already_tainted = bool(conv and memory_guard.is_tainted(conv, taint_file=MEMORY_TAINT_FILE))
-    turn_untrusted = session_readonly or conv_already_tainted or prompt_taint["untrusted"] or bool(remote_markers_hit)
-    if session_readonly:
-        taint_reason = "readonly_guest"
-        taint_source = "bridge:readonly"
-    elif prompt_taint["untrusted"] or remote_markers_hit:
-        reasons = list(prompt_taint.get("reasons") or []) + [f"marker:{m}" for m in remote_markers_hit if f"marker:{m}" not in (prompt_taint.get("reasons") or [])]
-        taint_reason = ",".join(reasons[:4]) or "untrusted_prompt"
-        taint_source = "bridge:prompt"
-    elif conv_already_tainted:
-        taint_reason = "sticky_tainted_conv"
-        taint_source = "bridge:sticky"
+    is_owner_direct = (
+        (not session_readonly)
+        and (not untrusted)
+        and (not is_external_origin)
+        and (not explicit_low_trust)
+        and (not conv_already_tainted)
+    )
+    owner_history_turn_taint = False
+    persist_sticky_taint = True
+    if is_owner_direct:
+        history_external_markers = _detect_external_history_markers(history_block)
+        if history_external_markers:
+            # P1-1: Group history contains external untrusted markers (e.g. [GITHUB_WEBHOOK], [REMOTE_AGENT_UNTRUSTED]).
+            # Enforce full turn-level untrusted boundary + PreToolUse/memory protection for THIS turn,
+            # WITHOUT permanently locking the Owner's conversation on subsequent clean turns.
+            turn_untrusted = True
+            owner_history_turn_taint = True
+            persist_sticky_taint = False
+            taint_reason = ",".join(f"history_marker:{m}" for m in history_external_markers[:4])
+            taint_source = "bridge:group_history_external"
+        else:
+            turn_untrusted = False
+            taint_reason = ""
+            taint_source = ""
     else:
-        taint_reason = ""
-        taint_source = ""
+        turn_untrusted = True
+        untrusted_payload = "\n\n".join(x for x in (history_block, str(base_prompt or "")) if x)
+        prompt_taint = memory_guard.inspect_text(untrusted_payload)
+        remote_markers_hit = [m for m in bot_bus.REMOTE_UNTRUSTED_MARKERS if m in untrusted_payload]
+        if session_readonly:
+            taint_reason = "readonly_guest"
+            taint_source = "bridge:readonly"
+        elif prompt_taint["untrusted"] or remote_markers_hit:
+            reasons = list(prompt_taint.get("reasons") or []) + [
+                f"marker:{m}"
+                for m in remote_markers_hit
+                if f"marker:{m}" not in (prompt_taint.get("reasons") or [])
+            ]
+            taint_reason = ",".join(reasons[:4]) or "untrusted_external_channel"
+            taint_source = f"bridge:{agent_origin}" if agent_origin else "bridge:external"
+        elif is_external_origin or untrusted or explicit_low_trust:
+            taint_reason = str(agent_origin or norm_explicit_trust or "untrusted_channel")
+            taint_source = f"bridge:{agent_origin}" if agent_origin else "bridge:external"
+        else:
+            taint_reason = "sticky_tainted_conv"
+            taint_source = "bridge:sticky"
 
     if turn_untrusted:
-        if conv:
+        if conv and persist_sticky_taint:
             memory_guard.mark_tainted(
                 conv,
                 reason=taint_reason,
                 source=taint_source,
                 taint_file=MEMORY_TAINT_FILE,
             )
-        if not session_readonly and "[AGY_MEMORY_READONLY=1]" not in effective_prompt:
+        if not session_readonly:
             effective_prompt = memory_guard.build_untrusted_memory_boundary() + "\n\n" + effective_prompt
 
     before_files = snapshot_workspace_files(workdir=workdir)
@@ -4900,6 +5308,12 @@ def run_agy(
             }
             if turn_untrusted:
                 acq_kw["untrusted"] = True
+            if owner_history_turn_taint:
+                acq_kw["turn_taint_only"] = True
+            if norm_explicit_trust:
+                acq_kw["trust_level"] = norm_explicit_trust
+            if agent_origin is not None and str(agent_origin).strip():
+                acq_kw["agent_origin"] = str(agent_origin).strip().lower()
             if active_wt_id:
                 acq_kw["is_worktree"] = True
             sess, reused_warm = _acquire_session(
@@ -4918,7 +5332,7 @@ def run_agy(
             if sess.cid and sess.cid != conv:
                 conv = sess.cid
                 streamer.set_cid(conv)
-            if turn_untrusted and conv:
+            if turn_untrusted and persist_sticky_taint and conv:
                 memory_guard.mark_tainted(
                     conv,
                     reason=taint_reason,
@@ -5008,7 +5422,7 @@ def run_agy(
                         bot_profiles.register_cid_owner(
                             cid, _current_bot_handle(), bus_dir=bot_bus.BUS_DIR
                         )
-                        if turn_untrusted:
+                        if turn_untrusted and persist_sticky_taint:
                             memory_guard.mark_tainted(
                                 cid,
                                 reason=taint_reason,
@@ -5194,7 +5608,8 @@ def run_agy(
                                     result, before_files, started, active_model, effort,
                                     cid=cur_cid, turn_start_line=turn_start_line,
                                     turn_tool_texts=turn_tool_texts, step_text=final_step_text,
-                                    workdir=workdir, fallback_from=fb_from,
+                                    workdir=workdir, fallback_from=fb_from, mode=mode,
+                                    readonly=session_readonly,
                                 )
                                 last_msg_info = streamer.finalize_step(
                                     final_step_text, header_html=header_html,
@@ -5615,7 +6030,7 @@ def run_agy(
                 sess.cid = res_cid
             if tg_turn_id is not None:
                 _studio_ipc_buffer.set_cid(tg_turn_id, res_cid)
-            if turn_untrusted:
+            if turn_untrusted and persist_sticky_taint:
                 memory_guard.mark_tainted(
                     res_cid,
                     reason=taint_reason,
@@ -5694,6 +6109,7 @@ def run_agy(
 
         status = result.get("status")
         finished_reason = result.get("finished_reason")
+        denied_actions = result.get("denied_actions") or []
         resp = (result.get("response") or "").strip()
         if not resp and step_buffers:
             resp = _latest_step_buffer_text(step_buffers)
@@ -5713,6 +6129,59 @@ def run_agy(
                     _latest_step_buffer_text(step_buffers),
                     post_rec_text,
                 )
+
+        if status == "SUCCESS" and delivered_steps == 0 and not resp:
+            # 1) First try recovering reply text from current turn's transcript slice
+            recovered_txt = _recover_turn_reply_from_transcript(conv, turn_start_line)
+            if recovered_txt:
+                log("Empty SUCCESS response recovered from transcript (conv=%s)" % ((conv or "none")[:8],))
+                resp = recovered_txt
+            elif denied_actions:
+                # 2) Clear Chinese denial explanation when actions were blocked
+                resp = _format_denied_actions_reply(
+                    denied_actions, mode=mode, readonly=session_readonly
+                )
+            else:
+                # 3) At most 1 automatic continuation follow-up on the same session
+                attempted_cont = False
+                if not cancel_requested and not shutting_down and not _is_my_turn_preempted():
+                    attempted_cont = True
+                    log("Empty SUCCESS response with 0 delivered steps; attempting 1 continuation retry (conv=%s)" % ((conv or "none")[:8],))
+                    cont_resp, cont_res = _attempt_empty_reply_continuation(
+                        sess,
+                        conv=conv,
+                        exec_skey=exec_skey,
+                        mode=mode,
+                        active_model=active_model,
+                        effort=effort,
+                        project=project,
+                        workdir=workdir,
+                        readonly=session_readonly,
+                        untrusted=turn_untrusted,
+                        is_worktree=bool(active_wt_id),
+                        my_turn_gen=my_turn_gen,
+                    )
+                    if cont_resp:
+                        resp = cont_resp
+                    if isinstance(cont_res, dict) and cont_res.get("denied_actions") and not resp:
+                        denied_actions = cont_res.get("denied_actions") or []
+                        result = dict(result)
+                        result["denied_actions"] = denied_actions
+                        resp = _format_denied_actions_reply(
+                            denied_actions, mode=mode, readonly=session_readonly
+                        )
+                # 4) Still empty -> readable Chinese execution summary (never raw placeholder)
+                if not resp:
+                    resp = _build_empty_success_fallback_summary(
+                        conv,
+                        turn_start_line,
+                        before_files=before_files,
+                        workdir=workdir,
+                        turn_tool_texts=turn_tool_texts,
+                        finished_reason=finished_reason,
+                        started=started,
+                        attempted_continuation=attempted_cont,
+                    )
         with state_lock:
             sc_w = _ensure_scope_locked(exec_skey)
             if isinstance(sc_w.get("last_turn"), dict):
@@ -5766,7 +6235,8 @@ def run_agy(
             result, before_files, started, active_model, effort,
             cid=conv, turn_start_line=turn_start_line,
             turn_tool_texts=turn_tool_texts, step_text=resp,
-            workdir=workdir, fallback_from=fb_from,
+            workdir=workdir, fallback_from=fb_from, mode=mode,
+            readonly=session_readonly,
         )
         push_step_images(
             chat_id, resp, conv, started, before_files, sent_images,
@@ -5807,7 +6277,15 @@ def run_agy(
                 if show_thinking:
                     th_list, tc_list, _ = get_turn_details(conv, segment_start_line)
                     header_html = build_thinking_header(th_list, tc_list)
-                out = resp or "(agy finished without a text response)"
+                out = resp or _build_empty_success_fallback_summary(
+                    conv,
+                    turn_start_line,
+                    before_files=before_files,
+                    workdir=workdir,
+                    turn_tool_texts=turn_tool_texts,
+                    finished_reason=finished_reason,
+                    started=started,
+                )
                 sent_info = send_rich(chat_id, out, header_html=header_html,
                           footer_str=footer_str, reply_markup=reply_markup, thread_id=norm_tid)
                 if sent_info[0]:
@@ -6743,11 +7221,12 @@ def execute_scheduled_task(task):
                 "markers": list(dict.fromkeys(list(precheck_taint["markers"]) + list(prompt_taint["markers"]))),
                 "poison_rules": list(dict.fromkeys(list(precheck_taint["poison_rules"]) + list(prompt_taint["poison_rules"]))),
             }
-            sched_untrusted = (not payload.get("use_memory")) or sched_taint["untrusted"]
-            if sched_untrusted:
-                env["AGY_INTERNAL_OBSERVER"] = "1"
-                env["AGY_UNTRUSTED_SESSION"] = "1"
-                env["AGY_MEMORY_READONLY"] = "1"
+            sched_untrusted = True
+            env["AGY_INTERNAL_OBSERVER"] = "1"
+            env["AGY_UNTRUSTED_SESSION"] = "1"
+            env["AGY_MEMORY_READONLY"] = "1"
+            env["AGY_TRUST_LEVEL"] = "remote_untrusted"
+            env["AGY_AGENT_ORIGIN"] = "scheduled"
 
             started_ts = time.time()
             before_files = snapshot_workspace_files(workdir=exec_workdir)
@@ -7139,26 +7618,15 @@ def _execute_bus_job(job_id, *, claimed_turn_gen=None, claimed_qid=None):
 
         before_files = snapshot_workspace_files(workdir=exec_workdir)
         before_outbox = snapshot_workspace_files(workdir=BOT_OUTBOX_DIR) if os.path.isdir(BOT_OUTBOX_DIR) else {}
-        full_prompt = bot_bus.format_worker_envelope(
+        raw_job_envelope = bot_bus.format_worker_envelope(
             job,
             exec_workdir,
             BOT_OUTBOX_DIR,
             worker_specialty=cfg.get("specialty") or "",
             worktree_info=wt_info,
         )
-        if not resume_cid:
-            try:
-                _b_rev, _b_prof = bot_profiles.render_bot_profile_prompt(
-                    my_handle,
-                    role=_current_bot_role(),
-                    catalog_dirs=[os.path.join(exec_workdir, ".agents", "skills")],
-                )
-                if _b_prof and "[ACB_BOT_PROFILE " not in full_prompt:
-                    full_prompt = _b_prof + "\n\n" + full_prompt
-            except Exception:
-                pass
 
-        # C2: Inspect prompt & job metadata for taint / monotonic privilege attenuation
+        # C2: Inspect pure untrusted job envelope BEFORE concatenating trusted system Profile/boundary blocks
         job_readonly = bool(job.get("readonly", False))
         job_team_id = agent_driver.validate_team_id(job.get("team_id") or "")
         job_origin = str(job.get("agent_origin") or "local_bus").strip().lower() or "local_bus"
@@ -7177,8 +7645,8 @@ def _execute_bus_job(job_id, *, claimed_turn_gen=None, claimed_qid=None):
         if job_trust == "readonly_guest":
             job_readonly = True
 
-        prompt_scan = memory_guard.inspect_text(full_prompt)
-        has_remote_marker = any(m in full_prompt for m in bot_bus.REMOTE_UNTRUSTED_MARKERS)
+        prompt_scan = memory_guard.inspect_text(raw_job_envelope)
+        has_remote_marker = any(m in raw_job_envelope for m in bot_bus.REMOTE_UNTRUSTED_MARKERS)
         conv_tainted = bool(resume_cid and memory_guard.is_tainted(resume_cid, taint_file=MEMORY_TAINT_FILE))
         if (
             is_remote_origin
@@ -7189,6 +7657,19 @@ def _execute_bus_job(job_id, *, claimed_turn_gen=None, claimed_qid=None):
         ):
             job_tainted = True
 
+        full_prompt = raw_job_envelope
+        if not resume_cid:
+            try:
+                _b_rev, _b_prof = bot_profiles.render_bot_profile_prompt(
+                    my_handle,
+                    role=_current_bot_role(),
+                    catalog_dirs=[os.path.join(exec_workdir, ".agents", "skills")],
+                )
+                if _b_prof:
+                    full_prompt = _b_prof + "\n\n" + full_prompt
+            except Exception:
+                pass
+
         job_untrusted = bool(job_tainted or job_readonly)
         job_max_mode = str(job.get("max_runtime_mode") or "").strip().lower()
         if job_untrusted:
@@ -7196,10 +7677,7 @@ def _execute_bus_job(job_id, *, claimed_turn_gen=None, claimed_qid=None):
                 job_trust,
                 "readonly_guest" if job_readonly else "remote_untrusted",
             )
-            exec_mode = "safe"
-            job_max_mode = "safe"
-            if "[AGY_MEMORY_READONLY=1]" not in full_prompt:
-                full_prompt = memory_guard.build_untrusted_memory_boundary() + "\n\n" + full_prompt
+            full_prompt = memory_guard.build_untrusted_memory_boundary() + "\n\n" + full_prompt
             if resume_cid:
                 memory_guard.mark_tainted(
                     resume_cid,
@@ -7207,6 +7685,9 @@ def _execute_bus_job(job_id, *, claimed_turn_gen=None, claimed_qid=None):
                     source=f"bus_job:{job_id}",
                     taint_file=MEMORY_TAINT_FILE,
                 )
+        if job_readonly:
+            exec_mode = "safe"
+            job_max_mode = "safe"
         elif job_max_mode:
             exec_mode = agent_driver.min_runtime_mode(exec_mode, job_max_mode, default=exec_mode)
 
@@ -7388,6 +7869,9 @@ def _execute_bus_job(job_id, *, claimed_turn_gen=None, claimed_qid=None):
                 )
                 final_text = resp
             elif st == "SUCCESS":
+                if not resp and new_cid:
+                    bus_start_line = pre_turn_tline if (resume_cid and new_cid == resume_cid) else 0
+                    resp = _recover_turn_reply_from_transcript(new_cid, bus_start_line)
                 if resp:
                     final_status = "done"
                     err_code = "OK"
@@ -8052,6 +8536,13 @@ _BATCH_WAKEUP_HEADER_RE = re.compile(
 
 def _extract_batch_wakeup_job_ids(prompt):
     """Extract pending `batch_done` job IDs from a queued wake prompt (supports restart recovery)."""
+    if (
+        isinstance(prompt, tuple)
+        and len(prompt) == 2
+        and prompt[0] == "__CHAT_TURN__"
+        and isinstance(prompt[1], dict)
+    ):
+        prompt = prompt[1].get("prompt")
     if not isinstance(prompt, str) or "[ACB_TEAM_ASYNC_DONE " not in prompt:
         return []
     m = _BATCH_WAKEUP_HEADER_RE.match(prompt)
@@ -8188,6 +8679,9 @@ def _handle_bot_bus_packet(pkt):
                 has_media=False,
                 raw_text="",
                 allow_preempt=False,
+                untrusted=True,
+                trust_level="remote_untrusted",
+                agent_origin="scheduled_handoff",
             )
     elif ptype == "sync_group_model":
         m_mode = str(pkt.get("model_mode") or bot_bus.MODEL_MODE_DEFAULT).strip().lower()
@@ -8334,7 +8828,24 @@ def _handle_bot_bus_packet(pkt):
                     if len(_pending_batch_wakeup_acks) >= 256:
                         _pending_batch_wakeup_acks.pop(next(iter(_pending_batch_wakeup_acks)), None)
                     _pending_batch_wakeup_acks[gid] = list(jids)
-            job_q.put((c_id, t_id, skey, wake_prompt))
+            if batch_tainted:
+                wake_item = (
+                    "__CHAT_TURN__",
+                    {
+                        "prompt": wake_prompt,
+                        "origin_msg_id": 0,
+                        "mention_hop": 0,
+                        "chain_id": "",
+                        "user_role": "admin",
+                        "user_id": None,
+                        "untrusted": True,
+                        "trust_level": "remote_untrusted",
+                        "agent_origin": "remote_batch_done",
+                    },
+                )
+            else:
+                wake_item = wake_prompt
+            job_q.put((c_id, t_id, skey, wake_item))
         elif jids:
             try:
                 bot_bus.mark_batch_wakeup_acked(jids)
@@ -8624,6 +9135,8 @@ def worker():
                                 % (item_sgen, item_tgen, wm)
                             )
                             continue
+                if isinstance(meta.get("prompt"), str):
+                    _ack_batch_wakeup_from_prompt(meta["prompt"])
                 run_agy(
                     chat_id,
                     meta["prompt"],
@@ -8638,6 +9151,9 @@ def worker():
                     override_workdir=meta.get("override_workdir"),
                     claimed_turn_gen=claimed_turn_gen,
                     claimed_qid=qid,
+                    trust_level=meta.get("trust_level"),
+                    untrusted=bool(meta.get("untrusted", False)),
+                    agent_origin=meta.get("agent_origin"),
                 )
             else:
                 if isinstance(prompt, str):
@@ -14477,6 +14993,9 @@ def enqueue(
     user_role="admin",
     user_id=None,
     allow_preempt=True,
+    untrusted=False,
+    trust_level=None,
+    agent_origin=None,
 ):
     global turn_waiting_bg, turn_waiting_bg_since, turn_preempted_gen
     norm_tid = _normalize_thread_id(thread_id)
@@ -14518,7 +15037,16 @@ def enqueue(
             "请直接响应下方最新消息。\n\n"
             + prompt
         )
-        if origin_msg_id or mention_hop or chain_id or user_role != "admin" or user_id is not None:
+        if (
+            origin_msg_id
+            or mention_hop
+            or chain_id
+            or user_role != "admin"
+            or user_id is not None
+            or untrusted
+            or trust_level is not None
+            or agent_origin is not None
+        ):
             item_payload = (
                 "__CHAT_TURN__",
                 {
@@ -14528,6 +15056,9 @@ def enqueue(
                     "chain_id": str(chain_id or ""),
                     "user_role": str(user_role or "admin"),
                     "user_id": user_id,
+                    "untrusted": bool(untrusted),
+                    "trust_level": trust_level,
+                    "agent_origin": agent_origin,
                 },
             )
         else:
@@ -14551,6 +15082,9 @@ def enqueue(
             and chat_id
             and int(chat_id) < 0
             and BUS_FAST_CHAT_ENABLED
+            and not untrusted
+            and trust_level is None
+            and not memory_guard.is_external_agent_origin(agent_origin)
             and _is_fast_chat_candidate(raw_text if raw_text is not None else prompt, has_media=has_media, is_mention=is_mention)
         ):
             if _fast_chat_sem.acquire(blocking=False):
@@ -14566,13 +15100,25 @@ def enqueue(
                         "busy_desc": busy_desc,
                         "user_role": user_role,
                         "user_id": user_id,
+                        "untrusted": bool(untrusted),
+                        "trust_level": trust_level,
+                        "agent_origin": agent_origin,
                     },
                     daemon=True,
                 ).start()
                 return
 
         enq_prompt = prompt
-        if origin_msg_id or mention_hop or chain_id or user_role != "admin" or user_id is not None:
+        if (
+            origin_msg_id
+            or mention_hop
+            or chain_id
+            or user_role != "admin"
+            or user_id is not None
+            or untrusted
+            or trust_level is not None
+            or agent_origin is not None
+        ):
             item_payload = (
                 "__CHAT_TURN__",
                 {
@@ -14582,6 +15128,9 @@ def enqueue(
                     "chain_id": str(chain_id or ""),
                     "user_role": str(user_role or "admin"),
                     "user_id": user_id,
+                    "untrusted": bool(untrusted),
+                    "trust_level": trust_level,
+                    "agent_origin": agent_origin,
                 },
             )
         else:

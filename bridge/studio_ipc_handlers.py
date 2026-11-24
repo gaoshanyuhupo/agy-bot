@@ -2336,6 +2336,12 @@ def _execute_room_turn(room_req, *, claimed_turn_gen=None, claimed_qid=None):
 
     try:
         eff_role, _team_id, _eff_trust = _resolve_room_turn_effective_role(room_req, host=h)
+        room_prompt_str = str(room_req["prompt"] or "")
+        room_untrusted = (
+            eff_role == "readonly"
+            or bool(room_req.get("untrusted", False))
+            or "[UNTRUSTED_WEB_ROOM_MESSAGE" in room_prompt_str
+        )
         h.run_agy(
             0,
             room_req["prompt"],
@@ -2350,6 +2356,9 @@ def _execute_room_turn(room_req, *, claimed_turn_gen=None, claimed_qid=None):
             sync_tg=False,
             claimed_turn_gen=claimed_turn_gen,
             claimed_qid=claimed_qid,
+            trust_level=_eff_trust,
+            untrusted=room_untrusted,
+            agent_origin=str(room_req.get("agent_origin") or "web_room"),
         )
         reply_text = "".join(deltas).strip() or final_resp["text"].strip()
         result_box["status"] = final_resp["status"]
@@ -2404,6 +2413,8 @@ def _execute_web_turn(web_req, *, claimed_turn_gen=None, claimed_qid=None):
             sync_tg=(web_req.get("sync_tg") is True),
             claimed_turn_gen=claimed_turn_gen,
             claimed_qid=claimed_qid,
+            trust_level="local_admin",
+            agent_origin="local_web",
         )
     except Exception as exc:
         h.log("web turn %s failed: %r" % (turn_id, exc))

@@ -154,7 +154,85 @@ def _record_block() -> None:
         _MEMORY_GUARD.record_guard_block(1)
 
 
-def _inspect_payload_and_steps(payload: dict[str, Any], tail_steps: list[dict[str, Any]]) -> tuple[bool, str]:
+def _is_owner_direct_session() -> bool:
+    """Return True ONLY when process-level env explicitly indicates a clean Owner direct channel."""
+    if _MEMORY_GUARD is not None and hasattr(_MEMORY_GUARD, "is_owner_direct_env"):
+        try:
+            return bool(_MEMORY_GUARD.is_owner_direct_env())
+        except Exception:
+            return False
+    trust = os.environ.get("AGY_TRUST_LEVEL", "").strip().lower()
+    if trust != "local_admin":
+        return False
+    if (
+        os.environ.get("AGY_UNTRUSTED_SESSION") == "1"
+        or os.environ.get("AGY_MEMORY_READONLY") == "1"
+        or os.environ.get("AGY_RBAC_ROLE", "").strip().lower() == "readonly"
+    ):
+        return False
+    orig = os.environ.get("AGY_AGENT_ORIGIN", "").strip().lower()
+    if orig.startswith("remote") or orig in (
+        "webhook",
+        "github_webhook",
+        "scheduled",
+        "scheduled_handoff",
+        "web_room",
+        "remote_hub",
+        "remote_untrusted",
+        "remote_batch_done",
+    ):
+        return False
+    return True
+
+
+def _inspect_payload_and_steps(
+    payload: dict[str, Any],
+    tail_steps: list[dict[str, Any]],
+    *,
+    owner_direct: bool = False,
+    truncated: bool = False,
+) -> tuple[bool, str]:
+    if owner_direct:
+        cwd = str(payload.get("cwd") or "")
+        ws_paths = payload.get("workspacePaths")
+        if not isinstance(ws_paths, list):
+            ws_paths = None
+        if _MEMORY_GUARD is not None and hasattr(_MEMORY_GUARD, "slice_current_turn_steps"):
+            turn_steps, found_user = _MEMORY_GUARD.slice_current_turn_steps(tail_steps)
+            if truncated and not found_user:
+                return True, "turn_window_truncated_no_user_input"
+            res = _MEMORY_GUARD.inspect_turn_external_steps(
+                turn_steps,
+                cwd=cwd,
+                workspace_paths=ws_paths,
+            )
+            if res.get("untrusted"):
+                return True, ",".join(res.get("reasons", [])[:4]) or "untrusted_external_tool"
+            return False, ""
+        last_u = -1
+        for i, st in enumerate(tail_steps):
+            if isinstance(st, dict) and st.get("type") == "USER_INPUT":
+                last_u = i
+        if truncated and last_u < 0:
+            return True, "turn_window_truncated_no_user_input"
+        turn_steps = tail_steps[last_u + 1 :] if last_u >= 0 else tail_steps
+        external_only = [
+            st
+            for st in turn_steps
+            if isinstance(st, dict)
+            and st.get("type") not in ("USER_INPUT", "PLANNER_RESPONSE", "CHECKPOINT", "SYSTEM_MESSAGE")
+        ]
+        blob = json.dumps(external_only, ensure_ascii=False)
+        for m in _FALLBACK_MARKERS:
+            if m in blob:
+                return True, f"marker:{m}"
+        if _FALLBACK_POISON_RE.search(blob):
+            return True, "poison:fallback"
+        return False, ""
+
+    if truncated and not any(isinstance(st, dict) and st.get("type") == "USER_INPUT" for st in tail_steps):
+        return True, "turn_window_truncated_no_user_input"
+
     if _MEMORY_GUARD is not None:
         res = _MEMORY_GUARD.inspect_payload(payload, tail_steps)
         if res["untrusted"]:
@@ -169,48 +247,84 @@ def _inspect_payload_and_steps(payload: dict[str, Any], tail_steps: list[dict[st
     return False, ""
 
 
+def _read_tail_steps_with_meta(
+    transcript_path: str,
+    max_bytes: int = 65536,
+    *,
+    hard_cap_bytes: int = 4 * 1024 * 1024,
+    expand_to_user_input: bool = False,
+) -> tuple[list[dict[str, Any]], bool]:
+    if _MEMORY_GUARD is not None and hasattr(_MEMORY_GUARD, "read_transcript_tail_steps_with_meta"):
+        try:
+            steps, meta = _MEMORY_GUARD.read_transcript_tail_steps_with_meta(
+                transcript_path,
+                max_bytes=max_bytes,
+                hard_cap_bytes=hard_cap_bytes,
+                expand_to_user_input=expand_to_user_input,
+            )
+            return steps, bool(isinstance(meta, dict) and meta.get("truncated"))
+        except Exception:
+            pass
+    if not transcript_path:
+        return [], False
+    tp = Path(transcript_path)
+    if not tp.is_file():
+        return [], False
+    try:
+        size = tp.stat().st_size
+        if size <= 0:
+            return [], False
+        window = max(1, int(max_bytes))
+        hard_cap = max(window, int(hard_cap_bytes))
+        steps: list[dict[str, Any]] = []
+        last_seek_pos = 0
+        with open(tp, "rb") as fb:
+            while True:
+                seek_pos = max(0, size - window)
+                last_seek_pos = seek_pos
+                fb.seek(seek_pos)
+                raw_lines = fb.read().splitlines()
+                if seek_pos > 0:
+                    raw_lines = raw_lines[1:]
+                parsed: list[dict[str, Any]] = []
+                for rl in raw_lines:
+                    if not rl.strip():
+                        continue
+                    try:
+                        obj = json.loads(rl.decode("utf-8", "replace"))
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(obj, dict):
+                        parsed.append(obj)
+                steps = parsed
+                if seek_pos == 0 or window >= hard_cap:
+                    break
+                if not steps:
+                    window = min(hard_cap, window * 2)
+                    continue
+                if expand_to_user_input and not any(st.get("type") == "USER_INPUT" for st in steps):
+                    window = min(hard_cap, window * 2)
+                    continue
+                break
+        return steps, (last_seek_pos > 0)
+    except OSError:
+        return [], False
+
+
 def _read_tail_steps(
     transcript_path: str,
     max_bytes: int = 65536,
     *,
     hard_cap_bytes: int = 4 * 1024 * 1024,
+    expand_to_user_input: bool = False,
 ) -> list[dict[str, Any]]:
-    if not transcript_path:
-        return []
-    tp = Path(transcript_path)
-    if not tp.is_file():
-        return []
-    try:
-        size = tp.stat().st_size
-        if size <= 0:
-            return []
-        window = max(1, int(max_bytes))
-        hard_cap = max(window, int(hard_cap_bytes))
-        with open(tp, "rb") as fb:
-            while True:
-                seek_pos = max(0, size - window)
-                fb.seek(seek_pos)
-                raw_lines = fb.read().splitlines()
-                if seek_pos == 0:
-                    break
-                non_empty_tail = [rl for rl in raw_lines[1:] if rl.strip()]
-                if non_empty_tail or window >= hard_cap:
-                    raw_lines = raw_lines[1:]
-                    break
-                window = min(hard_cap, window * 2)
-        steps: list[dict[str, Any]] = []
-        for rl in raw_lines:
-            if not rl.strip():
-                continue
-            try:
-                obj = json.loads(rl.decode("utf-8", "replace"))
-            except json.JSONDecodeError:
-                continue
-            if isinstance(obj, dict):
-                steps.append(obj)
-        return steps
-    except OSError:
-        return []
+    steps, _truncated = _read_tail_steps_with_meta(
+        transcript_path,
+        max_bytes=max_bytes,
+        hard_cap_bytes=hard_cap_bytes,
+        expand_to_user_input=expand_to_user_input,
+    )
+    return steps
 
 
 def _extract_prompt_text(payload: dict[str, Any], tail_steps: list[dict[str, Any]]) -> str:
@@ -471,7 +585,8 @@ def main() -> int:
             os.environ.get("AGY_UNTRUSTED_SESSION") == "1"
             or os.environ.get("AGY_MEMORY_READONLY") == "1"
         )
-        if env_untrusted and cid:
+        turn_taint_only = os.environ.get("AGY_TURN_TAINT_ONLY") == "1"
+        if env_untrusted and cid and not turn_taint_only:
             _mark_cid_tainted(cid, "env_untrusted_session", event)
 
         if event in ("session-init", "summarize") and (env_untrusted or _is_cid_tainted(cid)):
@@ -485,11 +600,18 @@ def main() -> int:
             return 0
 
         tpath = str(payload.get("transcriptPath") or payload.get("transcript_path") or "")
-        tail_steps: list[dict[str, Any]] = _read_tail_steps(tpath, max_bytes=65536) if tpath else []
+        owner_direct = _is_owner_direct_session()
+        tail_steps, truncated = (
+            _read_tail_steps_with_meta(tpath, max_bytes=65536, expand_to_user_input=True)
+            if tpath
+            else ([], False)
+        )
 
-        is_untrusted, untrusted_reason = _inspect_payload_and_steps(payload, tail_steps)
+        is_untrusted, untrusted_reason = _inspect_payload_and_steps(
+            payload, tail_steps, owner_direct=owner_direct, truncated=truncated
+        )
         if is_untrusted:
-            if cid:
+            if cid and not owner_direct and not turn_taint_only:
                 _mark_cid_tainted(cid, untrusted_reason, event)
             if event in ("session-init", "summarize"):
                 _record_block()

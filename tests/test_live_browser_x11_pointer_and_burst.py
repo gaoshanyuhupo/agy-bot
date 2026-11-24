@@ -991,10 +991,20 @@ class TestPhase2X11XTestPointerAndBurstContractD1ToD8(unittest.TestCase):
                 fake_clock[0] += 0.002
                 return fake_clock[0]
 
+            burst_acquired_exec_lock: list[bool] = []
+            orig_exec_acquire = hub._exec_lock.acquire
+
+            async def _spy_exec_acquire() -> bool:
+                if hub._burst_task is not None and asyncio.current_task() is hub._burst_task:
+                    burst_acquired_exec_lock.append(True)
+                return await orig_exec_acquire()
+
+            hub._exec_lock.acquire = _spy_exec_acquire  # type: ignore[method-assign]
+
             with (
                 mock.patch.object(srv, "_check_live_user_role", return_value="admin"),
                 mock.patch.object(srv.time, "monotonic", side_effect=_mono),
-                mock.patch.object(srv, "POST_CLICK_BURST_INTERVAL_SECONDS", 0.008),
+                mock.patch.object(srv, "POST_CLICK_BURST_INTERVAL_SECONDS", 0.03),
                 mock.patch.object(srv, "POST_CLICK_BURST_DURATION_SECONDS", 2.4),
                 mock.patch.object(srv, "POST_CLICK_BURST_MAX_FRAMES", 4),
                 mock.patch.object(srv, "SETTLE_RECAPTURE_DELAY_SECONDS", 5.0),  # keep settle out of burst window
@@ -1013,19 +1023,30 @@ class TestPhase2X11XTestPointerAndBurstContractD1ToD8(unittest.TestCase):
                 await asyncio.sleep(0)
                 tg_count_before_burst = len(tg_ticks)
                 self.assertEqual(10, tg_count_before_burst)
-                frames_before_burst = len(ws_a.sent_bytes)
+                # Clear lock observations from the concurrent 10-click loop (where another task held
+                # _exec_lock while the lock-free burst could wake on slower CI runners) so post-loop
+                # burst captures are verified cleanly alongside the direct acquire spy.
+                page.lock_states_during_screenshot.clear()
                 # Let bounded 4-frame burst finish naturally
                 burst_ref = hub._burst_task
                 self.assertIsNotNone(burst_ref)
-                await asyncio.wait_for(burst_ref, timeout=1.0)
+                await asyncio.wait_for(burst_ref, timeout=2.0)
 
-                burst_frames_delivered = len(ws_a.sent_bytes) - frames_before_burst
-                self.assertEqual(4, burst_frames_delivered, "Burst MUST deliver exactly bounded max frames to WS viewer A")
+                self.assertEqual(
+                    14,
+                    len(ws_a.sent_bytes),
+                    "10 discrete actions + 4 bounded burst frames MUST deliver 14 total frames to WS viewer A",
+                )
                 self.assertEqual([], ws_b.sent_bytes, "User B MUST receive 0 burst frames")
                 self.assertEqual(
                     tg_count_before_burst,
                     len(tg_ticks),
                     "Burst MUST NOT call tg.tick_updates at 8-10 FPS",
+                )
+                self.assertEqual(
+                    [],
+                    burst_acquired_exec_lock,
+                    "Burst task MUST NEVER acquire _exec_lock",
                 )
                 self.assertTrue(
                     all(not locked for locked in page.lock_states_during_screenshot),

@@ -43,6 +43,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 import collections
 import dataclasses
+import inspect
 import json
 import os
 import queue
@@ -452,6 +453,7 @@ class SessionSecurityContext:
     trust_level: str = "local_admin"
     team_id: str = ""
     agent_origin: str = "local_bus"
+    turn_taint_only: bool = False
 
 
 def build_session_security_context(
@@ -466,6 +468,7 @@ def build_session_security_context(
     team_id: str = "",
     agent_origin: str = "local_bus",
     max_runtime_mode: Optional[str] = None,
+    turn_taint_only: bool = False,
     host=None,
 ) -> SessionSecurityContext:
     """Compute canonical fail-closed security context shared by every Agent Driver.
@@ -474,8 +477,9 @@ def build_session_security_context(
     - `readonly=True` or `trust_level="readonly_guest"` ALWAYS forces `effective_mode="safe"`,
       `allow_skip_permissions=False`, `bus_enable=False`, `rbac_role="readonly"`, and `untrusted=True`.
     - `untrusted=True`, `trust_level <= "remote_untrusted"`, or `agent_origin.startswith("remote")`
-      ALWAYS forces `trust_level <= "remote_untrusted"`, `untrusted=True`, `effective_mode="safe"`,
-      `allow_skip_permissions=False`, and injects observer/readonly memory env vars.
+      forces `trust_level <= "remote_untrusted"`, `untrusted=True`, and injects observer/readonly
+      memory env vars (PreToolUse guardrails remain active), WITHOUT forcing `effective_mode="safe"`
+      or disabling `allow_skip_permissions` for non-readonly sessions.
     - `team_id` is strictly validated against `TEAM_ID_RE` (raises `ValueError` on invalid/traversal input).
     """
     clean_team_id = validate_team_id(team_id)
@@ -483,7 +487,8 @@ def build_session_security_context(
     is_remote_origin = clean_origin.startswith("remote")
 
     ro = bool(readonly)
-    untr = bool(untrusted) or ro or is_remote_origin
+    eff_turn_taint_only = bool(turn_taint_only) and (not ro) and (not is_remote_origin)
+    untr = bool(untrusted) or ro or is_remote_origin or eff_turn_taint_only
 
     default_trust = "readonly_guest" if ro else ("remote_untrusted" if untr else "local_admin")
     eff_trust = normalize_trust_level(trust_level, default=default_trust)
@@ -494,16 +499,17 @@ def build_session_security_context(
     if eff_trust == "readonly_guest":
         ro = True
         untr = True
+        eff_turn_taint_only = False
     if TRUST_ORDER[eff_trust] <= TRUST_ORDER["remote_untrusted"]:
         untr = True
 
-    if ro or untr:
+    if ro:
         eff_mode = "safe"
     elif max_runtime_mode:
         eff_mode = min_runtime_mode(mode, max_runtime_mode, default="safe")
     else:
         eff_mode = mode if mode is not None else "safe"
-    allow_skip = (eff_mode == "auto") and (not ro) and (not untr)
+    allow_skip = (eff_mode == "auto") and (not ro)
 
     if bus_role is not None:
         eff_bus_role = str(bus_role)
@@ -530,6 +536,7 @@ def build_session_security_context(
         trust_level=eff_trust,
         team_id=clean_team_id,
         agent_origin=clean_origin,
+        turn_taint_only=eff_turn_taint_only,
     )
 
 
@@ -579,9 +586,9 @@ def _check_readonly_allowed_tools(raw_tools: str, display_tok: str) -> None:
 
 
 def enforce_readonly_cli_args(cmd: Sequence[str], sec_ctx: SessionSecurityContext) -> List[str]:
-    """Fail-closed guard ensuring readonly/untrusted sessions NEVER receive bypass or write-enabling CLI flags."""
+    """Fail-closed guard ensuring readonly or safe-mode sessions NEVER receive bypass or write-enabling CLI flags."""
     args = list(cmd)
-    if not (sec_ctx.readonly or sec_ctx.untrusted or not sec_ctx.allow_skip_permissions):
+    if not (sec_ctx.readonly or not sec_ctx.allow_skip_permissions):
         return args
     n = len(args)
     i = 0
@@ -760,10 +767,17 @@ def build_base_session_env(
     env["AGY_TRUST_LEVEL"] = sec_ctx.trust_level
     env["AGY_RBAC_ROLE"] = sec_ctx.rbac_role
 
+    env.pop("AGY_TURN_TAINT_ONLY", None)
     if sec_ctx.untrusted:
         env["AGY_INTERNAL_OBSERVER"] = "1"
         env["AGY_UNTRUSTED_SESSION"] = "1"
         env["AGY_MEMORY_READONLY"] = "1"
+        if sec_ctx.turn_taint_only:
+            env["AGY_TURN_TAINT_ONLY"] = "1"
+    else:
+        env.pop("AGY_UNTRUSTED_SESSION", None)
+        env.pop("AGY_MEMORY_READONLY", None)
+        env.pop("AGY_INTERNAL_OBSERVER", None)
 
     return env
 
@@ -806,8 +820,10 @@ def run_one_shot_session(
 
     Enforces:
     - Unknown driver fail-closed validation via `DriverRegistry`.
-    - `SessionSecurityContext` monotonic downgrade (`readonly`/`untrusted` force `bus_enable=False`,
-      `effective_mode="safe"`, `allow_skip_permissions=False`, and isolation env vars).
+    - `SessionSecurityContext` monotonic downgrade (`readonly` / `trust_level="readonly_guest"` force
+      `effective_mode="safe"`, `allow_skip_permissions=False`, `bus_enable=False`, `rbac_role="readonly"`,
+      and `untrusted=True`; non-readonly `untrusted` forces `trust_level <= "remote_untrusted"`,
+      `bus_enable=False`, and readonly-memory/PreToolUse guardrail env vars without forcing `safe` mode).
     - `enforce_readonly_cli_args(cmd, sec_ctx)` prior to spawn.
     - `build_base_session_env(...)` with `AGY_CLI_DISABLE_AUTO_UPDATE`, bot isolation, and trust/team vars.
     - PID-reuse-safe `_kill_process_tree(pid, ..., expected_root_starttime=...)` on cancel/timeout.
@@ -819,7 +835,7 @@ def run_one_shot_session(
     eff_ro = bool(readonly)
     eff_untr = bool(untrusted) or eff_ro
     eff_bus_enable = False if (eff_ro or eff_untr) else bus_enable
-    eff_max_mode = "safe" if (eff_ro or eff_untr) else max_runtime_mode
+    eff_max_mode = "safe" if eff_ro else max_runtime_mode
 
     sec_ctx = build_session_security_context(
         mode,
@@ -1047,6 +1063,9 @@ class AgentSession(ABC):
         readonly: bool = False,
         untrusted: bool = False,
         is_worktree: bool = False,
+        trust_level: Optional[str] = None,
+        agent_origin: Optional[str] = None,
+        turn_taint_only: bool = False,
         driver_name: Optional[str] = None,
         capabilities: Optional[DriverCapabilities] = None,
         exec_signature: Any = None,
@@ -1067,12 +1086,18 @@ class AgentSession(ABC):
             scope_key=self.scope_key,
             readonly=readonly,
             untrusted=untrusted,
+            trust_level=trust_level,
+            agent_origin=agent_origin or "local_bus",
+            turn_taint_only=turn_taint_only,
             host=host,
         )
         self.security_context = sec_ctx
         self.cid = conv
         self.readonly = sec_ctx.readonly
         self.untrusted = sec_ctx.untrusted
+        self.trust_level = sec_ctx.trust_level
+        self.agent_origin = sec_ctx.agent_origin
+        self.turn_taint_only = sec_ctx.turn_taint_only
         self.mode = "safe" if self.readonly else mode
         self.model = model
         self.effort = effort
@@ -1117,6 +1142,9 @@ class AgentSession(ABC):
         untrusted=False,
         is_worktree=False,
         driver_name=None,
+        trust_level=None,
+        agent_origin=None,
+        turn_taint_only=False,
     ) -> bool:
         """Strict warm-session reuse predicate covering liveness, driver identity, trust boundary, and context."""
         if not self.is_alive():
@@ -1125,9 +1153,33 @@ class AgentSession(ABC):
             str(getattr(self, "driver_name", "agy")).strip().lower() != str(driver_name).strip().lower()
         ):
             return False
-        if getattr(self, "readonly", False) != bool(readonly):
+        clean_origin = str(agent_origin or "local_bus").strip().lower() or "local_bus"
+        is_remote_origin = clean_origin.startswith("remote")
+        ro = bool(readonly)
+        eff_turn_taint_only = bool(turn_taint_only) and (not ro) and (not is_remote_origin)
+        untr = bool(untrusted) or ro or is_remote_origin or eff_turn_taint_only
+        default_trust = "readonly_guest" if ro else ("remote_untrusted" if untr else "local_admin")
+        eff_trust = normalize_trust_level(trust_level, default=default_trust)
+        if ro:
+            eff_trust = min_trust_level(eff_trust, "readonly_guest")
+        if untr or is_remote_origin:
+            eff_trust = min_trust_level(eff_trust, "remote_untrusted")
+        if eff_trust == "readonly_guest":
+            ro = True
+            untr = True
+            eff_turn_taint_only = False
+        if TRUST_ORDER[eff_trust] <= TRUST_ORDER["remote_untrusted"]:
+            untr = True
+
+        if getattr(self, "readonly", False) != ro:
             return False
-        if getattr(self, "untrusted", False) != (bool(untrusted) or bool(readonly)):
+        if getattr(self, "untrusted", False) != untr:
+            return False
+        if hasattr(self, "trust_level") and getattr(self, "trust_level", None) != eff_trust:
+            return False
+        if hasattr(self, "agent_origin") and getattr(self, "agent_origin", None) != clean_origin:
+            return False
+        if bool(getattr(self, "turn_taint_only", False)) != eff_turn_taint_only:
             return False
         if bool(getattr(self, "is_worktree", False)) != bool(is_worktree):
             return False
@@ -1241,6 +1293,9 @@ class AgySession(AgentSession):
         readonly=False,
         untrusted=False,
         is_worktree=False,
+        trust_level=None,
+        agent_origin=None,
+        turn_taint_only=False,
         *,
         host=None,
     ):
@@ -1271,6 +1326,9 @@ class AgySession(AgentSession):
             readonly=readonly,
             untrusted=untrusted,
             is_worktree=is_worktree,
+            trust_level=trust_level,
+            agent_origin=agent_origin,
+            turn_taint_only=turn_taint_only,
             driver_name="agy",
             capabilities=AGY_CAPABILITIES,
             exec_signature=exec_plan["signature"],
@@ -1550,6 +1608,20 @@ class AgentDriver(ABC):
         """Spawn a new persistent `AgentSession` adhering to `SessionSecurityContext` invariants."""
 
 
+def _filter_supported_kwargs(callable_obj, extra_kw: Dict[str, Any]) -> Dict[str, Any]:
+    """Return subset of `extra_kw` accepted by `callable_obj` (keeps legacy test mocks compatible)."""
+    if not extra_kw:
+        return {}
+    try:
+        sig = inspect.signature(callable_obj)
+    except (TypeError, ValueError):
+        return dict(extra_kw)
+    params = sig.parameters
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return dict(extra_kw)
+    return {k: v for k, v in extra_kw.items() if k in params}
+
+
 class AgyDriver(AgentDriver):
     """Default built-in driver for Antigravity CLI (`agy`).
 
@@ -1573,6 +1645,9 @@ class AgyDriver(AgentDriver):
         readonly=False,
         untrusted=False,
         is_worktree=False,
+        trust_level=None,
+        agent_origin=None,
+        turn_taint_only=False,
     ):
         h = _resolve_host()
         session_cls = getattr(h, "AgySession", AgySession) if h is not None else AgySession
@@ -1585,6 +1660,18 @@ class AgyDriver(AgentDriver):
         }
         if is_worktree:
             sess_kw["is_worktree"] = True
+        opt_kw: Dict[str, Any] = {}
+        if trust_level is not None:
+            opt_kw["trust_level"] = trust_level
+        if agent_origin is not None:
+            opt_kw["agent_origin"] = agent_origin
+        if turn_taint_only:
+            opt_kw["turn_taint_only"] = True
+        if opt_kw:
+            if session_cls is AgySession or (isinstance(session_cls, type) and issubclass(session_cls, AgentSession)):
+                sess_kw.update(opt_kw)
+            else:
+                sess_kw.update(_filter_supported_kwargs(session_cls, opt_kw))
         return session_cls(conv, mode, model, effort, **sess_kw)
 
 
@@ -1759,6 +1846,9 @@ def _acquire_session(
     readonly=False,
     untrusted=False,
     is_worktree=False,
+    trust_level=None,
+    agent_origin=None,
+    turn_taint_only=False,
     *,
     driver=None,
     registry: Optional[DriverRegistry] = None,
@@ -1790,6 +1880,9 @@ def _acquire_session(
             )
             if same_driver and isinstance(existing, AgentSession):
                 matches_kw["driver_name"] = target_driver_name
+                matches_kw["trust_level"] = trust_level
+                matches_kw["agent_origin"] = agent_origin
+                matches_kw["turn_taint_only"] = turn_taint_only
             if not force_new and same_driver and existing.matches(
                 conv, mode, model, effort, project, workdir, **matches_kw
             ):
@@ -1831,18 +1924,27 @@ def _acquire_session(
         except Exception:
             pass
 
-    sess = target_driver.spawn_session(
-        conv,
-        mode,
-        model,
-        effort,
-        project=project,
-        workdir=workdir,
-        scope_key=skey,
-        readonly=readonly,
-        untrusted=untrusted,
-        is_worktree=is_worktree,
-    )
+    spawn_kw: Dict[str, Any] = {
+        "project": project,
+        "workdir": workdir,
+        "scope_key": skey,
+        "readonly": readonly,
+        "untrusted": untrusted,
+        "is_worktree": is_worktree,
+    }
+    opt_spawn_kw: Dict[str, Any] = {}
+    if trust_level is not None:
+        opt_spawn_kw["trust_level"] = trust_level
+    if agent_origin is not None:
+        opt_spawn_kw["agent_origin"] = agent_origin
+    if turn_taint_only:
+        opt_spawn_kw["turn_taint_only"] = True
+    if opt_spawn_kw:
+        if isinstance(target_driver, AgyDriver):
+            spawn_kw.update(opt_spawn_kw)
+        else:
+            spawn_kw.update(_filter_supported_kwargs(target_driver.spawn_session, opt_spawn_kw))
+    sess = target_driver.spawn_session(conv, mode, model, effort, **spawn_kw)
     if h is not None:
         with h.session_lock:
             prev_raced = h._session_pool.get(skey)
