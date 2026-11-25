@@ -871,7 +871,9 @@ class StudioDataSources:
         home = Path.home()
         agy_root = home / ".gemini" / "antigravity-cli"
         cache_root = agy_root / "cache"
-        self.bus_dir = bus_dir or Path(os.environ.get("AGY_BOT_BUS_DIR", str(cache_root / "bot_bus")))
+        self.bus_dir = bus_dir or Path(
+            os.environ.get("AGY_BOT_BUS_DIR", "").strip() or str(cache_root / "bot_bus")
+        )
         self.schedules_file = schedules_file or Path(
             os.environ.get("AGY_STUDIO_SCHEDULES_FILE", str(cache_root / "scheduled_tasks.json"))
         )

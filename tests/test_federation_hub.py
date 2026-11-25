@@ -8,6 +8,7 @@ import base64
 import concurrent.futures
 import http.client
 import importlib
+import importlib.util
 import io
 import json
 import os
@@ -2277,6 +2278,98 @@ class TestM2Round1SecurityRegressions(unittest.TestCase):
                     child.wait(timeout=3.0)
                 except Exception:
                     child.kill()
+
+
+class TestWithBotBusDirBindingIsolation(unittest.TestCase):
+    """Regression tests for B1 & B2 on `federation_hub._with_bot_bus_dir`."""
+
+    def _load_fresh_bus_at(self, initial_dir: str, mod_name: str):
+        spec = importlib.util.spec_from_file_location(mod_name, str(BRIDGE_DIR / "bot_bus.py"))
+        assert spec and spec.loader
+        mod = importlib.util.module_from_spec(spec)
+        with mock.patch.dict(os.environ, {"AGY_BOT_BUS_DIR": initial_dir}, clear=False):
+            spec.loader.exec_module(mod)
+        return mod
+
+    def test_b1_with_bot_bus_dir_target_equals_initial_overrides_env_and_restores(self):
+        with tempfile.TemporaryDirectory() as d_init, tempfile.TemporaryDirectory() as d_env:
+            fresh_bus = self._load_fresh_bus_at(d_init, "bot_bus_hub_b1")
+            with (
+                mock.patch.object(hub, "bot_bus", fresh_bus),
+                mock.patch.dict(os.environ, {"AGY_BOT_BUS_DIR": d_env}, clear=False),
+            ):
+                # Outer env override points at d_env
+                self.assertEqual(d_env, fresh_bus._effective_bus_dir())
+                self.assertEqual(os.path.join(d_env, "team_config.json"), fresh_bus._config_file())
+
+                # Inner _with_bot_bus_dir(d_init) MUST bind all paths & writes to d_init despite target == _INITIAL_BUS_DIR
+                with hub._with_bot_bus_dir(d_init):
+                    self.assertEqual(d_init, fresh_bus._effective_bus_dir())
+                    self.assertEqual(os.path.join(d_init, "team_config.json"), fresh_bus._config_file())
+                    self.assertEqual(os.path.join(d_init, "bus.lock"), fresh_bus._lock_file())
+                    self.assertEqual(os.path.join(d_init, "roster.json"), fresh_bus._roster_file())
+                    fresh_bus.update_bot_config("b1_worker", role="worker", specialty="dev")
+                    fresh_bus.heartbeat_bot(
+                        {"handle": "b1_worker", "pid": os.getpid(), "role": "worker", "busy": False}
+                    )
+
+                # Exit restores resolution back to d_env
+                self.assertEqual(d_env, fresh_bus._effective_bus_dir())
+                self.assertEqual(os.path.join(d_env, "team_config.json"), fresh_bus._config_file())
+                self.assertEqual(os.path.join(d_env, "bus.lock"), fresh_bus._lock_file())
+                self.assertEqual(os.path.join(d_env, "roster.json"), fresh_bus._roster_file())
+
+            # All disk writes landed in d_init, zero files created in d_env
+            self.assertTrue((Path(d_init) / "team_config.json").is_file())
+            self.assertTrue((Path(d_init) / "bus.lock").is_file())
+            self.assertTrue((Path(d_init) / "roster.json").is_file())
+            self.assertIn("b1_worker", json.loads((Path(d_init) / "team_config.json").read_text(encoding="utf-8"))["bots"])
+            self.assertEqual([], list(Path(d_env).iterdir()))
+
+    def test_b2_with_bot_bus_dir_overrides_single_constant_patch_and_restores(self):
+        with (
+            tempfile.TemporaryDirectory() as target,
+            tempfile.TemporaryDirectory() as custom_dir,
+            tempfile.TemporaryDirectory() as nested_dir,
+        ):
+            fresh_bus = self._load_fresh_bus_at(target, "bot_bus_hub_b2")
+            custom_cfg = os.path.join(custom_dir, "custom_team_config.json")
+
+            with (
+                mock.patch.object(hub, "bot_bus", fresh_bus),
+                mock.patch.object(fresh_bus, "CONFIG_FILE", custom_cfg),
+            ):
+                self.assertEqual(target, fresh_bus.BUS_DIR)
+                self.assertEqual(custom_cfg, fresh_bus._config_file())
+                self.assertEqual(os.path.join(target, "bus.lock"), fresh_bus._lock_file())
+
+                with hub._with_bot_bus_dir(target):
+                    self.assertEqual(os.path.join(target, "team_config.json"), fresh_bus._config_file())
+                    self.assertEqual(os.path.join(target, "bus.lock"), fresh_bus._lock_file())
+                    self.assertEqual(os.path.join(target, "team_config.json"), fresh_bus.CONFIG_FILE)
+                    fresh_bus.update_bot_config("b2_coord", role="coordinator")
+
+                    # Nested _with_bot_bus_dir switches cleanly and restores outer target
+                    with hub._with_bot_bus_dir(nested_dir):
+                        self.assertEqual(nested_dir, fresh_bus._effective_bus_dir())
+                        self.assertEqual(os.path.join(nested_dir, "team_config.json"), fresh_bus._config_file())
+                        fresh_bus.update_bot_config("b2_nested", role="worker")
+
+                    self.assertEqual(target, fresh_bus._effective_bus_dir())
+                    self.assertEqual(os.path.join(target, "team_config.json"), fresh_bus._config_file())
+
+                # Exit restores single-constant CONFIG_FILE patch
+                self.assertEqual(custom_cfg, fresh_bus.CONFIG_FILE)
+                self.assertEqual(custom_cfg, fresh_bus._config_file())
+
+                # Blank bus_dir rejected fail-closed
+                with self.assertRaises(ValueError):
+                    with hub._with_bot_bus_dir("   "):
+                        pass
+
+            self.assertFalse(os.path.exists(custom_cfg))
+            self.assertIn("b2_coord", json.loads((Path(target) / "team_config.json").read_text(encoding="utf-8"))["bots"])
+            self.assertIn("b2_nested", json.loads((Path(nested_dir) / "team_config.json").read_text(encoding="utf-8"))["bots"])
 
 
 if __name__ == "__main__":

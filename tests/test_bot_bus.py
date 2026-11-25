@@ -721,5 +721,283 @@ class TestBotBusTeamWorkflow(unittest.TestCase):
                     self.assertEqual("remote_untrusted", j["trust_level"], name)
 
 
+class TestBotBusDynamicPathIsolation(unittest.TestCase):
+    """Anti-regression tests ensuring BUS_DIR / AGY_BOT_BUS_DIR overrides isolate all 11 derived paths."""
+
+    def _load_fresh_bus_at(self, initial_dir: str, mod_name: str):
+        spec = importlib.util.spec_from_file_location(mod_name, str(BRIDGE_DIR / "bot_bus.py"))
+        assert spec and spec.loader
+        mod = importlib.util.module_from_spec(spec)
+        with mock.patch.dict(os.environ, {"AGY_BOT_BUS_DIR": initial_dir}, clear=False):
+            spec.loader.exec_module(mod)
+        return mod
+
+    def _exercise_all_bus_writers(self, mod) -> None:
+        mod.heartbeat_bot({"handle": "bot_one", "pid": os.getpid(), "role": "coordinator", "busy": False})
+        mod.heartbeat_bot({"handle": "bot_two", "pid": os.getpid(), "role": "worker", "busy": False})
+        mod.set_all_peers()
+        mod.promote_sole_coordinator("bot_one")
+        mirror_chat_id = -1001234567890 - 1
+        mod.set_team_mirror(mirror_chat_id, None)
+        mod.record_group_message(
+            -1001234567890,
+            msg_id=101,
+            sender_handle="tester",
+            is_bot=False,
+            text="hello @bot_two",
+        )
+        mod.set_origin_context("dm:123", bot_handle="bot_one", chat_id=123, msg_id=10)
+        self.assertTrue(mod.loop_guard_allow("scope:test"))
+        mod.mark_human_group_activity(-1001234567890, msg_id=101)
+        rel = mod.relay_group_mentions("bot_one", -1001234567890, "ping @bot_two", msg_id=102)
+        self.assertEqual(["bot_two"], rel["relayed"])
+        mod.thread_set("bot_one", "bot_two", "tk-1", "cid-abc")
+        res = mod.dispatch_assignments(
+            "bot_one",
+            [{"bot": "bot_two", "prompt": "isolated test job"}],
+            agent_origin="local_bus",
+            parent_trust_level="local_admin",
+        )
+        self.assertEqual(1, len(res["jobs"]))
+        self.assertEqual("cid-abc", mod.thread_get("bot_one", "bot_two", "tk-1"))
+        self.assertEqual(123, mod.get_origin_context("dm:123", bot_handle="bot_one").get("chat_id"))
+        self.assertEqual(mirror_chat_id, mod.get_team_mirror().get("chat_id"))
+        pkts = mod.pop_inbox_packets("bot_two")
+        self.assertGreaterEqual(len(pkts), 2)
+
+    def test_patch_bus_dir_only_isolates_all_derived_paths(self):
+        with tempfile.TemporaryDirectory() as default_dir, tempfile.TemporaryDirectory() as override_dir:
+            sentinel = {"version": 1, "bots": {"real_coord": {"role": "coordinator"}}}
+            sentinel_path = Path(default_dir) / "team_config.json"
+            sentinel_path.write_text(json.dumps(sentinel), encoding="utf-8")
+            sentinel_before = sentinel_path.read_bytes()
+
+            mod = self._load_fresh_bus_at(default_dir, "bot_bus_dyn_patch_bus_dir")
+            with mock.patch.object(mod, "BUS_DIR", override_dir):
+                self.assertEqual(override_dir, mod._effective_bus_dir())
+                self._exercise_all_bus_writers(mod)
+
+            # Default directory must remain completely untouched
+            self.assertEqual(sentinel_before, sentinel_path.read_bytes())
+            self.assertEqual({"team_config.json"}, {p.name for p in Path(default_dir).iterdir()})
+
+            # All 11 derived artifacts must live inside override_dir
+            for rel in (
+                "bus.lock",
+                "team_config.json",
+                "roster.json",
+                "threads.json",
+                "loop_guard.json",
+                "mention_chains.json",
+                "origin_context.json",
+                "dispatch_window.json",
+                "jobs",
+                "inbox",
+                "group_history",
+            ):
+                self.assertTrue((Path(override_dir) / rel).exists(), f"Missing {rel} in override_dir")
+
+    def test_patch_env_agy_bot_bus_dir_after_import_isolates_all_io(self):
+        with tempfile.TemporaryDirectory() as default_dir, tempfile.TemporaryDirectory() as env_dir:
+            sentinel_path = Path(default_dir) / "team_config.json"
+            sentinel_path.write_text(json.dumps({"bots": {"real_coord": {"role": "coordinator"}}}), encoding="utf-8")
+            sentinel_before = sentinel_path.read_bytes()
+
+            mod = self._load_fresh_bus_at(default_dir, "bot_bus_dyn_env_override")
+            with mock.patch.dict(os.environ, {"AGY_BOT_BUS_DIR": env_dir}, clear=False):
+                self.assertEqual(env_dir, mod._effective_bus_dir())
+                self._exercise_all_bus_writers(mod)
+                mod.upsert_studio_worktree_meta("wt-env-test", {"active": True, "branch": "agy-studio/wt-env-test"})
+                self.assertIn("wt-env-test", mod.load_studio_worktrees())
+
+            self.assertEqual(sentinel_before, sentinel_path.read_bytes())
+            self.assertEqual({"team_config.json"}, {p.name for p in Path(default_dir).iterdir()})
+            self.assertTrue((Path(env_dir) / "team_config.json").is_file())
+            self.assertTrue((Path(env_dir) / "studio_worktrees.json").is_file())
+
+    def test_explicit_single_constant_override_precedence(self):
+        with (
+            tempfile.TemporaryDirectory() as default_dir,
+            tempfile.TemporaryDirectory() as env_dir,
+            tempfile.TemporaryDirectory() as attr_dir,
+            tempfile.TemporaryDirectory() as custom_dir,
+        ):
+            mod = self._load_fresh_bus_at(default_dir, "bot_bus_dyn_precedence")
+            custom_cfg = os.path.join(custom_dir, "custom_team.json")
+
+            # Precedence: single-constant > BUS_DIR attr > AGY_BOT_BUS_DIR env > default
+            custom_mirror_id = -1001234567890 - 2
+            with (
+                mock.patch.dict(os.environ, {"AGY_BOT_BUS_DIR": env_dir}, clear=False),
+                mock.patch.object(mod, "BUS_DIR", attr_dir),
+                mock.patch.object(mod, "CONFIG_FILE", custom_cfg),
+            ):
+                self.assertEqual(custom_cfg, mod._config_file())
+                self.assertEqual(os.path.join(attr_dir, "roster.json"), mod._roster_file())
+                mod.set_team_mirror(custom_mirror_id, None)
+                mod.heartbeat_bot({"handle": "bot_prec", "pid": os.getpid(), "role": "worker", "busy": False})
+
+            self.assertTrue(os.path.isfile(custom_cfg))
+            self.assertEqual(custom_mirror_id, json.loads(Path(custom_cfg).read_text(encoding="utf-8"))["mirror"]["chat_id"])
+            self.assertTrue((Path(attr_dir) / "roster.json").is_file())
+            self.assertFalse((Path(attr_dir) / "team_config.json").exists())
+            self.assertEqual([], list(Path(env_dir).iterdir()))
+            self.assertEqual([], list(Path(default_dir).iterdir()))
+
+    def test_bind_bus_dir_tier0_precedence_nesting_and_validation(self):
+        with (
+            tempfile.TemporaryDirectory() as d_init,
+            tempfile.TemporaryDirectory() as d_env,
+            tempfile.TemporaryDirectory() as d_attr,
+            tempfile.TemporaryDirectory() as d_custom,
+            tempfile.TemporaryDirectory() as d_outer,
+            tempfile.TemporaryDirectory() as d_inner,
+        ):
+            mod = self._load_fresh_bus_at(d_init, "bot_bus_bind_tier0")
+            custom_cfg = os.path.join(d_custom, "custom_team.json")
+
+            # Empty / whitespace paths fail closed with ValueError
+            for bad in ("", "   ", "\t\n"):
+                with self.assertRaises(ValueError):
+                    with mod.bind_bus_dir(bad):
+                        pass
+
+            # Tier 0 overrides single-constant, BUS_DIR, and AGY_BOT_BUS_DIR simultaneously;
+            # nested bind_bus_dir and exception unwinding restore cleanly
+            with (
+                mock.patch.dict(os.environ, {"AGY_BOT_BUS_DIR": d_env}, clear=False),
+                mock.patch.object(mod, "BUS_DIR", d_attr),
+                mock.patch.object(mod, "CONFIG_FILE", custom_cfg),
+            ):
+                with mod.bind_bus_dir(d_outer + "/") as bound_outer:
+                    self.assertEqual(d_outer, bound_outer)
+                    self.assertEqual(d_outer, mod._effective_bus_dir())
+                    self.assertEqual(os.path.join(d_outer, "team_config.json"), mod._config_file())
+                    self.assertEqual(os.path.join(d_outer, "bus.lock"), mod._lock_file())
+                    self.assertEqual(os.path.join(d_outer, "roster.json"), mod._roster_file())
+                    mod.update_bot_config("outer_bot", role="worker")
+
+                    with mod.bind_bus_dir(d_inner) as bound_inner:
+                        self.assertEqual(d_inner, bound_inner)
+                        self.assertEqual(d_inner, mod._effective_bus_dir())
+                        self.assertEqual(os.path.join(d_inner, "team_config.json"), mod._config_file())
+                        self.assertEqual(os.path.join(d_inner, "bus.lock"), mod._lock_file())
+                        mod.update_bot_config("inner_bot", role="coordinator")
+
+                    # Restored to d_outer after inner exits
+                    self.assertEqual(d_outer, mod._effective_bus_dir())
+                    self.assertEqual(os.path.join(d_outer, "team_config.json"), mod._config_file())
+
+                    # Exception unwinding still restores to d_outer
+                    with self.assertRaises(RuntimeError):
+                        with mod.bind_bus_dir(d_inner):
+                            self.assertEqual(d_inner, mod._effective_bus_dir())
+                            raise RuntimeError("boom")
+                    self.assertEqual(d_outer, mod._effective_bus_dir())
+
+                # Restored to outer precedence after outer bind_bus_dir exits
+                self.assertEqual(d_attr, mod._effective_bus_dir())
+                self.assertEqual(custom_cfg, mod._config_file())
+                self.assertEqual(os.path.join(d_attr, "roster.json"), mod._roster_file())
+
+            # Target == _INITIAL_BUS_DIR with AGY_BOT_BUS_DIR=d_env still binds to d_init and restores d_env
+            with mock.patch.dict(os.environ, {"AGY_BOT_BUS_DIR": d_env}, clear=False):
+                self.assertEqual(d_env, mod._effective_bus_dir())
+                with mod.bind_bus_dir(d_init):
+                    self.assertEqual(d_init, mod._effective_bus_dir())
+                    self.assertEqual(os.path.join(d_init, "team_config.json"), mod._config_file())
+                    self.assertEqual(os.path.join(d_init, "bus.lock"), mod._lock_file())
+                    mod.update_bot_config("init_bot", role="worker")
+                self.assertEqual(d_env, mod._effective_bus_dir())
+                self.assertEqual(os.path.join(d_env, "team_config.json"), mod._config_file())
+
+            self.assertIn("outer_bot", json.loads((Path(d_outer) / "team_config.json").read_text(encoding="utf-8"))["bots"])
+            self.assertIn("inner_bot", json.loads((Path(d_inner) / "team_config.json").read_text(encoding="utf-8"))["bots"])
+            self.assertIn("init_bot", json.loads((Path(d_init) / "team_config.json").read_text(encoding="utf-8"))["bots"])
+            self.assertEqual([], list(Path(d_env).iterdir()))
+            self.assertEqual([], list(Path(d_attr).iterdir()))
+            self.assertEqual([], list(Path(d_custom).iterdir()))
+
+    def test_b3_path_normalization_tilde_blank_bus_dir_trailing_slash_and_atomic_write(self):
+        import federation_registry as fed  # noqa: E402
+
+        with (
+            tempfile.TemporaryDirectory() as d_init,
+            tempfile.TemporaryDirectory() as d_env,
+            tempfile.TemporaryDirectory() as d_fallback,
+            tempfile.TemporaryDirectory() as cwd_tmp,
+        ):
+            mod = self._load_fresh_bus_at(d_init, "bot_bus_b3_norm")
+
+            # 1. Tilde expansion in AGY_BOT_BUS_DIR matches federation_registry._resolve_bus_dir()
+            with mock.patch.dict(os.environ, {"AGY_BOT_BUS_DIR": "~/custom_bus_test"}, clear=False):
+                expected = fed._resolve_bus_dir()
+                self.assertEqual(expected, mod._effective_bus_dir())
+                self.assertEqual(os.path.join(expected, "team_config.json"), mod._config_file())
+                self.assertEqual(os.path.join(expected, "bus.lock"), mod._lock_file())
+                self.assertNotIn("~", mod._effective_bus_dir())
+            mod_tilde = self._load_fresh_bus_at("~/custom_bus_test", "bot_bus_b3_tilde_init")
+            with mock.patch.dict(os.environ, {"AGY_BOT_BUS_DIR": "~/custom_bus_test"}, clear=False):
+                self.assertEqual(fed._resolve_bus_dir(), mod_tilde.BUS_DIR)
+                self.assertEqual(fed._resolve_bus_dir(), mod_tilde._effective_bus_dir())
+
+            # 2. Trailing slash on BUS_DIR / single constant matching initial path must NOT trigger false override
+            with (
+                mock.patch.dict(os.environ, {"AGY_BOT_BUS_DIR": d_env}, clear=False),
+                mock.patch.object(mod, "BUS_DIR", d_init + "/"),
+                mock.patch.object(mod, "JOBS_DIR", os.path.join(d_init, "jobs") + "/"),
+            ):
+                self.assertEqual(d_env, mod._effective_bus_dir())
+                self.assertEqual(os.path.join(d_env, "team_config.json"), mod._config_file())
+                self.assertEqual(os.path.join(d_env, "jobs"), mod._jobs_dir())
+
+            # 3. Blank / whitespace BUS_DIR falls back cleanly to AGY_BOT_BUS_DIR or _DEFAULT_BUS_DIR (zero CWD dirt)
+            orig_cwd = os.getcwd()
+            try:
+                os.chdir(cwd_tmp)
+                for blank in ("", "   "):
+                    with (
+                        mock.patch.dict(os.environ, {"AGY_BOT_BUS_DIR": d_env}, clear=False),
+                        mock.patch.object(mod, "BUS_DIR", blank),
+                    ):
+                        self.assertEqual(d_env, mod._effective_bus_dir())
+                        self.assertEqual(os.path.join(d_env, "team_config.json"), mod._config_file())
+                        self.assertEqual(os.path.join(d_env, "bus.lock"), mod._lock_file())
+                        mod.heartbeat_bot({"handle": "blank_env_bot", "pid": os.getpid(), "role": "worker", "busy": False})
+
+                    with (
+                        mock.patch.dict(os.environ, {"AGY_BOT_BUS_DIR": ""}, clear=False),
+                        mock.patch.object(mod, "BUS_DIR", blank),
+                    ):
+                        self.assertEqual(mod._DEFAULT_BUS_DIR, mod._effective_bus_dir())
+                        self.assertEqual(os.path.join(mod._DEFAULT_BUS_DIR, "team_config.json"), mod._config_file())
+                        self.assertEqual(os.path.join(mod._DEFAULT_BUS_DIR, "bus.lock"), mod._lock_file())
+
+                    with (
+                        mock.patch.dict(os.environ, {"AGY_BOT_BUS_DIR": ""}, clear=False),
+                        mock.patch.object(mod, "_DEFAULT_BUS_DIR", d_fallback),
+                        mock.patch.object(mod, "BUS_DIR", blank),
+                    ):
+                        self.assertEqual(d_fallback, mod._effective_bus_dir())
+                        mod.heartbeat_bot({"handle": "blank_def_bot", "pid": os.getpid(), "role": "worker", "busy": False})
+
+                self.assertEqual([], list(Path(cwd_tmp).iterdir()))
+                self.assertTrue((Path(d_env) / "roster.json").is_file())
+                self.assertTrue((Path(d_fallback) / "roster.json").is_file())
+
+                # 4. Bare filename / relative path passed to _atomic_write_json must not raise FileNotFoundError
+                mod._atomic_write_json("bare_config.json", {"ok": True, "bare": 1})
+                bare_path = Path(cwd_tmp) / "bare_config.json"
+                self.assertTrue(bare_path.is_file())
+                self.assertEqual({"ok": True, "bare": 1}, json.loads(bare_path.read_text(encoding="utf-8")))
+
+                mod._atomic_write_json(os.path.join("rel_sub", "nested.json"), {"nested": True})
+                nested_path = Path(cwd_tmp) / "rel_sub" / "nested.json"
+                self.assertTrue(nested_path.is_file())
+                self.assertEqual({"nested": True}, json.loads(nested_path.read_text(encoding="utf-8")))
+            finally:
+                os.chdir(orig_cwd)
+
+
 if __name__ == "__main__":
     unittest.main()

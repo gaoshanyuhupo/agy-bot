@@ -812,13 +812,12 @@ def _extract_host_without_port(host_header: str) -> str:
 
 @contextlib.contextmanager
 def _with_bot_bus_dir(bus_dir: str):
-    """Thread-safe binding of `bot_bus` module-level paths to `bus_dir`."""
-    target = os.path.abspath(os.path.expanduser(bus_dir))
+    """Thread-safe binding of `bot_bus` module-level paths and context to `bus_dir`."""
+    raw = str(bus_dir or "").strip()
+    if not raw:
+        raise ValueError("bus_dir must be a non-empty path")
+    target = os.path.abspath(os.path.expanduser(raw))
     with _BOT_BUS_BIND_LOCK:
-        prev_bus = bot_bus.BUS_DIR
-        if os.path.abspath(prev_bus) == target:
-            yield
-            return
         saved = {
             "BUS_DIR": bot_bus.BUS_DIR,
             "JOBS_DIR": bot_bus.JOBS_DIR,
@@ -846,7 +845,8 @@ def _with_bot_bus_dir(bus_dir: str):
             bot_bus.MENTION_CHAINS_FILE = os.path.join(target, "mention_chains.json")
             bot_bus.ORIGIN_CTX_FILE = os.path.join(target, "origin_context.json")
             bot_bus.DISPATCH_WINDOW_FILE = os.path.join(target, "dispatch_window.json")
-            yield
+            with bot_bus.bind_bus_dir(target):
+                yield
         finally:
             for k, v in saved.items():
                 setattr(bot_bus, k, v)

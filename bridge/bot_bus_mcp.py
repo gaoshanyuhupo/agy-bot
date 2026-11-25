@@ -83,6 +83,11 @@ def _federation_auth_token() -> Any:
     return raw or None
 
 
+def _effective_bus_dir() -> str:
+    fn = getattr(bot_bus, "_effective_bus_dir", None)
+    return fn() if callable(fn) else str(bot_bus.BUS_DIR)
+
+
 def _bus_role() -> str:
     if not _bus_enabled():
         return "disabled"
@@ -92,7 +97,7 @@ def _bus_role() -> str:
     me = _my_handle()
     auth = federation_registry.resolve_actor_authority(
         me,
-        bus_dir=bot_bus.BUS_DIR,
+        bus_dir=_effective_bus_dir(),
         auth_token=_federation_auth_token(),
         env=dict(os.environ),
     )
@@ -392,13 +397,14 @@ def _filter_teams_for_actor(teams: List[Dict[str, Any]], auth: Dict[str, Any]) -
 def _handle_team_roster(args: Dict[str, Any]) -> Dict[str, Any]:
     include_offline = bool(args.get("include_offline", True))
     me = _my_handle()
-    fed_active = federation_registry.has_federation_state(bot_bus.BUS_DIR)
+    eff_bus = _effective_bus_dir()
+    fed_active = federation_registry.has_federation_state(eff_bus)
     auth: Dict[str, Any] = {"federation_active": fed_active}
     if fed_active:
         auth = federation_registry.authorize_team_action(
             me,
             "list",
-            bus_dir=bot_bus.BUS_DIR,
+            bus_dir=eff_bus,
             auth_token=_federation_auth_token(),
             env=dict(os.environ),
         )
@@ -414,7 +420,7 @@ def _handle_team_roster(args: Dict[str, Any]) -> Dict[str, Any]:
         "recent_jobs": recent,
     }
     if fed_active:
-        all_teams = federation_registry.list_teams(bus_dir=bot_bus.BUS_DIR)
+        all_teams = federation_registry.list_teams(bus_dir=eff_bus)
         payload["teams"] = _filter_teams_for_actor(all_teams, auth)
     return _tool_text(payload)
 
@@ -471,7 +477,7 @@ def _assert_dispatch_allowed(
     auth_token = _federation_auth_token()
     auth = federation_registry.resolve_actor_authority(
         me,
-        bus_dir=bot_bus.BUS_DIR,
+        bus_dir=_effective_bus_dir(),
         auth_token=auth_token,
         env=dict(os.environ),
     )
@@ -746,13 +752,14 @@ def _handle_team_job(args: Dict[str, Any]) -> Dict[str, Any]:
     me = _my_handle()
     if action == "list":
         limit = max(1, min(30, int(args.get("limit", 10) or 10)))
-        fed_active = federation_registry.has_federation_state(bot_bus.BUS_DIR)
+        eff_bus = _effective_bus_dir()
+        fed_active = federation_registry.has_federation_state(eff_bus)
         auth: Dict[str, Any] = {"federation_active": fed_active}
         if fed_active:
             auth = federation_registry.authorize_team_action(
                 me,
                 "list",
-                bus_dir=bot_bus.BUS_DIR,
+                bus_dir=eff_bus,
                 auth_token=_federation_auth_token(),
                 env=dict(os.environ),
             )
@@ -841,7 +848,7 @@ def _handle_team_broadcast(args: Dict[str, Any]) -> Dict[str, Any]:
                 "broadcast",
                 team_id=sec.get("team_id") or "",
                 target_agent_id=norm_target,
-                bus_dir=bot_bus.BUS_DIR,
+                bus_dir=_effective_bus_dir(),
                 auth_token=_federation_auth_token(),
                 env=dict(os.environ),
             )

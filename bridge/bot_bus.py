@@ -9,6 +9,7 @@ only to coordinator/peer sessions). Uses atomic temp-file writes + `fcntl.flock`
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import datetime
 import fcntl
 import hashlib
@@ -20,11 +21,36 @@ import time
 import uuid
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
-HOME = os.path.expanduser("~")
-BUS_DIR = os.environ.get(
-    "AGY_BOT_BUS_DIR",
-    os.path.join(HOME, ".gemini", "antigravity-cli", "cache", "bot_bus"),
+
+def _norm_bus_dir(raw: Any) -> str:
+    """Normalize a Bot Bus directory/file path (`~` expansion + `normpath`); blank -> `""`."""
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    return os.path.normpath(os.path.expanduser(s))
+
+
+_BOUND_BUS_DIR: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "agy_bot_bus_bound_dir", default=None
 )
+
+
+@contextlib.contextmanager
+def bind_bus_dir(bus_dir: str):
+    """Explicitly bind all Bot Bus paths in the current execution context to `bus_dir`."""
+    target = _norm_bus_dir(bus_dir)
+    if not target:
+        raise ValueError("bus_dir must be a non-empty path")
+    token = _BOUND_BUS_DIR.set(target)
+    try:
+        yield target
+    finally:
+        _BOUND_BUS_DIR.reset(token)
+
+
+HOME = os.path.expanduser("~")
+_DEFAULT_BUS_DIR = _norm_bus_dir(os.path.join(HOME, ".gemini", "antigravity-cli", "cache", "bot_bus"))
+BUS_DIR = _norm_bus_dir(os.environ.get("AGY_BOT_BUS_DIR", "")) or _DEFAULT_BUS_DIR
 JOBS_DIR = os.path.join(BUS_DIR, "jobs")
 INBOX_DIR = os.path.join(BUS_DIR, "inbox")
 GROUP_HISTORY_DIR = os.path.join(BUS_DIR, "group_history")
@@ -36,6 +62,103 @@ LOOP_GUARD_FILE = os.path.join(BUS_DIR, "loop_guard.json")
 MENTION_CHAINS_FILE = os.path.join(BUS_DIR, "mention_chains.json")
 ORIGIN_CTX_FILE = os.path.join(BUS_DIR, "origin_context.json")
 DISPATCH_WINDOW_FILE = os.path.join(BUS_DIR, "dispatch_window.json")
+
+_INITIAL_BUS_DIR = BUS_DIR
+_INITIAL_PATH_CONSTANTS: Dict[str, str] = {
+    "JOBS_DIR": JOBS_DIR,
+    "INBOX_DIR": INBOX_DIR,
+    "GROUP_HISTORY_DIR": GROUP_HISTORY_DIR,
+    "LOCK_FILE": LOCK_FILE,
+    "CONFIG_FILE": CONFIG_FILE,
+    "ROSTER_FILE": ROSTER_FILE,
+    "THREADS_FILE": THREADS_FILE,
+    "LOOP_GUARD_FILE": LOOP_GUARD_FILE,
+    "MENTION_CHAINS_FILE": MENTION_CHAINS_FILE,
+    "ORIGIN_CTX_FILE": ORIGIN_CTX_FILE,
+    "DISPATCH_WINDOW_FILE": DISPATCH_WINDOW_FILE,
+}
+
+
+def _effective_bus_dir() -> str:
+    """Resolve active Bot Bus directory dynamically across strict precedence tiers:
+
+    0. Explicit context binding via `bind_bus_dir()` (`_BOUND_BUS_DIR`)
+    1. Explicit non-blank `BUS_DIR` override (`_norm_bus_dir(BUS_DIR) != _INITIAL_BUS_DIR`)
+    2. Dynamic `AGY_BOT_BUS_DIR` env override (or fallback when `BUS_DIR` is blank)
+    3. Normalized `BUS_DIR` or `_DEFAULT_BUS_DIR`
+    """
+    bound = _norm_bus_dir(_BOUND_BUS_DIR.get())
+    if bound:
+        return bound
+    cur_bus_dir = _norm_bus_dir(BUS_DIR)
+    if cur_bus_dir and cur_bus_dir != _INITIAL_BUS_DIR:
+        return cur_bus_dir
+    env_dir = _norm_bus_dir(os.environ.get("AGY_BOT_BUS_DIR", ""))
+    if env_dir and (not cur_bus_dir or env_dir != _INITIAL_BUS_DIR):
+        return env_dir
+    return cur_bus_dir or _DEFAULT_BUS_DIR
+
+
+def _bus_path(attr_name: str, rel_name: str) -> str:
+    """Resolve a derived Bot Bus path following strict override precedence:
+
+    0. Explicit context binding via `bind_bus_dir()` (`_BOUND_BUS_DIR`)
+    1. Explicit single-constant override (`_norm_bus_dir(globals()[attr_name]) != _INITIAL_PATH_CONSTANTS[attr_name]`)
+    2. Explicit non-blank `BUS_DIR` override (`_norm_bus_dir(BUS_DIR) != _INITIAL_BUS_DIR`)
+    3. Dynamic `AGY_BOT_BUS_DIR` env override (or fallback when `BUS_DIR` is blank)
+    4. Active normalized bus directory (`_effective_bus_dir()`) + `rel_name`
+    """
+    bound = _norm_bus_dir(_BOUND_BUS_DIR.get())
+    if bound:
+        return os.path.join(bound, rel_name)
+    cur_val = _norm_bus_dir(globals()[attr_name])
+    if cur_val and cur_val != _INITIAL_PATH_CONSTANTS[attr_name]:
+        return cur_val
+    return os.path.join(_effective_bus_dir(), rel_name)
+
+
+def _jobs_dir() -> str:
+    return _bus_path("JOBS_DIR", "jobs")
+
+
+def _inbox_dir() -> str:
+    return _bus_path("INBOX_DIR", "inbox")
+
+
+def _group_history_dir() -> str:
+    return _bus_path("GROUP_HISTORY_DIR", "group_history")
+
+
+def _lock_file() -> str:
+    return _bus_path("LOCK_FILE", "bus.lock")
+
+
+def _config_file() -> str:
+    return _bus_path("CONFIG_FILE", "team_config.json")
+
+
+def _roster_file() -> str:
+    return _bus_path("ROSTER_FILE", "roster.json")
+
+
+def _threads_file() -> str:
+    return _bus_path("THREADS_FILE", "threads.json")
+
+
+def _loop_guard_file() -> str:
+    return _bus_path("LOOP_GUARD_FILE", "loop_guard.json")
+
+
+def _mention_chains_file() -> str:
+    return _bus_path("MENTION_CHAINS_FILE", "mention_chains.json")
+
+
+def _origin_ctx_file() -> str:
+    return _bus_path("ORIGIN_CTX_FILE", "origin_context.json")
+
+
+def _dispatch_window_file() -> str:
+    return _bus_path("DISPATCH_WINDOW_FILE", "dispatch_window.json")
 
 VALID_ROLES = ("coordinator", "worker", "peer")
 MODEL_MODE_DEFAULT = "default"
@@ -100,16 +223,20 @@ _LOOP_MAX_EVENTS = 12
 
 
 def _ensure_dirs() -> None:
-    os.makedirs(BUS_DIR, mode=0o700, exist_ok=True)
-    os.makedirs(JOBS_DIR, mode=0o700, exist_ok=True)
-    os.makedirs(INBOX_DIR, mode=0o700, exist_ok=True)
-    os.makedirs(GROUP_HISTORY_DIR, mode=0o700, exist_ok=True)
+    os.makedirs(_effective_bus_dir(), mode=0o700, exist_ok=True)
+    os.makedirs(_jobs_dir(), mode=0o700, exist_ok=True)
+    os.makedirs(_inbox_dir(), mode=0o700, exist_ok=True)
+    os.makedirs(_group_history_dir(), mode=0o700, exist_ok=True)
 
 
 @contextlib.contextmanager
 def _bus_lock():
     _ensure_dirs()
-    with open(LOCK_FILE, "a+", encoding="utf-8") as lf:
+    lock_path = _lock_file()
+    lock_parent = os.path.dirname(lock_path)
+    if lock_parent:
+        os.makedirs(lock_parent, mode=0o700, exist_ok=True)
+    with open(lock_path, "a+", encoding="utf-8") as lf:
         fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
         try:
             yield
@@ -127,7 +254,8 @@ def _read_json(path: str, default: Any = None) -> Any:
 
 def _atomic_write_json(path: str, payload: Any) -> None:
     parent = os.path.dirname(path)
-    os.makedirs(parent, mode=0o700, exist_ok=True)
+    if parent:
+        os.makedirs(parent, mode=0o700, exist_ok=True)
     tmp = f"{path}.{os.getpid()}.{uuid.uuid4().hex[:6]}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -157,7 +285,7 @@ def _pid_alive(pid: int) -> bool:
 
 # ---------------------------------------------------------------- team configuration
 def _load_team_config_unlocked() -> Dict[str, Any]:
-    data = _read_json(CONFIG_FILE, None)
+    data = _read_json(_config_file(), None)
     if not isinstance(data, dict):
         return {"version": 1, "bots": {}}
     bots = data.get("bots")
@@ -256,7 +384,7 @@ def set_team_mirror(chat_id: int, thread_id: Optional[int] = None) -> Dict[str, 
             cfg["mirror"] = {"chat_id": 0, "thread_id": None}
         else:
             cfg["mirror"] = {"chat_id": int(chat_id), "thread_id": thread_id}
-        _atomic_write_json(CONFIG_FILE, cfg)
+        _atomic_write_json(_config_file(), cfg)
         return dict(cfg["mirror"])
 
 
@@ -332,7 +460,7 @@ def _update_bot_config_unlocked(norm: str, **updates: Any) -> Dict[str, Any]:
 
     cur["updated_at"] = now
     bots[norm] = cur
-    _atomic_write_json(CONFIG_FILE, cfg)
+    _atomic_write_json(_config_file(), cfg)
     return dict(cur)
 
 
@@ -408,7 +536,7 @@ def promote_sole_coordinator(coordinator_handle: str, *, worker_default_model: s
     changed = []
     with _bus_lock():
         cfg = _load_team_config_unlocked()
-        roster = _read_json(ROSTER_FILE, {"bots": {}})
+        roster = _read_json(_roster_file(), {"bots": {}})
         all_handles = set((cfg.get("bots") or {}).keys()) | set((roster.get("bots") or {}).keys())
         all_handles.add(coord)
         bots_cfg = cfg.setdefault("bots", {})
@@ -430,7 +558,7 @@ def promote_sole_coordinator(coordinator_handle: str, *, worker_default_model: s
                 cur["updated_at"] = now
             bots_cfg[h] = cur
             changed.append(f"{h}={cur['role']}")
-        _atomic_write_json(CONFIG_FILE, cfg)
+        _atomic_write_json(_config_file(), cfg)
     return changed
 
 
@@ -439,7 +567,7 @@ def set_all_peers() -> List[str]:
     changed = []
     with _bus_lock():
         cfg = _load_team_config_unlocked()
-        roster = _read_json(ROSTER_FILE, {"bots": {}})
+        roster = _read_json(_roster_file(), {"bots": {}})
         all_handles = set((cfg.get("bots") or {}).keys()) | set((roster.get("bots") or {}).keys())
         bots_cfg = cfg.setdefault("bots", {})
         now = int(time.time())
@@ -451,7 +579,7 @@ def set_all_peers() -> List[str]:
             cur["updated_at"] = now
             bots_cfg[h] = cur
             changed.append(f"{h}=peer")
-        _atomic_write_json(CONFIG_FILE, cfg)
+        _atomic_write_json(_config_file(), cfg)
     return changed
 
 
@@ -468,7 +596,8 @@ def heartbeat_bot(info: Dict[str, Any]) -> Dict[str, Any]:
     entry["last_seen"] = now
 
     with _bus_lock():
-        roster = _read_json(ROSTER_FILE, {"version": 1, "bots": {}})
+        roster_file = _roster_file()
+        roster = _read_json(roster_file, {"version": 1, "bots": {}})
         if not isinstance(roster, dict):
             roster = {"version": 1, "bots": {}}
         bots = roster.setdefault("bots", {})
@@ -479,7 +608,7 @@ def heartbeat_bot(info: Dict[str, Any]) -> Dict[str, Any]:
             if stale_fallback in bots:
                 bots.pop(stale_fallback, None)
         bots[norm] = entry
-        _atomic_write_json(ROSTER_FILE, roster)
+        _atomic_write_json(roster_file, roster)
     return entry
 
 
@@ -572,11 +701,12 @@ def _reject_unsafe_actor_id(raw: Any, *, field: str = "agent_id") -> str:
 
 def _merge_federated_roster(base_roster: List[Dict[str, Any]], *, include_offline: bool = True) -> List[Dict[str, Any]]:
     fed = _federation_mod()
-    if fed is None or not fed.has_federation_state(BUS_DIR):
+    eff_bus = _effective_bus_dir()
+    if fed is None or not fed.has_federation_state(eff_bus):
         return base_roster
     all_fed_agents = {
         str(a.get("agent_id") or ""): a
-        for a in fed.list_agents(bus_dir=BUS_DIR, include_disabled=True, include_revoked=True)
+        for a in fed.list_agents(bus_dir=eff_bus, include_disabled=True, include_revoked=True)
         if isinstance(a, dict) and a.get("agent_id")
     }
     by_handle: Dict[str, Dict[str, Any]] = {str(b.get("handle") or ""): dict(b) for b in base_roster}
@@ -592,7 +722,7 @@ def _merge_federated_roster(base_roster: List[Dict[str, Any]], *, include_offlin
                 if not include_offline:
                     by_handle.pop(aid, None)
 
-    fed_items = fed.list_effective_roster(bus_dir=BUS_DIR, include_offline=include_offline)
+    fed_items = fed.list_effective_roster(bus_dir=eff_bus, include_offline=include_offline)
     for fitem in fed_items:
         h = str(fitem.get("handle") or "")
         if not h:
@@ -625,7 +755,7 @@ def _merge_federated_roster(base_roster: List[Dict[str, Any]], *, include_offlin
 def list_roster(include_offline: bool = True) -> List[Dict[str, Any]]:
     now = time.time()
     with _bus_lock():
-        roster = _read_json(ROSTER_FILE, {"bots": {}})
+        roster = _read_json(_roster_file(), {"bots": {}})
         cfg = _load_team_config_unlocked()
     r_bots = roster.get("bots") or {}
     c_bots = cfg.get("bots") or {}
@@ -699,7 +829,7 @@ def resolve_bot_by_id(bot_id: Any) -> Optional[Dict[str, Any]]:
 
     now = time.time()
     with _bus_lock():
-        roster = _read_json(ROSTER_FILE, {"bots": {}})
+        roster = _read_json(_roster_file(), {"bots": {}})
         cfg = _load_team_config_unlocked()
     r_bots = roster.get("bots") if isinstance(roster, dict) else {}
     if not isinstance(r_bots, dict):
@@ -907,8 +1037,9 @@ def _read_proc_euid(pid: int, proc_root: str = "/proc") -> Optional[int]:
 
 def _job_path(job_id: str) -> str:
     clean_id = validate_job_id(job_id)
-    jobs_root = os.path.realpath(JOBS_DIR)
-    candidate = os.path.join(JOBS_DIR, f"{clean_id}.json")
+    jobs_dir = _jobs_dir()
+    jobs_root = os.path.realpath(jobs_dir)
+    candidate = os.path.join(jobs_dir, f"{clean_id}.json")
     cand_real = os.path.realpath(candidate)
     if not cand_real.startswith(jobs_root + os.sep):
         raise ValueError(f"Job path escapes JOBS_DIR: {job_id!r}")
@@ -922,10 +1053,11 @@ _LAST_PKT_NS_BY_DIR: Dict[str, int] = {}
 def _scan_inbox_max_ns_unlocked() -> int:
     """Scan existing `INBOX_DIR/*/*.json` filenames under `_bus_lock()` to bootstrap watermark."""
     max_ns = 0
+    inbox_dir = _inbox_dir()
     try:
-        if not os.path.isdir(INBOX_DIR):
+        if not os.path.isdir(inbox_dir):
             return 0
-        for bot_entry in os.scandir(INBOX_DIR):
+        for bot_entry in os.scandir(inbox_dir):
             if not bot_entry.is_dir(follow_symlinks=False):
                 continue
             try:
@@ -950,8 +1082,9 @@ def _next_monotonic_pkt_ns_unlocked() -> int:
     persistence cannot be committed atomically.
     """
     now_ns = time.time_ns()
-    inbox_key = os.path.realpath(INBOX_DIR)
-    wm_path = os.path.join(INBOX_DIR, ".last_pkt_ns")
+    inbox_dir = _inbox_dir()
+    inbox_key = os.path.realpath(inbox_dir)
+    wm_path = os.path.join(inbox_dir, ".last_pkt_ns")
     prev_ns = _LAST_PKT_NS_BY_DIR.get(inbox_key, 0)
     wm_valid = False
     try:
@@ -972,7 +1105,7 @@ def _next_monotonic_pkt_ns_unlocked() -> int:
             prev_ns = backlog_ns
 
     mono_ns = now_ns if now_ns > prev_ns else (prev_ns + 1)
-    os.makedirs(INBOX_DIR, mode=0o700, exist_ok=True)
+    os.makedirs(inbox_dir, mode=0o700, exist_ok=True)
     tmp = f"{wm_path}.{os.getpid()}.{uuid.uuid4().hex[:6]}.tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as f:
@@ -1011,7 +1144,7 @@ def _inbox_sort_key(filename: str) -> Tuple[int, int, str]:
 def _drop_inbox_packet_unlocked(target_handle: str, packet: Dict[str, Any]) -> str:
     global _PKT_SEQ
     norm = normalize_handle(target_handle)
-    bot_inbox = os.path.join(INBOX_DIR, norm)
+    bot_inbox = os.path.join(_inbox_dir(), norm)
     os.makedirs(bot_inbox, mode=0o700, exist_ok=True)
     _PKT_SEQ = (_PKT_SEQ + 1) % 1_000_000
     ts_ns = _next_monotonic_pkt_ns_unlocked()
@@ -1025,7 +1158,7 @@ def pop_inbox_packets(handle: str) -> List[Dict[str, Any]]:
     norm = normalize_handle(handle)
     if not norm:
         return []
-    bot_inbox = os.path.join(INBOX_DIR, norm)
+    bot_inbox = os.path.join(_inbox_dir(), norm)
     if not os.path.isdir(bot_inbox):
         return []
     packets: List[Dict[str, Any]] = []
@@ -1050,15 +1183,16 @@ def pop_inbox_packets(handle: str) -> List[Dict[str, Any]]:
 
 
 def _prune_old_jobs_unlocked(limit: int = JOB_RETENTION_LIMIT) -> None:
+    jobs_dir = _jobs_dir()
     try:
-        files = [fn for fn in os.listdir(JOBS_DIR) if fn.endswith(".json") and not fn.endswith(".tmp")]
+        files = [fn for fn in os.listdir(jobs_dir) if fn.endswith(".json") and not fn.endswith(".tmp")]
     except OSError:
         return
     if len(files) <= limit:
         return
     entries = []
     for fn in files:
-        fp = os.path.join(JOBS_DIR, fn)
+        fp = os.path.join(jobs_dir, fn)
         try:
             st = os.stat(fp)
             entries.append((st.st_mtime, fp))
@@ -1081,7 +1215,8 @@ def _prune_old_jobs_unlocked(limit: int = JOB_RETENTION_LIMIT) -> None:
 
 def _record_dispatch_window_unlocked(now: float, count: int, max_jobs_10m: int) -> None:
     """Enforce and record 10-minute rolling job dispatch rate limit under `_bus_lock()`."""
-    data = _read_json(DISPATCH_WINDOW_FILE, {"events": []})
+    dw_file = _dispatch_window_file()
+    data = _read_json(dw_file, {"events": []})
     events = data.get("events") if isinstance(data, dict) else []
     if not isinstance(events, list):
         events = []
@@ -1092,7 +1227,7 @@ def _record_dispatch_window_unlocked(now: float, count: int, max_jobs_10m: int) 
             f"BUDGET_EXCEEDED: 10-minute dispatch window limit exceeded ({len(recent)} + {count} > {max_jobs_10m})"
         )
     recent.extend([now] * count)
-    _atomic_write_json(DISPATCH_WINDOW_FILE, {"events": recent})
+    _atomic_write_json(dw_file, {"events": recent})
 
 
 def dispatch_assignments(
@@ -1252,7 +1387,8 @@ def dispatch_assignments(
     created_jobs: List[Dict[str, Any]] = []
 
     with _bus_lock():
-        roster_raw = _read_json(ROSTER_FILE, {"bots": {}})
+        eff_bus = _effective_bus_dir()
+        roster_raw = _read_json(_roster_file(), {"bots": {}})
         cfg_raw = _load_team_config_unlocked()
         r_bots = roster_raw.get("bots") or {}
         c_bots = cfg_raw.get("bots") or {}
@@ -1261,7 +1397,7 @@ def dispatch_assignments(
         roster = [_merge_bot_view(h, r_bots.get(h), c_bots.get(h), now, team_mirror=team_mirror) for h in handles]
         roster = _merge_federated_roster(roster, include_offline=True)
         fed = _federation_mod()
-        fed_active = bool(fed is not None and fed.has_federation_state(BUS_DIR))
+        fed_active = bool(fed is not None and fed.has_federation_state(eff_bus))
 
         resolved_specs = []
         sender_auth: Optional[Dict[str, Any]] = None
@@ -1304,7 +1440,7 @@ def dispatch_assignments(
                     "dispatch",
                     team_id=spec_team,
                     target_agent_id=th,
-                    bus_dir=BUS_DIR,
+                    bus_dir=eff_bus,
                     auth_token=auth_token,
                 )
                 sender_auth = auth_res
@@ -1315,7 +1451,7 @@ def dispatch_assignments(
                     if allowed_list:
                         if fed_teams_by_id is None:
                             fed_teams_by_id = {
-                                t["team_id"]: t for t in fed.list_teams(bus_dir=BUS_DIR) if isinstance(t, dict)
+                                t["team_id"]: t for t in fed.list_teams(bus_dir=eff_bus) if isinstance(t, dict)
                             }
                         is_global_c = bool(auth_res.get("is_coordinator_peer") or auth_res.get("is_legacy_coordinator"))
                         scoped_candidates = (
@@ -1335,7 +1471,7 @@ def dispatch_assignments(
                     elif led_list:
                         if fed_teams_by_id is None:
                             fed_teams_by_id = {
-                                t["team_id"]: t for t in fed.list_teams(bus_dir=BUS_DIR) if isinstance(t, dict)
+                                t["team_id"]: t for t in fed.list_teams(bus_dir=eff_bus) if isinstance(t, dict)
                             }
                         matching_led = [
                             tid
@@ -1537,13 +1673,14 @@ def get_job(
     if requester_bot:
         _reject_unsafe_actor_id(requester_bot, field="requester_bot")
         fed = _federation_mod()
-        if fed is not None and fed.has_federation_state(BUS_DIR):
+        eff_bus = _effective_bus_dir()
+        if fed is not None and fed.has_federation_state(eff_bus):
             fed.authorize_team_action(
                 normalize_handle(requester_bot),
                 "status",
                 team_id=str(data.get("team_id") or ""),
                 job=data,
-                bus_dir=BUS_DIR,
+                bus_dir=eff_bus,
                 auth_token=auth_token,
             )
     return data
@@ -1552,13 +1689,14 @@ def get_job(
 def list_jobs(limit: int = 20, status: Optional[str] = None, bot: Optional[str] = None) -> List[Dict[str, Any]]:
     _ensure_dirs()
     norm_bot = normalize_handle(bot or "") if bot else ""
+    jobs_dir = _jobs_dir()
     try:
-        files = [fn for fn in os.listdir(JOBS_DIR) if fn.endswith(".json") and not fn.endswith(".tmp")]
+        files = [fn for fn in os.listdir(jobs_dir) if fn.endswith(".json") and not fn.endswith(".tmp")]
     except OSError:
         return []
     jobs = []
     for fn in files:
-        data = _read_json(os.path.join(JOBS_DIR, fn), None)
+        data = _read_json(os.path.join(jobs_dir, fn), None)
         if not isinstance(data, dict):
             continue
         if status and data.get("status") != status:
@@ -1632,13 +1770,14 @@ def reap_zombie_jobs(
     reaped: List[str] = []
 
     with _bus_lock():
+        jobs_dir = _jobs_dir()
         try:
-            files = sorted(fn for fn in os.listdir(JOBS_DIR) if fn.endswith(".json") and not fn.endswith(".tmp"))
+            files = sorted(fn for fn in os.listdir(jobs_dir) if fn.endswith(".json") and not fn.endswith(".tmp"))
         except OSError:
             return []
 
         for fn in files:
-            fp = os.path.join(JOBS_DIR, fn)
+            fp = os.path.join(jobs_dir, fn)
             job = _read_json(fp, None)
             if not isinstance(job, dict) or job.get("status") != "running":
                 continue
@@ -1806,7 +1945,7 @@ def requeue_unacked_batch_done(
         excluded_groups: set[str] = {
             str(g).strip() for g in (exclude_group_ids or ()) if str(g).strip()
         }
-        bot_inbox = os.path.join(INBOX_DIR, target)
+        bot_inbox = os.path.join(_inbox_dir(), target)
         if os.path.isdir(bot_inbox):
             try:
                 for pfn in os.listdir(bot_inbox):
@@ -1820,14 +1959,15 @@ def requeue_unacked_batch_done(
             except OSError:
                 pass
 
+        jobs_dir = _jobs_dir()
         try:
-            files = sorted(fn for fn in os.listdir(JOBS_DIR) if fn.endswith(".json") and not fn.endswith(".tmp"))
+            files = sorted(fn for fn in os.listdir(jobs_dir) if fn.endswith(".json") and not fn.endswith(".tmp"))
         except OSError:
             return []
 
         groups: Dict[str, List[Dict[str, Any]]] = {}
         for fn in files:
-            job = _read_json(os.path.join(JOBS_DIR, fn), None)
+            job = _read_json(os.path.join(jobs_dir, fn), None)
             if not isinstance(job, dict):
                 continue
             if normalize_handle(str(job.get("from_bot") or "")) != target:
@@ -2024,14 +2164,15 @@ def cancel_job(
         if not isinstance(job, dict):
             return None
         fed = _federation_mod()
-        fed_active = bool(fed is not None and fed.has_federation_state(BUS_DIR))
+        eff_bus = _effective_bus_dir()
+        fed_active = bool(fed is not None and fed.has_federation_state(eff_bus))
         if req and fed_active and fed is not None:
             fed.authorize_team_action(
                 req,
                 "cancel",
                 team_id=str(job.get("team_id") or ""),
                 job=job,
-                bus_dir=BUS_DIR,
+                bus_dir=eff_bus,
                 auth_token=auth_token,
             )
         elif req and req not in (job.get("from_bot"), job.get("target_bot")):
@@ -2361,13 +2502,14 @@ def retry_job(
         )
     fed = _federation_mod()
     reg_caller_trust = ""
-    if requester_bot and fed is not None and fed.has_federation_state(BUS_DIR):
+    eff_bus = _effective_bus_dir()
+    if requester_bot and fed is not None and fed.has_federation_state(eff_bus):
         retry_auth = fed.authorize_team_action(
             normalize_handle(requester_bot),
             "retry",
             team_id=prev_team_id,
             job=prev,
-            bus_dir=BUS_DIR,
+            bus_dir=eff_bus,
             auth_token=auth_token,
         )
         reg_agent = retry_auth.get("agent") if isinstance(retry_auth, dict) else None
@@ -2654,7 +2796,7 @@ def thread_get(from_bot: str, target_bot: str, thread_key: str) -> str:
         return ""
     k = _thread_map_key(from_bot, target_bot, thread_key)
     with _bus_lock():
-        data = _read_json(THREADS_FILE, {})
+        data = _read_json(_threads_file(), {})
         entry = data.get(k)
         return str((entry or {}).get("cid") or "")
 
@@ -2664,7 +2806,8 @@ def thread_set(from_bot: str, target_bot: str, thread_key: str, cid: str) -> Non
         return
     k = _thread_map_key(from_bot, target_bot, thread_key)
     with _bus_lock():
-        data = _read_json(THREADS_FILE, {})
+        tf = _threads_file()
+        data = _read_json(tf, {})
         if not isinstance(data, dict):
             data = {}
         data[k] = {"cid": cid, "updated_at": int(time.time())}
@@ -2672,7 +2815,7 @@ def thread_set(from_bot: str, target_bot: str, thread_key: str, cid: str) -> Non
             oldest = sorted(data.items(), key=lambda kv: int((kv[1] or {}).get("updated_at") or 0))[:-200]
             for old_k, _ in oldest:
                 data.pop(old_k, None)
-        _atomic_write_json(THREADS_FILE, data)
+        _atomic_write_json(tf, data)
 
 
 # ---------------------------------------------------------------- origin context & mention parser
@@ -2732,7 +2875,8 @@ def set_origin_context(
     nb = normalize_handle(bot_handle or os.environ.get("AGY_BOT_HANDLE", ""))
     ctx_key = _origin_context_key(sk, nb)
     with _bus_lock():
-        data = _read_json(ORIGIN_CTX_FILE, {})
+        of = _origin_ctx_file()
+        data = _read_json(of, {})
         if not isinstance(data, dict):
             data = {}
         data[ctx_key] = {
@@ -2749,7 +2893,7 @@ def set_origin_context(
             oldest = sorted(data.items(), key=lambda kv: float((kv[1] or {}).get("updated_at") or 0))[:-100]
             for old_k, _ in oldest:
                 data.pop(old_k, None)
-        _atomic_write_json(ORIGIN_CTX_FILE, data)
+        _atomic_write_json(of, data)
 
 
 def get_origin_context(scope_key: str, bot_handle: str = "") -> Dict[str, Any]:
@@ -2758,14 +2902,14 @@ def get_origin_context(scope_key: str, bot_handle: str = "") -> Dict[str, Any]:
         return {}
     ctx_key = _origin_context_key(sk, bot_handle)
     with _bus_lock():
-        data = _read_json(ORIGIN_CTX_FILE, {})
+        data = _read_json(_origin_ctx_file(), {})
         entry = data.get(ctx_key) if isinstance(data, dict) else None
         return dict(entry) if isinstance(entry, dict) else {}
 
 
 # ---------------------------------------------------------------- shared group chat ledger
 def _group_history_path(chat_id: int) -> str:
-    return os.path.join(GROUP_HISTORY_DIR, f"{int(chat_id)}.json")
+    return os.path.join(_group_history_dir(), f"{int(chat_id)}.json")
 
 
 def _cursor_key(bot_handle: str, thread_id: Optional[int]) -> str:
@@ -3026,13 +3170,14 @@ def loop_guard_allow(scope_key: str, max_events: int = _LOOP_MAX_EVENTS, window_
     now = time.time()
     sk = str(scope_key or "default")
     with _bus_lock():
-        data = _read_json(LOOP_GUARD_FILE, {})
+        lgf = _loop_guard_file()
+        data = _read_json(lgf, {})
         if not isinstance(data, dict):
             data = {}
         hist = [float(ts) for ts in (data.get(sk) or []) if (now - float(ts)) < window_sec]
         if len(hist) >= max_events:
             data[sk] = hist
-            _atomic_write_json(LOOP_GUARD_FILE, data)
+            _atomic_write_json(lgf, data)
             return False
         hist.append(now)
         data[sk] = hist
@@ -3040,7 +3185,7 @@ def loop_guard_allow(scope_key: str, max_events: int = _LOOP_MAX_EVENTS, window_
             for k in list(data.keys()):
                 if not data[k] or (now - float(data[k][-1])) > max(window_sec, 3600.0):
                     data.pop(k, None)
-        _atomic_write_json(LOOP_GUARD_FILE, data)
+        _atomic_write_json(lgf, data)
         return True
 
 
@@ -3057,7 +3202,8 @@ def mark_human_group_activity(
     mid = int(msg_id or 0)
     now = time.time()
     with _bus_lock():
-        data = _read_json(MENTION_CHAINS_FILE, {})
+        mcf = _mention_chains_file()
+        data = _read_json(mcf, {})
         if not isinstance(data, dict):
             data = {}
         cur = data.get(skey)
@@ -3081,7 +3227,7 @@ def mark_human_group_activity(
         for k in list(data.keys()):
             if (now - float((data[k] or {}).get("human_ts") or 0)) > 86400.0:
                 data.pop(k, None)
-        _atomic_write_json(MENTION_CHAINS_FILE, data)
+        _atomic_write_json(mcf, data)
         return chain_id
 
 
@@ -3115,7 +3261,7 @@ def relay_group_mentions(
     next_hop = max(0, int(source_hop or 0)) + 1
 
     with _bus_lock():
-        roster_raw = _read_json(ROSTER_FILE, {"bots": {}})
+        roster_raw = _read_json(_roster_file(), {"bots": {}})
         cfg_raw = _load_team_config_unlocked()
         r_bots = roster_raw.get("bots") or {}
         c_bots = cfg_raw.get("bots") or {}
@@ -3132,7 +3278,8 @@ def relay_group_mentions(
         if not targets:
             return {"relayed": [], "blocked_reason": ""}
 
-        chains = _read_json(MENTION_CHAINS_FILE, {})
+        mcf = _mention_chains_file()
+        chains = _read_json(mcf, {})
         if not isinstance(chains, dict):
             chains = {}
         chain = chains.get(skey)
@@ -3184,7 +3331,7 @@ def relay_group_mentions(
         chain["relays"] = relays_used
         chain["seen_relays"] = seen_relays[-32:]
         chains[skey] = chain
-        _atomic_write_json(MENTION_CHAINS_FILE, chains)
+        _atomic_write_json(mcf, chains)
         return {"relayed": relayed, "blocked_reason": blocked_reason}
 
 
@@ -3650,13 +3797,14 @@ def cleanup_job_worktree(
         return {"ok": False, "job_id": job_id, "error": f"Job not found: {job_id}"}
     if requester_bot:
         fed = _federation_mod()
-        if fed is not None and fed.has_federation_state(BUS_DIR):
+        eff_bus = _effective_bus_dir()
+        if fed is not None and fed.has_federation_state(eff_bus):
             fed.authorize_team_action(
                 normalize_handle(requester_bot),
                 "cleanup_worktree",
                 team_id=str(job.get("team_id") or ""),
                 job=job,
-                bus_dir=BUS_DIR,
+                bus_dir=eff_bus,
                 auth_token=auth_token,
             )
 
@@ -4126,7 +4274,7 @@ def cleanup_studio_worktree(
 
 
 def studio_worktrees_registry_path(bus_dir: Optional[str] = None) -> str:
-    base = str(bus_dir or BUS_DIR)
+    base = _norm_bus_dir(bus_dir) or _effective_bus_dir()
     return os.path.join(base, _STUDIO_WORKTREES_FILENAME)
 
 
@@ -4186,11 +4334,12 @@ def _mutate_studio_worktrees_atomic(
 ) -> None:
     """Atomically read-modify-write `studio_worktrees.json` inside a single `fcntl.flock(LOCK_EX)`."""
     parent = os.path.dirname(reg_path)
-    os.makedirs(parent, exist_ok=True)
-    try:
-        os.chmod(parent, 0o700)
-    except OSError:
-        pass
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+        try:
+            os.chmod(parent, 0o700)
+        except OSError:
+            pass
     lock_path = reg_path + ".lock"
     lfd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     try:

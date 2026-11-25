@@ -83,6 +83,7 @@ class TestP02SingleInstanceFlock(unittest.TestCase):
             env = {
                 **os.environ,
                 "PYTHONPATH": str(BRIDGE_DIR),
+                "AGY_BOT_BUS_DIR": os.path.join(tmp, "bus"),
                 "AGY_TG_ENV_FILE": os.path.join(tmp, "none.env"),
                 "AGY_TG_STATE_FILE": os.path.join(tmp, "state.json"),
                 "AGY_TG_LOCK_DIR": os.path.join(tmp, "locks"),

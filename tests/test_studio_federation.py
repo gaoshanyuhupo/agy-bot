@@ -846,12 +846,20 @@ class TestM3C6AndC7TelegramCommands(unittest.TestCase):
         self.assertFalse(access_control.is_command_allowed_for_role("readonly", "/team", "create t1")[0])
 
         # 2. Legacy empty `/team` & `/team peer` still work without regression
+        default_real_cfg = Path.home() / ".gemini" / "antigravity-cli" / "cache" / "bot_bus" / "team_config.json"
+        real_cfg_before = default_real_cfg.read_bytes() if default_real_cfg.is_file() else None
+
         tg_bridge.cmd_team(ADMIN_UID, "")
         self.assertTrue(self.sent_messages)
         self.sent_messages.clear()
         tg_bridge.cmd_team(ADMIN_UID, "peer")
         self.assertTrue(any("Peer" in str(m["text"]) for m in self.sent_messages))
         self.sent_messages.clear()
+
+        # Verify `/team peer` wrote ONLY into isolated self.bus_dir and never touched host team_config.json
+        self.assertTrue((Path(self.bus_dir) / "team_config.json").is_file())
+        real_cfg_after = default_real_cfg.read_bytes() if default_real_cfg.is_file() else None
+        self.assertEqual(real_cfg_before, real_cfg_after)
 
         # 3. Negative caller cases: readonly, denied, is_bot=True, from_user=None
         bad_callers = [
@@ -883,9 +891,20 @@ class TestM3C6AndC7TelegramCommands(unittest.TestCase):
         self.assertFalse(os.path.exists(federation_registry.teams_file_path(self.bus_dir)))
 
     def test_m3_c7_group_chat_hard_blocks_tokens_and_dm_delivers_safely(self) -> None:
+        default_real_cfg = Path.home() / ".gemini" / "antigravity-cli" / "cache" / "bot_bus" / "team_config.json"
+        real_cfg_before = default_real_cfg.read_bytes() if default_real_cfg.is_file() else None
+
         admin_user = {"id": ADMIN_UID, "is_bot": False}
         # Bind a team_mirror group to verify DM token NEVER leaks to mirror chat
         bot_bus.set_team_mirror(MIRROR_GROUP_ID, None)
+        isolated_cfg = Path(self.bus_dir) / "team_config.json"
+        self.assertTrue(isolated_cfg.is_file())
+        self.assertEqual(
+            MIRROR_GROUP_ID,
+            json.loads(isolated_cfg.read_text(encoding="utf-8")).get("mirror", {}).get("chat_id"),
+        )
+        real_cfg_after = default_real_cfg.read_bytes() if default_real_cfg.is_file() else None
+        self.assertEqual(real_cfg_before, real_cfg_after)
 
         # Register agent alpha via legitimate human admin in DM (without --mint)
         tg_bridge.cmd_agent(

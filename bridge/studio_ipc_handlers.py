@@ -60,6 +60,11 @@ def bind_host(host):
     return host
 
 
+def _bb_bus_dir(bb) -> str:
+    fn = getattr(bb, "_effective_bus_dir", None)
+    return fn() if callable(fn) else str(getattr(bb, "BUS_DIR", ""))
+
+
 def _h(host=None):
     target = host if host is not None else _host
     if target is None:
@@ -440,7 +445,7 @@ def _studio_ipc_enqueue_turn(req):
                 target_abort_tid = owner_active["turn_id"]
                 should_interrupt_running = True
         else:
-            if sipc.is_conversation_locked(bb.BUS_DIR, cid):
+            if sipc.is_conversation_locked(_bb_bus_dir(bb), cid):
                 return 409, {"ok": False, "code": "session_busy", "error": "会话已被其他进程占用（session_busy）"}
     elif interrupt_current and cur_running and cur_running_web_id:
         run_info = h._studio_ipc_buffer.get_turn_info(cur_running_web_id)
@@ -527,7 +532,7 @@ def _studio_ipc_enqueue_turn(req):
                     bb.upsert_studio_worktree_meta(
                         str(prep["worktree_id"]),
                         prep,
-                        bus_dir=bb.BUS_DIR,
+                        bus_dir=_bb_bus_dir(bb),
                     )
                 except Exception as wreg_err:
                     h.log("upsert_studio_worktree_meta enqueue error: %r" % wreg_err)
@@ -1309,7 +1314,7 @@ def _studio_ipc_apply_checkpoint(req, *, reverse=False):
 
         conv_lease = None
         if entry_cid and sipc.is_valid_cid(entry_cid):
-            conv_lease = sipc.ConversationLease.try_acquire(bb.BUS_DIR, entry_cid)
+            conv_lease = sipc.ConversationLease.try_acquire(_bb_bus_dir(bb), entry_cid)
             if conv_lease is None:
                 return 409, {"ok": False, "code": "session_busy", "error": "会话已被其他进程占用（session_busy）"}
 
@@ -1464,7 +1469,7 @@ def _studio_ipc_cleanup_worktree(req):
                         base_commit_hint = str(wt["base_commit"])
 
         # Also check shared registry for cid/base_commit metadata
-        reg_meta = bb.load_studio_worktrees(bb.BUS_DIR).get(wt_id)
+        reg_meta = bb.load_studio_worktrees(_bb_bus_dir(bb)).get(wt_id)
         if isinstance(reg_meta, dict):
             if reg_meta.get("cid"):
                 bound_cids.add(str(reg_meta["cid"]))
@@ -1510,7 +1515,7 @@ def _studio_ipc_cleanup_worktree(req):
         try:
             for c in sorted(bound_cids):
                 if sipc.is_valid_cid(c):
-                    lease = sipc.ConversationLease.try_acquire(bb.BUS_DIR, c)
+                    lease = sipc.ConversationLease.try_acquire(_bb_bus_dir(bb), c)
                     if lease is None:
                         return 409, {
                             "ok": False,
@@ -1570,7 +1575,7 @@ def _studio_ipc_cleanup_worktree(req):
                             wt_map.pop(cid_k, None)
             h.save_state()
             try:
-                bb.remove_studio_worktree_meta(wt_id, bus_dir=bb.BUS_DIR)
+                bb.remove_studio_worktree_meta(wt_id, bus_dir=_bb_bus_dir(bb))
             except Exception:
                 pass
             return 200, {
@@ -2444,7 +2449,7 @@ def _start_studio_ipc():
         return existing
     try:
         srv = sipc.StudioIPCServer(
-            bus_dir=bb.BUS_DIR,
+            bus_dir=_bb_bus_dir(bb),
             bot_handle=h._current_bot_handle(),
             resolve_role_fn=getattr(h, "_studio_ipc_resolve_role", _studio_ipc_resolve_role),
             get_meta_fn=getattr(h, "_studio_ipc_get_meta", _studio_ipc_get_meta),

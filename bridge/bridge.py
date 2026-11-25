@@ -53,6 +53,11 @@ try:
 except ImportError:
     from bridge import bot_bus
 
+
+def _effective_bus_dir() -> str:
+    fn = getattr(bot_bus, "_effective_bus_dir", None)
+    return fn() if callable(fn) else str(getattr(bot_bus, "BUS_DIR", ""))
+
 try:
     import formatting
 except ImportError:
@@ -4570,7 +4575,7 @@ def _run_fast_group_reply(
                 reply_text = (parsed.get("response") or "").strip()
                 fast_cid = parsed.get("conversation_id")
                 if fast_cid:
-                    bot_profiles.register_cid_owner(str(fast_cid), my_handle, bus_dir=bot_bus.BUS_DIR)
+                    bot_profiles.register_cid_owner(str(fast_cid), my_handle, bus_dir=_effective_bus_dir())
                 if fast_untrusted and fast_cid:
                     memory_guard.mark_tainted(
                         str(fast_cid),
@@ -5063,7 +5068,7 @@ def run_agy(
 
     conv_lease = None
     if conv:
-        conv_lease = studio_ipc.ConversationLease.try_acquire(bot_bus.BUS_DIR, conv)
+        conv_lease = studio_ipc.ConversationLease.try_acquire(_effective_bus_dir(), conv)
         if conv_lease is None:
             if is_web_turn:
                 _emit_web("error", {
@@ -5176,7 +5181,7 @@ def run_agy(
         src = "web" if is_web_turn else "tg"
         try:
             written = studio_ipc.write_chat_sync_atomic(
-                bot_bus.BUS_DIR,
+                _effective_bus_dir(),
                 _current_bot_handle(),
                 cid=cid_val,
                 source=src,
@@ -5419,9 +5424,9 @@ def run_agy(
                         with session_lock:
                             turn_running_cid = cid
                         if conv_lease is None and studio_ipc.is_valid_cid(cid):
-                            conv_lease = studio_ipc.ConversationLease.try_acquire(bot_bus.BUS_DIR, cid)
+                            conv_lease = studio_ipc.ConversationLease.try_acquire(_effective_bus_dir(), cid)
                         bot_profiles.register_cid_owner(
-                            cid, _current_bot_handle(), bus_dir=bot_bus.BUS_DIR
+                            cid, _current_bot_handle(), bus_dir=_effective_bus_dir()
                         )
                         if turn_untrusted and persist_sticky_taint:
                             memory_guard.mark_tainted(
@@ -6064,7 +6069,7 @@ def run_agy(
                     reg_wt["cid"] = res_cid
                     reg_wt["scope_key"] = exec_skey
                     reg_wt["bot"] = _current_bot_handle()
-                    bot_bus.upsert_studio_worktree_meta(active_wt_id, reg_wt, bus_dir=bot_bus.BUS_DIR)
+                    bot_bus.upsert_studio_worktree_meta(active_wt_id, reg_wt, bus_dir=_effective_bus_dir())
                 except Exception as wreg_err:
                     log("upsert_studio_worktree_meta error: %r" % wreg_err)
                 active_wt_sanitized = bot_bus.sanitize_studio_worktree_meta({
@@ -7278,7 +7283,7 @@ def execute_scheduled_task(task):
 
             if new_cid:
                 _record_scheduled_cid(new_cid)
-                bot_profiles.register_cid_owner(str(new_cid), _current_bot_handle(), bus_dir=bot_bus.BUS_DIR)
+                bot_profiles.register_cid_owner(str(new_cid), _current_bot_handle(), bus_dir=_effective_bus_dir())
                 if sched_untrusted:
                     memory_guard.mark_tainted(
                         str(new_cid),
@@ -7783,7 +7788,7 @@ def _execute_bus_job(job_id, *, claimed_turn_gen=None, claimed_qid=None):
                 cid = ev.get("conversation_id")
                 if cid:
                     new_cid = cid
-                    bot_profiles.register_cid_owner(str(cid), my_handle, bus_dir=bot_bus.BUS_DIR)
+                    bot_profiles.register_cid_owner(str(cid), my_handle, bus_dir=_effective_bus_dir())
                     if job_tainted:
                         memory_guard.mark_tainted(
                             str(cid),
@@ -11724,7 +11729,7 @@ def _leader_dispatch_warning_html(leader_agent_id):
     if not leader_agent_id:
         return ""
     try:
-        rec = federation_registry.get_agent(leader_agent_id, bus_dir=bot_bus.BUS_DIR)
+        rec = federation_registry.get_agent(leader_agent_id, bus_dir=_effective_bus_dir())
     except Exception:
         return ""
     if isinstance(rec, dict) and not bool((rec.get("capabilities") or {}).get("can_dispatch", False)):
@@ -11757,7 +11762,7 @@ def _handle_federation_team_subcommand(chat_id, raw, parts, *, norm_tid, skey, f
         return
 
     if sub == "list":
-        teams = federation_registry.list_teams(bus_dir=bot_bus.BUS_DIR)
+        teams = federation_registry.list_teams(bus_dir=_effective_bus_dir())
         if not teams:
             send(
                 chat_id,
@@ -11828,7 +11833,7 @@ def _handle_federation_team_subcommand(chat_id, raw, parts, *, norm_tid, skey, f
                 co_leaders=co_leaders,
                 members=members,
                 require_registered=True,
-                bus_dir=bot_bus.BUS_DIR,
+                bus_dir=_effective_bus_dir(),
             )
         except (ValueError, PermissionError) as exc:
             send(chat_id, f"❌ 创建团队失败：<code>{html_mod.escape(str(exc))}</code>", parse_mode="HTML", thread_id=norm_tid)
@@ -11860,7 +11865,7 @@ def _handle_federation_team_subcommand(chat_id, raw, parts, *, norm_tid, skey, f
                 leader_id,
                 owner_auth=owner_auth,
                 require_registered=True,
-                bus_dir=bot_bus.BUS_DIR,
+                bus_dir=_effective_bus_dir(),
             )
         except (ValueError, PermissionError) as exc:
             send(chat_id, f"❌ 切换负责人失败：<code>{html_mod.escape(str(exc))}</code>", parse_mode="HTML", thread_id=norm_tid)
@@ -11892,14 +11897,14 @@ def _handle_federation_team_subcommand(chat_id, raw, parts, *, norm_tid, skey, f
                     aid,
                     owner_auth=owner_auth,
                     require_registered=True,
-                    bus_dir=bot_bus.BUS_DIR,
+                    bus_dir=_effective_bus_dir(),
                 )
             else:
                 team = federation_registry.remove_team_member(
                     team_id,
                     aid,
                     owner_auth=owner_auth,
-                    bus_dir=bot_bus.BUS_DIR,
+                    bus_dir=_effective_bus_dir(),
                 )
         except (ValueError, PermissionError) as exc:
             send(chat_id, f"❌ 更新团队成员失败：<code>{html_mod.escape(str(exc))}</code>", parse_mode="HTML", thread_id=norm_tid)
@@ -11919,7 +11924,7 @@ def _handle_federation_team_subcommand(chat_id, raw, parts, *, norm_tid, skey, f
             return
         team_id = tokens[1]
         try:
-            deleted = federation_registry.delete_team(team_id, owner_auth=owner_auth, bus_dir=bot_bus.BUS_DIR)
+            deleted = federation_registry.delete_team(team_id, owner_auth=owner_auth, bus_dir=_effective_bus_dir())
         except (ValueError, PermissionError) as exc:
             send(chat_id, f"❌ 删除团队失败：<code>{html_mod.escape(str(exc))}</code>", parse_mode="HTML", thread_id=norm_tid)
             return
@@ -11967,7 +11972,7 @@ def cmd_agent(chat_id, raw_rest="", thread_id=None, scope_key=None, from_user=No
         sub = tokens[0].lower() if tokens else "list"
 
     if sub in ("list", "ls", "help"):
-        agents = federation_registry.list_agents(bus_dir=bot_bus.BUS_DIR, include_disabled=True, include_revoked=True)
+        agents = federation_registry.list_agents(bus_dir=_effective_bus_dir(), include_disabled=True, include_revoked=True)
         if not agents:
             send(
                 chat_id,
@@ -12084,7 +12089,7 @@ def cmd_agent(chat_id, raw_rest="", thread_id=None, scope_key=None, from_user=No
                 transport=norm_transport,
                 trust_level=trust_level,
                 metadata=meta,
-                bus_dir=bot_bus.BUS_DIR,
+                bus_dir=_effective_bus_dir(),
             )
             minted = None
             if want_mint:
@@ -12092,7 +12097,7 @@ def cmd_agent(chat_id, raw_rest="", thread_id=None, scope_key=None, from_user=No
                     rec["agent_id"],
                     owner_auth=owner_auth,
                     label="tg-dm-add",
-                    bus_dir=bot_bus.BUS_DIR,
+                    bus_dir=_effective_bus_dir(),
                 )
         except (ValueError, PermissionError) as exc:
             send(chat_id, f"❌ 注册 Agent 失败：<code>{html_mod.escape(str(exc))}</code>", parse_mode="HTML", thread_id=norm_tid)
@@ -12150,7 +12155,7 @@ def cmd_agent(chat_id, raw_rest="", thread_id=None, scope_key=None, from_user=No
                 aid,
                 owner_auth=owner_auth,
                 capabilities=cap_updates,
-                bus_dir=bot_bus.BUS_DIR,
+                bus_dir=_effective_bus_dir(),
             )
         except (ValueError, PermissionError) as exc:
             send(chat_id, f"❌ 更新权限失败：<code>{html_mod.escape(str(exc))}</code>", parse_mode="HTML", thread_id=norm_tid)
@@ -12175,7 +12180,7 @@ def cmd_agent(chat_id, raw_rest="", thread_id=None, scope_key=None, from_user=No
             return
         aid = tokens[1]
         try:
-            revoked = federation_registry.revoke_agent(aid, owner_auth=owner_auth, bus_dir=bot_bus.BUS_DIR)
+            revoked = federation_registry.revoke_agent(aid, owner_auth=owner_auth, bus_dir=_effective_bus_dir())
         except (ValueError, PermissionError) as exc:
             send(chat_id, f"❌ 吊销失败：<code>{html_mod.escape(str(exc))}</code>", parse_mode="HTML", thread_id=norm_tid)
             return
@@ -12211,7 +12216,7 @@ def cmd_agent(chat_id, raw_rest="", thread_id=None, scope_key=None, from_user=No
                     owner_auth=owner_auth,
                     revoke_existing=True,
                     label="tg-dm-rotate",
-                    bus_dir=bot_bus.BUS_DIR,
+                    bus_dir=_effective_bus_dir(),
                 )
                 extra_note = f"\n• 已立即作废旧凭据数: <code>{int(issued.get('revoked_previous') or 0)}</code>"
             else:
@@ -12219,7 +12224,7 @@ def cmd_agent(chat_id, raw_rest="", thread_id=None, scope_key=None, from_user=No
                     aid,
                     owner_auth=owner_auth,
                     label="tg-dm-mint",
-                    bus_dir=bot_bus.BUS_DIR,
+                    bus_dir=_effective_bus_dir(),
                 )
                 extra_note = ""
         except (ValueError, PermissionError) as exc:
