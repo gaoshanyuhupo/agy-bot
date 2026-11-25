@@ -1,0 +1,23 @@
+[Unit]
+Description=AGY External Agent Federation Inbound Hub & Outbound Worker Dispatcher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_USER
+WorkingDirectory=/path/to/agy-bot/bridge
+Environment=HOME=/home/YOUR_USER
+Environment=AGY_FEDERATION_HUB_HOST=127.0.0.1
+Environment=AGY_FEDERATION_HUB_PORT=18799
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ExecStart=/usr/bin/python3 /path/to/agy-bot/bridge/federation_hub.py
+Restart=on-failure
+RestartSec=3
+KillMode=control-group
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
