@@ -762,6 +762,21 @@ def create_app(
     app.router.add_delete("/api/federation/teams/{team_id}", federation_svc.handle_delete_team)
     app.router.add_get("/api/federation/audit", federation_svc.handle_get_audit)
 
+    # External Agent Federation Workbench
+    app.router.add_get("/api/federation/workbench", federation_svc.handle_get_workbench)
+    app.router.add_get(
+        "/api/federation/workbench/agents/{agent_id}/timeline",
+        federation_svc.handle_get_workbench_timeline,
+    )
+    app.router.add_post(
+        "/api/federation/workbench/agents/{agent_id}/dispatch",
+        federation_svc.handle_workbench_dispatch,
+    )
+    app.router.add_post(
+        "/api/federation/workbench/agents/{agent_id}/jobs/{job_id}/cancel",
+        federation_svc.handle_workbench_cancel,
+    )
+
     app.router.add_get("/ws/browser", proxy.handle_ws_browser)
     app.router.add_post("/api/browser/upload", proxy.handle_upload)
     app.router.add_get("/api/browser/download/{download_id}", proxy.handle_download)
@@ -775,6 +790,7 @@ def create_app(
     app.router.add_get("/auth/magic", handle_spa_shell)
     for spa_route in (
         "/workspace",
+        "/federation-workbench",
         "/overview",
         "/bots",
         "/models",

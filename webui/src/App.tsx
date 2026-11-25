@@ -15,6 +15,7 @@ import {
   MessageSquare,
   MoreHorizontal,
   Network,
+  Radio,
   Shield,
   ShieldCheck,
 } from "lucide-react";
@@ -40,6 +41,7 @@ import { ChangePasswordModal } from "./components/ChangePasswordModal";
 import { CostsView } from "./components/CostsView";
 import { ExternalModelsView } from "./components/ExternalModelsView";
 import { FederationView } from "./components/FederationView";
+import { FederationWorkbenchView } from "./components/FederationWorkbenchView";
 import { FilesDiffPanel } from "./components/FilesDiffPanel";
 import { JobsView } from "./components/JobsView";
 import { LoginView } from "./components/LoginView";
@@ -67,6 +69,7 @@ const DESKTOP_NAV_ITEMS: {
   badge?: string;
 }[] = [
   { id: "workspace", label: "工作台", icon: MessageSquare },
+  { id: "federation-workbench", label: "联邦工作台", icon: Radio },
   { id: "attention", label: "审批中心", icon: Bell },
   { id: "files", label: "文件审查", icon: FileCode },
   { id: "jobs", label: "派工流水", icon: Activity },
@@ -94,6 +97,7 @@ function detectInitialTab(): NavTab {
   }
   if (
     path === "workspace" ||
+    path === "federation-workbench" ||
     path === "attention" ||
     path === "files" ||
     path === "overview" ||
@@ -623,6 +627,7 @@ export function App() {
     ? session.username
     : `${session.bot} · #${session.user_id}`;
   const isMoreTabActive =
+    activeTab === "federation-workbench" ||
     activeTab === "attention" ||
     activeTab === "files" ||
     activeTab === "overview" ||
@@ -789,6 +794,14 @@ export function App() {
               onRoleChanged={handleRoleChanged}
               onSessionRevoked={handleSessionRevoked}
             />
+          ) : activeTab === "federation-workbench" ? (
+            <FederationWorkbenchView
+              session={session}
+              federationEventVer={federationEventVer}
+              jobsEventVer={jobsEventVer}
+              onNavigate={handleNavigate}
+              onSessionRevoked={handleSessionRevoked}
+            />
           ) : activeTab === "attention" ? (
             <AttentionPanel
               session={session}
@@ -830,6 +843,7 @@ export function App() {
                 <FederationView
                   session={session}
                   eventVersion={federationEventVer}
+                  onNavigate={handleNavigate}
                   onSessionRevoked={handleSessionRevoked}
                 />
               )}

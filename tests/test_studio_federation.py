@@ -58,6 +58,8 @@ from studio.data_sources import StudioDataSources, redact_secrets_only  # noqa: 
 from studio.event_hub import _sanitize_event_value  # noqa: E402
 from studio.federation_service import (  # noqa: E402
     StudioFederationService,
+    _merge_single_timeline_job,
+    _validate_hub_public_url,
     _validate_loopback_hub_target,
 )
 from studio.server import (  # noqa: E402
@@ -1446,11 +1448,1289 @@ class TestM3C8ExportWhitelistCoverage(unittest.TestCase):
         for core_rel in (
             "studio/federation_service.py",
             "webui/src/components/FederationView.tsx",
+            "webui/src/components/FederationWorkbenchView.tsx",
             "bridge/federation_registry.py",
             "bridge/federation_hub.py",
             "bridge/external_drivers.py",
         ):
             self.assertTrue(export_public.is_public_core(core_rel), f"is_public_core({core_rel!r}) returned False")
+
+
+# ==============================================================================
+# Federation Workbench + AGY_FEDERATION_HUB_PUBLIC_URL Contract Tests (W1..W7)
+# ==============================================================================
+
+
+class TestWorkbenchW1WriteGateAndReadonly(_FederationTestBase):
+    """W1: 4-layer Admin write gate (9 counterexamples), oversized body, read gates, readonly isolation."""
+
+    async def test_w1_write_endpoints_nine_counterexamples_and_read_gates(self) -> None:
+        from studio.chat_service import MAX_PROMPT_BODY_BYTES
+
+        admin_cookie, admin_csrf = await self._login("AdminUser", ADMIN_PASS)
+        ro_cookie, ro_csrf = await self._login("ViewerUser", RO_PASS)
+        forced_cookie, forced_csrf = await self._login("ForcedPwUser", FORCED_PASS)
+        admin_hdrs = self._admin_headers(admin_cookie, admin_csrf)
+
+        # Register a pull_worker agent with secret_ref to verify readonly secret_ref masking too
+        r_reg = await self.client.post(
+            "/api/federation/agents",
+            headers=admin_hdrs,
+            data=json.dumps(
+                {
+                    "agent_id": "wb_pull_1",
+                    "display_name": "WB Pull 1",
+                    "kind": "pull_worker",
+                    "secret_ref": "lv" + "1" + "/services/demo-wb#token",
+                }
+            ),
+        )
+        self.assertEqual(r_reg.status, 200, await r_reg.text())
+
+        # Read endpoints: unauthenticated -> 401; must_change_password -> 403; readonly -> 200 + masked
+        for read_path in (
+            "/api/federation/workbench",
+            "/api/federation/workbench/agents/wb_pull_1/timeline",
+        ):
+            r_unauth = await self.client.get(read_path)
+            self.assertEqual(r_unauth.status, 401, read_path)
+            r_forced = await self.client.get(
+                read_path,
+                headers={"Cookie": f"{SESSION_COOKIE_NAME}={forced_cookie}"},
+            )
+            self.assertEqual(r_forced.status, 403, read_path)
+            r_ro = await self.client.get(
+                read_path,
+                headers={"Cookie": f"{SESSION_COOKIE_NAME}={ro_cookie}"},
+            )
+            self.assertEqual(r_ro.status, 200, f"{read_path}: {await r_ro.text()}")
+            self.assertEqual(r_ro.headers.get("Cache-Control"), "no-store, max-age=0")
+            d_ro = await r_ro.json()
+            self.assertFalse(d_ro["can_edit"])
+            if "agents" in d_ro:
+                self.assertEqual(d_ro["agents"][0]["secret_ref"], "")
+            else:
+                self.assertEqual(d_ro["agent"]["secret_ref"], "")
+
+        # Verify write endpoints fail closed across all 9 counterexamples with 0 make_owner_auth calls & 0 disk writes
+        write_cases = [
+            ("/api/federation/workbench/agents/wb_pull_1/dispatch", json.dumps({"prompt": "ping"})),
+            ("/api/federation/workbench/agents/wb_pull_1/jobs/pull-demo-1/cancel", json.dumps({"reason": "stop"})),
+        ]
+        pq_dir = Path(federation_registry.pull_queue_dir(str(self.bus_dir)))
+        jobs_dir = self.bus_dir / "jobs"
+
+        with mock.patch.object(
+            federation_registry, "make_owner_auth", wraps=federation_registry.make_owner_auth
+        ) as spy_owner:
+            for endpoint, payload in write_cases:
+                # 1. Unauthenticated -> 401
+                r1 = await self.client.post(
+                    endpoint,
+                    headers={"Origin": self.origin, "Content-Type": "application/json"},
+                    data=payload,
+                )
+                self.assertEqual(r1.status, 401, endpoint)
+
+                # 2. must_change_password=True -> 403
+                r2 = await self.client.post(
+                    endpoint,
+                    headers=self._admin_headers(forced_cookie, forced_csrf),
+                    data=payload,
+                )
+                self.assertEqual(r2.status, 403, endpoint)
+
+                # 3. readonly -> 403
+                r3 = await self.client.post(
+                    endpoint,
+                    headers=self._admin_headers(ro_cookie, ro_csrf),
+                    data=payload,
+                )
+                self.assertEqual(r3.status, 403, endpoint)
+
+                # 4a. Missing Origin -> 403
+                h_no_orig = self._admin_headers(admin_cookie, admin_csrf)
+                h_no_orig.pop("Origin", None)
+                r4a = await self.client.post(endpoint, headers=h_no_orig, data=payload)
+                self.assertEqual(r4a.status, 403, endpoint)
+
+                # 4b. Cross-site Origin -> 403
+                r4b = await self.client.post(
+                    endpoint,
+                    headers=self._admin_headers(admin_cookie, admin_csrf, Origin="https://evil.example.com"),
+                    data=payload,
+                )
+                self.assertEqual(r4b.status, 403, endpoint)
+
+                # 5. Sec-Fetch-Site: cross-site -> 403
+                r5 = await self.client.post(
+                    endpoint,
+                    headers=self._admin_headers(admin_cookie, admin_csrf, **{"Sec-Fetch-Site": "cross-site"}),
+                    data=payload,
+                )
+                self.assertEqual(r5.status, 403, endpoint)
+
+                # 6. Non-JSON Content-Type -> 415
+                for bad_ct in ("text/plain", "application/x-www-form-urlencoded"):
+                    r6 = await self.client.post(
+                        endpoint,
+                        headers=self._admin_headers(admin_cookie, admin_csrf, **{"Content-Type": bad_ct}),
+                        data=payload,
+                    )
+                    self.assertEqual(r6.status, 415, f"{endpoint} {bad_ct}")
+
+                # 7. Missing & forged X-Studio-CSRF -> 403
+                h_no_csrf = self._admin_headers(admin_cookie, admin_csrf)
+                h_no_csrf.pop("X-Studio-CSRF", None)
+                r7a = await self.client.post(endpoint, headers=h_no_csrf, data=payload)
+                self.assertEqual(r7a.status, 403, endpoint)
+                r7b = await self.client.post(
+                    endpoint,
+                    headers=self._admin_headers(admin_cookie, "forged-csrf-token"),
+                    data=payload,
+                )
+                self.assertEqual(r7b.status, 403, endpoint)
+
+                # 9. Oversized body > MAX_PROMPT_BODY_BYTES -> 413
+                oversized = json.dumps({"prompt": "x" * (MAX_PROMPT_BODY_BYTES + 256)})
+                r9 = await self.client.post(endpoint, headers=admin_hdrs, data=oversized)
+                self.assertEqual(r9.status, 413, endpoint)
+
+            # 8. Logged-out / revoked session -> 401/403
+            r_out = await self.client.post("/api/auth/logout", headers=admin_hdrs, data="{}")
+            self.assertEqual(r_out.status, 200)
+            for endpoint, payload in write_cases:
+                r8 = await self.client.post(endpoint, headers=admin_hdrs, data=payload)
+                self.assertIn(r8.status, (401, 403), endpoint)
+
+            self.assertEqual(spy_owner.call_count, 0)
+
+        self.assertFalse(pq_dir.exists())
+        self.assertFalse(jobs_dir.exists())
+        audit_text = self.audit_log.read_text(encoding="utf-8")
+        for expected_outcome in (
+            "denied_auth_401",
+            "denied_auth_403",
+            "denied_rbac",
+            "denied_origin",
+            "denied_sec_fetch_site",
+            "denied_content_type",
+            "denied_csrf",
+        ):
+            self.assertIn(expected_outcome, audit_text)
+
+
+class TestWorkbenchW2FieldInjectionAndTargetEligibility(_FederationTestBase):
+    """W2: Forbidden client keys, strict types, plaintext secrets, target eligibility, pull vs push routing."""
+
+    async def test_w2_forbidden_keys_type_validation_plaintext_secrets_and_target_routing(self) -> None:
+        admin_cookie, admin_csrf = await self._login("AdminUser", ADMIN_PASS)
+        headers = self._admin_headers(admin_cookie, admin_csrf)
+
+        agents_specs = [
+            {"agent_id": "ag_pull_ok", "kind": "pull_worker"},
+            {"agent_id": "ag_push_ok", "kind": "hermes_remote", "endpoint_url": "https://node.example.com"},
+            {"agent_id": "ag_local_no", "kind": "agy_local"},
+            {"agent_id": "ag_mcp_no", "kind": "mcp_inbound_only"},
+            {"agent_id": "ag_disabled", "kind": "pull_worker", "enabled": False},
+            {"agent_id": "ag_revoked", "kind": "pull_worker"},
+            {"agent_id": "ag_norecv", "kind": "pull_worker", "capabilities": {"can_receive": False}},
+        ]
+        for spec in agents_specs:
+            r = await self.client.post("/api/federation/agents", headers=headers, data=json.dumps(spec))
+            self.assertEqual(r.status, 200, await r.text())
+        r_rev = await self.client.post("/api/federation/agents/ag_revoked/revoke", headers=headers, data="{}")
+        self.assertEqual(r_rev.status, 200)
+
+        # 1. Forbidden keys, unknown fields, non-strict types, empty prompt, plaintext secrets -> all 400
+        bad_payloads = [
+            {"prompt": "hi", "owner_auth": {"is_owner": True}},
+            {"prompt": "hi", "is_owner": True},
+            {"prompt": "hi", "role": "owner"},
+            {"prompt": "hi", "token": SYNTH_FAKE_FED},
+            {"prompt": "hi", "api_key": SYNTH_FAKE_SK},
+            {"prompt": "hi", "password": "EXAMPLE_RAW_PASSWORD"},
+            {"prompt": "hi", "cmd": "id"},
+            {"prompt": "hi", "shell": "/bin/sh"},
+            {"prompt": "hi", "workdir": "/tmp"},
+            {"prompt": "hi", "target_chat_id": -100123},
+            {"prompt": "hi", "agent_origin": "local_owner"},
+            {"prompt": "hi", "trust_override": "local_admin"},
+            {"prompt": "hi", "unknown_extra_field": 1},
+            {"prompt": ""},
+            {"prompt": "   \t\n  "},
+            {"prompt": 12345},
+            {"prompt": "hi", "label": 999},
+            {"prompt": "hi", "timeout_s": True},
+            {"prompt": "hi", "timeout_s": "30"},
+            {"prompt": "hi", "timeout_s": 0},
+            {"prompt": f"leak {SYNTH_FAKE_SK}"},
+            {"prompt": f"leak {SYNTH_FAKE_FED}"},
+            {"prompt": "hi", "label": f"bad {SYNTH_FAKE_SK}"},
+        ]
+        for bad in bad_payloads:
+            r_bad = await self.client.post(
+                "/api/federation/workbench/agents/ag_pull_ok/dispatch",
+                headers=headers,
+                data=json.dumps(bad),
+            )
+            self.assertEqual(r_bad.status, 400, f"Expected 400 for {bad!r}, got {r_bad.status}")
+
+        # 2. Target eligibility fail-closed
+        for bad_aid, expected_codes in (
+            ("ag_local_no", (400,)),
+            ("ag_mcp_no", (400,)),
+            ("unregistered_node", (404,)),
+            ("ag_disabled", (403,)),
+            ("ag_revoked", (403,)),
+            ("ag_norecv", (403,)),
+        ):
+            r_inel = await self.client.post(
+                f"/api/federation/workbench/agents/{bad_aid}/dispatch",
+                headers=headers,
+                data=json.dumps({"prompt": "check eligibility"}),
+            )
+            self.assertIn(r_inel.status, expected_codes, f"Unexpected status for {bad_aid}: {r_inel.status}")
+
+        pq_dir = Path(federation_registry.pull_queue_dir(str(self.bus_dir)))
+        jobs_dir = self.bus_dir / "jobs"
+        self.assertFalse(pq_dir.exists())
+        self.assertFalse(jobs_dir.exists())
+
+        # 3. Valid pull_worker dispatch -> writes ONLY to PullWorkerQueue, NOT bot_bus
+        r_pull = await self.client.post(
+            "/api/federation/workbench/agents/ag_pull_ok/dispatch",
+            headers=headers,
+            data=json.dumps({"prompt": "run edge check", "label": "edge-check", "timeout_s": 120}),
+        )
+        self.assertEqual(r_pull.status, 200, await r_pull.text())
+        d_pull = await r_pull.json()
+        self.assertEqual(d_pull["dispatch_mode"], "pull")
+        pull_jid = d_pull["job"]["job_id"]
+        self.assertTrue((pq_dir / f"{pull_jid}.json").is_file())
+        self.assertFalse((jobs_dir / f"{pull_jid}.json").exists())
+
+        # 4. Valid push external agent dispatch -> writes via explicit bus_dir to bot_bus, NOT pull_queue
+        r_push = await self.client.post(
+            "/api/federation/workbench/agents/ag_push_ok/dispatch",
+            headers=headers,
+            data=json.dumps({"prompt": "run remote push task", "label": "push-task"}),
+        )
+        self.assertEqual(r_push.status, 200, await r_push.text())
+        d_push = await r_push.json()
+        self.assertEqual(d_push["dispatch_mode"], "push")
+        push_jid = d_push["job"]["job_id"]
+        self.assertTrue((jobs_dir / f"{push_jid}.json").is_file())
+        self.assertFalse((pq_dir / f"{push_jid}.json").exists())
+
+
+class TestWorkbenchW3TraversalAntiSymlinkAndZeroSideEffects(_FederationTestBase):
+    """W3: Malformed IDs, directory/file symlinks rejected with 0 bytes leaked, empty BUS_DIR zero side effects."""
+
+    async def test_w3_malformed_ids_symlinks_and_empty_bus_zero_side_effects(self) -> None:
+        admin_cookie, admin_csrf = await self._login("AdminUser", ADMIN_PASS)
+        admin_get = {"Cookie": f"{SESSION_COOKIE_NAME}={admin_cookie}"}
+        admin_hdrs = self._admin_headers(admin_cookie, admin_csrf)
+
+        # 3. Empty BUS_DIR -> GET workbench returns 200 and creates ZERO dirs or .lock files
+        self.assertEqual(list(self.bus_dir.iterdir()), [])
+        r_empty = await self.client.get("/api/federation/workbench", headers=admin_get)
+        self.assertEqual(r_empty.status, 200, await r_empty.text())
+        self.assertEqual((await r_empty.json())["agents"], [])
+        self.assertEqual(list(self.bus_dir.iterdir()), [])
+
+        # 1. Malformed agent_id / job_id -> 400 without touching disk
+        for bad_aid in ("UPPER_BAD", "bad.dot", "a" * 65):
+            r1 = await self.client.get(
+                f"/api/federation/workbench/agents/{bad_aid}/timeline",
+                headers=admin_get,
+            )
+            self.assertEqual(r1.status, 400, f"GET timeline bad_aid={bad_aid}")
+            r2 = await self.client.post(
+                f"/api/federation/workbench/agents/{bad_aid}/dispatch",
+                headers=admin_hdrs,
+                data=json.dumps({"prompt": "hi"}),
+            )
+            self.assertEqual(r2.status, 400, f"POST dispatch bad_aid={bad_aid}")
+
+        for bad_jid in ("..escape", "job..bad", "a" * 130):
+            r_cj = await self.client.post(
+                f"/api/federation/workbench/agents/wb_sym/jobs/{bad_jid}/cancel",
+                headers=admin_hdrs,
+                data="{}",
+            )
+            self.assertEqual(r_cj.status, 400, f"POST cancel bad_jid={bad_jid}")
+
+        self.assertEqual(list(self.bus_dir.iterdir()), [])
+
+        # Prepare canary outside BUS_DIR
+        canary = "TOP_SECRET_SYMLINK_CANARY_W3"
+        outside_file = self.tmp / "outside_canary.json"
+        outside_file.write_text(json.dumps({"prompt": canary, "event_id": canary}), encoding="utf-8")
+        outside_dir = self.tmp / "outside_dir"
+        outside_dir.mkdir()
+        (outside_dir / "leak.json").write_text(
+            json.dumps({"job_id": "j1", "target_agent_id": "wb_sym", "target_bot": "wb_sym", "prompt": canary}),
+            encoding="utf-8",
+        )
+
+        # Register real agent wb_sym
+        r_reg = await self.client.post(
+            "/api/federation/agents",
+            headers=admin_hdrs,
+            data=json.dumps({"agent_id": "wb_sym", "kind": "pull_worker"}),
+        )
+        self.assertEqual(r_reg.status, 200)
+
+        fed_dir = self.bus_dir / "federation"
+        pq_dir = fed_dir / "pull_queue"
+        le_root = fed_dir / "leader_events"
+        le_ag = le_root / "wb_sym"
+        jobs_dir = self.bus_dir / "jobs"
+
+        # 2a. Symlinked pull_queue/ dir -> 403, 0 canary leaked
+        os.symlink(outside_dir, pq_dir)
+        for path in ("/api/federation/workbench", "/api/federation/workbench/agents/wb_sym/timeline"):
+            r = await self.client.get(path, headers=admin_get)
+            self.assertEqual(r.status, 403, f"pull_queue dir symlink {path}")
+            self.assertNotIn(canary, await r.text())
+        pq_dir.unlink()
+
+        # 2b. Symlinked .json inside pull_queue/ -> 403, 0 canary leaked
+        pq_dir.mkdir(parents=True)
+        os.symlink(outside_file, pq_dir / "evil.json")
+        r = await self.client.get("/api/federation/workbench/agents/wb_sym/timeline", headers=admin_get)
+        self.assertEqual(r.status, 403)
+        self.assertNotIn(canary, await r.text())
+        (pq_dir / "evil.json").unlink()
+
+        # 2c. Symlinked leader_events/ root dir -> 403
+        os.symlink(outside_dir, le_root)
+        r = await self.client.get("/api/federation/workbench/agents/wb_sym/timeline", headers=admin_get)
+        self.assertEqual(r.status, 403)
+        self.assertNotIn(canary, await r.text())
+        le_root.unlink()
+
+        # 2d. Symlinked leader_events/<aid>/ dir -> 403
+        le_root.mkdir(parents=True)
+        os.symlink(outside_dir, le_ag)
+        r = await self.client.get("/api/federation/workbench/agents/wb_sym/timeline", headers=admin_get)
+        self.assertEqual(r.status, 403)
+        self.assertNotIn(canary, await r.text())
+        le_ag.unlink()
+
+        # 2e. Symlinked .json inside leader_events/<aid>/ -> 403
+        le_ag.mkdir(parents=True)
+        os.symlink(outside_file, le_ag / "ev.json")
+        r = await self.client.get("/api/federation/workbench/agents/wb_sym/timeline", headers=admin_get)
+        self.assertEqual(r.status, 403)
+        self.assertNotIn(canary, await r.text())
+        (le_ag / "ev.json").unlink()
+
+        # 2f. Symlinked jobs/ dir & symlinked .json inside jobs/ -> 403
+        os.symlink(outside_dir, jobs_dir)
+        r = await self.client.get("/api/federation/workbench/agents/wb_sym/timeline", headers=admin_get)
+        self.assertEqual(r.status, 403)
+        self.assertNotIn(canary, await r.text())
+        jobs_dir.unlink()
+
+        jobs_dir.mkdir(parents=True)
+        os.symlink(outside_file, jobs_dir / "evil_job.json")
+        r = await self.client.get("/api/federation/workbench/agents/wb_sym/timeline", headers=admin_get)
+        self.assertEqual(r.status, 403)
+        self.assertNotIn(canary, await r.text())
+        (jobs_dir / "evil_job.json").unlink()
+
+        # 2g. Symlinked federation/ dir itself -> 403
+        import shutil
+
+        shutil.rmtree(fed_dir)
+        os.symlink(outside_dir, fed_dir)
+        r = await self.client.get("/api/federation/workbench", headers=admin_get)
+        self.assertEqual(r.status, 403)
+        self.assertNotIn(canary, await r.text())
+
+    async def test_w3_write_path_inbox_and_lock_symlinks_rejected_zero_outside_writes(self) -> None:
+        admin_cookie, admin_csrf = await self._login("AdminUser", ADMIN_PASS)
+        admin_hdrs = self._admin_headers(admin_cookie, admin_csrf)
+
+        for spec in (
+            {"agent_id": "wb_push_sym", "kind": "hermes_remote", "endpoint_url": "https://push.example.com"},
+            {"agent_id": "wb_pull_sym", "kind": "pull_worker"},
+        ):
+            r_reg = await self.client.post("/api/federation/agents", headers=admin_hdrs, data=json.dumps(spec))
+            self.assertEqual(r_reg.status, 200, await r_reg.text())
+
+        outside_dir = self.tmp / "outside_write_sink"
+        outside_dir.mkdir()
+        inbox_dir = self.bus_dir / "inbox"
+        jobs_dir = self.bus_dir / "jobs"
+        bus_lock = self.bus_dir / "bus.lock"
+        pq_dir = Path(federation_registry.pull_queue_dir(str(self.bus_dir)))
+        pq_lock = pq_dir / ".lock"
+
+        # Seed an in-flight push job and pull job for cancel anti-symlink tests
+        jobs_dir.mkdir(parents=True, exist_ok=True)
+        (jobs_dir / "job-push-sym-1.json").write_text(
+            json.dumps(
+                {
+                    "job_id": "job-push-sym-1",
+                    "target_bot": "wb_push_sym",
+                    "from_bot": "studio",
+                    "prompt": "push sym test",
+                    "status": "queued",
+                    "cancel_requested": False,
+                    "created_at": time.time() - 5,
+                }
+            ),
+            encoding="utf-8",
+        )
+        pq_dir.mkdir(parents=True, exist_ok=True)
+        (pq_dir / "pull-sym-1.json").write_text(
+            json.dumps(
+                {
+                    "job_id": "pull-sym-1",
+                    "target_agent_id": "wb_pull_sym",
+                    "prompt": "pull sym test",
+                    "status": "queued",
+                    "cancelled": False,
+                    "created_at": time.time() - 5,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        # 1. <BUS_DIR>/inbox -> <outside> blocks BOTH push dispatch and push cancel with 0 writes to <outside>
+        os.symlink(outside_dir, inbox_dir)
+        try:
+            r_d = await self.client.post(
+                "/api/federation/workbench/agents/wb_push_sym/dispatch",
+                headers=admin_hdrs,
+                data=json.dumps({"prompt": "should block inbox symlink"}),
+            )
+            self.assertEqual(r_d.status, 403)
+            self.assertEqual((await r_d.json()).get("code"), "SECURITY_SYMLINK_REJECTED")
+
+            r_c = await self.client.post(
+                "/api/federation/workbench/agents/wb_push_sym/jobs/job-push-sym-1/cancel",
+                headers=admin_hdrs,
+                data="{}",
+            )
+            self.assertEqual(r_c.status, 403)
+            self.assertEqual((await r_c.json()).get("code"), "SECURITY_SYMLINK_REJECTED")
+            self.assertEqual(list(outside_dir.iterdir()), [])
+        finally:
+            inbox_dir.unlink()
+
+        # 2. <BUS_DIR>/inbox/<aid> -> <outside> blocks BOTH push dispatch and push cancel with 0 writes to <outside>
+        inbox_dir.mkdir(parents=True, exist_ok=True)
+        inbox_aid = inbox_dir / "wb_push_sym"
+        os.symlink(outside_dir, inbox_aid)
+        try:
+            r_d = await self.client.post(
+                "/api/federation/workbench/agents/wb_push_sym/dispatch",
+                headers=admin_hdrs,
+                data=json.dumps({"prompt": "should block inbox aid symlink"}),
+            )
+            self.assertEqual(r_d.status, 403)
+            self.assertEqual((await r_d.json()).get("code"), "SECURITY_SYMLINK_REJECTED")
+
+            r_c = await self.client.post(
+                "/api/federation/workbench/agents/wb_push_sym/jobs/job-push-sym-1/cancel",
+                headers=admin_hdrs,
+                data="{}",
+            )
+            self.assertEqual(r_c.status, 403)
+            self.assertEqual((await r_c.json()).get("code"), "SECURITY_SYMLINK_REJECTED")
+            self.assertEqual(list(outside_dir.iterdir()), [])
+        finally:
+            inbox_aid.unlink()
+
+        # 3. <BUS_DIR>/bus.lock -> <outside>/bus.lock blocks BOTH push dispatch and push cancel with 0 writes to <outside>
+        outside_bus_lock = outside_dir / "bus.lock"
+        os.symlink(outside_bus_lock, bus_lock)
+        try:
+            r_d = await self.client.post(
+                "/api/federation/workbench/agents/wb_push_sym/dispatch",
+                headers=admin_hdrs,
+                data=json.dumps({"prompt": "should block bus.lock symlink"}),
+            )
+            self.assertEqual(r_d.status, 403)
+            self.assertEqual((await r_d.json()).get("code"), "SECURITY_SYMLINK_REJECTED")
+
+            r_c = await self.client.post(
+                "/api/federation/workbench/agents/wb_push_sym/jobs/job-push-sym-1/cancel",
+                headers=admin_hdrs,
+                data="{}",
+            )
+            self.assertEqual(r_c.status, 403)
+            self.assertEqual((await r_c.json()).get("code"), "SECURITY_SYMLINK_REJECTED")
+            self.assertFalse(outside_bus_lock.exists())
+            self.assertEqual(list(outside_dir.iterdir()), [])
+        finally:
+            bus_lock.unlink()
+
+        # 4. <BUS_DIR>/federation/pull_queue/.lock -> <outside>/pq.lock blocks BOTH pull dispatch and pull cancel
+        outside_pq_lock = outside_dir / "pq.lock"
+        os.symlink(outside_pq_lock, pq_lock)
+        try:
+            r_d = await self.client.post(
+                "/api/federation/workbench/agents/wb_pull_sym/dispatch",
+                headers=admin_hdrs,
+                data=json.dumps({"prompt": "should block pull .lock symlink"}),
+            )
+            self.assertEqual(r_d.status, 403)
+            self.assertEqual((await r_d.json()).get("code"), "SECURITY_SYMLINK_REJECTED")
+
+            r_c = await self.client.post(
+                "/api/federation/workbench/agents/wb_pull_sym/jobs/pull-sym-1/cancel",
+                headers=admin_hdrs,
+                data="{}",
+            )
+            self.assertEqual(r_c.status, 403)
+            self.assertEqual((await r_c.json()).get("code"), "SECURITY_SYMLINK_REJECTED")
+            self.assertFalse(outside_pq_lock.exists())
+            self.assertEqual(list(outside_dir.iterdir()), [])
+        finally:
+            pq_lock.unlink()
+
+        # Verify jobs remained untouched and audit log recorded denied_symlink
+        self.assertEqual(json.loads((jobs_dir / "job-push-sym-1.json").read_text(encoding="utf-8"))["status"], "queued")
+        self.assertEqual(json.loads((pq_dir / "pull-sym-1.json").read_text(encoding="utf-8"))["status"], "queued")
+        audit_text = self.audit_log.read_text(encoding="utf-8")
+        self.assertIn("denied_symlink", audit_text)
+
+
+class TestWorkbenchW4RedactionLeaderSummaryAndFrontendXSS(_FederationTestBase):
+    """W4: Cross-endpoint deep secret/path redaction, safe leader_events summary, frontend XSS & zero-persistence."""
+
+    async def test_w4_deep_redaction_leader_events_summary_and_frontend_static_guards(self) -> None:
+        admin_cookie, admin_csrf = await self._login("AdminUser", ADMIN_PASS)
+        admin_get = {"Cookie": f"{SESSION_COOKIE_NAME}={admin_cookie}"}
+        headers = self._admin_headers(admin_cookie, admin_csrf)
+
+        r_reg = await self.client.post(
+            "/api/federation/agents",
+            headers=headers,
+            data=json.dumps({"agent_id": "wb_redact", "kind": "pull_worker", "mint_token": True}),
+        )
+        self.assertEqual(r_reg.status, 200)
+        minted_tok = (await r_reg.json())["token"]
+
+        # Plant dirty pull_queue job & leader_event on disk with secrets, hashes, host paths, and XSS payloads
+        pq_dir = Path(federation_registry.pull_queue_dir(str(self.bus_dir)))
+        pq_dir.mkdir(parents=True, exist_ok=True)
+        (pq_dir / "pull-dirty-1.json").write_text(
+            json.dumps(
+                {
+                    "job_id": "pull-dirty-1",
+                    "target_agent_id": "wb_redact",
+                    "from_agent_id": "",
+                    "team_id": "team-1",
+                    "prompt": f"check {SYNTH_HOST_PATH} with {SYNTH_FAKE_SK}",
+                    "result_text": f"done {SYNTH_FAKE_FED} <script>alert(1)</script> <img src=x onerror=alert(1)>",
+                    "error": f"err {SYNTH_HOST_PATH} {minted_tok}",
+                    "cancel_reason": f"reason {SYNTH_FAKE_SK}",
+                    "status": "done",
+                    "token_hash": "LEAK_HASH_999",
+                    "salt": "LEAK_SALT_999",
+                    "metadata": {"source": "studio", "api_key": SYNTH_FAKE_SK},
+                    "created_at": time.time() - 30,
+                    "finished_at": time.time() - 10,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        le_dir = self.bus_dir / "federation" / "leader_events" / "wb_redact"
+        le_dir.mkdir(parents=True, exist_ok=True)
+        (le_dir / "0001_ev-1.json").write_text(
+            json.dumps(
+                {
+                    "event_id": "ev-redact-1",
+                    "type": "batch_done",
+                    "group_id": "grp-1",
+                    "team_id": "team-1",
+                    "job_ids": ["pull-dirty-1"],
+                    "jobs": [{"job_id": "pull-dirty-1", "status": "done", "result_text": "SENSITIVE_RAW_JOB_PAYLOAD"}],
+                    "sensitive_extra_blob": "MUST_NOT_APPEAR_IN_SUMMARY",
+                    "token_records": [{"token_hash": "LEAK_EV_HASH"}],
+                    "created_at": time.time() - 5,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        for path in ("/api/federation/workbench", "/api/federation/workbench/agents/wb_redact/timeline"):
+            r = await self.client.get(path, headers=admin_get)
+            self.assertEqual(r.status, 200, await r.text())
+            self.assertEqual(r.headers.get("Cache-Control"), "no-store, max-age=0")
+            body_txt = await r.text()
+            for forbidden in (
+                SYNTH_FAKE_SK,
+                SYNTH_FAKE_FED,
+                SYNTH_PREFIX,
+                minted_tok,
+                SYNTH_HOST_PATH,
+                "LEAK_HASH_999",
+                "LEAK_SALT_999",
+                "LEAK_EV_HASH",
+                "token_hash",
+                "token_records",
+                "SENSITIVE_RAW_JOB_PAYLOAD",
+                "MUST_NOT_APPEAR_IN_SUMMARY",
+            ):
+                self.assertNotIn(forbidden, body_txt, f"Leak {forbidden!r} in {path}")
+
+        # Verify SSE ring buffer & audit log contain zero secrets
+        for _seq, _et, ev_data in list(self.app[EVENT_HUB_KEY]._events):
+            ev_txt = json.dumps(ev_data)
+            self.assertNotIn(SYNTH_PREFIX, ev_txt)
+            self.assertNotIn(minted_tok, ev_txt)
+        audit_txt = self.audit_log.read_text(encoding="utf-8")
+        self.assertNotIn(SYNTH_PREFIX, audit_txt)
+        self.assertNotIn(minted_tok, audit_txt)
+
+        # Static XSS & zero-persistence guards on FederationWorkbenchView.tsx and FederationView.tsx
+        wb_tsx = (REPO_ROOT / "webui" / "src" / "components" / "FederationWorkbenchView.tsx").read_text(
+            encoding="utf-8"
+        )
+        fed_tsx = (REPO_ROOT / "webui" / "src" / "components" / "FederationView.tsx").read_text(
+            encoding="utf-8"
+        )
+        for src_name, src_txt in (("FederationWorkbenchView.tsx", wb_tsx), ("FederationView.tsx", fed_tsx)):
+            for sink in (
+                "dangerouslySetInnerHTML",
+                "innerHTML",
+                "<script",
+                "localStorage",
+                "sessionStorage",
+                "document.cookie",
+                "workbench/state",
+                "unp" + "kg" + "." + "com",
+                "cdn." + "jsdelivr",
+                "cdnjs." + "cloudflare",
+            ):
+                self.assertNotIn(sink, src_txt, f"Forbidden sink {sink!r} in {src_name}")
+        self.assertIn("SafeMarkdown", wb_tsx)
+        self.assertIn("setOneTimeToken(null)", fed_tsx)
+
+
+class TestWorkbenchW5HubPublicUrlValidationAndAntiSSRF(_FederationTestBase):
+    """W5: Strict AGY_FEDERATION_HUB_PUBLIC_URL validation & Anti-SSRF loopback-only health probe."""
+
+    async def test_w5_public_url_validator_hub_config_and_loopback_only_health(self) -> None:
+        # 1. Invalid values fail-closed to ""
+        invalid_urls = [
+            "",
+            "http://hub.example.com",
+            "http://hub.example.com:18799",
+            "https://user:pass@hub.example.com",
+            "https://user@hub.example.com",
+            "https://hub.example.com?a=1",
+            "https://hub.example.com?",
+            "https://hub.example.com#frag",
+            "https://hub.example.com#",
+            "https://hub.example.com/hub",
+            "https://hub.example.com/hub/mcp",
+            "https://hub.example.com:",
+            "https://hub.example.com:0",
+            "https://hub.example.com:99999",
+            "https://hub.example.com\r\n",
+            "https://hub.example.com ",
+            " https://hub.example.com",
+            "http://" + ".".join(("127", "0", "0", "2")) + ":18799",
+            f"http://{SYNTH_IMDS_IP}",
+            f"https://{SYNTH_IMDS_IP}",
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "ftp://hub.example.com",
+            "http://[0:0:0:0:0:0:0:1]:18799",
+        ]
+        for bad in invalid_urls:
+            self.assertEqual(_validate_hub_public_url(bad), "", f"Expected rejection for {bad!r}")
+
+        # 2. Valid values normalized (trailing slash stripped)
+        valid_cases = [
+            ("https://hub.example.com/", "https://hub.example.com"),
+            ("https://hub.example.com", "https://hub.example.com"),
+            ("https://hub.example.com:8443", "https://hub.example.com:8443"),
+            ("https://hub.example.com:8443/", "https://hub.example.com:8443"),
+            ("http://127.0.0.1:18799", "http://127.0.0.1:18799"),
+            ("http://127.0.0.1:18799/", "http://127.0.0.1:18799"),
+            ("http://localhost:18799/", "http://localhost:18799"),
+            ("http://[::1]:18799", "http://[::1]:18799"),
+        ]
+        for raw, expected in valid_cases:
+            self.assertEqual(_validate_hub_public_url(raw), expected, f"Expected {expected!r} for {raw!r}")
+
+        # 3. End-to-end API behavior + Anti-SSRF proof: probe_hub_health NEVER requests public_url
+        admin_cookie, _ = await self._login("AdminUser", ADMIN_PASS)
+        admin_get = {"Cookie": f"{SESSION_COOKIE_NAME}={admin_cookie}"}
+
+        loopback_hits: list[str] = []
+
+        async def handle_stub_health(_req: web.Request) -> web.Response:
+            loopback_hits.append(str(_req.url))
+            return web.json_response({"ok": True, "service": "agy-federation-hub"})
+
+        stub_app = web.Application()
+        stub_app.router.add_get("/hub/v1/health", handle_stub_health)
+        stub_server = TestServer(stub_app)
+        await stub_server.start_server()
+        try:
+            self.fed_svc._hub_host_override = "127.0.0.1"
+            self.fed_svc._hub_port_override = stub_server.port
+            expected_loopback_mcp = f"http://127.0.0.1:{stub_server.port}/hub/mcp"
+
+            # Invalid env -> public_url="" and mcp_url falls back to loopback
+            with mock.patch.dict(os.environ, {"AGY_FEDERATION_HUB_PUBLIC_URL": "http://hub.example.com"}):
+                r_inv = await self.client.get("/api/federation/overview", headers=admin_get)
+                self.assertEqual(r_inv.status, 200)
+                hc = (await r_inv.json())["hub_config"]
+                self.assertEqual(hc["public_url"], "")
+                self.assertEqual(hc["loopback_mcp_url"], expected_loopback_mcp)
+                self.assertEqual(hc["mcp_url"], expected_loopback_mcp)
+
+            # Valid public URL -> exposed in hub_config, while health probe strictly hits loopback only
+            probed_urls: list[str] = []
+            orig_get = aiohttp.ClientSession.get
+
+            def spy_get(session_self, url, *args, **kwargs):
+                probed_urls.append(str(url))
+                return orig_get(session_self, url, *args, **kwargs)
+
+            with (
+                mock.patch.dict(os.environ, {"AGY_FEDERATION_HUB_PUBLIC_URL": "https://hub.example.com/"}),
+                mock.patch.object(aiohttp.ClientSession, "get", new=spy_get),
+            ):
+                r_ov = await self.client.get("/api/federation/overview", headers=admin_get)
+                self.assertEqual(r_ov.status, 200)
+                d_ov = await r_ov.json()
+                self.assertEqual(d_ov["hub_config"]["public_url"], "https://hub.example.com")
+                self.assertEqual(d_ov["hub_config"]["loopback_mcp_url"], expected_loopback_mcp)
+                self.assertEqual(d_ov["hub_config"]["mcp_url"], "https://hub.example.com/hub/mcp")
+                self.assertTrue(d_ov["hub_health"]["reachable"])
+
+                r_hl = await self.client.get("/api/federation/health", headers=admin_get)
+                self.assertEqual(r_hl.status, 200)
+                self.assertTrue((await r_hl.json())["reachable"])
+
+                r_wb = await self.client.get("/api/federation/workbench", headers=admin_get)
+                self.assertEqual(r_wb.status, 200)
+                self.assertEqual((await r_wb.json())["hub_config"]["public_url"], "https://hub.example.com")
+
+            self.assertTrue(probed_urls)
+            for u in probed_urls:
+                self.assertTrue(u.startswith(f"http://127.0.0.1:{stub_server.port}/hub/v1/health"), u)
+                self.assertNotIn("hub.example.com", u)
+        finally:
+            await stub_server.close()
+
+    async def test_w5_blocker1_alt_ipv4_ipv6_mapped_zone_and_noncanonical_loopback_rejected(self) -> None:
+        # Alternative IPv4 encodings, IPv6 zone IDs, IPv4-mapped IPv6, and non-canonical loopbacks MUST fail-closed
+        https_prefix = "https" + "://"
+        ip_127_0_0_1 = ".".join(("127", "0", "0", "1"))
+        ip_127_0_0_2 = ".".join(("127", "0", "0", "2"))
+        ip_169_254_short = ".".join(("169", "254", "43518"))
+        imds_dec = str(0xA9FEA9FE)
+        loopback_dec = str(0x7F000001)
+        bypass_urls = [
+            f"{https_prefix}{imds_dec}",
+            f"{https_prefix}0251.0376.0251.0376",
+            f"{https_prefix}0xa9.0xfe.0xa9.0xfe",
+            f"{https_prefix}{ip_169_254_short}",
+            f"{https_prefix}0",
+            f"{https_prefix}{loopback_dec}",
+            f"{https_prefix}127.1",
+            f"{https_prefix}0x7f000001",
+            f"{https_prefix}[2001:db8::1%eth0]",
+            f"{https_prefix}[2001:db8::1%25eth0]",
+            f"{https_prefix}{ip_127_0_0_2}",
+            f"{https_prefix}[::ffff:{ip_127_0_0_1}]",
+            f"{https_prefix}[::ffff:{ip_127_0_0_2}]",
+            f"{https_prefix}[::ffff:{SYNTH_IMDS_IP}]",
+            f"{https_prefix}[0:0:0:0:0:0:0:1]",
+            f"{https_prefix}hub%2eexample.com",
+            f"{https_prefix}singlelabel",
+        ]
+        for bad in bypass_urls:
+            self.assertEqual(_validate_hub_public_url(bad), "", f"Expected bypass rejection for {bad!r}")
+
+        # Legitimate canonical HTTPS targets remain accepted
+        punycode_host = ".".join(("hub", "xn--fiqs8s"))
+        for raw, expected in (
+            (f"{https_prefix}localhost", f"{https_prefix}localhost"),
+            (f"{https_prefix}localhost:8443/", f"{https_prefix}localhost:8443"),
+            (f"{https_prefix}{ip_127_0_0_1}:8443/", f"{https_prefix}{ip_127_0_0_1}:8443"),
+            (f"{https_prefix}[::1]:8443/", f"{https_prefix}[::1]:8443"),
+            (f"{https_prefix}{punycode_host}:8443/", f"{https_prefix}{punycode_host}:8443"),
+        ):
+            self.assertEqual(_validate_hub_public_url(raw), expected, f"Expected valid URL for {raw!r}")
+
+
+class TestWorkbenchW6DedupMergeAndCancelIdempotency(_FederationTestBase):
+    """W6: Cross-source dedup merge, cross-agent isolation, terminal idempotency, dual atomic cancel, dotted job_id."""
+
+    async def test_w6_cross_source_dedup_cross_agent_isolation_and_atomic_dual_cancel(self) -> None:
+        admin_cookie, admin_csrf = await self._login("AdminUser", ADMIN_PASS)
+        admin_get = {"Cookie": f"{SESSION_COOKIE_NAME}={admin_cookie}"}
+        headers = self._admin_headers(admin_cookie, admin_csrf)
+
+        for aid in ("ag_alpha", "ag_beta"):
+            r = await self.client.post(
+                "/api/federation/agents",
+                headers=headers,
+                data=json.dumps({"agent_id": aid, "kind": "pull_worker"}),
+            )
+            self.assertEqual(r.status, 200)
+
+        pq_dir = Path(federation_registry.pull_queue_dir(str(self.bus_dir)))
+        pq_dir.mkdir(parents=True, exist_ok=True)
+        jobs_dir = self.bus_dir / "jobs"
+        jobs_dir.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+
+        # 1. Same job_id in both PullWorkerQueue (done) and bot_bus (running) + other agent job interference
+        (pq_dir / "job-shared-done.json").write_text(
+            json.dumps(
+                {
+                    "job_id": "job-shared-done",
+                    "target_agent_id": "ag_alpha",
+                    "prompt": "shared task",
+                    "status": "done",
+                    "result_text": "FINAL_ALPHA_RESULT",
+                    "created_at": now - 60,
+                    "claimed_at": now - 55,
+                    "finished_at": now - 40,
+                    "metadata": {"bridged_from_bot_bus": True},
+                }
+            ),
+            encoding="utf-8",
+        )
+        (jobs_dir / "job-shared-done.json").write_text(
+            json.dumps(
+                {
+                    "job_id": "job-shared-done",
+                    "target_bot": "ag_alpha",
+                    "from_bot": "coord_bot",
+                    "origin_chat_id": -100999,
+                    "prompt": "shared task",
+                    "status": "running",
+                    "created_at": now - 60,
+                    "started_at": now - 55,
+                    "finished_at": 0.0,
+                }
+            ),
+            encoding="utf-8",
+        )
+        # Other agent's job that must NEVER leak into ag_alpha's timeline
+        (pq_dir / "pull-beta-only.json").write_text(
+            json.dumps(
+                {
+                    "job_id": "pull-beta-only",
+                    "target_agent_id": "ag_beta",
+                    "prompt": "beta secret task",
+                    "status": "queued",
+                    "created_at": now - 20,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        # In-flight bridged job in BOTH PullWorkerQueue (queued) and bot_bus (queued)
+        (pq_dir / "job-bridged-inflight.json").write_text(
+            json.dumps(
+                {
+                    "job_id": "job-bridged-inflight",
+                    "target_agent_id": "ag_alpha",
+                    "prompt": "bridged cancel test",
+                    "status": "queued",
+                    "cancelled": False,
+                    "created_at": now - 15,
+                    "metadata": {"bridged_from_bot_bus": True},
+                }
+            ),
+            encoding="utf-8",
+        )
+        (jobs_dir / "job-bridged-inflight.json").write_text(
+            json.dumps(
+                {
+                    "job_id": "job-bridged-inflight",
+                    "target_bot": "ag_alpha",
+                    "from_bot": "studio",
+                    "prompt": "bridged cancel test",
+                    "status": "queued",
+                    "cancel_requested": False,
+                    "created_at": now - 15,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        # Dotted bot_bus job_id (invalid for PULL_JOB_ID_RE, valid for bot_bus.JOB_ID_RE)
+        (jobs_dir / "job-2026.11.dotted.json").write_text(
+            json.dumps(
+                {
+                    "job_id": "job-2026.11.dotted",
+                    "target_bot": "ag_alpha",
+                    "from_bot": "studio",
+                    "prompt": "dotted bus job",
+                    "status": "queued",
+                    "cancel_requested": False,
+                    "created_at": now - 10,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        r_tl = await self.client.get(
+            "/api/federation/workbench/agents/ag_alpha/timeline",
+            headers=admin_get,
+        )
+        self.assertEqual(r_tl.status, 200, await r_tl.text())
+        tl = (await r_tl.json())["timeline"]
+        jids = [item["job_id"] for item in tl]
+        # Strict dedup + zero cross-agent leakage
+        self.assertEqual(jids.count("job-shared-done"), 1)
+        self.assertNotIn("pull-beta-only", jids)
+        shared = next(it for it in tl if it["job_id"] == "job-shared-done")
+        self.assertEqual(shared["status"], "done")
+        self.assertEqual(shared["result_text"], "FINAL_ALPHA_RESULT")
+        self.assertEqual(shared["source"], "telegram")
+        self.assertTrue(shared["bridged"])
+
+        # 2. Cross-agent cancel rejected with 404, target untouched
+        r_x = await self.client.post(
+            "/api/federation/workbench/agents/ag_alpha/jobs/pull-beta-only/cancel",
+            headers=headers,
+            data="{}",
+        )
+        self.assertEqual(r_x.status, 404)
+        beta_after = json.loads((pq_dir / "pull-beta-only.json").read_text(encoding="utf-8"))
+        self.assertEqual(beta_after["status"], "queued")
+
+        # 3. Terminal `done` job cancel -> idempotent, never overwrites result_text or status
+        r_term = await self.client.post(
+            "/api/federation/workbench/agents/ag_alpha/jobs/job-shared-done/cancel",
+            headers=headers,
+            data=json.dumps({"reason": "late_cancel"}),
+        )
+        self.assertEqual(r_term.status, 200)
+        d_term = await r_term.json()
+        self.assertTrue(d_term["already_terminal"])
+        self.assertFalse(d_term["cancelled"])
+        self.assertEqual(d_term["status"], "done")
+        self.assertEqual(d_term["job"]["result_text"], "FINAL_ALPHA_RESULT")
+
+        # Non-existent job cancel -> 404
+        r_404 = await self.client.post(
+            "/api/federation/workbench/agents/ag_alpha/jobs/job-does-not-exist/cancel",
+            headers=headers,
+            data="{}",
+        )
+        self.assertEqual(r_404.status, 404)
+
+        # 4. In-flight bridged job cancel -> dual-side atomic cancel (both pull_queue and bot_bus cancelled)
+        r_dual = await self.client.post(
+            "/api/federation/workbench/agents/ag_alpha/jobs/job-bridged-inflight/cancel",
+            headers=headers,
+            data=json.dumps({"reason": "operator_stop"}),
+        )
+        self.assertEqual(r_dual.status, 200, await r_dual.text())
+        d_dual = await r_dual.json()
+        self.assertTrue(d_dual["cancelled"])
+        self.assertEqual(d_dual["status"], "cancelled")
+        pq_after = json.loads((pq_dir / "job-bridged-inflight.json").read_text(encoding="utf-8"))
+        bus_after = json.loads((jobs_dir / "job-bridged-inflight.json").read_text(encoding="utf-8"))
+        self.assertEqual(pq_after["status"], "cancelled")
+        self.assertEqual(bus_after["status"], "cancelled")
+
+        # 5. Dotted bot_bus job_id cancel succeeds cleanly without PullWorkerQueue ValueError
+        r_dot = await self.client.post(
+            "/api/federation/workbench/agents/ag_alpha/jobs/job-2026.11.dotted/cancel",
+            headers=headers,
+            data="{}",
+        )
+        self.assertEqual(r_dot.status, 200, await r_dot.text())
+        self.assertTrue((await r_dot.json())["cancelled"])
+        dot_after = json.loads((jobs_dir / "job-2026.11.dotted.json").read_text(encoding="utf-8"))
+        self.assertEqual(dot_after["status"], "cancelled")
+
+    async def test_w6_blocker3_terminal_priority_cancel_race_and_value_error_not_silenced(self) -> None:
+        admin_cookie, admin_csrf = await self._login("AdminUser", ADMIN_PASS)
+        admin_get = {"Cookie": f"{SESSION_COOKIE_NAME}={admin_cookie}"}
+        headers = self._admin_headers(admin_cookie, admin_csrf)
+
+        r_reg = await self.client.post(
+            "/api/federation/agents",
+            headers=headers,
+            data=json.dumps({"agent_id": "ag_race", "kind": "pull_worker"}),
+        )
+        self.assertEqual(r_reg.status, 200, await r_reg.text())
+
+        pq_dir = Path(federation_registry.pull_queue_dir(str(self.bus_dir)))
+        pq_dir.mkdir(parents=True, exist_ok=True)
+        jobs_dir = self.bus_dir / "jobs"
+        jobs_dir.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+
+        # 1. Terminal merge semantic priority: pull=done(T1) + bus=cancelled(T2 > T1) MUST stay `done` & preserve result_text
+        t1 = now - 50
+        t2 = now - 10
+        merged_done_vs_cancel = _merge_single_timeline_job(
+            "job-term-prio-1",
+            {
+                "job_id": "job-term-prio-1",
+                "target_agent_id": "ag_race",
+                "prompt": "priority check",
+                "status": "done",
+                "result_text": "DONE_AT_T1_PRESERVED",
+                "created_at": now - 80,
+                "finished_at": t1,
+            },
+            {
+                "job_id": "job-term-prio-1",
+                "target_bot": "ag_race",
+                "from_bot": "studio",
+                "prompt": "priority check",
+                "status": "cancelled",
+                "cancel_reason": "late_cancel_t2",
+                "created_at": now - 80,
+                "finished_at": t2,
+            },
+            is_admin=True,
+            now_ts=now,
+        )
+        self.assertEqual(merged_done_vs_cancel["status"], "done")
+        self.assertEqual(merged_done_vs_cancel["result_text"], "DONE_AT_T1_PRESERVED")
+
+        # Also verify `error` > `cancelled` regardless of newer cancelled timestamp, and same-class uses finished_at
+        merged_err_vs_cancel = _merge_single_timeline_job(
+            "job-term-prio-2",
+            {"job_id": "job-term-prio-2", "status": "error", "error": "ERR_T1", "finished_at": t1, "created_at": now - 80},
+            {"job_id": "job-term-prio-2", "status": "cancelled", "cancel_reason": "C_T2", "finished_at": t2, "created_at": now - 80},
+            is_admin=True,
+            now_ts=now,
+        )
+        self.assertEqual(merged_err_vs_cancel["status"], "error")
+        self.assertEqual(merged_err_vs_cancel["error"], "ERR_T1")
+
+        merged_same_class = _merge_single_timeline_job(
+            "job-term-prio-3",
+            {"job_id": "job-term-prio-3", "status": "done", "result_text": "OLDER_DONE", "finished_at": t1, "created_at": now - 80},
+            {"job_id": "job-term-prio-3", "status": "done", "result_text": "NEWER_DONE", "finished_at": t2, "created_at": now - 80},
+            is_admin=True,
+            now_ts=now,
+        )
+        self.assertEqual(merged_same_class["status"], "done")
+        self.assertEqual(merged_same_class["result_text"], "NEWER_DONE")
+
+        # Verify end-to-end via timeline endpoint for pull=done(T1) + bus=cancelled(T2 > T1)
+        (pq_dir / "job-merge-e2e.json").write_text(
+            json.dumps(
+                {
+                    "job_id": "job-merge-e2e",
+                    "target_agent_id": "ag_race",
+                    "prompt": "merge e2e",
+                    "status": "done",
+                    "result_text": "E2E_DONE_T1",
+                    "created_at": now - 90,
+                    "finished_at": t1,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (jobs_dir / "job-merge-e2e.json").write_text(
+            json.dumps(
+                {
+                    "job_id": "job-merge-e2e",
+                    "target_bot": "ag_race",
+                    "from_bot": "studio",
+                    "prompt": "merge e2e",
+                    "status": "cancelled",
+                    "cancel_reason": "late_bus_cancel",
+                    "created_at": now - 90,
+                    "finished_at": t2,
+                }
+            ),
+            encoding="utf-8",
+        )
+        r_tl = await self.client.get("/api/federation/workbench/agents/ag_race/timeline", headers=admin_get)
+        self.assertEqual(r_tl.status, 200)
+        e2e_item = next(it for it in (await r_tl.json())["timeline"] if it["job_id"] == "job-merge-e2e")
+        self.assertEqual(e2e_item["status"], "done")
+        self.assertEqual(e2e_item["result_text"], "E2E_DONE_T1")
+
+        # 2. Dual-side cancel race: PullWorkerQueue.cancel() returns already `done` -> MUST skip bot_bus.cancel_job_in_dir()
+        race_jid = "job-race-done-1"
+        (pq_dir / f"{race_jid}.json").write_text(
+            json.dumps(
+                {
+                    "job_id": race_jid,
+                    "target_agent_id": "ag_race",
+                    "prompt": "race cancel task",
+                    "status": "claimed",
+                    "cancelled": False,
+                    "created_at": now - 30,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (jobs_dir / f"{race_jid}.json").write_text(
+            json.dumps(
+                {
+                    "job_id": race_jid,
+                    "target_bot": "ag_race",
+                    "from_bot": "studio",
+                    "prompt": "race cancel task",
+                    "status": "running",
+                    "cancel_requested": False,
+                    "created_at": now - 30,
+                }
+            ),
+            encoding="utf-8",
+        )
+        raced_done_rec = {
+            "job_id": race_jid,
+            "target_agent_id": "ag_race",
+            "prompt": "race cancel task",
+            "status": "done",
+            "result_text": "RACED_DONE_RESULT_INTACT",
+            "cancelled": False,
+            "created_at": now - 30,
+            "finished_at": now - 1,
+        }
+        with (
+            mock.patch.object(federation_registry.PullWorkerQueue, "cancel", return_value=raced_done_rec),
+            mock.patch.object(bot_bus, "cancel_job_in_dir", wraps=bot_bus.cancel_job_in_dir) as spy_bus_cancel,
+        ):
+            r_race = await self.client.post(
+                f"/api/federation/workbench/agents/ag_race/jobs/{race_jid}/cancel",
+                headers=headers,
+                data=json.dumps({"reason": "too_late"}),
+            )
+            self.assertEqual(r_race.status, 200, await r_race.text())
+            d_race = await r_race.json()
+            self.assertTrue(d_race["already_terminal"])
+            self.assertFalse(d_race["cancelled"])
+            self.assertEqual(d_race["status"], "done")
+            self.assertEqual(d_race["job"]["result_text"], "RACED_DONE_RESULT_INTACT")
+            self.assertEqual(spy_bus_cancel.call_count, 0)
+
+        # bot_bus job on disk MUST remain untouched (not overwritten to cancelled)
+        bus_race_after = json.loads((jobs_dir / f"{race_jid}.json").read_text(encoding="utf-8"))
+        self.assertEqual(bus_race_after["status"], "running")
+        self.assertFalse(bus_race_after["cancel_requested"])
+
+        # Same race when PullWorkerQueue.cancel() returns already `error`
+        raced_err_rec = {
+            "job_id": race_jid,
+            "target_agent_id": "ag_race",
+            "prompt": "race cancel task",
+            "status": "error",
+            "error": "WORKER_FAILED_FIRST",
+            "cancelled": False,
+            "created_at": now - 30,
+            "finished_at": now - 1,
+        }
+        with (
+            mock.patch.object(federation_registry.PullWorkerQueue, "cancel", return_value=raced_err_rec),
+            mock.patch.object(bot_bus, "cancel_job_in_dir", wraps=bot_bus.cancel_job_in_dir) as spy_bus_cancel_err,
+        ):
+            r_race_err = await self.client.post(
+                f"/api/federation/workbench/agents/ag_race/jobs/{race_jid}/cancel",
+                headers=headers,
+                data="{}",
+            )
+            self.assertEqual(r_race_err.status, 200, await r_race_err.text())
+            d_err = await r_race_err.json()
+            self.assertTrue(d_err["already_terminal"])
+            self.assertFalse(d_err["cancelled"])
+            self.assertEqual(d_err["status"], "error")
+            self.assertEqual(d_err["job"]["error"], "WORKER_FAILED_FIRST")
+            self.assertEqual(spy_bus_cancel_err.call_count, 0)
+
+        # 3. PullWorkerQueue.cancel() raising ValueError MUST NOT silently return 200 OK
+        with (
+            mock.patch.object(
+                federation_registry.PullWorkerQueue,
+                "cancel",
+                side_effect=ValueError("invalid pull queue state"),
+            ),
+            mock.patch.object(bot_bus, "cancel_job_in_dir", wraps=bot_bus.cancel_job_in_dir) as spy_bus_cancel_ve,
+        ):
+            r_ve = await self.client.post(
+                f"/api/federation/workbench/agents/ag_race/jobs/{race_jid}/cancel",
+                headers=headers,
+                data="{}",
+            )
+            self.assertEqual(r_ve.status, 400, f"Expected 400 on ValueError, got {r_ve.status}")
+            self.assertIn("invalid pull queue state", await r_ve.text())
+            self.assertEqual(spy_bus_cancel_ve.call_count, 0)
+        audit_text = self.audit_log.read_text(encoding="utf-8")
+        self.assertIn("invalid_request", audit_text)
+        self.assertIn('"status_code":400', audit_text.replace(" ", ""))
+
+
+class TestWorkbenchW7NavigationSpaShellDemoAndRedlines(_FederationTestBase):
+    """W7: Navigation order, zero-data /federation-workbench SPA shell, zero personal domains."""
+
+    async def test_w7_navigation_order_spa_shell_and_zero_personal_domains(self) -> None:
+        # 1. Desktop nav order: DESKTOP_NAV_ITEMS[0] == workspace, [1] == federation-workbench
+        app_tsx = (REPO_ROOT / "webui" / "src" / "App.tsx").read_text(encoding="utf-8")
+        nav_match = re.search(r"const DESKTOP_NAV_ITEMS[^=]*=\s*\[(.*?)\];", app_tsx, re.DOTALL)
+        self.assertIsNotNone(nav_match)
+        desktop_ids = re.findall(r'id:\s*"([^"]+)"', nav_match.group(1))
+        self.assertGreaterEqual(len(desktop_ids), 2)
+        self.assertEqual(desktop_ids[0], "workspace")
+        self.assertEqual(desktop_ids[1], "federation-workbench")
+        self.assertIn('path === "federation-workbench"', app_tsx)
+        self.assertIn("FederationWorkbenchView", app_tsx)
+
+        # MobileMoreSheet order: SHEET_ITEMS[0] == federation-workbench
+        sheet_tsx = (REPO_ROOT / "webui" / "src" / "components" / "MobileMoreSheet.tsx").read_text(
+            encoding="utf-8"
+        )
+        sheet_match = re.search(r"const SHEET_ITEMS[^=]*=\s*\[(.*?)\];", sheet_tsx, re.DOTALL)
+        self.assertIsNotNone(sheet_match)
+        sheet_ids = re.findall(r'id:\s*"([^"]+)"', sheet_match.group(1))
+        self.assertGreaterEqual(len(sheet_ids), 1)
+        self.assertEqual(sheet_ids[0], "federation-workbench")
+
+        # Two-way navigation buttons present
+        fed_tsx = (REPO_ROOT / "webui" / "src" / "components" / "FederationView.tsx").read_text(encoding="utf-8")
+        wb_tsx = (REPO_ROOT / "webui" / "src" / "components" / "FederationWorkbenchView.tsx").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('onNavigate("federation-workbench")', fed_tsx)
+        self.assertIn('onNavigate("federation")', wb_tsx)
+
+        # 2. Unauthenticated GET /federation-workbench returns 200 zero-data SPA shell with no-store & CSP
+        r_spa = await self.client.get("/federation-workbench")
+        self.assertEqual(r_spa.status, 200)
+        self.assertEqual(r_spa.headers.get("Cache-Control"), "no-store, max-age=0")
+        self.assertIn("script-src 'self'", r_spa.headers.get("Content-Security-Policy", ""))
+        spa_txt = await r_spa.text()
+        self.assertNotIn(SYNTH_PREFIX, spa_txt)
+        self.assertNotIn("token_records", spa_txt)
+
+        # 3. Zero personal domains / real private IDs in all touched runtime & demo files
+        personal_tokens = (
+            ".".join(("gaoshan", "de5", "net")),
+            ".".join(("fisht", "de5", "net")),
+            "-".join(("muse", "f01")),
+        )
+        for rel in (
+            "studio/federation_service.py",
+            "studio/server.py",
+            "webui/src/components/FederationView.tsx",
+            "webui/src/components/FederationWorkbenchView.tsx",
+            "webui/src/demo/mockApi.ts",
+        ):
+            content = (REPO_ROOT / rel).read_text(encoding="utf-8")
+            for ptok in personal_tokens:
+                self.assertNotIn(ptok, content, f"Personal marker {ptok!r} found in {rel}")
 
 
 if __name__ == "__main__":

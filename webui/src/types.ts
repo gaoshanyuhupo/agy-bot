@@ -586,6 +586,7 @@ export interface LiveBrowserState {
 
 export type NavTab =
   | "workspace"
+  | "federation-workbench"
   | "attention"
   | "files"
   | "overview"
@@ -1630,6 +1631,15 @@ export interface FederationHardLockItem {
   detail: string;
 }
 
+export interface FederationHubConfig {
+  loopback_valid: boolean;
+  host: string;
+  port: number;
+  public_url: string;
+  loopback_mcp_url: string;
+  mcp_url: string;
+}
+
 export interface FederationOverviewResponse {
   ok: boolean;
   can_edit: boolean;
@@ -1644,12 +1654,7 @@ export interface FederationOverviewResponse {
     teams_total: number;
   };
   hub_health: FederationHubHealth;
-  hub_config: {
-    loopback_valid: boolean;
-    host: string;
-    port: number;
-    mcp_url: string;
-  };
+  hub_config: FederationHubConfig;
   hard_locks: FederationHardLockItem[];
   updated_at: string;
 }
@@ -1747,6 +1752,134 @@ export interface FederationAuditResponse {
   total: number;
   limit: number;
   offset: number;
+}
+
+// External Agent Federation Workbench
+export type FederationRuntimeStatus = "online" | "stale" | "offline" | "disabled" | "revoked";
+export type FederationDispatchMode = "pull" | "push" | "inbound_only" | "local_only";
+export type FederationTimelineSource = "studio" | "telegram" | "bus" | "pull";
+
+export interface FederationPullQueueCounts {
+  queued: number;
+  claimed: number;
+  done: number;
+  error: number;
+  cancelled: number;
+  total: number;
+}
+
+export interface FederationBusJobCounts {
+  queued: number;
+  running: number;
+  done: number;
+  error: number;
+  cancelled: number;
+  total: number;
+}
+
+export interface FederationWorkbenchAgentItem extends FederationAgentItem {
+  runtime_status: FederationRuntimeStatus;
+  adapter_type: string;
+  dispatch_mode: FederationDispatchMode;
+  can_dispatch: boolean;
+  dispatch_disabled_reason?: string;
+  pull_queue_counts: FederationPullQueueCounts;
+  bus_job_counts: FederationBusJobCounts;
+  leader_events_count: number;
+  last_activity_at: number | null;
+}
+
+export interface FederationWorkbenchResponse {
+  ok: boolean;
+  agents: FederationWorkbenchAgentItem[];
+  hub_config: FederationHubConfig;
+  can_edit: boolean;
+  role: UserRole | string;
+  updated_at: string;
+}
+
+export interface FederationTimelineJobItem {
+  job_id: string;
+  status: "queued" | "claimed" | "running" | "done" | "error" | "cancelled" | string;
+  source: FederationTimelineSource;
+  stores: string[];
+  bridged: boolean;
+  label: string;
+  from_actor: string;
+  team_id: string;
+  group_id: string;
+  prompt: string;
+  result_text: string;
+  error: string;
+  cancel_reason: string;
+  created_at: number | null;
+  started_at: number | null;
+  claimed_at: number | null;
+  finished_at: number | null;
+  elapsed_s: number | null;
+  is_active: boolean;
+  can_cancel: boolean;
+}
+
+export interface FederationPullInboxItem {
+  job_id: string;
+  status: string;
+  source: FederationTimelineSource;
+  label: string;
+  prompt_preview: string;
+  created_at: number | null;
+  claimed_at: number | null;
+  can_cancel: boolean;
+}
+
+export interface FederationLeaderEventSummary {
+  event_id: string;
+  type: string;
+  created_at: number | null;
+  group_id: string;
+  team_id: string;
+  job_ids: string[];
+  jobs_count: number;
+  status: string;
+  status_counts?: Record<string, number>;
+  tainted: boolean;
+}
+
+export interface FederationWorkbenchTimelineResponse {
+  ok: boolean;
+  agent: FederationWorkbenchAgentItem;
+  timeline: FederationTimelineJobItem[];
+  total: number;
+  limit: number;
+  has_active_jobs: boolean;
+  pull_inbox: FederationPullInboxItem[];
+  leader_events: FederationLeaderEventSummary[];
+  can_edit: boolean;
+  role: UserRole | string;
+  updated_at: string;
+}
+
+export interface FederationWorkbenchDispatchPayload {
+  prompt: string;
+  label?: string;
+  timeout_s?: number;
+}
+
+export interface FederationWorkbenchDispatchResponse {
+  ok: boolean;
+  agent_id: string;
+  dispatch_mode: FederationDispatchMode;
+  job: FederationTimelineJobItem;
+}
+
+export interface FederationWorkbenchCancelResponse {
+  ok: boolean;
+  agent_id: string;
+  job_id: string;
+  status: string;
+  already_terminal: boolean;
+  cancelled: boolean;
+  job: FederationTimelineJobItem;
 }
 
 declare global {

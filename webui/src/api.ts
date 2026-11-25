@@ -30,6 +30,11 @@ import type {
   FederationTeamMutationResponse,
   FederationTeamPatchPayload,
   FederationTokenResponse,
+  FederationWorkbenchCancelResponse,
+  FederationWorkbenchDispatchPayload,
+  FederationWorkbenchDispatchResponse,
+  FederationWorkbenchResponse,
+  FederationWorkbenchTimelineResponse,
   FileContentResponse,
   FileDiffResponse,
   FileTreeResponse,
@@ -431,6 +436,7 @@ export class StudioEventClient {
     bindType("job_updated");
     bindType("schedule_updated");
     bindType("bots_updated");
+    bindType("federation_updated");
     bindType("gateways_updated");
     bindType("accounts_updated");
     bindType("workbench_state_updated");
@@ -1431,6 +1437,52 @@ export function fetchFederationAudit(params?: {
   if (params?.event) q.set("event", params.event);
   const qs = q.toString();
   return requestJson<FederationAuditResponse>(`/api/federation/audit${qs ? `?${qs}` : ""}`);
+}
+
+// External Agent Federation Workbench
+export function fetchFederationWorkbench(): Promise<FederationWorkbenchResponse> {
+  return requestJson<FederationWorkbenchResponse>("/api/federation/workbench");
+}
+
+export function fetchFederationWorkbenchTimeline(
+  agentId: string,
+  params?: { limit?: number },
+): Promise<FederationWorkbenchTimelineResponse> {
+  const q = new URLSearchParams();
+  if (params?.limit) q.set("limit", String(params.limit));
+  const qs = q.toString();
+  return requestJson<FederationWorkbenchTimelineResponse>(
+    `/api/federation/workbench/agents/${encodeURIComponent(agentId)}/timeline${qs ? `?${qs}` : ""}`,
+  );
+}
+
+export function dispatchFederationWorkbenchJob(
+  agentId: string,
+  payload: FederationWorkbenchDispatchPayload,
+): Promise<FederationWorkbenchDispatchResponse> {
+  return requestJson<FederationWorkbenchDispatchResponse>(
+    `/api/federation/workbench/agents/${encodeURIComponent(agentId)}/dispatch`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+    true,
+  );
+}
+
+export function cancelFederationWorkbenchJob(
+  agentId: string,
+  jobId: string,
+  reason?: string,
+): Promise<FederationWorkbenchCancelResponse> {
+  return requestJson<FederationWorkbenchCancelResponse>(
+    `/api/federation/workbench/agents/${encodeURIComponent(agentId)}/jobs/${encodeURIComponent(jobId)}/cancel`,
+    {
+      method: "POST",
+      body: JSON.stringify(reason ? { reason } : {}),
+    },
+    true,
+  );
 }
 
 export function formatTokens(n: number): string {

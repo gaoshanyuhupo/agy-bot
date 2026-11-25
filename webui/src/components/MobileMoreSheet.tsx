@@ -9,6 +9,7 @@ import {
   LayoutDashboard,
   LogOut,
   Network,
+  Radio,
   ShieldCheck,
   X,
 } from "lucide-react";
@@ -32,6 +33,12 @@ const SHEET_ITEMS: {
   icon: typeof LayoutDashboard;
   badge?: string;
 }[] = [
+  {
+    id: "federation-workbench",
+    label: "联邦工作台",
+    desc: "外部联邦节点跨来源对话、派单与 Pull 队列遥测",
+    icon: Radio,
+  },
   { id: "attention", label: "审批中心", desc: "统一审批队列与浏览器接管感知", icon: Bell },
   { id: "files", label: "文件审查", desc: "项目文件树、Git Diff 与撤回/重做", icon: FileCode },
   { id: "overview", label: "总览", desc: "多 Bot 状态与系统健康指标", icon: LayoutDashboard },

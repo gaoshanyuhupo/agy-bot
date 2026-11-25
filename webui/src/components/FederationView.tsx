@@ -11,6 +11,7 @@ import {
   Lock,
   Network,
   Plus,
+  Radio,
   RefreshCw,
   RotateCw,
   Server,
@@ -42,12 +43,14 @@ import type {
   FederationAuditEntry,
   FederationOverviewResponse,
   FederationTeamItem,
+  NavTab,
   StudioSession,
 } from "../types";
 
 interface FederationViewProps {
   session: StudioSession;
   eventVersion?: number;
+  onNavigate?: (tab: NavTab) => void;
   onSessionRevoked?: (reason: string) => void;
 }
 
@@ -150,6 +153,7 @@ function formatTs(ts?: number): string {
 export function FederationView({
   session,
   eventVersion = 0,
+  onNavigate,
   onSessionRevoked,
 }: FederationViewProps) {
   const isAdmin = session.role === "admin";
@@ -589,7 +593,14 @@ export function FederationView({
   };
 
   const hubHealth = overview?.hub_health;
-  const hubMcpUrl = overview?.hub_config?.mcp_url || "http://127.0.0.1:18799/hub/mcp";
+  const hubLoopbackMcpUrl =
+    overview?.hub_config?.loopback_mcp_url ||
+    (overview?.hub_config?.loopback_valid
+      ? `http://${overview.hub_config.host}:${overview.hub_config.port}/hub/mcp`
+      : "http://127.0.0.1:18799/hub/mcp");
+  const hubPublicUrl = overview?.hub_config?.public_url || "";
+  const hubMcpUrl = overview?.hub_config?.mcp_url || hubLoopbackMcpUrl;
+  const hubBaseUrl = hubPublicUrl || hubMcpUrl.replace(/\/hub\/mcp$/, "");
 
   const hermesStdioSnippet = oneTimeToken
     ? JSON.stringify(
@@ -600,7 +611,7 @@ export function FederationView({
               args: [
                 "bridge/federation_mcp_stdio.py",
                 "--hub-url",
-                hubMcpUrl.replace(/\/hub\/mcp$/, ""),
+                hubBaseUrl,
                 "--agent-id",
                 oneTimeToken.agentId,
               ],
@@ -646,6 +657,19 @@ export function FederationView({
           </p>
         </div>
         <div className="flex items-center gap-2">
+          {onNavigate && (
+            <button
+              type="button"
+              onClick={() => {
+                setOneTimeToken(null);
+                onNavigate("federation-workbench");
+              }}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-sky-500/40 bg-sky-500/15 hover:bg-sky-500/25 px-3 py-1.5 text-xs font-medium text-sky-200 cursor-pointer"
+            >
+              <Radio className="w-3.5 h-3.5" />
+              进入联邦工作台
+            </button>
+          )}
           <button
             type="button"
             onClick={() => void handleRefreshHealth()}
@@ -682,13 +706,27 @@ export function FederationView({
               {hubHealth?.reachable ? "HEALTHY" : (hubHealth?.status || "UNKNOWN").toUpperCase()}
             </span>
           </div>
-          <div className="mt-2 font-mono text-xs text-slate-200">
-            {overview?.hub_config?.loopback_valid
-              ? `${overview.hub_config.host}:${overview.hub_config.port}`
-              : "未配置合法回环端口"}
+          <div className="mt-2 font-mono text-xs text-slate-200 truncate" title={hubPublicUrl || hubMcpUrl}>
+            {hubPublicUrl
+              ? hubPublicUrl
+              : overview?.hub_config?.loopback_valid
+                ? `${overview.hub_config.host}:${overview.hub_config.port}`
+                : "未配置合法回环端口"}
           </div>
           <div className="mt-1 text-[11px] text-slate-400">
-            延迟：{hubHealth?.latency_ms != null ? `${hubHealth.latency_ms} ms` : "-"} · 防 SSRF 硬绑定回环
+            {hubPublicUrl ? (
+              <>
+                公网接入已配置 · 回环探活{" "}
+                {overview?.hub_config?.loopback_valid
+                  ? `${overview.hub_config.host}:${overview.hub_config.port}`
+                  : "invalid"}
+                （{hubHealth?.latency_ms != null ? `${hubHealth.latency_ms} ms` : "-"}）
+              </>
+            ) : (
+              <>
+                延迟：{hubHealth?.latency_ms != null ? `${hubHealth.latency_ms} ms` : "-"} · 防 SSRF 硬绑定回环
+              </>
+            )}
           </div>
         </div>
 
@@ -1527,6 +1565,14 @@ export function FederationView({
               </div>
               <div className="text-amber-300/90 text-[11px]">
                 此凭据仅暂存于当前弹窗内存，关闭弹窗或切换页面后立即清零，服务端仅保留加盐 HMAC-SHA256 哈希。
+              </div>
+              <div className="text-[11px] text-slate-400">
+                接入地址：<code className="text-slate-200">{hubMcpUrl}</code>{" "}
+                {hubPublicUrl ? (
+                  <span className="text-emerald-300">（公网 URL）</span>
+                ) : (
+                  <span className="text-amber-300">（本地回环回退）</span>
+                )}
               </div>
             </div>
 

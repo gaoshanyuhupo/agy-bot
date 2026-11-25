@@ -40,7 +40,14 @@ import type {
   FederationTeamItem,
   FederationTeamMutationResponse,
   FederationTeamPatchPayload,
+  FederationTimelineJobItem,
   FederationTokenResponse,
+  FederationWorkbenchAgentItem,
+  FederationWorkbenchCancelResponse,
+  FederationWorkbenchDispatchPayload,
+  FederationWorkbenchDispatchResponse,
+  FederationWorkbenchResponse,
+  FederationWorkbenchTimelineResponse,
   FileContentResponse,
   FileDiffResponse,
   FileTreeNode,
@@ -3921,6 +3928,32 @@ let demoFederationAgents: FederationAgentItem[] = [
     created_at: nowSec() - 3600,
     updated_at: nowSec() - 300,
   },
+  {
+    agent_id: "pull_worker_demo",
+    display_name: "NAT Pull Worker Demo",
+    kind: "http_a2a",
+    driver: "pull_worker",
+    profile: "",
+    endpoint_url: "",
+    secret_ref: "",
+    has_secret_ref: false,
+    transport: "pull_worker",
+    capabilities: {
+      coordinator_peer: false,
+      host_server_invoke: false,
+      allowed_teams: ["demo-squad"],
+      can_dispatch: false,
+      can_receive: true,
+    },
+    trust_level: "remote_trusted",
+    enabled: true,
+    revoked: false,
+    active_token_count: 1,
+    has_active_token: true,
+    metadata: {},
+    created_at: nowSec() - 2400,
+    updated_at: nowSec() - 90,
+  },
 ];
 
 let demoFederationTeams: FederationTeamItem[] = [
@@ -4023,7 +4056,9 @@ export async function fetchFederationOverview(): Promise<FederationOverviewRespo
       loopback_valid: true,
       host: "127.0.0.1",
       port: 18799,
-      mcp_url: "http://127.0.0.1:18799/hub/mcp",
+      public_url: "https://hub.example.com",
+      loopback_mcp_url: "http://127.0.0.1:18799/hub/mcp",
+      mcp_url: "https://hub.example.com/hub/mcp",
     },
     hard_locks: [
       { id: "lock1", title: "锁 1：禁止读取凭据与篡改运行时", detail: "阻断私钥、环境变量、Vault 与运行目录写入。" },
@@ -4320,6 +4355,315 @@ export async function fetchFederationAudit(params?: {
     total: rows.length,
     limit,
     offset,
+  };
+}
+
+// External Agent Federation Workbench (Demo Mode)
+const demoFedWorkbenchTimelines: Record<string, FederationTimelineJobItem[]> = {
+  pull_worker_demo: [
+    {
+      job_id: "pull-demo-001",
+      status: "done",
+      source: "studio",
+      stores: ["pull"],
+      bridged: false,
+      label: "集群健康巡检",
+      from_actor: "studio:demo-admin",
+      team_id: "demo-squad",
+      group_id: "",
+      prompt: "检查边缘节点的磁盘剩余空间与核心容器状态。",
+      result_text:
+        "### 巡检完成\n- 根分区剩余空间：**68%**\n- 运行中容器：**6 / 6 健康**\n- 最近 5 分钟无异常重启。",
+      error: "",
+      cancel_reason: "",
+      created_at: nowSec() - 420,
+      started_at: nowSec() - 416,
+      claimed_at: nowSec() - 416,
+      finished_at: nowSec() - 404,
+      elapsed_s: 12.0,
+      is_active: false,
+      can_cancel: false,
+    },
+    {
+      job_id: "job-demo-bridged-002",
+      status: "done",
+      source: "telegram",
+      stores: ["pull", "bus"],
+      bridged: true,
+      label: "日报摘要",
+      from_actor: "@example_main_bot",
+      team_id: "demo-squad",
+      group_id: "batch-demo-01",
+      prompt: "汇总今日构建流水线的通过率与耗时。",
+      result_text: "今日共执行 **14 次构建**，通过率 **100%**，平均耗时 `42s`。",
+      error: "",
+      cancel_reason: "",
+      created_at: nowSec() - 180,
+      started_at: nowSec() - 175,
+      claimed_at: nowSec() - 175,
+      finished_at: nowSec() - 166,
+      elapsed_s: 9.0,
+      is_active: false,
+      can_cancel: false,
+    },
+  ],
+  hermes_remote_demo: [
+    {
+      job_id: "job-demo-remote-001",
+      status: "done",
+      source: "bus",
+      stores: ["bus"],
+      bridged: false,
+      label: "日志聚合",
+      from_actor: "hermes_local_demo",
+      team_id: "demo-squad",
+      group_id: "batch-demo-02",
+      prompt: "统计过去 1 小时 5xx 错误数。",
+      result_text: "过去 1 小时内共检测到 **0** 条 5xx 错误记录。",
+      error: "",
+      cancel_reason: "",
+      created_at: nowSec() - 300,
+      started_at: nowSec() - 298,
+      claimed_at: null,
+      finished_at: nowSec() - 291,
+      elapsed_s: 7.0,
+      is_active: false,
+      can_cancel: false,
+    },
+  ],
+};
+
+function demoBuildWorkbenchAgent(ag: FederationAgentItem): FederationWorkbenchAgentItem {
+  const isPull = ag.transport === "pull_worker" || ag.driver === "pull_worker";
+  const items = demoFedWorkbenchTimelines[ag.agent_id] || [];
+  const pullCounts = { queued: 0, claimed: 0, done: 0, error: 0, cancelled: 0, total: 0 };
+  const busCounts = { queued: 0, running: 0, done: 0, error: 0, cancelled: 0, total: 0 };
+  let lastAct: number | null = ag.updated_at || null;
+  for (const it of items) {
+    if (it.created_at && (!lastAct || it.created_at > lastAct)) {
+      lastAct = it.created_at;
+    }
+    if (it.stores.includes("pull")) {
+      pullCounts.total += 1;
+      if (it.status in pullCounts) {
+        (pullCounts as Record<string, number>)[it.status] += 1;
+      }
+    }
+    if (it.stores.includes("bus")) {
+      busCounts.total += 1;
+      if (it.status in busCounts) {
+        (busCounts as Record<string, number>)[it.status] += 1;
+      }
+    }
+  }
+  const canDispatch =
+    ag.kind !== "agy_local" &&
+    ag.kind !== "mcp_inbound_only" &&
+    ag.enabled &&
+    !ag.revoked &&
+    Boolean(ag.capabilities.can_receive);
+  return {
+    ...ag,
+    capabilities: { ...ag.capabilities, allowed_teams: [...ag.capabilities.allowed_teams] },
+    runtime_status: ag.revoked ? "revoked" : !ag.enabled ? "disabled" : "online",
+    adapter_type: isPull ? "pull_worker" : ag.kind,
+    dispatch_mode: isPull
+      ? "pull"
+      : ag.kind === "mcp_inbound_only"
+        ? "inbound_only"
+        : ag.kind === "agy_local"
+          ? "local_only"
+          : "push",
+    can_dispatch: canDispatch,
+    dispatch_disabled_reason: canDispatch ? "" : "当前节点状态不支持派单",
+    pull_queue_counts: pullCounts,
+    bus_job_counts: busCounts,
+    leader_events_count: ag.agent_id === "pull_worker_demo" ? 1 : 0,
+    last_activity_at: lastAct,
+  };
+}
+
+export async function fetchFederationWorkbench(): Promise<FederationWorkbenchResponse> {
+  await delay(25);
+  const me = requireAuth();
+  const agents = demoFederationAgents
+    .filter((a) => a.kind !== "agy_local")
+    .map((a) => demoBuildWorkbenchAgent(a));
+  return {
+    ok: true,
+    agents,
+    hub_config: {
+      loopback_valid: true,
+      host: "127.0.0.1",
+      port: 18799,
+      public_url: "https://hub.example.com",
+      loopback_mcp_url: "http://127.0.0.1:18799/hub/mcp",
+      mcp_url: "https://hub.example.com/hub/mcp",
+    },
+    can_edit: me.role === "admin",
+    role: me.role,
+    updated_at: new Date().toISOString(),
+  };
+}
+
+export async function fetchFederationWorkbenchTimeline(
+  agentId: string,
+  params?: { limit?: number },
+): Promise<FederationWorkbenchTimelineResponse> {
+  await delay(25);
+  const me = requireAuth();
+  const ag = demoFederationAgents.find((a) => a.agent_id === agentId);
+  if (!ag) {
+    throw new StudioApiError(`未找到外部 Agent: ${agentId}`, 404, "studio_api");
+  }
+  const lim = Math.min(200, Math.max(1, params?.limit || 50));
+  const list = (demoFedWorkbenchTimelines[agentId] || []).map((it) => ({
+    ...it,
+    can_cancel: me.role === "admin" && it.is_active,
+  }));
+  const sliced = list.slice(-lim);
+  const pullInbox = sliced
+    .filter((it) => it.stores.includes("pull") && (it.status === "queued" || it.status === "claimed"))
+    .map((it) => ({
+      job_id: it.job_id,
+      status: it.status,
+      source: it.source,
+      label: it.label,
+      prompt_preview: it.prompt.slice(0, 120),
+      created_at: it.created_at,
+      claimed_at: it.claimed_at,
+      can_cancel: me.role === "admin",
+    }));
+  const leaderEvents =
+    agentId === "pull_worker_demo"
+      ? [
+          {
+            event_id: "ev-demo-001",
+            type: "batch_done",
+            created_at: nowSec() - 160,
+            group_id: "batch-demo-01",
+            team_id: "demo-squad",
+            job_ids: ["job-demo-bridged-002"],
+            jobs_count: 1,
+            status: "done",
+            tainted: false,
+          },
+        ]
+      : [];
+  return {
+    ok: true,
+    agent: demoBuildWorkbenchAgent(ag),
+    timeline: sliced,
+    total: list.length,
+    limit: lim,
+    has_active_jobs: list.some((it) => it.is_active),
+    pull_inbox: pullInbox,
+    leader_events: leaderEvents,
+    can_edit: me.role === "admin",
+    role: me.role,
+    updated_at: new Date().toISOString(),
+  };
+}
+
+export async function dispatchFederationWorkbenchJob(
+  agentId: string,
+  payload: FederationWorkbenchDispatchPayload,
+): Promise<FederationWorkbenchDispatchResponse> {
+  await delay(40);
+  requireAuth();
+  const ag = demoFederationAgents.find((a) => a.agent_id === agentId);
+  if (!ag) {
+    throw new StudioApiError(`未找到外部 Agent: ${agentId}`, 404, "studio_api");
+  }
+  const prompt = (payload.prompt || "").trim();
+  if (!prompt) {
+    throw new StudioApiError("prompt 不能为空", 400, "studio_api");
+  }
+  const isPull = ag.transport === "pull_worker" || ag.driver === "pull_worker";
+  const ts = nowSec();
+  const jid = nextDemoId(isPull ? "pull" : "job");
+  const item: FederationTimelineJobItem = {
+    job_id: jid,
+    status: "queued",
+    source: "studio",
+    stores: [isPull ? "pull" : "bus"],
+    bridged: false,
+    label: payload.label || prompt.slice(0, 32),
+    from_actor: "studio:demo-admin",
+    team_id: "demo-squad",
+    group_id: "",
+    prompt,
+    result_text: "",
+    error: "",
+    cancel_reason: "",
+    created_at: ts,
+    started_at: null,
+    claimed_at: null,
+    finished_at: null,
+    elapsed_s: 0.1,
+    is_active: true,
+    can_cancel: true,
+  };
+  if (!demoFedWorkbenchTimelines[agentId]) {
+    demoFedWorkbenchTimelines[agentId] = [];
+  }
+  demoFedWorkbenchTimelines[agentId].push(item);
+  emitDemoEvent("federation_updated", { action: "workbench_dispatch", agent_id: agentId, ts });
+
+  window.setTimeout(() => {
+    const cur = (demoFedWorkbenchTimelines[agentId] || []).find((x) => x.job_id === jid);
+    if (cur && cur.is_active) {
+      const doneTs = nowSec();
+      cur.status = "done";
+      cur.started_at = ts + 1;
+      cur.claimed_at = isPull ? ts + 1 : null;
+      cur.finished_at = doneTs;
+      cur.elapsed_s = Math.max(1, doneTs - ts);
+      cur.is_active = false;
+      cur.can_cancel = false;
+      cur.result_text = `节点 \`${agentId}\` 已完成演示任务 **${cur.label}**，所有校验通过。`;
+      emitDemoEvent("federation_updated", { action: "workbench_done", agent_id: agentId, ts: doneTs });
+    }
+  }, 1500);
+
+  return {
+    ok: true,
+    agent_id: agentId,
+    dispatch_mode: isPull ? "pull" : "push",
+    job: { ...item },
+  };
+}
+
+export async function cancelFederationWorkbenchJob(
+  agentId: string,
+  jobId: string,
+  reason = "cancelled_by_studio",
+): Promise<FederationWorkbenchCancelResponse> {
+  await delay(30);
+  requireAuth();
+  const list = demoFedWorkbenchTimelines[agentId] || [];
+  const item = list.find((x) => x.job_id === jobId);
+  if (!item) {
+    throw new StudioApiError(`未找到任务 ${jobId}`, 404, "studio_api");
+  }
+  const alreadyTerminal = !item.is_active;
+  if (!alreadyTerminal) {
+    item.status = "cancelled";
+    item.cancel_reason = reason;
+    item.error = reason;
+    item.finished_at = nowSec();
+    item.is_active = false;
+    item.can_cancel = false;
+    emitDemoEvent("federation_updated", { action: "workbench_cancel", agent_id: agentId, ts: nowSec() });
+  }
+  return {
+    ok: true,
+    agent_id: agentId,
+    job_id: jobId,
+    status: item.status,
+    already_terminal: alreadyTerminal,
+    cancelled: !alreadyTerminal,
+    job: { ...item },
   };
 }
 
