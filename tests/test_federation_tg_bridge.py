@@ -34,6 +34,7 @@ for _p in (str(BRIDGE_DIR), str(SCRIPTS_DIR), str(REPO_ROOT)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import bot_bus  # noqa: E402
 import federation_registry  # noqa: E402
 import federation_tg_bridge as ftb  # noqa: E402
 
@@ -71,6 +72,10 @@ class MockTelegramTransport:
         self.fail_html_once_send = False
         self.fail_html_once_edit = False
         self.fail_not_modified_edit = False
+        self.fail_reply_not_found_once_send: Optional[str] = None
+        self.fail_edit_missing_once: Optional[str] = None
+        self.send_error_queue: List[Exception] = []
+        self.edit_error_queue: List[Exception] = []
 
     def _record(self, method: str, payload: Dict[str, Any]) -> None:
         with self._lock:
@@ -99,8 +104,17 @@ class MockTelegramTransport:
                 return self.pending_updates.pop(0)
         return []
 
-    def send_chat_action(self, chat_id: int, action: str = "typing") -> bool:
-        self._record("sendChatAction", {"chat_id": chat_id, "action": action})
+    def send_chat_action(
+        self,
+        chat_id: int,
+        action: str = "typing",
+        *,
+        message_thread_id: Optional[int] = None,
+    ) -> bool:
+        rec: Dict[str, Any] = {"chat_id": chat_id, "action": action}
+        if message_thread_id is not None:
+            rec["message_thread_id"] = message_thread_id
+        self._record("sendChatAction", rec)
         return True
 
     def send_message(
@@ -110,16 +124,28 @@ class MockTelegramTransport:
         *,
         parse_mode: Optional[str] = None,
         reply_to_message_id: Optional[int] = None,
+        message_thread_id: Optional[int] = None,
     ) -> Dict[str, Any]:
-        self._record(
-            "sendMessage",
-            {
-                "chat_id": chat_id,
-                "text": text,
-                "parse_mode": parse_mode,
-                "reply_to_message_id": reply_to_message_id,
-            },
-        )
+        rec: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": parse_mode,
+            "reply_to_message_id": reply_to_message_id,
+        }
+        if message_thread_id is not None:
+            rec["message_thread_id"] = message_thread_id
+        self._record("sendMessage", rec)
+        if self.send_error_queue:
+            raise self.send_error_queue.pop(0)
+        if reply_to_message_id is not None and self.fail_reply_not_found_once_send:
+            desc = self.fail_reply_not_found_once_send
+            self.fail_reply_not_found_once_send = None
+            raise ftb.TelegramAPIError(
+                f"Telegram API sendMessage failed (HTTP 400): {desc}",
+                status_code=400,
+                description=desc,
+                method="sendMessage",
+            )
         if parse_mode == "HTML" and self.fail_html_once_send:
             self.fail_html_once_send = False
             raise ftb.TelegramAPIError(
@@ -150,6 +176,17 @@ class MockTelegramTransport:
                 "parse_mode": parse_mode,
             },
         )
+        if self.edit_error_queue:
+            raise self.edit_error_queue.pop(0)
+        if self.fail_edit_missing_once:
+            desc = self.fail_edit_missing_once
+            self.fail_edit_missing_once = None
+            raise ftb.TelegramAPIError(
+                f"Telegram API editMessageText failed (HTTP 400): {desc}",
+                status_code=400,
+                description=desc,
+                method="editMessageText",
+            )
         if self.fail_not_modified_edit:
             self.fail_not_modified_edit = False
             raise ftb.TelegramAPIError(
@@ -179,12 +216,26 @@ def _make_update(
     sender_chat: Optional[Dict[str, Any]] = None,
     text: str = "hello",
     reply_to_message: Optional[Dict[str, Any]] = None,
+    message_id: Optional[int] = None,
+    is_forum: Optional[bool] = None,
+    is_topic_message: Optional[bool] = None,
+    message_thread_id: Any = None,
+    date: Optional[int] = None,
 ) -> Dict[str, Any]:
+    chat_obj: Dict[str, Any] = {"id": chat_id, "type": chat_type}
+    if is_forum is not None:
+        chat_obj["is_forum"] = is_forum
     msg: Dict[str, Any] = {
-        "message_id": update_id * 10,
-        "chat": {"id": chat_id, "type": chat_type},
+        "message_id": message_id if message_id is not None else update_id * 10,
+        "chat": chat_obj,
         "text": text,
     }
+    if is_topic_message is not None:
+        msg["is_topic_message"] = is_topic_message
+    if message_thread_id is not None:
+        msg["message_thread_id"] = message_thread_id
+    if date is not None:
+        msg["date"] = date
     if include_from:
         msg["from"] = (
             from_user
@@ -1986,6 +2037,1294 @@ class TestM4BackwardCompatServiceUnitAndTooling(_BridgeTestBase):
                 sl_mod._touch_reload_sentinels(include_bridges=True, include_fed_tg=True)
                 self.assertTrue(tmp_bridge_flag.exists())
                 self.assertTrue(tmp_fed_flag.exists())
+
+
+# ===========================================================================
+# G1: RBAC / Tenant / DM Isolation for Shared Group Bus
+# ===========================================================================
+class TestG1GroupBusRBACAndDMIsolation(_BridgeTestBase):
+    def test_g1_unauthorized_denied_bot_anon_bindgroup_and_dm_never_touch_bot_bus(self) -> None:
+        # Use multi-bot config to also exercise defaults | bot | env denied_chats union
+        cfg_path = self.root / "g1_bots.json"
+        state_root = str(self.root / "g1_state")
+        env_denied_chat = -55002
+        bot_denied_chat = -55003
+        unbound_chat = -55004
+        cfg_payload = {
+            "defaults": {
+                "owner_users": [OWNER_UID],
+                "denied_chats": [GROUP_DENIED],
+                "state_root_dir": state_root,
+                "bus_dir": self.bus_dir,
+                "job_poll_interval_sec": 0.01,
+            },
+            "bots": [
+                {
+                    "name": "bot_g1",
+                    "agent_id": EXAMPLE_AGENT_ID,
+                    "enabled": True,
+                    "token_secret_ref": EXAMPLE_SECRET_REF,
+                    "allowed_chats": [GROUP_ALLOWED],
+                    "denied_chats": [bot_denied_chat],
+                }
+            ],
+        }
+        _write_secure_json(cfg_path, cfg_payload, mode=0o600)
+        mcfg = ftb.load_multi_bot_config(
+            str(cfg_path),
+            env={"AGY_FED_TG_DENIED_CHATS": str(env_denied_chat)},
+            secret_resolver=lambda _r: self.token,
+        )
+        client = MockTelegramTransport(bot_id=BOT_UID, bot_username=BOT_USERNAME)
+        bridge = ftb.FederationTelegramBridge(mcfg.bots[0], client=client, env={})
+        bridge.startup()
+        try:
+            with (
+                mock.patch.object(
+                    bot_bus, "record_group_message", wraps=bot_bus.record_group_message
+                ) as spy_rec,
+                mock.patch.object(
+                    bot_bus, "format_unseen_group_history", wraps=bot_bus.format_unseen_group_history
+                ) as spy_fmt,
+            ):
+                # 1) Non-owner in authorized group
+                self.assertFalse(
+                    bridge.handle_update(
+                        _make_update(
+                            1,
+                            chat_id=GROUP_ALLOWED,
+                            chat_type="supergroup",
+                            from_user={"id": OTHER_UID, "is_bot": False, "username": "intruder"},
+                            text=f"@{BOT_USERNAME} leak context",
+                        )
+                    )
+                )
+                # 2a) Anonymous admin (sender_chat)
+                self.assertFalse(
+                    bridge.handle_update(
+                        _make_update(
+                            2,
+                            chat_id=GROUP_ALLOWED,
+                            chat_type="supergroup",
+                            from_user={"id": OWNER_UID, "is_bot": False, "username": "owner_user"},
+                            sender_chat={"id": GROUP_ALLOWED, "type": "supergroup"},
+                            text="anon admin chatter",
+                        )
+                    )
+                )
+                # 2b) from.is_bot=True (even with OWNER_UID)
+                self.assertFalse(
+                    bridge.handle_update(
+                        _make_update(
+                            3,
+                            chat_id=GROUP_ALLOWED,
+                            chat_type="supergroup",
+                            from_user={"id": OWNER_UID, "is_bot": True, "username": OTHER_BOT_USERNAME},
+                            text="bot chatter",
+                        )
+                    )
+                )
+                # 3) Denied chats across defaults | bot | env union
+                for idx, denied_cid in enumerate((GROUP_DENIED, bot_denied_chat, env_denied_chat), start=4):
+                    self.assertFalse(
+                        bridge.handle_update(
+                            _make_update(
+                                idx,
+                                chat_id=denied_cid,
+                                chat_type="supergroup",
+                                text=f"@{BOT_USERNAME} denied group msg",
+                            )
+                        )
+                    )
+                # 4) Unauthorized / unbound group: plain message + /bindgroup (only updates bindings.json)
+                self.assertFalse(
+                    bridge.handle_update(
+                        _make_update(
+                            10,
+                            chat_id=unbound_chat,
+                            chat_type="supergroup",
+                            text="plain message in unbound group",
+                        )
+                    )
+                )
+                self.assertTrue(
+                    bridge.handle_update(
+                        _make_update(
+                            11,
+                            chat_id=unbound_chat,
+                            chat_type="supergroup",
+                            text="/bindgroup",
+                        )
+                    )
+                )
+                self.assertIn(unbound_chat, bridge.state.load_bound_chats())
+
+                # 5) Owner DM (chat_id > 0): normal turns + /clear never touch bot_bus; keeps local _chat_context
+                self.assertTrue(bridge.handle_update(_make_update(12, chat_id=OWNER_UID, text="dm turn one")))
+                job1 = bridge.queue.claim(EXAMPLE_AGENT_ID, auth_token=self.worker_token)
+                self.assertIsNotNone(job1)
+                bridge.queue.complete(
+                    job1["job_id"], EXAMPLE_AGENT_ID, result_text="dm reply one", auth_token=self.worker_token
+                )
+                bridge.wait_for_active_jobs(timeout=3.0)
+
+                self.assertTrue(bridge.handle_update(_make_update(13, chat_id=OWNER_UID, text="dm turn two")))
+                job2 = bridge.queue.claim(EXAMPLE_AGENT_ID, auth_token=self.worker_token)
+                self.assertIsNotNone(job2)
+                self.assertIn("[Recent Chat Context]", job2["prompt"])
+                self.assertIn("dm turn one", job2["prompt"])
+                self.assertIn("dm reply one", job2["prompt"])
+                bridge.queue.complete(
+                    job2["job_id"], EXAMPLE_AGENT_ID, result_text="dm reply two", auth_token=self.worker_token
+                )
+                bridge.wait_for_active_jobs(timeout=3.0)
+
+                self.assertTrue(bridge.handle_update(_make_update(14, chat_id=OWNER_UID, text="/clear")))
+                with bridge._ctx_lock:
+                    self.assertNotIn(OWNER_UID, bridge._chat_context)
+
+                # Zero calls to bot_bus across all 5 cases
+                self.assertEqual(spy_rec.call_count, 0)
+                self.assertEqual(spy_fmt.call_count, 0)
+                gh_dir = Path(self.bus_dir) / "group_history"
+                for cid in (GROUP_ALLOWED, GROUP_DENIED, bot_denied_chat, env_denied_chat, unbound_chat, OWNER_UID):
+                    self.assertFalse((gh_dir / f"{cid}.json").exists())
+        finally:
+            bridge.shutdown()
+
+
+# ===========================================================================
+# G2: Cross-Bot Interop, ContextVar bus_dir Concurrency Isolation & Scrubbing
+# ===========================================================================
+class TestG2CrossBotSharingBusDirIsolationAndRedaction(_MultiBotTestBase):
+    def test_g2_concurrent_bus_dir_isolation_shared_interop_and_full_token_scrubbing(self) -> None:
+        orig_global_bus_dir = bot_bus.BUS_DIR
+        dir_a = str(self.root / "bus_a")
+        dir_b = str(self.root / "bus_b")
+        dir_shared = str(self.root / "bus_shared")
+
+        _, worker_tok_a_iso = _register_pull_agent(dir_a, BOT_A_AGENT)
+        _, worker_tok_b_iso = _register_pull_agent(dir_b, BOT_B_AGENT)
+        _, worker_tok_shared = _register_pull_agent(dir_shared, EXAMPLE_AGENT_ID)
+
+        enc_a = urllib.parse.quote(self.token_a, safe="")
+        enc_b = urllib.parse.quote(self.token_b, safe="")
+        enc_b_lower = enc_b.replace("%3A", "%3a")
+
+        # Part 1: MultiBotSupervisor concurrent dual threads with isolated bus_dir (dir_a vs dir_b)
+        iso_cfg = self._base_config_dict()
+        iso_cfg["bots"][0]["bus_dir"] = dir_a
+        iso_cfg["bots"][1]["bus_dir"] = dir_b
+        _write_secure_json(self.config_path, iso_cfg, mode=0o600)
+        mcfg = ftb.load_multi_bot_config(str(self.config_path), env={}, secret_resolver=self._resolve_secret)
+
+        client_a = MockTelegramTransport(bot_id=BOT_A_UID, bot_username="your_bot_1")
+        client_b = MockTelegramTransport(bot_id=BOT_B_UID, bot_username="your_bot_2")
+        sup = ftb.MultiBotSupervisor(
+            mcfg,
+            client_factory=lambda b: client_a if b.agent_id == BOT_A_AGENT else client_b,
+            env={},
+        )
+        sup.startup()
+        try:
+            br_a = sup.bridges["bot_alpha"]
+            br_b = sup.bridges["bot_beta"]
+            barrier = threading.Barrier(2)
+            errors: List[Exception] = []
+
+            def _run_bot(br, wtok, agent_id, tag, uname, base_uid):
+                try:
+                    barrier.wait(timeout=3.0)
+                    # Plain human chatter with both raw and URL-encoded tokens
+                    br.handle_update(
+                        _make_update(
+                            base_uid,
+                            chat_id=GROUP_ALLOWED,
+                            chat_type="supergroup",
+                            message_id=base_uid * 10,
+                            text=f"{tag}_chatter raw={self.token_a} other={self.token_b} enc={enc_b} low={enc_b_lower}",
+                        )
+                    )
+                    # Trigger task
+                    br.handle_update(
+                        _make_update(
+                            base_uid + 1,
+                            chat_id=GROUP_ALLOWED,
+                            chat_type="supergroup",
+                            message_id=(base_uid + 1) * 10,
+                            text=f"@{uname} {tag}_task {enc_a}",
+                        )
+                    )
+                    claimed = br.queue.claim(agent_id, auth_token=wtok)
+                    assert claimed is not None
+                    for leak in (self.token_a, self.token_b, enc_a, enc_b, enc_b_lower):
+                        assert leak not in claimed["prompt"], f"Token leaked into prompt: {leak}"
+                    br.queue.complete(
+                        claimed["job_id"],
+                        agent_id,
+                        status="done",
+                        result_text=f"{tag}_reply {self.token_a} {self.token_b} {enc_a} {enc_b} {enc_b_lower}",
+                        auth_token=wtok,
+                    )
+                    br.wait_for_active_jobs(timeout=3.0)
+                except Exception as exc:
+                    errors.append(exc)
+
+            th_a = threading.Thread(
+                target=_run_bot, args=(br_a, worker_tok_a_iso, BOT_A_AGENT, "ONLY_A", "your_bot_1", 10)
+            )
+            th_b = threading.Thread(
+                target=_run_bot, args=(br_b, worker_tok_b_iso, BOT_B_AGENT, "ONLY_B", "your_bot_2", 30)
+            )
+            th_a.start()
+            th_b.start()
+            th_a.join(timeout=5.0)
+            th_b.join(timeout=5.0)
+            self.assertEqual(errors, [])
+
+            # Verify global bot_bus.BUS_DIR untouched
+            self.assertEqual(bot_bus.BUS_DIR, orig_global_bus_dir)
+
+            # Verify strict dir_a vs dir_b isolation and zero token leakage in disk JSON
+            gh_a_path = Path(dir_a) / "group_history" / f"{GROUP_ALLOWED}.json"
+            gh_b_path = Path(dir_b) / "group_history" / f"{GROUP_ALLOWED}.json"
+            self.assertTrue(gh_a_path.is_file())
+            self.assertTrue(gh_b_path.is_file())
+
+            raw_a = gh_a_path.read_text(encoding="utf-8")
+            raw_b = gh_b_path.read_text(encoding="utf-8")
+            self.assertIn("ONLY_A_chatter", raw_a)
+            self.assertIn("ONLY_A_reply", raw_a)
+            self.assertNotIn("ONLY_B", raw_a)
+            self.assertIn("ONLY_B_chatter", raw_b)
+            self.assertIn("ONLY_B_reply", raw_b)
+            self.assertNotIn("ONLY_A", raw_b)
+            for disk_json in (raw_a, raw_b):
+                for leak in (self.token_a, self.token_b, enc_a, enc_b, enc_b_lower):
+                    self.assertNotIn(leak, disk_json)
+        finally:
+            sup.shutdown()
+
+        # Part 2: Shared dir_shared bidirectional interop (local bot <-> federation bot)
+        shared_cfg = ftb.BridgeConfig(
+            agent_id=EXAMPLE_AGENT_ID,
+            bot_token=self.token_a,
+            owner_users=frozenset({OWNER_UID}),
+            allowed_chats=frozenset({GROUP_ALLOWED}),
+            state_dir=str(self.root / "shared_state"),
+            reload_sentinel=str(self.root / "shared_reload"),
+            bus_dir=dir_shared,
+            job_poll_interval_sec=0.01,
+        )
+        shared_client = MockTelegramTransport(bot_id=BOT_UID, bot_username=BOT_USERNAME)
+        shared_bridge = ftb.FederationTelegramBridge(shared_cfg, client=shared_client, env={})
+        shared_bridge.startup()
+        try:
+            # Local coordinator bot writes a message to shared bus (even containing raw/encoded token)
+            with bot_bus.bind_bus_dir(dir_shared):
+                bot_bus.record_group_message(
+                    GROUP_ALLOWED,
+                    msg_id=5001,
+                    thread_id=None,
+                    sender_handle=OTHER_BOT_USERNAME,
+                    sender_role="coordinator",
+                    is_bot=True,
+                    text=f"Local bot handoff notes with secret {self.token_b} and {enc_b}",
+                    source="tg",
+                )
+
+            # Federation bot receives Owner mention in same group
+            self.assertTrue(
+                shared_bridge.handle_update(
+                    _make_update(
+                        1,
+                        chat_id=GROUP_ALLOWED,
+                        chat_type="supergroup",
+                        message_id=5002,
+                        text=f"@{BOT_USERNAME} continue from local bot",
+                    )
+                )
+            )
+            claimed = shared_bridge.queue.claim(EXAMPLE_AGENT_ID, auth_token=worker_tok_shared)
+            self.assertIsNotNone(claimed)
+            self.assertIn("Local bot handoff notes", claimed["prompt"])
+            self.assertIn(f"@{OTHER_BOT_USERNAME}(coordinator)", claimed["prompt"])
+            for leak in (self.token_a, self.token_b, enc_a, enc_b, enc_b_lower):
+                self.assertNotIn(leak, claimed["prompt"])
+
+            # Remote agent finishes with a reply containing secret tokens
+            shared_bridge.queue.complete(
+                claimed["job_id"],
+                EXAMPLE_AGENT_ID,
+                status="done",
+                result_text=f"Fed reply for local bot {self.token_a} {self.token_b} {enc_a} {enc_b}",
+                auth_token=worker_tok_shared,
+            )
+            shared_bridge.wait_for_active_jobs(timeout=3.0)
+
+            edits = shared_client.get_calls("editMessageText")
+            self.assertEqual(len(edits), 1)
+            delivered_mid = edits[0]["message_id"]
+
+            # Inspect disk JSON: text_excerpt & full_text scrubbed, metadata fields exact
+            gh_shared = Path(dir_shared) / "group_history" / f"{GROUP_ALLOWED}.json"
+            data = json.loads(gh_shared.read_text(encoding="utf-8"))
+            bot_entries = [e for e in data["entries"] if e.get("msg_id") == delivered_mid]
+            self.assertEqual(len(bot_entries), 1)
+            entry = bot_entries[0]
+            self.assertTrue(entry["is_bot"])
+            self.assertEqual(entry["sender_role"], "worker")
+            self.assertEqual(entry["sender_handle"], BOT_USERNAME)
+            for field in ("text_excerpt", "full_text"):
+                for leak in (self.token_a, self.token_b, enc_a, enc_b, enc_b_lower):
+                    self.assertNotIn(leak, entry[field])
+
+            # Local bot reads federation bot's reply from shared bus
+            with bot_bus.bind_bus_dir(dir_shared):
+                seen_by_local = bot_bus.format_unseen_group_history(
+                    GROUP_ALLOWED,
+                    OTHER_BOT_USERNAME,
+                    thread_id=None,
+                    advance_cursor=True,
+                )
+            self.assertIn(f"@{BOT_USERNAME}(worker)", seen_by_local)
+            self.assertIn("Fed reply for local bot", seen_by_local)
+            for leak in (self.token_a, self.token_b, enc_a, enc_b, enc_b_lower):
+                self.assertNotIn(leak, seen_by_local)
+            self.assertEqual(bot_bus.BUS_DIR, orig_global_bus_dir)
+        finally:
+            shared_bridge.shutdown()
+
+
+# ===========================================================================
+# G3: Dedup, Cursor Transaction Timing, /clear Isolation & I/O Degradation
+# ===========================================================================
+class TestG3DeduplicationCursorTxClearAndIODegradation(_BridgeTestBase):
+    def test_g3_dedup_no_double_injection_and_no_self_echo(self) -> None:
+        bridge, _client = self._build_bridge(allowed_chats=(GROUP_ALLOWED,))
+        bridge.startup()
+        try:
+            # Plain human chatter + another bot's message
+            self.assertFalse(
+                bridge.handle_update(
+                    _make_update(
+                        1,
+                        chat_id=GROUP_ALLOWED,
+                        chat_type="supergroup",
+                        message_id=101,
+                        text="plain human context alpha",
+                    )
+                )
+            )
+            with bot_bus.bind_bus_dir(self.bus_dir):
+                bot_bus.record_group_message(
+                    GROUP_ALLOWED,
+                    msg_id=102,
+                    sender_handle="peer_bot",
+                    sender_role="coordinator",
+                    is_bot=True,
+                    text="peer bot context beta",
+                )
+
+            # Owner triggers task 1 via exact mention
+            self.assertTrue(
+                bridge.handle_update(
+                    _make_update(
+                        2,
+                        chat_id=GROUP_ALLOWED,
+                        chat_type="supergroup",
+                        message_id=103,
+                        text=f"@{BOT_USERNAME} unique_trigger_gamma",
+                    )
+                )
+            )
+            job1 = bridge.queue.claim(EXAMPLE_AGENT_ID, auth_token=self.worker_token)
+            self.assertIsNotNone(job1)
+            # Contains unseen bus history, NOT double-injected _chat_context, trigger msg NOT duplicated
+            self.assertIn("plain human context alpha", job1["prompt"])
+            self.assertIn("peer bot context beta", job1["prompt"])
+            self.assertNotIn("[Recent Chat Context]", job1["prompt"])
+            self.assertEqual(job1["prompt"].count("unique_trigger_gamma"), 1)
+
+            # Complete job1 -> bot writes is_bot=True reply to bus
+            bridge.queue.complete(
+                job1["job_id"],
+                EXAMPLE_AGENT_ID,
+                result_text="self_bot_reply_delta",
+                auth_token=self.worker_token,
+            )
+            bridge.wait_for_active_jobs(timeout=3.0)
+
+            # Next turn: bot must NOT echo its own previous is_bot=True reply
+            self.assertTrue(
+                bridge.handle_update(
+                    _make_update(
+                        3,
+                        chat_id=GROUP_ALLOWED,
+                        chat_type="supergroup",
+                        message_id=104,
+                        text=f"@{BOT_USERNAME} second_trigger_epsilon",
+                    )
+                )
+            )
+            job2 = bridge.queue.claim(EXAMPLE_AGENT_ID, auth_token=self.worker_token)
+            self.assertIsNotNone(job2)
+            self.assertNotIn("self_bot_reply_delta", job2["prompt"])
+            self.assertNotIn("[Recent Chat Context]", job2["prompt"])
+            self.assertEqual(job2["prompt"].count("second_trigger_epsilon"), 1)
+            bridge.queue.complete(
+                job2["job_id"], EXAMPLE_AGENT_ID, result_text="done2", auth_token=self.worker_token
+            )
+            bridge.wait_for_active_jobs(timeout=3.0)
+        finally:
+            bridge.shutdown()
+
+    def test_g3_cursor_not_advanced_on_disabled_agent_or_busy_rejection(self) -> None:
+        owner_auth = federation_registry.make_owner_auth("test_owner", env={})
+        bridge, _client = self._build_bridge(allowed_chats=(GROUP_ALLOWED,))
+        bridge.startup()
+        try:
+            # (a) Unseen history present, agent disabled -> rejected without advancing cursor
+            with bot_bus.bind_bus_dir(self.bus_dir):
+                bot_bus.record_group_message(
+                    GROUP_ALLOWED,
+                    msg_id=201,
+                    sender_handle="peer_bot",
+                    sender_role="coordinator",
+                    is_bot=True,
+                    text="must_survive_disabled_check",
+                )
+            federation_registry.update_agent(
+                EXAMPLE_AGENT_ID, enabled=False, owner_auth=owner_auth, bus_dir=self.bus_dir, env={}
+            )
+            bridge.handle_update(
+                _make_update(
+                    1,
+                    chat_id=GROUP_ALLOWED,
+                    chat_type="supergroup",
+                    message_id=202,
+                    text=f"@{BOT_USERNAME} blocked while disabled",
+                )
+            )
+            self.assertEqual(_count_pull_queue_jobs(self.bus_dir), 0)
+
+            # Re-enable agent -> subsequent request STILL reads unseen history!
+            federation_registry.update_agent(
+                EXAMPLE_AGENT_ID, enabled=True, owner_auth=owner_auth, bus_dir=self.bus_dir, env={}
+            )
+            bridge.handle_update(
+                _make_update(
+                    2,
+                    chat_id=GROUP_ALLOWED,
+                    chat_type="supergroup",
+                    message_id=203,
+                    text=f"@{BOT_USERNAME} task after reenable",
+                )
+            )
+            job1 = bridge.queue.claim(EXAMPLE_AGENT_ID, auth_token=self.worker_token)
+            self.assertIsNotNone(job1)
+            self.assertIn("must_survive_disabled_check", job1["prompt"])
+
+            # (b) While job1 is active (busy), new unseen message arrives and a busy trigger is rejected
+            with bot_bus.bind_bus_dir(self.bus_dir):
+                bot_bus.record_group_message(
+                    GROUP_ALLOWED,
+                    msg_id=204,
+                    sender_handle="peer_bot",
+                    sender_role="coordinator",
+                    is_bot=True,
+                    text="must_survive_busy_rejection",
+                )
+            bridge.handle_update(
+                _make_update(
+                    3,
+                    chat_id=GROUP_ALLOWED,
+                    chat_type="supergroup",
+                    message_id=205,
+                    text=f"@{BOT_USERNAME} rejected because busy",
+                )
+            )
+            # Complete job1, then send a normal trigger -> must still read msg 204!
+            bridge.queue.complete(
+                job1["job_id"], EXAMPLE_AGENT_ID, result_text="done1", auth_token=self.worker_token
+            )
+            bridge.wait_for_active_jobs(timeout=3.0)
+
+            bridge.handle_update(
+                _make_update(
+                    4,
+                    chat_id=GROUP_ALLOWED,
+                    chat_type="supergroup",
+                    message_id=206,
+                    text=f"@{BOT_USERNAME} task after busy cleared",
+                )
+            )
+            job2 = bridge.queue.claim(EXAMPLE_AGENT_ID, auth_token=self.worker_token)
+            self.assertIsNotNone(job2)
+            self.assertIn("must_survive_busy_rejection", job2["prompt"])
+            bridge.queue.complete(
+                job2["job_id"], EXAMPLE_AGENT_ID, result_text="done2", auth_token=self.worker_token
+            )
+            bridge.wait_for_active_jobs(timeout=3.0)
+        finally:
+            bridge.shutdown()
+
+    def test_g3_clear_in_topic_100_isolates_topic_200_and_other_bots(self) -> None:
+        bridge, _client = self._build_bridge(allowed_chats=(GROUP_ALLOWED,))
+        bridge.startup()
+        try:
+            # Populate Topic 100 and Topic 200 in bot_bus + local _chat_context
+            self.assertFalse(
+                bridge.handle_update(
+                    _make_update(
+                        1,
+                        chat_id=GROUP_ALLOWED,
+                        chat_type="supergroup",
+                        is_forum=True,
+                        is_topic_message=True,
+                        message_thread_id=100,
+                        message_id=301,
+                        text="topic100_old_msg",
+                    )
+                )
+            )
+            self.assertFalse(
+                bridge.handle_update(
+                    _make_update(
+                        2,
+                        chat_id=GROUP_ALLOWED,
+                        chat_type="supergroup",
+                        is_forum=True,
+                        is_topic_message=True,
+                        message_thread_id=200,
+                        message_id=302,
+                        text="topic200_old_msg",
+                    )
+                )
+            )
+
+            # Execute /clear in Topic 100
+            self.assertTrue(
+                bridge.handle_update(
+                    _make_update(
+                        3,
+                        chat_id=GROUP_ALLOWED,
+                        chat_type="supergroup",
+                        is_forum=True,
+                        is_topic_message=True,
+                        message_thread_id=100,
+                        message_id=303,
+                        text="/clear",
+                    )
+                )
+            )
+
+            # Local _chat_context cleared ONLY for Topic 100, intact for Topic 200
+            with bridge._ctx_lock:
+                self.assertNotIn((GROUP_ALLOWED, 100), bridge._chat_context)
+                self.assertIn((GROUP_ALLOWED, 200), bridge._chat_context)
+
+            # Trigger in Topic 100 -> must NOT see topic100_old_msg
+            bridge.handle_update(
+                _make_update(
+                    4,
+                    chat_id=GROUP_ALLOWED,
+                    chat_type="supergroup",
+                    is_forum=True,
+                    is_topic_message=True,
+                    message_thread_id=100,
+                    message_id=304,
+                    text=f"@{BOT_USERNAME} fresh_t100",
+                )
+            )
+            job_t100 = bridge.queue.claim(EXAMPLE_AGENT_ID, auth_token=self.worker_token)
+            self.assertIsNotNone(job_t100)
+            self.assertNotIn("topic100_old_msg", job_t100["prompt"])
+            bridge.queue.complete(
+                job_t100["job_id"], EXAMPLE_AGENT_ID, result_text="ok100", auth_token=self.worker_token
+            )
+            bridge.wait_for_active_jobs(timeout=3.0)
+
+            # Trigger in Topic 200 -> MUST still see topic200_old_msg
+            bridge.handle_update(
+                _make_update(
+                    5,
+                    chat_id=GROUP_ALLOWED,
+                    chat_type="supergroup",
+                    is_forum=True,
+                    is_topic_message=True,
+                    message_thread_id=200,
+                    message_id=305,
+                    text=f"@{BOT_USERNAME} fresh_t200",
+                )
+            )
+            job_t200 = bridge.queue.claim(EXAMPLE_AGENT_ID, auth_token=self.worker_token)
+            self.assertIsNotNone(job_t200)
+            self.assertIn("topic200_old_msg", job_t200["prompt"])
+            bridge.queue.complete(
+                job_t200["job_id"], EXAMPLE_AGENT_ID, result_text="ok200", auth_token=self.worker_token
+            )
+            bridge.wait_for_active_jobs(timeout=3.0)
+
+            # Another bot's cursor in Topic 100 is unaffected and still sees topic100_old_msg
+            with bot_bus.bind_bus_dir(self.bus_dir):
+                other_unseen = bot_bus.format_unseen_group_history(
+                    GROUP_ALLOWED, "other_peer_bot", thread_id=100, advance_cursor=False
+                )
+            self.assertIn("topic100_old_msg", other_unseen)
+        finally:
+            bridge.shutdown()
+
+    def test_g3_bot_bus_io_error_degrades_gracefully_with_scrubbed_warning(self) -> None:
+        log_buf = io.StringIO()
+        test_logger = logging.getLogger("test.g3.io_degrade")
+        test_logger.handlers.clear()
+        test_logger.filters.clear()
+        test_logger.propagate = False
+        test_logger.setLevel(logging.WARNING)
+        handler = logging.StreamHandler(log_buf)
+        test_logger.addHandler(handler)
+
+        cfg = ftb.BridgeConfig(
+            agent_id=EXAMPLE_AGENT_ID,
+            bot_token=self.token,
+            owner_users=frozenset({OWNER_UID}),
+            allowed_chats=frozenset({GROUP_ALLOWED}),
+            state_dir=self.state_dir,
+            reload_sentinel=self.sentinel,
+            bus_dir=self.bus_dir,
+            job_poll_interval_sec=0.01,
+        )
+        client = MockTelegramTransport(bot_id=BOT_UID, bot_username=BOT_USERNAME)
+        bridge = ftb.FederationTelegramBridge(cfg, client=client, env={}, logger=test_logger)
+        bridge.startup()
+        encoded_tok = urllib.parse.quote(self.token, safe="")
+        try:
+            boom = OSError(f"disk full token={self.token} enc={encoded_tok}")
+            with (
+                mock.patch.object(bot_bus, "record_group_message", side_effect=boom),
+                mock.patch.object(bot_bus, "format_unseen_group_history", side_effect=boom),
+            ):
+                self.assertTrue(
+                    bridge.handle_update(
+                        _make_update(
+                            1,
+                            chat_id=GROUP_ALLOWED,
+                            chat_type="supergroup",
+                            message_id=401,
+                            text=f"@{BOT_USERNAME} proceed despite disk full",
+                        )
+                    )
+                )
+                claimed = bridge.queue.claim(EXAMPLE_AGENT_ID, auth_token=self.worker_token)
+                self.assertIsNotNone(claimed)
+                self.assertIn("proceed despite disk full", claimed["prompt"])
+                bridge.queue.complete(
+                    claimed["job_id"],
+                    EXAMPLE_AGENT_ID,
+                    result_text="delivered despite bus io error",
+                    auth_token=self.worker_token,
+                )
+                bridge.wait_for_active_jobs(timeout=3.0)
+
+            edits = client.get_calls("editMessageText")
+            self.assertEqual(len(edits), 1)
+            self.assertIn("delivered despite bus io error", edits[0]["text"])
+            logs = log_buf.getvalue()
+            self.assertIn("disk full", logs)
+            self.assertIn("[REDACTED]", logs)
+            self.assertNotIn(self.token, logs)
+            self.assertNotIn(encoded_tok, logs)
+        finally:
+            bridge.shutdown()
+
+    def test_g3_cursor_not_advanced_on_enqueue_failure_or_cancel_and_advances_on_retry(self) -> None:
+        bridge, client = self._build_bridge(allowed_chats=(GROUP_ALLOWED,))
+        bridge.startup()
+        try:
+            bot_handle = bridge._bus_bot_handle()
+
+            def _read_cursor() -> int:
+                with bot_bus.bind_bus_dir(self.bus_dir):
+                    hist_path = Path(bot_bus._group_history_path(GROUP_ALLOWED))
+                    ckey = bot_bus._cursor_key(bot_handle, None)
+                if not hist_path.is_file():
+                    return 0
+                data = json.loads(hist_path.read_text(encoding="utf-8"))
+                cursors = data.get("cursors") or {}
+                return int(cursors.get(ckey) or 0)
+
+            # (a) queue.enqueue raises PermissionError -> cursor MUST NOT advance
+            with bot_bus.bind_bus_dir(self.bus_dir):
+                bot_bus.record_group_message(
+                    GROUP_ALLOWED,
+                    msg_id=501,
+                    sender_handle="peer_bot",
+                    sender_role="coordinator",
+                    is_bot=True,
+                    text="must_survive_permission_error",
+                )
+            self.assertEqual(_read_cursor(), 0)
+            with mock.patch.object(
+                bridge.queue, "enqueue", side_effect=PermissionError("toctou_revoked_env")
+            ):
+                bridge.handle_update(
+                    _make_update(
+                        1,
+                        chat_id=GROUP_ALLOWED,
+                        chat_type="supergroup",
+                        message_id=502,
+                        text=f"@{BOT_USERNAME} trigger perm fail",
+                    )
+                )
+            self.assertEqual(_count_pull_queue_jobs(self.bus_dir), 0)
+            self.assertEqual(_read_cursor(), 0)
+            with bot_bus.bind_bus_dir(self.bus_dir):
+                unseen_after_perm = bot_bus.format_unseen_group_history(
+                    GROUP_ALLOWED, bot_handle, advance_cursor=False
+                )
+            self.assertIn("must_survive_permission_error", unseen_after_perm)
+
+            # (b) queue.enqueue raises RuntimeError -> cursor MUST NOT advance
+            with bot_bus.bind_bus_dir(self.bus_dir):
+                bot_bus.record_group_message(
+                    GROUP_ALLOWED,
+                    msg_id=503,
+                    sender_handle="peer_bot",
+                    sender_role="coordinator",
+                    is_bot=True,
+                    text="must_survive_runtime_error",
+                )
+            with mock.patch.object(
+                bridge.queue, "enqueue", side_effect=RuntimeError("disk_write_failure")
+            ):
+                bridge.handle_update(
+                    _make_update(
+                        2,
+                        chat_id=GROUP_ALLOWED,
+                        chat_type="supergroup",
+                        message_id=504,
+                        text=f"@{BOT_USERNAME} trigger runtime fail",
+                    )
+                )
+            self.assertEqual(_count_pull_queue_jobs(self.bus_dir), 0)
+            self.assertEqual(_read_cursor(), 0)
+
+            # (c) already_cancelled right after enqueue -> cursor MUST NOT advance
+            with bot_bus.bind_bus_dir(self.bus_dir):
+                bot_bus.record_group_message(
+                    GROUP_ALLOWED,
+                    msg_id=505,
+                    sender_handle="peer_bot",
+                    sender_role="coordinator",
+                    is_bot=True,
+                    text="must_survive_early_cancel",
+                )
+            orig_enqueue = bridge.queue.enqueue
+
+            def _enqueue_then_cancel(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+                rec = orig_enqueue(*args, **kwargs)
+                with bridge._jobs_lock:
+                    act = bridge._active_jobs.get(GROUP_ALLOWED)
+                    if act is not None:
+                        act.cancel_requested = True
+                return rec
+
+            with mock.patch.object(bridge.queue, "enqueue", side_effect=_enqueue_then_cancel):
+                bridge.handle_update(
+                    _make_update(
+                        3,
+                        chat_id=GROUP_ALLOWED,
+                        chat_type="supergroup",
+                        message_id=506,
+                        text=f"@{BOT_USERNAME} trigger cancelled mid enqueue",
+                    )
+                )
+            self.assertEqual(_read_cursor(), 0)
+            edits_cancel = client.get_calls("editMessageText")
+            self.assertTrue(any("已取消" in c["text"] for c in edits_cancel))
+
+            # (d) Subsequent retry succeeds -> reads ALL preserved unseen context and commits cursor
+            bridge.handle_update(
+                _make_update(
+                    4,
+                    chat_id=GROUP_ALLOWED,
+                    chat_type="supergroup",
+                    message_id=507,
+                    text=f"@{BOT_USERNAME} retry after enqueue failures",
+                )
+            )
+            claimed = bridge.queue.claim(EXAMPLE_AGENT_ID, auth_token=self.worker_token)
+            self.assertIsNotNone(claimed)
+            self.assertIn("must_survive_permission_error", claimed["prompt"])
+            self.assertIn("must_survive_runtime_error", claimed["prompt"])
+            self.assertIn("must_survive_early_cancel", claimed["prompt"])
+            self.assertIn("retry after enqueue failures", claimed["prompt"])
+            self.assertGreater(_read_cursor(), 0)
+            with bot_bus.bind_bus_dir(self.bus_dir):
+                unseen_after_retry = bot_bus.format_unseen_group_history(
+                    GROUP_ALLOWED, bot_handle, advance_cursor=False
+                )
+            self.assertEqual(unseen_after_retry, "")
+
+            bridge.queue.complete(
+                claimed["job_id"],
+                EXAMPLE_AGENT_ID,
+                result_text="retry_succeeded_ok",
+                auth_token=self.worker_token,
+            )
+            bridge.wait_for_active_jobs(timeout=3.0)
+            edits_ok = client.get_calls("editMessageText")
+            self.assertTrue(any("retry_succeeded_ok" in c["text"] for c in edits_ok))
+
+            # (e) Post-enqueue cursor commit I/O error degrades gracefully without breaking job wait/delivery
+            with bot_bus.bind_bus_dir(self.bus_dir):
+                bot_bus.record_group_message(
+                    GROUP_ALLOWED,
+                    msg_id=508,
+                    sender_handle="peer_bot",
+                    sender_role="coordinator",
+                    is_bot=True,
+                    text="post_enqueue_commit_err_context",
+                )
+            real_fmt = bot_bus.format_unseen_group_history
+
+            def _fail_only_on_commit(*args: Any, **kwargs: Any) -> str:
+                if kwargs.get("advance_cursor", True):
+                    raise OSError(f"commit disk err {self.token}")
+                return real_fmt(*args, **kwargs)
+
+            with mock.patch.object(bot_bus, "format_unseen_group_history", side_effect=_fail_only_on_commit):
+                bridge.handle_update(
+                    _make_update(
+                        5,
+                        chat_id=GROUP_ALLOWED,
+                        chat_type="supergroup",
+                        message_id=509,
+                        text=f"@{BOT_USERNAME} commit io error should not break delivery",
+                    )
+                )
+            claimed2 = bridge.queue.claim(EXAMPLE_AGENT_ID, auth_token=self.worker_token)
+            self.assertIsNotNone(claimed2)
+            self.assertIn("post_enqueue_commit_err_context", claimed2["prompt"])
+            bridge.queue.complete(
+                claimed2["job_id"],
+                EXAMPLE_AGENT_ID,
+                result_text="delivered_despite_cursor_commit_err",
+                auth_token=self.worker_token,
+            )
+            bridge.wait_for_active_jobs(timeout=3.0)
+            edits_final = client.get_calls("editMessageText")
+            self.assertTrue(any("delivered_despite_cursor_commit_err" in c["text"] for c in edits_final))
+        finally:
+            bridge.shutdown()
+
+
+# ===========================================================================
+# G4: Forum Topic Normalization & Concurrent Multi-Topic Isolation
+# ===========================================================================
+class TestG4ForumTopicNormalizationAndIsolation(_BridgeTestBase):
+    def test_g4_invalid_and_non_forum_thread_ids_normalized_and_http_payload_exact(self) -> None:
+        # 1) Direct TelegramClient HTTP payload verification
+        captured: List[Tuple[str, Dict[str, Any]]] = []
+
+        class _FakeResp:
+            def __init__(self, body: Dict[str, Any]):
+                self._raw = json.dumps(body).encode("utf-8")
+
+            def read(self) -> bytes:
+                return self._raw
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_a):
+                return False
+
+        def _fake_urlopen(req, timeout=30.0):
+            method = req.full_url.rsplit("/", 1)[-1]
+            payload = json.loads(req.data.decode("utf-8"))
+            captured.append((method, payload))
+            if method == "sendChatAction":
+                return _FakeResp({"ok": True, "result": True})
+            return _FakeResp({"ok": True, "result": {"message_id": 777}})
+
+        tg = ftb.TelegramClient(self.token, urlopen_fn=_fake_urlopen)
+        for bad_tid in (None, 1, 0, -5, True, "42"):
+            tg.send_chat_action(GROUP_ALLOWED, "typing", message_thread_id=bad_tid)  # type: ignore[arg-type]
+            tg.send_message(GROUP_ALLOWED, "hi", message_thread_id=bad_tid)  # type: ignore[arg-type]
+        for _method, payload in captured:
+            self.assertNotIn("message_thread_id", payload)
+
+        captured.clear()
+        tg.send_chat_action(GROUP_ALLOWED, "typing", message_thread_id=101)
+        tg.send_message(GROUP_ALLOWED, "in topic", reply_to_message_id=55, message_thread_id=101)
+        tg.edit_message_text(GROUP_ALLOWED, 777, "edited")
+        self.assertEqual(captured[0][0], "sendChatAction")
+        self.assertEqual(captured[0][1].get("message_thread_id"), 101)
+        self.assertEqual(captured[1][0], "sendMessage")
+        self.assertEqual(captured[1][1].get("message_thread_id"), 101)
+        self.assertEqual(captured[1][1].get("reply_to_message_id"), 55)
+        self.assertEqual(captured[2][0], "editMessageText")
+        self.assertNotIn("message_thread_id", captured[2][1])
+
+        # 2) Bridge end-to-end normalization for all invalid Forum / non-Forum thread_id inputs
+        bridge, client = self._build_bridge(allowed_chats=(GROUP_ALLOWED,))
+        bridge.startup()
+        try:
+            cases = [
+                (True, True, 1),
+                (True, True, 0),
+                (True, True, -5),
+                (True, True, True),
+                (True, True, "42"),
+                (False, False, 77),
+            ]
+            for idx, (is_forum, is_topic, raw_tid) in enumerate(cases, start=1):
+                before_actions = len(client.get_calls("sendChatAction"))
+                before_sends = len(client.get_calls("sendMessage"))
+                self.assertTrue(
+                    bridge.handle_update(
+                        _make_update(
+                            idx,
+                            chat_id=GROUP_ALLOWED,
+                            chat_type="supergroup",
+                            is_forum=is_forum,
+                            is_topic_message=is_topic,
+                            message_thread_id=raw_tid,
+                            message_id=500 + idx,
+                            text=f"@{BOT_USERNAME} check case {idx}",
+                        )
+                    )
+                )
+                job = bridge.queue.claim(EXAMPLE_AGENT_ID, auth_token=self.worker_token)
+                self.assertIsNotNone(job)
+                self.assertIsNone(job["metadata"]["thread_id"])
+                new_actions = client.get_calls("sendChatAction")[before_actions:]
+                new_sends = client.get_calls("sendMessage")[before_sends:]
+                for call in new_actions + new_sends:
+                    self.assertNotIn("message_thread_id", call)
+                bridge.queue.complete(
+                    job["job_id"], EXAMPLE_AGENT_ID, result_text=f"ok {idx}", auth_token=self.worker_token
+                )
+                bridge.wait_for_active_jobs(timeout=3.0)
+        finally:
+            bridge.shutdown()
+
+    def test_g4_concurrent_topics_101_and_202_isolated_jobs_status_clear_cancel(self) -> None:
+        bridge, client = self._build_bridge(allowed_chats=(GROUP_ALLOWED,))
+        bridge.startup()
+        try:
+            # Start Topic 101 and Topic 202 jobs concurrently -> neither reports busy!
+            self.assertTrue(
+                bridge.handle_update(
+                    _make_update(
+                        1,
+                        chat_id=GROUP_ALLOWED,
+                        chat_type="supergroup",
+                        is_forum=True,
+                        is_topic_message=True,
+                        message_thread_id=101,
+                        message_id=601,
+                        text=f"@{BOT_USERNAME} work in topic 101",
+                    )
+                )
+            )
+            self.assertTrue(
+                bridge.handle_update(
+                    _make_update(
+                        2,
+                        chat_id=GROUP_ALLOWED,
+                        chat_type="supergroup",
+                        is_forum=True,
+                        is_topic_message=True,
+                        message_thread_id=202,
+                        message_id=602,
+                        text=f"@{BOT_USERNAME} work in topic 202",
+                    )
+                )
+            )
+            with bridge._jobs_lock:
+                self.assertIn((GROUP_ALLOWED, 101), bridge._active_jobs)
+                self.assertIn((GROUP_ALLOWED, 202), bridge._active_jobs)
+                jid_101 = bridge._active_jobs[(GROUP_ALLOWED, 101)].job_id
+                jid_202 = bridge._active_jobs[(GROUP_ALLOWED, 202)].job_id
+            self.assertNotEqual(jid_101, jid_202)
+            self.assertEqual(bridge.queue.get(jid_101)["metadata"]["thread_id"], 101)
+            self.assertEqual(bridge.queue.get(jid_202)["metadata"]["thread_id"], 202)
+
+            actions = client.get_calls("sendChatAction")
+            self.assertEqual([a.get("message_thread_id") for a in actions[:2]], [101, 202])
+            sends = client.get_calls("sendMessage")
+            self.assertEqual([s.get("message_thread_id") for s in sends[:2]], [101, 202])
+
+            # /status in Topic 101 reports Topic 101 job & replies inside Topic 101
+            self.assertTrue(
+                bridge.handle_update(
+                    _make_update(
+                        3,
+                        chat_id=GROUP_ALLOWED,
+                        chat_type="supergroup",
+                        is_forum=True,
+                        is_topic_message=True,
+                        message_thread_id=101,
+                        message_id=603,
+                        text="/status",
+                    )
+                )
+            )
+            status_call = client.get_calls("sendMessage")[-1]
+            self.assertEqual(status_call.get("message_thread_id"), 101)
+            self.assertEqual(status_call.get("reply_to_message_id"), 603)
+            self.assertIn(jid_101, status_call["text"])
+
+            # /clear in Topic 101 clears only Topic 101 context; Topic 202 intact
+            self.assertTrue(
+                bridge.handle_update(
+                    _make_update(
+                        4,
+                        chat_id=GROUP_ALLOWED,
+                        chat_type="supergroup",
+                        is_forum=True,
+                        is_topic_message=True,
+                        message_thread_id=101,
+                        message_id=604,
+                        text="/clear",
+                    )
+                )
+            )
+            with bridge._ctx_lock:
+                self.assertNotIn((GROUP_ALLOWED, 101), bridge._chat_context)
+                self.assertIn((GROUP_ALLOWED, 202), bridge._chat_context)
+
+            # /cancel in Topic 101 cancels ONLY jid_101; jid_202 remains active and completes!
+            self.assertTrue(
+                bridge.handle_update(
+                    _make_update(
+                        5,
+                        chat_id=GROUP_ALLOWED,
+                        chat_type="supergroup",
+                        is_forum=True,
+                        is_topic_message=True,
+                        message_thread_id=101,
+                        message_id=605,
+                        text="/cancel",
+                    )
+                )
+            )
+            self.assertEqual(bridge.queue.get(jid_101)["status"], "cancelled")
+            self.assertEqual(bridge.queue.get(jid_202)["status"], "queued")
+
+            claimed_202 = bridge.queue.claim(EXAMPLE_AGENT_ID, job_id=jid_202, auth_token=self.worker_token)
+            self.assertIsNotNone(claimed_202)
+            bridge.queue.complete(
+                jid_202, EXAMPLE_AGENT_ID, result_text="topic 202 completed", auth_token=self.worker_token
+            )
+            bridge.wait_for_active_jobs(timeout=3.0)
+            edits = client.get_calls("editMessageText")
+            self.assertTrue(any("topic 202 completed" in e["text"] for e in edits))
+            for e in edits:
+                self.assertNotIn("message_thread_id", e)
+        finally:
+            bridge.shutdown()
+
+
+# ===========================================================================
+# G5: Group reply_to_message_id & 400 Deleted-Message Fallback Resilience
+# ===========================================================================
+class TestG5GroupReplyToAnd400FallbackResilience(_BridgeTestBase):
+    def test_g5_reply_to_400_and_html_400_orthogonal_fallback_preserves_thread_id(self) -> None:
+        bridge, client = self._build_bridge(allowed_chats=(GROUP_ALLOWED,))
+        bridge.startup()
+        try:
+            # 1) Combined 400: reply-not-found -> HTML parse entities -> plain succeeds, thread_id=101 preserved
+            client.fail_reply_not_found_once_send = "Bad Request: message to be replied not found"
+            client.fail_html_once_send = True
+            self.assertTrue(
+                bridge.handle_update(
+                    _make_update(
+                        1,
+                        chat_id=GROUP_ALLOWED,
+                        chat_type="supergroup",
+                        is_forum=True,
+                        is_topic_message=True,
+                        message_thread_id=101,
+                        message_id=701,
+                        text="/status",
+                    )
+                )
+            )
+            sends = client.get_calls("sendMessage")
+            self.assertEqual(len(sends), 3)
+            self.assertEqual(sends[0]["reply_to_message_id"], 701)
+            self.assertEqual(sends[0]["parse_mode"], "HTML")
+            self.assertEqual(sends[0].get("message_thread_id"), 101)
+            self.assertIsNone(sends[1]["reply_to_message_id"])
+            self.assertEqual(sends[1]["parse_mode"], "HTML")
+            self.assertEqual(sends[1].get("message_thread_id"), 101)
+            self.assertIsNone(sends[2]["reply_to_message_id"])
+            self.assertIsNone(sends[2]["parse_mode"])
+            self.assertEqual(sends[2].get("message_thread_id"), 101)
+
+            # 2) Alternate phrasing ("replied message not found") + reverse order (HTML 400 first, then reply 400)
+            base_n = len(client.get_calls("sendMessage"))
+            client.send_error_queue.extend(
+                [
+                    ftb.TelegramAPIError(
+                        "HTTP 400: Bad Request: can't parse entities",
+                        status_code=400,
+                        description="Bad Request: can't parse entities",
+                        method="sendMessage",
+                    ),
+                    ftb.TelegramAPIError(
+                        "HTTP 400: Bad Request: replied message not found",
+                        status_code=400,
+                        description="Bad Request: replied message not found",
+                        method="sendMessage",
+                    ),
+                ]
+            )
+            self.assertTrue(
+                bridge.handle_update(
+                    _make_update(
+                        2,
+                        chat_id=GROUP_ALLOWED,
+                        chat_type="supergroup",
+                        is_forum=True,
+                        is_topic_message=True,
+                        message_thread_id=101,
+                        message_id=702,
+                        text="/help",
+                    )
+                )
+            )
+            sends2 = client.get_calls("sendMessage")[base_n:]
+            self.assertEqual(len(sends2), 3)
+            self.assertEqual(sends2[0]["reply_to_message_id"], 702)
+            self.assertEqual(sends2[0]["parse_mode"], "HTML")
+            self.assertEqual(sends2[1]["reply_to_message_id"], 702)
+            self.assertIsNone(sends2[1]["parse_mode"])
+            self.assertIsNone(sends2[2]["reply_to_message_id"])
+            self.assertIsNone(sends2[2]["parse_mode"])
+            self.assertEqual(sends2[2].get("message_thread_id"), 101)
+
+            # 3) Bounded retry: persistent 400 errors never infinite-loop
+            client.send_error_queue.extend(
+                [
+                    ftb.TelegramAPIError("400", status_code=400, description="Bad Request: message to be replied not found"),
+                    ftb.TelegramAPIError("400", status_code=400, description="Bad Request: message to be replied not found"),
+                ]
+            )
+            with self.assertRaises(ftb.TelegramAPIError):
+                bridge._send_resilient(
+                    GROUP_ALLOWED,
+                    html_text="x",
+                    plain_text="x",
+                    reply_to_message_id=703,
+                    message_thread_id=101,
+                )
+        finally:
+            bridge.shutdown()
+
+    def test_g5_placeholder_deleted_fallback_records_real_msg_id_and_total_failure_skips_bus(self) -> None:
+        bridge, client = self._build_bridge(allowed_chats=(GROUP_ALLOWED,))
+        bridge.startup()
+        try:
+            # Case A: "message to edit not found" -> fallback _send_resilient in Topic 101 & bus records NEW msg_id
+            for idx, err_desc in enumerate(
+                ("Bad Request: message to edit not found", "Bad Request: MESSAGE_ID_INVALID"), start=1
+            ):
+                base_sends = len(client.get_calls("sendMessage"))
+                self.assertTrue(
+                    bridge.handle_update(
+                        _make_update(
+                            idx,
+                            chat_id=GROUP_ALLOWED,
+                            chat_type="supergroup",
+                            is_forum=True,
+                            is_topic_message=True,
+                            message_thread_id=101,
+                            message_id=800 + idx,
+                            text=f"@{BOT_USERNAME} placeholder deleted test {idx}",
+                        )
+                    )
+                )
+                ph_call = client.get_calls("sendMessage")[base_sends]
+                self.assertEqual(ph_call["reply_to_message_id"], 800 + idx)
+                self.assertEqual(ph_call.get("message_thread_id"), 101)
+
+                claimed = bridge.queue.claim(EXAMPLE_AGENT_ID, auth_token=self.worker_token)
+                self.assertIsNotNone(claimed)
+                client.fail_edit_missing_once = err_desc
+                bridge.queue.complete(
+                    claimed["job_id"],
+                    EXAMPLE_AGENT_ID,
+                    result_text=f"fallback_delivered_{idx}",
+                    auth_token=self.worker_token,
+                )
+                bridge.wait_for_active_jobs(timeout=3.0)
+
+                sends_after = client.get_calls("sendMessage")[base_sends:]
+                # Placeholder send + fallback final send
+                self.assertEqual(len(sends_after), 2)
+                fallback_send = sends_after[1]
+                self.assertEqual(fallback_send.get("message_thread_id"), 101)
+                self.assertEqual(fallback_send.get("reply_to_message_id"), 800 + idx)
+                self.assertIn(f"fallback_delivered_{idx}", fallback_send["text"])
+
+                # Verify bot_bus recorded the fallback message's real message_id (NOT the deleted placeholder id)
+                gh_file = Path(self.bus_dir) / "group_history" / f"{GROUP_ALLOWED}.json"
+                data = json.loads(gh_file.read_text(encoding="utf-8"))
+                matched = [
+                    e
+                    for e in data["entries"]
+                    if e.get("is_bot") and f"fallback_delivered_{idx}" in e.get("text_excerpt", "")
+                ]
+                self.assertEqual(len(matched), 1)
+                self.assertEqual(matched[0]["thread_id"], 101)
+                self.assertEqual(matched[0]["sender_role"], "worker")
+                # Placeholder was msg_seq-1, fallback send was msg_seq
+                self.assertEqual(matched[0]["msg_id"], client._msg_seq)
+
+            # Case B: Total Telegram delivery failure -> MUST NOT record bot reply in bot_bus
+            self.assertTrue(
+                bridge.handle_update(
+                    _make_update(
+                        10,
+                        chat_id=GROUP_ALLOWED,
+                        chat_type="supergroup",
+                        is_forum=True,
+                        is_topic_message=True,
+                        message_thread_id=101,
+                        message_id=810,
+                        text=f"@{BOT_USERNAME} total delivery failure test",
+                    )
+                )
+            )
+            claimed_fail = bridge.queue.claim(EXAMPLE_AGENT_ID, auth_token=self.worker_token)
+            self.assertIsNotNone(claimed_fail)
+            # Fail initial edit + fallback send + error notice edit/send
+            client.edit_error_queue.extend(
+                [
+                    ftb.TelegramAPIError("HTTP 500", status_code=500, description="Internal error", method="editMessageText"),
+                    ftb.TelegramAPIError("HTTP 500", status_code=500, description="Internal error", method="editMessageText"),
+                ]
+            )
+            bridge.queue.complete(
+                claimed_fail["job_id"],
+                EXAMPLE_AGENT_ID,
+                result_text="never_delivered_to_tg_secret_marker",
+                auth_token=self.worker_token,
+            )
+            bridge.wait_for_active_jobs(timeout=3.0)
+
+            gh_file = Path(self.bus_dir) / "group_history" / f"{GROUP_ALLOWED}.json"
+            data = json.loads(gh_file.read_text(encoding="utf-8"))
+            self.assertFalse(
+                any("never_delivered_to_tg_secret_marker" in e.get("text_excerpt", "") for e in data["entries"])
+            )
+        finally:
+            bridge.shutdown()
 
 
 if __name__ == "__main__":

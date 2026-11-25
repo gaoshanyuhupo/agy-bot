@@ -62,15 +62,17 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 if __package__:
+    from . import bot_bus  # type: ignore
     from . import external_drivers  # type: ignore
     from . import federation_registry  # type: ignore
 else:
     _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
     if _THIS_DIR not in sys.path:
         sys.path.insert(0, _THIS_DIR)
+    import bot_bus  # type: ignore
     import external_drivers  # type: ignore
     import federation_registry  # type: ignore
 
@@ -92,6 +94,7 @@ MAX_CONTEXT_CHARS = 3600
 MAX_BOTS_CONFIG_BYTES = 2 * 1024 * 1024
 
 _TG_BOT_URL_TOKEN_RE = re.compile(r"bot\d+(?::|%3[Aa])[A-Za-z0-9_-]{8,}")
+_TG_URL_ENCODED_TOKEN_RE = re.compile(r"\b\d{7,12}%3[Aa][A-Za-z0-9_-]{16,64}\b")
 _POSITIVE_INT_RE = re.compile(r"^\d+$")
 _SIGNED_INT_RE = re.compile(r"^-?\d+$")
 _ALIAS_NAME_RE = re.compile(r"^[a-z0-9_]{1,32}$")
@@ -215,6 +218,7 @@ def scrub_secrets(
     secrets_list = sorted(secret_set, key=len, reverse=True)
     out = federation_registry.redact_secrets(str(text or ""), extra_secrets=secrets_list)
     out = _TG_BOT_URL_TOKEN_RE.sub("bot[REDACTED]", out)
+    out = _TG_URL_ENCODED_TOKEN_RE.sub("[REDACTED]", out)
     return out
 
 
@@ -1565,9 +1569,19 @@ class TelegramClient:
         res = self.call("getUpdates", payload, timeout=float(timeout) + 10.0)
         return list(res) if isinstance(res, list) else []
 
-    def send_chat_action(self, chat_id: int, action: str = "typing") -> bool:
+    def send_chat_action(
+        self,
+        chat_id: int,
+        action: str = "typing",
+        *,
+        message_thread_id: Optional[int] = None,
+    ) -> bool:
+        payload: Dict[str, Any] = {"chat_id": int(chat_id), "action": str(action)}
+        norm_tid = _normalize_thread_id(message_thread_id)
+        if norm_tid is not None:
+            payload["message_thread_id"] = norm_tid
         try:
-            self.call("sendChatAction", {"chat_id": int(chat_id), "action": str(action)}, timeout=10.0)
+            self.call("sendChatAction", payload, timeout=10.0)
             return True
         except TelegramAPIError:
             return False
@@ -1579,12 +1593,16 @@ class TelegramClient:
         *,
         parse_mode: Optional[str] = None,
         reply_to_message_id: Optional[int] = None,
+        message_thread_id: Optional[int] = None,
     ) -> Dict[str, Any]:
         payload: Dict[str, Any] = {"chat_id": int(chat_id), "text": str(text)}
         if parse_mode:
             payload["parse_mode"] = str(parse_mode)
-        if reply_to_message_id is not None:
-            payload["reply_to_message_id"] = int(reply_to_message_id)
+        if type(reply_to_message_id) is int and reply_to_message_id > 0:
+            payload["reply_to_message_id"] = reply_to_message_id
+        norm_tid = _normalize_thread_id(message_thread_id)
+        if norm_tid is not None:
+            payload["message_thread_id"] = norm_tid
         res = self.call("sendMessage", payload, timeout=20.0)
         return res if isinstance(res, dict) else {}
 
@@ -1633,10 +1651,88 @@ def validate_target_agent(agent_id: str, *, bus_dir: Optional[str] = None) -> Di
 # ---------------------------------------------------------------------------
 # Active Chat Job Tracking & Main Bridge Engine
 # ---------------------------------------------------------------------------
+_MISSING = object()
+
+
+def _normalize_thread_id(raw: Any) -> Optional[int]:
+    """Normalize a Telegram Forum Topic `message_thread_id` strictly (`type(val) is int and val > 1`)."""
+    if type(raw) is not int:
+        return None
+    return raw if raw > 1 else None
+
+
+def _extract_thread_id(message: Mapping[str, Any]) -> Optional[int]:
+    """Extract normalized Forum Topic `thread_id` from a Telegram Message dict."""
+    if not isinstance(message, Mapping):
+        return None
+    chat = message.get("chat")
+    if not isinstance(chat, Mapping):
+        return None
+    chat_type = str(chat.get("type") or "").strip().lower()
+    if chat_type not in ("group", "supergroup"):
+        return None
+    is_forum = chat.get("is_forum") is True
+    is_topic = message.get("is_topic_message") is True
+    if not (is_forum or is_topic):
+        return None
+    return _normalize_thread_id(message.get("message_thread_id"))
+
+
+def _extract_message_id(message: Mapping[str, Any]) -> Optional[int]:
+    """Extract a valid positive integer Telegram `message_id` from a Message dict."""
+    if not isinstance(message, Mapping):
+        return None
+    raw = message.get("message_id")
+    if type(raw) is not int or raw <= 0:
+        return None
+    return raw
+
+
+def _session_key(chat_id: int, thread_id: Optional[int] = None) -> Union[int, Tuple[int, int]]:
+    """Canonical session key isolating `(chat_id, thread_id)` while keeping `chat_id` for non-topic sessions."""
+    norm_tid = _normalize_thread_id(thread_id)
+    return chat_id if norm_tid is None else (chat_id, norm_tid)
+
+
+def _normalize_session_key(key: Any) -> Any:
+    if isinstance(key, tuple) and len(key) == 2:
+        cid, tid = key
+        if type(cid) is int:
+            return _session_key(cid, tid)
+    return key
+
+
+class _SessionKeyDict(dict):
+    """Dict normalizing `(chat_id, None)` <-> `chat_id` while keeping `(chat_id, thread_id)` distinct."""
+
+    def __getitem__(self, key: Any) -> Any:
+        return super().__getitem__(_normalize_session_key(key))
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        super().__setitem__(_normalize_session_key(key), value)
+
+    def __delitem__(self, key: Any) -> None:
+        super().__delitem__(_normalize_session_key(key))
+
+    def __contains__(self, key: object) -> bool:
+        return super().__contains__(_normalize_session_key(key))
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        return super().get(_normalize_session_key(key), default)
+
+    def pop(self, key: Any, default: Any = _MISSING) -> Any:
+        norm = _normalize_session_key(key)
+        if default is _MISSING:
+            return super().pop(norm)
+        return super().pop(norm, default)
+
+
 @dataclasses.dataclass
 class ActiveChatJob:
     chat_id: int
     owner_user_id: int
+    thread_id: Optional[int] = None
+    reply_to_message_id: Optional[int] = None
     job_id: str = ""
     placeholder_msg_id: Optional[int] = None
     started_mono: float = 0.0
@@ -1660,6 +1756,29 @@ def _is_html_parse_400(exc: TelegramAPIError) -> bool:
 
 def _is_not_modified_400(exc: TelegramAPIError) -> bool:
     return exc.status_code == 400 and "message is not modified" in exc.description.lower()
+
+
+def _is_reply_not_found_400(exc: TelegramAPIError) -> bool:
+    if exc.status_code != 400:
+        return False
+    desc = exc.description.lower()
+    return (
+        "message to be replied not found" in desc
+        or "replied message not found" in desc
+        or "reply message not found" in desc
+    )
+
+
+def _is_edit_target_missing_400(exc: TelegramAPIError) -> bool:
+    if exc.status_code != 400:
+        return False
+    desc = exc.description.lower()
+    return (
+        "message to edit not found" in desc
+        or "message_id_invalid" in desc
+        or "message can't be edited" in desc
+        or "message cannot be edited" in desc
+    )
 
 
 def _parse_slash_command(text: str) -> Optional[Tuple[str, str, str]]:
@@ -1733,12 +1852,107 @@ class FederationTelegramBridge:
         self._reload_requested = False
 
         self._jobs_lock = threading.Lock()
-        self._active_jobs: Dict[int, ActiveChatJob] = {}
+        self._active_jobs: Dict[Any, ActiveChatJob] = _SessionKeyDict()
         self._ctx_lock = threading.Lock()
-        self._chat_context: Dict[int, "collections.deque[Tuple[str, str]]"] = {}
+        self._chat_context: Dict[Any, "collections.deque[Tuple[str, str]]"] = _SessionKeyDict()
 
     def _scrub(self, text: Any) -> str:
         return scrub_secrets(text, bot_token=self.config.bot_token)
+
+    def _bus_dir_scope(self):
+        if self.config.bus_dir:
+            return bot_bus.bind_bus_dir(self.config.bus_dir)
+        return contextlib.nullcontext()
+
+    def _bus_bot_handle(self) -> str:
+        raw = self.bot_username or self.config.bot_name or self.config.agent_id
+        return bot_bus.normalize_handle(raw) or bot_bus.normalize_handle(self.config.agent_id) or "bot"
+
+    def _extract_human_sender_handle(self, from_user: Mapping[str, Any], uid: int) -> str:
+        raw = str(from_user.get("username") or from_user.get("first_name") or f"owner_{uid}").strip()
+        clean = self._scrub(raw).strip()
+        return clean or f"owner_{uid}"
+
+    def _record_group_bus_message(
+        self,
+        chat_id: int,
+        *,
+        msg_id: int = 0,
+        thread_id: Optional[int] = None,
+        sender_handle: str = "",
+        sender_role: str = "human",
+        is_bot: bool = False,
+        text: str = "",
+        ts: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        if type(chat_id) is not int or chat_id >= 0:
+            return None
+        safe_text = self._scrub(text).strip()
+        if not safe_text:
+            return None
+        safe_sender = self._scrub(sender_handle).strip()
+        norm_tid = _normalize_thread_id(thread_id)
+        try:
+            with self._bus_dir_scope():
+                return bot_bus.record_group_message(
+                    chat_id,
+                    msg_id=int(msg_id or 0),
+                    thread_id=norm_tid,
+                    sender_handle=safe_sender,
+                    sender_role=sender_role,
+                    is_bot=bool(is_bot),
+                    text=safe_text,
+                    ts=ts,
+                    source="tg",
+                )
+        except Exception as exc:
+            self.logger.warning(
+                "Failed to record shared group message for chat %s (thread=%s): %s",
+                chat_id,
+                norm_tid,
+                self._scrub(exc),
+            )
+            return None
+
+    def _read_group_bus_history(
+        self,
+        chat_id: int,
+        *,
+        thread_id: Optional[int] = None,
+        exclude_msg_id: int = 0,
+        advance_cursor: bool = True,
+    ) -> Tuple[str, bool]:
+        if type(chat_id) is not int or chat_id >= 0:
+            return "", True
+        norm_tid = _normalize_thread_id(thread_id)
+        try:
+            with self._bus_dir_scope():
+                raw_block = bot_bus.format_unseen_group_history(
+                    chat_id,
+                    self._bus_bot_handle(),
+                    thread_id=norm_tid,
+                    exclude_msg_id=int(exclude_msg_id or 0),
+                    advance_cursor=advance_cursor,
+                )
+            return self._scrub(raw_block).strip(), True
+        except Exception as exc:
+            self.logger.warning(
+                "Failed to read shared group history for chat %s (thread=%s): %s",
+                chat_id,
+                norm_tid,
+                self._scrub(exc),
+            )
+            return "", False
+
+    def _advance_group_bus_cursor(self, chat_id: int, *, thread_id: Optional[int] = None) -> None:
+        if type(chat_id) is not int or chat_id >= 0:
+            return
+        self._read_group_bus_history(
+            chat_id,
+            thread_id=thread_id,
+            exclude_msg_id=0,
+            advance_cursor=True,
+        )
 
     def _make_owner_auth(self, owner_uid: int) -> federation_registry.OwnerAuth:
         return federation_registry.make_owner_auth(f"tg_owner_{owner_uid}", env=self._env)
@@ -1896,7 +2110,19 @@ class FederationTelegramBridge:
         else:
             self._stop_event.wait(timeout=seconds)
 
-    # ---------------------------------------------------------------- Delivery Helpers (F7)
+    # ---------------------------------------------------------------- Delivery Helpers (F7, G4, G5)
+    def _send_chat_action(
+        self,
+        chat_id: int,
+        action: str = "typing",
+        *,
+        message_thread_id: Optional[int] = None,
+    ) -> bool:
+        norm_tid = _normalize_thread_id(message_thread_id)
+        if norm_tid is not None:
+            return self.client.send_chat_action(chat_id, action, message_thread_id=norm_tid)
+        return self.client.send_chat_action(chat_id, action)
+
     def _send_resilient(
         self,
         chat_id: int,
@@ -1904,23 +2130,42 @@ class FederationTelegramBridge:
         html_text: str,
         plain_text: str,
         reply_to_message_id: Optional[int] = None,
+        message_thread_id: Optional[int] = None,
     ) -> Dict[str, Any]:
-        try:
-            return self.client.send_message(
-                chat_id,
-                html_text,
-                parse_mode="HTML",
-                reply_to_message_id=reply_to_message_id,
-            )
-        except TelegramAPIError as exc:
-            if _is_html_parse_400(exc):
+        norm_tid = _normalize_thread_id(message_thread_id)
+        cur_reply_to = (
+            reply_to_message_id
+            if (type(reply_to_message_id) is int and reply_to_message_id > 0)
+            else None
+        )
+        use_html = True
+        dropped_reply = False
+        dropped_html = False
+
+        for _attempt in range(3):
+            send_kwargs: Dict[str, Any] = {
+                "parse_mode": "HTML" if use_html else None,
+                "reply_to_message_id": cur_reply_to,
+            }
+            if norm_tid is not None:
+                send_kwargs["message_thread_id"] = norm_tid
+            try:
                 return self.client.send_message(
                     chat_id,
-                    plain_text,
-                    parse_mode=None,
-                    reply_to_message_id=reply_to_message_id,
+                    html_text if use_html else plain_text,
+                    **send_kwargs,
                 )
-            raise
+            except TelegramAPIError as exc:
+                if cur_reply_to is not None and not dropped_reply and _is_reply_not_found_400(exc):
+                    cur_reply_to = None
+                    dropped_reply = True
+                    continue
+                if use_html and not dropped_html and _is_html_parse_400(exc):
+                    use_html = False
+                    dropped_html = True
+                    continue
+                raise
+        raise TelegramAPIError("sendMessage exhausted fallback attempts", status_code=400, method="sendMessage")
 
     def _edit_resilient(
         self,
@@ -1951,34 +2196,83 @@ class FederationTelegramBridge:
         raw_text: str,
         *,
         placeholder_msg_id: Optional[int] = None,
-    ) -> None:
+        reply_to_message_id: Optional[int] = None,
+        message_thread_id: Optional[int] = None,
+    ) -> Optional[int]:
         safe_text = self._scrub(raw_text)
         chunks = split_text_for_telegram(safe_text, max_len=MAX_TELEGRAM_CHUNK_LEN, html_aware=True)
+        norm_tid = _normalize_thread_id(message_thread_id)
+        delivered_msg_id: Optional[int] = None
         for idx, chunk in enumerate(chunks):
             escaped = html_mod.escape(chunk)
             if idx == 0 and placeholder_msg_id is not None:
-                self._edit_resilient(
-                    chat_id,
-                    placeholder_msg_id,
-                    html_text=escaped,
-                    plain_text=chunk,
-                )
+                try:
+                    self._edit_resilient(
+                        chat_id,
+                        placeholder_msg_id,
+                        html_text=escaped,
+                        plain_text=chunk,
+                    )
+                    delivered_msg_id = placeholder_msg_id
+                except TelegramAPIError as exc:
+                    if not _is_edit_target_missing_400(exc):
+                        raise
+                    self.logger.warning(
+                        "Placeholder message %s missing/uneditable in chat %s; falling back to sendMessage: %s",
+                        placeholder_msg_id,
+                        chat_id,
+                        self._scrub(exc),
+                    )
+                    res = self._send_resilient(
+                        chat_id,
+                        html_text=escaped,
+                        plain_text=chunk,
+                        reply_to_message_id=reply_to_message_id,
+                        message_thread_id=norm_tid,
+                    )
+                    if isinstance(res, dict) and type(res.get("message_id")) is int and res["message_id"] > 0:
+                        delivered_msg_id = res["message_id"]
             else:
-                self._send_resilient(
+                res = self._send_resilient(
                     chat_id,
                     html_text=escaped,
                     plain_text=chunk,
+                    reply_to_message_id=reply_to_message_id if idx == 0 else None,
+                    message_thread_id=norm_tid,
                 )
+                if idx == 0 and isinstance(res, dict) and type(res.get("message_id")) is int and res["message_id"] > 0:
+                    delivered_msg_id = res["message_id"]
+        return delivered_msg_id
 
-    def _send_notice(self, chat_id: int, text: str) -> None:
+    def _send_notice(
+        self,
+        chat_id: int,
+        text: str,
+        *,
+        reply_to_message_id: Optional[int] = None,
+        message_thread_id: Optional[int] = None,
+    ) -> None:
         safe = self._scrub(text)
         try:
-            self._send_resilient(chat_id, html_text=html_mod.escape(safe), plain_text=safe)
+            self._send_resilient(
+                chat_id,
+                html_text=html_mod.escape(safe),
+                plain_text=safe,
+                reply_to_message_id=reply_to_message_id,
+                message_thread_id=message_thread_id,
+            )
         except TelegramAPIError as exc:
             self.logger.warning("Failed to send notice to chat %s: %s", chat_id, self._scrub(exc))
 
     # ---------------------------------------------------------------- Context Buffer
-    def _record_context(self, chat_id: int, speaker: str, text: str) -> None:
+    def _record_context(
+        self,
+        chat_id: int,
+        speaker: str,
+        text: str,
+        *,
+        thread_id: Optional[int] = None,
+    ) -> None:
         turns = self.config.context_turns
         if turns <= 0:
             return
@@ -1986,19 +2280,26 @@ class FederationTelegramBridge:
         if not clean:
             return
         max_items = max(2, turns * 2)
+        skey = _session_key(chat_id, thread_id)
         with self._ctx_lock:
-            buf = self._chat_context.get(chat_id)
+            buf = self._chat_context.get(skey)
             if buf is None or buf.maxlen != max_items:
                 buf = collections.deque(maxlen=max_items)
-                self._chat_context[chat_id] = buf
+                self._chat_context[skey] = buf
             buf.append((speaker, clean[:1200]))
 
-    def _build_prompt_with_context(self, chat_id: int, user_prompt: str) -> str:
-        clean_prompt = self._scrub(user_prompt).strip()
+    def _build_local_prompt_with_context(
+        self,
+        chat_id: int,
+        clean_prompt: str,
+        *,
+        thread_id: Optional[int] = None,
+    ) -> str:
         if self.config.context_turns <= 0:
             return clean_prompt
+        skey = _session_key(chat_id, thread_id)
         with self._ctx_lock:
-            entries = list(self._chat_context.get(chat_id) or ())
+            entries = list(self._chat_context.get(skey) or ())
         if not entries:
             return clean_prompt
         lines: List[str] = []
@@ -2014,7 +2315,36 @@ class FederationTelegramBridge:
         history_block = "\n".join(lines)
         return f"[Recent Chat Context]\n{history_block}\n\n[Current Request]\n{clean_prompt}"
 
-    # ---------------------------------------------------------------- Update Dispatch (F2, F3, F4, F5, F6, F7)
+    def _build_prompt_with_context(
+        self,
+        chat_id: int,
+        user_prompt: str,
+        *,
+        chat_type: str = "private",
+        thread_id: Optional[int] = None,
+        exclude_msg_id: int = 0,
+        advance_cursor: bool = False,
+    ) -> Tuple[str, bool]:
+        clean_prompt = self._scrub(user_prompt).strip()
+        if self.config.context_turns <= 0:
+            return clean_prompt, False
+        if chat_id < 0 and chat_type in ("group", "supergroup"):
+            bus_block, bus_ok = self._read_group_bus_history(
+                chat_id,
+                thread_id=thread_id,
+                exclude_msg_id=exclude_msg_id,
+                advance_cursor=advance_cursor,
+            )
+            if bus_ok:
+                should_advance = not advance_cursor
+                if bus_block:
+                    return f"{bus_block}\n\n[Current Request]\n{clean_prompt}", should_advance
+                return clean_prompt, should_advance
+            # Graceful degradation when bot_bus I/O fails
+            return self._build_local_prompt_with_context(chat_id, clean_prompt, thread_id=thread_id), False
+        return self._build_local_prompt_with_context(chat_id, clean_prompt, thread_id=thread_id), False
+
+    # ---------------------------------------------------------------- Update Dispatch (F2, F3, F4, F5, F6, F7, G1..G5)
     def _is_chat_authorized(self, chat_id: int, chat_type: str, owner_uid: int) -> bool:
         # DENIED_CHATS always wins unconditionally (F2)
         if chat_id in self.config.denied_chats:
@@ -2064,7 +2394,7 @@ class FederationTelegramBridge:
         if type(uid) is not int:
             return False
 
-        # F2: Strict Owner RBAC — non-owners silently dropped (0 replies, 0 make_owner_auth, 0 enqueue)
+        # F2: Strict Owner RBAC — non-owners silently dropped (0 replies, 0 make_owner_auth, 0 enqueue, 0 bot_bus)
         if uid not in self.config.owner_users:
             return False
 
@@ -2087,6 +2417,11 @@ class FederationTelegramBridge:
         if not text:
             return False
 
+        is_group_chat = chat_type in ("group", "supergroup") and chat_id < 0
+        thread_id = _extract_thread_id(message) if is_group_chat else None
+        incoming_msg_id = _extract_message_id(message)
+        group_reply_to = incoming_msg_id if is_group_chat else None
+
         parsed_cmd = _parse_slash_command(text)
         if parsed_cmd is not None:
             cmd_name, target_bot, cmd_args = parsed_cmd
@@ -2094,9 +2429,15 @@ class FederationTelegramBridge:
                 return False
 
             if cmd_name in _BIND_COMMANDS:
-                return self._handle_bind_command(cmd_name, chat_id, chat_type)
+                return self._handle_bind_command(
+                    cmd_name,
+                    chat_id,
+                    chat_type,
+                    reply_to_message_id=group_reply_to,
+                    message_thread_id=thread_id,
+                )
 
-        # Check chat authorization before executing any other command or prompt
+        # Check chat authorization before executing any other command, bus write, or prompt
         if not self._is_chat_authorized(chat_id, chat_type, uid):
             return False
 
@@ -2104,24 +2445,53 @@ class FederationTelegramBridge:
         if parsed_cmd is not None:
             cmd_name, _target_bot, cmd_args = parsed_cmd
             if cmd_name in ("start", "help"):
-                self._handle_help(chat_id)
+                self._handle_help(
+                    chat_id,
+                    reply_to_message_id=group_reply_to,
+                    message_thread_id=thread_id,
+                )
                 return True
             if cmd_name == "status":
-                self._handle_status(chat_id, chat_type)
+                self._handle_status(
+                    chat_id,
+                    chat_type,
+                    thread_id=thread_id,
+                    reply_to_message_id=group_reply_to,
+                )
                 return True
             if cmd_name == "clear":
-                with self._ctx_lock:
-                    self._chat_context.pop(chat_id, None)
-                self._send_notice(chat_id, "🧹 已清空当前会话上下文缓存。")
+                self._handle_clear(
+                    chat_id,
+                    chat_type,
+                    thread_id=thread_id,
+                    reply_to_message_id=group_reply_to,
+                )
                 return True
             if cmd_name == "cancel":
-                self._handle_cancel(chat_id, uid)
+                self._handle_cancel(
+                    chat_id,
+                    uid,
+                    thread_id=thread_id,
+                    reply_to_message_id=group_reply_to,
+                )
                 return True
             if cmd_name in self.config.command_aliases:
                 if not cmd_args:
-                    self._send_notice(chat_id, f"用法：/{cmd_name} <任务内容>")
+                    self._send_notice(
+                        chat_id,
+                        f"用法：/{cmd_name} <任务内容>",
+                        reply_to_message_id=group_reply_to,
+                        message_thread_id=thread_id,
+                    )
                     return True
-                self._dispatch_prompt(chat_id, chat_type, uid, cmd_args)
+                self._dispatch_prompt(
+                    chat_id,
+                    chat_type,
+                    uid,
+                    cmd_args,
+                    thread_id=thread_id,
+                    incoming_msg_id=incoming_msg_id,
+                )
                 return True
             # Unknown slash command: polite notice in DM, silent ignore in groups
             if chat_type == "private":
@@ -2131,10 +2501,31 @@ class FederationTelegramBridge:
 
         # Non-command message: DM triggers directly; group requires exact bot mention or reply to this bot (F3)
         if chat_type == "private":
-            self._dispatch_prompt(chat_id, chat_type, uid, text)
+            self._dispatch_prompt(
+                chat_id,
+                chat_type,
+                uid,
+                text,
+                thread_id=None,
+                incoming_msg_id=incoming_msg_id,
+            )
             return True
 
         if chat_type in ("group", "supergroup"):
+            if is_group_chat:
+                raw_date = message.get("date")
+                msg_ts = float(raw_date) if (type(raw_date) in (int, float) and raw_date > 0) else None
+                self._record_group_bus_message(
+                    chat_id,
+                    msg_id=incoming_msg_id or 0,
+                    thread_id=thread_id,
+                    sender_handle=self._extract_human_sender_handle(from_user, uid),
+                    sender_role="human",
+                    is_bot=False,
+                    text=text,
+                    ts=msg_ts,
+                )
+
             reply = message.get("reply_to_message")
             is_reply_to_me = (
                 isinstance(reply, dict)
@@ -2145,19 +2536,39 @@ class FederationTelegramBridge:
             mentioned, stripped_text = _match_exact_bot_mention(text, self.bot_username)
             if not is_reply_to_me and not mentioned:
                 # Plain group chatter: cache bounded human context, do not reply or enqueue
-                self._record_context(chat_id, "owner", text)
+                self._record_context(chat_id, "owner", text, thread_id=thread_id)
                 return False
             prompt_text = stripped_text if mentioned else text
             if not prompt_text:
-                self._send_notice(chat_id, "请在提及后附带需要远端 Agent 处理的内容。")
+                self._send_notice(
+                    chat_id,
+                    "请在提及后附带需要远端 Agent 处理的内容。",
+                    reply_to_message_id=group_reply_to,
+                    message_thread_id=thread_id,
+                )
                 return True
-            self._dispatch_prompt(chat_id, chat_type, uid, prompt_text)
+            self._dispatch_prompt(
+                chat_id,
+                chat_type,
+                uid,
+                prompt_text,
+                thread_id=thread_id,
+                incoming_msg_id=incoming_msg_id,
+            )
             return True
 
         return False
 
     # ---------------------------------------------------------------- Command Handlers
-    def _handle_bind_command(self, cmd_name: str, chat_id: int, chat_type: str) -> bool:
+    def _handle_bind_command(
+        self,
+        cmd_name: str,
+        chat_id: int,
+        chat_type: str,
+        *,
+        reply_to_message_id: Optional[int] = None,
+        message_thread_id: Optional[int] = None,
+    ) -> bool:
         if chat_type not in ("group", "supergroup") or chat_id >= 0:
             self._send_notice(chat_id, "⚠️ /bindgroup 与 /unbindgroup 仅允许在普通群或超级群中使用。")
             return False
@@ -2180,16 +2591,37 @@ class FederationTelegramBridge:
                 )
         except PermissionError as exc:
             self.logger.error("Bind command rejected: %s", self._scrub(exc))
-            self._send_notice(chat_id, "🔒 状态文件安全校验未通过，操作已拒绝。")
+            self._send_notice(
+                chat_id,
+                "🔒 状态文件安全校验未通过，操作已拒绝。",
+                reply_to_message_id=reply_to_message_id,
+                message_thread_id=message_thread_id,
+            )
             return False
         except Exception as exc:
             self.logger.error("Bind command failed: %s", self._scrub(exc))
-            self._send_notice(chat_id, "⚠️ 群聊绑定状态更新失败，请检查守护日志。")
+            self._send_notice(
+                chat_id,
+                "⚠️ 群聊绑定状态更新失败，请检查守护日志。",
+                reply_to_message_id=reply_to_message_id,
+                message_thread_id=message_thread_id,
+            )
             return False
-        self._send_notice(chat_id, msg)
+        self._send_notice(
+            chat_id,
+            msg,
+            reply_to_message_id=reply_to_message_id,
+            message_thread_id=message_thread_id,
+        )
         return True
 
-    def _handle_help(self, chat_id: int) -> None:
+    def _handle_help(
+        self,
+        chat_id: int,
+        *,
+        reply_to_message_id: Optional[int] = None,
+        message_thread_id: Optional[int] = None,
+    ) -> None:
         aliases_str = ", ".join(f"/{a}" for a in sorted(self.config.command_aliases))
         lines = [
             f"🤖 Federation Telegram Bridge ({self.config.agent_id})",
@@ -2200,9 +2632,44 @@ class FederationTelegramBridge:
             "• /bindgroup / /unbindgroup - 绑定或解绑当前群聊",
             f"• {aliases_str} <内容> - 显式派发任务到目标 Agent",
         ]
-        self._send_notice(chat_id, "\n".join(lines))
+        self._send_notice(
+            chat_id,
+            "\n".join(lines),
+            reply_to_message_id=reply_to_message_id,
+            message_thread_id=message_thread_id,
+        )
 
-    def _handle_status(self, chat_id: int, chat_type: str) -> None:
+    def _handle_clear(
+        self,
+        chat_id: int,
+        chat_type: str,
+        *,
+        thread_id: Optional[int] = None,
+        reply_to_message_id: Optional[int] = None,
+    ) -> None:
+        norm_tid = _normalize_thread_id(thread_id)
+        skey = _session_key(chat_id, norm_tid)
+        with self._ctx_lock:
+            self._chat_context.pop(skey, None)
+        if chat_id < 0 and chat_type in ("group", "supergroup"):
+            self._advance_group_bus_cursor(chat_id, thread_id=norm_tid)
+        self._send_notice(
+            chat_id,
+            "🧹 已清空当前会话上下文缓存。",
+            reply_to_message_id=reply_to_message_id,
+            message_thread_id=norm_tid,
+        )
+
+    def _handle_status(
+        self,
+        chat_id: int,
+        chat_type: str,
+        *,
+        thread_id: Optional[int] = None,
+        reply_to_message_id: Optional[int] = None,
+    ) -> None:
+        norm_tid = _normalize_thread_id(thread_id)
+        skey = _session_key(chat_id, norm_tid)
         rec = federation_registry.get_agent(self.config.agent_id, bus_dir=self.config.bus_dir)
         if not isinstance(rec, dict):
             agent_state = "未注册 (unregistered)"
@@ -2219,7 +2686,7 @@ class FederationTelegramBridge:
             )
 
         with self._jobs_lock:
-            active = self._active_jobs.get(chat_id)
+            active = self._active_jobs.get(skey)
             total_active = len(self._active_jobs)
 
         if active is not None:
@@ -2234,6 +2701,8 @@ class FederationTelegramBridge:
             bind_line = "静态白名单群聊"
         else:
             bind_line = "动态绑定群聊 (/bindgroup)"
+        if norm_tid is not None:
+            bind_line = f"{bind_line} [Topic {norm_tid}]"
 
         lines = [
             f"📊 Agent: {self.config.agent_id}",
@@ -2241,11 +2710,25 @@ class FederationTelegramBridge:
             f"当前会话: {bind_line}",
             f"当前任务: {job_line} (全局在途: {total_active})",
         ]
-        self._send_notice(chat_id, "\n".join(lines))
+        self._send_notice(
+            chat_id,
+            "\n".join(lines),
+            reply_to_message_id=reply_to_message_id,
+            message_thread_id=norm_tid,
+        )
 
-    def _handle_cancel(self, chat_id: int, owner_uid: int) -> None:
+    def _handle_cancel(
+        self,
+        chat_id: int,
+        owner_uid: int,
+        *,
+        thread_id: Optional[int] = None,
+        reply_to_message_id: Optional[int] = None,
+    ) -> None:
+        norm_tid = _normalize_thread_id(thread_id)
+        skey = _session_key(chat_id, norm_tid)
         with self._jobs_lock:
-            active = self._active_jobs.get(chat_id)
+            active = self._active_jobs.get(skey)
             if active is None:
                 jid = None
             else:
@@ -2254,14 +2737,24 @@ class FederationTelegramBridge:
                 jid = active.job_id
 
         if active is None:
-            self._send_notice(chat_id, "ℹ️ 当前会话没有正在执行的任务。")
+            self._send_notice(
+                chat_id,
+                "ℹ️ 当前会话没有正在执行的任务。",
+                reply_to_message_id=reply_to_message_id,
+                message_thread_id=norm_tid,
+            )
             return
 
         try:
             owner_auth = self._make_owner_auth(owner_uid)
         except PermissionError as exc:
             self.logger.warning("Cancel blocked by tainted env: %s", self._scrub(exc))
-            self._send_notice(chat_id, "🔒 当前运行环境受限，无法执行取消操作。")
+            self._send_notice(
+                chat_id,
+                "🔒 当前运行环境受限，无法执行取消操作。",
+                reply_to_message_id=reply_to_message_id,
+                message_thread_id=norm_tid,
+            )
             return
 
         if jid:
@@ -2274,13 +2767,36 @@ class FederationTelegramBridge:
                 )
             except Exception as exc:
                 self.logger.warning("Queue cancel failed for %s: %s", jid, self._scrub(exc))
-                self._send_notice(chat_id, "⚠️ 取消队列任务时发生错误，请稍后重试。")
+                self._send_notice(
+                    chat_id,
+                    "⚠️ 取消队列任务时发生错误，请稍后重试。",
+                    reply_to_message_id=reply_to_message_id,
+                    message_thread_id=norm_tid,
+                )
                 return
-        self._send_notice(chat_id, f"🛑 已请求取消当前会话任务 ({jid or 'pending'})。")
+        self._send_notice(
+            chat_id,
+            f"🛑 已请求取消当前会话任务 ({jid or 'pending'})。",
+            reply_to_message_id=reply_to_message_id,
+            message_thread_id=norm_tid,
+        )
 
-    # ---------------------------------------------------------------- Prompt Dispatch & Worker Waiter (F5, F6, F7)
-    def _dispatch_prompt(self, chat_id: int, chat_type: str, owner_uid: int, prompt_text: str) -> None:
-        # F5: Real-time target agent check BEFORE enqueue
+    # ---------------------------------------------------------------- Prompt Dispatch & Worker Waiter (F5, F6, F7, G2..G5)
+    def _dispatch_prompt(
+        self,
+        chat_id: int,
+        chat_type: str,
+        owner_uid: int,
+        prompt_text: str,
+        *,
+        thread_id: Optional[int] = None,
+        incoming_msg_id: Optional[int] = None,
+    ) -> None:
+        norm_tid = _normalize_thread_id(thread_id)
+        skey = _session_key(chat_id, norm_tid)
+        reply_to_id = incoming_msg_id if (chat_type in ("group", "supergroup") and chat_id < 0) else None
+
+        # F5: Real-time target agent check BEFORE enqueue (and before advancing bot_bus cursor)
         try:
             validate_target_agent(self.config.agent_id, bus_dir=self.config.bus_dir)
         except TargetAgentUnavailableError as exc:
@@ -2288,6 +2804,8 @@ class FederationTelegramBridge:
             self._send_notice(
                 chat_id,
                 f"⚠️ 目标 Agent ({self.config.agent_id}) 当前不可用（未注册、已禁用/撤权或传输模式不兼容），已拒绝入队。",
+                reply_to_message_id=reply_to_id,
+                message_thread_id=norm_tid,
             )
             return
 
@@ -2296,46 +2814,69 @@ class FederationTelegramBridge:
             owner_auth = self._make_owner_auth(owner_uid)
         except PermissionError as exc:
             self.logger.warning("Enqueue blocked by tainted env: %s", self._scrub(exc))
-            self._send_notice(chat_id, "🔒 当前进程环境处于受限/污点状态，已拒绝派发任务。")
+            self._send_notice(
+                chat_id,
+                "🔒 当前进程环境处于受限/污点状态，已拒绝派发任务。",
+                reply_to_message_id=reply_to_id,
+                message_thread_id=norm_tid,
+            )
             return
 
-        # F6: Per-chat concurrency guard (deterministic busy rejection; never overwrites active job)
+        # F6 / G4: Per-(chat_id, thread_id) concurrency guard (deterministic busy rejection; never overwrites active job)
         active = ActiveChatJob(
             chat_id=chat_id,
             owner_user_id=owner_uid,
+            thread_id=norm_tid,
+            reply_to_message_id=reply_to_id,
             started_mono=self._clock(),
         )
         busy = False
         with self._jobs_lock:
-            if chat_id in self._active_jobs:
+            if skey in self._active_jobs:
                 busy = True
             else:
-                self._active_jobs[chat_id] = active
+                self._active_jobs[skey] = active
         if busy:
-            self._send_notice(chat_id, "⏳ 当前会话已有任务正在处理，请等待完成或发送 /cancel 取消。")
+            self._send_notice(
+                chat_id,
+                "⏳ 当前会话已有任务正在处理，请等待完成或发送 /cancel 取消。",
+                reply_to_message_id=reply_to_id,
+                message_thread_id=norm_tid,
+            )
             return
 
         placeholder_msg_id: Optional[int] = None
         try:
-            self.client.send_chat_action(chat_id, "typing")
+            self._send_chat_action(chat_id, "typing", message_thread_id=norm_tid)
             ph_res = self._send_resilient(
                 chat_id,
                 html_text=html_mod.escape(f"⏳ 已提交给 {self.config.agent_id}，等待远端 Worker 处理…"),
                 plain_text=f"⏳ 已提交给 {self.config.agent_id}，等待远端 Worker 处理…",
+                reply_to_message_id=reply_to_id,
+                message_thread_id=norm_tid,
             )
-            if isinstance(ph_res, dict) and type(ph_res.get("message_id")) is int:
+            if isinstance(ph_res, dict) and type(ph_res.get("message_id")) is int and ph_res["message_id"] > 0:
                 placeholder_msg_id = ph_res["message_id"]
 
-            full_prompt = self._build_prompt_with_context(chat_id, prompt_text)
-            safe_meta = scrub_metadata(
-                {
-                    "source": "federation_tg_bridge",
-                    "agent_id": self.config.agent_id,
-                    "chat_id": chat_id,
-                    "chat_type": chat_type,
-                    "owner_user_id": owner_uid,
-                },
-                bot_token=self.config.bot_token,
+            meta_payload: Dict[str, Any] = {
+                "source": "federation_tg_bridge",
+                "agent_id": self.config.agent_id,
+                "chat_id": chat_id,
+                "chat_type": chat_type,
+                "owner_user_id": owner_uid,
+                "thread_id": norm_tid,
+            }
+            if reply_to_id is not None:
+                meta_payload["reply_to_message_id"] = reply_to_id
+            safe_meta = scrub_metadata(meta_payload, bot_token=self.config.bot_token)
+
+            full_prompt, should_advance_cursor = self._build_prompt_with_context(
+                chat_id,
+                prompt_text,
+                chat_type=chat_type,
+                thread_id=norm_tid,
+                exclude_msg_id=incoming_msg_id or 0,
+                advance_cursor=False,
             )
             job_rec = self.queue.enqueue(
                 self.config.agent_id,
@@ -2350,7 +2891,7 @@ class FederationTelegramBridge:
                 active.placeholder_msg_id = placeholder_msg_id
                 already_cancelled = active.cancel_requested
 
-            self._record_context(chat_id, "owner", prompt_text)
+            self._record_context(chat_id, "owner", prompt_text, thread_id=norm_tid)
 
             if already_cancelled:
                 self.queue.cancel(
@@ -2360,10 +2901,19 @@ class FederationTelegramBridge:
                     env=self._env,
                 )
                 with self._jobs_lock:
-                    if self._active_jobs.get(chat_id) is active:
-                        self._active_jobs.pop(chat_id, None)
-                self._deliver_text(chat_id, "🛑 任务已取消。", placeholder_msg_id=placeholder_msg_id)
+                    if self._active_jobs.get(skey) is active:
+                        self._active_jobs.pop(skey, None)
+                self._deliver_text(
+                    chat_id,
+                    "🛑 任务已取消。",
+                    placeholder_msg_id=placeholder_msg_id,
+                    reply_to_message_id=reply_to_id,
+                    message_thread_id=norm_tid,
+                )
                 return
+
+            if should_advance_cursor:
+                self._advance_group_bus_cursor(chat_id, thread_id=norm_tid)
 
             worker = threading.Thread(
                 target=self._wait_for_job,
@@ -2376,24 +2926,34 @@ class FederationTelegramBridge:
             worker.start()
         except PermissionError as exc:
             with self._jobs_lock:
-                if self._active_jobs.get(chat_id) is active:
-                    self._active_jobs.pop(chat_id, None)
+                if self._active_jobs.get(skey) is active:
+                    self._active_jobs.pop(skey, None)
             self.logger.warning("Enqueue rejected with PermissionError: %s", self._scrub(exc))
-            self._deliver_text(
-                chat_id,
-                "🔒 权限或环境校验未通过，任务已拒绝入队。",
-                placeholder_msg_id=placeholder_msg_id,
-            )
+            try:
+                self._deliver_text(
+                    chat_id,
+                    "🔒 权限或环境校验未通过，任务已拒绝入队。",
+                    placeholder_msg_id=placeholder_msg_id,
+                    reply_to_message_id=reply_to_id,
+                    message_thread_id=norm_tid,
+                )
+            except Exception as deliver_exc:
+                self.logger.warning("Failed to deliver permission error notice: %s", self._scrub(deliver_exc))
         except Exception as exc:
             with self._jobs_lock:
-                if self._active_jobs.get(chat_id) is active:
-                    self._active_jobs.pop(chat_id, None)
+                if self._active_jobs.get(skey) is active:
+                    self._active_jobs.pop(skey, None)
             self.logger.error("Failed to enqueue job: %s", self._scrub(exc))
-            self._deliver_text(
-                chat_id,
-                "⚠️ 任务入队失败，请稍后重试或检查守护日志。",
-                placeholder_msg_id=placeholder_msg_id,
-            )
+            try:
+                self._deliver_text(
+                    chat_id,
+                    "⚠️ 任务入队失败，请稍后重试或检查守护日志。",
+                    placeholder_msg_id=placeholder_msg_id,
+                    reply_to_message_id=reply_to_id,
+                    message_thread_id=norm_tid,
+                )
+            except Exception as deliver_exc:
+                self.logger.warning("Failed to deliver enqueue error notice: %s", self._scrub(deliver_exc))
 
     def _wait_for_job(
         self,
@@ -2402,6 +2962,7 @@ class FederationTelegramBridge:
     ) -> None:
         started = active.started_mono
         last_typing = started
+        skey = _session_key(active.chat_id, active.thread_id)
         try:
             while True:
                 job = self.queue.get(active.job_id)
@@ -2410,6 +2971,8 @@ class FederationTelegramBridge:
                         active.chat_id,
                         "⚠️ 任务状态记录缺失，请重试。",
                         placeholder_msg_id=active.placeholder_msg_id,
+                        reply_to_message_id=active.reply_to_message_id,
+                        message_thread_id=active.thread_id,
                     )
                     return
 
@@ -2417,12 +2980,29 @@ class FederationTelegramBridge:
                 if status == "done":
                     result_text = str(job.get("result_text") or "").strip() or "(远端 Agent 返回了空内容)"
                     safe_result = self._scrub(result_text)
-                    self._record_context(active.chat_id, self.config.agent_id, safe_result)
-                    self._deliver_text(
+                    delivered_msg_id = self._deliver_text(
                         active.chat_id,
                         safe_result,
                         placeholder_msg_id=active.placeholder_msg_id,
+                        reply_to_message_id=active.reply_to_message_id,
+                        message_thread_id=active.thread_id,
                     )
+                    self._record_context(
+                        active.chat_id,
+                        self.config.agent_id,
+                        safe_result,
+                        thread_id=active.thread_id,
+                    )
+                    if delivered_msg_id is not None and active.chat_id < 0:
+                        self._record_group_bus_message(
+                            active.chat_id,
+                            msg_id=delivered_msg_id,
+                            thread_id=active.thread_id,
+                            sender_handle=self._bus_bot_handle(),
+                            sender_role="worker",
+                            is_bot=True,
+                            text=safe_result,
+                        )
                     return
 
                 if status == "error":
@@ -2431,6 +3011,8 @@ class FederationTelegramBridge:
                         active.chat_id,
                         f"❌ 执行失败：{err_text}",
                         placeholder_msg_id=active.placeholder_msg_id,
+                        reply_to_message_id=active.reply_to_message_id,
+                        message_thread_id=active.thread_id,
                     )
                     return
 
@@ -2444,6 +3026,8 @@ class FederationTelegramBridge:
                         active.chat_id,
                         msg,
                         placeholder_msg_id=active.placeholder_msg_id,
+                        reply_to_message_id=active.reply_to_message_id,
+                        message_thread_id=active.thread_id,
                     )
                     return
 
@@ -2461,6 +3045,8 @@ class FederationTelegramBridge:
                         active.chat_id,
                         "🛑 任务已取消。",
                         placeholder_msg_id=active.placeholder_msg_id,
+                        reply_to_message_id=active.reply_to_message_id,
+                        message_thread_id=active.thread_id,
                     )
                     return
 
@@ -2479,11 +3065,13 @@ class FederationTelegramBridge:
                         active.chat_id,
                         "⏱ 任务执行超时，已自动取消排队/在途作业。",
                         placeholder_msg_id=active.placeholder_msg_id,
+                        reply_to_message_id=active.reply_to_message_id,
+                        message_thread_id=active.thread_id,
                     )
                     return
 
                 if (now - last_typing) >= self.config.typing_refresh_sec:
-                    self.client.send_chat_action(active.chat_id, "typing")
+                    self._send_chat_action(active.chat_id, "typing", message_thread_id=active.thread_id)
                     last_typing = now
 
                 if self._sleep_fn is not None:
@@ -2497,13 +3085,15 @@ class FederationTelegramBridge:
                     active.chat_id,
                     "⚠️ 等待任务结果时发生异常，请查看守护日志。",
                     placeholder_msg_id=active.placeholder_msg_id,
+                    reply_to_message_id=active.reply_to_message_id,
+                    message_thread_id=active.thread_id,
                 )
             except Exception:
                 pass
         finally:
             with self._jobs_lock:
-                if self._active_jobs.get(active.chat_id) is active:
-                    self._active_jobs.pop(active.chat_id, None)
+                if self._active_jobs.get(skey) is active:
+                    self._active_jobs.pop(skey, None)
 
 
 # ---------------------------------------------------------------------------
