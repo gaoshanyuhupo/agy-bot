@@ -97,6 +97,8 @@ HOST_PRIVATE_PREFIXES: Tuple[str, ...] = (
 
 FORBIDDEN_RUNTIME_NAMES: Set[str] = {
     ".env",
+    ".env.fed",
+    "fed_bots.json",
     ".bao_credentials.json",
     "auth.json",
     "credentials.json",

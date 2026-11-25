@@ -1,7 +1,9 @@
 # Secrets & Environment Files (NEVER COMMIT)
 .env
 .env.*
+.env.fed
 !.env.example
+fed_bots.json
 *.token
 *.key
 *.pem
