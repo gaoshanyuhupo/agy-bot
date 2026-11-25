@@ -732,7 +732,12 @@ _BOT_BUS_BIND_LOCK = threading.RLock()
 
 
 _PEEK_ROUTE_RE = re.compile(r"/hub/v1/agents/([^/]+)/peek")
+_EVENTS_ACK_ROUTE_RE = re.compile(r"/hub/v1/agents/([^/]+)/events/ack")
 _PEEK_AGENT_ID_CI_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+_EVENTS_ACK_ALLOWED_KEYS = frozenset({"event_ids", "all"})
+MAX_ACK_EVENT_IDS = 200
+MAX_ACK_EVENT_ID_LEN = 128
+MAX_RESULT_TEXT_CHARS = 65536
 
 
 class HubError(Exception):
@@ -2935,18 +2940,126 @@ def store_leader_event(bus_dir: str, agent_id: str, event: Dict[str, Any]) -> Di
 
 def list_leader_events(bus_dir: str, agent_id: str) -> List[Dict[str, Any]]:
     ed = _leader_events_dir(bus_dir, agent_id)
-    if not os.path.isdir(ed):
+    if os.path.islink(ed) or not os.path.isdir(ed):
         return []
+    ed_real = os.path.realpath(ed)
+    ed_prefix = ed_real + os.sep
     out: List[Dict[str, Any]] = []
     try:
         names = sorted(fn for fn in os.listdir(ed) if fn.endswith(".json") and not fn.endswith(".tmp"))
     except OSError:
         return []
     for fn in names:
-        data = federation_registry._read_json(os.path.join(ed, fn), None)
+        fp = os.path.join(ed, fn)
+        if os.path.islink(fp):
+            continue
+        try:
+            fp_real = os.path.realpath(fp)
+        except OSError:
+            continue
+        if not fp_real.startswith(ed_prefix) or not os.path.isfile(fp_real):
+            continue
+        data = federation_registry._read_json(fp, None)
         if isinstance(data, dict):
             out.append(data)
     return out
+
+
+def ack_leader_events(
+    bus_dir: str,
+    agent_id: str,
+    *,
+    event_ids: Optional[Sequence[str]] = None,
+    ack_all: bool = False,
+) -> Dict[str, Any]:
+    """Safely acknowledge (delete) leader events for `agent_id`.
+
+    - Never creates `leader_events/<agent_id>` when the directory does not exist.
+    - Rejects symlinks and any path resolving outside `os.path.realpath(ed) + os.sep`.
+    - Matches strictly on JSON `"event_id"` (never filename substring).
+    - Ignores `.tmp` files and handles concurrent `FileNotFoundError` gracefully.
+    """
+    ed = _leader_events_dir(bus_dir, agent_id)
+    if os.path.islink(ed) or not os.path.isdir(ed):
+        return {"acked": 0, "acked_ids": [], "remaining": 0}
+    ed_real = os.path.realpath(ed)
+    ed_prefix = ed_real + os.sep
+    target_set: Optional[set[str]] = None if ack_all else set(event_ids or ())
+
+    try:
+        names = sorted(fn for fn in os.listdir(ed) if fn.endswith(".json") and not fn.endswith(".tmp"))
+    except OSError:
+        return {"acked": 0, "acked_ids": [], "remaining": 0}
+
+    acked_ids: List[str] = []
+    remaining = 0
+    for fn in names:
+        fp = os.path.join(ed, fn)
+        if os.path.islink(fp):
+            continue
+        try:
+            fp_real = os.path.realpath(fp)
+        except OSError:
+            continue
+        if not fp_real.startswith(ed_prefix) or not os.path.isfile(fp_real):
+            continue
+        data = federation_registry._read_json(fp, None)
+        if not isinstance(data, dict):
+            continue
+        raw_eid = data.get("event_id")
+        eid = raw_eid if isinstance(raw_eid, str) else ""
+        if ack_all:
+            matched = True
+        else:
+            matched = bool(eid) and target_set is not None and (eid in target_set)
+        if matched:
+            try:
+                os.unlink(fp)
+            except FileNotFoundError:
+                continue
+            acked_ids.append(eid or fn)
+        else:
+            remaining += 1
+
+    return {
+        "acked": len(acked_ids),
+        "acked_ids": acked_ids,
+        "remaining": remaining,
+    }
+
+
+def _extract_pull_result_text(
+    body: Mapping[str, Any],
+    *,
+    max_chars: int = MAX_RESULT_TEXT_CHARS,
+) -> str:
+    """Extract and safely normalize result text for `op_pull_result`.
+
+    `result_text` takes precedence whenever present and not `None` (including `""`);
+    otherwise falls back to `result`. Dict/list values are JSON-serialized cleanly,
+    non-string scalars are coerced via `str()`, and oversized strings are capped at
+    `max_chars` so `PullWorkerQueue` and `bot_bus` always stay in exact sync.
+    """
+    if "result_text" in body and body["result_text"] is not None:
+        raw_val = body["result_text"]
+    else:
+        raw_val = body.get("result")
+
+    if raw_val is None:
+        text = ""
+    elif isinstance(raw_val, str):
+        text = raw_val
+    elif isinstance(raw_val, (dict, list)):
+        try:
+            text = json.dumps(raw_val, ensure_ascii=False, default=str)
+        except Exception:
+            text = str(raw_val)
+    else:
+        text = str(raw_val)
+
+    if max_chars > 0 and len(text) > max_chars:
+        text = text[:max_chars]
+    return text
 
 
 # ---------------------------------------------------------------- Outbound External Worker Dispatcher (M2-C6)
@@ -4139,6 +4252,171 @@ class FederationHubServer(http.server.ThreadingHTTPServer):
             "oldest_created_at": summary["oldest_created_at"],
         }
 
+    def op_ack_leader_events(
+        self,
+        auth: Dict[str, Any],
+        raw_path_agent_id: str,
+        body: Any,
+        *,
+        raw_token: str,
+    ) -> Dict[str, Any]:
+        """Acknowledge (delete) pending leader events (`POST /hub/v1/agents/<agent_id>/events/ack`).
+
+        - Rejects percent-encoding, traversal, whitespace, or non-identifier path segments with `400 INVALID_AGENT_ID`.
+        - Enforces strict actor isolation (`403 CROSS_AGENT_FORBIDDEN` + redacted audit), including case variants
+          and privileged roles (`coordinator_peer` / `local_admin`).
+        - Validates body schema strictly (`event_ids` XOR `all: true`, no unknown keys; fail-closed `400 INVALID_ACK_REQUEST`).
+        - Deletes matched files safely (no symlink traversal, exact JSON `event_id` match) and records redacted audit.
+        """
+        actor = str(auth.get("actor_id") or "")
+        extra_sec = [raw_token] if raw_token else []
+        raw_seg = str(raw_path_agent_id or "")
+        if (
+            not raw_seg
+            or "%" in raw_seg
+            or ".." in raw_seg
+            or "/" in raw_seg
+            or "\\" in raw_seg
+            or "\x00" in raw_seg
+            or any(ch.isspace() for ch in raw_seg)
+            or not _PEEK_AGENT_ID_CI_RE.fullmatch(raw_seg)
+        ):
+            raise HubError(400, "INVALID_AGENT_ID", "Invalid agent_id path segment", rpc_code=-32602)
+
+        if raw_seg.lower() != actor:
+            self.audit.record(
+                "pull_events_ack",
+                actor_id=actor,
+                action="events_ack",
+                outcome="denied",
+                http_status=403,
+                reason="CROSS_AGENT_FORBIDDEN",
+                detail={"target_agent_id": raw_seg[:64]},
+                extra_secrets=extra_sec,
+            )
+            raise HubError(
+                403,
+                "CROSS_AGENT_FORBIDDEN",
+                f"CROSS_AGENT_FORBIDDEN: agent {actor!r} cannot ack events for {raw_seg!r}",
+                rpc_code=-32003,
+            )
+
+        try:
+            target_aid = federation_registry.validate_agent_id(raw_seg)
+        except ValueError as exc:
+            raise HubError(400, "INVALID_AGENT_ID", str(exc), rpc_code=-32602) from exc
+
+        if actor != target_aid:
+            self.audit.record(
+                "pull_events_ack",
+                actor_id=actor,
+                action="events_ack",
+                outcome="denied",
+                http_status=403,
+                reason="CROSS_AGENT_FORBIDDEN",
+                detail={"target_agent_id": target_aid},
+                extra_secrets=extra_sec,
+            )
+            raise HubError(
+                403,
+                "CROSS_AGENT_FORBIDDEN",
+                f"CROSS_AGENT_FORBIDDEN: agent {actor!r} cannot ack events for {target_aid!r}",
+                rpc_code=-32003,
+            )
+
+        if not isinstance(body, dict):
+            raise HubError(400, "INVALID_ACK_REQUEST", "Request body must be a JSON object", rpc_code=-32602)
+
+        unknown_keys = set(body.keys()) - _EVENTS_ACK_ALLOWED_KEYS
+        if unknown_keys:
+            raise HubError(
+                400,
+                "INVALID_ACK_REQUEST",
+                f"Unsupported field(s) in ack request: {', '.join(sorted(str(k) for k in unknown_keys))}",
+                rpc_code=-32602,
+            )
+
+        has_all = "all" in body
+        has_ids = "event_ids" in body
+        if has_all == has_ids:
+            raise HubError(
+                400,
+                "INVALID_ACK_REQUEST",
+                "Request body must specify exactly one of 'event_ids' or 'all': true",
+                rpc_code=-32602,
+            )
+
+        ack_all = False
+        clean_ids: Optional[List[str]] = None
+        if has_all:
+            raw_all = body["all"]
+            if type(raw_all) is not bool or raw_all is not True:
+                raise HubError(
+                    400,
+                    "INVALID_ACK_REQUEST",
+                    "'all' must be strictly boolean true",
+                    rpc_code=-32602,
+                )
+            ack_all = True
+        else:
+            raw_ids = body["event_ids"]
+            if type(raw_ids) is not list or not (1 <= len(raw_ids) <= MAX_ACK_EVENT_IDS):
+                raise HubError(
+                    400,
+                    "INVALID_ACK_REQUEST",
+                    f"'event_ids' must be a list of 1..{MAX_ACK_EVENT_IDS} event IDs",
+                    rpc_code=-32602,
+                )
+            seen_ids: set[str] = set()
+            dedup_ids: List[str] = []
+            for item in raw_ids:
+                if (
+                    type(item) is not str
+                    or not item
+                    or item != item.strip()
+                    or len(item) > MAX_ACK_EVENT_ID_LEN
+                    or "/" in item
+                    or "\\" in item
+                    or ".." in item
+                    or "\x00" in item
+                    or any(ord(ch) < 32 for ch in item)
+                ):
+                    raise HubError(
+                        400,
+                        "INVALID_ACK_REQUEST",
+                        "Each item in 'event_ids' must be a trimmed non-empty string (<=128 chars) without path or control characters",
+                        rpc_code=-32602,
+                    )
+                if item not in seen_ids:
+                    seen_ids.add(item)
+                    dedup_ids.append(item)
+            clean_ids = dedup_ids
+
+        res = ack_leader_events(
+            self.bus_dir,
+            target_aid,
+            event_ids=clean_ids,
+            ack_all=ack_all,
+        )
+        acked_ids = list(res["acked_ids"])
+        remaining = int(res["remaining"])
+        self.audit.record(
+            "pull_events_ack",
+            actor_id=actor,
+            action="events_ack",
+            outcome="allowed",
+            http_status=200,
+            detail={"acked": len(acked_ids), "remaining": remaining},
+            extra_secrets=extra_sec,
+        )
+        return {
+            "ok": True,
+            "agent_id": target_aid,
+            "acked": len(acked_ids),
+            "acked_ids": acked_ids,
+            "remaining": remaining,
+        }
+
     def op_pull_claim(self, auth: Dict[str, Any], job_id: Optional[str], *, raw_token: str) -> Dict[str, Any]:
         actor = str(auth.get("actor_id") or "")
         extra_sec = [raw_token] if raw_token else []
@@ -4242,8 +4520,19 @@ class FederationHubServer(http.server.ThreadingHTTPServer):
         status = str(body.get("status") or "").strip().lower()
         if status not in ("done", "error"):
             raise HubError(400, "INVALID_STATUS", "`status` must be 'done' or 'error'", rpc_code=-32602)
-        result_text = str(body.get("result_text") or "")
-        error_text = str(body.get("error") or "")
+        result_text = _extract_pull_result_text(body)
+        raw_err = body.get("error")
+        if raw_err is None:
+            error_text = ""
+        elif isinstance(raw_err, str):
+            error_text = raw_err[:MAX_RESULT_TEXT_CHARS]
+        elif isinstance(raw_err, (dict, list)):
+            try:
+                error_text = json.dumps(raw_err, ensure_ascii=False, default=str)[:MAX_RESULT_TEXT_CHARS]
+            except Exception:
+                error_text = str(raw_err)[:MAX_RESULT_TEXT_CHARS]
+        else:
+            error_text = str(raw_err)[:MAX_RESULT_TEXT_CHARS]
 
         pull_q = federation_registry.PullWorkerQueue(self.bus_dir)
         existing = pull_q.get(clean_jid)
@@ -4936,6 +5225,15 @@ class _FederationHubHandler(http.server.BaseHTTPRequestHandler):
                 if m_res:
                     jid = unquote(m_res.group(1))
                     self._send_json(200, self.server.op_pull_result(auth, jid, body, raw_token=raw_token), extra_secrets=[raw_token])
+                    return
+                m_events_ack = _EVENTS_ACK_ROUTE_RE.fullmatch(path_only)
+                if m_events_ack:
+                    raw_aid_seg = m_events_ack.group(1)
+                    self._send_json(
+                        200,
+                        self.server.op_ack_leader_events(auth, raw_aid_seg, body, raw_token=raw_token),
+                        extra_secrets=[raw_token],
+                    )
                     return
                 if path_only == "/hub/v1/host/exec":
                     self._send_json(200, self.server.host_bridge.host_exec(auth, body, raw_token=raw_token), extra_secrets=[raw_token])

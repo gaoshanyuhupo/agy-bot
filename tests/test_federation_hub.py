@@ -2765,5 +2765,672 @@ class TestHubPeekEndpointProdRelease(unittest.TestCase):
                 self.assertNotIn(tok_peek, audit_after_rep)
 
 
+# ==============================================================================
+# Prod-Release Contract Suite: Hub POST /events/ack + op_pull_result `result` alias (E1..E6)
+# ==============================================================================
+class TestHubEventsAckAndResultAliasProdRelease(unittest.TestCase):
+    """Comprehensive Prod-Release security & functional suite covering E1..E6."""
+
+    def _register_pull_agent(
+        self,
+        tmp: str,
+        owner: fed.OwnerAuth,
+        agent_id: str,
+        *,
+        trust_level: str = "remote_trusted",
+        capabilities: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        fed.register_agent(
+            agent_id,
+            kind="http_a2a",
+            driver="pull_worker",
+            transport="pull_worker",
+            trust_level=trust_level,
+            capabilities=capabilities
+            or {
+                "coordinator_peer": False,
+                "host_server_invoke": False,
+                "can_dispatch": False,
+                "can_receive": True,
+            },
+            owner_auth=owner,
+            bus_dir=tmp,
+        )
+
+    def _seed_claimed_synced_job(
+        self,
+        rh: _RunningHub,
+        tmp: str,
+        owner: fed.OwnerAuth,
+        agent_id: str,
+        tok_full: str,
+        job_id: str,
+    ) -> None:
+        """Create a matching job in both `bot_bus` and `PullWorkerQueue`, then claim it via Hub HTTP."""
+        with hub._with_bot_bus_dir(tmp):
+            fp = bot_bus._job_path(job_id)
+            bot_bus._atomic_write_json(
+                fp,
+                {
+                    "job_id": job_id,
+                    "group_id": f"grp-{job_id}",
+                    "batch_job_ids": [job_id],
+                    "target_bot": agent_id,
+                    "sender_bot": "owner",
+                    "prompt": f"prompt for {job_id}",
+                    "status": "queued",
+                    "result_text": "",
+                    "error": "",
+                    "created_at": time.time(),
+                },
+            )
+        q = fed.PullWorkerQueue(tmp)
+        q.enqueue(agent_id, f"prompt for {job_id}", job_id=job_id, owner_auth=owner)
+        st, _, body = rh.request("POST", f"/hub/v1/jobs/{job_id}/claim", token=tok_full, body={})
+        self.assertEqual(200, st, body)
+
+    def test_e1_events_ack_auth_scope_method_content_type_and_replay(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, _clean_env({"AGY_BOT_BUS_DIR": tmp}), clear=True):
+            owner = fed.make_owner_auth("owner")
+            self._register_pull_agent(tmp, owner, "agent_a")
+            tok_full = fed.mint_agent_token("agent_a", owner_auth=owner, scope="full", bus_dir=tmp)["token"]
+            tok_peek = fed.mint_agent_token("agent_a", owner_auth=owner, scope="peek", bus_dir=tmp)["token"]
+            tok_revoked_rec = fed.mint_agent_token("agent_a", owner_auth=owner, scope="full", bus_dir=tmp)
+            tok_revoked = tok_revoked_rec["token"]
+            fed.revoke_agent_token("agent_a", owner_auth=owner, token_id=tok_revoked_rec["token_id"], bus_dir=tmp)
+
+            hub.store_leader_event(tmp, "agent_a", {"event_id": "ev-e1-1", "type": "batch_done"})
+            audit_path = Path(fed.federation_dir(tmp)) / "audit.jsonl"
+
+            with _RunningHub(bus_dir=tmp) as rh:
+                # E1-1: peek token, revoked token, and missing auth -> 401 UNAUTHORIZED, 0 deletions, redacted audit
+                for label, tok in (("peek", tok_peek), ("revoked", tok_revoked), ("no_auth", None)):
+                    with self.subTest(auth_case=label):
+                        st, hdrs, body = rh.request(
+                            "POST",
+                            "/hub/v1/agents/agent_a/events/ack",
+                            token=tok,
+                            body={"all": True},
+                        )
+                        self.assertEqual(401, st, f"{label} -> {st}: {body}")
+                        self.assertEqual("UNAUTHORIZED", body.get("error"))
+                        self.assertIn("no-store", hdrs.get("cache-control", "").lower())
+
+                # E1-2: Non-POST methods -> full token gets 404 NOT_FOUND, peek token gets 401 UNAUTHORIZED
+                for method in ("GET", "DELETE", "PUT"):
+                    with self.subTest(method=method, scope="full"):
+                        st_f, hdrs_f, body_f = rh.request(
+                            method,
+                            "/hub/v1/agents/agent_a/events/ack",
+                            token=tok_full,
+                            body=({} if method == "PUT" else None),
+                        )
+                        self.assertEqual(404, st_f, f"full {method} -> {st_f}: {body_f}")
+                        self.assertEqual("NOT_FOUND", body_f.get("error"))
+                        self.assertIn("no-store", hdrs_f.get("cache-control", "").lower())
+                    with self.subTest(method=method, scope="peek"):
+                        st_p, hdrs_p, body_p = rh.request(
+                            method,
+                            "/hub/v1/agents/agent_a/events/ack",
+                            token=tok_peek,
+                            body=({} if method == "PUT" else None),
+                        )
+                        self.assertEqual(401, st_p, f"peek {method} -> {st_p}: {body_p}")
+                        self.assertEqual("UNAUTHORIZED", body_p.get("error"))
+                        self.assertIn("no-store", hdrs_p.get("cache-control", "").lower())
+
+                # E1-3a: Query-string token -> 400 QUERY_TOKEN_FORBIDDEN + Cache-Control: no-store
+                st_q, hdrs_q, body_q = rh.request(
+                    "POST",
+                    f"/hub/v1/agents/agent_a/events/ack?token={tok_full}",
+                    body={"all": True},
+                )
+                self.assertEqual(400, st_q, body_q)
+                self.assertEqual("QUERY_TOKEN_FORBIDDEN", body_q.get("error"))
+                self.assertIn("no-store", hdrs_q.get("cache-control", "").lower())
+
+                # E1-3b: Non-application/json Content-Type -> 415 UNSUPPORTED_MEDIA_TYPE + Cache-Control: no-store
+                st_ct, hdrs_ct, body_ct = rh.request(
+                    "POST",
+                    "/hub/v1/agents/agent_a/events/ack",
+                    token=tok_full,
+                    raw_body=b'{"all":true}',
+                    headers={"Content-Type": "text/plain"},
+                )
+                self.assertEqual(415, st_ct, body_ct)
+                self.assertEqual("UNSUPPORTED_MEDIA_TYPE", body_ct.get("error"))
+                self.assertIn("no-store", hdrs_ct.get("cache-control", "").lower())
+
+                # Event must remain untouched across all rejected requests
+                self.assertEqual(1, len(hub.list_leader_events(tmp, "agent_a")))
+
+                # Audit must be present and fully redacted
+                audit_text = audit_path.read_text(encoding="utf-8")
+                for secret_tok in (tok_full, tok_peek, tok_revoked, fed.TOKEN_PREFIX):
+                    self.assertNotIn(secret_tok, audit_text)
+
+            # E1-3c: Replay protection (reused Nonce -> 401 REPLAY_NONCE_REUSED; tampered sig -> 401 REPLAY_SIGNATURE_INVALID)
+            with _RunningHub(bus_dir=tmp, require_replay_headers=True) as rh_rep:
+                raw_payload = json.dumps({"event_ids": ["ev-missing"]}).encode("utf-8")
+                replay_hdrs = hub.build_replay_headers(
+                    tok_full,
+                    "POST",
+                    "/hub/v1/agents/agent_a/events/ack",
+                    raw_payload,
+                    nonce="ack-nonce-unique-1",
+                )
+                replay_hdrs["Content-Type"] = "application/json"
+                st_ok, hdrs_ok, body_ok = rh_rep.request(
+                    "POST",
+                    "/hub/v1/agents/agent_a/events/ack",
+                    token=tok_full,
+                    raw_body=raw_payload,
+                    headers=replay_hdrs,
+                )
+                self.assertEqual(200, st_ok, body_ok)
+                self.assertIn("no-store", hdrs_ok.get("cache-control", "").lower())
+
+                # Exact same nonce replayed -> 401 REPLAY_NONCE_REUSED
+                st_dup, hdrs_dup, body_dup = rh_rep.request(
+                    "POST",
+                    "/hub/v1/agents/agent_a/events/ack",
+                    token=tok_full,
+                    raw_body=raw_payload,
+                    headers=replay_hdrs,
+                )
+                self.assertEqual(401, st_dup, body_dup)
+                self.assertEqual("REPLAY_NONCE_REUSED", body_dup.get("error"))
+                self.assertIn("no-store", hdrs_dup.get("cache-control", "").lower())
+
+                # Tampered signature -> 401 REPLAY_SIGNATURE_INVALID
+                tampered_hdrs = dict(
+                    hub.build_replay_headers(
+                        tok_full,
+                        "POST",
+                        "/hub/v1/agents/agent_a/events/ack",
+                        raw_payload,
+                        nonce="ack-nonce-tamper-2",
+                    )
+                )
+                tampered_hdrs["X-Agy-Signature"] = "f" * 64
+                tampered_hdrs["Content-Type"] = "application/json"
+                st_sig, hdrs_sig, body_sig = rh_rep.request(
+                    "POST",
+                    "/hub/v1/agents/agent_a/events/ack",
+                    token=tok_full,
+                    raw_body=raw_payload,
+                    headers=tampered_hdrs,
+                )
+                self.assertEqual(401, st_sig, body_sig)
+                self.assertEqual("REPLAY_SIGNATURE_INVALID", body_sig.get("error"))
+                self.assertIn("no-store", hdrs_sig.get("cache-control", "").lower())
+
+                # Event still untouched and audit fully redacted
+                self.assertEqual(1, len(hub.list_leader_events(tmp, "agent_a")))
+                self.assertNotIn(tok_full, audit_path.read_text(encoding="utf-8"))
+
+    def test_e2_events_ack_raw_path_injection_and_cross_agent_isolation(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, _clean_env({"AGY_BOT_BUS_DIR": tmp}), clear=True):
+            owner = fed.make_owner_auth("owner")
+            self._register_pull_agent(tmp, owner, "agent_a")
+            self._register_pull_agent(tmp, owner, "agent_b")
+            self._register_pull_agent(
+                tmp,
+                owner,
+                "coord_peer",
+                trust_level="remote_trusted",
+                capabilities={
+                    "coordinator_peer": True,
+                    "host_server_invoke": True,
+                    "can_dispatch": True,
+                    "can_receive": True,
+                },
+            )
+            self._register_pull_agent(
+                tmp,
+                owner,
+                "local_admin_node",
+                trust_level="local_admin",
+                capabilities={
+                    "coordinator_peer": True,
+                    "host_server_invoke": True,
+                    "can_dispatch": True,
+                    "can_receive": True,
+                },
+            )
+            tok_a = fed.mint_agent_token("agent_a", owner_auth=owner, scope="full", bus_dir=tmp)["token"]
+            tok_coord = fed.mint_agent_token("coord_peer", owner_auth=owner, scope="full", bus_dir=tmp)["token"]
+            tok_admin = fed.mint_agent_token("local_admin_node", owner_auth=owner, scope="full", bus_dir=tmp)["token"]
+
+            hub.store_leader_event(tmp, "agent_b", {"event_id": "ev-b-secret-1", "type": "batch_done"})
+            audit_path = Path(fed.federation_dir(tmp)) / "audit.jsonl"
+            leader_root = Path(fed.federation_dir(tmp)) / "leader_events"
+            dirs_before = sorted(p.name for p in leader_root.iterdir())
+
+            with _RunningHub(bus_dir=tmp) as rh:
+                # E2-1: Raw path traversal / encoded slashes / whitespace / NUL -> 400 INVALID_AGENT_ID, no dir touched
+                bad_paths = (
+                    "/hub/v1/agents/%2e%2e/events/ack",
+                    "/hub/v1/agents/agent_a%2f..%2fagent_b/events/ack",
+                    "/hub/v1/agents/agent_a%20/events/ack",
+                    "/hub/v1/agents/agent_a%00/events/ack",
+                )
+                for p in bad_paths:
+                    with self.subTest(bad_path=p):
+                        st, hdrs, body = rh.request("POST", p, token=tok_a, body={"all": True})
+                        self.assertEqual(400, st, f"{p} -> {st}: {body}")
+                        self.assertEqual("INVALID_AGENT_ID", body.get("error"))
+                        self.assertIn("no-store", hdrs.get("cache-control", "").lower())
+
+                self.assertEqual(dirs_before, sorted(p.name for p in leader_root.iterdir()))
+
+                # E2-2: Cross-agent ack (ordinary, coordinator_peer, local_admin) on agent_b and AGENT_B -> 403 + redacted audit
+                for label, tok in (("agent_a", tok_a), ("coord_peer", tok_coord), ("local_admin", tok_admin)):
+                    for target_path in (
+                        "/hub/v1/agents/agent_b/events/ack",
+                        "/hub/v1/agents/AGENT_B/events/ack",
+                    ):
+                        with self.subTest(caller=label, target=target_path):
+                            before_lines = len(audit_path.read_text(encoding="utf-8").splitlines()) if audit_path.is_file() else 0
+                            st, hdrs, body = rh.request("POST", target_path, token=tok, body={"all": True})
+                            self.assertEqual(403, st, f"{label} {target_path} -> {st}: {body}")
+                            self.assertEqual("CROSS_AGENT_FORBIDDEN", body.get("error"))
+                            self.assertIn("no-store", hdrs.get("cache-control", "").lower())
+                            after_text = audit_path.read_text(encoding="utf-8")
+                            self.assertGreater(len(after_text.splitlines()), before_lines)
+                            self.assertNotIn(tok, after_text)
+                            self.assertNotIn(fed.TOKEN_PREFIX, after_text)
+
+                # agent_b's event MUST suffer zero damage
+                remaining_b = hub.list_leader_events(tmp, "agent_b")
+                self.assertEqual(["ev-b-secret-1"], [e["event_id"] for e in remaining_b])
+
+    def test_e3_events_ack_strict_body_schema_and_type_coercion(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, _clean_env({"AGY_BOT_BUS_DIR": tmp}), clear=True):
+            owner = fed.make_owner_auth("owner")
+            self._register_pull_agent(tmp, owner, "agent_a")
+            tok_a = fed.mint_agent_token("agent_a", owner_auth=owner, scope="full", bus_dir=tmp)["token"]
+            hub.store_leader_event(tmp, "agent_a", {"event_id": "ev-1", "type": "batch_done"})
+            hub.store_leader_event(tmp, "agent_a", {"event_id": "ev-2", "type": "batch_done"})
+            audit_path = Path(fed.federation_dir(tmp)) / "audit.jsonl"
+
+            invalid_raw_cases: List[Tuple[str, bytes]] = [
+                ("empty_bytes", b""),
+                ("empty_object", b"{}"),
+                ("json_array", b"[]"),
+                ("both_event_ids_and_all", json.dumps({"event_ids": ["ev-1"], "all": True}).encode("utf-8")),
+                ("unknown_key_force", json.dumps({"all": True, "force": True}).encode("utf-8")),
+                ("unknown_key_extra", json.dumps({"event_ids": ["ev-1"], "extra": 1}).encode("utf-8")),
+                ("all_false", json.dumps({"all": False}).encode("utf-8")),
+                ("all_int_1", json.dumps({"all": 1}).encode("utf-8")),
+                ("all_str_true", json.dumps({"all": "true"}).encode("utf-8")),
+                ("event_ids_string", json.dumps({"event_ids": "ev-1"}).encode("utf-8")),
+                ("event_ids_empty_list", json.dumps({"event_ids": []}).encode("utf-8")),
+                ("event_ids_int_item", json.dumps({"event_ids": [123]}).encode("utf-8")),
+                ("event_ids_empty_str", json.dumps({"event_ids": [""]}).encode("utf-8")),
+                ("event_ids_whitespace", json.dumps({"event_ids": ["   "]}).encode("utf-8")),
+                ("event_ids_untrimmed", json.dumps({"event_ids": [" ev-1 "]}).encode("utf-8")),
+                ("event_ids_201_items", json.dumps({"event_ids": [f"ev-{i}" for i in range(201)]}).encode("utf-8")),
+                ("event_ids_len_129", json.dumps({"event_ids": ["x" * 129]}).encode("utf-8")),
+                ("event_ids_dotdot", json.dumps({"event_ids": ["../other"]}).encode("utf-8")),
+                ("event_ids_slash", json.dumps({"event_ids": ["a/b"]}).encode("utf-8")),
+                ("event_ids_backslash", json.dumps({"event_ids": ["a\\b"]}).encode("utf-8")),
+                ("event_ids_nul", json.dumps({"event_ids": ["ev\x001"]}).encode("utf-8")),
+                ("event_ids_ctrl_lf", json.dumps({"event_ids": ["ev\n1"]}).encode("utf-8")),
+            ]
+
+            with _RunningHub(bus_dir=tmp) as rh:
+                for label, raw_payload in invalid_raw_cases:
+                    with self.subTest(case=label):
+                        st, hdrs, body = rh.request(
+                            "POST",
+                            "/hub/v1/agents/agent_a/events/ack",
+                            token=tok_a,
+                            raw_body=raw_payload,
+                            headers={"Content-Type": "application/json"},
+                        )
+                        self.assertEqual(400, st, f"{label} -> {st}: {body}")
+                        self.assertIn("no-store", hdrs.get("cache-control", "").lower())
+
+                # Direct non-dict call to op_ack_leader_events also fails closed with 400 INVALID_ACK_REQUEST
+                with self.assertRaises(hub.HubError) as ctx:
+                    rh.server.op_ack_leader_events({"actor_id": "agent_a"}, "agent_a", [], raw_token=tok_a)
+                self.assertEqual(400, ctx.exception.http_status)
+                self.assertEqual("INVALID_ACK_REQUEST", ctx.exception.error_code)
+
+            # 0 files deleted and 0 allowed audit entries written
+            self.assertEqual(["ev-1", "ev-2"], [e["event_id"] for e in hub.list_leader_events(tmp, "agent_a")])
+            if audit_path.is_file():
+                entries = [json.loads(ln) for ln in audit_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+                allowed_acks = [e for e in entries if e.get("event") == "pull_events_ack" and e.get("outcome") == "allowed"]
+                self.assertEqual([], allowed_acks)
+
+    def test_e4_events_ack_symlink_escape_tmp_guard_exact_id_and_concurrent_unlink(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, _clean_env({"AGY_BOT_BUS_DIR": tmp}), clear=True):
+            owner = fed.make_owner_auth("owner")
+            self._register_pull_agent(tmp, owner, "agent_a")
+            tok_a = fed.mint_agent_token("agent_a", owner_auth=owner, scope="full", bus_dir=tmp)["token"]
+
+            ed = Path(hub._leader_events_dir(tmp, "agent_a"))
+            ed.mkdir(parents=True, exist_ok=True)
+
+            # 1. External victim file + symlink 9999_evil.json inside leader_events/agent_a
+            victim = Path(tmp) / "outside_victim.json"
+            victim_payload = json.dumps({"event_id": "ev-evil", "sensitive": "DO_NOT_DELETE"})
+            victim.write_text(victim_payload, encoding="utf-8")
+            evil_link = ed / "9999_evil.json"
+            evil_link.symlink_to(victim)
+
+            # 2. .tmp temporary file
+            tmp_file = ed / "1234_inflight.json.tmp"
+            tmp_file.write_text(json.dumps({"event_id": "ev-tmp"}), encoding="utf-8")
+
+            # 3. File whose filename contains `ev-x` while JSON `event_id` is `ev-real`
+            mismatch_file = ed / "9998_ev-x.json"
+            mismatch_file.write_text(json.dumps({"event_id": "ev-real", "type": "batch_done"}), encoding="utf-8")
+
+            with _RunningHub(bus_dir=tmp) as rh:
+                # Filename substring `ev-x` MUST NOT match JSON `event_id: ev-real`
+                st1, _, b1 = rh.request(
+                    "POST",
+                    "/hub/v1/agents/agent_a/events/ack",
+                    token=tok_a,
+                    body={"event_ids": ["ev-x"]},
+                )
+                self.assertEqual(200, st1, b1)
+                self.assertEqual(0, b1["acked"])
+                self.assertEqual([], b1["acked_ids"])
+                self.assertEqual(1, b1["remaining"])
+                self.assertTrue(mismatch_file.is_file())
+
+                # Symlink target event_id `ev-evil` MUST be skipped; victim & symlink untouched
+                st2, _, b2 = rh.request(
+                    "POST",
+                    "/hub/v1/agents/agent_a/events/ack",
+                    token=tok_a,
+                    body={"event_ids": ["ev-evil"]},
+                )
+                self.assertEqual(200, st2, b2)
+                self.assertEqual(0, b2["acked"])
+                self.assertEqual(1, b2["remaining"])
+                self.assertTrue(victim.is_file())
+                self.assertEqual(victim_payload, victim.read_text(encoding="utf-8"))
+                self.assertTrue(evil_link.is_symlink())
+
+                # `all: true` deletes ONLY the real event file; symlink, external victim, and `.tmp` all survive
+                st3, _, b3 = rh.request(
+                    "POST",
+                    "/hub/v1/agents/agent_a/events/ack",
+                    token=tok_a,
+                    body={"all": True},
+                )
+                self.assertEqual(200, st3, b3)
+                self.assertEqual(1, b3["acked"])
+                self.assertEqual(["ev-real"], b3["acked_ids"])
+                self.assertEqual(0, b3["remaining"])
+                self.assertFalse(mismatch_file.exists())
+                self.assertTrue(victim.is_file())
+                self.assertEqual(victim_payload, victim.read_text(encoding="utf-8"))
+                self.assertTrue(evil_link.is_symlink())
+                self.assertTrue(tmp_file.is_file())
+
+                # Concurrent FileNotFoundError during unlink MUST degrade gracefully (200, never 500)
+                hub.store_leader_event(tmp, "agent_a", {"event_id": "ev-race", "type": "batch_done"})
+                real_unlink = os.unlink
+
+                def _vanishing_unlink(path: str) -> None:
+                    if str(path).endswith("ev-race.json"):
+                        raise FileNotFoundError(path)
+                    real_unlink(path)
+
+                with mock.patch("federation_hub.os.unlink", side_effect=_vanishing_unlink):
+                    st4, _, b4 = rh.request(
+                        "POST",
+                        "/hub/v1/agents/agent_a/events/ack",
+                        token=tok_a,
+                        body={"event_ids": ["ev-race"]},
+                    )
+                self.assertEqual(200, st4, b4)
+                self.assertEqual(0, b4["acked"])
+                self.assertEqual([], b4["acked_ids"])
+                self.assertEqual(0, b4["remaining"])
+
+    def test_e5_events_ack_idempotency_peek_inbox_sync_and_audit(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, _clean_env({"AGY_BOT_BUS_DIR": tmp}), clear=True):
+            owner = fed.make_owner_auth("owner")
+            self._register_pull_agent(tmp, owner, "agent_a")
+            self._register_pull_agent(tmp, owner, "fresh_agent")
+            tok_a_full = fed.mint_agent_token("agent_a", owner_auth=owner, scope="full", bus_dir=tmp)["token"]
+            tok_a_peek = fed.mint_agent_token("agent_a", owner_auth=owner, scope="peek", bus_dir=tmp)["token"]
+            tok_fresh = fed.mint_agent_token("fresh_agent", owner_auth=owner, scope="full", bus_dir=tmp)["token"]
+
+            hub.store_leader_event(tmp, "agent_a", {"event_id": "ev-1", "type": "batch_done"})
+            hub.store_leader_event(tmp, "agent_a", {"event_id": "ev-2", "type": "batch_done"})
+            audit_path = Path(fed.federation_dir(tmp)) / "audit.jsonl"
+
+            with _RunningHub(bus_dir=tmp) as rh:
+                # Baseline /peek & /inbox show 2 pending events
+                st_p0, _, p0 = rh.request("GET", "/hub/v1/agents/agent_a/peek", token=tok_a_peek)
+                self.assertEqual(200, st_p0)
+                self.assertEqual(2, p0["pending_events"])
+                self.assertEqual(2, p0["pending"])
+                self.assertTrue(p0["watermark"])
+
+                # E5-1: Duplicate + missing IDs -> acks ev-1 once, remaining=1, /peek & /inbox sync immediately
+                st1, hdr1, b1 = rh.request(
+                    "POST",
+                    "/hub/v1/agents/agent_a/events/ack",
+                    token=tok_a_full,
+                    body={"event_ids": ["ev-1", "ev-1", "ev-missing"]},
+                )
+                self.assertEqual(200, st1, b1)
+                self.assertIn("no-store", hdr1.get("cache-control", "").lower())
+                self.assertEqual(
+                    {"ok": True, "agent_id": "agent_a", "acked": 1, "acked_ids": ["ev-1"], "remaining": 1},
+                    b1,
+                )
+
+                _, _, p1 = rh.request("GET", "/hub/v1/agents/agent_a/peek", token=tok_a_peek)
+                _, _, inb1 = rh.request("GET", "/hub/v1/agents/agent_a/inbox", token=tok_a_full)
+                self.assertEqual(1, p1["pending_events"])
+                self.assertEqual(1, p1["pending"])
+                self.assertNotEqual(p0["watermark"], p1["watermark"])
+                self.assertEqual(["ev-2"], [e["event_id"] for e in inb1["events"]])
+
+                # E5-2: Repeating ["ev-1"] is idempotent (acked=0, remaining=1)
+                st2, hdr2, b2 = rh.request(
+                    "POST",
+                    "/hub/v1/agents/agent_a/events/ack",
+                    token=tok_a_full,
+                    body={"event_ids": ["ev-1"]},
+                )
+                self.assertEqual(200, st2, b2)
+                self.assertIn("no-store", hdr2.get("cache-control", "").lower())
+                self.assertEqual(0, b2["acked"])
+                self.assertEqual([], b2["acked_ids"])
+                self.assertEqual(1, b2["remaining"])
+
+                # E5-3: `{"all": true}` clears remaining event -> /peek resets to pending=0, watermark=""
+                st3, hdr3, b3 = rh.request(
+                    "POST",
+                    "/hub/v1/agents/agent_a/events/ack",
+                    token=tok_a_full,
+                    body={"all": True},
+                )
+                self.assertEqual(200, st3, b3)
+                self.assertIn("no-store", hdr3.get("cache-control", "").lower())
+                self.assertEqual(1, b3["acked"])
+                self.assertEqual(["ev-2"], b3["acked_ids"])
+                self.assertEqual(0, b3["remaining"])
+
+                _, _, p_zero = rh.request("GET", "/hub/v1/agents/agent_a/peek", token=tok_a_peek)
+                _, _, inb_zero = rh.request("GET", "/hub/v1/agents/agent_a/inbox", token=tok_a_full)
+                self.assertEqual(0, p_zero["pending"])
+                self.assertEqual(0, p_zero["pending_events"])
+                self.assertEqual("", p_zero["watermark"])
+                self.assertEqual([], inb_zero["events"])
+
+                # E5-4: Fresh agent with non-existent leader_events dir -> idempotent 0 & MUST NOT create empty dir
+                fresh_dir = Path(hub._leader_events_dir(tmp, "fresh_agent"))
+                self.assertFalse(fresh_dir.exists())
+                st4, hdr4, b4 = rh.request(
+                    "POST",
+                    "/hub/v1/agents/fresh_agent/events/ack",
+                    token=tok_fresh,
+                    body={"all": True},
+                )
+                self.assertEqual(200, st4, b4)
+                self.assertIn("no-store", hdr4.get("cache-control", "").lower())
+                self.assertEqual(
+                    {"ok": True, "agent_id": "fresh_agent", "acked": 0, "acked_ids": [], "remaining": 0},
+                    b4,
+                )
+                self.assertFalse(fresh_dir.exists())
+
+            # Redacted audit log recorded for allowed acks
+            audit_raw = audit_path.read_text(encoding="utf-8")
+            for secret_tok in (tok_a_full, tok_a_peek, tok_fresh, fed.TOKEN_PREFIX):
+                self.assertNotIn(secret_tok, audit_raw)
+            entries = [json.loads(ln) for ln in audit_raw.splitlines() if ln.strip()]
+            ack_entries = [
+                e
+                for e in entries
+                if e.get("event") == "pull_events_ack"
+                and e.get("action") == "events_ack"
+                and e.get("outcome") == "allowed"
+            ]
+            self.assertEqual(4, len(ack_entries))
+            self.assertEqual({"acked": 1, "remaining": 1}, ack_entries[0].get("detail"))
+            self.assertEqual({"acked": 0, "remaining": 1}, ack_entries[1].get("detail"))
+            self.assertEqual({"acked": 1, "remaining": 0}, ack_entries[2].get("detail"))
+            self.assertEqual({"acked": 0, "remaining": 0}, ack_entries[3].get("detail"))
+
+    def test_e6_pull_result_alias_precedence_normalization_truncation_and_regressions(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, _clean_env({"AGY_BOT_BUS_DIR": tmp}), clear=True):
+            owner = fed.make_owner_auth("owner")
+            self._register_pull_agent(tmp, owner, "worker_a")
+            self._register_pull_agent(tmp, owner, "worker_b")
+            tok_a = fed.mint_agent_token("worker_a", owner_auth=owner, scope="full", bus_dir=tmp)["token"]
+            tok_b = fed.mint_agent_token("worker_b", owner_auth=owner, scope="full", bus_dir=tmp)["token"]
+
+            cases: List[Tuple[str, Dict[str, Any], str]] = [
+                (
+                    "job-e6-primary",
+                    {"status": "done", "result_text": "primary-wins", "result": "alias-ignored"},
+                    "primary-wins",
+                ),
+                (
+                    "job-e6-empty-primary",
+                    {"status": "done", "result_text": "", "result": "alias-must-not-override"},
+                    "",
+                ),
+                (
+                    "job-e6-alias-only",
+                    {"status": "done", "result": "from-result-alias"},
+                    "from-result-alias",
+                ),
+                (
+                    "job-e6-none-fallback",
+                    {"status": "done", "result_text": None, "result": "fallback-after-none"},
+                    "fallback-after-none",
+                ),
+                (
+                    "job-e6-dict-result",
+                    {"status": "done", "result": {"ok": True, "msg": "中文载荷", "count": 3}},
+                    json.dumps({"ok": True, "msg": "中文载荷", "count": 3}, ensure_ascii=False),
+                ),
+                (
+                    "job-e6-list-result",
+                    {"status": "done", "result": [1, "two", {"three": 3}]},
+                    json.dumps([1, "two", {"three": 3}], ensure_ascii=False),
+                ),
+                (
+                    "job-e6-int-result",
+                    {"status": "done", "result": 42},
+                    "42",
+                ),
+                (
+                    "job-e6-none-result",
+                    {"status": "done", "result": None},
+                    "",
+                ),
+                (
+                    "job-e6-oversize",
+                    {"status": "done", "result": "Z" * (hub.MAX_RESULT_TEXT_CHARS + 5000)},
+                    "Z" * hub.MAX_RESULT_TEXT_CHARS,
+                ),
+            ]
+
+            with _RunningHub(bus_dir=tmp) as rh:
+                for jid, payload, expected_text in cases:
+                    with self.subTest(job_id=jid):
+                        self._seed_claimed_synced_job(rh, tmp, owner, "worker_a", tok_a, jid)
+                        st, hdrs, body = rh.request(
+                            "POST",
+                            f"/hub/v1/jobs/{jid}/result",
+                            token=tok_a,
+                            body=payload,
+                        )
+                        self.assertEqual(200, st, f"{jid} -> {st}: {body}")
+                        self.assertIn("no-store", hdrs.get("cache-control", "").lower())
+                        self.assertTrue(body.get("bus_synced"))
+                        self.assertEqual(expected_text, body["job"]["result_text"])
+                        with hub._with_bot_bus_dir(tmp):
+                            bus_job = bot_bus.get_job(jid)
+                        self.assertIsInstance(bus_job, dict)
+                        self.assertEqual("done", bus_job["status"])
+                        self.assertEqual(expected_text, bus_job["result_text"])
+                        self.assertLessEqual(len(bus_job["result_text"]), hub.MAX_RESULT_TEXT_CHARS)
+
+                # Regression 1: 400 INVALID_STATUS
+                self._seed_claimed_synced_job(rh, tmp, owner, "worker_a", tok_a, "job-e6-reg")
+                st_bad, _, body_bad = rh.request(
+                    "POST",
+                    "/hub/v1/jobs/job-e6-reg/result",
+                    token=tok_a,
+                    body={"status": "pending", "result": "x"},
+                )
+                self.assertEqual(400, st_bad, body_bad)
+                self.assertEqual("INVALID_STATUS", body_bad.get("error"))
+
+                # Regression 2: 403 CROSS_AGENT_FORBIDDEN
+                st_x, _, body_x = rh.request(
+                    "POST",
+                    "/hub/v1/jobs/job-e6-reg/result",
+                    token=tok_b,
+                    body={"status": "done", "result": "hijack"},
+                )
+                self.assertEqual(403, st_x, body_x)
+                self.assertEqual("CROSS_AGENT_FORBIDDEN", body_x.get("error"))
+
+                # Regression 3: 409 JOB_STATE_CONFLICT (already terminal AND unclaimed)
+                st_done, _, _ = rh.request(
+                    "POST",
+                    "/hub/v1/jobs/job-e6-reg/result",
+                    token=tok_a,
+                    body={"status": "error", "result": "err-body", "error": "boom"},
+                )
+                self.assertEqual(200, st_done)
+                st_dup, _, body_dup = rh.request(
+                    "POST",
+                    "/hub/v1/jobs/job-e6-reg/result",
+                    token=tok_a,
+                    body={"status": "done", "result": "second-try"},
+                )
+                self.assertEqual(409, st_dup, body_dup)
+                self.assertEqual("JOB_STATE_CONFLICT", body_dup.get("error"))
+
+                q = fed.PullWorkerQueue(tmp)
+                q.enqueue("worker_a", "unclaimed job", job_id="job-e6-unclaimed", owner_auth=owner)
+                st_unc, _, body_unc = rh.request(
+                    "POST",
+                    "/hub/v1/jobs/job-e6-unclaimed/result",
+                    token=tok_a,
+                    body={"status": "done", "result": "too-early"},
+                )
+                self.assertEqual(409, st_unc, body_unc)
+                self.assertEqual("JOB_STATE_CONFLICT", body_unc.get("error"))
+
+
 if __name__ == "__main__":
     unittest.main()
