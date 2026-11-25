@@ -2372,5 +2372,398 @@ class TestWithBotBusDirBindingIsolation(unittest.TestCase):
             self.assertIn("b2_nested", json.loads((Path(nested_dir) / "team_config.json").read_text(encoding="utf-8"))["bots"])
 
 
+# ==============================================================================
+# Prod-Release Contract Suite: Hub GET /hub/v1/agents/<aid>/peek & peek scope (C1..C5, C7)
+# ==============================================================================
+class TestHubPeekEndpointProdRelease(unittest.TestCase):
+    """Comprehensive security & functional suite for read-only `/peek` and `scope='peek'` tokens."""
+
+    def test_c1_peek_scope_escape_non_get_and_query_token_blocked(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, _clean_env({"AGY_BOT_BUS_DIR": tmp}), clear=True):
+            owner = fed.make_owner_auth("owner")
+            fed.register_agent(
+                "agent_a",
+                kind="http_a2a",
+                driver="pull_worker",
+                transport="pull_worker",
+                capabilities={
+                    "coordinator_peer": True,
+                    "host_server_invoke": True,
+                    "can_dispatch": True,
+                    "can_receive": True,
+                },
+                trust_level="remote_trusted",
+                owner_auth=owner,
+                bus_dir=tmp,
+            )
+            tok_peek = fed.mint_agent_token("agent_a", owner_auth=owner, scope="peek", bus_dir=tmp)["token"]
+            q = fed.PullWorkerQueue(tmp)
+            job = q.enqueue("agent_a", "secret prompt", job_id="pull-c1-job", owner_auth=owner)
+            jid = job["job_id"]
+
+            with _RunningHub(bus_dir=tmp) as rh:
+                # Sanity: GET /hub/v1/agents/agent_a/peek succeeds with peek token
+                st_ok, _, body_ok = rh.request("GET", "/hub/v1/agents/agent_a/peek", token=tok_peek)
+                self.assertEqual(200, st_ok, body_ok)
+                self.assertEqual(1, body_ok["pending"])
+
+                # C1-1: All other GET endpoints MUST fail-closed with 401 UNAUTHORIZED
+                forbidden_gets = (
+                    "/hub/v1/me",
+                    "/hub/v1/teams",
+                    "/hub/v1/roster",
+                    "/hub/v1/jobs",
+                    f"/hub/v1/jobs/{jid}",
+                    "/hub/v1/agents/agent_a/inbox",
+                )
+                for path in forbidden_gets:
+                    with self.subTest(method="GET", path=path):
+                        st, _, body = rh.request("GET", path, token=tok_peek)
+                        self.assertEqual(401, st, f"GET {path} returned {st}: {body}")
+                        self.assertEqual("UNAUTHORIZED", body.get("error"))
+
+                # C1-2: All mutating / MCP / host bridge POST endpoints MUST fail-closed with 401 UNAUTHORIZED
+                forbidden_posts = (
+                    ("/hub/v1/dispatch", {"target": "agent_a", "prompt": "p"}),
+                    ("/hub/v1/jobs/claim", {"job_id": jid}),
+                    (f"/hub/v1/jobs/{jid}/claim", {}),
+                    (f"/hub/v1/jobs/{jid}/result", {"status": "done", "result_text": "x"}),
+                    (f"/hub/v1/jobs/{jid}/cancel", {"reason": "x"}),
+                    ("/hub/mcp", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+                    ("/hub/v1/host/exec", {"argv": ["pwd"]}),
+                    ("/hub/v1/host/files", {"op": "list", "path": "."}),
+                    ("/hub/v1/host/services", {"op": "status", "unit": "agy-federation-hub.service"}),
+                    ("/hub/v1/host/invoke_agent", {"agent_id": "agent_a", "prompt": "hi"}),
+                )
+                for path, payload in forbidden_posts:
+                    with self.subTest(method="POST", path=path):
+                        st, _, body = rh.request("POST", path, token=tok_peek, body=payload)
+                        self.assertEqual(401, st, f"POST {path} returned {st}: {body}")
+                        self.assertEqual("UNAUTHORIZED", body.get("error"))
+
+                # C1-3: Non-GET methods on /peek MUST fail-closed with 401 UNAUTHORIZED
+                for method in ("POST", "PUT", "PATCH", "DELETE"):
+                    with self.subTest(method=method, path="/hub/v1/agents/agent_a/peek"):
+                        st, _, body = rh.request(method, "/hub/v1/agents/agent_a/peek", token=tok_peek, body={})
+                        self.assertEqual(401, st, f"{method} /peek returned {st}: {body}")
+                        self.assertEqual("UNAUTHORIZED", body.get("error"))
+
+                # C1-4: Query-string token MUST be rejected by _check_query_tokens with 400
+                st_q, _, body_q = rh.request("GET", f"/hub/v1/agents/agent_a/peek?token={tok_peek}")
+                self.assertEqual(400, st_q, body_q)
+                self.assertEqual("QUERY_TOKEN_FORBIDDEN", body_q.get("error"))
+
+    def test_c2_peek_cross_agent_isolation_and_path_encoding_bypass(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, _clean_env({"AGY_BOT_BUS_DIR": tmp}), clear=True):
+            owner = fed.make_owner_auth("owner")
+            for aid in ("agent_a", "agent_b"):
+                fed.register_agent(
+                    aid,
+                    kind="http_a2a",
+                    driver="pull_worker",
+                    transport="pull_worker",
+                    owner_auth=owner,
+                    bus_dir=tmp,
+                )
+            tok_a_peek = fed.mint_agent_token("agent_a", owner_auth=owner, scope="peek", bus_dir=tmp)["token"]
+            tok_a_full = fed.mint_agent_token("agent_a", owner_auth=owner, scope="full", bus_dir=tmp)["token"]
+            q = fed.PullWorkerQueue(tmp)
+            q.enqueue("agent_b", "CONFIDENTIAL_FOR_B", job_id="pull-b-only", owner_auth=owner)
+
+            audit_path = Path(fed.federation_dir(tmp)) / "audit.jsonl"
+            with _RunningHub(bus_dir=tmp) as rh:
+                for tok_label, tok in (("peek", tok_a_peek), ("full", tok_a_full)):
+                    # C2-1 & C2-2: Direct cross-agent and uppercase variant -> 403 CROSS_AGENT_FORBIDDEN + audit
+                    for bad_target in ("/hub/v1/agents/agent_b/peek", "/hub/v1/agents/AGENT_B/peek"):
+                        before_lines = len(audit_path.read_text(encoding="utf-8").splitlines()) if audit_path.is_file() else 0
+                        st, _, body = rh.request("GET", bad_target, token=tok)
+                        self.assertEqual(403, st, f"{tok_label} {bad_target} -> {st}: {body}")
+                        self.assertEqual("CROSS_AGENT_FORBIDDEN", body.get("error"))
+                        after_text = audit_path.read_text(encoding="utf-8")
+                        self.assertGreater(len(after_text.splitlines()), before_lines)
+                        self.assertNotIn(tok, after_text)
+                        self.assertNotIn("CONFIDENTIAL_FOR_B", json.dumps(body))
+
+                    # C2-3: Encoded traversal / whitespace / suffix bypasses -> 400 INVALID_AGENT_ID or 401/404
+                    encoded_bad_paths = (
+                        "/hub/v1/agents/agent_b%2F..%2Fagent_a/peek",
+                        "/hub/v1/agents/..%2Fagent_b/peek",
+                        "/hub/v1/agents/%20agent_b%20/peek",
+                    )
+                    for path in encoded_bad_paths:
+                        st, _, body = rh.request("GET", path, token=tok)
+                        self.assertEqual(400, st, f"{tok_label} {path} -> {st}: {body}")
+                        self.assertEqual("INVALID_AGENT_ID", body.get("error"))
+                        self.assertNotIn("pending", body)
+
+                    for non_match_path in (
+                        "/hub/v1/agents/agent_a/peek/..",
+                        "/hub/v1/agents/agent_a/..%2Finbox",
+                    ):
+                        st, _, body = rh.request("GET", non_match_path, token=tok)
+                        expected_codes = (401,) if tok_label == "peek" else (400, 404)
+                        self.assertIn(st, expected_codes, f"{tok_label} {non_match_path} -> {st}: {body}")
+                        self.assertNotIn("jobs", body)
+                        self.assertNotIn("pending", body)
+
+    def test_c3_peek_revocation_disable_rotation_and_legacy_keepalive(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, _clean_env({"AGY_BOT_BUS_DIR": tmp}), clear=True):
+            owner = fed.make_owner_auth("owner")
+            for aid in ("dual_rev", "dual_dis", "dual_rot"):
+                fed.register_agent(
+                    aid,
+                    kind="http_a2a",
+                    driver="pull_worker",
+                    transport="pull_worker",
+                    owner_auth=owner,
+                    bus_dir=tmp,
+                )
+            rev_full = fed.mint_agent_token("dual_rev", owner_auth=owner, scope="full", bus_dir=tmp)["token"]
+            rev_peek = fed.mint_agent_token("dual_rev", owner_auth=owner, scope="peek", bus_dir=tmp)["token"]
+
+            dis_peek = fed.mint_agent_token("dual_dis", owner_auth=owner, scope="peek", bus_dir=tmp)["token"]
+
+            rot_full_rec = fed.mint_agent_token("dual_rot", owner_auth=owner, scope="full", bus_dir=tmp)
+            rot_peek_rec = fed.mint_agent_token("dual_rot", owner_auth=owner, scope="peek", bus_dir=tmp)
+            rot_full = rot_full_rec["token"]
+            rot_peek = rot_peek_rec["token"]
+
+            with _RunningHub(bus_dir=tmp) as rh:
+                # C3-1a: revoke_agent on dual-token agent -> immediate 401 on SAME keep-alive connection
+                conn1 = http.client.HTTPConnection("127.0.0.1", rh.port, timeout=5.0)
+                try:
+                    self.assertEqual(200, rh.request("GET", "/hub/v1/agents/dual_rev/peek", token=rev_peek, conn=conn1)[0])
+                    fed.revoke_agent("dual_rev", owner_auth=owner, bus_dir=tmp)
+                    self.assertEqual(401, rh.request("GET", "/hub/v1/agents/dual_rev/peek", token=rev_peek, conn=conn1)[0])
+                    self.assertEqual(401, rh.request("GET", "/hub/v1/agents/dual_rev/peek", token=rev_full, conn=conn1)[0])
+                finally:
+                    conn1.close()
+
+                # C3-1b: enabled=False -> immediate 401 on SAME keep-alive connection
+                conn2 = http.client.HTTPConnection("127.0.0.1", rh.port, timeout=5.0)
+                try:
+                    self.assertEqual(200, rh.request("GET", "/hub/v1/agents/dual_dis/peek", token=dis_peek, conn=conn2)[0])
+                    fed.update_agent("dual_dis", enabled=False, owner_auth=owner, bus_dir=tmp)
+                    self.assertEqual(401, rh.request("GET", "/hub/v1/agents/dual_dis/peek", token=dis_peek, conn=conn2)[0])
+                finally:
+                    conn2.close()
+
+                # C3-3: rotate_agent_token(scope="peek", revoke_existing=True) revokes old peek, keeps full active
+                r_peek2 = fed.rotate_agent_token("dual_rot", owner_auth=owner, scope="peek", revoke_existing=True, bus_dir=tmp)
+                self.assertEqual("peek", r_peek2["scope"])
+                self.assertEqual(1, r_peek2["revoked_previous"])
+                self.assertEqual(401, rh.request("GET", "/hub/v1/agents/dual_rot/peek", token=rot_peek)[0])
+                self.assertEqual(200, rh.request("GET", "/hub/v1/agents/dual_rot/peek", token=r_peek2["token"])[0])
+                self.assertEqual(401, rh.request("GET", "/hub/v1/me", token=r_peek2["token"])[0])
+                self.assertEqual(200, rh.request("GET", "/hub/v1/me", token=rot_full)[0])
+
+                # C3-2: revoke_agent_token(aid, token_id=peek_tid) revokes ONLY that peek token
+                fed.revoke_agent_token("dual_rot", owner_auth=owner, token_id=r_peek2["token_id"], bus_dir=tmp)
+                self.assertEqual(401, rh.request("GET", "/hub/v1/agents/dual_rot/peek", token=r_peek2["token"])[0])
+                self.assertEqual(200, rh.request("GET", "/hub/v1/agents/dual_rot/peek", token=rot_full)[0])
+
+                # C3-4: Legacy token_records missing `scope` treated as `"full"`
+                agents_path = Path(fed.agents_file_path(tmp))
+                disk_obj = json.loads(agents_path.read_text(encoding="utf-8"))
+                for tr in disk_obj["agents"]["dual_rot"]["token_records"]:
+                    if tr["token_id"] == rot_full_rec["token_id"]:
+                        tr.pop("scope", None)
+                agents_path.write_text(json.dumps(disk_obj, indent=2), encoding="utf-8")
+                self.assertEqual(200, rh.request("GET", "/hub/v1/me", token=rot_full)[0])
+                self.assertEqual(200, rh.request("GET", "/hub/v1/agents/dual_rot/peek", token=rot_full)[0])
+
+    def test_c4_c5_peek_zero_leak_cache_header_and_watermark_lifecycle(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, _clean_env({"AGY_BOT_BUS_DIR": tmp}), clear=True):
+            owner = fed.make_owner_auth("owner")
+            fed.register_agent(
+                "muse_node",
+                kind="http_a2a",
+                driver="pull_worker",
+                transport="pull_worker",
+                owner_auth=owner,
+                bus_dir=tmp,
+            )
+            tok_full = fed.mint_agent_token("muse_node", owner_auth=owner, scope="full", bus_dir=tmp)["token"]
+            tok_peek = fed.mint_agent_token("muse_node", owner_auth=owner, scope="peek", bus_dir=tmp)["token"]
+            q = fed.PullWorkerQueue(tmp)
+
+            expected_keys = {
+                "ok",
+                "agent_id",
+                "pending",
+                "pending_jobs",
+                "pending_events",
+                "watermark",
+                "latest_created_at_ms",
+                "oldest_created_at",
+            }
+            with _RunningHub(bus_dir=tmp) as rh:
+                # C5-1: Idle x2
+                st0a, hdr0a, b0a = rh.request("GET", "/hub/v1/agents/muse_node/peek", token=tok_peek)
+                st0b, _, b0b = rh.request("GET", "/hub/v1/agents/muse_node/peek", token=tok_peek)
+                self.assertEqual(200, st0a)
+                self.assertEqual(200, st0b)
+                self.assertEqual(expected_keys, set(b0a.keys()))
+                self.assertIn("no-store", hdr0a.get("cache-control", "").lower())
+                self.assertEqual(b0a, b0b)
+                self.assertEqual(0, b0a["pending"])
+                self.assertEqual("", b0a["watermark"])
+
+                # C5-2 & C4: Same-millisecond 1st & 2nd enqueue + sensitive payload check
+                fixed_ts = 1764001111.456
+                with mock.patch("federation_registry.time.time", return_value=fixed_ts):
+                    j1 = q.enqueue(
+                        "muse_node",
+                        "TOP_SECRET_PROMPT_BODY_1",
+                        job_id="pull-secret-jid-01",
+                        metadata={"hint": "TOP_SECRET_META_1"},
+                        owner_auth=owner,
+                    )
+                    st1, hdr1, b1 = rh.request("GET", "/hub/v1/agents/muse_node/peek", token=tok_peek)
+                    j2 = q.enqueue(
+                        "muse_node",
+                        "TOP_SECRET_PROMPT_BODY_2",
+                        job_id="pull-secret-jid-02",
+                        owner_auth=owner,
+                    )
+                    st2, hdr2, b2 = rh.request("GET", "/hub/v1/agents/muse_node/peek", token=tok_peek)
+
+                self.assertEqual(200, st1)
+                self.assertEqual(200, st2)
+                self.assertEqual(expected_keys, set(b2.keys()))
+                self.assertIn("no-store", hdr1.get("cache-control", "").lower())
+                self.assertIn("no-store", hdr2.get("cache-control", "").lower())
+                self.assertEqual(1, b1["pending_jobs"])
+                self.assertEqual(2, b2["pending_jobs"])
+                self.assertNotEqual(b1["watermark"], b2["watermark"])
+
+                # C5-3 & C5-4: Claim j1, then cancel j2 & enqueue j3 (maintaining pending_jobs==1)
+                q.claim("muse_node", job_id=j1["job_id"], auth_token=tok_full)
+                _, _, b_after_claim = rh.request("GET", "/hub/v1/agents/muse_node/peek", token=tok_peek)
+                self.assertEqual(1, b_after_claim["pending_jobs"])
+                self.assertNotEqual(b2["watermark"], b_after_claim["watermark"])
+
+                q.cancel(j2["job_id"], owner_auth=owner)
+                with mock.patch("federation_registry.time.time", return_value=fixed_ts):
+                    j3 = q.enqueue("muse_node", "TOP_SECRET_PROMPT_BODY_3", job_id="pull-secret-jid-03", owner_auth=owner)
+                _, _, b_swapped = rh.request("GET", "/hub/v1/agents/muse_node/peek", token=tok_peek)
+                self.assertEqual(1, b_swapped["pending_jobs"])
+                self.assertNotEqual(b_after_claim["watermark"], b_swapped["watermark"])
+
+                # Complete j1 with sensitive result_text and cancel j3 -> pending_jobs==0
+                q.complete(j1["job_id"], "muse_node", status="done", result_text="TOP_SECRET_RESULT_TEXT", auth_token=tok_full)
+                q.cancel(j3["job_id"], owner_auth=owner)
+
+                # C5-5: Store leader_event with sensitive payload & event_id
+                ev = hub.store_leader_event(
+                    tmp,
+                    "muse_node",
+                    {
+                        "event_id": "ev-sensitive-canary-777",
+                        "type": "batch_done",
+                        "summary": "SENSITIVE_EVENT_BODY_CANARY",
+                    },
+                )
+                st_ev, hdr_ev, b_ev = rh.request("GET", "/hub/v1/agents/muse_node/peek", token=tok_peek)
+                self.assertEqual(200, st_ev)
+                self.assertEqual(expected_keys, set(b_ev.keys()))
+                self.assertIn("no-store", hdr_ev.get("cache-control", "").lower())
+                self.assertEqual(0, b_ev["pending_jobs"])
+                self.assertEqual(1, b_ev["pending_events"])
+                self.assertEqual(1, b_ev["pending"])
+                self.assertTrue(b_ev["watermark"])
+
+                # C4: Zero leakage across all responses and agents.json on disk
+                all_resp_blob = json.dumps([b1, b2, b_swapped, b_ev])
+                for forbidden in (
+                    "TOP_SECRET_PROMPT_BODY",
+                    "TOP_SECRET_META_1",
+                    "TOP_SECRET_RESULT_TEXT",
+                    "SENSITIVE_EVENT_BODY_CANARY",
+                    "pull-secret-jid-01",
+                    "pull-secret-jid-02",
+                    "pull-secret-jid-03",
+                    ev["event_id"],
+                    tmp,
+                    fed.TOKEN_PREFIX,
+                ):
+                    self.assertNotIn(forbidden, all_resp_blob)
+                agents_disk = Path(fed.agents_file_path(tmp)).read_text(encoding="utf-8")
+                self.assertNotIn(tok_peek, agents_disk)
+                self.assertNotIn(tok_full, agents_disk)
+
+                # C5-6: Clear all leader_events -> resets watermark to ""
+                ev_dir = Path(hub._leader_events_dir(tmp, "muse_node"))
+                for fp in ev_dir.glob("*.json"):
+                    fp.unlink()
+                _, _, b_zero = rh.request("GET", "/hub/v1/agents/muse_node/peek", token=tok_peek)
+                self.assertEqual(0, b_zero["pending"])
+                self.assertEqual("", b_zero["watermark"])
+                self.assertIsNone(b_zero["latest_created_at_ms"])
+                self.assertIsNone(b_zero["oldest_created_at"])
+
+    def test_c7_peek_audit_anti_flood_denial_audit_redaction_and_replay(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, _clean_env({"AGY_BOT_BUS_DIR": tmp}), clear=True):
+            owner = fed.make_owner_auth("owner")
+            for aid in ("poller_a", "poller_b"):
+                fed.register_agent(
+                    aid,
+                    kind="http_a2a",
+                    driver="pull_worker",
+                    transport="pull_worker",
+                    owner_auth=owner,
+                    bus_dir=tmp,
+                )
+            tok_peek = fed.mint_agent_token("poller_a", owner_auth=owner, scope="peek", bus_dir=tmp)["token"]
+            audit_path = Path(fed.federation_dir(tmp)) / "audit.jsonl"
+
+            # C7-1: 20 consecutive valid 200 OK /peek calls add 0 lines to audit.jsonl
+            with _RunningHub(bus_dir=tmp, rate_limit_max_requests=25) as rh:
+                for _ in range(20):
+                    st, _, body = rh.request("GET", "/hub/v1/agents/poller_a/peek", token=tok_peek)
+                    self.assertEqual(200, st, body)
+                if audit_path.is_file():
+                    self.assertEqual(0, len(audit_path.read_text(encoding="utf-8").splitlines()))
+
+                # C7-2: 401 (scope escape), 403 (cross-agent), and 429 (rate limit) MUST all be audited & redacted
+                st_401, _, b_401 = rh.request("GET", "/hub/v1/me", token=tok_peek)
+                self.assertEqual(401, st_401)
+                self.assertNotIn(tok_peek, json.dumps(b_401))
+
+                st_403, _, b_403 = rh.request("GET", "/hub/v1/agents/poller_b/peek", token=tok_peek)
+                self.assertEqual(403, st_403)
+                self.assertNotIn(tok_peek, json.dumps(b_403))
+
+                # Exhaust remaining rate limit (20 + 1 cross-agent = 21 allowed; 5 more hits 429)
+                got_429 = False
+                for _ in range(10):
+                    st_rl, _, b_rl = rh.request("GET", "/hub/v1/agents/poller_a/peek", token=tok_peek)
+                    if st_rl == 429:
+                        got_429 = True
+                        self.assertNotIn(tok_peek, json.dumps(b_rl))
+                        break
+                self.assertTrue(got_429, "Expected 429 RATE_LIMIT_EXCEEDED")
+
+                audit_raw = audit_path.read_text(encoding="utf-8")
+                self.assertNotIn(tok_peek, audit_raw)
+                self.assertNotIn(fed.TOKEN_PREFIX, audit_raw)
+                entries = [json.loads(ln) for ln in audit_raw.splitlines() if ln.strip()]
+                statuses = {e.get("http_status") for e in entries}
+                self.assertTrue({401, 403, 429}.issubset(statuses), statuses)
+
+            # C7-3: require_replay_headers=True -> duplicate Nonce rejected with 401 REPLAY_NONCE_REUSED
+            with _RunningHub(bus_dir=tmp, require_replay_headers=True) as rh_rep:
+                hdrs = hub.build_replay_headers(tok_peek, "GET", "/hub/v1/agents/poller_a/peek", b"", nonce="peek-nonce-1")
+                st_r1, _, _ = rh_rep.request("GET", "/hub/v1/agents/poller_a/peek", token=tok_peek, headers=hdrs)
+                self.assertEqual(200, st_r1)
+                st_r2, _, b_r2 = rh_rep.request("GET", "/hub/v1/agents/poller_a/peek", token=tok_peek, headers=hdrs)
+                self.assertEqual(401, st_r2)
+                self.assertEqual("REPLAY_NONCE_REUSED", b_r2.get("error"))
+                self.assertNotIn(tok_peek, json.dumps(b_r2))
+                audit_after_rep = audit_path.read_text(encoding="utf-8")
+                self.assertIn("REPLAY_NONCE_REUSED", audit_after_rep)
+                self.assertNotIn(tok_peek, audit_after_rep)
+
+
 if __name__ == "__main__":
     unittest.main()

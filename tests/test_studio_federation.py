@@ -978,6 +978,107 @@ class TestM3C6AndC7TelegramCommands(unittest.TestCase):
         tg_bridge.cmd_agent(ADMIN_UID, "revoke alpha", from_user=admin_user)
         self.assertIsNone(federation_registry.verify_agent_token(dm_token, bus_dir=self.bus_dir))
 
+    def test_c6_telegram_agent_token_peek_group_topic_block_and_dm_scope(self) -> None:
+        default_real_cfg = Path.home() / ".gemini" / "antigravity-cli" / "cache" / "bot_bus" / "team_config.json"
+        real_cfg_before = default_real_cfg.read_bytes() if default_real_cfg.is_file() else None
+
+        admin_user = {"id": ADMIN_UID, "is_bot": False}
+        bot_bus.set_team_mirror(MIRROR_GROUP_ID, None)
+        tg_bridge.cmd_agent(ADMIN_UID, "add peek_tg pull_worker", from_user=admin_user)
+        agents_path = Path(federation_registry.agents_file_path(self.bus_dir))
+        self.sent_messages.clear()
+        self.logged_lines.clear()
+
+        # C6-1: Group chat (chat_id < 0) AND Topic (thread_id != None, even with DM chat_id) MUST block BEFORE registry
+        before_bytes = agents_path.read_bytes()
+        with (
+            mock.patch.object(
+                federation_registry, "mint_agent_token", wraps=federation_registry.mint_agent_token
+            ) as spy_mint,
+            mock.patch.object(
+                federation_registry, "rotate_agent_token", wraps=federation_registry.rotate_agent_token
+            ) as spy_rotate,
+        ):
+            tg_bridge.cmd_agent(GROUP_CHAT_ID, "token peek_tg peek", from_user=admin_user)
+            tg_bridge.cmd_agent(GROUP_CHAT_ID, "mint peek_tg peek", from_user=admin_user)
+            tg_bridge.cmd_agent(GROUP_CHAT_ID, "rotate peek_tg peek", from_user=admin_user)
+            tg_bridge.cmd_agent(GROUP_CHAT_ID, "token peek_tg peek", thread_id=42, from_user=admin_user)
+            tg_bridge.cmd_agent(ADMIN_UID, "token peek_tg peek", thread_id=42, from_user=admin_user)
+            tg_bridge.cmd_agent(ADMIN_UID, "mint peek_tg peek", thread_id=99, from_user=admin_user)
+            tg_bridge.cmd_agent(ADMIN_UID, "rotate peek_tg peek", thread_id=7, from_user=admin_user)
+            self.assertEqual(spy_mint.call_count, 0)
+            self.assertEqual(spy_rotate.call_count, 0)
+        self.assertEqual(before_bytes, agents_path.read_bytes())
+        for m in self.sent_messages:
+            self.assertNotIn(SYNTH_PREFIX, str(m["text"]))
+        for ln in self.logged_lines:
+            self.assertNotIn(SYNTH_PREFIX, ln)
+
+        # C6-2a: Valid DM with invalid scope or extra args MUST reject BEFORE registry with 0 disk mutations
+        self.sent_messages.clear()
+        self.logged_lines.clear()
+        with (
+            mock.patch.object(
+                federation_registry, "mint_agent_token", wraps=federation_registry.mint_agent_token
+            ) as spy_mint,
+            mock.patch.object(
+                federation_registry, "rotate_agent_token", wraps=federation_registry.rotate_agent_token
+            ) as spy_rotate,
+        ):
+            tg_bridge.cmd_agent(ADMIN_UID, "token peek_tg admin", from_user=admin_user)
+            tg_bridge.cmd_agent(ADMIN_UID, "mint peek_tg PEEK", from_user=admin_user)
+            tg_bridge.cmd_agent(ADMIN_UID, "rotate peek_tg peek extra_arg", from_user=admin_user)
+            self.assertEqual(spy_mint.call_count, 0)
+            self.assertEqual(spy_rotate.call_count, 0)
+        self.assertEqual(before_bytes, agents_path.read_bytes())
+
+        # C6-2b: Valid DM delivers full & peek tokens with thread_id=None, Scope label, no log, no mirror
+        self.sent_messages.clear()
+        self.logged_lines.clear()
+        tg_bridge.cmd_agent(ADMIN_UID, "token peek_tg", from_user=admin_user)
+        m_full = re.search(rf"{re.escape(SYNTH_PREFIX)}[A-Za-z0-9._-]+", str(self.sent_messages[-1]["text"]))
+        self.assertIsNotNone(m_full)
+        full_tok = m_full.group(0)
+        self.assertIn("Scope: <code>full</code>", str(self.sent_messages[-1]["text"]))
+        self.assertIsNone(self.sent_messages[-1]["kwargs"].get("thread_id"))
+
+        self.sent_messages.clear()
+        tg_bridge.cmd_agent(ADMIN_UID, "token peek_tg peek", from_user=admin_user)
+        self.assertEqual(len(self.sent_messages), 1)
+        self.assertEqual(self.sent_messages[0]["chat_id"], ADMIN_UID)
+        self.assertIsNone(self.sent_messages[0]["kwargs"].get("thread_id"))
+        peek_msg = str(self.sent_messages[0]["text"])
+        self.assertIn("Scope: <code>peek</code>", peek_msg)
+        self.assertIn("/peek", peek_msg)
+        m_peek1 = re.search(rf"{re.escape(SYNTH_PREFIX)}[A-Za-z0-9._-]+", peek_msg)
+        self.assertIsNotNone(m_peek1)
+        peek_tok1 = m_peek1.group(0)
+        self.assertIsNone(federation_registry.verify_agent_token(peek_tok1, bus_dir=self.bus_dir))
+        self.assertIsNotNone(
+            federation_registry.verify_agent_token(peek_tok1, bus_dir=self.bus_dir, allowed_scopes=("full", "peek"))
+        )
+
+        # Rotate peek in DM -> revokes old peek, keeps full intact
+        self.sent_messages.clear()
+        tg_bridge.cmd_agent(ADMIN_UID, "rotate peek_tg peek", from_user=admin_user)
+        self.assertEqual(len(self.sent_messages), 1)
+        self.assertIsNone(self.sent_messages[0]["kwargs"].get("thread_id"))
+        m_peek2 = re.search(rf"{re.escape(SYNTH_PREFIX)}[A-Za-z0-9._-]+", str(self.sent_messages[0]["text"]))
+        self.assertIsNotNone(m_peek2)
+        peek_tok2 = m_peek2.group(0)
+        self.assertIsNone(
+            federation_registry.verify_agent_token(peek_tok1, bus_dir=self.bus_dir, allowed_scopes=("full", "peek"))
+        )
+        self.assertIsNotNone(
+            federation_registry.verify_agent_token(peek_tok2, bus_dir=self.bus_dir, allowed_scopes=("full", "peek"))
+        )
+        self.assertIsNotNone(federation_registry.verify_agent_token(full_tok, bus_dir=self.bus_dir))
+
+        self.assertFalse(any(m["chat_id"] == MIRROR_GROUP_ID for m in self.sent_messages))
+        self.assertFalse(any(SYNTH_PREFIX in ln for ln in self.logged_lines))
+        real_cfg_after = default_real_cfg.read_bytes() if default_real_cfg.is_file() else None
+        self.assertEqual(real_cfg_before, real_cfg_after)
+
 
 class TestM3Round1QAHardening(_FederationTestBase):
     """QA Round 1 regression suite covering M3-B1, M3-B2, M3-B3 and Follow-ups 1–3."""
@@ -1200,6 +1301,130 @@ class TestM3Round1QAHardening(_FederationTestBase):
         t_rec = next(t for t in d_list["teams"] if t["team_id"] == "t_orphan")
         self.assertFalse(t_rec["leader_can_dispatch"])
         self.assertTrue(t_rec["warnings"])
+
+    async def test_c6_studio_token_scope_validation_and_gates(self) -> None:
+        admin_cookie, admin_csrf = await self._login("AdminUser", ADMIN_PASS)
+        ro_cookie, ro_csrf = await self._login("ViewerUser", RO_PASS)
+        admin_hdrs = self._admin_headers(admin_cookie, admin_csrf)
+
+        r_create = await self.client.post(
+            "/api/federation/agents",
+            headers=admin_hdrs,
+            data=json.dumps({"agent_id": "studio_peek_ag", "kind": "pull_worker"}),
+        )
+        self.assertEqual(r_create.status, 200)
+
+        agents_path = Path(federation_registry.agents_file_path(str(self.bus_dir)))
+        before_bytes = agents_path.read_bytes()
+
+        # C6-3a: Malformed scope values MUST return 400 with 0 disk mutations on both mint & rotate
+        bad_scopes: list[object] = ["admin", "", "* ", ["peek"], True, 123, None]
+        for bad_scope in bad_scopes:
+            for endpoint in (
+                "/api/federation/agents/studio_peek_ag/tokens",
+                "/api/federation/agents/studio_peek_ag/rotate",
+            ):
+                r_bad = await self.client.post(
+                    endpoint,
+                    headers=admin_hdrs,
+                    data=json.dumps({"scope": bad_scope}),
+                )
+                self.assertEqual(r_bad.status, 400, f"{endpoint} with scope={bad_scope!r} -> {r_bad.status}")
+        self.assertEqual(before_bytes, agents_path.read_bytes())
+
+        # C6-3b: Missing CSRF / bad Origin / readonly / unauthenticated -> 401/403 with 0 disk mutations
+        r_unauth = await self.client.post(
+            "/api/federation/agents/studio_peek_ag/tokens",
+            headers={"Origin": self.origin, "Content-Type": "application/json"},
+            data=json.dumps({"scope": "peek"}),
+        )
+        self.assertEqual(r_unauth.status, 401)
+
+        r_no_csrf = await self.client.post(
+            "/api/federation/agents/studio_peek_ag/tokens",
+            headers={
+                "Origin": self.origin,
+                "Content-Type": "application/json",
+                "Cookie": f"{SESSION_COOKIE_NAME}={admin_cookie}",
+            },
+            data=json.dumps({"scope": "peek"}),
+        )
+        self.assertEqual(r_no_csrf.status, 403)
+
+        r_bad_orig = await self.client.post(
+            "/api/federation/agents/studio_peek_ag/tokens",
+            headers={**admin_hdrs, "Origin": "https://evil.example.com"},
+            data=json.dumps({"scope": "peek"}),
+        )
+        self.assertEqual(r_bad_orig.status, 403)
+
+        r_ro = await self.client.post(
+            "/api/federation/agents/studio_peek_ag/tokens",
+            headers=self._admin_headers(ro_cookie, ro_csrf),
+            data=json.dumps({"scope": "peek"}),
+        )
+        self.assertEqual(r_ro.status, 403)
+        self.assertEqual(before_bytes, agents_path.read_bytes())
+
+        # C6-3c: Valid omitted scope defaults to "full" + Cache-Control: no-store
+        r_def = await self.client.post(
+            "/api/federation/agents/studio_peek_ag/tokens",
+            headers=admin_hdrs,
+            data=json.dumps({}),
+        )
+        self.assertEqual(r_def.status, 200)
+        self.assertIn("no-store", r_def.headers.get("Cache-Control", "").lower())
+        d_def = await r_def.json()
+        self.assertEqual(d_def["scope"], "full")
+        full_tok = d_def["token"]
+        self.assertIsNotNone(federation_registry.verify_agent_token(full_tok, bus_dir=str(self.bus_dir)))
+
+        # C6-3d: Valid {"scope": "peek"} returns 200 + no-store + scoped peek token
+        r_peek = await self.client.post(
+            "/api/federation/agents/studio_peek_ag/tokens",
+            headers=admin_hdrs,
+            data=json.dumps({"scope": "peek", "label": "hook-5s"}),
+        )
+        self.assertEqual(r_peek.status, 200)
+        self.assertIn("no-store", r_peek.headers.get("Cache-Control", "").lower())
+        d_peek = await r_peek.json()
+        self.assertEqual(d_peek["scope"], "peek")
+        peek_tok1 = d_peek["token"]
+        self.assertIsNone(federation_registry.verify_agent_token(peek_tok1, bus_dir=str(self.bus_dir)))
+        self.assertIsNotNone(
+            federation_registry.verify_agent_token(
+                peek_tok1,
+                bus_dir=str(self.bus_dir),
+                allowed_scopes=("full", "peek"),
+            )
+        )
+
+        # Rotate peek token via Studio -> revokes old peek, keeps full token valid
+        r_rot = await self.client.post(
+            "/api/federation/agents/studio_peek_ag/rotate",
+            headers=admin_hdrs,
+            data=json.dumps({"scope": "peek", "revoke_existing": True}),
+        )
+        self.assertEqual(r_rot.status, 200)
+        self.assertIn("no-store", r_rot.headers.get("Cache-Control", "").lower())
+        d_rot = await r_rot.json()
+        self.assertEqual(d_rot["scope"], "peek")
+        self.assertEqual(d_rot["revoked_previous"], 1)
+        self.assertIsNone(
+            federation_registry.verify_agent_token(
+                peek_tok1,
+                bus_dir=str(self.bus_dir),
+                allowed_scopes=("full", "peek"),
+            )
+        )
+        self.assertIsNotNone(
+            federation_registry.verify_agent_token(
+                d_rot["token"],
+                bus_dir=str(self.bus_dir),
+                allowed_scopes=("full", "peek"),
+            )
+        )
+        self.assertIsNotNone(federation_registry.verify_agent_token(full_tok, bus_dir=str(self.bus_dir)))
 
 
 class TestM3C8ExportWhitelistCoverage(unittest.TestCase):

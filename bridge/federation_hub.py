@@ -731,6 +731,10 @@ _RELOAD_SENTINEL_MAP: Dict[str, str] = {
 _BOT_BUS_BIND_LOCK = threading.RLock()
 
 
+_PEEK_ROUTE_RE = re.compile(r"/hub/v1/agents/([^/]+)/peek")
+_PEEK_AGENT_ID_CI_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+
+
 class HubError(Exception):
     """Structured HTTP / JSON-RPC error raised inside the Federation Hub."""
 
@@ -4045,6 +4049,96 @@ class FederationHubServer(http.server.ThreadingHTTPServer):
         events = list_leader_events(self.bus_dir, target_aid)
         return {"ok": True, "agent_id": target_aid, "jobs": jobs, "events": events}
 
+    def op_pull_peek(self, auth: Dict[str, Any], raw_path_agent_id: str, *, raw_token: str) -> Dict[str, Any]:
+        """Read-only zero-payload wake-up probe (`GET /hub/v1/agents/<agent_id>/peek`).
+
+        - Rejects percent-encoding, traversal, whitespace, or non-identifier path segments with `400 INVALID_AGENT_ID`.
+        - Enforces strict actor isolation (`403 CROSS_AGENT_FORBIDDEN` + redacted audit), including uppercase variants.
+        - Never writes `audit.jsonl` on legitimate `200 OK` responses to avoid log flooding on 5s polling.
+        - Returns strictly allowlisted keys with zero payload/body/plaintext ID leakage.
+        """
+        actor = str(auth.get("actor_id") or "")
+        extra_sec = [raw_token] if raw_token else []
+        raw_seg = str(raw_path_agent_id or "")
+        if (
+            not raw_seg
+            or "%" in raw_seg
+            or ".." in raw_seg
+            or "/" in raw_seg
+            or "\\" in raw_seg
+            or "\x00" in raw_seg
+            or any(ch.isspace() for ch in raw_seg)
+            or not _PEEK_AGENT_ID_CI_RE.fullmatch(raw_seg)
+        ):
+            raise HubError(400, "INVALID_AGENT_ID", "Invalid agent_id path segment", rpc_code=-32602)
+
+        if raw_seg.lower() != actor:
+            self.audit.record(
+                "pull_peek",
+                actor_id=actor,
+                action="peek",
+                outcome="denied",
+                http_status=403,
+                reason="CROSS_AGENT_FORBIDDEN",
+                detail={"target_agent_id": raw_seg[:64]},
+                extra_secrets=extra_sec,
+            )
+            raise HubError(
+                403,
+                "CROSS_AGENT_FORBIDDEN",
+                f"CROSS_AGENT_FORBIDDEN: agent {actor!r} cannot peek {raw_seg!r}",
+                rpc_code=-32003,
+            )
+
+        try:
+            target_aid = federation_registry.validate_agent_id(raw_seg)
+        except ValueError as exc:
+            raise HubError(400, "INVALID_AGENT_ID", str(exc), rpc_code=-32602) from exc
+
+        if actor != target_aid:
+            self.audit.record(
+                "pull_peek",
+                actor_id=actor,
+                action="peek",
+                outcome="denied",
+                http_status=403,
+                reason="CROSS_AGENT_FORBIDDEN",
+                detail={"target_agent_id": target_aid},
+                extra_secrets=extra_sec,
+            )
+            raise HubError(
+                403,
+                "CROSS_AGENT_FORBIDDEN",
+                f"CROSS_AGENT_FORBIDDEN: agent {actor!r} cannot peek {target_aid!r}",
+                rpc_code=-32003,
+            )
+
+        pull_q = federation_registry.PullWorkerQueue(self.bus_dir)
+        try:
+            summary = pull_q.peek_summary(target_aid, auth_token=raw_token, bus_dir=self.bus_dir)
+        except PermissionError as exc:
+            self.audit.record(
+                "auth_failed",
+                actor_id=actor,
+                action=f"GET /hub/v1/agents/{target_aid}/peek",
+                outcome="denied",
+                http_status=401,
+                reason="INVALID_OR_REVOKED_TOKEN",
+                extra_secrets=extra_sec,
+            )
+            raise HubError(401, "UNAUTHORIZED", "Invalid, expired, or revoked federation token", rpc_code=-32001) from exc
+
+        return {
+            "ok": True,
+            "agent_id": str(summary["agent_id"]),
+            "pending": int(summary["pending"]),
+            "pending_jobs": int(summary["pending_jobs"]),
+            "pending_events": int(summary["pending_events"]),
+            "watermark": str(summary["watermark"]),
+            "latest_created_at_ms": summary["latest_created_at_ms"],
+            "oldest_created_at": summary["oldest_created_at"],
+        }
+
     def op_pull_claim(self, auth: Dict[str, Any], job_id: Optional[str], *, raw_token: str) -> Dict[str, Any]:
         actor = str(auth.get("actor_id") or "")
         extra_sec = [raw_token] if raw_token else []
@@ -4593,8 +4687,20 @@ class _FederationHubHandler(http.server.BaseHTTPRequestHandler):
             raise HubError(401, "UNAUTHORIZED", "Authorization header must use Bearer scheme")
 
         raw_token = parts[1].strip()
+        is_peek_route = (
+            self.command == "GET" and _PEEK_ROUTE_RE.fullmatch(path_only) is not None
+        )
+        allowed_scopes = (
+            (federation_registry.TOKEN_SCOPE_FULL, federation_registry.TOKEN_SCOPE_PEEK)
+            if is_peek_route
+            else (federation_registry.TOKEN_SCOPE_FULL,)
+        )
         # Zero-cache real-time disk verification on EVERY request (including keep-alive)
-        verified_agent = federation_registry.verify_agent_token(raw_token, bus_dir=self.server.bus_dir)
+        verified_agent = federation_registry.verify_agent_token(
+            raw_token,
+            bus_dir=self.server.bus_dir,
+            allowed_scopes=allowed_scopes,
+        )
         if verified_agent is None:
             self.server.audit.record(
                 "auth_failed",
@@ -4611,6 +4717,7 @@ class _FederationHubHandler(http.server.BaseHTTPRequestHandler):
             aid,
             bus_dir=self.server.bus_dir,
             auth_token=raw_token,
+            allowed_scopes=allowed_scopes,
             env={},
         )
         if not auth.get("authorized") or not auth.get("token_verified"):
@@ -4693,6 +4800,15 @@ class _FederationHubHandler(http.server.BaseHTTPRequestHandler):
                 )
                 raise HubError(401, "REPLAY_TIMESTAMP_EXPIRED", "Request timestamp outside allowed replay window")
             if not (1 <= len(nonce_str) <= 128) or any(ch.isspace() or ord(ch) < 32 for ch in nonce_str):
+                self.server.audit.record(
+                    "replay_rejected",
+                    actor_id=aid,
+                    action=f"{self.command} {path_only}",
+                    outcome="denied",
+                    http_status=401,
+                    reason="REPLAY_NONCE_INVALID",
+                    extra_secrets=[raw_token],
+                )
                 raise HubError(401, "REPLAY_NONCE_INVALID", "Invalid X-Agy-Nonce header")
 
             expected_sig = compute_replay_signature(
@@ -4786,6 +4902,11 @@ class _FederationHubHandler(http.server.BaseHTTPRequestHandler):
                 if m_inbox:
                     aid = unquote(m_inbox.group(1))
                     self._send_json(200, self.server.op_pull_inbox(auth, aid, raw_token=raw_token), extra_secrets=[raw_token])
+                    return
+                m_peek = _PEEK_ROUTE_RE.fullmatch(path_only)
+                if m_peek:
+                    raw_aid_seg = m_peek.group(1)
+                    self._send_json(200, self.server.op_pull_peek(auth, raw_aid_seg, raw_token=raw_token), extra_secrets=[raw_token])
                     return
 
             if self.command == "POST":

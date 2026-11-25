@@ -170,8 +170,8 @@ _ALLOWED_CAPABILITY_KEYS = frozenset(
     }
 )
 
-_ALLOWED_MINT_TOKEN_KEYS = frozenset({"label"})
-_ALLOWED_ROTATE_TOKEN_KEYS = frozenset({"label", "revoke_existing"})
+_ALLOWED_MINT_TOKEN_KEYS = frozenset({"label", "scope"})
+_ALLOWED_ROTATE_TOKEN_KEYS = frozenset({"label", "revoke_existing", "scope"})
 
 _ALLOWED_CREATE_TEAM_KEYS = frozenset(
     {
@@ -356,6 +356,16 @@ def _validate_strict_str_list(
     val = body[key]
     if not isinstance(val, list) or not all(isinstance(item, str) for item in val):
         return False, None, f"字段 {key} 必须为字符串数组 (list[str])"
+    return True, val, ""
+
+
+def _validate_strict_token_scope(body: dict[str, Any]) -> tuple[bool, str, str]:
+    """Require exact string `'full'` or `'peek'` whenever `'scope'` key is present in body."""
+    if "scope" not in body:
+        return True, federation_registry.TOKEN_SCOPE_FULL, ""
+    val = body["scope"]
+    if type(val) is not str or val not in federation_registry.VALID_TOKEN_SCOPES:
+        return False, "", "字段 scope 必须为精确字符串 'full' 或 'peek'"
     return True, val, ""
 
 
@@ -1383,6 +1393,18 @@ class StudioFederationService:
         if not ok_body or body is None:
             return body_resp  # type: ignore[return-value]
 
+        ok_scope, scope_val, err_scope = _validate_strict_token_scope(body)
+        if not ok_scope:
+            self.audit.record(
+                action="federation.agent.token_mint",
+                status_code=400,
+                outcome="invalid_scope",
+                client_ip=client_ip,
+                target_id=aid,
+                sess=sess,
+            )
+            return _api_error(err_scope, status=400, code="INVALID_TOKEN_SCOPE")
+
         label = str(body.get("label") or "studio").strip()[:80]
         try:
             owner_auth = self._make_studio_owner_auth(sess)
@@ -1391,6 +1413,7 @@ class StudioFederationService:
                 aid,
                 owner_auth=owner_auth,
                 label=label,
+                scope=scope_val,
                 bus_dir=self.bus_dir,
             )
             agent = await asyncio.to_thread(federation_registry.get_agent, aid, bus_dir=self.bus_dir)
@@ -1424,6 +1447,7 @@ class StudioFederationService:
                 "agent_id": aid,
                 "token_id": minted["token_id"],
                 "token": minted["token"],
+                "scope": minted["scope"],
                 "created_at": minted["created_at"],
                 "agent": _sanitize_agent_record(agent, viewer_role="admin") if agent is not None else None,
             },
@@ -1455,6 +1479,18 @@ class StudioFederationService:
         if not ok_body or body is None:
             return body_resp  # type: ignore[return-value]
 
+        ok_scope, scope_val, err_scope = _validate_strict_token_scope(body)
+        if not ok_scope:
+            self.audit.record(
+                action="federation.agent.token_rotate",
+                status_code=400,
+                outcome="invalid_scope",
+                client_ip=client_ip,
+                target_id=aid,
+                sess=sess,
+            )
+            return _api_error(err_scope, status=400, code="INVALID_TOKEN_SCOPE")
+
         label = str(body.get("label") or "studio-rotated").strip()[:80]
         ok_re, revoke_existing_val, err_re = _validate_strict_bool(body, "revoke_existing", default=True)
         if not ok_re:
@@ -1468,6 +1504,7 @@ class StudioFederationService:
                 owner_auth=owner_auth,
                 revoke_existing=revoke_existing,
                 label=label,
+                scope=scope_val,
                 bus_dir=self.bus_dir,
             )
             agent = await asyncio.to_thread(federation_registry.get_agent, aid, bus_dir=self.bus_dir)
@@ -1501,6 +1538,7 @@ class StudioFederationService:
                 "agent_id": aid,
                 "token_id": rotated["token_id"],
                 "token": rotated["token"],
+                "scope": rotated["scope"],
                 "revoked_previous": rotated["revoked_previous"],
                 "created_at": rotated["created_at"],
                 "agent": _sanitize_agent_record(agent, viewer_role="admin") if agent is not None else None,

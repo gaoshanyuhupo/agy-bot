@@ -11980,7 +11980,7 @@ def cmd_agent(chat_id, raw_rest="", thread_id=None, scope_key=None, from_user=No
                 "<i>用法：\n"
                 "• <code>/agent add &lt;id&gt; &lt;driver&gt; [--profile ...] [--endpoint ...] [--model ...] [--display ...]</code>\n"
                 "• <code>/agent grant &lt;id&gt; [coordinator_peer=true|false] [host_server_invoke=true|false] [can_dispatch=true|false] [can_receive=true|false] [teams=a,b]</code>\n"
-                "• <code>/agent token|mint|rotate &lt;id&gt;</code>（仅限私聊 DM）\n"
+                "• <code>/agent token|mint|rotate &lt;id&gt; [full|peek]</code>（仅限私聊 DM）\n"
                 "• <code>/agent revoke &lt;id&gt;</code>（一键 Kill-Switch）</i>",
                 parse_mode="HTML",
                 thread_id=norm_tid,
@@ -12060,8 +12060,8 @@ def cmd_agent(chat_id, raw_rest="", thread_id=None, scope_key=None, from_user=No
                 )
                 return
 
-        # M3-C7: Hard pre-check BEFORE touching registry if --mint requested outside DM
-        if want_mint and not _is_dm_chat(chat_id):
+        # M3-C7: Hard pre-check BEFORE touching registry if --mint requested outside DM or inside a Topic
+        if want_mint and (not _is_dm_chat(chat_id) or norm_tid is not None):
             send(
                 chat_id,
                 "🔒 <b>安全拦截：禁止在群聊/Topic 中使用 <code>--mint</code> 签发明文 Token</b>\n"
@@ -12194,11 +12194,8 @@ def cmd_agent(chat_id, raw_rest="", thread_id=None, scope_key=None, from_user=No
         return
 
     if sub in ("token", "mint", "rotate"):
-        if len(tokens) < 2:
-            send(chat_id, f"用法：<code>/agent {sub} &lt;agent_id&gt;</code>（仅限私聊 DM）", parse_mode="HTML", thread_id=norm_tid)
-            return
-        # M3-C7: Hard pre-check BEFORE touching federation_registry!
-        if not _is_dm_chat(chat_id):
+        # M3-C7: Hard pre-check BEFORE touching federation_registry (blocks groups & topics)!
+        if not _is_dm_chat(chat_id) or norm_tid is not None:
             send(
                 chat_id,
                 "🔒 <b>安全拦截：禁止在群聊/Topic 中签发或轮换明文 Token</b>\n"
@@ -12208,7 +12205,36 @@ def cmd_agent(chat_id, raw_rest="", thread_id=None, scope_key=None, from_user=No
                 thread_id=norm_tid,
             )
             return
+        if len(tokens) < 2:
+            send(
+                chat_id,
+                f"用法：<code>/agent {sub} &lt;agent_id&gt; [full|peek]</code>（仅限私聊 DM）",
+                parse_mode="HTML",
+                thread_id=None,
+            )
+            return
+        if len(tokens) > 3:
+            send(
+                chat_id,
+                f"⚠️ 参数过多：用法 <code>/agent {sub} &lt;agent_id&gt; [full|peek]</code>（仅限私聊 DM）",
+                parse_mode="HTML",
+                thread_id=None,
+            )
+            return
         aid = tokens[1]
+        token_scope = federation_registry.TOKEN_SCOPE_FULL
+        if len(tokens) == 3:
+            raw_scope = tokens[2]
+            if type(raw_scope) is not str or raw_scope not in federation_registry.VALID_TOKEN_SCOPES:
+                send(
+                    chat_id,
+                    f"❌ 无效的 Token Scope：<code>{html_mod.escape(str(raw_scope))}</code>"
+                    f"（仅支持 <code>full</code> 或 <code>peek</code>；未写入磁盘）",
+                    parse_mode="HTML",
+                    thread_id=None,
+                )
+                return
+            token_scope = raw_scope
         try:
             if sub == "rotate":
                 issued = federation_registry.rotate_agent_token(
@@ -12216,28 +12242,37 @@ def cmd_agent(chat_id, raw_rest="", thread_id=None, scope_key=None, from_user=No
                     owner_auth=owner_auth,
                     revoke_existing=True,
                     label="tg-dm-rotate",
+                    scope=token_scope,
                     bus_dir=_effective_bus_dir(),
                 )
-                extra_note = f"\n• 已立即作废旧凭据数: <code>{int(issued.get('revoked_previous') or 0)}</code>"
+                extra_note = f"\n• 已立即作废同作用域旧凭据数: <code>{int(issued.get('revoked_previous') or 0)}</code>"
             else:
                 issued = federation_registry.mint_agent_token(
                     aid,
                     owner_auth=owner_auth,
                     label="tg-dm-mint",
+                    scope=token_scope,
                     bus_dir=_effective_bus_dir(),
                 )
                 extra_note = ""
         except (ValueError, PermissionError) as exc:
             send(chat_id, f"❌ 签发 Token 失败：<code>{html_mod.escape(str(exc))}</code>", parse_mode="HTML", thread_id=None)
             return
+        issued_scope = str(issued.get("scope") or token_scope)
+        scope_hint = (
+            f"\n<i>此 Token 作用域为只读 <code>peek</code>（仅限 <code>GET /hub/v1/agents/{html_mod.escape(issued['agent_id'])}/peek</code> 唤醒探针，不可拉取正文、认领或派发任务）。</i>"
+            if issued_scope == federation_registry.TOKEN_SCOPE_PEEK
+            else ""
+        )
         # Strictly DM-only delivery, never mirrored to team_mirror and never logged
         send(
             chat_id,
             f"🔑 <b>一次性入站 Bearer Token（仅此展示一次）</b>\n"
             f"• Agent: <code>{html_mod.escape(issued['agent_id'])}</code>\n"
+            f"• Scope: <code>{html_mod.escape(issued_scope)}</code>\n"
             f"• Token ID: <code>{html_mod.escape(issued['token_id'])}</code>{extra_note}\n"
             f"• Token:\n<code>{html_mod.escape(issued['token'])}</code>\n"
-            f"<i>请及时保存并在客户端配置，切勿转发至任何群聊。</i>",
+            f"<i>请及时保存并在客户端配置，切勿转发至任何群聊。</i>{scope_hint}",
             parse_mode="HTML",
             thread_id=None,
         )

@@ -60,6 +60,9 @@ SECRET_REF_RE = re.compile(
     r"^(?:" + "|".join(_OPENBAO_MOUNTS) + r")/[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+(?:#[A-Za-z0-9._-]+)?$"
 )
 TOKEN_PREFIX = "agy_fed_"
+TOKEN_SCOPE_FULL = "full"
+TOKEN_SCOPE_PEEK = "peek"
+VALID_TOKEN_SCOPES = frozenset({TOKEN_SCOPE_FULL, TOKEN_SCOPE_PEEK})
 
 VALID_AGENT_KINDS = frozenset(
     {
@@ -259,6 +262,29 @@ def validate_pull_job_id(job_id: Any) -> str:
     if not PULL_JOB_ID_RE.fullmatch(job_id):
         raise ValueError(f"Invalid pull job_id format: {job_id!r}")
     return job_id
+
+
+def validate_token_scope(scope: Any) -> str:
+    """Strictly validate federation bearer token scope (`'full'` or `'peek'` only)."""
+    if type(scope) is not str or scope not in VALID_TOKEN_SCOPES:
+        raise ValueError(
+            f"Invalid token scope: {scope!r} (expected one of {sorted(VALID_TOKEN_SCOPES)})"
+        )
+    return scope
+
+
+def _record_token_scope(tr: Dict[str, Any]) -> str:
+    """Return normalized scope for a stored `token_records` entry.
+
+    Historical records lacking a `scope` field (or with `None`) default to `'full'`
+    for backward compatibility. Unknown/corrupted values return `''` (fail-closed).
+    """
+    if "scope" not in tr or tr.get("scope") is None:
+        return TOKEN_SCOPE_FULL
+    raw_scope = tr.get("scope")
+    if type(raw_scope) is str and raw_scope in VALID_TOKEN_SCOPES:
+        return raw_scope
+    return ""
 
 
 def validate_secret_ref(secret_ref: Any) -> str:
@@ -609,15 +635,26 @@ def sanitize_agent_record(rec: Dict[str, Any]) -> Dict[str, Any]:
     out = copy.deepcopy(rec)
     raw_tokens = out.pop("token_records", None)
     active_count = 0
+    active_tokens: List[Dict[str, Any]] = []
     if isinstance(raw_tokens, list):
         for tr in raw_tokens:
             if isinstance(tr, dict) and tr.get("revoked_at") is None:
                 active_count += 1
+                rec_scope = _record_token_scope(tr) or TOKEN_SCOPE_FULL
+                active_tokens.append(
+                    {
+                        "token_id": str(tr.get("token_id") or ""),
+                        "label": str(tr.get("label") or ""),
+                        "scope": rec_scope,
+                        "created_at": tr.get("created_at"),
+                    }
+                )
     for secret_k in list(out.keys()):
         if secret_k.lower() in FORBIDDEN_SECRET_KEYS or secret_k in ("salt", "token_hash", "token_records"):
             out.pop(secret_k, None)
     out["active_token_count"] = active_count
     out["has_active_token"] = active_count > 0
+    out["active_tokens"] = active_tokens
     return out
 
 
@@ -903,12 +940,14 @@ def mint_agent_token(
     *,
     owner_auth: Any,
     label: str = "",
+    scope: str = TOKEN_SCOPE_FULL,
     bus_dir: Optional[str] = None,
     env: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Mint a high-entropy bearer token for `agent_id`, storing ONLY salted HMAC-SHA256 hash."""
     assert_owner_auth(owner_auth, action="mint_agent_token", bus_dir=bus_dir, env=env)
     aid = validate_agent_id(agent_id)
+    norm_scope = validate_token_scope(scope)
     clean_label = str(label or "").strip()[:80]
     reject_plaintext_secrets(clean_label, path="label")
 
@@ -934,6 +973,7 @@ def mint_agent_token(
                 "salt": salt_hex,
                 "token_hash": token_hash,
                 "label": clean_label,
+                "scope": norm_scope,
                 "created_at": now,
                 "revoked_at": None,
             }
@@ -947,6 +987,7 @@ def mint_agent_token(
         "agent_id": aid,
         "token_id": token_id,
         "token": raw_token,
+        "scope": norm_scope,
         "created_at": now,
     }
 
@@ -957,12 +998,14 @@ def rotate_agent_token(
     owner_auth: Any,
     revoke_existing: bool = True,
     label: str = "rotated",
+    scope: str = TOKEN_SCOPE_FULL,
     bus_dir: Optional[str] = None,
     env: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
-    """Atomically revoke existing tokens (when `revoke_existing=True`) and mint a replacement token."""
+    """Atomically revoke same-scope active tokens (when `revoke_existing=True`) and mint a replacement token."""
     assert_owner_auth(owner_auth, action="rotate_agent_token", bus_dir=bus_dir, env=env)
     aid = validate_agent_id(agent_id)
+    norm_scope = validate_token_scope(scope)
     clean_label = str(label or "rotated").strip()[:80]
     reject_plaintext_secrets(clean_label, path="label")
 
@@ -985,7 +1028,11 @@ def rotate_agent_token(
         records = list(rec.get("token_records") or [])
         if revoke_existing:
             for tr in records:
-                if isinstance(tr, dict) and tr.get("revoked_at") is None:
+                if (
+                    isinstance(tr, dict)
+                    and tr.get("revoked_at") is None
+                    and _record_token_scope(tr) == norm_scope
+                ):
                     tr["revoked_at"] = now
                     revoked_count += 1
         records.append(
@@ -994,6 +1041,7 @@ def rotate_agent_token(
                 "salt": salt_hex,
                 "token_hash": token_hash,
                 "label": clean_label,
+                "scope": norm_scope,
                 "created_at": now,
                 "revoked_at": None,
             }
@@ -1007,6 +1055,7 @@ def rotate_agent_token(
         "agent_id": aid,
         "token_id": token_id,
         "token": raw_token,
+        "scope": norm_scope,
         "revoked_previous": revoked_count,
         "created_at": now,
     }
@@ -1077,12 +1126,23 @@ def verify_agent_token(
     *,
     agent_id: Optional[str] = None,
     bus_dir: Optional[str] = None,
+    allowed_scopes: Sequence[str] = (TOKEN_SCOPE_FULL,),
 ) -> Optional[Dict[str, Any]]:
     """Verify a bearer token against salted HMAC-SHA256 digests under `flock`.
 
-    Returns sanitized agent view on success, or `None` on invalid/revoked/disabled token.
+    Fail-closed by default: only tokens with `scope == "full"` (or legacy records lacking `scope`)
+    are accepted unless `allowed_scopes` explicitly includes additional scopes (e.g. `"peek"`).
+    Returns sanitized agent view (with `"token_scope"`) on success, or `None` on invalid/revoked/disabled/out-of-scope token.
     Never logs or echoes `raw_token`.
     """
+    if isinstance(allowed_scopes, str):
+        allowed_set = frozenset({allowed_scopes}) if allowed_scopes in VALID_TOKEN_SCOPES else frozenset()
+    else:
+        allowed_set = frozenset(
+            s for s in (allowed_scopes or ()) if type(s) is str and s in VALID_TOKEN_SCOPES
+        )
+    if not allowed_set:
+        return None
     if not isinstance(raw_token, str) or not raw_token.startswith(TOKEN_PREFIX):
         return None
     if any(ch in raw_token for ch in ("\r", "\n", "\x00", " ")):
@@ -1130,7 +1190,12 @@ def verify_agent_token(
             except ValueError:
                 continue
             if hmac.compare_digest(computed, stored_hash):
-                return sanitize_agent_record(rec)
+                rec_scope = _record_token_scope(tr)
+                if rec_scope not in allowed_set:
+                    return None
+                sanitized = sanitize_agent_record(rec)
+                sanitized["token_scope"] = rec_scope
+                return sanitized
     return None
 
 
@@ -1409,6 +1474,7 @@ def resolve_actor_authority(
     *,
     bus_dir: Optional[str] = None,
     auth_token: Optional[str] = None,
+    allowed_scopes: Sequence[str] = (TOKEN_SCOPE_FULL,),
     env: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Resolve authoritative server-side privileges for `actor_id` from `federation` + `team_config.json`.
@@ -1431,6 +1497,7 @@ def resolve_actor_authority(
             "member_teams": [],
             "agent": None,
             "token_verified": False,
+            "token_scope": "",
             "federation_active": has_federation_state(bus_dir),
         }
 
@@ -1450,7 +1517,12 @@ def resolve_actor_authority(
     token_verified = False
     verified_agent: Optional[Dict[str, Any]] = None
     if auth_token is not None:
-        verified_agent = verify_agent_token(auth_token, agent_id=raw_actor, bus_dir=bus_dir)
+        verified_agent = verify_agent_token(
+            auth_token,
+            agent_id=raw_actor,
+            bus_dir=bus_dir,
+            allowed_scopes=allowed_scopes,
+        )
         if verified_agent is None:
             return {
                 "actor_id": raw_actor,
@@ -1464,6 +1536,7 @@ def resolve_actor_authority(
                 "member_teams": [],
                 "agent": None,
                 "token_verified": False,
+                "token_scope": "",
                 "federation_active": fed_active,
             }
         token_verified = True
@@ -1541,6 +1614,7 @@ def resolve_actor_authority(
         "member_teams": effective_member_teams,
         "agent": sanitized_agent,
         "token_verified": token_verified,
+        "token_scope": str((verified_agent or {}).get("token_scope") or ""),
         "federation_active": fed_active,
         "has_legacy_bots": bool(legacy_bots),
     }
@@ -1866,6 +1940,7 @@ class PullWorkerQueue:
         *,
         auth_token: Optional[str],
         action: str,
+        allowed_scopes: Sequence[str] = (TOKEN_SCOPE_FULL,),
     ) -> None:
         raw_rec: Optional[Dict[str, Any]] = None
         if os.path.isfile(agents_file_path(self.bus_dir)):
@@ -1886,14 +1961,30 @@ class PullWorkerQueue:
                     raise PermissionError(
                         f"PRIVILEGE_ESCALATION_DENIED: auth_token is required for agent {aid!r} on pull_queue {action}"
                     )
-                if verify_agent_token(auth_token, agent_id=aid, bus_dir=self.bus_dir) is None:
+                if (
+                    verify_agent_token(
+                        auth_token,
+                        agent_id=aid,
+                        bus_dir=self.bus_dir,
+                        allowed_scopes=allowed_scopes,
+                    )
+                    is None
+                ):
                     raise PermissionError(
                         f"PRIVILEGE_ESCALATION_DENIED: invalid or revoked agent token for pull_queue {action}"
                     )
                 return
 
         if auth_token is not None:
-            if verify_agent_token(auth_token, agent_id=aid, bus_dir=self.bus_dir) is None:
+            if (
+                verify_agent_token(
+                    auth_token,
+                    agent_id=aid,
+                    bus_dir=self.bus_dir,
+                    allowed_scopes=allowed_scopes,
+                )
+                is None
+            ):
                 raise PermissionError(
                     f"PRIVILEGE_ESCALATION_DENIED: invalid or revoked agent token for pull_queue {action}"
                 )
@@ -2199,6 +2290,112 @@ class PullWorkerQueue:
             job["finished_at"] = time.time()
             _atomic_write_json(fp, job)
             return copy.deepcopy(job)
+
+    def peek_summary(
+        self,
+        agent_id: str,
+        *,
+        auth_token: Optional[str],
+        bus_dir: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Return zero-payload pending counts and an opaque SHA-256 watermark for `agent_id`.
+
+        Accepts `'full'` and `'peek'` tokens strictly bound to `agent_id` (active, non-revoked).
+        Counts queued (non-cancelled) pull jobs plus pending `leader_events` matching `op_pull_inbox`.
+        Never creates directories on disk and never leaks job/event payloads or plaintext IDs.
+        """
+        aid = validate_agent_id(agent_id)
+        eff_bus_dir = _resolve_bus_dir(bus_dir) if bus_dir is not None else self.bus_dir
+        if not auth_token or (
+            verify_agent_token(
+                auth_token,
+                agent_id=aid,
+                bus_dir=eff_bus_dir,
+                allowed_scopes=(TOKEN_SCOPE_FULL, TOKEN_SCOPE_PEEK),
+            )
+            is None
+        ):
+            raise PermissionError(
+                f"PRIVILEGE_ESCALATION_DENIED: invalid, revoked, or unauthorized token for pull_queue peek ({aid!r})"
+            )
+
+        qdir = pull_queue_dir(eff_bus_dir)
+        pending_job_items: List[Tuple[str, float]] = []
+        if os.path.isdir(qdir):
+            queue_obj = self if eff_bus_dir == self.bus_dir else PullWorkerQueue(eff_bus_dir)
+            with queue_obj._lock():
+                try:
+                    names = sorted(
+                        fn for fn in os.listdir(qdir) if fn.endswith(".json") and not fn.endswith(".tmp")
+                    )
+                except OSError:
+                    names = []
+                for fn in names:
+                    job = _read_json(os.path.join(qdir, fn), None)
+                    if not isinstance(job, dict):
+                        continue
+                    if job.get("target_agent_id") != aid:
+                        continue
+                    if job.get("status") != "queued" or job.get("cancelled"):
+                        continue
+                    jid = str(job.get("job_id") or fn)
+                    ts = float(job.get("created_at") or 0.0)
+                    pending_job_items.append((jid, ts))
+        pending_job_items.sort(key=lambda item: (item[1], item[0]))
+
+        events_dir = os.path.join(federation_dir(eff_bus_dir), "leader_events", aid)
+        pending_event_items: List[Tuple[str, float]] = []
+        if os.path.isdir(events_dir):
+            try:
+                ev_names = sorted(
+                    fn for fn in os.listdir(events_dir) if fn.endswith(".json") and not fn.endswith(".tmp")
+                )
+            except OSError:
+                ev_names = []
+            for fn in ev_names:
+                ev = _read_json(os.path.join(events_dir, fn), None)
+                if not isinstance(ev, dict):
+                    continue
+                eid = str(ev.get("event_id") or fn)
+                ts = float(ev.get("created_at") or 0.0)
+                pending_event_items.append((eid, ts))
+        pending_event_items.sort(key=lambda item: (item[1], item[0]))
+
+        pending_jobs = len(pending_job_items)
+        pending_events = len(pending_event_items)
+        pending = pending_jobs + pending_events
+        if pending == 0:
+            return {
+                "agent_id": aid,
+                "pending": 0,
+                "pending_jobs": 0,
+                "pending_events": 0,
+                "watermark": "",
+                "latest_created_at_ms": None,
+                "oldest_created_at": None,
+            }
+
+        wm_payload = json.dumps(
+            {
+                "jobs": [[jid, ts] for jid, ts in pending_job_items],
+                "events": [[eid, ts] for eid, ts in pending_event_items],
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        watermark = hashlib.sha256(wm_payload).hexdigest()[:24]
+        all_ts = [ts for _, ts in pending_job_items] + [ts for _, ts in pending_event_items]
+        latest_created_at_ms = int(round(max(all_ts) * 1000))
+        oldest_created_at = min(all_ts)
+        return {
+            "agent_id": aid,
+            "pending": pending,
+            "pending_jobs": pending_jobs,
+            "pending_events": pending_events,
+            "watermark": watermark,
+            "latest_created_at_ms": latest_created_at_ms,
+            "oldest_created_at": oldest_created_at,
+        }
 
     def get(self, job_id: str) -> Optional[Dict[str, Any]]:
         clean_id = validate_pull_job_id(job_id)

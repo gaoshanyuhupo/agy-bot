@@ -1124,5 +1124,306 @@ class TestQARound1HardeningRegressions(unittest.TestCase):
                 self.assertNotIn("shared_bot", after_revoke)
 
 
+class TestPeekTokenScopeAndQueueSummary(unittest.TestCase):
+    """Prod-Release contract tests for token scopes (`full`/`peek`) and `PullWorkerQueue.peek_summary` (C1, C3, C4, C5)."""
+
+    def test_c1_c3_token_scope_validation_fail_closed_and_same_scope_rotation(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, _clean_env({"AGY_BOT_BUS_DIR": tmp}), clear=True):
+            owner = fed.make_owner_auth("owner_user")
+            self.assertEqual("full", fed.TOKEN_SCOPE_FULL)
+            self.assertEqual("peek", fed.TOKEN_SCOPE_PEEK)
+            self.assertEqual(frozenset({"full", "peek"}), fed.VALID_TOKEN_SCOPES)
+
+            fed.register_agent(
+                "worker_a",
+                kind="http_a2a",
+                driver="pull_worker",
+                transport="pull_worker",
+                capabilities={"can_receive": True, "can_dispatch": True},
+                owner_auth=owner,
+                bus_dir=tmp,
+            )
+            fed.register_agent(
+                "worker_b",
+                kind="http_a2a",
+                driver="pull_worker",
+                transport="pull_worker",
+                capabilities={"can_receive": True},
+                owner_auth=owner,
+                bus_dir=tmp,
+            )
+
+            agents_path = Path(fed.agents_file_path(tmp))
+            before_bad_scope = agents_path.read_bytes()
+            for bad_scope in (None, True, False, 123, ["peek"], "", " peek", "peek ", "PEEK", "FULL", "admin", "*"):
+                with self.subTest(bad_scope=bad_scope):
+                    with self.assertRaises(ValueError):
+                        fed.validate_token_scope(bad_scope)
+                    with self.assertRaises(ValueError):
+                        fed.mint_agent_token("worker_a", owner_auth=owner, scope=bad_scope, bus_dir=tmp)  # type: ignore[arg-type]
+                    with self.assertRaises(ValueError):
+                        fed.rotate_agent_token("worker_a", owner_auth=owner, scope=bad_scope, bus_dir=tmp)  # type: ignore[arg-type]
+            self.assertEqual(before_bad_scope, agents_path.read_bytes())
+
+            # Mint both full and peek tokens
+            m_full = fed.mint_agent_token("worker_a", owner_auth=owner, label="vault-full", scope="full", bus_dir=tmp)
+            m_peek = fed.mint_agent_token("worker_a", owner_auth=owner, label="hook-peek", scope="peek", bus_dir=tmp)
+            self.assertEqual("full", m_full["scope"])
+            self.assertEqual("peek", m_peek["scope"])
+            tok_full = m_full["token"]
+            tok_peek = m_peek["token"]
+            self.assertTrue(tok_peek.startswith(fed.TOKEN_PREFIX))
+
+            # Disk stores only salted HMAC digests + scope, never plaintext token
+            disk_raw = agents_path.read_text(encoding="utf-8")
+            self.assertNotIn(tok_full, disk_raw)
+            self.assertNotIn(tok_peek, disk_raw)
+            disk_rec = json.loads(disk_raw)["agents"]["worker_a"]
+            scopes_on_disk = {tr["token_id"]: tr["scope"] for tr in disk_rec["token_records"]}
+            self.assertEqual("full", scopes_on_disk[m_full["token_id"]])
+            self.assertEqual("peek", scopes_on_disk[m_peek["token_id"]])
+
+            # sanitize_agent_record exposes scope in active_tokens summary without hashes/salts
+            sanitized = fed.get_agent("worker_a", bus_dir=tmp)
+            assert sanitized is not None
+            self.assertEqual(2, sanitized["active_token_count"])
+            summary_by_id = {item["token_id"]: item for item in sanitized["active_tokens"]}
+            self.assertEqual("full", summary_by_id[m_full["token_id"]]["scope"])
+            self.assertEqual("peek", summary_by_id[m_peek["token_id"]]["scope"])
+            san_dump = json.dumps(sanitized)
+            self.assertNotIn("token_hash", san_dump)
+            self.assertNotIn("salt", san_dump)
+            self.assertNotIn(tok_full, san_dump)
+            self.assertNotIn(tok_peek, san_dump)
+
+            # C1: Default verify_agent_token & resolve_actor_authority reject peek token fail-closed
+            self.assertIsNone(fed.verify_agent_token(tok_peek, bus_dir=tmp))
+            self.assertIsNone(fed.verify_agent_token(tok_peek, agent_id="worker_a", bus_dir=tmp))
+            v_peek = fed.verify_agent_token(tok_peek, bus_dir=tmp, allowed_scopes=("full", "peek"))
+            self.assertIsNotNone(v_peek)
+            assert v_peek is not None
+            self.assertEqual("peek", v_peek["token_scope"])
+
+            v_full = fed.verify_agent_token(tok_full, bus_dir=tmp)
+            self.assertIsNotNone(v_full)
+            assert v_full is not None
+            self.assertEqual("full", v_full["token_scope"])
+
+            auth_default = fed.resolve_actor_authority("worker_a", auth_token=tok_peek, bus_dir=tmp)
+            self.assertFalse(auth_default["authorized"])
+            self.assertFalse(auth_default["token_verified"])
+            auth_peek = fed.resolve_actor_authority(
+                "worker_a",
+                auth_token=tok_peek,
+                allowed_scopes=("full", "peek"),
+                bus_dir=tmp,
+            )
+            self.assertTrue(auth_peek["authorized"])
+            self.assertTrue(auth_peek["token_verified"])
+            self.assertEqual("peek", auth_peek["token_scope"])
+
+            # C1: All non-peek PullWorkerQueue methods raise PermissionError on peek token
+            q = fed.PullWorkerQueue(tmp)
+            job = q.enqueue("worker_a", "do work", owner_auth=owner)
+            with self.assertRaises(PermissionError):
+                q.list_jobs("worker_a", auth_token=tok_peek)
+            with self.assertRaises(PermissionError):
+                q.claim("worker_a", auth_token=tok_peek)
+            with self.assertRaises(PermissionError):
+                q.claim("worker_a", job_id=job["job_id"], auth_token=tok_peek)
+            with self.assertRaises(PermissionError):
+                q.complete(job["job_id"], "worker_a", status="done", result_text="x", auth_token=tok_peek)
+            with self.assertRaises(PermissionError):
+                q.enqueue("worker_b", "escape", from_agent_id="worker_a", auth_token=tok_peek)
+            with self.assertRaises(PermissionError):
+                q.cancel(job["job_id"], requester_agent_id="worker_a", auth_token=tok_peek)
+
+            # peek_summary works for self (both peek & full) and rejects cross-agent / missing token
+            ps = q.peek_summary("worker_a", auth_token=tok_peek)
+            self.assertEqual(1, ps["pending"])
+            self.assertEqual(1, ps["pending_jobs"])
+            with self.assertRaises(PermissionError):
+                q.peek_summary("worker_b", auth_token=tok_peek)
+            with self.assertRaises(PermissionError):
+                q.peek_summary("worker_a", auth_token=None)
+
+            # C3: rotate_agent_token(scope="peek", revoke_existing=True) revokes ONLY old peek, preserves full
+            r_peek = fed.rotate_agent_token("worker_a", owner_auth=owner, scope="peek", revoke_existing=True, bus_dir=tmp)
+            self.assertEqual("peek", r_peek["scope"])
+            self.assertEqual(1, r_peek["revoked_previous"])
+            self.assertIsNone(fed.verify_agent_token(tok_peek, bus_dir=tmp, allowed_scopes=("full", "peek")))
+            self.assertIsNone(fed.verify_agent_token(r_peek["token"], bus_dir=tmp))
+            self.assertIsNotNone(fed.verify_agent_token(r_peek["token"], bus_dir=tmp, allowed_scopes=("full", "peek")))
+            self.assertIsNotNone(fed.verify_agent_token(tok_full, bus_dir=tmp))
+
+            # C3: Revoking specific peek token_id leaves full token active
+            rev_n = fed.revoke_agent_token("worker_a", owner_auth=owner, token_id=r_peek["token_id"], bus_dir=tmp)
+            self.assertEqual(1, rev_n)
+            self.assertIsNone(fed.verify_agent_token(r_peek["token"], bus_dir=tmp, allowed_scopes=("full", "peek")))
+            self.assertIsNotNone(fed.verify_agent_token(tok_full, bus_dir=tmp))
+
+            # C3: Historical token_records missing `scope` treated as `"full"`
+            m_peek2 = fed.mint_agent_token("worker_a", owner_auth=owner, scope="peek", bus_dir=tmp)
+            disk_obj = json.loads(agents_path.read_text(encoding="utf-8"))
+            for tr in disk_obj["agents"]["worker_a"]["token_records"]:
+                if tr["token_id"] == m_full["token_id"]:
+                    tr.pop("scope", None)
+            agents_path.write_text(json.dumps(disk_obj, indent=2), encoding="utf-8")
+
+            v_legacy = fed.verify_agent_token(tok_full, bus_dir=tmp)
+            self.assertIsNotNone(v_legacy)
+            assert v_legacy is not None
+            self.assertEqual("full", v_legacy["token_scope"])
+            san_legacy = fed.get_agent("worker_a", bus_dir=tmp)
+            assert san_legacy is not None
+            legacy_summary = {item["token_id"]: item["scope"] for item in san_legacy["active_tokens"]}
+            self.assertEqual("full", legacy_summary[m_full["token_id"]])
+            self.assertEqual("peek", legacy_summary[m_peek2["token_id"]])
+
+            # Rotating full revokes legacy full while keeping peek2 alive
+            r_full = fed.rotate_agent_token("worker_a", owner_auth=owner, scope="full", revoke_existing=True, bus_dir=tmp)
+            self.assertEqual(1, r_full["revoked_previous"])
+            self.assertIsNone(fed.verify_agent_token(tok_full, bus_dir=tmp))
+            self.assertIsNotNone(fed.verify_agent_token(m_peek2["token"], bus_dir=tmp, allowed_scopes=("full", "peek")))
+
+            # C3: Revoked agent rejects mint/rotate with ValueError
+            fed.revoke_agent("worker_a", owner_auth=owner, bus_dir=tmp)
+            with self.assertRaises(ValueError):
+                fed.mint_agent_token("worker_a", owner_auth=owner, scope="peek", bus_dir=tmp)
+            with self.assertRaises(ValueError):
+                fed.rotate_agent_token("worker_a", owner_auth=owner, scope="peek", bus_dir=tmp)
+
+    def test_c4_c5_peek_summary_watermark_sensitivity_and_zero_leak(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, _clean_env({"AGY_BOT_BUS_DIR": tmp}), clear=True):
+            owner = fed.make_owner_auth("owner_user")
+            fed.register_agent(
+                "peek_worker",
+                kind="http_a2a",
+                driver="pull_worker",
+                transport="pull_worker",
+                owner_auth=owner,
+                bus_dir=tmp,
+            )
+            tok_full = fed.mint_agent_token("peek_worker", owner_auth=owner, scope="full", bus_dir=tmp)["token"]
+            tok_peek = fed.mint_agent_token("peek_worker", owner_auth=owner, scope="peek", bus_dir=tmp)["token"]
+            q = fed.PullWorkerQueue(tmp)
+
+            # C5-1: Idle polling twice -> stable pending=0, watermark=""
+            s0_a = q.peek_summary("peek_worker", auth_token=tok_peek)
+            s0_b = q.peek_summary("peek_worker", auth_token=tok_peek)
+            self.assertEqual(s0_a, s0_b)
+            self.assertEqual(0, s0_a["pending"])
+            self.assertEqual(0, s0_a["pending_jobs"])
+            self.assertEqual(0, s0_a["pending_events"])
+            self.assertEqual("", s0_a["watermark"])
+            self.assertIsNone(s0_a["latest_created_at_ms"])
+            self.assertIsNone(s0_a["oldest_created_at"])
+
+            # C5-2: Enqueue 2 jobs in the exact same millisecond -> watermark MUST change
+            fixed_ts = 1764000000.123
+            with mock.patch("federation_registry.time.time", return_value=fixed_ts):
+                j1 = q.enqueue(
+                    "peek_worker",
+                    "SECRET_PROMPT_CANARY_ALPHA",
+                    job_id="pull-canary-job-1",
+                    metadata={"secret_note": "SENSITIVE_META_CANARY"},
+                    owner_auth=owner,
+                )
+                s1 = q.peek_summary("peek_worker", auth_token=tok_peek)
+                j2 = q.enqueue(
+                    "peek_worker",
+                    "SECRET_PROMPT_CANARY_BETA",
+                    job_id="pull-canary-job-2",
+                    owner_auth=owner,
+                )
+                s2 = q.peek_summary("peek_worker", auth_token=tok_peek)
+
+            self.assertEqual(1, s1["pending_jobs"])
+            self.assertEqual(2, s2["pending_jobs"])
+            self.assertTrue(s1["watermark"])
+            self.assertTrue(s2["watermark"])
+            self.assertNotEqual(s1["watermark"], s2["watermark"])
+            self.assertEqual(int(round(fixed_ts * 1000)), s2["latest_created_at_ms"])
+            self.assertEqual(fixed_ts, s2["oldest_created_at"])
+
+            # C4: Opaque watermark & zero payload leakage
+            s2_text = json.dumps(s2)
+            for forbidden in (
+                "SECRET_PROMPT_CANARY",
+                "SENSITIVE_META_CANARY",
+                "pull-canary-job-1",
+                "pull-canary-job-2",
+                tok_peek,
+                tok_full,
+                tmp,
+            ):
+                self.assertNotIn(forbidden, s2_text)
+
+            # C5-3 & C5-4: Claim j1 (excluded), cancel j2 & enqueue j3 (maintaining pending_jobs==1) -> watermark changes
+            q.claim("peek_worker", job_id=j1["job_id"], auth_token=tok_full)
+            s_after_claim = q.peek_summary("peek_worker", auth_token=tok_peek)
+            self.assertEqual(1, s_after_claim["pending_jobs"])
+            self.assertNotEqual(s2["watermark"], s_after_claim["watermark"])
+
+            q.cancel(j2["job_id"], owner_auth=owner)
+            with mock.patch("federation_registry.time.time", return_value=fixed_ts):
+                j3 = q.enqueue("peek_worker", "replacement job", job_id="pull-canary-job-3", owner_auth=owner)
+            s_replaced = q.peek_summary("peek_worker", auth_token=tok_peek)
+            self.assertEqual(1, s_replaced["pending_jobs"])
+            self.assertNotEqual(s_after_claim["watermark"], s_replaced["watermark"])
+
+            # Finish j1 (done) and cancel j3 -> pending_jobs == 0
+            q.complete(j1["job_id"], "peek_worker", status="done", result_text="SENSITIVE_RESULT_CANARY", auth_token=tok_full)
+            q.cancel(j3["job_id"], owner_auth=owner)
+            # Also inject synthetic running/failed job files to prove strict queued-only filtering
+            for st_name in ("running", "failed"):
+                fp = Path(q.queue_dir) / f"pull-synth-{st_name}.json"
+                fp.write_text(
+                    json.dumps(
+                        {
+                            "job_id": f"pull-synth-{st_name}",
+                            "target_agent_id": "peek_worker",
+                            "status": st_name,
+                            "cancelled": False,
+                            "created_at": fixed_ts + 10.0,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            s_empty_jobs = q.peek_summary("peek_worker", auth_token=tok_peek)
+            self.assertEqual(0, s_empty_jobs["pending"])
+            self.assertEqual("", s_empty_jobs["watermark"])
+
+            # C5-5: pending_jobs==0 + write 1 leader_event -> pending_events==1, pending==1, watermark changes
+            ev_dir = Path(fed.federation_dir(tmp)) / "leader_events" / "peek_worker"
+            ev_dir.mkdir(parents=True, exist_ok=True)
+            ev_file = ev_dir / "0001_ev-secret-999.json"
+            ev_file.write_text(
+                json.dumps(
+                    {
+                        "event_id": "ev-secret-999",
+                        "body": "LEADER_EVENT_SECRET_BODY",
+                        "created_at": fixed_ts + 20.0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            s_ev = q.peek_summary("peek_worker", auth_token=tok_peek)
+            self.assertEqual(0, s_ev["pending_jobs"])
+            self.assertEqual(1, s_ev["pending_events"])
+            self.assertEqual(1, s_ev["pending"])
+            self.assertTrue(s_ev["watermark"])
+            self.assertNotIn("ev-secret-999", json.dumps(s_ev))
+            self.assertNotIn("LEADER_EVENT_SECRET_BODY", json.dumps(s_ev))
+
+            # C5-6: Clear all -> resets watermark to ""
+            ev_file.unlink()
+            s_zero = q.peek_summary("peek_worker", auth_token=tok_peek)
+            self.assertEqual(0, s_zero["pending"])
+            self.assertEqual("", s_zero["watermark"])
+            self.assertIsNone(s_zero["latest_created_at_ms"])
+            self.assertIsNone(s_zero["oldest_created_at"])
+
+
 if __name__ == "__main__":
     unittest.main()
