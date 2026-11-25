@@ -23,12 +23,14 @@ from typing import Any, Dict, FrozenSet, List
 
 try:
     import bot_bus
+    import federation_registry
     import memory_guard
 except ImportError:
     _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
     if _THIS_DIR not in sys.path:
         sys.path.insert(0, _THIS_DIR)
     import bot_bus
+    import federation_registry
     import memory_guard
 
 _STDOUT_LOCK = threading.Lock()
@@ -76,13 +78,41 @@ def _bus_enabled() -> bool:
     return True
 
 
+def _federation_auth_token() -> Any:
+    raw = os.environ.get("AGY_FEDERATION_TOKEN", "").strip()
+    return raw or None
+
+
 def _bus_role() -> str:
     if not _bus_enabled():
         return "disabled"
     raw = os.environ.get("AGY_BOT_BUS_ROLE", "").strip().lower()
-    if raw in _VALID_BUS_ROLES:
-        return raw
-    return "disabled"
+    if raw not in _VALID_BUS_ROLES:
+        return "disabled"
+    me = _my_handle()
+    auth = federation_registry.resolve_actor_authority(
+        me,
+        bus_dir=bot_bus.BUS_DIR,
+        auth_token=_federation_auth_token(),
+        env=dict(os.environ),
+    )
+    if auth.get("federation_active") or auth.get("has_legacy_bots"):
+        if not auth.get("authorized"):
+            return "disabled"
+        agent = auth.get("agent")
+        if isinstance(agent, dict):
+            if agent.get("kind") != "agy_local" and not auth.get("token_verified"):
+                return "disabled"
+            if str(agent.get("trust_level") or "").strip().lower() == "readonly_guest":
+                return "disabled"
+            if not auth.get("can_dispatch"):
+                return "worker"
+        if auth.get("is_coordinator_peer") or auth.get("is_legacy_coordinator") or auth.get("led_teams"):
+            return "coordinator" if raw in ("coordinator", "peer") else raw
+        if auth.get("is_legacy_peer"):
+            return "peer" if raw in ("coordinator", "peer") else raw
+        return "worker"
+    return raw
 
 
 def _allowed_tool_names() -> FrozenSet[str]:
@@ -314,16 +344,79 @@ def _tool_schemas() -> List[Dict[str, Any]]:
     return [tool for tool in all_tools if tool["name"] in allowed]
 
 
+def _is_global_coordinator_auth(auth: Dict[str, Any]) -> bool:
+    return bool(auth.get("is_coordinator_peer") or auth.get("is_legacy_coordinator"))
+
+
+def _filter_jobs_for_actor(jobs: List[Dict[str, Any]], auth: Dict[str, Any], me: str) -> List[Dict[str, Any]]:
+    """Scope job listings strictly to allowed teams / teams led by `me` or jobs where `me` is sender/target (B1, M2-C4)."""
+    if not auth.get("federation_active"):
+        return jobs
+    allowed_teams = set(auth.get("allowed_teams") or [])
+    if _is_global_coordinator_auth(auth):
+        if not allowed_teams:
+            return jobs
+        return [
+            j
+            for j in jobs
+            if isinstance(j, dict) and str(j.get("team_id") or "").strip() in allowed_teams
+        ]
+    led_teams = set(auth.get("led_teams") or [])
+    filtered: List[Dict[str, Any]] = []
+    for j in jobs:
+        if not isinstance(j, dict):
+            continue
+        j_team = str(j.get("team_id") or "").strip()
+        if allowed_teams and j_team not in allowed_teams:
+            continue
+        if (j_team and j_team in led_teams) or j.get("from_bot") == me or j.get("target_bot") == me:
+            filtered.append(j)
+    return filtered
+
+
+def _filter_teams_for_actor(teams: List[Dict[str, Any]], auth: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Scope team metadata strictly to allowed teams and teams led by or containing the actor (B1, M2-C4)."""
+    if not auth.get("federation_active"):
+        return teams
+    allowed_cap_teams = set(auth.get("allowed_teams") or [])
+    if _is_global_coordinator_auth(auth):
+        if not allowed_cap_teams:
+            return teams
+        return [t for t in teams if isinstance(t, dict) and t.get("team_id") in allowed_cap_teams]
+    scoped_teams = set(auth.get("led_teams") or []) | set(auth.get("member_teams") or [])
+    if allowed_cap_teams:
+        scoped_teams &= allowed_cap_teams
+    return [t for t in teams if isinstance(t, dict) and t.get("team_id") in scoped_teams]
+
+
 def _handle_team_roster(args: Dict[str, Any]) -> Dict[str, Any]:
     include_offline = bool(args.get("include_offline", True))
-    roster = bot_bus.list_roster(include_offline=include_offline)
     me = _my_handle()
-    recent = [bot_bus.summarize_job_brief(j) for j in bot_bus.list_jobs(limit=6)]
-    return _tool_text({
+    fed_active = federation_registry.has_federation_state(bot_bus.BUS_DIR)
+    auth: Dict[str, Any] = {"federation_active": fed_active}
+    if fed_active:
+        auth = federation_registry.authorize_team_action(
+            me,
+            "list",
+            bus_dir=bot_bus.BUS_DIR,
+            auth_token=_federation_auth_token(),
+            env=dict(os.environ),
+        )
+    roster = bot_bus.list_roster(include_offline=include_offline)
+    raw_jobs = bot_bus.list_jobs(
+        limit=(bot_bus.JOB_RETENTION_LIMIT if (fed_active and not _is_global_coordinator_auth(auth)) else 6)
+    )
+    scoped_jobs = _filter_jobs_for_actor(raw_jobs, auth, me)[:6]
+    recent = [bot_bus.summarize_job_brief(j) for j in scoped_jobs]
+    payload: Dict[str, Any] = {
         "self_bot": f"@{me}" if me else "",
         "roster": roster,
         "recent_jobs": recent,
-    })
+    }
+    if fed_active:
+        all_teams = federation_registry.list_teams(bus_dir=bot_bus.BUS_DIR)
+        payload["teams"] = _filter_teams_for_actor(all_teams, auth)
+    return _tool_text(payload)
 
 
 def _session_security_env() -> Dict[str, Any]:
@@ -363,22 +456,111 @@ def _session_security_env() -> Dict[str, Any]:
     }
 
 
-def _assert_dispatch_allowed(sec: Dict[str, Any], *, action: str) -> None:
-    """Fail-closed hard block preventing untrusted/external/readonly/non-local sessions from
-    dispatching, retrying, or broadcasting onto the trusted local Coordinator Bus."""
-    if sec.get("readonly") or sec.get("untrusted") or sec.get("external_origin") or sec.get("non_local_trust"):
-        reasons: List[str] = []
-        if sec.get("readonly"):
-            reasons.append("readonly")
-        if sec.get("external_origin"):
-            reasons.append(f"external_origin={sec.get('agent_origin')!r}")
-        if sec.get("non_local_trust"):
-            reasons.append(f"non_local_trust={sec.get('trust_level')!r}")
-        if not reasons:
-            reasons.append("untrusted_session")
+def _assert_dispatch_allowed(
+    sec: Dict[str, Any],
+    *,
+    action: str,
+    require_orchestrator: bool = True,
+) -> Dict[str, Any]:
+    """Fail-closed hard block combining session taint guards and server-side authority verification (C3, C4).
+
+    Never trusts forged process environment claims (`AGY_BOT_BUS_ROLE=coordinator`,
+    `AGY_TRUST_LEVEL=local_admin`) when `federation_registry` / `team_config.json` do not grant authority.
+    """
+    me = _my_handle()
+    auth_token = _federation_auth_token()
+    auth = federation_registry.resolve_actor_authority(
+        me,
+        bus_dir=bot_bus.BUS_DIR,
+        auth_token=auth_token,
+        env=dict(os.environ),
+    )
+
+    # B2: Authoritative server-side trust_level clamping (blocks forged AGY_TRUST_LEVEL=local_admin).
+    agent = auth.get("agent")
+    reg_trust = ""
+    if isinstance(agent, dict) and agent.get("trust_level"):
+        reg_trust = bot_bus._normalize_trust_level(agent.get("trust_level"), default="remote_untrusted")
+    sec_trust = str(sec.get("trust_level") or "").strip()
+    if sec_trust and reg_trust:
+        eff_trust = bot_bus._min_trust_level(sec_trust, reg_trust)
+    else:
+        eff_trust = reg_trust or sec_trust
+    eff_readonly = bool(sec.get("readonly")) or (eff_trust == "readonly_guest") or (reg_trust == "readonly_guest")
+    eff_untrusted = (
+        bool(sec.get("untrusted"))
+        or eff_readonly
+        or (bool(eff_trust) and bot_bus.TRUST_ORDER.get(eff_trust, 0) <= bot_bus.TRUST_ORDER["remote_untrusted"])
+    )
+
+    if reg_trust in ("readonly_guest", "remote_untrusted") or eff_trust in ("readonly_guest", "remote_untrusted"):
         raise PermissionError(
-            f"PRIVILEGE_ESCALATION_DENIED: untrusted/external/non-local session cannot perform {action} ({', '.join(reasons)})"
+            f"PRIVILEGE_ESCALATION_DENIED: server-side agent trust_level "
+            f"(registered={reg_trust or 'none'!r}, effective={eff_trust or 'none'!r}) cannot perform {action}"
         )
+
+    # An explicitly verified federated agent token with Owner-granted orchestration rights
+    # is permitted only if not readonly/untrusted/tainted; otherwise untrusted/external env ALWAYS fails closed.
+    token_authenticated_federated = (
+        bool(auth.get("token_verified"))
+        and bool(auth.get("authorized"))
+        and not eff_readonly
+        and os.environ.get("AGY_UNTRUSTED_SESSION", "").strip() != "1"
+        and os.environ.get("AGY_MEMORY_READONLY", "").strip() != "1"
+        and reg_trust not in ("readonly_guest", "remote_untrusted")
+        and eff_trust not in ("readonly_guest", "remote_untrusted")
+    )
+
+    if not token_authenticated_federated:
+        if (
+            eff_readonly
+            or sec.get("untrusted")
+            or sec.get("external_origin")
+            or sec.get("non_local_trust")
+        ):
+            reasons: List[str] = []
+            if eff_readonly:
+                reasons.append("readonly")
+            if sec.get("external_origin"):
+                reasons.append(f"external_origin={sec.get('agent_origin')!r}")
+            if sec.get("non_local_trust"):
+                reasons.append(f"non_local_trust={eff_trust or sec.get('trust_level')!r}")
+            if not reasons:
+                reasons.append("untrusted_session")
+            raise PermissionError(
+                f"PRIVILEGE_ESCALATION_DENIED: untrusted/external/non-local session cannot perform {action} ({', '.join(reasons)})"
+            )
+
+    # Server-side authoritative verification against federation_registry + team_config.json
+    if auth.get("federation_active") or auth.get("has_legacy_bots"):
+        if not auth.get("authorized"):
+            raise PermissionError(
+                f"PRIVILEGE_ESCALATION_DENIED: server-side authority rejected {me!r} for {action} ({auth.get('reason') or 'unauthorized'})"
+            )
+        if isinstance(agent, dict) and agent.get("kind") != "agy_local" and not auth.get("token_verified"):
+            raise PermissionError(
+                f"PRIVILEGE_ESCALATION_DENIED: external agent {me!r} requires valid verified federation token for {action}"
+            )
+        if require_orchestrator:
+            if isinstance(agent, dict) and not auth.get("can_dispatch"):
+                raise PermissionError(
+                    f"PRIVILEGE_ESCALATION_DENIED: agent {me!r} has capabilities.can_dispatch=False and cannot perform {action}"
+                )
+            has_orch_auth = bool(
+                auth.get("is_coordinator_peer")
+                or auth.get("is_legacy_coordinator")
+                or auth.get("is_legacy_peer")
+                or auth.get("led_teams")
+            )
+            if not has_orch_auth:
+                raise PermissionError(
+                    f"PRIVILEGE_ESCALATION_DENIED: actor {me!r} lacks server-side coordinator/leader authority for {action} (forged env role ignored)"
+                )
+    auth = dict(auth)
+    auth["effective_trust_level"] = eff_trust
+    auth["effective_readonly"] = eff_readonly
+    auth["effective_untrusted"] = eff_untrusted
+    return auth
 
 
 def _enforce_bound_dispatch_fields(
@@ -475,12 +657,12 @@ def _handle_team_dispatch(args: Dict[str, Any]) -> Dict[str, Any]:
         return _tool_text("AGY_BOT_HANDLE missing in session environment.", is_error=True)
 
     sec = _session_security_env()
-    _assert_dispatch_allowed(sec, action="team_dispatch")
+    auth = _assert_dispatch_allowed(sec, action="team_dispatch")
     env_team_id = sec["team_id"]
-    env_trust_level = sec["trust_level"]
+    eff_trust_level = auth.get("effective_trust_level") or sec["trust_level"]
     env_agent_origin = sec["agent_origin"]
-    env_untrusted = sec["untrusted"]
-    env_readonly = sec["readonly"]
+    eff_untrusted = bool(auth.get("effective_untrusted", sec["untrusted"]))
+    eff_readonly = bool(auth.get("effective_readonly", sec["readonly"]))
 
     req_team_id = str(args.get("team_id") or "").strip()
     if env_team_id and req_team_id and req_team_id != env_team_id:
@@ -521,13 +703,14 @@ def _handle_team_dispatch(args: Dict[str, Any]) -> Dict[str, Any]:
         wake_on_async=not wait,
         team_id=eff_team_id,
         agent_origin=eff_origin,
-        parent_trust_level=env_trust_level,
+        parent_trust_level=eff_trust_level,
         parent_agent_origin=env_agent_origin,
-        parent_untrusted=env_untrusted,
-        parent_tainted=env_untrusted,
-        parent_readonly=env_readonly,
+        parent_untrusted=eff_untrusted,
+        parent_tainted=eff_untrusted,
+        parent_readonly=eff_readonly,
         parent_max_runtime_mode=sec["max_runtime_mode"],
         batch_budget_usd=args.get("batch_budget_usd"),
+        auth_token=_federation_auth_token(),
     )
     job_ids = [j["job_id"] for j in created["jobs"]]
 
@@ -563,7 +746,21 @@ def _handle_team_job(args: Dict[str, Any]) -> Dict[str, Any]:
     me = _my_handle()
     if action == "list":
         limit = max(1, min(30, int(args.get("limit", 10) or 10)))
-        jobs = [bot_bus.summarize_job_brief(j) for j in bot_bus.list_jobs(limit=limit)]
+        fed_active = federation_registry.has_federation_state(bot_bus.BUS_DIR)
+        auth: Dict[str, Any] = {"federation_active": fed_active}
+        if fed_active:
+            auth = federation_registry.authorize_team_action(
+                me,
+                "list",
+                bus_dir=bot_bus.BUS_DIR,
+                auth_token=_federation_auth_token(),
+                env=dict(os.environ),
+            )
+        raw_jobs = bot_bus.list_jobs(
+            limit=(bot_bus.JOB_RETENTION_LIMIT if (fed_active and not _is_global_coordinator_auth(auth)) else limit)
+        )
+        scoped = _filter_jobs_for_actor(raw_jobs, auth, me)[:limit]
+        jobs = [bot_bus.summarize_job_brief(j) for j in scoped]
         return _tool_text({"jobs": jobs})
 
     jid = str(args.get("job_id") or "").strip()
@@ -571,7 +768,7 @@ def _handle_team_job(args: Dict[str, Any]) -> Dict[str, Any]:
         return _tool_text("`job_id` is required for this action.", is_error=True)
 
     if action == "status":
-        job = bot_bus.get_job(jid)
+        job = bot_bus.get_job(jid, requester_bot=me, auth_token=_federation_auth_token())
         if not job:
             return _tool_text(f"Job not found: {jid}", is_error=True)
         return _tool_text(bot_bus.summarize_job_brief(job))
@@ -579,25 +776,34 @@ def _handle_team_job(args: Dict[str, Any]) -> Dict[str, Any]:
     if action == "cancel":
         sec = _session_security_env()
         _assert_dispatch_allowed(sec, action="team_job(cancel)")
-        job = bot_bus.cancel_job(jid, requester_bot=me, reason=str(args.get("reason") or "cancelled_by_coordinator"))
+        job = bot_bus.cancel_job(
+            jid,
+            requester_bot=me,
+            reason=str(args.get("reason") or "cancelled_by_coordinator"),
+            auth_token=_federation_auth_token(),
+        )
         if not job:
             return _tool_text(f"Job not found: {jid}", is_error=True)
         return _tool_text({"cancelled": bot_bus.summarize_job_brief(job)})
 
     if action == "retry":
         sec = _session_security_env()
-        _assert_dispatch_allowed(sec, action="team_job(retry)")
+        auth = _assert_dispatch_allowed(sec, action="team_job(retry)")
+        eff_trust = auth.get("effective_trust_level") or sec["trust_level"]
+        eff_readonly = bool(auth.get("effective_readonly", sec["readonly"]))
+        eff_untrusted = bool(auth.get("effective_untrusted", sec["untrusted"]))
         job = bot_bus.retry_job(
             jid,
             requester_bot=me,
             prompt_override=str(args.get("prompt_override") or ""),
             caller_team_id=sec["team_id"],
             caller_agent_origin=sec["agent_origin"],
-            caller_trust_level=sec["trust_level"],
-            caller_readonly=sec["readonly"],
-            caller_untrusted=sec["untrusted"],
-            caller_tainted=sec["untrusted"],
+            caller_trust_level=eff_trust,
+            caller_readonly=eff_readonly,
+            caller_untrusted=eff_untrusted,
+            caller_tainted=eff_untrusted,
             caller_max_runtime_mode=sec["max_runtime_mode"],
+            auth_token=_federation_auth_token(),
         )
         return _tool_text({"retried": bot_bus.summarize_job_brief(job)})
 
@@ -605,7 +811,12 @@ def _handle_team_job(args: Dict[str, Any]) -> Dict[str, Any]:
         sec = _session_security_env()
         _assert_dispatch_allowed(sec, action="team_job(cleanup_worktree)")
         force = bool(args.get("force", False))
-        res = bot_bus.cleanup_job_worktree(jid, force=force)
+        res = bot_bus.cleanup_job_worktree(
+            jid,
+            force=force,
+            requester_bot=me,
+            auth_token=_federation_auth_token(),
+        )
         return _tool_text(res, is_error=not bool(res.get("ok")))
 
     return _tool_text(f"Unknown action: {action}", is_error=True)
@@ -613,7 +824,7 @@ def _handle_team_job(args: Dict[str, Any]) -> Dict[str, Any]:
 
 def _handle_team_broadcast(args: Dict[str, Any]) -> Dict[str, Any]:
     sec = _session_security_env()
-    _assert_dispatch_allowed(sec, action="team_broadcast")
+    auth = _assert_dispatch_allowed(sec, action="team_broadcast")
     msg = str(args.get("message") or "").strip()
     if not msg:
         return _tool_text("`message` cannot be empty.", is_error=True)
@@ -621,6 +832,19 @@ def _handle_team_broadcast(args: Dict[str, Any]) -> Dict[str, Any]:
     target_bot = str(args.get("bot") or me or "").strip()
     if not target_bot:
         return _tool_text("Target bot handle unavailable.", is_error=True)
+    bot_bus._reject_unsafe_actor_id(target_bot, field="bot")
+    norm_target = bot_bus.normalize_handle(target_bot)
+    if auth.get("federation_active") and (not _is_global_coordinator_auth(auth) or auth.get("allowed_teams")):
+        if norm_target != me:
+            federation_registry.authorize_team_action(
+                me,
+                "broadcast",
+                team_id=sec.get("team_id") or "",
+                target_agent_id=norm_target,
+                bus_dir=bot_bus.BUS_DIR,
+                auth_token=_federation_auth_token(),
+                env=dict(os.environ),
+            )
     origin = _origin_context()
     chat_id = int(args.get("chat_id") or origin["origin_chat_id"] or 0)
     thread_id = args.get("thread_id")
@@ -641,7 +865,7 @@ def _handle_team_broadcast(args: Dict[str, Any]) -> Dict[str, Any]:
 
 def _handle_group_say(args: Dict[str, Any]) -> Dict[str, Any]:
     sec = _session_security_env()
-    _assert_dispatch_allowed(sec, action="group_say")
+    _assert_dispatch_allowed(sec, action="group_say", require_orchestrator=False)
     msg = str(args.get("message") or "").strip()
     if not msg:
         return _tool_text("`message` cannot be empty.", is_error=True)
@@ -751,7 +975,9 @@ def _handle_request(req: Dict[str, Any]) -> None:
         try:
             res = fn(args)
         except Exception as exc:
-            res = _tool_text(f"{tname} error: {exc}", is_error=True)
+            tok = _federation_auth_token()
+            safe_exc = federation_registry.redact_secrets(str(exc), extra_secrets=([tok] if tok else ()))
+            res = _tool_text(f"{tname} error: {safe_exc}", is_error=True)
         _reply_ok(req_id, res)
         return
 

@@ -118,6 +118,14 @@ try:
 except ImportError:
     from bridge import studio_ipc_handlers
 
+try:
+    import federation_registry
+except ImportError:
+    try:
+        from bridge import federation_registry
+    except ImportError:
+        federation_registry = None
+
 
 class _BridgeGlobalsHost:
     """Zero-overhead dynamic view over `bridge.py` module globals for split sibling modules."""
@@ -11650,13 +11658,612 @@ def build_team_panel(scope_key=None):
     return "\n".join(lines), {"inline_keyboard": kb_rows}
 
 
-def cmd_team(chat_id, raw_rest="", thread_id=None, scope_key=None, edit_msg_id=None):
+def _is_dm_chat(chat_id):
+    """Return True strictly for private DM chat IDs (`int(chat_id) > 0`)."""
+    if chat_id is None or isinstance(chat_id, bool):
+        return False
+    try:
+        return int(chat_id) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _enforce_federation_owner_caller(chat_id, from_user, *, scope_key=None):
+    """Strict human-Admin + clean non-tainted session gate for Telegram federation commands."""
+    if federation_registry is None:
+        return False, None, "federation_module_unavailable"
+    ok_admin, deny_reason = _is_human_admin_caller(chat_id, from_user)
+    if not ok_admin:
+        return False, None, deny_reason
+    if (
+        str(os.environ.get("AGY_UNTRUSTED_SESSION") or "").strip() == "1"
+        or str(os.environ.get("AGY_MEMORY_READONLY") or "").strip() == "1"
+        or str(os.environ.get("AGY_RBAC_ROLE") or "").strip().lower() == "readonly"
+    ):
+        return False, None, "untrusted_or_readonly_env"
+    if scope_key:
+        conv = get_scope_value(scope_key, "conversation_id")
+        if conv and memory_guard.is_tainted(conv, taint_file=MEMORY_TAINT_FILE):
+            return False, None, "tainted_session"
+    uid = access_control.extract_user_id(from_user)
+    try:
+        owner_auth = federation_registry.make_owner_auth(actor_id=f"tg_owner:{uid}")
+    except PermissionError:
+        return False, None, "owner_auth_denied"
+    return True, owner_auth, "admin"
+
+
+def _parse_bool_arg_strict(raw_val):
+    s = str(raw_val or "").strip().lower()
+    if s in ("true", "1", "yes", "on"):
+        return True
+    if s in ("false", "0", "no", "off"):
+        return False
+    raise ValueError(f"无效布尔值: {raw_val!r}（仅支持 true/false）")
+
+
+def _resolve_agent_driver_spec(driver_token):
+    tok = str(driver_token or "").strip().lower()
+    mapping = {
+        "hermes_local": ("hermes_local", "hermes_local", "local_cli"),
+        "hermes_remote": ("hermes_remote", "hermes_remote", "hermes_api"),
+        "muse_remote": ("muse_remote", "http_external", "http_push"),
+        "http_a2a": ("http_a2a", "http_external", "http_push"),
+        "pull_worker": ("http_a2a", "pull_worker", "pull_worker"),
+        "agy_local": ("agy_local", "agy", "local_cli"),
+        "agy": ("agy_local", "agy", "local_cli"),
+        "mcp_inbound_only": ("mcp_inbound_only", "mcp_inbound_only", "mcp_inbound"),
+    }
+    if tok not in mapping:
+        raise ValueError(f"不支持的 driver: {driver_token!r}（支持: {', '.join(sorted(mapping.keys()))}）")
+    return mapping[tok]
+
+
+def _leader_dispatch_warning_html(leader_agent_id):
+    """Return HTML warning line if `leader_agent_id` has `can_dispatch=False` (never mutates agent)."""
+    if not leader_agent_id:
+        return ""
+    try:
+        rec = federation_registry.get_agent(leader_agent_id, bus_dir=bot_bus.BUS_DIR)
+    except Exception:
+        return ""
+    if isinstance(rec, dict) and not bool((rec.get("capabilities") or {}).get("can_dispatch", False)):
+        return (
+            f"\n⚠️ <b>提示</b>：<code>{html_mod.escape(leader_agent_id)}</code> 当前 "
+            f"<code>can_dispatch=false</code>（系统未静默提权）。如需允许其派工，请由 Owner 显式执行：\n"
+            f"<code>/agent grant {html_mod.escape(leader_agent_id)} can_dispatch=true</code>"
+        )
+    return ""
+
+
+def _handle_federation_team_subcommand(chat_id, raw, parts, *, norm_tid, skey, from_user):
+    """Handle Owner-only federation multi-team subcommands under `/team`."""
+    sub = parts[0].lower()
+    ok_owner, owner_auth, deny_reason = _enforce_federation_owner_caller(chat_id, from_user, scope_key=skey)
+    if not ok_owner:
+        log("Rejected /team %s from chat=%s reason=%s" % (sub, chat_id, deny_reason))
+        send(
+            chat_id,
+            access_control.format_rbac_denied_message(f"/team {sub}"),
+            parse_mode="HTML",
+            thread_id=norm_tid,
+        )
+        return
+
+    try:
+        tokens = shlex.split(raw)
+    except ValueError as exc:
+        send(chat_id, f"⚠️ 参数解析失败：<code>{html_mod.escape(str(exc))}</code>", parse_mode="HTML", thread_id=norm_tid)
+        return
+
+    if sub == "list":
+        teams = federation_registry.list_teams(bus_dir=bot_bus.BUS_DIR)
+        if not teams:
+            send(
+                chat_id,
+                "📋 当前尚未配置多团队联邦。\n"
+                "<i>可用：<code>/team create &lt;team_id&gt; --leader &lt;agent_id&gt; [--name ...] [--members a,b]</code></i>",
+                parse_mode="HTML",
+                thread_id=norm_tid,
+            )
+            return
+        lines = ["<b>🌐 联邦多团队列表 (/team list)</b>", "━━━━━━━━━━━━━━━━━━━━"]
+        for t in teams:
+            tid = t.get("team_id") or ""
+            dname = t.get("display_name") or tid
+            leader = t.get("leader_agent_id") or "未指派"
+            members = ", ".join(t.get("members") or []) or "无"
+            warn = " ⚠️(can_dispatch=false)" if _leader_dispatch_warning_html(t.get("leader_agent_id") or "") else ""
+            lines.append(
+                f"• <code>{html_mod.escape(tid)}</code> ({html_mod.escape(dname)})\n"
+                f"  👑 负责人: <code>{html_mod.escape(leader)}</code>{warn}\n"
+                f"  👥 成员: <code>{html_mod.escape(members)}</code>"
+            )
+        send(chat_id, "\n".join(lines), parse_mode="HTML", thread_id=norm_tid)
+        return
+
+    if sub == "create":
+        if len(tokens) < 2:
+            send(
+                chat_id,
+                "用法：<code>/team create &lt;team_id&gt; --leader &lt;agent_id&gt; [--name 名称] [--members a,b]</code>",
+                parse_mode="HTML",
+                thread_id=norm_tid,
+            )
+            return
+        team_id = tokens[1]
+        leader_id = ""
+        display_name = ""
+        members = []
+        co_leaders = []
+        idx = 2
+        while idx < len(tokens):
+            tok = tokens[idx]
+            if tok == "--leader" and idx + 1 < len(tokens):
+                leader_id = tokens[idx + 1]
+                idx += 2
+            elif tok == "--name" and idx + 1 < len(tokens):
+                display_name = tokens[idx + 1]
+                idx += 2
+            elif tok == "--members" and idx + 1 < len(tokens):
+                members = [m.strip() for m in tokens[idx + 1].split(",") if m.strip()]
+                idx += 2
+            elif tok == "--co-leaders" and idx + 1 < len(tokens):
+                co_leaders = [c.strip() for c in tokens[idx + 1].split(",") if c.strip()]
+                idx += 2
+            else:
+                send(
+                    chat_id,
+                    f"⚠️ 未识别参数：<code>{html_mod.escape(tok)}</code>",
+                    parse_mode="HTML",
+                    thread_id=norm_tid,
+                )
+                return
+        try:
+            team = federation_registry.create_team(
+                team_id,
+                owner_auth=owner_auth,
+                display_name=display_name,
+                leader_agent_id=leader_id,
+                co_leaders=co_leaders,
+                members=members,
+                require_registered=True,
+                bus_dir=bot_bus.BUS_DIR,
+            )
+        except (ValueError, PermissionError) as exc:
+            send(chat_id, f"❌ 创建团队失败：<code>{html_mod.escape(str(exc))}</code>", parse_mode="HTML", thread_id=norm_tid)
+            return
+        warn_html = _leader_dispatch_warning_html(team.get("leader_agent_id") or "")
+        send(
+            chat_id,
+            f"✅ 已创建团队 <code>{html_mod.escape(team['team_id'])}</code>\n"
+            f"• 负责人：<code>{html_mod.escape(team.get('leader_agent_id') or '未指派')}</code>\n"
+            f"• 成员：<code>{html_mod.escape(', '.join(team.get('members') or []))}</code>{warn_html}",
+            parse_mode="HTML",
+            thread_id=norm_tid,
+        )
+        return
+
+    if sub == "leader":
+        if len(tokens) < 3:
+            send(
+                chat_id,
+                "用法：<code>/team leader &lt;team_id&gt; &lt;agent_id&gt;</code>",
+                parse_mode="HTML",
+                thread_id=norm_tid,
+            )
+            return
+        team_id, leader_id = tokens[1], tokens[2]
+        try:
+            team = federation_registry.set_team_leader(
+                team_id,
+                leader_id,
+                owner_auth=owner_auth,
+                require_registered=True,
+                bus_dir=bot_bus.BUS_DIR,
+            )
+        except (ValueError, PermissionError) as exc:
+            send(chat_id, f"❌ 切换负责人失败：<code>{html_mod.escape(str(exc))}</code>", parse_mode="HTML", thread_id=norm_tid)
+            return
+        warn_html = _leader_dispatch_warning_html(team.get("leader_agent_id") or "")
+        send(
+            chat_id,
+            f"👑 团队 <code>{html_mod.escape(team['team_id'])}</code> 负责人已切换为 "
+            f"<code>{html_mod.escape(team.get('leader_agent_id') or '')}</code>{warn_html}",
+            parse_mode="HTML",
+            thread_id=norm_tid,
+        )
+        return
+
+    if sub == "members":
+        if len(tokens) < 4 or tokens[2].lower() not in ("add", "remove"):
+            send(
+                chat_id,
+                "用法：<code>/team members &lt;team_id&gt; &lt;add|remove&gt; &lt;agent_id&gt;</code>",
+                parse_mode="HTML",
+                thread_id=norm_tid,
+            )
+            return
+        team_id, op, aid = tokens[1], tokens[2].lower(), tokens[3]
+        try:
+            if op == "add":
+                team = federation_registry.add_team_member(
+                    team_id,
+                    aid,
+                    owner_auth=owner_auth,
+                    require_registered=True,
+                    bus_dir=bot_bus.BUS_DIR,
+                )
+            else:
+                team = federation_registry.remove_team_member(
+                    team_id,
+                    aid,
+                    owner_auth=owner_auth,
+                    bus_dir=bot_bus.BUS_DIR,
+                )
+        except (ValueError, PermissionError) as exc:
+            send(chat_id, f"❌ 更新团队成员失败：<code>{html_mod.escape(str(exc))}</code>", parse_mode="HTML", thread_id=norm_tid)
+            return
+        send(
+            chat_id,
+            f"✅ 团队 <code>{html_mod.escape(team['team_id'])}</code> 成员已更新（{op}: <code>{html_mod.escape(aid)}</code>）\n"
+            f"• 当前成员：<code>{html_mod.escape(', '.join(team.get('members') or []) or '无')}</code>",
+            parse_mode="HTML",
+            thread_id=norm_tid,
+        )
+        return
+
+    if sub == "delete":
+        if len(tokens) < 2:
+            send(chat_id, "用法：<code>/team delete &lt;team_id&gt;</code>", parse_mode="HTML", thread_id=norm_tid)
+            return
+        team_id = tokens[1]
+        try:
+            deleted = federation_registry.delete_team(team_id, owner_auth=owner_auth, bus_dir=bot_bus.BUS_DIR)
+        except (ValueError, PermissionError) as exc:
+            send(chat_id, f"❌ 删除团队失败：<code>{html_mod.escape(str(exc))}</code>", parse_mode="HTML", thread_id=norm_tid)
+            return
+        if not deleted:
+            send(chat_id, f"⚠️ 未找到团队：<code>{html_mod.escape(team_id)}</code>", parse_mode="HTML", thread_id=norm_tid)
+            return
+        send(chat_id, f"🗑 已删除联邦团队 <code>{html_mod.escape(team_id)}</code>。", parse_mode="HTML", thread_id=norm_tid)
+        return
+
+
+def cmd_agent(chat_id, raw_rest="", thread_id=None, scope_key=None, from_user=None):
+    """Owner-only Telegram management command for federated external agents (`/agent`).
+
+    Security invariants (M3-C6, M3-C7):
+    - Strictly enforces human-Admin RBAC + non-tainted clean session BEFORE any read/write.
+    - Hard-blocks minting/rotating plaintext `agy_fed_` tokens in group chats (`int(chat_id) <= 0`)
+      BEFORE touching the registry (zero disk mutation, zero token generation, zero leakage).
+    - In valid human-Admin DM (`int(chat_id) > 0`), sends one-time token ONLY directly to DM and
+      NEVER logs it or forwards it to `team_mirror`.
+    """
+    norm_tid = _normalize_thread_id(thread_id)
+    skey = scope_key or scope_key_for(chat_id, norm_tid)
+
+    ok_owner, owner_auth, deny_reason = _enforce_federation_owner_caller(chat_id, from_user, scope_key=skey)
+    if not ok_owner:
+        log("Rejected /agent from chat=%s reason=%s" % (chat_id, deny_reason))
+        send(
+            chat_id,
+            access_control.format_rbac_denied_message("/agent"),
+            parse_mode="HTML",
+            thread_id=norm_tid,
+        )
+        return
+
+    raw = (raw_rest or "").strip()
+    if not raw:
+        sub = "list"
+        tokens = ["list"]
+    else:
+        try:
+            tokens = shlex.split(raw)
+        except ValueError as exc:
+            send(chat_id, f"⚠️ 参数解析失败：<code>{html_mod.escape(str(exc))}</code>", parse_mode="HTML", thread_id=norm_tid)
+            return
+        sub = tokens[0].lower() if tokens else "list"
+
+    if sub in ("list", "ls", "help"):
+        agents = federation_registry.list_agents(bus_dir=bot_bus.BUS_DIR, include_disabled=True, include_revoked=True)
+        if not agents:
+            send(
+                chat_id,
+                "🤖 当前尚未注册任何联邦外部 Agent。\n"
+                "<i>用法：\n"
+                "• <code>/agent add &lt;id&gt; &lt;driver&gt; [--profile ...] [--endpoint ...] [--model ...] [--display ...]</code>\n"
+                "• <code>/agent grant &lt;id&gt; [coordinator_peer=true|false] [host_server_invoke=true|false] [can_dispatch=true|false] [can_receive=true|false] [teams=a,b]</code>\n"
+                "• <code>/agent token|mint|rotate &lt;id&gt;</code>（仅限私聊 DM）\n"
+                "• <code>/agent revoke &lt;id&gt;</code>（一键 Kill-Switch）</i>",
+                parse_mode="HTML",
+                thread_id=norm_tid,
+            )
+            return
+        lines = ["<b>🌐 联邦外部 Agent 列表 (/agent list)</b>", "━━━━━━━━━━━━━━━━━━━━"]
+        for ag in agents:
+            aid = ag.get("agent_id") or ""
+            caps = ag.get("capabilities") or {}
+            st_badge = "🚫 REVOKED" if ag.get("revoked") else ("🟢 ON" if ag.get("enabled") else "⚪ OFF")
+            flags = []
+            if caps.get("coordinator_peer"):
+                flags.append("coord_peer")
+            if caps.get("host_server_invoke"):
+                flags.append("host_invoke")
+            if caps.get("can_dispatch"):
+                flags.append("dispatch")
+            if caps.get("can_receive"):
+                flags.append("receive")
+            flag_str = ", ".join(flags) or "none"
+            prof_part = f" · profile=<code>{html_mod.escape(ag.get('profile') or '')}</code>" if ag.get("profile") else ""
+            lines.append(
+                f"• <code>{html_mod.escape(aid)}</code> [{st_badge}] ({html_mod.escape(str(ag.get('kind') or ''))}/{html_mod.escape(str(ag.get('driver') or ''))}{prof_part})\n"
+                f"  权限: <code>{html_mod.escape(flag_str)}</code> · Tokens: <code>{int(ag.get('active_token_count') or 0)}</code>"
+            )
+        send(chat_id, "\n".join(lines), parse_mode="HTML", thread_id=norm_tid)
+        return
+
+    if sub == "add":
+        if len(tokens) < 3:
+            send(
+                chat_id,
+                "用法：<code>/agent add &lt;agent_id&gt; &lt;driver&gt; [--profile ...] [--endpoint ...] [--model ...] [--display ...] [--secret-ref ...] [--mint]</code>",
+                parse_mode="HTML",
+                thread_id=norm_tid,
+            )
+            return
+        aid = tokens[1]
+        driver_tok = tokens[2]
+        profile = ""
+        endpoint_url = ""
+        model_name = ""
+        display_name = ""
+        secret_ref = ""
+        trust_level = None
+        want_mint = False
+        idx = 3
+        while idx < len(tokens):
+            tok = tokens[idx]
+            if tok == "--mint":
+                want_mint = True
+                idx += 1
+            elif tok == "--profile" and idx + 1 < len(tokens):
+                profile = tokens[idx + 1]
+                idx += 2
+            elif tok == "--endpoint" and idx + 1 < len(tokens):
+                endpoint_url = tokens[idx + 1]
+                idx += 2
+            elif tok == "--model" and idx + 1 < len(tokens):
+                model_name = tokens[idx + 1]
+                idx += 2
+            elif tok == "--display" and idx + 1 < len(tokens):
+                display_name = tokens[idx + 1]
+                idx += 2
+            elif tok == "--secret-ref" and idx + 1 < len(tokens):
+                secret_ref = tokens[idx + 1]
+                idx += 2
+            elif tok == "--trust" and idx + 1 < len(tokens):
+                trust_level = tokens[idx + 1]
+                idx += 2
+            else:
+                send(
+                    chat_id,
+                    f"⚠️ 未识别参数：<code>{html_mod.escape(tok)}</code>",
+                    parse_mode="HTML",
+                    thread_id=norm_tid,
+                )
+                return
+
+        # M3-C7: Hard pre-check BEFORE touching registry if --mint requested outside DM
+        if want_mint and not _is_dm_chat(chat_id):
+            send(
+                chat_id,
+                "🔒 <b>安全拦截：禁止在群聊/Topic 中使用 <code>--mint</code> 签发明文 Token</b>\n"
+                "本次注册已中止（未落盘、未签发 Token）。请移步 <b>与本 Bot 的私聊（DM）</b> 或 "
+                "<b>AGY Studio WebUI（/federation）</b> 执行注册与签发。",
+                parse_mode="HTML",
+                thread_id=norm_tid,
+            )
+            return
+
+        try:
+            norm_kind, norm_driver, norm_transport = _resolve_agent_driver_spec(driver_tok)
+            if norm_kind == "hermes_local" and not profile:
+                profile = "default"
+            meta = {"model": model_name} if model_name else {}
+            rec = federation_registry.register_agent(
+                aid,
+                kind=norm_kind,
+                owner_auth=owner_auth,
+                display_name=display_name,
+                driver=norm_driver,
+                profile=profile,
+                endpoint_url=endpoint_url,
+                secret_ref=secret_ref,
+                transport=norm_transport,
+                trust_level=trust_level,
+                metadata=meta,
+                bus_dir=bot_bus.BUS_DIR,
+            )
+            minted = None
+            if want_mint:
+                minted = federation_registry.mint_agent_token(
+                    rec["agent_id"],
+                    owner_auth=owner_auth,
+                    label="tg-dm-add",
+                    bus_dir=bot_bus.BUS_DIR,
+                )
+        except (ValueError, PermissionError) as exc:
+            send(chat_id, f"❌ 注册 Agent 失败：<code>{html_mod.escape(str(exc))}</code>", parse_mode="HTML", thread_id=norm_tid)
+            return
+
+        if minted is not None:
+            # Strictly DM-only delivery; never logged or forwarded to team_mirror
+            send(
+                chat_id,
+                f"✅ 已注册外部 Agent <code>{html_mod.escape(rec['agent_id'])}</code> 并签发一次性 Token：\n"
+                f"• Token ID: <code>{html_mod.escape(minted['token_id'])}</code>\n"
+                f"• Bearer Token（仅展示一次，请妥善保存）:\n"
+                f"<code>{html_mod.escape(minted['token'])}</code>",
+                parse_mode="HTML",
+                thread_id=None,
+            )
+            return
+
+        send(
+            chat_id,
+            f"✅ 已注册外部 Agent <code>{html_mod.escape(rec['agent_id'])}</code> "
+            f"(<code>{html_mod.escape(rec['kind'])}</code> / <code>{html_mod.escape(rec['driver'])}</code>)。\n"
+            f"<i>如需签发入站凭据，请在私聊 DM 发送 <code>/agent token {html_mod.escape(rec['agent_id'])}</code> 或前往 Studio <code>/federation</code>。</i>",
+            parse_mode="HTML",
+            thread_id=norm_tid,
+        )
+        return
+
+    if sub == "grant":
+        if len(tokens) < 3:
+            send(
+                chat_id,
+                "用法：<code>/agent grant &lt;agent_id&gt; [coordinator_peer=true|false] [host_server_invoke=true|false] "
+                "[can_dispatch=true|false] [can_receive=true|false] [teams=a,b]</code>",
+                parse_mode="HTML",
+                thread_id=norm_tid,
+            )
+            return
+        aid = tokens[1]
+        cap_updates = {}
+        try:
+            for item in tokens[2:]:
+                if "=" not in item:
+                    raise ValueError(f"参数格式错误：{item!r}（需要 key=value）")
+                k, v = item.split("=", 1)
+                kl = k.strip().lower()
+                if kl in ("coordinator_peer", "host_server_invoke", "can_dispatch", "can_receive"):
+                    cap_updates[kl] = _parse_bool_arg_strict(v)
+                elif kl in ("teams", "allowed_teams"):
+                    cleaned = [t.strip() for t in v.split(",") if t.strip()]
+                    cap_updates["allowed_teams"] = cleaned
+                else:
+                    raise ValueError(f"不支持的权限项: {k!r}")
+            updated = federation_registry.update_agent(
+                aid,
+                owner_auth=owner_auth,
+                capabilities=cap_updates,
+                bus_dir=bot_bus.BUS_DIR,
+            )
+        except (ValueError, PermissionError) as exc:
+            send(chat_id, f"❌ 更新权限失败：<code>{html_mod.escape(str(exc))}</code>", parse_mode="HTML", thread_id=norm_tid)
+            return
+        caps = updated.get("capabilities") or {}
+        send(
+            chat_id,
+            f"✅ 已更新 <code>{html_mod.escape(updated['agent_id'])}</code> 权限：\n"
+            f"• coordinator_peer=<code>{caps.get('coordinator_peer')}</code> · "
+            f"host_server_invoke=<code>{caps.get('host_server_invoke')}</code>\n"
+            f"• can_dispatch=<code>{caps.get('can_dispatch')}</code> · "
+            f"can_receive=<code>{caps.get('can_receive')}</code>\n"
+            f"• allowed_teams=<code>{html_mod.escape(', '.join(caps.get('allowed_teams') or []) or '全部允许')}</code>",
+            parse_mode="HTML",
+            thread_id=norm_tid,
+        )
+        return
+
+    if sub == "revoke":
+        if len(tokens) < 2:
+            send(chat_id, "用法：<code>/agent revoke &lt;agent_id&gt;</code>", parse_mode="HTML", thread_id=norm_tid)
+            return
+        aid = tokens[1]
+        try:
+            revoked = federation_registry.revoke_agent(aid, owner_auth=owner_auth, bus_dir=bot_bus.BUS_DIR)
+        except (ValueError, PermissionError) as exc:
+            send(chat_id, f"❌ 吊销失败：<code>{html_mod.escape(str(exc))}</code>", parse_mode="HTML", thread_id=norm_tid)
+            return
+        send(
+            chat_id,
+            f"🛑 <b>Kill-Switch 已触发</b>：外部 Agent <code>{html_mod.escape(revoked['agent_id'])}</code> "
+            f"已即时吊销并作废全部 Token（<code>revoked=true</code>, <code>enabled=false</code>）。",
+            parse_mode="HTML",
+            thread_id=norm_tid,
+        )
+        return
+
+    if sub in ("token", "mint", "rotate"):
+        if len(tokens) < 2:
+            send(chat_id, f"用法：<code>/agent {sub} &lt;agent_id&gt;</code>（仅限私聊 DM）", parse_mode="HTML", thread_id=norm_tid)
+            return
+        # M3-C7: Hard pre-check BEFORE touching federation_registry!
+        if not _is_dm_chat(chat_id):
+            send(
+                chat_id,
+                "🔒 <b>安全拦截：禁止在群聊/Topic 中签发或轮换明文 Token</b>\n"
+                "本次操作已被前置阻断（未生成新 Token、未轮换旧 Token）。\n"
+                "请前往 <b>与本 Bot 的私聊（DM）</b> 发送本命令，或登录 <b>AGY Studio WebUI（/federation）</b> 操作。",
+                parse_mode="HTML",
+                thread_id=norm_tid,
+            )
+            return
+        aid = tokens[1]
+        try:
+            if sub == "rotate":
+                issued = federation_registry.rotate_agent_token(
+                    aid,
+                    owner_auth=owner_auth,
+                    revoke_existing=True,
+                    label="tg-dm-rotate",
+                    bus_dir=bot_bus.BUS_DIR,
+                )
+                extra_note = f"\n• 已立即作废旧凭据数: <code>{int(issued.get('revoked_previous') or 0)}</code>"
+            else:
+                issued = federation_registry.mint_agent_token(
+                    aid,
+                    owner_auth=owner_auth,
+                    label="tg-dm-mint",
+                    bus_dir=bot_bus.BUS_DIR,
+                )
+                extra_note = ""
+        except (ValueError, PermissionError) as exc:
+            send(chat_id, f"❌ 签发 Token 失败：<code>{html_mod.escape(str(exc))}</code>", parse_mode="HTML", thread_id=None)
+            return
+        # Strictly DM-only delivery, never mirrored to team_mirror and never logged
+        send(
+            chat_id,
+            f"🔑 <b>一次性入站 Bearer Token（仅此展示一次）</b>\n"
+            f"• Agent: <code>{html_mod.escape(issued['agent_id'])}</code>\n"
+            f"• Token ID: <code>{html_mod.escape(issued['token_id'])}</code>{extra_note}\n"
+            f"• Token:\n<code>{html_mod.escape(issued['token'])}</code>\n"
+            f"<i>请及时保存并在客户端配置，切勿转发至任何群聊。</i>",
+            parse_mode="HTML",
+            thread_id=None,
+        )
+        return
+
+    send(
+        chat_id,
+        f"⚠️ 未知子命令：<code>{html_mod.escape(sub)}</code>\n"
+        "<i>支持：<code>list</code> · <code>add</code> · <code>grant</code> · <code>revoke</code> · <code>token</code> · <code>mint</code> · <code>rotate</code></i>",
+        parse_mode="HTML",
+        thread_id=norm_tid,
+    )
+
+
+def cmd_team(chat_id, raw_rest="", thread_id=None, scope_key=None, edit_msg_id=None, from_user=None):
     norm_tid = _normalize_thread_id(thread_id)
     skey = scope_key or scope_key_for(chat_id, norm_tid)
     raw = (raw_rest or "").strip()
     if raw:
         parts = raw.split()
         sub = parts[0].lower()
+        if sub in ("list", "create", "leader", "members", "delete"):
+            _handle_federation_team_subcommand(
+                chat_id,
+                raw,
+                parts,
+                norm_tid=norm_tid,
+                skey=skey,
+                from_user=from_user,
+            )
+            return
         if sub == "sole":
             bot_bus.promote_sole_coordinator(_current_bot_handle())
             invalidate_session("cmd_team_sole")
@@ -14514,6 +15121,7 @@ _KNOWN_BRIDGE_COMMANDS = frozenset({
     "/retry",
     "/undo", "/redo",
     "/team", "/bots",
+    "/agent", "/agents",
     "/group", "/groups",
     "/delegate", "/ask",
     "/compact", "/context",
@@ -14681,7 +15289,9 @@ def handle_message(msg):
         elif cmd == "/redo":
             cmd_redo(chat_id, thread_id=thread_id, scope_key=skey)
         elif cmd in ("/team", "/bots"):
-            cmd_team(chat_id, raw_rest, thread_id=thread_id, scope_key=skey)
+            cmd_team(chat_id, raw_rest, thread_id=thread_id, scope_key=skey, from_user=from_user)
+        elif cmd in ("/agent", "/agents"):
+            cmd_agent(chat_id, raw_rest, thread_id=thread_id, scope_key=skey, from_user=from_user)
         elif cmd in ("/group", "/groups"):
             cmd_group(chat_id, raw_rest, thread_id=thread_id, scope_key=skey, from_user=from_user)
         elif cmd in ("/delegate", "/ask"):

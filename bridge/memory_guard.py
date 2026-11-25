@@ -1156,6 +1156,33 @@ def _is_protected_guard_path(
                 if br_low and (cand_low == br_low or cand_low.startswith(f"{br_low}/")):
                     return True, "bot_profiles_store"
 
+        # Protect External Agent Federation Registry & Pull Queue (`BUS_DIR/federation/...`)
+        if (
+            "/bot_bus/federation/" in f"{cand_low}/"
+            or cand_low.endswith("/bot_bus/federation")
+            or cand_low == "bot_bus/federation"
+            or cand_low in ("federation/agents.json", "federation/teams.json", "federation/federation.lock", "federation/pull_queue")
+            or cand_low.endswith("/federation/agents.json")
+            or cand_low.endswith("/federation/teams.json")
+            or cand_low.endswith("/federation/federation.lock")
+            or cand_low.endswith("/federation/pull_queue")
+            or "/federation/pull_queue/" in f"{cand_low}/"
+            or cand_low.startswith("federation/pull_queue/")
+        ):
+            return True, "federation_registry"
+        raw_fed_roots = [f"{eff_home}/.gemini/antigravity-cli/cache/bot_bus/federation"]
+        env_bus_dir = os.environ.get("AGY_BOT_BUS_DIR", "").strip()
+        if env_bus_dir:
+            raw_fed_roots.append(os.path.join(env_bus_dir, "federation"))
+        for raw_fr in raw_fed_roots:
+            f_norm, f_res = _expand_and_normalize_path(raw_fr, cwd=cwd, home_dir=eff_home)
+            for froot in (f_norm, f_res):
+                if not froot:
+                    continue
+                fr_low = froot.replace("\\", "/").rstrip("/").lower()
+                if fr_low and (cand_low == fr_low or cand_low.startswith(f"{fr_low}/")):
+                    return True, "federation_registry"
+
     return False, ""
 
 

@@ -90,6 +90,12 @@ _FORBIDDEN_EVENT_KEYS = frozenset({
     "code_verifier",
     "oauth_state",
     "profile_dir",
+    "token_hash",
+    "token_records",
+    "salt",
+    "raw_token",
+    "plaintext_token",
+    "bearer_token",
 })
 
 _VALID_CHAT_SYNC_SOURCES = frozenset({"web", "tg"})
@@ -110,7 +116,8 @@ def _sanitize_event_value(val: Any, *, depth: int = 0) -> Any:
         out: dict[str, Any] = {}
         for k, v in val.items():
             ks = str(k)
-            if ks.strip().lower() in _FORBIDDEN_EVENT_KEYS:
+            kl = ks.strip().lower()
+            if kl in _FORBIDDEN_EVENT_KEYS or kl.replace("-", "_") in _FORBIDDEN_EVENT_KEYS:
                 continue
             out[ks] = _sanitize_event_value(v, depth=depth + 1)
         return out

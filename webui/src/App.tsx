@@ -14,6 +14,7 @@ import {
   LogOut,
   MessageSquare,
   MoreHorizontal,
+  Network,
   Shield,
   ShieldCheck,
 } from "lucide-react";
@@ -38,6 +39,7 @@ import { BrowserView } from "./components/BrowserView";
 import { ChangePasswordModal } from "./components/ChangePasswordModal";
 import { CostsView } from "./components/CostsView";
 import { ExternalModelsView } from "./components/ExternalModelsView";
+import { FederationView } from "./components/FederationView";
 import { FilesDiffPanel } from "./components/FilesDiffPanel";
 import { JobsView } from "./components/JobsView";
 import { LoginView } from "./components/LoginView";
@@ -70,6 +72,7 @@ const DESKTOP_NAV_ITEMS: {
   { id: "jobs", label: "派工流水", icon: Activity },
   { id: "schedules", label: "定时任务", icon: Clock },
   { id: "bots", label: "Bot 团队", icon: Bot },
+  { id: "federation", label: "外部联邦", icon: Network },
   { id: "models", label: "外部模型", icon: Layers },
   { id: "openbao", label: "OpenBao", icon: ShieldCheck },
   { id: "security-card", label: "安全卡", icon: CreditCard, badge: "预留" },
@@ -96,6 +99,7 @@ function detectInitialTab(): NavTab {
     path === "overview" ||
     path === "browser" ||
     path === "bots" ||
+    path === "federation" ||
     path === "models" ||
     path === "openbao" ||
     path === "security-card" ||
@@ -150,6 +154,7 @@ export function App() {
   const [jobsEventVer, setJobsEventVer] = useState(0);
   const [schedulesEventVer, setSchedulesEventVer] = useState(0);
   const [botsEventVer, setBotsEventVer] = useState(0);
+  const [federationEventVer, setFederationEventVer] = useState(0);
   const [gatewaysEventVer, setGatewaysEventVer] = useState(0);
   const [accountsEventVer, setAccountsEventVer] = useState(0);
   const [workbenchStateEventVer, setWorkbenchStateEventVer] = useState(0);
@@ -443,6 +448,8 @@ export function App() {
             room_id: "lobby",
             ts: typeof d.ts === "number" ? d.ts : Math.floor(Date.now() / 1000),
           });
+        } else if (ev.type === "federation_updated") {
+          setFederationEventVer((n) => n + 1);
         } else if (ev.type === "gateways_updated") {
           setGatewaysEventVer((n) => n + 1);
         } else if (ev.type === "accounts_updated") {
@@ -545,6 +552,7 @@ export function App() {
           setJobsEventVer((n) => n + 1);
           setSchedulesEventVer((n) => n + 1);
           setBotsEventVer((n) => n + 1);
+          setFederationEventVer((n) => n + 1);
           setGatewaysEventVer((n) => n + 1);
           setAccountsEventVer((n) => n + 1);
           setWorkbenchStateEventVer((n) => n + 1);
@@ -619,6 +627,7 @@ export function App() {
     activeTab === "files" ||
     activeTab === "overview" ||
     activeTab === "bots" ||
+    activeTab === "federation" ||
     activeTab === "models" ||
     activeTab === "openbao" ||
     activeTab === "security-card" ||
@@ -814,6 +823,13 @@ export function App() {
                 <BotsView
                   session={session}
                   eventVersion={botsEventVer}
+                  onSessionRevoked={handleSessionRevoked}
+                />
+              )}
+              {activeTab === "federation" && (
+                <FederationView
+                  session={session}
+                  eventVersion={federationEventVer}
                   onSessionRevoked={handleSessionRevoked}
                 />
               )}

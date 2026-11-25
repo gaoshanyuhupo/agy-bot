@@ -20,6 +20,16 @@ import type {
   CostsResponse,
   EventStreamStatus,
   ExecutionMode,
+  FederationAgentCreatePayload,
+  FederationAgentMutationResponse,
+  FederationAgentPatchPayload,
+  FederationAuditResponse,
+  FederationHubHealth,
+  FederationOverviewResponse,
+  FederationTeamCreatePayload,
+  FederationTeamMutationResponse,
+  FederationTeamPatchPayload,
+  FederationTokenResponse,
   FileContentResponse,
   FileDiffResponse,
   FileTreeResponse,
@@ -1262,6 +1272,165 @@ export function updateWorkbenchState(
     },
     true,
   );
+}
+
+// External Agent Bidirectional Federation Control Plane
+export function fetchFederationOverview(): Promise<FederationOverviewResponse> {
+  return requestJson<FederationOverviewResponse>("/api/federation/overview");
+}
+
+export function fetchFederationHealth(): Promise<FederationHubHealth> {
+  return requestJson<FederationHubHealth>("/api/federation/health");
+}
+
+export function createFederationAgent(
+  payload: FederationAgentCreatePayload,
+): Promise<FederationAgentMutationResponse> {
+  return requestJson<FederationAgentMutationResponse>(
+    "/api/federation/agents",
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+    true,
+  );
+}
+
+export function updateFederationAgent(
+  agentId: string,
+  payload: FederationAgentPatchPayload,
+): Promise<FederationAgentMutationResponse> {
+  return requestJson<FederationAgentMutationResponse>(
+    `/api/federation/agents/${encodeURIComponent(agentId)}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    },
+    true,
+  );
+}
+
+export function deleteFederationAgent(
+  agentId: string,
+): Promise<{ ok: boolean; deleted: boolean; agent_id: string }> {
+  return requestJson<{ ok: boolean; deleted: boolean; agent_id: string }>(
+    `/api/federation/agents/${encodeURIComponent(agentId)}`,
+    {
+      method: "DELETE",
+      body: "{}",
+    },
+    true,
+  );
+}
+
+export function mintFederationAgentToken(
+  agentId: string,
+  label = "studio",
+): Promise<FederationTokenResponse> {
+  return requestJson<FederationTokenResponse>(
+    `/api/federation/agents/${encodeURIComponent(agentId)}/tokens`,
+    {
+      method: "POST",
+      body: JSON.stringify({ label }),
+    },
+    true,
+  );
+}
+
+export function rotateFederationAgentToken(
+  agentId: string,
+  payload?: { label?: string; revoke_existing?: boolean },
+): Promise<FederationTokenResponse> {
+  return requestJson<FederationTokenResponse>(
+    `/api/federation/agents/${encodeURIComponent(agentId)}/rotate`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload || { label: "studio-rotated", revoke_existing: true }),
+    },
+    true,
+  );
+}
+
+export function revokeFederationAgent(
+  agentId: string,
+): Promise<FederationAgentMutationResponse> {
+  return requestJson<FederationAgentMutationResponse>(
+    `/api/federation/agents/${encodeURIComponent(agentId)}/revoke`,
+    {
+      method: "POST",
+      body: "{}",
+    },
+    true,
+  );
+}
+
+export function createFederationTeam(
+  payload: FederationTeamCreatePayload,
+): Promise<FederationTeamMutationResponse> {
+  return requestJson<FederationTeamMutationResponse>(
+    "/api/federation/teams",
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+    true,
+  );
+}
+
+export function updateFederationTeam(
+  teamId: string,
+  payload: FederationTeamPatchPayload,
+): Promise<FederationTeamMutationResponse> {
+  return requestJson<FederationTeamMutationResponse>(
+    `/api/federation/teams/${encodeURIComponent(teamId)}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    },
+    true,
+  );
+}
+
+export function setFederationTeamLeader(
+  teamId: string,
+  payload: { leader_agent_id: string; co_leaders?: string[] },
+): Promise<FederationTeamMutationResponse> {
+  return requestJson<FederationTeamMutationResponse>(
+    `/api/federation/teams/${encodeURIComponent(teamId)}/leader`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+    true,
+  );
+}
+
+export function deleteFederationTeam(
+  teamId: string,
+): Promise<{ ok: boolean; deleted: boolean; team_id: string }> {
+  return requestJson<{ ok: boolean; deleted: boolean; team_id: string }>(
+    `/api/federation/teams/${encodeURIComponent(teamId)}`,
+    {
+      method: "DELETE",
+      body: "{}",
+    },
+    true,
+  );
+}
+
+export function fetchFederationAudit(params?: {
+  limit?: number;
+  offset?: number;
+  actor_id?: string;
+  event?: string;
+}): Promise<FederationAuditResponse> {
+  const q = new URLSearchParams();
+  if (params?.limit) q.set("limit", String(params.limit));
+  if (params?.offset) q.set("offset", String(params.offset));
+  if (params?.actor_id) q.set("actor_id", params.actor_id);
+  if (params?.event) q.set("event", params.event);
+  const qs = q.toString();
+  return requestJson<FederationAuditResponse>(`/api/federation/audit${qs ? `?${qs}` : ""}`);
 }
 
 export function formatTokens(n: number): string {

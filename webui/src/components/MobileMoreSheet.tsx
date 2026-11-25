@@ -8,6 +8,7 @@ import {
   Layers,
   LayoutDashboard,
   LogOut,
+  Network,
   ShieldCheck,
   X,
 } from "lucide-react";
@@ -35,6 +36,7 @@ const SHEET_ITEMS: {
   { id: "files", label: "文件审查", desc: "项目文件树、Git Diff 与撤回/重做", icon: FileCode },
   { id: "overview", label: "总览", desc: "多 Bot 状态与系统健康指标", icon: LayoutDashboard },
   { id: "bots", label: "Bot 团队", desc: "在线节点、专长与当前任务", icon: Bot },
+  { id: "federation", label: "外部联邦", desc: "外部 Agent、多团队换帅、Token 与审计", icon: Network },
   { id: "models", label: "外部模型", desc: "中转站接入、方言适配与模型过滤", icon: Layers },
   { id: "openbao", label: "OpenBao", desc: "中央密码库自动载入、连通性测试与路径配置", icon: ShieldCheck },
   {

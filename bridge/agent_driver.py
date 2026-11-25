@@ -1683,6 +1683,21 @@ class DriverRegistry:
         self._drivers: Dict[str, AgentDriver] = {}
         if register_builtin:
             self._drivers["agy"] = AgyDriver()
+            self._register_builtin_external_drivers()
+
+    def _register_builtin_external_drivers(self) -> None:
+        """Lazily register built-in external agent drivers (`hermes_local`, `hermes_remote`, `http_external` + aliases)."""
+        try:
+            if __package__:
+                from . import external_drivers as _ext_drv  # type: ignore
+            else:
+                import external_drivers as _ext_drv  # type: ignore
+        except ImportError:
+            return
+        try:
+            _ext_drv.register_external_drivers(self)
+        except Exception:
+            pass
 
     @staticmethod
     def _normalize_name(name: Any) -> str:

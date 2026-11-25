@@ -137,6 +137,8 @@ def is_authorized(
 _ADMIN_ONLY_COMMANDS = frozenset({
     "/guard",
     "/urgent",
+    "/agent",
+    "/agents",
 })
 
 _ALWAYS_READONLY_COMMANDS = frozenset({

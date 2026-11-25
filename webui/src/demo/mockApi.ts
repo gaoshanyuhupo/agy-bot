@@ -28,6 +28,19 @@ import type {
   DailyCostRow,
   EventStreamStatus,
   ExecutionMode,
+  FederationAgentCreatePayload,
+  FederationAgentItem,
+  FederationAgentMutationResponse,
+  FederationAgentPatchPayload,
+  FederationAuditEntry,
+  FederationAuditResponse,
+  FederationHubHealth,
+  FederationOverviewResponse,
+  FederationTeamCreatePayload,
+  FederationTeamItem,
+  FederationTeamMutationResponse,
+  FederationTeamPatchPayload,
+  FederationTokenResponse,
   FileContentResponse,
   FileDiffResponse,
   FileTreeNode,
@@ -3849,6 +3862,465 @@ export async function updateWorkbenchState(
   demoWorkbenchState = { ...payload.state };
   emitDemoEvent("workbench_state_updated", { version: demoWorkbenchVersion, ts: nowSec() });
   return fetchWorkbenchState();
+}
+
+// ---------------------------------------------------------------------------
+// External Agent Bidirectional Federation Control Plane (Demo Mode)
+// ---------------------------------------------------------------------------
+
+let demoFederationAgents: FederationAgentItem[] = [
+  {
+    agent_id: "hermes_local_demo",
+    display_name: "Hermes Local Demo",
+    kind: "hermes_local",
+    driver: "hermes_local",
+    profile: "default",
+    endpoint_url: "",
+    secret_ref: "",
+    has_secret_ref: false,
+    transport: "local_cli",
+    capabilities: {
+      coordinator_peer: true,
+      host_server_invoke: true,
+      allowed_teams: ["*"],
+      can_dispatch: true,
+      can_receive: true,
+    },
+    trust_level: "local_admin",
+    enabled: true,
+    revoked: false,
+    active_token_count: 1,
+    has_active_token: true,
+    metadata: {},
+    created_at: nowSec() - 7200,
+    updated_at: nowSec() - 600,
+  },
+  {
+    agent_id: "hermes_remote_demo",
+    display_name: "Hermes Remote Server Demo",
+    kind: "hermes_remote",
+    driver: "hermes_remote",
+    profile: "prod",
+    endpoint_url: "https://hermes-node.example.com/p/prod",
+    secret_ref: "demo/services/hermes-remote#bearer_key",
+    has_secret_ref: true,
+    transport: "hermes_api",
+    capabilities: {
+      coordinator_peer: false,
+      host_server_invoke: false,
+      allowed_teams: ["demo-squad"],
+      can_dispatch: true,
+      can_receive: true,
+    },
+    trust_level: "remote_trusted",
+    enabled: true,
+    revoked: false,
+    active_token_count: 1,
+    has_active_token: true,
+    metadata: {},
+    created_at: nowSec() - 3600,
+    updated_at: nowSec() - 300,
+  },
+];
+
+let demoFederationTeams: FederationTeamItem[] = [
+  {
+    team_id: "demo-squad",
+    display_name: "Demo Federated Squad",
+    leader_agent_id: "hermes_local_demo",
+    co_leaders: ["hermes_remote_demo"],
+    members: ["hermes_local_demo", "hermes_remote_demo"],
+    metadata: {},
+    leader_can_dispatch: true,
+    warnings: [],
+    created_at: nowSec() - 3600,
+    updated_at: nowSec() - 300,
+  },
+];
+
+let demoFederationAudit: FederationAuditEntry[] = [
+  {
+    ts: nowSec() - 300,
+    event: "studio_register_agent",
+    actor_id: "demo-admin",
+    action: "register_agent",
+    outcome: "ok",
+    http_status: 201,
+    detail: { agent_id: "hermes_remote_demo" },
+  },
+];
+
+function demoAgentDefaults(kind: string): { driver: string; transport: string } {
+  if (kind === "hermes_local") return { driver: "hermes_local", transport: "local_cli" };
+  if (kind === "hermes_remote") return { driver: "hermes_remote", transport: "hermes_api" };
+  if (kind === "pull_worker") return { driver: "http_external", transport: "pull_worker" };
+  if (kind === "agy_local") return { driver: "agy_cli", transport: "local_bus" };
+  return { driver: "http_external", transport: "http_push" };
+}
+
+function demoAnnotateTeam(team: FederationTeamItem): FederationTeamItem {
+  const leader = demoFederationAgents.find((a) => a.agent_id === team.leader_agent_id);
+  const warnings: string[] = [];
+  let leaderCanDispatch: boolean | null = null;
+  if (team.leader_agent_id) {
+    if (!leader) {
+      leaderCanDispatch = false;
+      warnings.push(`负责人 ${team.leader_agent_id} 不在已注册 Agent 名册中或已被删除。`);
+    } else if (leader.revoked) {
+      leaderCanDispatch = false;
+      warnings.push(`负责人 ${team.leader_agent_id} 已被吊销。`);
+    } else {
+      leaderCanDispatch = Boolean(leader.capabilities.can_dispatch);
+      if (!leaderCanDispatch) {
+        warnings.push(`负责人 ${team.leader_agent_id} 当前 can_dispatch=false。`);
+      }
+    }
+  }
+  return {
+    ...team,
+    co_leaders: [...team.co_leaders],
+    members: [...team.members],
+    leader_can_dispatch: leaderCanDispatch,
+    warnings,
+  };
+}
+
+function demoBuildHubHealth(): FederationHubHealth {
+  return {
+    ok: true,
+    reachable: true,
+    status: "healthy",
+    service: "agy-federation-hub",
+    http_status: 200,
+    latency_ms: 4,
+    checked_at: new Date().toISOString(),
+  };
+}
+
+export async function fetchFederationOverview(): Promise<FederationOverviewResponse> {
+  await delay(25);
+  requireAuth();
+  const agents = demoFederationAgents.map((a) => ({
+    ...a,
+    capabilities: { ...a.capabilities, allowed_teams: [...a.capabilities.allowed_teams] },
+  }));
+  const teams = demoFederationTeams.map((t) => demoAnnotateTeam(t));
+  return {
+    ok: true,
+    can_edit: true,
+    agents,
+    teams,
+    counts: {
+      agents_total: agents.length,
+      agents_enabled: agents.filter((a) => a.enabled && !a.revoked).length,
+      agents_revoked: agents.filter((a) => a.revoked).length,
+      agents_coordinator_peer: agents.filter((a) => a.capabilities.coordinator_peer).length,
+      agents_host_invoke: agents.filter((a) => a.capabilities.host_server_invoke).length,
+      teams_total: teams.length,
+    },
+    hub_health: demoBuildHubHealth(),
+    hub_config: {
+      loopback_valid: true,
+      host: "127.0.0.1",
+      port: 18799,
+      mcp_url: "http://127.0.0.1:18799/hub/mcp",
+    },
+    hard_locks: [
+      { id: "lock1", title: "锁 1：禁止读取凭据与篡改运行时", detail: "阻断私钥、环境变量、Vault 与运行目录写入。" },
+      { id: "lock2", title: "锁 2：禁止自我提权", detail: "外部 Agent 不可修改联邦注册表或团队负责人。" },
+      { id: "lock3", title: "锁 3：单调信任降级", detail: "受污/不可信任务不可升级权限或执行主机命令。" },
+    ],
+    updated_at: new Date().toISOString(),
+  };
+}
+
+export async function fetchFederationHealth(): Promise<FederationHubHealth> {
+  await delay(20);
+  requireAuth();
+  return demoBuildHubHealth();
+}
+
+export async function createFederationAgent(
+  payload: FederationAgentCreatePayload,
+): Promise<FederationAgentMutationResponse> {
+  await delay(30);
+  requireAuth();
+  const agentId = (payload.agent_id || "").trim().toLowerCase();
+  if (!agentId) {
+    throw new StudioApiError("agent_id 不能为空", 400, "federation");
+  }
+  const defs = demoAgentDefaults(payload.kind);
+  const now = nowSec();
+  const item: FederationAgentItem = {
+    agent_id: agentId,
+    display_name: payload.display_name || agentId,
+    kind: payload.kind,
+    driver: payload.driver || defs.driver,
+    profile: payload.profile || "",
+    endpoint_url: payload.endpoint_url || "",
+    secret_ref: payload.secret_ref || "",
+    has_secret_ref: Boolean(payload.secret_ref),
+    transport: payload.transport || defs.transport,
+    capabilities: {
+      coordinator_peer: Boolean(payload.capabilities?.coordinator_peer),
+      host_server_invoke: Boolean(payload.capabilities?.host_server_invoke),
+      allowed_teams: Array.isArray(payload.capabilities?.allowed_teams)
+        ? [...payload.capabilities.allowed_teams]
+        : [],
+      can_dispatch: Boolean(payload.capabilities?.can_dispatch),
+      can_receive: payload.capabilities?.can_receive !== false,
+    },
+    trust_level: payload.trust_level || "remote_trusted",
+    enabled: payload.enabled !== false,
+    revoked: false,
+    active_token_count: payload.mint_token ? 1 : 0,
+    has_active_token: Boolean(payload.mint_token),
+    metadata: payload.metadata ? { ...payload.metadata } : {},
+    created_at: now,
+    updated_at: now,
+  };
+  demoFederationAgents = [
+    ...demoFederationAgents.filter((a) => a.agent_id !== agentId),
+    item,
+  ];
+  demoFederationAudit.unshift({
+    ts: now,
+    event: "studio_register_agent",
+    actor_id: "demo-admin",
+    action: "register_agent",
+    outcome: "ok",
+    http_status: 201,
+    detail: { agent_id: agentId },
+  });
+  const res: FederationAgentMutationResponse = { ok: true, agent: { ...item } };
+  if (payload.mint_token) {
+    res.token_id = `demo_tok_${now}`;
+    res.token = `demo-placeholder-federation-credential-${agentId}-${now}`;
+    res.token_created_at = now;
+  }
+  return res;
+}
+
+export async function updateFederationAgent(
+  agentId: string,
+  payload: FederationAgentPatchPayload,
+): Promise<FederationAgentMutationResponse> {
+  await delay(30);
+  requireAuth();
+  const idx = demoFederationAgents.findIndex((a) => a.agent_id === agentId);
+  if (idx < 0) {
+    throw new StudioApiError(`Agent ${agentId} 不存在`, 404, "federation");
+  }
+  const cur = demoFederationAgents[idx];
+  const nextKind = payload.kind ?? cur.kind;
+  const defs = demoAgentDefaults(nextKind);
+  const updated: FederationAgentItem = {
+    ...cur,
+    display_name: payload.display_name ?? cur.display_name,
+    kind: nextKind,
+    driver: payload.driver ?? (payload.kind && payload.kind !== cur.kind ? defs.driver : cur.driver),
+    transport:
+      payload.transport ??
+      (payload.kind && payload.kind !== cur.kind ? defs.transport : cur.transport),
+    profile: payload.profile ?? cur.profile,
+    endpoint_url: payload.endpoint_url ?? cur.endpoint_url,
+    secret_ref: payload.secret_ref !== undefined ? payload.secret_ref : cur.secret_ref,
+    has_secret_ref: Boolean(
+      payload.secret_ref !== undefined ? payload.secret_ref : cur.secret_ref,
+    ),
+    trust_level: payload.trust_level ?? cur.trust_level,
+    enabled: payload.enabled !== undefined ? Boolean(payload.enabled) : cur.enabled,
+    revoked: payload.revoked !== undefined ? Boolean(payload.revoked) : cur.revoked,
+    capabilities: {
+      ...cur.capabilities,
+      ...(payload.capabilities || {}),
+    },
+    updated_at: nowSec(),
+  };
+  demoFederationAgents[idx] = updated;
+  return { ok: true, agent: { ...updated } };
+}
+
+export async function deleteFederationAgent(
+  agentId: string,
+): Promise<{ ok: boolean; deleted: boolean; agent_id: string }> {
+  await delay(25);
+  requireAuth();
+  const before = demoFederationAgents.length;
+  demoFederationAgents = demoFederationAgents.filter((a) => a.agent_id !== agentId);
+  return { ok: true, deleted: demoFederationAgents.length < before, agent_id: agentId };
+}
+
+export async function mintFederationAgentToken(
+  agentId: string,
+  _label = "studio",
+): Promise<FederationTokenResponse> {
+  await delay(25);
+  requireAuth();
+  const ag = demoFederationAgents.find((a) => a.agent_id === agentId);
+  if (!ag) {
+    throw new StudioApiError(`Agent ${agentId} 不存在`, 404, "federation");
+  }
+  const now = nowSec();
+  ag.active_token_count += 1;
+  ag.has_active_token = true;
+  ag.updated_at = now;
+  return {
+    ok: true,
+    agent_id: agentId,
+    token_id: `demo_tok_${now}`,
+    token: `demo-placeholder-federation-credential-${agentId}-${now}`,
+    created_at: now,
+    agent: { ...ag },
+  };
+}
+
+export async function rotateFederationAgentToken(
+  agentId: string,
+  payload?: { label?: string; revoke_existing?: boolean },
+): Promise<FederationTokenResponse> {
+  await delay(25);
+  requireAuth();
+  const ag = demoFederationAgents.find((a) => a.agent_id === agentId);
+  if (!ag) {
+    throw new StudioApiError(`Agent ${agentId} 不存在`, 404, "federation");
+  }
+  const now = nowSec();
+  const prev = ag.active_token_count;
+  ag.active_token_count = payload?.revoke_existing === false ? prev + 1 : 1;
+  ag.has_active_token = true;
+  ag.updated_at = now;
+  return {
+    ok: true,
+    agent_id: agentId,
+    token_id: `demo_tok_${now}`,
+    token: `demo-placeholder-federation-credential-${agentId}-${now}`,
+    revoked_previous: payload?.revoke_existing === false ? 0 : prev,
+    created_at: now,
+    agent: { ...ag },
+  };
+}
+
+export async function revokeFederationAgent(
+  agentId: string,
+): Promise<FederationAgentMutationResponse> {
+  await delay(25);
+  requireAuth();
+  const ag = demoFederationAgents.find((a) => a.agent_id === agentId);
+  if (!ag) {
+    throw new StudioApiError(`Agent ${agentId} 不存在`, 404, "federation");
+  }
+  ag.revoked = true;
+  ag.enabled = false;
+  ag.active_token_count = 0;
+  ag.has_active_token = false;
+  ag.updated_at = nowSec();
+  return { ok: true, agent: { ...ag } };
+}
+
+export async function createFederationTeam(
+  payload: FederationTeamCreatePayload,
+): Promise<FederationTeamMutationResponse> {
+  await delay(25);
+  requireAuth();
+  const teamId = (payload.team_id || "").trim().toLowerCase();
+  if (!teamId) {
+    throw new StudioApiError("team_id 不能为空", 400, "federation");
+  }
+  const now = nowSec();
+  const base: FederationTeamItem = {
+    team_id: teamId,
+    display_name: payload.display_name || teamId,
+    leader_agent_id: payload.leader_agent_id || "",
+    co_leaders: [...(payload.co_leaders || [])],
+    members: [...(payload.members || [])],
+    metadata: payload.metadata ? { ...payload.metadata } : {},
+    created_at: now,
+    updated_at: now,
+  };
+  demoFederationTeams = [...demoFederationTeams.filter((t) => t.team_id !== teamId), base];
+  const annotated = demoAnnotateTeam(base);
+  return {
+    ok: true,
+    team: annotated,
+    leader_can_dispatch: annotated.leader_can_dispatch ?? null,
+    warnings: annotated.warnings || [],
+  };
+}
+
+export async function updateFederationTeam(
+  teamId: string,
+  payload: FederationTeamPatchPayload,
+): Promise<FederationTeamMutationResponse> {
+  await delay(25);
+  requireAuth();
+  const idx = demoFederationTeams.findIndex((t) => t.team_id === teamId);
+  if (idx < 0) {
+    throw new StudioApiError(`团队 ${teamId} 不存在`, 404, "federation");
+  }
+  const cur = demoFederationTeams[idx];
+  const updated: FederationTeamItem = {
+    ...cur,
+    display_name: payload.display_name ?? cur.display_name,
+    leader_agent_id: payload.leader_agent_id ?? cur.leader_agent_id,
+    co_leaders: payload.co_leaders ? [...payload.co_leaders] : [...cur.co_leaders],
+    members: payload.members ? [...payload.members] : [...cur.members],
+    updated_at: nowSec(),
+  };
+  demoFederationTeams[idx] = updated;
+  const annotated = demoAnnotateTeam(updated);
+  return {
+    ok: true,
+    team: annotated,
+    leader_can_dispatch: annotated.leader_can_dispatch ?? null,
+    warnings: annotated.warnings || [],
+  };
+}
+
+export async function setFederationTeamLeader(
+  teamId: string,
+  payload: { leader_agent_id: string; co_leaders?: string[] },
+): Promise<FederationTeamMutationResponse> {
+  return updateFederationTeam(teamId, {
+    leader_agent_id: payload.leader_agent_id,
+    co_leaders: payload.co_leaders,
+  });
+}
+
+export async function deleteFederationTeam(
+  teamId: string,
+): Promise<{ ok: boolean; deleted: boolean; team_id: string }> {
+  await delay(25);
+  requireAuth();
+  const before = demoFederationTeams.length;
+  demoFederationTeams = demoFederationTeams.filter((t) => t.team_id !== teamId);
+  return { ok: true, deleted: demoFederationTeams.length < before, team_id: teamId };
+}
+
+export async function fetchFederationAudit(params?: {
+  limit?: number;
+  offset?: number;
+  actor_id?: string;
+  event?: string;
+}): Promise<FederationAuditResponse> {
+  await delay(20);
+  requireAuth();
+  let rows = [...demoFederationAudit];
+  if (params?.actor_id) {
+    rows = rows.filter((r) => r.actor_id === params.actor_id);
+  }
+  if (params?.event) {
+    rows = rows.filter((r) => r.event === params.event);
+  }
+  const offset = Math.max(0, params?.offset || 0);
+  const limit = Math.max(1, params?.limit || 50);
+  return {
+    ok: true,
+    entries: rows.slice(offset, offset + limit),
+    total: rows.length,
+    limit,
+    offset,
+  };
 }
 
 export function formatTokens(n: number): string {

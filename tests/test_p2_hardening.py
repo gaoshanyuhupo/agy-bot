@@ -479,6 +479,27 @@ class TestC2CrossAgentTaintAndMonotonicAttenuation(unittest.TestCase):
             seen_prompts: list[str] = []
 
             def _fake_popen(cmd, **kwargs):
+                if cmd and os.path.basename(str(cmd[0])) == "git":
+                    class _GitProc:
+                        pid = 60122
+                        returncode = 1
+                        stdout = io.StringIO("")
+                        stderr = io.StringIO("")
+
+                        def wait(self, timeout=None):
+                            return 1
+
+                        def communicate(self, input=None, timeout=None):
+                            return ("", "")
+
+                        def __enter__(self):
+                            return self
+
+                        def __exit__(self, *args):
+                            return False
+
+                    return _GitProc()
+
                 seen_prompts.append(cmd[-1])
 
                 class _Proc:

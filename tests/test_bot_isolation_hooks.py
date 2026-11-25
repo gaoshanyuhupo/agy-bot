@@ -1055,6 +1055,106 @@ class TestC4BotIsolationGuardParentAndSelfWrite(unittest.TestCase):
                     f"Expected coordinator allowed for {tool_name}({tool_args}), got {res}",
                 )
 
+    def test_b3_clean_worker_and_coordinator_blocked_from_federation_registry_paths(self) -> None:
+        guard = self._load_guard_module()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home_dir, _profiles_dir, ws_dir, env = self._make_fixture(root)
+            custom_bus = root / "custom_bus"
+            fed_dir = custom_bus / "federation"
+            (fed_dir / "pull_queue").mkdir(parents=True, exist_ok=True)
+            agents_file = fed_dir / "agents.json"
+            agents_file.write_text('{"agents":{}}', encoding="utf-8")
+            symlink_escape = ws_dir / "innocent_link.json"
+            os.symlink(agents_file, symlink_escape)
+
+            worker_env = dict(env)
+            worker_env["AGY_BOT_BUS_DIR"] = str(custom_bus)
+
+            blocked_worker_calls = [
+                ("write_file", {"Path": str(agents_file), "Content": "{}"}),
+                ("edit_file", {"Path": str(fed_dir / "teams.json")}),
+                ("read_file", {"Path": str(fed_dir / "federation.lock")}),
+                ("read_file", {"Path": str(fed_dir / "pull_queue" / "pull-1.json")}),
+                ("write_file", {"Path": str(home_dir / ".gemini" / "antigravity-cli" / "cache" / "bot_bus" / "federation" / "agents.json")}),
+                ("write_file", {"Path": "federation/agents.json"}),
+                ("read_file", {"Path": "federation/teams.json"}),
+                ("read_file", {"Path": "federation/pull_queue/job1.json"}),
+                ("write_file", {"Path": str(symlink_escape), "Content": "{}"}),
+                ("run_command", {"CommandLine": "echo '{}' > $AGY_BOT_BUS_DIR/federation/agents.json"}),
+                ("run_command", {"CommandLine": "cat ~/.gemini/antigravity-cli/cache/bot_bus/federation/agents.json"}),
+                ("run_command", {"CommandLine": "python3 -c \"open('federation/agents.json','w').write('{}')\""}),
+                ("run_command", {"CommandLine": f"cat {symlink_escape}"}),
+            ]
+            for tool_name, tool_args in blocked_worker_calls:
+                with self.subTest(worker_call=(tool_name, tool_args)):
+                    res = guard.evaluate_bot_isolation_tool_call(
+                        tool_name, tool_args, cwd=str(ws_dir), env=worker_env
+                    )
+                    self.assertTrue(res["blocked"], f"Expected federation path blocked: {tool_name}({tool_args})")
+                    self.assertIn("federation", res["reason"].lower())
+
+            # Coordinator bot session is ALSO blocked from tampering <BUS_DIR>/federation/
+            coord_env = dict(worker_env)
+            coord_env["AGY_BOT_HANDLE"] = "coord_main"
+            coord_env["AGY_BOT_BUS_ROLE"] = "coordinator"
+            for tool_name, tool_args in (
+                ("write_file", {"Path": str(agents_file), "Content": "{}"}),
+                ("read_file", {"Path": str(symlink_escape)}),
+                ("run_command", {"CommandLine": f"echo '{{}}' > {agents_file}"}),
+            ):
+                with self.subTest(coord_call=(tool_name, tool_args)):
+                    res = guard.evaluate_bot_isolation_tool_call(
+                        tool_name, tool_args, cwd=str(ws_dir), env=coord_env
+                    )
+                    self.assertTrue(res["blocked"], f"Expected coordinator blocked on federation path: {tool_args}")
+
+            # Benign repo commands touching federation source/test files remain allowed (zero false positives)
+            for tool_name, tool_args in (
+                ("run_command", {"CommandLine": "python3 -m unittest tests/test_federation_registry.py"}),
+                ("run_command", {"CommandLine": "git diff bridge/federation_registry.py"}),
+                ("read_file", {"Path": str(ws_dir / "bridge" / "federation_registry.py")}),
+            ):
+                res_ok = guard.evaluate_bot_isolation_tool_call(
+                    tool_name, tool_args, cwd=str(ws_dir), env=worker_env
+                )
+                self.assertFalse(res_ok["blocked"], f"Unexpected false block for {tool_args}: {res_ok}")
+
+            # Real subprocess PreToolUse contract check
+            sub_env = os.environ.copy()
+            sub_env.update(worker_env)
+            deny_payload = {
+                "toolCall": {"name": "write_file", "args": {"Path": str(agents_file), "Content": "{}"}},
+                "cwd": str(ws_dir),
+            }
+            p_deny = subprocess.run(
+                [sys.executable, str(HOOKS_DIR / "bot_isolation_guard.py")],
+                input=json.dumps(deny_payload),
+                text=True,
+                capture_output=True,
+                env=sub_env,
+                timeout=10,
+                check=False,
+            )
+            self.assertEqual(0, p_deny.returncode)
+            self.assertEqual("deny", json.loads(p_deny.stdout.strip()).get("decision"))
+
+            pass_payload = {
+                "toolCall": {"name": "run_command", "args": {"CommandLine": "python3 -m unittest tests/test_federation_registry.py"}},
+                "cwd": str(ws_dir),
+            }
+            p_pass = subprocess.run(
+                [sys.executable, str(HOOKS_DIR / "bot_isolation_guard.py")],
+                input=json.dumps(pass_payload),
+                text=True,
+                capture_output=True,
+                env=sub_env,
+                timeout=10,
+                check=False,
+            )
+            self.assertEqual(0, p_pass.returncode)
+            self.assertEqual("", p_pass.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

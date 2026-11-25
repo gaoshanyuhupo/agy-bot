@@ -31,6 +31,7 @@ from .chat_service import StudioChatService
 from .control_plane import StudioControlPlane
 from .data_sources import StudioDataSources
 from .event_hub import StudioEventHub
+from .federation_service import StudioFederationService
 from .gateway_service import GatewayService
 from .git_workflow import StudioGitWorkflowService
 from .google_accounts_service import StudioGoogleAccountsService
@@ -60,6 +61,9 @@ GOOGLE_ACCOUNTS_KEY: web.AppKey[StudioGoogleAccountsService] = web.AppKey(
 )
 WORKBENCH_STATE_KEY: web.AppKey[WorkbenchStateService] = web.AppKey(
     "workbench_state", WorkbenchStateService
+)
+FEDERATION_SERVICE_KEY: web.AppKey[StudioFederationService] = web.AppKey(
+    "federation_service", StudioFederationService
 )
 STATIC_DIST_KEY: web.AppKey[Path] = web.AppKey("static_dist_dir", Path)
 
@@ -216,6 +220,9 @@ def create_app(
     google_accounts_host_token_path: Path | None = None,
     google_accounts_audit_log_path: Path | None = None,
     google_accounts_service: StudioGoogleAccountsService | None = None,
+    federation_hub_host: str | None = None,
+    federation_hub_port: int | None = None,
+    federation_service: StudioFederationService | None = None,
 ) -> web.Application:
     public_url = os.environ.get("AGY_STUDIO_PUBLIC_URL", "").strip()
     auth = auth_mgr or StudioAuthManager(public_url=public_url)
@@ -306,6 +313,14 @@ def create_app(
         event_hub=event_hub,
         state_path=workbench_state_path,
     )
+    federation_svc = federation_service or StudioFederationService(
+        auth,
+        sources,
+        chat_service.audit,
+        event_hub=event_hub,
+        hub_host=federation_hub_host,
+        hub_port=federation_hub_port,
+    )
     dist_dir = static_dist_dir or Path(
         os.environ.get("AGY_STUDIO_DIST_DIR", str(DEFAULT_STATIC_DIST_DIR))
     )
@@ -330,6 +345,7 @@ def create_app(
     app[GATEWAY_SERVICE_KEY] = gateway_service
     app[GOOGLE_ACCOUNTS_KEY] = google_accounts_svc
     app[WORKBENCH_STATE_KEY] = workbench_state
+    app[FEDERATION_SERVICE_KEY] = federation_svc
     app[STATIC_DIST_KEY] = dist_dir
 
     async def _on_startup(application: web.Application) -> None:
@@ -728,6 +744,24 @@ def create_app(
     app.router.add_get("/api/workbench/state", workbench_state.handle_get_state)
     app.router.add_put("/api/workbench/state", workbench_state.handle_put_state)
 
+    # External Agent Bidirectional Federation Control Plane
+    app.router.add_get("/api/federation/overview", federation_svc.handle_get_overview)
+    app.router.add_get("/api/federation/health", federation_svc.handle_get_health)
+    app.router.add_get("/api/federation/agents", federation_svc.handle_list_agents)
+    app.router.add_post("/api/federation/agents", federation_svc.handle_create_agent)
+    app.router.add_get("/api/federation/agents/{agent_id}", federation_svc.handle_get_agent)
+    app.router.add_patch("/api/federation/agents/{agent_id}", federation_svc.handle_patch_agent)
+    app.router.add_delete("/api/federation/agents/{agent_id}", federation_svc.handle_delete_agent)
+    app.router.add_post("/api/federation/agents/{agent_id}/tokens", federation_svc.handle_mint_token)
+    app.router.add_post("/api/federation/agents/{agent_id}/rotate", federation_svc.handle_rotate_token)
+    app.router.add_post("/api/federation/agents/{agent_id}/revoke", federation_svc.handle_revoke_agent)
+    app.router.add_get("/api/federation/teams", federation_svc.handle_list_teams)
+    app.router.add_post("/api/federation/teams", federation_svc.handle_create_team)
+    app.router.add_patch("/api/federation/teams/{team_id}", federation_svc.handle_patch_team)
+    app.router.add_post("/api/federation/teams/{team_id}/leader", federation_svc.handle_set_team_leader)
+    app.router.add_delete("/api/federation/teams/{team_id}", federation_svc.handle_delete_team)
+    app.router.add_get("/api/federation/audit", federation_svc.handle_get_audit)
+
     app.router.add_get("/ws/browser", proxy.handle_ws_browser)
     app.router.add_post("/api/browser/upload", proxy.handle_upload)
     app.router.add_get("/api/browser/download/{download_id}", proxy.handle_download)
@@ -753,6 +787,7 @@ def create_app(
         "/rooms",
         "/attention",
         "/files",
+        "/federation",
     ):
         app.router.add_get(spa_route, handle_spa_shell)
 

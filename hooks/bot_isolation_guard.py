@@ -88,6 +88,13 @@ _HOME_VAR_RE = re.compile(r"\$\{HOME\}|\$HOME(?=/|$)")
 _PROFILES_VAR_RE = re.compile(r"\$\{AGY_BOT_PROFILES_DIR\}|\$AGY_BOT_PROFILES_DIR(?=/|$)")
 _DB_VAR_RE = re.compile(r"\$\{CLAUDE_MEM_DB_PATH\}|\$CLAUDE_MEM_DB_PATH(?=/|$)")
 _DATA_DIR_VAR_RE = re.compile(r"\$\{CLAUDE_MEM_DATA_DIR\}|\$CLAUDE_MEM_DATA_DIR(?=/|$)")
+_BUS_DIR_VAR_RE = re.compile(r"\$\{AGY_BOT_BUS_DIR\}|\$AGY_BOT_BUS_DIR(?=/|$)")
+_FEDERATION_PATH_RE = re.compile(
+    r"(?i)(?:^|/)bot_bus/federation(?:/|$)|(?:^|/)federation/(?:agents\.json|teams\.json|federation\.lock|pull_queue)(?:/|$)"
+)
+_FEDERATION_CMD_RE = re.compile(
+    r"(?i)(?:bot_bus/federation(?:/|$|[\s'\"`;&|<>()])|(?<![A-Za-z0-9_.-])federation/(?:agents\.json|teams\.json|federation\.lock|pull_queue)(?:/|$|[\s'\"`;&|<>()]))"
+)
 
 _WRITE_TOOL_NAMES: frozenset[str] = frozenset(
     {
@@ -181,6 +188,13 @@ def _resolve_db_path(env: Mapping[str, str]) -> Path:
     return Path(_effective_home(env)) / ".claude-mem" / "claude-mem.db"
 
 
+def _resolve_bus_dir(env: Mapping[str, str]) -> Path:
+    raw = str(env.get("AGY_BOT_BUS_DIR") or "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return Path(_effective_home(env)) / ".gemini" / "antigravity-cli" / "cache" / "bot_bus"
+
+
 def _normalize_handle(raw: str) -> str | None:
     if _BOT_PROFILES is not None:
         return _BOT_PROFILES.normalize_bot_handle(raw)
@@ -215,8 +229,10 @@ def _expand_path_candidates(
     env: Mapping[str, str],
     profiles_root: Path,
     db_path: Path,
+    bus_dir: Path | None = None,
 ) -> tuple[str, str]:
     eff_home = _effective_home(env)
+    eff_bus = bus_dir if bus_dir is not None else _resolve_bus_dir(env)
     s = str(raw_token or "").strip().strip("'\"")
     if not s:
         return "", ""
@@ -229,6 +245,7 @@ def _expand_path_candidates(
     s = _PROFILES_VAR_RE.sub(str(profiles_root), s)
     s = _DB_VAR_RE.sub(str(db_path), s)
     s = _DATA_DIR_VAR_RE.sub(str(db_path.parent), s)
+    s = _BUS_DIR_VAR_RE.sub(str(eff_bus), s)
     if s == "~":
         s = eff_home
     elif s.startswith("~/"):
@@ -243,6 +260,54 @@ def _expand_path_candidates(
     return norm_p, res_p
 
 
+def _is_federation_registry_path(
+    raw_path: str,
+    norm_p: str,
+    res_p: str,
+    *,
+    env: Mapping[str, str],
+    bus_dir: Path,
+) -> bool:
+    """Return True if path targets `<BUS_DIR>/federation` or any federation registry/queue file (B3)."""
+    eff_home = _effective_home(env)
+    fed_roots: list[str] = []
+    for base_fed in (
+        bus_dir / "federation",
+        Path(eff_home) / ".gemini" / "antigravity-cli" / "cache" / "bot_bus" / "federation",
+    ):
+        rn = os.path.normpath(str(base_fed)).replace("\\", "/").rstrip("/")
+        if rn:
+            fed_roots.append(rn)
+        try:
+            rr = str(base_fed.resolve(strict=False)).replace("\\", "/").rstrip("/")
+            if rr and rr not in fed_roots:
+                fed_roots.append(rr)
+        except Exception:
+            pass
+
+    raw_clean = str(raw_path or "").strip().strip("'\"").replace("\\", "/")
+    if raw_clean.startswith("./"):
+        raw_clean = raw_clean[2:]
+    extra_cands = [raw_clean, norm_p, res_p]
+    if norm_p:
+        try:
+            rp = os.path.realpath(norm_p).replace("\\", "/")
+            if rp not in extra_cands:
+                extra_cands.append(rp)
+        except Exception:
+            pass
+
+    for cand in extra_cands:
+        if not cand:
+            continue
+        if _FEDERATION_PATH_RE.search(cand):
+            return True
+        for root_s in fed_roots:
+            if cand == root_s or cand.startswith(root_s + "/"):
+                return True
+    return False
+
+
 def _check_single_path(
     raw_path: str,
     *,
@@ -253,16 +318,24 @@ def _check_single_path(
     db_path: Path,
     skill_policy: tuple[str, set[str]],
     is_write: bool = False,
+    bus_dir: Path | None = None,
 ) -> tuple[bool, str]:
     if not raw_path or not str(raw_path).strip():
         return False, ""
+    eff_bus = bus_dir if bus_dir is not None else _resolve_bus_dir(env)
     norm_p, res_p = _expand_path_candidates(
         raw_path,
         cwd=cwd,
         env=env,
         profiles_root=profiles_root,
         db_path=db_path,
+        bus_dir=eff_bus,
     )
+    if _is_federation_registry_path(raw_path, norm_p, res_p, env=env, bus_dir=eff_bus):
+        return (
+            True,
+            "direct access to federation registry (<BUS_DIR>/federation) is forbidden for bot sessions; Owner-only",
+        )
     p_root_norm = os.path.normpath(str(profiles_root)).replace("\\", "/").rstrip("/")
     p_root_res = str(profiles_root.resolve(strict=False)).replace("\\", "/").rstrip("/")
     p_parent_norm = os.path.normpath(str(profiles_root.parent)).replace("\\", "/").rstrip("/")
@@ -492,13 +565,13 @@ def _extract_shell_candidate_tokens(cmd: str) -> list[str]:
 
     # Also catch quoted path substrings inside inline python/awk/sqlite3 scripts
     inline_hits = re.findall(
-        r"(?:(?:\$\{?(?:HOME|AGY_BOT_PROFILES_DIR|CLAUDE_MEM_DB_PATH|CLAUDE_MEM_DATA_DIR)\}?)|(?:~|/|\.\./)[^\s'\"`;&|<>(),\]]+)[^\s'\"`;&|<>(),\]]*",
+        r"(?:(?:\$\{?(?:HOME|AGY_BOT_PROFILES_DIR|CLAUDE_MEM_DB_PATH|CLAUDE_MEM_DATA_DIR|AGY_BOT_BUS_DIR)\}?)|(?:~|/|\.\./)[^\s'\"`;&|<>(),\]]+)[^\s'\"`;&|<>(),\]]*",
         cmd,
     )
     tokens.extend(inline_hits)
-    # Catch relative `.agents/skills`, `.claude-mem`, `.config/agy-tg-bridge`, `bots/<handle>`, or DB references inside inline scripts
+    # Catch relative `.agents/skills`, `.claude-mem`, `.config/agy-tg-bridge`, `bots/<handle>`, `bot_bus/federation`, `federation/*`, or DB references inside inline scripts
     rel_hits = re.findall(
-        r"(?:\.agents/skills(?:/[^\s'\"`;&|<>(),\]]*)?|\.claude-mem(?:/[^\s'\"`;&|<>(),\]]*)?|\.config/agy-tg-bridge(?:/[^\s'\"`;&|<>(),\]]*)?|bots/[a-zA-Z0-9_.-]+(?:/[^\s'\"`;&|<>(),\]]*)?|claude-mem\.db(?:-wal|-shm)?)",
+        r"(?:\.agents/skills(?:/[^\s'\"`;&|<>(),\]]*)?|\.claude-mem(?:/[^\s'\"`;&|<>(),\]]*)?|\.config/agy-tg-bridge(?:/[^\s'\"`;&|<>(),\]]*)?|bots/[a-zA-Z0-9_.-]+(?:/[^\s'\"`;&|<>(),\]]*)?|bot_bus/federation(?:/[^\s'\"`;&|<>(),\]]*)?|federation/(?:agents\.json|teams\.json|federation\.lock|pull_queue(?:/[^\s'\"`;&|<>(),\]]*)?)|claude-mem\.db(?:-wal|-shm)?)",
         cmd,
     )
     tokens.extend(rel_hits)
@@ -526,12 +599,10 @@ def evaluate_bot_isolation_tool_call(
         }
 
     role = str(eff_env.get("AGY_BOT_BUS_ROLE") or "worker").strip().lower()
-    if role == "coordinator":
-        return {"blocked": False, "reason": ""}
-
     profiles_root = _resolve_profiles_root(eff_env)
     db_path = _resolve_db_path(eff_env)
-    skill_policy = _get_worker_skill_policy(my_handle, profiles_root)
+    bus_dir = _resolve_bus_dir(eff_env)
+    skill_policy = _get_worker_skill_policy(my_handle, profiles_root) if role != "coordinator" else ("all", set())
 
     tname = str(tool_name or "").strip()
     args = dict(tool_args) if isinstance(tool_args, Mapping) else {}
@@ -555,6 +626,45 @@ def evaluate_bot_isolation_tool_call(
                 if isinstance(item, str) and item.strip():
                     path_candidates.append(item)
 
+    fed_deny_msg = (
+        "[bot-isolation-guard] direct access to federation registry (<BUS_DIR>/federation) "
+        "is forbidden for bot sessions; Owner-only"
+    )
+    if role == "coordinator":
+        # Coordinator retains full bots/** and skills access, but STILL cannot read/tamper <BUS_DIR>/federation/ (B3).
+        for cand in path_candidates:
+            norm_p, res_p = _expand_path_candidates(
+                cand,
+                cwd=cwd,
+                env=eff_env,
+                profiles_root=profiles_root,
+                db_path=db_path,
+                bus_dir=bus_dir,
+            )
+            if _is_federation_registry_path(cand, norm_p, res_p, env=eff_env, bus_dir=bus_dir):
+                return {"blocked": True, "reason": fed_deny_msg}
+        if tname == "run_command":
+            cmd = str(args.get("CommandLine") or args.get("command") or args.get("cmd") or "")
+            if cmd.strip():
+                if _FEDERATION_CMD_RE.search(cmd) or (
+                    "AGY_BOT_BUS_DIR" in cmd and "federation" in cmd.lower()
+                ):
+                    return {"blocked": True, "reason": fed_deny_msg}
+                for tok in _extract_shell_candidate_tokens(cmd):
+                    if not tok or tok.startswith("-"):
+                        continue
+                    norm_p, res_p = _expand_path_candidates(
+                        tok,
+                        cwd=cwd,
+                        env=eff_env,
+                        profiles_root=profiles_root,
+                        db_path=db_path,
+                        bus_dir=bus_dir,
+                    )
+                    if _is_federation_registry_path(tok, norm_p, res_p, env=eff_env, bus_dir=bus_dir):
+                        return {"blocked": True, "reason": fed_deny_msg}
+        return {"blocked": False, "reason": ""}
+
     is_write_tool = tname.lower() in _WRITE_TOOL_NAMES
     for cand in path_candidates:
         blocked, reason = _check_single_path(
@@ -566,6 +676,7 @@ def evaluate_bot_isolation_tool_call(
             db_path=db_path,
             skill_policy=skill_policy,
             is_write=is_write_tool,
+            bus_dir=bus_dir,
         )
         if blocked:
             return {"blocked": True, "reason": f"[bot-isolation-guard] {reason}"}
@@ -574,6 +685,10 @@ def evaluate_bot_isolation_tool_call(
     if tname == "run_command":
         cmd = str(args.get("CommandLine") or args.get("command") or args.get("cmd") or "")
         if cmd.strip():
+            if _FEDERATION_CMD_RE.search(cmd) or (
+                "AGY_BOT_BUS_DIR" in cmd and "federation" in cmd.lower()
+            ):
+                return {"blocked": True, "reason": fed_deny_msg}
             if _CLAUDE_MEM_DB_RE.search(cmd):
                 return {
                     "blocked": True,
@@ -598,6 +713,7 @@ def evaluate_bot_isolation_tool_call(
                     db_path=db_path,
                     skill_policy=skill_policy,
                     is_write=shell_is_write,
+                    bus_dir=bus_dir,
                 )
                 if blocked:
                     return {"blocked": True, "reason": f"[bot-isolation-guard] {reason}"}
@@ -622,12 +738,12 @@ def main() -> int:
         return _emit_pass()
 
     role = os.environ.get("AGY_BOT_BUS_ROLE", "worker").strip().lower()
-    if role == "coordinator":
-        return _emit_pass()
 
     try:
         raw_stdin = sys.stdin.read()
         if not raw_stdin.strip():
+            if role == "coordinator":
+                return _emit_pass()
             return _emit_deny(
                 "[bot-isolation-guard] Fail-closed: empty PreToolUse payload in worker session"
             )

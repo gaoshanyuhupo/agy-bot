@@ -211,6 +211,7 @@ export type StudioEventType =
   | "job_updated"
   | "schedule_updated"
   | "bots_updated"
+  | "federation_updated"
   | "gateways_updated"
   | "accounts_updated"
   | "workbench_state_updated"
@@ -590,6 +591,7 @@ export type NavTab =
   | "overview"
   | "browser"
   | "bots"
+  | "federation"
   | "models"
   | "openbao"
   | "security-card"
@@ -1558,6 +1560,194 @@ export interface WorkbenchStateUpdatePayload {
 }
 
 export type BrowserOwner = "none" | "tab" | "drawer" | `pane:${string}`;
+
+// External Agent Bidirectional Federation Control Plane
+export type FederationAgentKind =
+  | "hermes_local"
+  | "hermes_remote"
+  | "muse_remote"
+  | "http_a2a"
+  | "pull_worker"
+  | "agy_local"
+  | "mcp_inbound_only";
+
+export interface FederationAgentCapabilities {
+  coordinator_peer: boolean;
+  host_server_invoke: boolean;
+  allowed_teams: string[];
+  can_dispatch: boolean;
+  can_receive: boolean;
+}
+
+export interface FederationAgentItem {
+  agent_id: string;
+  display_name: string;
+  kind: string;
+  driver: string;
+  profile: string;
+  endpoint_url: string;
+  secret_ref: string;
+  has_secret_ref?: boolean;
+  transport: string;
+  capabilities: FederationAgentCapabilities;
+  trust_level: string;
+  enabled: boolean;
+  revoked: boolean;
+  active_token_count: number;
+  has_active_token: boolean;
+  metadata?: Record<string, unknown>;
+  created_at?: number;
+  updated_at?: number;
+}
+
+export interface FederationTeamItem {
+  team_id: string;
+  display_name: string;
+  leader_agent_id: string;
+  co_leaders: string[];
+  members: string[];
+  metadata?: Record<string, unknown>;
+  leader_can_dispatch?: boolean | null;
+  warnings?: string[];
+  created_at?: number;
+  updated_at?: number;
+}
+
+export interface FederationHubHealth {
+  ok: boolean;
+  reachable: boolean;
+  status: string;
+  service: string;
+  reason?: string;
+  http_status?: number;
+  latency_ms: number | null;
+  checked_at: string;
+}
+
+export interface FederationHardLockItem {
+  id: string;
+  title: string;
+  detail: string;
+}
+
+export interface FederationOverviewResponse {
+  ok: boolean;
+  can_edit: boolean;
+  agents: FederationAgentItem[];
+  teams: FederationTeamItem[];
+  counts: {
+    agents_total: number;
+    agents_enabled: number;
+    agents_revoked: number;
+    agents_coordinator_peer: number;
+    agents_host_invoke: number;
+    teams_total: number;
+  };
+  hub_health: FederationHubHealth;
+  hub_config: {
+    loopback_valid: boolean;
+    host: string;
+    port: number;
+    mcp_url: string;
+  };
+  hard_locks: FederationHardLockItem[];
+  updated_at: string;
+}
+
+export interface FederationAgentCreatePayload {
+  agent_id: string;
+  display_name?: string;
+  kind: FederationAgentKind;
+  driver?: string;
+  profile?: string;
+  endpoint_url?: string;
+  secret_ref?: string;
+  transport?: string;
+  capabilities?: Partial<FederationAgentCapabilities>;
+  trust_level?: string;
+  enabled?: boolean;
+  metadata?: Record<string, unknown>;
+  overwrite?: boolean;
+  mint_token?: boolean;
+  token_label?: string;
+}
+
+export interface FederationAgentPatchPayload {
+  display_name?: string;
+  kind?: FederationAgentKind;
+  driver?: string;
+  profile?: string;
+  endpoint_url?: string;
+  secret_ref?: string;
+  transport?: string;
+  capabilities?: Partial<FederationAgentCapabilities>;
+  trust_level?: string;
+  enabled?: boolean;
+  revoked?: boolean;
+  metadata?: Record<string, unknown>;
+}
+
+export interface FederationAgentMutationResponse {
+  ok: boolean;
+  agent: FederationAgentItem;
+  token?: string;
+  token_id?: string;
+  token_created_at?: number;
+}
+
+export interface FederationTokenResponse {
+  ok: boolean;
+  agent_id: string;
+  token_id: string;
+  token: string;
+  revoked_previous?: number;
+  created_at: number;
+  agent?: FederationAgentItem | null;
+}
+
+export interface FederationTeamCreatePayload {
+  team_id: string;
+  display_name?: string;
+  leader_agent_id?: string;
+  co_leaders?: string[];
+  members?: string[];
+  metadata?: Record<string, unknown>;
+  overwrite?: boolean;
+}
+
+export interface FederationTeamPatchPayload {
+  display_name?: string;
+  leader_agent_id?: string;
+  co_leaders?: string[];
+  members?: string[];
+  metadata?: Record<string, unknown>;
+}
+
+export interface FederationTeamMutationResponse {
+  ok: boolean;
+  team: FederationTeamItem;
+  leader_can_dispatch: boolean | null;
+  warnings: string[];
+}
+
+export interface FederationAuditEntry {
+  ts?: number;
+  event?: string;
+  actor_id?: string;
+  action?: string;
+  outcome?: string;
+  http_status?: number;
+  reason?: string;
+  detail?: Record<string, unknown>;
+}
+
+export interface FederationAuditResponse {
+  ok: boolean;
+  entries: FederationAuditEntry[];
+  total: number;
+  limit: number;
+  offset: number;
+}
 
 declare global {
   interface Window {

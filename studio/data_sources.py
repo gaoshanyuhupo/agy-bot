@@ -96,6 +96,7 @@ _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bAIza[0-9A-Za-z_-]{16,}\b"),
     re.compile(r"\bsk-(?:proj-|ant-|svcacct-|admin-)?[A-Za-z0-9_-]{16,}\b"),
     re.compile(r"\b(?:cfut|cfsd|cfat|ibk|ibssh|alt)_[A-Za-z0-9_-]{8,}\b"),
+    re.compile(r"(?<![A-Za-z0-9])agy_fed_[A-Za-z0-9._-]{12,}"),
     re.compile(r"\bhvs\.[A-Za-z0-9_-]{10,}\b"),
     _JWT_RE,
     re.compile(r"\b(?:lv[12]|kv/data|secret/data)/[A-Za-z0-9_./*-]+\b"),

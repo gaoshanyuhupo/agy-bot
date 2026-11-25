@@ -544,6 +544,84 @@ def _merge_bot_view(handle: str, raw_roster: Dict[str, Any], raw_cfg: Dict[str, 
     }
 
 
+def _federation_mod():
+    try:
+        if __package__:
+            from . import federation_registry as _fed  # type: ignore
+        else:
+            import federation_registry as _fed  # type: ignore
+        return _fed
+    except ImportError:
+        return None
+
+
+def _reject_unsafe_actor_id(raw: Any, *, field: str = "agent_id") -> str:
+    """Fail-closed against path traversal, null bytes, or illegal dots in actor/agent IDs."""
+    if not isinstance(raw, str):
+        raise ValueError(f"Invalid {field} type: {type(raw).__name__}")
+    cleaned = raw.strip()
+    if not cleaned:
+        return ""
+    if ".." in cleaned or "/" in cleaned or "\\" in cleaned or "\x00" in cleaned:
+        raise ValueError(f"Unsafe {field} rejected: {raw!r}")
+    body = cleaned.lstrip("@")
+    if "." in body:
+        raise ValueError(f"Unsafe {field} rejected (dot not permitted): {raw!r}")
+    return cleaned
+
+
+def _merge_federated_roster(base_roster: List[Dict[str, Any]], *, include_offline: bool = True) -> List[Dict[str, Any]]:
+    fed = _federation_mod()
+    if fed is None or not fed.has_federation_state(BUS_DIR):
+        return base_roster
+    all_fed_agents = {
+        str(a.get("agent_id") or ""): a
+        for a in fed.list_agents(bus_dir=BUS_DIR, include_disabled=True, include_revoked=True)
+        if isinstance(a, dict) and a.get("agent_id")
+    }
+    by_handle: Dict[str, Dict[str, Any]] = {str(b.get("handle") or ""): dict(b) for b in base_roster}
+    # B7.3: Authoritative federation revoked/disabled state overrides legacy heartbeat/online state.
+    for aid, ag in all_fed_agents.items():
+        if ag.get("revoked"):
+            by_handle.pop(aid, None)
+        elif not ag.get("enabled", True):
+            if aid in by_handle:
+                by_handle[aid]["online"] = False
+                by_handle[aid]["busy"] = False
+                by_handle[aid]["enabled"] = False
+                if not include_offline:
+                    by_handle.pop(aid, None)
+
+    fed_items = fed.list_effective_roster(bus_dir=BUS_DIR, include_offline=include_offline)
+    for fitem in fed_items:
+        h = str(fitem.get("handle") or "")
+        if not h:
+            continue
+        if h in by_handle:
+            existing = by_handle[h]
+            existing["federated"] = True
+            existing["kind"] = fitem.get("kind") or existing.get("kind") or "agy_local"
+            existing["driver"] = fitem.get("driver") or existing.get("driver") or "agy"
+            existing["transport"] = fitem.get("transport") or existing.get("transport") or "local_cli"
+            existing["coordinator_peer"] = bool(fitem.get("coordinator_peer"))
+            existing["host_server_invoke"] = bool(fitem.get("host_server_invoke"))
+            existing["can_dispatch"] = bool(fitem.get("can_dispatch", False))
+            existing["can_receive"] = bool(fitem.get("can_receive", True))
+            existing["allowed_teams"] = list(fitem.get("allowed_teams") or [])
+            existing["led_teams"] = list(fitem.get("led_teams") or [])
+            existing["teams"] = list(fitem.get("teams") or [])
+            existing["has_active_token"] = bool(fitem.get("has_active_token"))
+            if not fitem.get("online"):
+                existing["online"] = False
+                existing["busy"] = False
+        else:
+            by_handle[h] = dict(fitem)
+    merged = list(by_handle.values())
+    role_order = {"coordinator": 0, "peer": 1, "worker": 2}
+    merged.sort(key=lambda b: (0 if b.get("online") else 1, role_order.get(str(b.get("role") or ""), 9), str(b.get("handle") or "")))
+    return merged
+
+
 def list_roster(include_offline: bool = True) -> List[Dict[str, Any]]:
     now = time.time()
     with _bus_lock():
@@ -560,7 +638,7 @@ def list_roster(include_offline: bool = True) -> List[Dict[str, Any]]:
             out.append(view)
     role_order = {"coordinator": 0, "peer": 1, "worker": 2}
     out.sort(key=lambda b: (0 if b["online"] else 1, role_order.get(b["role"], 9), b["handle"]))
-    return out
+    return _merge_federated_roster(out, include_offline=include_offline)
 
 
 def resolve_target_bot(query: str, roster: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
@@ -1044,8 +1122,10 @@ def dispatch_assignments(
     retry_count: int = 0,
     max_retries: Optional[int] = None,
     parent_job_id: str = "",
+    auth_token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Validate and enqueue 1..FAN_OUT_MAX delegation jobs atomically onto target bot inboxes."""
+    _reject_unsafe_actor_id(from_bot, field="from_bot")
     sender = normalize_handle(from_bot)
     if not sender:
         raise ValueError("Sender bot handle could not be determined")
@@ -1179,12 +1259,18 @@ def dispatch_assignments(
         handles = sorted(set(r_bots.keys()) | set(c_bots.keys()))
         team_mirror = cfg_raw.get("mirror") if isinstance(cfg_raw.get("mirror"), dict) else {}
         roster = [_merge_bot_view(h, r_bots.get(h), c_bots.get(h), now, team_mirror=team_mirror) for h in handles]
+        roster = _merge_federated_roster(roster, include_offline=True)
+        fed = _federation_mod()
+        fed_active = bool(fed is not None and fed.has_federation_state(BUS_DIR))
 
         resolved_specs = []
+        sender_auth: Optional[Dict[str, Any]] = None
+        fed_teams_by_id: Optional[Dict[str, Dict[str, Any]]] = None
         for idx, spec in enumerate(assignments):
             if not isinstance(spec, dict):
                 raise ValueError(f"Assignment #{idx + 1} must be an object")
             target_q = str(spec.get("bot") or "").strip()
+            _reject_unsafe_actor_id(target_q, field="target_bot")
             prompt = str(spec.get("prompt") or "").strip()
             if not prompt:
                 raise ValueError(f"Assignment #{idx + 1} prompt cannot be empty")
@@ -1208,7 +1294,75 @@ def dispatch_assignments(
                 raise ValueError(f"Cycle detected in delegation chain ({' -> '.join(chain)} -> {th})")
             if not target["online"]:
                 raise ValueError(f"Target bot @{th} is currently offline")
+            if target.get("can_receive") is False:
+                raise PermissionError(
+                    f"PRIVILEGE_ESCALATION_DENIED: target agent {th!r} has capabilities.can_receive=False"
+                )
+            if fed_active and fed is not None:
+                auth_res = fed.authorize_team_action(
+                    sender,
+                    "dispatch",
+                    team_id=spec_team,
+                    target_agent_id=th,
+                    bus_dir=BUS_DIR,
+                    auth_token=auth_token,
+                )
+                sender_auth = auth_res
+                # B1.4 / M2-B6: Auto-backfill unique allowed_team / led_team when caller omits team_id so jobs are never unscoped.
+                if not spec_team:
+                    led_list = list(auth_res.get("led_teams") or [])
+                    allowed_list = list(auth_res.get("allowed_teams") or [])
+                    if allowed_list:
+                        if fed_teams_by_id is None:
+                            fed_teams_by_id = {
+                                t["team_id"]: t for t in fed.list_teams(bus_dir=BUS_DIR) if isinstance(t, dict)
+                            }
+                        is_global_c = bool(auth_res.get("is_coordinator_peer") or auth_res.get("is_legacy_coordinator"))
+                        scoped_candidates = (
+                            allowed_list if is_global_c else [tid for tid in allowed_list if tid in set(led_list)]
+                        )
+                        matching_allowed = [
+                            tid
+                            for tid in scoped_candidates
+                            if th in ((fed_teams_by_id.get(tid) or {}).get("members") or [])
+                        ]
+                        if len(matching_allowed) == 1:
+                            spec_team = matching_allowed[0]
+                        else:
+                            raise PermissionError(
+                                f"PRIVILEGE_ESCALATION_DENIED: explicit team_id required when capabilities.allowed_teams={sorted(allowed_list)} is set for {sender!r}"
+                            )
+                    elif led_list:
+                        if fed_teams_by_id is None:
+                            fed_teams_by_id = {
+                                t["team_id"]: t for t in fed.list_teams(bus_dir=BUS_DIR) if isinstance(t, dict)
+                            }
+                        matching_led = [
+                            tid
+                            for tid in led_list
+                            if th in ((fed_teams_by_id.get(tid) or {}).get("members") or [])
+                        ]
+                        if len(matching_led) == 1:
+                            spec_team = matching_led[0]
+                        elif len(led_list) == 1 and not (
+                            auth_res.get("is_coordinator_peer") or auth_res.get("is_legacy_coordinator")
+                        ):
+                            spec_team = led_list[0]
             resolved_specs.append((spec, target, spec_team, spec_origin))
+
+        # B2: Server-side monotonic trust_level clamping against registered federation agent record.
+        if fed_active and isinstance(sender_auth, dict):
+            reg_agent = sender_auth.get("agent")
+            if isinstance(reg_agent, dict) and reg_agent.get("trust_level"):
+                reg_trust = _normalize_trust_level(reg_agent.get("trust_level"), default="remote_untrusted")
+                eff_parent_trust = _min_trust_level(eff_parent_trust, reg_trust)
+                if reg_trust == "readonly_guest" or eff_parent_trust == "readonly_guest":
+                    raise PermissionError(
+                        f"PRIVILEGE_ESCALATION_DENIED: registered agent {sender!r} with trust_level='readonly_guest' cannot dispatch assignments"
+                    )
+                if TRUST_ORDER[eff_parent_trust] <= TRUST_ORDER["remote_untrusted"]:
+                    eff_parent_untr = True
+                    eff_parent_tainted = True
 
         # Check & record 10-minute sliding window AFTER spec validation so invalid specs don't burn quota
         _record_dispatch_window_unlocked(now, len(resolved_specs), eff_window_max)
@@ -1343,6 +1497,10 @@ def dispatch_assignments(
                 "artifacts": [],
                 "usage": {},
             }
+            if target.get("federated"):
+                job["target_driver"] = str(target.get("driver") or "")
+                job["target_transport"] = str(target.get("transport") or "")
+                job["target_kind"] = str(target.get("kind") or "")
             _atomic_write_json(_job_path(jid), job)
             _drop_inbox_packet_unlocked(
                 target["handle"],
@@ -1364,12 +1522,31 @@ def dispatch_assignments(
     return {"group_id": group_id, "jobs": created_jobs}
 
 
-def get_job(job_id: str) -> Optional[Dict[str, Any]]:
+def get_job(
+    job_id: str,
+    *,
+    requester_bot: str = "",
+    auth_token: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     fp = _job_path(job_id)
     if not os.path.isfile(fp):
         return None
     data = _read_json(fp, None)
-    return data if isinstance(data, dict) else None
+    if not isinstance(data, dict):
+        return None
+    if requester_bot:
+        _reject_unsafe_actor_id(requester_bot, field="requester_bot")
+        fed = _federation_mod()
+        if fed is not None and fed.has_federation_state(BUS_DIR):
+            fed.authorize_team_action(
+                normalize_handle(requester_bot),
+                "status",
+                team_id=str(data.get("team_id") or ""),
+                job=data,
+                bus_dir=BUS_DIR,
+                auth_token=auth_token,
+            )
+    return data
 
 
 def list_jobs(limit: int = 20, status: Optional[str] = None, bot: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -1831,14 +2008,33 @@ def finish_job(
         return dict(job)
 
 
-def cancel_job(job_id: str, requester_bot: str = "", reason: str = "cancelled") -> Optional[Dict[str, Any]]:
+def cancel_job(
+    job_id: str,
+    requester_bot: str = "",
+    reason: str = "cancelled",
+    *,
+    auth_token: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    if requester_bot:
+        _reject_unsafe_actor_id(requester_bot, field="requester_bot")
     req = normalize_handle(requester_bot or "")
     fp = _job_path(job_id)
     with _bus_lock():
         job = _read_json(fp, None)
         if not isinstance(job, dict):
             return None
-        if req and req not in (job.get("from_bot"), job.get("target_bot")):
+        fed = _federation_mod()
+        fed_active = bool(fed is not None and fed.has_federation_state(BUS_DIR))
+        if req and fed_active and fed is not None:
+            fed.authorize_team_action(
+                req,
+                "cancel",
+                team_id=str(job.get("team_id") or ""),
+                job=job,
+                bus_dir=BUS_DIR,
+                auth_token=auth_token,
+            )
+        elif req and req not in (job.get("from_bot"), job.get("target_bot")):
             raise PermissionError(f"Only @{job.get('from_bot')} may cancel {job_id}")
         if job.get("status") in TERMINAL_STATUSES:
             return dict(job)
@@ -2124,7 +2320,10 @@ def retry_job(
     caller_untrusted: Optional[bool] = None,
     caller_tainted: Optional[bool] = None,
     caller_max_runtime_mode: Optional[str] = None,
+    auth_token: Optional[str] = None,
 ) -> Dict[str, Any]:
+    if requester_bot:
+        _reject_unsafe_actor_id(requester_bot, field="requester_bot")
     # P0-1: Read current session security context (caller args monotonically intersected with env)
     env_rbac_ro = os.environ.get("AGY_RBAC_ROLE", "").strip().lower() == "readonly"
     env_untr = (
@@ -2160,6 +2359,24 @@ def retry_job(
         raise PermissionError(
             f"PRIVILEGE_ESCALATION_DENIED: cross-team retry rejected (session team_id={eff_caller_team!r}, job team_id={prev_team_id!r})"
         )
+    fed = _federation_mod()
+    reg_caller_trust = ""
+    if requester_bot and fed is not None and fed.has_federation_state(BUS_DIR):
+        retry_auth = fed.authorize_team_action(
+            normalize_handle(requester_bot),
+            "retry",
+            team_id=prev_team_id,
+            job=prev,
+            bus_dir=BUS_DIR,
+            auth_token=auth_token,
+        )
+        reg_agent = retry_auth.get("agent") if isinstance(retry_auth, dict) else None
+        if isinstance(reg_agent, dict) and reg_agent.get("trust_level"):
+            reg_caller_trust = _normalize_trust_level(reg_agent.get("trust_level"), default="remote_untrusted")
+            if reg_caller_trust == "readonly_guest":
+                raise PermissionError(
+                    f"PRIVILEGE_ESCALATION_DENIED: registered agent {normalize_handle(requester_bot)!r} with trust_level='readonly_guest' cannot retry jobs"
+                )
     eff_team_id = eff_caller_team or prev_team_id
 
     if prev.get("retryable") is False and not force_non_idempotent:
@@ -2208,7 +2425,7 @@ def retry_job(
         default=("readonly_guest" if prev_ro else ("remote_untrusted" if prev_untr else "local_admin")),
     )
     eff_trust = prev_trust
-    for _raw_t in (arg_caller_trust, env_trust):
+    for _raw_t in (arg_caller_trust, env_trust, reg_caller_trust):
         if _raw_t:
             eff_trust = _min_trust_level(eff_trust, _raw_t)
     if eff_ro:
@@ -2280,6 +2497,7 @@ def retry_job(
         retry_count=next_retry_count,
         max_retries=eff_max_retries,
         parent_job_id=job_id,
+        auth_token=auth_token,
     )
     return res["jobs"][0]
 
@@ -3417,11 +3635,30 @@ def finalize_job_worktree(wt_info: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def cleanup_job_worktree(job_id: str, force: bool = False) -> Dict[str, Any]:
+def cleanup_job_worktree(
+    job_id: str,
+    force: bool = False,
+    *,
+    requester_bot: str = "",
+    auth_token: Optional[str] = None,
+) -> Dict[str, Any]:
     """Explicitly clean up a job's preserved worktree and branch after review/merge."""
+    if requester_bot:
+        _reject_unsafe_actor_id(requester_bot, field="requester_bot")
     job = get_job(job_id)
     if not job:
         return {"ok": False, "job_id": job_id, "error": f"Job not found: {job_id}"}
+    if requester_bot:
+        fed = _federation_mod()
+        if fed is not None and fed.has_federation_state(BUS_DIR):
+            fed.authorize_team_action(
+                normalize_handle(requester_bot),
+                "cleanup_worktree",
+                team_id=str(job.get("team_id") or ""),
+                job=job,
+                bus_dir=BUS_DIR,
+                auth_token=auth_token,
+            )
 
     wt = (
         job.get("worktree_info")
