@@ -1627,6 +1627,13 @@ class TestCB2PermissionMultiTenantCrossBotGoogleIsolation(unittest.TestCase):
         # Verify real server `internal_sync_start` keeps allow_google_verified=False & pinned_verified=False
         async def _verify_real_server() -> None:
             hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "tok")
+            auth_ctx = (
+                {"main": "dummy-test-token"},
+                {str(BOT_ID_A): "main"},
+                {ADMIN_UID_A},
+                {"main": {ADMIN_UID_A}},
+                {"main": {ADMIN_UID_A: "admin"}},
+            )
             req = types.SimpleNamespace(
                 app={"hub": hub},
                 headers={"X-Live-Token": "tok"},
@@ -1642,10 +1649,14 @@ class TestCB2PermissionMultiTenantCrossBotGoogleIsolation(unittest.TestCase):
                     )
                 )
             )
-            with mock.patch.object(srv, "web", fake_web):
+            with (
+                mock.patch.object(srv, "web", fake_web),
+                mock.patch.object(srv, "_load_auth_context", return_value=auth_ctx),
+            ):
                 resp = await srv.internal_sync_start(req)  # type: ignore[arg-type]
             payload = json.loads(resp.text)
             self.assertTrue(payload["ok"])
+            self.assertEqual("main", payload["bot_key"])
             self.assertFalse(payload["pinned_verified"])
             self.assertFalse(payload["allow_google_verified"])
             self.assertFalse(payload["google_allowed"])
