@@ -143,6 +143,12 @@ _FORBIDDEN_TG_GROUP_IPC_KEYS = frozenset({
     "mirror_chat_id",
     "mirror_thread_id",
     "scope_key",
+    "owner_auth",
+    "is_owner",
+    "token",
+    "__proto__",
+    "prototype",
+    "constructor",
     "workdir",
     "ipc_sock",
     "script",
@@ -161,7 +167,13 @@ _ALLOWED_TG_GROUP_IPC_KEYS = frozenset({
     "origin_msg_id",
     "priority",
     "interrupt_current",
+    "channel",
+    "dispatch_turn",
+    "relay_sender",
 })
+_VALID_TG_GROUP_CHANNELS = frozenset({"team_mirror", "federation_mirror"})
+_RELAY_SENDER_IPC_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_FORBIDDEN_RELAY_SENDER_NAMES = frozenset({".", "..", "__proto__", "constructor", "prototype"})
 _FORBIDDEN_ACCOUNT_RECYCLE_IPC_KEYS = frozenset({
     "role",
     "cmd",
@@ -316,6 +328,20 @@ def is_valid_sha1_hex(raw: Any) -> bool:
     if not isinstance(raw, str):
         return False
     return bool(SHA1_HEX_RE.fullmatch(raw))
+
+
+def is_valid_relay_sender(raw: Any) -> bool:
+    """Strictly validate an optional federation relay_sender identifier (`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)."""
+    if type(raw) is not str or not raw:
+        return False
+    if raw != raw.strip():
+        return False
+    if ".." in raw or "/" in raw or "\\" in raw or "\x00" in raw:
+        return False
+    low = raw.lower()
+    if low in _FORBIDDEN_RELAY_SENDER_NAMES or "[acb_" in low:
+        return False
+    return bool(_RELAY_SENDER_IPC_RE.fullmatch(raw))
 
 
 def _find_forbidden_ipc_key(obj: Any, forbidden: frozenset[str], *, depth: int = 0) -> str | None:
@@ -1381,6 +1407,36 @@ class _StudioIPCHandler(http.server.BaseHTTPRequestHandler):
             if not isinstance(raw_interrupt, bool):
                 self._send_json(400, {"ok": False, "error": "interrupt_current 必须为布尔值"})
                 return
+            if "channel" not in body or body["channel"] is None:
+                channel_val = "team_mirror"
+            else:
+                raw_channel = body["channel"]
+                if type(raw_channel) is not str or raw_channel not in _VALID_TG_GROUP_CHANNELS:
+                    self._send_json(400, {"ok": False, "error": "channel 必须为 team_mirror 或 federation_mirror"})
+                    return
+                channel_val = raw_channel
+            if "dispatch_turn" not in body:
+                dispatch_turn_val = True
+            else:
+                raw_dispatch = body["dispatch_turn"]
+                if not isinstance(raw_dispatch, bool):
+                    self._send_json(400, {"ok": False, "error": "dispatch_turn 必须为严格布尔值"})
+                    return
+                dispatch_turn_val = raw_dispatch
+            raw_relay = body.get("relay_sender")
+            if raw_relay is None or raw_relay == "":
+                relay_sender_val = ""
+            else:
+                if not is_valid_relay_sender(raw_relay):
+                    self._send_json(400, {"ok": False, "error": "relay_sender 格式非法"})
+                    return
+                relay_sender_val = raw_relay
+            if relay_sender_val and dispatch_turn_val is True:
+                self._send_json(400, {"ok": False, "error": "relay_sender 非空时必须设置 dispatch_turn=false"})
+                return
+            if relay_sender_val and mirror_human is not True:
+                self._send_json(400, {"ok": False, "error": "relay_sender 非空时必须设置 mirror_human_to_tg=true"})
+                return
             safe_content = neutralize_control_tags(content).strip()
             if not safe_content:
                 self._send_json(400, {"ok": False, "error": "content 不能为空"})
@@ -1399,6 +1455,9 @@ class _StudioIPCHandler(http.server.BaseHTTPRequestHandler):
                 "origin_msg_id": int(raw_origin_mid),
                 "priority": priority_val,
                 "interrupt_current": raw_interrupt,
+                "channel": channel_val,
+                "dispatch_turn": dispatch_turn_val,
+                "relay_sender": relay_sender_val,
             }
             try:
                 status_code, resp_payload = self.ipc.tg_group_send_fn(req_tg)

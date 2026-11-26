@@ -3922,9 +3922,1266 @@ class TestFederationWorkbenchUpgradeFW1ToFW7(_FederationTestBase):
         self.assertEqual(wb_tsx.count("clearInterval("), 1)
 
         # FW7: API & Demo exports parity for new federation workbench state endpoints
-        for sym in ("fetchFederationWorkbenchState", "updateFederationWorkbenchState"):
+        for sym in (
+            "fetchFederationWorkbenchState",
+            "updateFederationWorkbenchState",
+            "fetchFederationChatroomMessages",
+            "sendFederationChatroomMessage",
+        ):
             self.assertIn(sym, api_ts)
             self.assertIn(sym, mock_ts)
+
+
+class _DummyJobQ:
+    def __init__(self) -> None:
+        self.items: list[tuple] = []
+
+    def put(self, item: tuple) -> int:
+        self.items.append(("put", item))
+        return len(self.items)
+
+    def put_front(self, item: tuple) -> int:
+        self.items.append(("put_front", item))
+        return len(self.items)
+
+    def put_front_and_mark_dispatched_preempt(self, item: tuple, _skey: str) -> tuple[int, int]:
+        self.items.append(("preempt", item))
+        return len(self.items), 0
+
+
+class _DummyBridgeHost:
+    def __init__(self, bus_dir: Path, handle: str, *, allowed: set[int], authorized: bool = True) -> None:
+        self.bus_dir = bus_dir
+        self._handle = handle
+        self.ALLOWED = set(allowed)
+        self._authorized = authorized
+        self.job_q = _DummyJobQ()
+        self.sent_calls: list[dict[str, object]] = []
+        self.recorded_entries: list[dict[str, object]] = []
+        self.human_activity_calls: list[dict[str, object]] = []
+        self._seq = 0
+        self._msg_id = 100
+        self.bot_bus = self._make_bus_proxy()
+
+    def _make_bus_proxy(self):
+        host = self
+
+        class _BusProxy:
+            BUS_DIR = str(host.bus_dir)
+
+            @staticmethod
+            def _effective_bus_dir() -> str:
+                return str(host.bus_dir)
+
+            @staticmethod
+            def get_team_mirror() -> dict[str, object]:
+                p = host.bus_dir / "team_config.json"
+                if p.is_file():
+                    doc = json.loads(p.read_text(encoding="utf-8"))
+                    if isinstance(doc.get("mirror"), dict):
+                        return doc["mirror"]
+                return {}
+
+            @staticmethod
+            def record_group_message(
+                chat_id: int,
+                *,
+                msg_id: int = 0,
+                thread_id: int | None = None,
+                sender_handle: str = "",
+                sender_role: str = "",
+                is_bot: bool = False,
+                text: str = "",
+                ts: float | None = None,
+                source: str = "tg",
+            ) -> dict[str, object]:
+                host._seq += 1
+                entry = {
+                    "seq": host._seq,
+                    "msg_id": msg_id,
+                    "ts": float(ts or time.time()),
+                    "thread_id": thread_id,
+                    "sender_handle": sender_handle,
+                    "sender_role": sender_role,
+                    "is_bot": bool(is_bot),
+                    "full_text": text,
+                    "text_excerpt": text[:500],
+                    "truncated": False,
+                    "source": source,
+                }
+                host.recorded_entries.append({"chat_id": chat_id, **entry})
+                gh_dir = host.bus_dir / "group_history"
+                gh_dir.mkdir(parents=True, exist_ok=True)
+                gh_file = gh_dir / f"{chat_id}.json"
+                doc = (
+                    json.loads(gh_file.read_text(encoding="utf-8"))
+                    if gh_file.is_file()
+                    else {"version": 1, "next_seq": 1, "entries": [], "cursors": {}}
+                )
+                doc["entries"].append(entry)
+                doc["next_seq"] = host._seq + 1
+                gh_file.write_text(json.dumps(doc), encoding="utf-8")
+                return dict(entry)
+
+            @staticmethod
+            def mark_human_group_activity(
+                chat_id: int,
+                thread_id: int | None = None,
+                msg_id: int = 0,
+            ) -> str:
+                host.human_activity_calls.append(
+                    {"chat_id": chat_id, "thread_id": thread_id, "msg_id": msg_id}
+                )
+                return f"chain-{msg_id}"
+
+        return _BusProxy()
+
+    def _current_bot_handle(self) -> str:
+        return self._handle
+
+    def _is_authorized(self, chat_id: int) -> bool:
+        return self._authorized and (int(chat_id) in self.ALLOWED)
+
+    @staticmethod
+    def _normalize_thread_id(raw: object) -> int | None:
+        if raw is None or isinstance(raw, bool):
+            return None
+        try:
+            v = int(raw)
+            return v if v > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def list_agy_projects() -> list[dict[str, str]]:
+        return []
+
+    @staticmethod
+    def scope_key_for(chat_id: int, thread_id: int | None) -> str:
+        return f"g:{chat_id}:{thread_id or 0}"
+
+    def send(
+        self,
+        chat_id: int,
+        text: str,
+        *,
+        thread_id: int | None = None,
+        disable_web_page_preview: bool = True,
+    ) -> int:
+        self._msg_id += 1
+        self.sent_calls.append(
+            {
+                "chat_id": int(chat_id),
+                "text": text,
+                "thread_id": thread_id,
+                "disable_web_page_preview": disable_web_page_preview,
+            }
+        )
+        return self._msg_id
+
+
+class TestFederationChatroomFC1ToFC7(_FederationTestBase):
+    """Comprehensive Prod-Release self-verification for FC1..FC7 (Standalone Federation Chatroom TG Mirror)."""
+
+    FED_CHAT_ID = GROUP_CHAT_ID - 10
+    TEAM_CHAT_ID = GROUP_CHAT_ID - 20
+
+    @staticmethod
+    def _at(handle: str) -> str:
+        return "@" + handle
+
+    def _write_team_config(
+        self,
+        *,
+        team_mirror: dict[str, object] | None = None,
+        fed_mirror: dict[str, object] | None = None,
+        bots: dict[str, object] | None = None,
+    ) -> None:
+        doc: dict[str, object] = {"version": 1, "bots": bots or {}}
+        if team_mirror is not None:
+            doc["mirror"] = team_mirror
+        if fed_mirror is not None:
+            doc["federation_mirror"] = fed_mirror
+        (self.bus_dir / "team_config.json").write_text(json.dumps(doc), encoding="utf-8")
+
+    def _write_roster(self, bots: dict[str, dict[str, object]]) -> None:
+        (self.bus_dir / "roster.json").write_text(
+            json.dumps({"version": 1, "bots": bots}), encoding="utf-8"
+        )
+
+    def _start_ipc_server(
+        self,
+        handle: str,
+        host: _DummyBridgeHost,
+    ):
+        import studio_ipc as sipc
+        import studio_ipc_handlers as handlers
+
+        def _tg_send(req: dict[str, object]) -> tuple[int, dict[str, object]]:
+            prev = handlers._host
+            handlers.bind_host(host)
+            try:
+                return handlers._studio_ipc_tg_group_send(req)
+            finally:
+                handlers._host = prev
+
+        srv = sipc.StudioIPCServer(
+            bus_dir=self.bus_dir,
+            bot_handle=handle,
+            resolve_role_fn=lambda uid: "admin" if int(uid) == ADMIN_UID else "readonly",
+            get_meta_fn=lambda: {"handle": handle, "role": "coordinator"},
+            enqueue_turn_fn=lambda _r: (202, {"ok": True}),
+            abort_turn_fn=lambda _t, _u: (200, {"ok": True}),
+            tg_group_send_fn=_tg_send,
+        )
+        srv.start()
+        return srv
+
+    async def _post_uds_ipc(
+        self,
+        sock_path: Path,
+        token: str,
+        payload: dict[str, object],
+    ) -> tuple[int, dict[str, object]]:
+        connector = aiohttp.UnixConnector(path=str(sock_path))
+        async with aiohttp.ClientSession(connector=connector) as cli:
+            async with cli.post(
+                "http://localhost/ipc/tg_group/send",
+                headers={"X-Bridge-IPC-Token": token, "Content-Type": "application/json"},
+                json=payload,
+            ) as resp:
+                data = await resp.json()
+                return resp.status, data
+
+    def _setup_online_coord_and_worker(
+        self,
+        *,
+        allowed: set[int] | None = None,
+        authorized: bool = True,
+        start_worker: bool = True,
+    ) -> tuple[_DummyBridgeHost, object, _DummyBridgeHost | None, object | None]:
+        now = time.time()
+        cur_pid = os.getpid()
+        self._write_roster(
+            {
+                "coord_bot": {
+                    "handle": "coord_bot",
+                    "role": "coordinator",
+                    "pid": cur_pid,
+                    "last_seen": now,
+                    "online": True,
+                },
+                "local_dev": {
+                    "handle": "local_dev",
+                    "role": "worker",
+                    "pid": cur_pid,
+                    "last_seen": now,
+                    "online": True,
+                },
+                "offline_dev": {
+                    "handle": "offline_dev",
+                    "role": "worker",
+                    "pid": 0,
+                    "last_seen": now - 9999,
+                    "online": False,
+                },
+            }
+        )
+        allow_set = allowed if allowed is not None else {self.FED_CHAT_ID, self.TEAM_CHAT_ID}
+        coord_host = _DummyBridgeHost(self.bus_dir, "coord_bot", allowed=allow_set, authorized=authorized)
+        coord_srv = self._start_ipc_server("coord_bot", coord_host)
+        worker_host = None
+        worker_srv = None
+        if start_worker:
+            worker_host = _DummyBridgeHost(self.bus_dir, "local_dev", allowed=allow_set, authorized=authorized)
+            worker_srv = self._start_ipc_server("local_dev", worker_host)
+        return coord_host, coord_srv, worker_host, worker_srv
+
+    async def test_fc1_cross_group_isolation_bridge_auth_and_zero_chat_id_leak(self) -> None:
+        """FC1: Zero fallback to team_mirror, Bridge 403 unauthorized chat, nested forbidden keys 400, zero chat_id/thread_id leak."""
+        admin_cookie, admin_csrf = await self._login("AdminUser", ADMIN_PASS)
+        admin_get = {"Cookie": f"{SESSION_COOKIE_NAME}={admin_cookie}"}
+        admin_hdrs = self._admin_headers(admin_cookie, admin_csrf)
+
+        # 1. Only team_mirror configured (NO federation_mirror) -> zero fallback
+        self._write_team_config(team_mirror={"chat_id": self.TEAM_CHAT_ID, "thread_id": 7})
+        coord_host, coord_srv, _wh, worker_srv = self._setup_online_coord_and_worker()
+        try:
+            sc_ipc, data_ipc = await self._post_uds_ipc(
+                coord_srv.sock_path,
+                coord_srv.token,
+                {"user_id": ADMIN_UID, "content": "hello", "channel": "federation_mirror"},
+            )
+            self.assertEqual(sc_ipc, 400, data_ipc)
+            self.assertEqual(coord_host.sent_calls, [])
+
+            r_get = await self.client.get("/api/federation/workbench/chatroom/messages", headers=admin_get)
+            self.assertEqual(r_get.status, 200)
+            g_body = await r_get.json()
+            self.assertFalse(g_body["bound"])
+            self.assertEqual(g_body["messages"], [])
+            self.assertNotIn(str(self.TEAM_CHAT_ID), json.dumps(g_body))
+
+            r_post = await self.client.post(
+                "/api/federation/workbench/chatroom/messages",
+                headers=admin_hdrs,
+                data=json.dumps({"content": "should fail closed"}),
+            )
+            self.assertEqual(r_post.status, 400)
+            self.assertEqual(coord_host.sent_calls, [])
+
+            # Explicit env disable values must NEVER fallback even when team_config has federation_mirror
+            self._write_team_config(
+                team_mirror={"chat_id": self.TEAM_CHAT_ID},
+                fed_mirror={"chat_id": self.FED_CHAT_ID, "title": "联邦群"},
+            )
+            for dis_val in ("0", "off", "false", "none", "disabled"):
+                with mock.patch.dict(os.environ, {"AGY_STUDIO_FEDERATION_MIRROR_CHAT_ID": dis_val}):
+                    self.assertIsNone(self.sources.resolve_federation_tg_mirror())
+                    sc_d, _ = await self._post_uds_ipc(
+                        coord_srv.sock_path,
+                        coord_srv.token,
+                        {"user_id": ADMIN_UID, "content": "hi", "channel": "federation_mirror"},
+                    )
+                    self.assertEqual(sc_d, 400)
+        finally:
+            coord_srv.stop()
+            if worker_srv:
+                worker_srv.stop()
+
+        # 2. Unauthorized federation_mirror chat_id -> Bridge IPC 403, zero TG call, zero group_history write
+        self._write_team_config(fed_mirror={"chat_id": self.FED_CHAT_ID, "title": "联邦群"})
+        unauth_host, unauth_srv, _, _ = self._setup_online_coord_and_worker(
+            allowed={self.TEAM_CHAT_ID}, start_worker=False
+        )
+        try:
+            sc_unauth, data_unauth = await self._post_uds_ipc(
+                unauth_srv.sock_path,
+                unauth_srv.token,
+                {"user_id": ADMIN_UID, "content": "hi", "channel": "federation_mirror"},
+            )
+            self.assertEqual(sc_unauth, 403, data_unauth)
+            self.assertEqual(unauth_host.sent_calls, [])
+            self.assertFalse((self.bus_dir / "group_history" / f"{self.FED_CHAT_ID}.json").exists())
+        finally:
+            unauth_srv.stop()
+
+        # 3. Top-level & nested forbidden keys + invalid channel -> 400 on both Studio HTTP and Bridge IPC
+        coord_host, coord_srv, _, worker_srv = self._setup_online_coord_and_worker()
+        try:
+            bad_ipc_payloads = [
+                {"user_id": ADMIN_UID, "content": "hi", "channel": "../team_mirror"},
+                {"user_id": ADMIN_UID, "content": "hi", "channel": " federation_mirror "},
+                {"user_id": ADMIN_UID, "content": "hi", "channel": 123},
+                {"user_id": ADMIN_UID, "content": "hi", "chat_id": self.FED_CHAT_ID},
+                {"user_id": ADMIN_UID, "content": "hi", "target_chat_id": self.FED_CHAT_ID},
+                {"user_id": ADMIN_UID, "content": "hi", "thread_id": 5},
+                {"user_id": ADMIN_UID, "content": "hi", "mirror_chat_id": self.FED_CHAT_ID},
+                {"user_id": ADMIN_UID, "content": "hi", "scope_key": "g:1"},
+                {"user_id": ADMIN_UID, "content": "hi", "nested": {"target_thread_id": 9}},
+                {"user_id": ADMIN_UID, "content": "hi", "nested": [{" constructor ": {}}]},
+            ]
+            for bp in bad_ipc_payloads:
+                sc_b, _ = await self._post_uds_ipc(coord_srv.sock_path, coord_srv.token, bp)
+                self.assertEqual(sc_b, 400, f"Expected 400 for IPC payload {bp}")
+
+            bad_http_payloads = [
+                {"content": "hi", "chat_id": self.FED_CHAT_ID},
+                {"content": "hi", "target_chat_id": self.FED_CHAT_ID},
+                {"content": "hi", "thread_id": 3},
+                {"content": "hi", "target_thread_id": 3},
+                {"content": "hi", "mirror_chat_id": self.FED_CHAT_ID},
+                {"content": "hi", "mirror_thread_id": 3},
+                {"content": "hi", "scope_key": "g:1"},
+                {"content": "hi", "role": "admin"},
+                {"content": "hi", "channel": "../team_mirror"},
+                {"content": "hi", "extra": {"chat_id": self.FED_CHAT_ID}},
+            ]
+            for bp in bad_http_payloads:
+                r_b = await self.client.post(
+                    "/api/federation/workbench/chatroom/messages",
+                    headers=admin_hdrs,
+                    data=json.dumps(bp),
+                )
+                self.assertEqual(r_b.status, 400, f"Expected 400 for HTTP payload {bp}")
+
+            # 4. Zero chat_id/thread_id leak across GET/POST/audit/EventHub + zero lobby event bleed
+            r_ok = await self.client.post(
+                "/api/federation/workbench/chatroom/messages",
+                headers=admin_hdrs,
+                data=json.dumps({"content": f"ping chat {self.FED_CHAT_ID}"}),
+            )
+            self.assertEqual(r_ok.status, 200, await r_ok.text())
+            post_raw = await r_ok.text()
+            self.assertNotIn("chat_id", post_raw)
+            self.assertNotIn("thread_id", post_raw)
+            self.assertNotIn(str(self.FED_CHAT_ID), post_raw)
+
+            r_get2 = await self.client.get("/api/federation/workbench/chatroom/messages", headers=admin_get)
+            self.assertEqual(r_get2.status, 200)
+            get_raw = await r_get2.text()
+            self.assertNotIn("chat_id", get_raw)
+            self.assertNotIn("thread_id", get_raw)
+            self.assertNotIn(str(self.FED_CHAT_ID), get_raw)
+
+            audit_txt = self.audit_log.read_text(encoding="utf-8")
+            self.assertNotIn(str(self.FED_CHAT_ID), audit_txt)
+            self.assertNotIn("chat_id", audit_txt)
+
+            # EventHub federation watcher emits ONLY federation_updated, NEVER lobby room_message/room_activity
+            hub = self.app[EVENT_HUB_KEY]
+            hub._poll_federation_tg_mirror_history(bootstrap=True)
+            before_ev_cnt = len(hub._events)
+            # Append a new message to federation group_history directly
+            coord_host.bot_bus.record_group_message(
+                self.FED_CHAT_ID,
+                msg_id=5001,
+                sender_handle="ext_peer",
+                sender_role="worker",
+                is_bot=True,
+                text=f"reply mentioning {self.FED_CHAT_ID}",
+                source="federation",
+            )
+            hub._poll_federation_tg_mirror_history(bootstrap=False)
+            new_events = list(hub._events)[before_ev_cnt:]
+            self.assertTrue(
+                any(ev[1] == "federation_updated" and ev[2].get("action") == "chatroom_updated" for ev in new_events),
+                f"Expected federation_updated chatroom_updated event, got {new_events}",
+            )
+            for _seq, ev_name, ev_data in new_events:
+                self.assertNotEqual(ev_name, "room_message")
+                self.assertNotEqual(ev_name, "room_activity")
+                ev_str = json.dumps(ev_data)
+                self.assertNotIn("chat_id", ev_str)
+                self.assertNotIn("thread_id", ev_str)
+                self.assertNotIn(str(self.FED_CHAT_ID), ev_str)
+                self.assertNotIn("content", ev_data)
+        finally:
+            coord_srv.stop()
+            if worker_srv:
+                worker_srv.stop()
+
+    async def test_fc2_write_gate_live_rbac_rate_limit_size_caps_and_unbound(self) -> None:
+        """FC2: 4-layer admin gate, live users.json downgrade/disable, 429+Retry-After, 413 fixed & chunked + 16KiB, 400 proto/shell."""
+        admin_cookie, admin_csrf = await self._login("AdminUser", ADMIN_PASS)
+        ro_cookie, ro_csrf = await self._login("ViewerUser", RO_PASS)
+        forced_cookie, forced_csrf = await self._login("ForcedPwUser", FORCED_PASS)
+
+        self._write_team_config(fed_mirror={"chat_id": self.FED_CHAT_ID, "title": "联邦群"})
+        coord_host, coord_srv, _, worker_srv = self._setup_online_coord_and_worker()
+        try:
+            body_ok = json.dumps({"content": "hello"})
+
+            # 1a. Missing / cross Origin -> 403
+            r = await self.client.post(
+                "/api/federation/workbench/chatroom/messages",
+                headers={"Content-Type": "application/json", "X-Studio-CSRF": admin_csrf, "Cookie": f"{SESSION_COOKIE_NAME}={admin_cookie}"},
+                data=body_ok,
+            )
+            self.assertEqual(r.status, 403)
+            r = await self.client.post(
+                "/api/federation/workbench/chatroom/messages",
+                headers=self._admin_headers(admin_cookie, admin_csrf, Origin="https://evil.example.com"),
+                data=body_ok,
+            )
+            self.assertEqual(r.status, 403)
+
+            # 1b. Cross-site Sec-Fetch-Site -> 403
+            r = await self.client.post(
+                "/api/federation/workbench/chatroom/messages",
+                headers=self._admin_headers(admin_cookie, admin_csrf, **{"Sec-Fetch-Site": "cross-site"}),
+                data=body_ok,
+            )
+            self.assertEqual(r.status, 403)
+
+            # 1c. Non-JSON Content-Type -> 415
+            r = await self.client.post(
+                "/api/federation/workbench/chatroom/messages",
+                headers=self._admin_headers(admin_cookie, admin_csrf, **{"Content-Type": "text/plain"}),
+                data=body_ok,
+            )
+            self.assertEqual(r.status, 415)
+
+            # 1d. Unauthenticated / invalid cookie -> 401; must_change_password -> 403
+            r = await self.client.post(
+                "/api/federation/workbench/chatroom/messages",
+                headers={"Origin": self.origin, "Content-Type": "application/json"},
+                data=body_ok,
+            )
+            self.assertEqual(r.status, 401)
+            r = await self.client.post(
+                "/api/federation/workbench/chatroom/messages",
+                headers=self._admin_headers(forced_cookie, forced_csrf),
+                data=body_ok,
+            )
+            self.assertEqual(r.status, 403)
+
+            # 1e. Missing/wrong CSRF -> 403
+            r = await self.client.post(
+                "/api/federation/workbench/chatroom/messages",
+                headers=self._admin_headers(admin_cookie, "wrong-csrf"),
+                data=body_ok,
+            )
+            self.assertEqual(r.status, 403)
+
+            # 1f. Readonly user -> 403
+            r = await self.client.post(
+                "/api/federation/workbench/chatroom/messages",
+                headers=self._admin_headers(ro_cookie, ro_csrf),
+                data=body_ok,
+            )
+            self.assertEqual(r.status, 403)
+            self.assertEqual(coord_host.sent_calls, [])
+
+            # 3. Size caps: fixed Content-Length > 32KiB -> 413; chunked > 32KiB -> 413; content > 16KiB -> 413
+            admin_hdrs = self._admin_headers(admin_cookie, admin_csrf)
+            big_fixed = json.dumps({"content": "A" * (34 * 1024)})
+            r = await self.client.post(
+                "/api/federation/workbench/chatroom/messages",
+                headers=admin_hdrs,
+                data=big_fixed,
+            )
+            self.assertEqual(r.status, 413)
+
+            async def _chunked_big():
+                yield b'{"content":"'
+                for _ in range(9):
+                    yield b"B" * 4096
+                yield b'"}'
+
+            r_chunked = await self.client.post(
+                "/api/federation/workbench/chatroom/messages",
+                headers=admin_hdrs,
+                data=_chunked_big(),
+            )
+            self.assertEqual(r_chunked.status, 413)
+
+            over_16k = json.dumps({"content": "C" * (16 * 1024 + 50)})
+            r_16k = await self.client.post(
+                "/api/federation/workbench/chatroom/messages",
+                headers=admin_hdrs,
+                data=over_16k,
+            )
+            self.assertEqual(r_16k.status, 413)
+
+            # 4. Unknown field, prototype pollution (padded whitespace), privilege/shell nested -> 400
+            for bad in (
+                {"content": "hi", "unknown_field": 1},
+                {"content": "hi", " constructor ": {"pollute": True}},
+                {"content": "hi", "nested": {"__proto__": {"a": 1}}},
+                {"content": "hi", "owner_auth": True},
+                {"content": "hi", "nested": {"cmd": "id"}},
+            ):
+                r_bad = await self.client.post(
+                    "/api/federation/workbench/chatroom/messages",
+                    headers=admin_hdrs,
+                    data=json.dumps(bad),
+                )
+                self.assertEqual(r_bad.status, 400, f"Expected 400 for {bad}")
+
+            # 2. Sliding-window rate limit -> 429 + valid integer Retry-After
+            self.fed_svc.chatroom_rate_limit_max = 2
+            self.fed_svc._chatroom_rate_buckets.clear()
+            for _ in range(2):
+                r_ok = await self.client.post(
+                    "/api/federation/workbench/chatroom/messages",
+                    headers=admin_hdrs,
+                    data=body_ok,
+                )
+                self.assertEqual(r_ok.status, 200)
+            r_429 = await self.client.post(
+                "/api/federation/workbench/chatroom/messages",
+                headers=admin_hdrs,
+                data=body_ok,
+            )
+            self.assertEqual(r_429.status, 429)
+            ra = r_429.headers.get("Retry-After", "")
+            self.assertTrue(ra.isdigit() and int(ra) >= 1, f"Invalid Retry-After: {ra!r}")
+
+            # 1g. Live RBAC downgrade in users.json -> immediate 403 on existing admin session
+            self.fed_svc.chatroom_rate_limit_max = 20
+            users_path = self.studio_cfg / "users.json"
+            users_doc = json.loads(users_path.read_text(encoding="utf-8"))
+            users_doc["users"]["adminuser"]["role"] = "readonly"
+            save_users_file_atomic(users_path, users_doc["users"])
+            r_down = await self.client.post(
+                "/api/federation/workbench/chatroom/messages",
+                headers=admin_hdrs,
+                data=body_ok,
+            )
+            self.assertEqual(r_down.status, 403)
+        finally:
+            coord_srv.stop()
+            if worker_srv:
+                worker_srv.stop()
+
+    async def test_fc3_anti_symlink_and_fifo_and_zero_file_creation(self) -> None:
+        """FC3: Anti-symlink & anti-FIFO on group_history/<cid>.json and team_config.json + zero creation on missing."""
+        admin_cookie, _ = await self._login("AdminUser", ADMIN_PASS)
+        admin_get = {"Cookie": f"{SESSION_COOKIE_NAME}={admin_cookie}"}
+        hub = self.app[EVENT_HUB_KEY]
+
+        # 1. Missing group_history dir & file -> empty list + ZERO file/dir created
+        self._write_team_config(fed_mirror={"chat_id": self.FED_CHAT_ID, "title": "联邦群"})
+        gh_dir = self.bus_dir / "group_history"
+        self.assertFalse(gh_dir.exists())
+        r_empty = await self.client.get("/api/federation/workbench/chatroom/messages", headers=admin_get)
+        self.assertEqual(r_empty.status, 200)
+        d_empty = await r_empty.json()
+        self.assertTrue(d_empty["bound"])
+        self.assertEqual(d_empty["messages"], [])
+        self.assertFalse(gh_dir.exists(), "GET must NOT create group_history directory")
+
+        # 2. Symlink group_history dir -> 403 and EventHub watcher skips safely
+        outside_dir = self.tmp / "outside_dir"
+        outside_dir.mkdir()
+        os.symlink(outside_dir, gh_dir)
+        r_sym_dir = await self.client.get("/api/federation/workbench/chatroom/messages", headers=admin_get)
+        self.assertEqual(r_sym_dir.status, 403)
+        hub._poll_federation_tg_mirror_history(bootstrap=False)
+        gh_dir.unlink()
+
+        # 3. Symlink <cid>.json -> 403 and EventHub watcher skips safely
+        gh_dir.mkdir()
+        outside_file = self.tmp / "outside.json"
+        outside_file.write_text('{"entries":[]}', encoding="utf-8")
+        hist_file = gh_dir / f"{self.FED_CHAT_ID}.json"
+        os.symlink(outside_file, hist_file)
+        r_sym_f = await self.client.get("/api/federation/workbench/chatroom/messages", headers=admin_get)
+        self.assertEqual(r_sym_f.status, 403)
+        hub._poll_federation_tg_mirror_history(bootstrap=False)
+        hist_file.unlink()
+
+        # 4. FIFO <cid>.json -> 403 without blocking event loop; EventHub skips without hanging
+        os.mkfifo(hist_file)
+        t0 = time.monotonic()
+        r_fifo_f = await asyncio.wait_for(
+            self.client.get("/api/federation/workbench/chatroom/messages", headers=admin_get),
+            timeout=2.0,
+        )
+        self.assertEqual(r_fifo_f.status, 403)
+        hub._poll_federation_tg_mirror_history(bootstrap=False)
+        self.assertLess(time.monotonic() - t0, 2.0)
+        hist_file.unlink()
+
+        # 5. Symlink & FIFO team_config.json -> 403 without hanging
+        tc_path = self.bus_dir / "team_config.json"
+        tc_path.unlink()
+        os.symlink(outside_file, tc_path)
+        r_sym_tc = await self.client.get("/api/federation/workbench/chatroom/messages", headers=admin_get)
+        self.assertEqual(r_sym_tc.status, 403)
+        hub._poll_federation_tg_mirror_history(bootstrap=False)
+        tc_path.unlink()
+
+        os.mkfifo(tc_path)
+        t1 = time.monotonic()
+        r_fifo_tc = await asyncio.wait_for(
+            self.client.get("/api/federation/workbench/chatroom/messages", headers=admin_get),
+            timeout=2.0,
+        )
+        self.assertEqual(r_fifo_tc.status, 403)
+        hub._poll_federation_tg_mirror_history(bootstrap=False)
+        self.assertLess(time.monotonic() - t1, 2.0)
+        tc_path.unlink()
+
+    async def test_fc4_smart_at_routing_and_relay_sender_anti_loop(self) -> None:
+        """FC4: Smart mention routing (none / local / external / mixed / offline / revoked) + relay_sender constraints."""
+        admin_cookie, admin_csrf = await self._login("AdminUser", ADMIN_PASS)
+        admin_hdrs = self._admin_headers(admin_cookie, admin_csrf)
+
+        # Register an active Pull external agent `muse-f01` and a revoked agent `revoked-f02`
+        r_reg1 = await self.client.post(
+            "/api/federation/agents",
+            headers=admin_hdrs,
+            data=json.dumps({"agent_id": "muse-f01", "kind": "pull_worker", "display_name": "Muse Node"}),
+        )
+        self.assertEqual(r_reg1.status, 200, await r_reg1.text())
+        r_reg2 = await self.client.post(
+            "/api/federation/agents",
+            headers=admin_hdrs,
+            data=json.dumps({"agent_id": "revoked-f02", "kind": "pull_worker"}),
+        )
+        self.assertEqual(r_reg2.status, 200)
+        r_rev = await self.client.post("/api/federation/agents/revoked-f02/revoke", headers=admin_hdrs, data="{}")
+        self.assertEqual(r_rev.status, 200)
+
+        self._write_team_config(fed_mirror={"chat_id": self.FED_CHAT_ID, "title": "联邦群"})
+        coord_host, coord_srv, worker_host, worker_srv = self._setup_online_coord_and_worker()
+        assert worker_host is not None and worker_srv is not None
+        try:
+            # 1. No mention -> routes to online coordinator with dispatch_turn=True
+            r1 = await self.client.post(
+                "/api/federation/workbench/chatroom/messages",
+                headers=admin_hdrs,
+                data=json.dumps({"content": "全体汇报进度"}),
+            )
+            self.assertEqual(r1.status, 200, await r1.text())
+            d1 = await r1.json()
+            self.assertEqual(d1["routed_local"], ["coord_bot"])
+            self.assertEqual(d1["routed_external"], [])
+            self.assertEqual(len(coord_host.sent_calls), 1)
+            self.assertEqual(len(coord_host.job_q.items), 1)
+
+            # 2a. Explicit local_dev mention -> routes ONLY to local_dev (NOT coord_bot)
+            r2 = await self.client.post(
+                "/api/federation/workbench/chatroom/messages",
+                headers=admin_hdrs,
+                data=json.dumps({"content": f"{self._at('local_dev')} 检查构建日志"}),
+            )
+            self.assertEqual(r2.status, 200, await r2.text())
+            d2 = await r2.json()
+            self.assertEqual(d2["routed_local"], ["local_dev"])
+            self.assertEqual(len(worker_host.sent_calls), 1)
+            self.assertEqual(len(worker_host.job_q.items), 1)
+            self.assertEqual(len(coord_host.job_q.items), 1)  # unchanged
+
+            # 2b. Offline or non-existent local bot -> 503, NO fallback to coordinator, ZERO TG send
+            for bad_mention in (
+                f"{self._at('offline_dev')} ping",
+                f"{self._at('nonexistent_bot')} ping",
+            ):
+                r_off = await self.client.post(
+                    "/api/federation/workbench/chatroom/messages",
+                    headers=admin_hdrs,
+                    data=json.dumps({"content": bad_mention}),
+                )
+                self.assertEqual(r_off.status, 503)
+            self.assertEqual(len(coord_host.sent_calls), 1)
+            self.assertEqual(len(coord_host.job_q.items), 1)
+
+            # 3a. Revoked external agent -> fail-closed 403 BEFORE mirroring to TG
+            r_rev_msg = await self.client.post(
+                "/api/federation/workbench/chatroom/messages",
+                headers=admin_hdrs,
+                data=json.dumps({"content": f"{self._at('revoked-f02')} 请执行"}),
+            )
+            self.assertEqual(r_rev_msg.status, 403)
+            self.assertEqual(len(coord_host.sent_calls), 1)
+
+            # 3b. Valid external agent (muse-f01) -> mirrors ONCE via coordinator with dispatch_turn=False (NO coordinator turn!), dispatches PullQueue
+            r3 = await self.client.post(
+                "/api/federation/workbench/chatroom/messages",
+                headers=admin_hdrs,
+                data=json.dumps({"content": f"{self._at('muse-f01')} 巡检外部节点健康状态"}),
+            )
+            self.assertEqual(r3.status, 200, await r3.text())
+            d3 = await r3.json()
+            self.assertEqual(d3["routed_local"], [])
+            self.assertEqual(d3["routed_external"], ["muse-f01"])
+            self.assertEqual(len(d3["external_jobs"]), 1)
+            self.assertEqual(len(coord_host.sent_calls), 2)  # mirrored once
+            self.assertEqual(len(coord_host.job_q.items), 1)  # coordinator turn NOT triggered!
+
+            # 3c. Fail-closed on IPC 400: NEVER strip channel/dispatch_turn and retry
+            ipc_calls_400: list[dict[str, object]] = []
+            orig_ipc_fn = coord_srv.tg_group_send_fn
+
+            def _reject_400_once(req: dict[str, object]) -> tuple[int, dict[str, object]]:
+                ipc_calls_400.append(dict(req))
+                return 400, {"ok": False, "error": "不支持的字段: channel"}
+
+            coord_srv.tg_group_send_fn = _reject_400_once
+            try:
+                r_no_retry = await self.client.post(
+                    "/api/federation/workbench/chatroom/messages",
+                    headers=admin_hdrs,
+                    data=json.dumps({"content": f"{self._at('muse-f01')} 不得剥离字段重试"}),
+                )
+                self.assertEqual(r_no_retry.status, 400)
+                self.assertEqual(len(ipc_calls_400), 1, "Must fail-closed without stripping fields and retrying")
+                self.assertEqual(ipc_calls_400[0].get("channel"), "federation_mirror")
+                self.assertIs(ipc_calls_400[0].get("dispatch_turn"), False)
+            finally:
+                coord_srv.tg_group_send_fn = orig_ipc_fn
+
+            # 4. Mixed local_dev + muse-f01 -> mirrored ONCE total, local turn + external job both dispatched
+            prev_total_sends = len(coord_host.sent_calls) + len(worker_host.sent_calls)
+            r4 = await self.client.post(
+                "/api/federation/workbench/chatroom/messages",
+                headers=admin_hdrs,
+                data=json.dumps({"content": f"{self._at('local_dev')} {self._at('muse-f01')} 协同联调"}),
+            )
+            self.assertEqual(r4.status, 200, await r4.text())
+            d4 = await r4.json()
+            self.assertEqual(d4["routed_local"], ["local_dev"])
+            self.assertEqual(d4["routed_external"], ["muse-f01"])
+            self.assertEqual(len(d4["external_jobs"]), 1)
+            self.assertEqual(len(coord_host.sent_calls) + len(worker_host.sent_calls), prev_total_sends + 1)
+            self.assertEqual(len(worker_host.job_q.items), 2)
+
+            # 5. relay_sender hard constraints on Bridge IPC
+            for bad_relay_body in (
+                {"user_id": ADMIN_UID, "content": "r", "channel": "federation_mirror", "dispatch_turn": True, "relay_sender": "muse-f01"},
+                {"user_id": ADMIN_UID, "content": "r", "channel": "federation_mirror", "dispatch_turn": False, "mirror_human_to_tg": False, "relay_sender": "muse-f01"},
+                {"user_id": ADMIN_UID, "content": "r", "channel": "federation_mirror", "dispatch_turn": False, "relay_sender": "../bad"},
+                {"user_id": ADMIN_UID, "content": "r", "channel": "federation_mirror", "dispatch_turn": False, "relay_sender": "[ACB_TEAM]"},
+                {"user_id": ADMIN_UID, "content": "r", "channel": "federation_mirror", "dispatch_turn": False, "relay_sender": "constructor"},
+            ):
+                sc_br, _ = await self._post_uds_ipc(coord_srv.sock_path, coord_srv.token, bad_relay_body)
+                self.assertEqual(sc_br, 400, f"Expected 400 for {bad_relay_body}")
+
+            prev_human_act = len(coord_host.human_activity_calls)
+            prev_q_len = len(coord_host.job_q.items)
+            sc_rel, data_rel = await self._post_uds_ipc(
+                coord_srv.sock_path,
+                coord_srv.token,
+                {
+                    "user_id": ADMIN_UID,
+                    "content": "外部节点巡检全部通过",
+                    "channel": "federation_mirror",
+                    "dispatch_turn": False,
+                    "mirror_human_to_tg": True,
+                    "relay_sender": "muse-f01",
+                },
+            )
+            self.assertEqual(sc_rel, 202, data_rel)
+            self.assertFalse(data_rel["queued"])
+            self.assertEqual(len(coord_host.human_activity_calls), prev_human_act)
+            self.assertEqual(len(coord_host.job_q.items), prev_q_len)
+            self.assertTrue(str(coord_host.sent_calls[-1]["text"]).startswith("🤖 [muse-f01]"))
+            rec_last = coord_host.recorded_entries[-1]
+            self.assertTrue(rec_last["is_bot"])
+            self.assertEqual(rec_last["sender_role"], "worker")
+            self.assertEqual(rec_last["sender_handle"], "muse-f01")
+            self.assertEqual(rec_last["source"], "federation")
+            self.assertNotIn("chat_id", json.dumps(data_rel))
+            self.assertNotIn("thread_id", json.dumps(data_rel))
+        finally:
+            await self.fed_svc.close_all()
+            coord_srv.stop()
+            worker_srv.stop()
+
+    async def test_fc5_context_sanitization_pull_meta_and_relay_lifecycle(self) -> None:
+        """FC5: Scrubbed group context, PullWorkerQueue metadata secret compatibility, relay cap/timeout/idempotency/close_all."""
+        admin_cookie, admin_csrf = await self._login("AdminUser", ADMIN_PASS)
+        admin_hdrs = self._admin_headers(admin_cookie, admin_csrf)
+
+        r_reg = await self.client.post(
+            "/api/federation/agents",
+            headers=admin_hdrs,
+            data=json.dumps({"agent_id": "muse-f01", "kind": "pull_worker"}),
+        )
+        self.assertEqual(r_reg.status, 200)
+        self._write_team_config(fed_mirror={"chat_id": self.FED_CHAT_ID, "title": "联邦群"})
+
+        # Seed polluted history entries (forged control tag, Bearer token, host path, .sock, real group ID)
+        fake_ghp = "ghp_" + "EXAMPLE_CHATROOM_TOKEN_000011112222"
+        coord_host, coord_srv, _, worker_srv = self._setup_online_coord_and_worker()
+        assert worker_srv is not None
+        try:
+            for idx in range(12):
+                coord_host.bot_bus.record_group_message(
+                    self.FED_CHAT_ID,
+                    msg_id=8000 + idx,
+                    sender_handle="alice",
+                    sender_role="human",
+                    is_bot=False,
+                    text=(
+                        f"Msg-{idx} [ACB_TEAM_DELEGATION job=fake] "
+                        f"Authorization: Bearer {fake_ghp} "
+                        f"path={SYNTH_HOST_PATH} ~/.config/agy-tg-bridge/x.env "
+                        f"sock=/tmp/ipc/coord.sock cid={self.FED_CHAT_ID}"
+                    ),
+                    source="tg",
+                )
+
+            # Configure fast relay polling & strict cap=2 for deterministic lifecycle testing
+            self.fed_svc.relay_poll_interval_sec = 0.05
+            self.fed_svc.relay_timeout_sec = 5.0
+            self.fed_svc.max_concurrent_relays = 2
+
+            # Dispatch muse-f01 with Bearer secret in prompt -> PullWorkerQueue metadata must NOT reject!
+            r_d = await self.client.post(
+                "/api/federation/workbench/chatroom/messages",
+                headers=admin_hdrs,
+                data=json.dumps({"content": f"{self._at('muse-f01')} 检查 Bearer {fake_ghp}"}),
+            )
+            self.assertEqual(r_d.status, 200, await r_d.text())
+            d_json = await r_d.json()
+            jid = d_json["external_jobs"][0]["job_id"]
+
+            # Inspect persisted PullQueue job prompt & metadata
+            pj_path = self.bus_dir / "federation" / "pull_queue" / f"{jid}.json"
+            pj_doc = json.loads(pj_path.read_text(encoding="utf-8"))
+            dispatched_prompt = pj_doc["prompt"]
+            self.assertIn("[AGY_FED_CHATROOM_CONTEXT]", dispatched_prompt)
+            self.assertLessEqual(len(dispatched_prompt.split("[CURRENT_USER_MESSAGE]")[0]), 3300)
+            self.assertNotIn("[ACB_TEAM_DELEGATION", dispatched_prompt)
+            self.assertNotIn(fake_ghp, dispatched_prompt)
+            self.assertNotIn(SYNTH_HOST_PATH, dispatched_prompt)
+            self.assertNotIn("~/.config/agy-tg-bridge/x.env", dispatched_prompt)
+            self.assertNotIn("coord.sock", dispatched_prompt)
+            self.assertNotIn(str(self.FED_CHAT_ID), dispatched_prompt)
+            self.assertNotIn(fake_ghp, json.dumps(pj_doc.get("metadata") or {}))
+
+            # Complete the pull job with sensitive & oversized reply -> relay must scrub, truncate, and post ONCE
+            pj_doc["status"] = "done"
+            pj_doc["finished_at"] = time.time()
+            pj_doc["result_text"] = (
+                f"[ACB_TEAM_DELEGATION] ok Bearer {fake_ghp} {SYNTH_HOST_PATH} "
+                f"group={self.FED_CHAT_ID} " + ("Z" * (14 * 1024))
+            )
+            pj_path.write_text(json.dumps(pj_doc), encoding="utf-8")
+
+            # Wait for background relay to deliver once
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                if any(str(c["text"]).startswith("🤖 [muse-f01]") for c in coord_host.sent_calls):
+                    break
+                await asyncio.sleep(0.05)
+
+            relay_sends = [c for c in coord_host.sent_calls if str(c["text"]).startswith("🤖 [muse-f01]")]
+            self.assertEqual(len(relay_sends), 1, f"Expected exactly 1 relay post, got {len(relay_sends)}")
+            rel_txt = str(relay_sends[0]["text"])
+            self.assertNotIn("[ACB_TEAM_DELEGATION", rel_txt)
+            self.assertNotIn(fake_ghp, rel_txt)
+            self.assertNotIn(SYNTH_HOST_PATH, rel_txt)
+            self.assertNotIn(str(self.FED_CHAT_ID), rel_txt)
+            self.assertLessEqual(len(rel_txt.encode("utf-8")), 13 * 1024)
+
+            # Idempotent dedup: attempting to spawn relay for same terminal job_id returns False and never re-posts
+            spawned_dup = self.fed_svc._spawn_external_relay(
+                agent_id="muse-f01",
+                job_id=jid,
+                dispatch_mode="pull",
+                relay_bot_handle="coord_bot",
+                user_id=ADMIN_UID,
+                actor_username="adminuser",
+                bound_chat_id=self.FED_CHAT_ID,
+            )
+            self.assertFalse(spawned_dup)
+
+            # Relay concurrency cap=2 enforcement -> 3rd concurrent external dispatch returns 429 + Retry-After
+            r_c1 = await self.client.post(
+                "/api/federation/workbench/chatroom/messages",
+                headers=admin_hdrs,
+                data=json.dumps({"content": f"{self._at('muse-f01')} task 1"}),
+            )
+            r_c2 = await self.client.post(
+                "/api/federation/workbench/chatroom/messages",
+                headers=admin_hdrs,
+                data=json.dumps({"content": f"{self._at('muse-f01')} task 2"}),
+            )
+            self.assertEqual(r_c1.status, 200)
+            self.assertEqual(r_c2.status, 200)
+            self.assertEqual(len(self.fed_svc._relay_tasks), 2)
+            r_c3 = await self.client.post(
+                "/api/federation/workbench/chatroom/messages",
+                headers=admin_hdrs,
+                data=json.dumps({"content": f"{self._at('muse-f01')} task 3"}),
+            )
+            self.assertEqual(r_c3.status, 429)
+            self.assertTrue(r_c3.headers.get("Retry-After", "").isdigit())
+
+            # Graceful cleanup via close_all() cancels all in-flight relay tasks with zero residuals
+            await self.fed_svc.close_all()
+            self.assertEqual(len(self.fed_svc._relay_tasks), 0)
+
+            # Hard timeout test: short relay_timeout_sec exits cleanly
+            self.fed_svc._closed = False
+            self.fed_svc.relay_timeout_sec = 0.12
+            ok_sp = self.fed_svc._spawn_external_relay(
+                agent_id="muse-f01",
+                job_id="pull-timeout-test-01",
+                dispatch_mode="pull",
+                relay_bot_handle="coord_bot",
+                user_id=ADMIN_UID,
+                actor_username="adminuser",
+                bound_chat_id=self.FED_CHAT_ID,
+            )
+            self.assertTrue(ok_sp)
+            await asyncio.sleep(0.25)
+            self.assertNotIn("pull-timeout-test-01", self.fed_svc._relay_tasks)
+        finally:
+            await self.fed_svc.close_all()
+            coord_srv.stop()
+            worker_srv.stop()
+
+    async def test_fc6_and_fc7_frontend_chatroom_invariants_and_server_cleanup(self) -> None:
+        """FC6 & FC7: Frontend chatroom XSS/race/debounce/readonly invariants, server.py close_all wiring, demo parity."""
+        wb_tsx = (REPO_ROOT / "webui" / "src" / "components" / "FederationWorkbenchView.tsx").read_text(
+            encoding="utf-8"
+        )
+        srv_py = (REPO_ROOT / "studio" / "server.py").read_text(encoding="utf-8")
+        api_ts = (REPO_ROOT / "webui" / "src" / "api.ts").read_text(encoding="utf-8")
+        mock_ts = (REPO_ROOT / "webui" / "src" / "demo" / "mockApi.ts").read_text(encoding="utf-8")
+
+        # FC6: Frontend invariants
+        self.assertIn("activePaneMode", wb_tsx)
+        self.assertIn("chatroomGenRef", wb_tsx)
+        self.assertIn("CHATROOM_SSE_DEBOUNCE_MS", wb_tsx)
+        self.assertIn("clearTimeout(chatroomSseDebounceRef.current)", wb_tsx)
+        self.assertIn("if (!canEdit || !chatroomData?.bound || chatroomSending) return;", wb_tsx)
+        self.assertIn("<SafeMarkdown content={msg.content || \"\"}", wb_tsx)
+        for forbidden in ("dangerouslySetInnerHTML", "innerHTML", "<script"):
+            self.assertNotIn(forbidden, wb_tsx)
+        self.assertEqual(wb_tsx.count("setInterval("), 1)
+        self.assertEqual(wb_tsx.count("clearInterval("), 1)
+
+        # FC5/FC7: server.py _on_cleanup calls federation_svc.close_all() and registers chatroom routes
+        self.assertIn("await federation_svc.close_all()", srv_py)
+        self.assertIn("/api/federation/workbench/chatroom/messages", srv_py)
+
+        # FC7: API & Demo parity
+        for sym in ("fetchFederationChatroomMessages", "sendFederationChatroomMessage"):
+            self.assertIn(f"export function {sym}", api_ts)
+            self.assertIn(f"export async function {sym}", mock_ts)
+
+    async def test_blocker1_pull_queue_and_federation_lock_symlinks_rejected(self) -> None:
+        """BLOCKER-1: Symlinked pull_queue.lock / .lock / federation.lock rejected 403 with zero TG send & zero queue write."""
+        admin_cookie, admin_csrf = await self._login("AdminUser", ADMIN_PASS)
+        admin_hdrs = self._admin_headers(admin_cookie, admin_csrf)
+
+        r_reg = await self.client.post(
+            "/api/federation/agents",
+            headers=admin_hdrs,
+            data=json.dumps({"agent_id": "muse-f01", "kind": "pull_worker", "display_name": "Muse Node"}),
+        )
+        self.assertEqual(r_reg.status, 200, await r_reg.text())
+
+        self._write_team_config(fed_mirror={"chat_id": self.FED_CHAT_ID, "title": "联邦群"})
+        coord_host, coord_srv, _, worker_srv = self._setup_online_coord_and_worker()
+        assert worker_srv is not None
+        try:
+            pq_dir = self.bus_dir / "federation" / "pull_queue"
+            pq_dir.mkdir(parents=True, exist_ok=True)
+            outside_target = self.tmp / "outside_lock_target.txt"
+            outside_target.write_text("UNTOUCHED_LOCK_CANARY", encoding="utf-8")
+
+            lock_cases = [
+                ("pull_queue.lock", pq_dir / "pull_queue.lock"),
+                (".lock", pq_dir / ".lock"),
+                ("federation.lock", self.bus_dir / "federation" / "federation.lock"),
+            ]
+            for label, lock_path in lock_cases:
+                if lock_path.exists() or lock_path.is_symlink():
+                    lock_path.unlink()
+                os.symlink(outside_target, lock_path)
+                try:
+                    # 1. Chatroom POST mentioning external agent must fail-closed 403 SECURITY_SYMLINK_REJECTED, zero TG send, zero queue write
+                    r_chat = await self.client.post(
+                        "/api/federation/workbench/chatroom/messages",
+                        headers=admin_hdrs,
+                        data=json.dumps({"content": f"{self._at('muse-f01')} should block on {label}"}),
+                    )
+                    self.assertEqual(r_chat.status, 403, f"chatroom POST should return 403 for {label}")
+                    chat_body = await r_chat.json()
+                    self.assertEqual(chat_body.get("code"), "SECURITY_SYMLINK_REJECTED", chat_body)
+                    self.assertEqual(coord_host.sent_calls, [], f"Zero TG send required for {label}")
+                    self.assertEqual(list(pq_dir.glob("*.json")), [], f"Zero pull_queue writes required for {label}")
+                    self.assertEqual(outside_target.read_text(encoding="utf-8"), "UNTOUCHED_LOCK_CANARY")
+                    self.assertEqual(self.fed_svc._relay_reserved, 0)
+
+                    # 2. Workbench direct pull dispatch must also fail-closed 403 SECURITY_SYMLINK_REJECTED
+                    r_wb = await self.client.post(
+                        "/api/federation/workbench/agents/muse-f01/dispatch",
+                        headers=admin_hdrs,
+                        data=json.dumps({"prompt": f"wb dispatch blocked by {label}"}),
+                    )
+                    self.assertEqual(r_wb.status, 403, f"workbench dispatch should return 403 for {label}")
+                    wb_body = await r_wb.json()
+                    self.assertEqual(wb_body.get("code"), "SECURITY_SYMLINK_REJECTED", wb_body)
+                    self.assertEqual(list(pq_dir.glob("*.json")), [], f"Zero pull_queue writes on wb dispatch for {label}")
+                finally:
+                    if lock_path.is_symlink():
+                        lock_path.unlink()
+        finally:
+            await self.fed_svc.close_all()
+            coord_srv.stop()
+            worker_srv.stop()
+
+    async def test_blocker2_env_bound_team_config_and_roster_symlink_and_fifo_rejected(self) -> None:
+        """BLOCKER-2: Env-bound federation mirror rejects symlink/FIFO team_config.json, roster.json & bus_dir (GET & POST)."""
+        admin_cookie, admin_csrf = await self._login("AdminUser", ADMIN_PASS)
+        admin_get = {"Cookie": f"{SESSION_COOKIE_NAME}={admin_cookie}"}
+        admin_hdrs = self._admin_headers(admin_cookie, admin_csrf)
+
+        self._write_team_config(fed_mirror={"chat_id": self.FED_CHAT_ID, "title": "联邦群"})
+        coord_host, coord_srv, _, worker_srv = self._setup_online_coord_and_worker()
+        assert worker_srv is not None
+        canary = "SECRET_CANARY_DO_NOT_LEAK_BLOCKER2"
+        outside_secret = self.tmp / "outside_secret.json"
+        outside_secret.write_text(json.dumps({"bots": {"leak_bot": {"display_name": canary}}}), encoding="utf-8")
+
+        orig_tc = (self.bus_dir / "team_config.json").read_text(encoding="utf-8")
+        orig_roster = (self.bus_dir / "roster.json").read_text(encoding="utf-8")
+
+        try:
+            with mock.patch.dict(
+                os.environ,
+                {"AGY_STUDIO_FEDERATION_MIRROR_CHAT_ID": str(self.FED_CHAT_ID)},
+            ):
+                for fname in ("team_config.json", "roster.json"):
+                    target_path = self.bus_dir / fname
+                    for kind in ("symlink", "fifo"):
+                        if target_path.exists() or target_path.is_symlink():
+                            target_path.unlink()
+                        if kind == "symlink":
+                            os.symlink(outside_secret, target_path)
+                        else:
+                            os.mkfifo(target_path)
+                        try:
+                            t0 = time.monotonic()
+                            r_get = await asyncio.wait_for(
+                                self.client.get("/api/federation/workbench/chatroom/messages", headers=admin_get),
+                                timeout=2.0,
+                            )
+                            self.assertLess(time.monotonic() - t0, 2.0, f"GET blocked on {fname} ({kind})")
+                            self.assertEqual(r_get.status, 403, f"GET must return 403 for {fname} ({kind})")
+                            get_txt = await r_get.text()
+                            self.assertIn("SECURITY_SYMLINK_REJECTED", get_txt)
+                            self.assertNotIn(canary, get_txt)
+
+                            t1 = time.monotonic()
+                            r_post = await asyncio.wait_for(
+                                self.client.post(
+                                    "/api/federation/workbench/chatroom/messages",
+                                    headers=admin_hdrs,
+                                    data=json.dumps({"content": f"blocked {fname} {kind}"}),
+                                ),
+                                timeout=2.0,
+                            )
+                            self.assertLess(time.monotonic() - t1, 2.0, f"POST blocked on {fname} ({kind})")
+                            self.assertEqual(r_post.status, 403, f"POST must return 403 for {fname} ({kind})")
+                            post_txt = await r_post.text()
+                            self.assertIn("SECURITY_SYMLINK_REJECTED", post_txt)
+                            self.assertNotIn(canary, post_txt)
+                            self.assertEqual(coord_host.sent_calls, [], f"Zero TG send for {fname} ({kind})")
+                        finally:
+                            if target_path.exists() or target_path.is_symlink():
+                                target_path.unlink()
+                            # Restore clean regular files before next case
+                            (self.bus_dir / "team_config.json").write_text(orig_tc, encoding="utf-8")
+                            (self.bus_dir / "roster.json").write_text(orig_roster, encoding="utf-8")
+
+                # Also verify symlinked bus_dir itself fails closed 403 on GET & POST under env binding
+                sym_bus = self.tmp / "symlink_bus_dir"
+                os.symlink(self.bus_dir, sym_bus)
+                orig_ds_bus = self.sources.bus_dir
+                self.sources.bus_dir = sym_bus
+                try:
+                    r_g_sym = await asyncio.wait_for(
+                        self.client.get("/api/federation/workbench/chatroom/messages", headers=admin_get),
+                        timeout=2.0,
+                    )
+                    self.assertEqual(r_g_sym.status, 403)
+                    self.assertIn("SECURITY_SYMLINK_REJECTED", await r_g_sym.text())
+
+                    r_p_sym = await asyncio.wait_for(
+                        self.client.post(
+                            "/api/federation/workbench/chatroom/messages",
+                            headers=admin_hdrs,
+                            data=json.dumps({"content": "blocked symlink bus_dir"}),
+                        ),
+                        timeout=2.0,
+                    )
+                    self.assertEqual(r_p_sym.status, 403)
+                    self.assertIn("SECURITY_SYMLINK_REJECTED", await r_p_sym.text())
+                    self.assertEqual(coord_host.sent_calls, [])
+                finally:
+                    self.sources.bus_dir = orig_ds_bus
+                    sym_bus.unlink()
+        finally:
+            await self.fed_svc.close_all()
+            coord_srv.stop()
+            worker_srv.stop()
+
+    async def test_followup_relay_reservation_prevents_burst_race_and_rolls_back(self) -> None:
+        """Follow-up: Atomic relay slot reservation blocks burst race with 429 and rolls back cleanly on failure."""
+        import threading
+
+        admin_cookie, admin_csrf = await self._login("AdminUser", ADMIN_PASS)
+        admin_hdrs = self._admin_headers(admin_cookie, admin_csrf)
+
+        r_reg = await self.client.post(
+            "/api/federation/agents",
+            headers=admin_hdrs,
+            data=json.dumps({"agent_id": "muse-f01", "kind": "pull_worker", "display_name": "Muse Node"}),
+        )
+        self.assertEqual(r_reg.status, 200)
+        self._write_team_config(fed_mirror={"chat_id": self.FED_CHAT_ID, "title": "联邦群"})
+        coord_host, coord_srv, _, worker_srv = self._setup_online_coord_and_worker()
+        assert worker_srv is not None
+        try:
+            self.fed_svc.max_concurrent_relays = 1
+            self.fed_svc.relay_poll_interval_sec = 0.05
+            self.fed_svc.relay_timeout_sec = 5.0
+
+            # Part A: Pause Request 1 mid-IPC after reserving the 1 slot -> concurrent Request 2 must get 429 immediately
+            orig_ipc_fn = coord_srv.tg_group_send_fn
+            ipc_entered = threading.Event()
+            ipc_release = threading.Event()
+
+            def _gated_ipc(req: dict[str, object]) -> tuple[int, dict[str, object]]:
+                ipc_entered.set()
+                ipc_release.wait(timeout=3.0)
+                return orig_ipc_fn(req)
+
+            coord_srv.tg_group_send_fn = _gated_ipc
+            try:
+                t1 = asyncio.create_task(
+                    self.client.post(
+                        "/api/federation/workbench/chatroom/messages",
+                        headers=admin_hdrs,
+                        data=json.dumps({"content": f"{self._at('muse-f01')} burst req 1"}),
+                    )
+                )
+                # Wait until Request 1 has reserved its slot and entered IPC
+                deadline = time.monotonic() + 2.0
+                while not ipc_entered.is_set() and time.monotonic() < deadline:
+                    await asyncio.sleep(0.01)
+                self.assertTrue(ipc_entered.is_set(), "Request 1 did not reach IPC gate")
+                self.assertEqual(self.fed_svc._relay_reserved, 1)
+
+                # Burst Request 2 arrives while Request 1 is still awaiting IPC -> must be rejected 429
+                r2 = await self.client.post(
+                    "/api/federation/workbench/chatroom/messages",
+                    headers=admin_hdrs,
+                    data=json.dumps({"content": f"{self._at('muse-f01')} burst req 2"}),
+                )
+                self.assertEqual(r2.status, 429)
+                d2 = await r2.json()
+                self.assertEqual(d2.get("code"), "relay_capacity_exceeded")
+
+                ipc_release.set()
+                r1 = await t1
+                self.assertEqual(r1.status, 200, await r1.text())
+                self.assertEqual(self.fed_svc._relay_reserved, 0)
+                self.assertEqual(len(self.fed_svc._relay_tasks), 1)
+            finally:
+                ipc_release.set()
+                coord_srv.tg_group_send_fn = orig_ipc_fn
+
+            await self.fed_svc.close_all()
+            self.fed_svc._closed = False
+
+            # Part B: Rollback on IPC error -> _relay_reserved returns to 0 and next valid request succeeds
+            coord_srv.tg_group_send_fn = lambda _req: (502, {"ok": False, "error": "simulated ipc failure"})
+            try:
+                r_fail = await self.client.post(
+                    "/api/federation/workbench/chatroom/messages",
+                    headers=admin_hdrs,
+                    data=json.dumps({"content": f"{self._at('muse-f01')} ipc fail rollback"}),
+                )
+                self.assertEqual(r_fail.status, 502)
+                self.assertEqual(self.fed_svc._relay_reserved, 0)
+                self.assertEqual(len(self.fed_svc._relay_tasks), 0)
+            finally:
+                coord_srv.tg_group_send_fn = orig_ipc_fn
+
+            # Next request after rollback succeeds cleanly (proving zero leaked reservation)
+            r_ok = await self.client.post(
+                "/api/federation/workbench/chatroom/messages",
+                headers=admin_hdrs,
+                data=json.dumps({"content": f"{self._at('muse-f01')} after rollback"}),
+            )
+            self.assertEqual(r_ok.status, 200, await r_ok.text())
+            self.assertEqual(self.fed_svc._relay_reserved, 0)
+            self.assertEqual(len(self.fed_svc._relay_tasks), 1)
+        finally:
+            await self.fed_svc.close_all()
+            coord_srv.stop()
+            worker_srv.stop()
 
 
 if __name__ == "__main__":

@@ -2061,15 +2061,147 @@ def _resolve_studio_mirror_target():
     return cid, h._normalize_thread_id(tm.get("thread_id"))
 
 
+def _read_team_config_no_symlink(bus_dir):
+    """Anti-symlink/FIFO reader for `<BUS_DIR>/team_config.json` (zero creation, fail-closed on symlink/FIFO)."""
+    if not bus_dir:
+        return True, None, ""
+    dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        dir_fd = os.open(str(bus_dir), dir_flags)
+    except FileNotFoundError:
+        return True, None, ""
+    except OSError:
+        return False, None, "SECURITY_SYMLINK_REJECTED: unable to open bus directory"
+    try:
+        try:
+            st = os.lstat("team_config.json", dir_fd=dir_fd)
+        except FileNotFoundError:
+            return True, None, ""
+        except OSError:
+            return False, None, "SECURITY_SYMLINK_REJECTED: unable to inspect team_config.json"
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+            return False, None, "SECURITY_SYMLINK_REJECTED: team_config.json is a symlink or non-regular file"
+        file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        try:
+            fd = os.open("team_config.json", file_flags, dir_fd=dir_fd)
+        except FileNotFoundError:
+            return True, None, ""
+        except OSError:
+            return False, None, "SECURITY_SYMLINK_REJECTED: refused to open team_config.json"
+        try:
+            fst = os.fstat(fd)
+            if not stat.S_ISREG(fst.st_mode):
+                return False, None, "SECURITY_SYMLINK_REJECTED: team_config.json is not a regular file"
+            chunks = []
+            remaining = 1024 * 1024
+            while remaining > 0:
+                chunk = os.read(fd, min(65536, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            raw = b"".join(chunks)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(dir_fd)
+    try:
+        doc = json.loads(raw.decode("utf-8", errors="replace"))
+    except Exception:
+        return True, None, ""
+    return True, doc if isinstance(doc, dict) else None, ""
+
+
+def _resolve_studio_federation_mirror_target():
+    """Resolve standalone Federation Chatroom TG mirror `(chat_id, thread_id)` (strictly zero fallback to `team_mirror`)."""
+    h = _h()
+    bb = _mod("bot_bus", _default_bot_bus, host=h)
+    raw_env = os.environ.get("AGY_STUDIO_FEDERATION_MIRROR_CHAT_ID", "").strip()
+    if raw_env:
+        if raw_env.lower() in ("0", "off", "false", "none", "disabled"):
+            return 0, None
+        try:
+            env_cid = int(raw_env)
+        except ValueError:
+            return 0, None
+        if env_cid >= 0:
+            return 0, None
+        raw_tid = os.environ.get("AGY_STUDIO_FEDERATION_MIRROR_THREAD_ID", "").strip()
+        return env_cid, h._normalize_thread_id(raw_tid) if raw_tid else None
+
+    ok_cfg, cfg_doc, err_cfg = _read_team_config_no_symlink(_bb_bus_dir(bb))
+    if not ok_cfg:
+        raise PermissionError(err_cfg)
+    if not isinstance(cfg_doc, dict):
+        return 0, None
+    fm = cfg_doc.get("federation_mirror")
+    if not isinstance(fm, dict) or fm.get("enabled") is False:
+        return 0, None
+    raw_cid = fm.get("chat_id")
+    if isinstance(raw_cid, bool) or raw_cid is None:
+        return 0, None
+    try:
+        cid = int(raw_cid)
+    except (TypeError, ValueError):
+        return 0, None
+    if cid >= 0:
+        return 0, None
+    return cid, h._normalize_thread_id(fm.get("thread_id"))
+
+
 def _studio_ipc_tg_group_send(req):
-    """Mirror an authenticated Web admin message into the whitelisted TG group & enqueue real group turn."""
+    """Mirror an authenticated Web admin message (or federation relay reply) into the whitelisted TG group."""
     h = _h()
     bb = _mod("bot_bus", _default_bot_bus, host=h)
     sipc = _mod("studio_ipc", _default_studio_ipc, host=h)
-    resolve_mirror_fn = getattr(h, "_resolve_studio_mirror_target", _resolve_studio_mirror_target)
-    mirror_chat_id, mirror_thread_id = resolve_mirror_fn()
-    if not mirror_chat_id or int(mirror_chat_id) >= 0:
-        return 400, {"ok": False, "error": "服务端未配置有效的 TG 镜像工作群"}
+
+    raw_channel = req.get("channel", "team_mirror")
+    if raw_channel is None:
+        channel = "team_mirror"
+    elif type(raw_channel) is not str or raw_channel not in ("team_mirror", "federation_mirror"):
+        return 400, {"ok": False, "error": "channel 必须为 team_mirror 或 federation_mirror"}
+    else:
+        channel = raw_channel
+
+    raw_dispatch_turn = req.get("dispatch_turn", True)
+    if not isinstance(raw_dispatch_turn, bool):
+        return 400, {"ok": False, "error": "dispatch_turn 必须为严格布尔值"}
+    dispatch_turn = raw_dispatch_turn
+
+    raw_mirror_flag = req.get("mirror_human_to_tg", True)
+    if not isinstance(raw_mirror_flag, bool):
+        return 400, {"ok": False, "error": "mirror_human_to_tg 必须为布尔值"}
+    mirror_to_tg = raw_mirror_flag
+
+    raw_relay_sender = req.get("relay_sender")
+    if raw_relay_sender is None or raw_relay_sender == "":
+        relay_sender = ""
+    else:
+        if not sipc.is_valid_relay_sender(raw_relay_sender):
+            return 400, {"ok": False, "error": "relay_sender 格式非法"}
+        relay_sender = raw_relay_sender
+
+    if relay_sender and dispatch_turn is True:
+        return 400, {"ok": False, "error": "relay_sender 非空时必须设置 dispatch_turn=false"}
+    if relay_sender and mirror_to_tg is not True:
+        return 400, {"ok": False, "error": "relay_sender 非空时必须设置 mirror_human_to_tg=true"}
+
+    if channel == "federation_mirror":
+        resolve_fed_fn = getattr(
+            h, "_resolve_studio_federation_mirror_target", _resolve_studio_federation_mirror_target
+        )
+        try:
+            mirror_chat_id, mirror_thread_id = resolve_fed_fn()
+        except PermissionError as exc:
+            return 403, {"ok": False, "error": str(exc)}
+        if not mirror_chat_id or int(mirror_chat_id) >= 0:
+            return 400, {"ok": False, "error": "服务端未配置有效的联邦聊天室 TG 镜像群"}
+    else:
+        resolve_mirror_fn = getattr(h, "_resolve_studio_mirror_target", _resolve_studio_mirror_target)
+        mirror_chat_id, mirror_thread_id = resolve_mirror_fn()
+        if not mirror_chat_id or int(mirror_chat_id) >= 0:
+            return 400, {"ok": False, "error": "服务端未配置有效的 TG 镜像工作群"}
+
     if int(mirror_chat_id) not in h.ALLOWED or not h._is_authorized(int(mirror_chat_id)):
         return 403, {"ok": False, "error": "TG 镜像工作群不在当前 Bot 的白名单内"}
 
@@ -2100,12 +2232,34 @@ def _studio_ipc_tg_group_send(req):
         if override_project is None:
             return 400, {"ok": False, "error": "项目不在服务端白名单内"}
 
-    mirror_to_tg = bool(req.get("mirror_human_to_tg", True))
     sent_mid = int(req.get("origin_msg_id") or 0)
     recorded_entry = None
     chain_id = ""
 
-    if mirror_to_tg:
+    if relay_sender:
+        sep = "\n" if "\n" in safe_content else " "
+        tg_text = f"🤖 [{relay_sender}]{sep}{safe_content}"
+        sent_mid_raw = h.send(
+            int(mirror_chat_id),
+            tg_text,
+            thread_id=mirror_thread_id,
+            disable_web_page_preview=True,
+        )
+        sent_mid = int(sent_mid_raw or 0)
+        if sent_mid <= 0:
+            return 502, {"ok": False, "error": "向 Telegram 联邦聊天室回贴外部回复失败"}
+        recorded_entry = bb.record_group_message(
+            int(mirror_chat_id),
+            msg_id=sent_mid,
+            thread_id=mirror_thread_id,
+            sender_handle=relay_sender,
+            sender_role="worker",
+            is_bot=True,
+            text=safe_content,
+            source="federation",
+        )
+        # Relay reply mode MUST NEVER call bb.mark_human_group_activity() or enqueue __CHAT_TURN__
+    elif mirror_to_tg:
         sep = "\n" if "\n" in safe_content else " "
         tg_text = f"💬 [Web · {actor}]{sep}{safe_content}"
         sent_mid_raw = h.send(
@@ -2133,37 +2287,40 @@ def _studio_ipc_tg_group_send(req):
             msg_id=sent_mid,
         ) or ""
 
-    skey = h.scope_key_for(int(mirror_chat_id), mirror_thread_id)
-    item_payload = (
-        "__CHAT_TURN__",
-        {
-            "prompt": safe_content,
-            "origin_msg_id": int(sent_mid or 0),
-            "mention_hop": 0,
-            "chain_id": str(chain_id or ""),
-            "user_role": "admin",
-            "user_id": uid,
-            "override_project": override_project,
-            "override_workdir": override_workdir,
-        },
-    )
     interrupted_current = False
-    if interrupt_current:
-        new_qid, marked_dispatched = h.job_q.put_front_and_mark_dispatched_preempt(
-            (int(mirror_chat_id), mirror_thread_id, skey, item_payload),
-            skey,
+    queued_turn = False
+    if dispatch_turn and not relay_sender:
+        skey = h.scope_key_for(int(mirror_chat_id), mirror_thread_id)
+        item_payload = (
+            "__CHAT_TURN__",
+            {
+                "prompt": safe_content,
+                "origin_msg_id": int(sent_mid or 0),
+                "mention_hop": 0,
+                "chain_id": str(chain_id or ""),
+                "user_role": "admin",
+                "user_id": uid,
+                "override_project": override_project,
+                "override_workdir": override_workdir,
+            },
         )
-        preempted_active, _other_scope_busy, to_kill, _preempted_gen = h._preempt_active_turn_for_scope(
-            skey,
-            exclude_qid=new_qid,
-        )
-        if to_kill is not None:
-            h.close_session_async(to_kill, force=True)
-        interrupted_current = bool(preempted_active or marked_dispatched > 0)
-    elif priority == "urgent":
-        h.job_q.put_front((int(mirror_chat_id), mirror_thread_id, skey, item_payload))
-    else:
-        h.job_q.put((int(mirror_chat_id), mirror_thread_id, skey, item_payload))
+        if interrupt_current:
+            new_qid, marked_dispatched = h.job_q.put_front_and_mark_dispatched_preempt(
+                (int(mirror_chat_id), mirror_thread_id, skey, item_payload),
+                skey,
+            )
+            preempted_active, _other_scope_busy, to_kill, _preempted_gen = h._preempt_active_turn_for_scope(
+                skey,
+                exclude_qid=new_qid,
+            )
+            if to_kill is not None:
+                h.close_session_async(to_kill, force=True)
+            interrupted_current = bool(preempted_active or marked_dispatched > 0)
+        elif priority == "urgent":
+            h.job_q.put_front((int(mirror_chat_id), mirror_thread_id, skey, item_payload))
+        else:
+            h.job_q.put((int(mirror_chat_id), mirror_thread_id, skey, item_payload))
+        queued_turn = True
 
     entry_payload = None
     seq_val = 0
@@ -2172,17 +2329,22 @@ def _studio_ipc_tg_group_send(req):
         entry_payload = {
             "seq": seq_val,
             "ts": float(recorded_entry.get("ts") or time.time()),
-            "sender_handle": str(recorded_entry.get("sender_handle") or actor),
-            "sender_role": str(recorded_entry.get("sender_role") or "human"),
-            "is_bot": False,
+            "sender_handle": str(
+                recorded_entry.get("sender_handle") or (relay_sender if relay_sender else actor)
+            ),
+            "sender_role": str(
+                recorded_entry.get("sender_role") or ("worker" if relay_sender else "human")
+            ),
+            "is_bot": bool(recorded_entry.get("is_bot", bool(relay_sender))),
             "full_text": str(recorded_entry.get("full_text") or safe_content),
             "text_excerpt": str(recorded_entry.get("text_excerpt") or ""),
             "truncated": bool(recorded_entry.get("truncated", False)),
-            "source": str(recorded_entry.get("source") or "web"),
+            "source": "federation" if relay_sender else str(recorded_entry.get("source") or "web"),
         }
     return 202, {
         "ok": True,
-        "queued": True,
+        "queued": queued_turn,
+        "channel": channel,
         "bot": h._current_bot_handle(),
         "mirrored_to_tg": bool(mirror_to_tg),
         "origin_msg_id": int(sent_mid or 0),

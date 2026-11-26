@@ -3,6 +3,7 @@ import {
   AlertCircle,
   Archive,
   Bell,
+  Bot,
   Check,
   CheckCircle2,
   ChevronDown,
@@ -35,19 +36,25 @@ import {
   Tag,
   Terminal,
   Trash2,
+  Users,
   X,
 } from "lucide-react";
 import {
   StudioApiError,
   cancelFederationWorkbenchJob,
   dispatchFederationWorkbenchJob,
+  fetchFederationChatroomMessages,
   fetchFederationWorkbench,
   fetchFederationWorkbenchState,
   fetchFederationWorkbenchTimeline,
+  sendFederationChatroomMessage,
   updateFederationWorkbenchState,
 } from "../api";
 import { SafeMarkdown } from "./SafeMarkdown";
 import type {
+  FederationChatroomMessageItem,
+  FederationChatroomMessagesResponse,
+  FederationChatroomParticipant,
   FederationHubConfig,
   FederationLeaderEventSummary,
   FederationPullInboxItem,
@@ -72,9 +79,11 @@ interface FederationWorkbenchViewProps {
 }
 
 type MobilePane = "projects" | "chat" | "telemetry";
+type ActivePaneMode = "chatroom" | "conversation";
 
 const POLL_ACTIVE_INTERVAL_MS = 4000;
 const POLL_IDLE_INTERVAL_MS = 30000;
+const CHATROOM_SSE_DEBOUNCE_MS = 300;
 
 const DEFAULT_PROJECT_ID = "default";
 const EXTERNAL_HISTORY_PROJECT_ID = "__external_history__";
@@ -547,6 +556,15 @@ export function FederationWorkbenchView({
   const [selectedAgentId, setSelectedAgentId] = useState<string>("");
   const [selectedProjectId, setSelectedProjectId] = useState<string>(DEFAULT_PROJECT_ID);
   const [selectedConversationId, setSelectedConversationId] = useState<string>("");
+  const [activePaneMode, setActivePaneMode] = useState<ActivePaneMode>("conversation");
+
+  // Standalone Federation Chatroom (TG Group Bidirectional Mirror) State
+  const [chatroomData, setChatroomData] = useState<FederationChatroomMessagesResponse | null>(null);
+  const [chatroomLoading, setChatroomLoading] = useState(false);
+  const [chatroomSending, setChatroomSending] = useState(false);
+  const [chatroomInput, setChatroomInput] = useState("");
+  const [chatroomIncludeContext, setChatroomIncludeContext] = useState(true);
+  const [chatroomReadSeq, setChatroomReadSeq] = useState<number | null>(null);
 
   const [timeline, setTimeline] = useState<FederationTimelineJobItem[]>([]);
   const [pullInbox, setPullInbox] = useState<FederationPullInboxItem[]>([]);
@@ -589,6 +607,10 @@ export function FederationWorkbenchView({
   const mountedRef = useRef(true);
   const reqGenRef = useRef(0);
   const listGenRef = useRef(0);
+  const chatroomGenRef = useRef(0);
+  const chatroomSseDebounceRef = useRef<number | null>(null);
+  const activePaneModeRef = useRef<ActivePaneMode>(activePaneMode);
+  activePaneModeRef.current = activePaneMode;
   const selectedAgentIdRef = useRef("");
   selectedAgentIdRef.current = selectedAgentId;
   const selectedConversationIdRef = useRef("");
@@ -603,6 +625,7 @@ export function FederationWorkbenchView({
 
   const isComposingRef = useRef(false);
   const timelineEndRef = useRef<HTMLDivElement | null>(null);
+  const chatroomEndRef = useRef<HTMLDivElement | null>(null);
 
   const canEdit = session.role === "admin" && serverCanEdit;
 
@@ -615,6 +638,10 @@ export function FederationWorkbenchView({
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
+      if (chatroomSseDebounceRef.current !== null) {
+        window.clearTimeout(chatroomSseDebounceRef.current);
+        chatroomSseDebounceRef.current = null;
+      }
     };
   }, []);
 
@@ -884,6 +911,40 @@ export function FederationWorkbenchView({
     [handleApiError],
   );
 
+  const loadChatroom = useCallback(
+    async (silent = false) => {
+      const gen = ++chatroomGenRef.current;
+      if (!silent) {
+        setChatroomLoading(true);
+      }
+      try {
+        const res = await fetchFederationChatroomMessages({ limit: 120 });
+        if (!mountedRef.current || gen !== chatroomGenRef.current) return;
+        setChatroomData(res);
+        setServerCanEdit(Boolean(res.can_edit));
+        setChatroomReadSeq((prev) => {
+          if (activePaneModeRef.current === "chatroom") {
+            return res.last_seq;
+          }
+          if (prev === null) {
+            return res.last_seq;
+          }
+          return prev;
+        });
+      } catch (err) {
+        if (!mountedRef.current || gen !== chatroomGenRef.current) return;
+        if (!silent || activePaneModeRef.current === "chatroom") {
+          handleApiError(err, "加载联邦聊天室失败");
+        }
+      } finally {
+        if (mountedRef.current && gen === chatroomGenRef.current) {
+          setChatroomLoading(false);
+        }
+      }
+    },
+    [handleApiError],
+  );
+
   // Initial & SSE-triggered refresh
   useEffect(() => {
     void loadWorkbenchState(federationEventVer === 0);
@@ -892,6 +953,29 @@ export function FederationWorkbenchView({
   useEffect(() => {
     void loadWorkbench(federationEventVer > 0 || jobsEventVer > 0);
   }, [loadWorkbench, federationEventVer, jobsEventVer]);
+
+  // Initial chatroom load
+  useEffect(() => {
+    void loadChatroom(false);
+  }, [loadChatroom]);
+
+  // Debounced SSE refresh for Federation Chatroom (300ms, strictly cleaned up on unmount/re-trigger)
+  useEffect(() => {
+    if (federationEventVer === 0) return;
+    if (chatroomSseDebounceRef.current !== null) {
+      window.clearTimeout(chatroomSseDebounceRef.current);
+    }
+    chatroomSseDebounceRef.current = window.setTimeout(() => {
+      chatroomSseDebounceRef.current = null;
+      void loadChatroom(true);
+    }, CHATROOM_SSE_DEBOUNCE_MS);
+    return () => {
+      if (chatroomSseDebounceRef.current !== null) {
+        window.clearTimeout(chatroomSseDebounceRef.current);
+        chatroomSseDebounceRef.current = null;
+      }
+    };
+  }, [federationEventVer, loadChatroom]);
 
   useEffect(() => {
     if (!selectedAgentId) {
@@ -929,6 +1013,7 @@ export function FederationWorkbenchView({
     const intervalMs = anyActiveInRoster ? POLL_ACTIVE_INTERVAL_MS : POLL_IDLE_INTERVAL_MS;
     const timer = window.setInterval(() => {
       void loadWorkbench(true);
+      void loadChatroom(true);
       if (anyActiveInRoster && selectedAgentId) {
         void loadTimeline(selectedAgentId, true);
       }
@@ -936,7 +1021,7 @@ export function FederationWorkbenchView({
     return () => {
       window.clearInterval(timer);
     };
-  }, [anyActiveInRoster, selectedAgentId, loadWorkbench, loadTimeline]);
+  }, [anyActiveInRoster, selectedAgentId, loadWorkbench, loadTimeline, loadChatroom]);
 
   // ------------------------------------------------------------------ Derived Tree Data (Projects -> Conversations)
   const pinnedSet = useMemo(() => new Set(wbState.pinnedConversationIds), [wbState.pinnedConversationIds]);
@@ -1186,10 +1271,86 @@ export function FederationWorkbenchView({
   }, [canEdit, selectedConversationId, isExternalHistoryView, visibleMessages, updateStateAndSync]);
 
   // ------------------------------------------------------------------ Actions
-  const handleSelectAgent = (agentId: string) => {
-    if (agentId === selectedAgentId) return;
+  const chatroomMessages = useMemo(
+    () => chatroomData?.messages || [],
+    [chatroomData?.messages],
+  );
+  const chatroomParticipants = useMemo(
+    () => chatroomData?.participants || [],
+    [chatroomData?.participants],
+  );
+  const chatroomUnreadCount = useMemo(() => {
+    if (activePaneMode === "chatroom" || !chatroomData?.bound || chatroomReadSeq === null) {
+      return 0;
+    }
+    return chatroomMessages.filter((m) => m.seq > chatroomReadSeq).length;
+  }, [activePaneMode, chatroomData?.bound, chatroomReadSeq, chatroomMessages]);
+
+  const handleOpenChatroom = () => {
     setError(null);
     setNotice(null);
+    setActivePaneMode("chatroom");
+    setMobilePane("chat");
+    if (chatroomData) {
+      setChatroomReadSeq(chatroomData.last_seq);
+    }
+    void loadChatroom(true);
+  };
+
+  const handleInsertChatroomMention = (participant: FederationChatroomParticipant) => {
+    if (!canEdit || !chatroomData?.bound || !participant.can_mention) return;
+    const tag = `@${participant.handle} `;
+    setChatroomInput((prev) => {
+      if (!prev) return tag;
+      return prev.endsWith(" ") || prev.endsWith("\n") ? `${prev}${tag}` : `${prev} ${tag}`;
+    });
+  };
+
+  const handleSendChatroomMessage = async () => {
+    if (!canEdit || !chatroomData?.bound || chatroomSending) return;
+    const trimmed = chatroomInput.trim();
+    if (!trimmed) return;
+    setChatroomSending(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await sendFederationChatroomMessage({
+        content: trimmed,
+        include_context: chatroomIncludeContext,
+      });
+      if (!mountedRef.current) return;
+      setChatroomInput("");
+      const routedParts: string[] = [];
+      if (res.routed_local.length > 0) {
+        routedParts.push(`本地: ${res.routed_local.map((h) => `@${h}`).join(", ")}`);
+      }
+      if (res.routed_external.length > 0) {
+        routedParts.push(`外部联邦: ${res.routed_external.map((h) => `@${h}`).join(", ")}`);
+      }
+      setNotice(
+        routedParts.length > 0
+          ? `已同步至联邦聊天室 TG 群（${routedParts.join(" · ")}）`
+          : "已同步至联邦聊天室 TG 群",
+      );
+      await loadChatroom(true);
+      window.setTimeout(() => {
+        chatroomEndRef.current?.scrollIntoView({ behavior: "smooth" });
+      }, 60);
+    } catch (err) {
+      if (!mountedRef.current) return;
+      handleApiError(err, "发送联邦聊天室消息失败");
+    } finally {
+      if (mountedRef.current) {
+        setChatroomSending(false);
+      }
+    }
+  };
+
+  const handleSelectAgent = (agentId: string) => {
+    if (agentId === selectedAgentId && activePaneMode === "conversation") return;
+    setError(null);
+    setNotice(null);
+    setActivePaneMode("conversation");
     setSelectedAgentId(agentId);
     // Keep conversation if it belongs to the new agent, else switch to draft new conversation
     const existingForNew = wbState.conversations.find(
@@ -1215,6 +1376,7 @@ export function FederationWorkbenchView({
   const handleSelectConversation = (convId: string, projectId: string) => {
     setError(null);
     setNotice(null);
+    setActivePaneMode("conversation");
     setSelectedConversationId(convId);
     setSelectedProjectId(projectId);
     setMobilePane("chat");
@@ -1250,6 +1412,7 @@ export function FederationWorkbenchView({
           : DEFAULT_PROJECT_ID;
     setError(null);
     setNotice(null);
+    setActivePaneMode("conversation");
     setSelectedProjectId(targetProj);
     setSelectedConversationId("");
     setMobilePane("chat");
@@ -1737,14 +1900,15 @@ export function FederationWorkbenchView({
             onClick={() => {
               void loadWorkbench(false);
               void loadWorkbenchState(false);
+              void loadChatroom(false);
               if (selectedAgentId) void loadTimeline(selectedAgentId, false);
             }}
-            disabled={loadingList || loadingTimeline}
-            title="刷新节点状态与时间线"
+            disabled={loadingList || loadingTimeline || chatroomLoading}
+            title="刷新节点状态、联邦聊天室与时间线"
             className="inline-flex items-center gap-1 h-7 rounded-md border border-slate-700 bg-slate-900 hover:bg-slate-800 px-2 text-xs text-slate-200 cursor-pointer disabled:opacity-50"
           >
             <RefreshCw
-              className={`w-3.5 h-3.5 ${loadingList || loadingTimeline ? "animate-spin" : ""}`}
+              className={`w-3.5 h-3.5 ${loadingList || loadingTimeline || chatroomLoading ? "animate-spin" : ""}`}
             />
             <span className="hidden sm:inline">刷新</span>
           </button>
@@ -1778,7 +1942,7 @@ export function FederationWorkbenchView({
 
       {/* Main 3-Pane Body */}
       <div className="flex-1 min-h-0 flex overflow-hidden">
-        {/* Left Collapsible Sidebar: Projects -> Conversations Tree */}
+        {/* Left Collapsible Sidebar: Pinned Federation Chatroom + Projects -> Conversations Tree */}
         <aside
           className={`${
             mobilePane === "projects"
@@ -1788,6 +1952,63 @@ export function FederationWorkbenchView({
                 : "hidden"
           } shrink-0 flex-col border-r border-slate-800/90 bg-slate-900/45 min-h-0`}
         >
+          {/* Top Pinned Entry: Standalone Federation Chatroom (Symmetrical to Workspace Lobby) */}
+          <div className="shrink-0 p-2 border-b border-slate-800/80">
+            <button
+              type="button"
+              onClick={handleOpenChatroom}
+              className={`w-full rounded-xl border px-2.5 py-2 text-left transition-colors cursor-pointer flex items-center justify-between gap-2 ${
+                activePaneMode === "chatroom"
+                  ? "bg-sky-500/15 border-sky-500/45 text-sky-100 shadow-xs"
+                  : "bg-slate-950/65 border-slate-800/90 text-slate-200 hover:bg-slate-800/60"
+              }`}
+            >
+              <div className="flex items-center gap-2 min-w-0">
+                <span
+                  className={`h-7 w-7 rounded-lg flex items-center justify-center shrink-0 border ${
+                    activePaneMode === "chatroom"
+                      ? "bg-sky-500/20 border-sky-400/40 text-sky-300"
+                      : "bg-slate-900 border-slate-700/80 text-indigo-300"
+                  }`}
+                >
+                  <Users className="w-3.5 h-3.5" />
+                </span>
+                <div className="min-w-0">
+                  <div className="text-xs font-semibold truncate">
+                    {chatroomData?.title || "联邦聊天室"}
+                  </div>
+                  <div className="flex items-center gap-1.5 text-[10px] text-slate-400">
+                    <span
+                      className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                        chatroomData?.bound
+                          ? chatroomData.mirror_status === "connected"
+                            ? "bg-emerald-400"
+                            : "bg-amber-400"
+                          : "bg-slate-500"
+                      }`}
+                    />
+                    <span className="truncate">
+                      {chatroomData?.bound
+                        ? chatroomData.mirror_status === "connected"
+                          ? "TG 群双向镜像"
+                          : "总指挥离线"
+                        : "未绑定 TG 群"}
+                    </span>
+                  </div>
+                </div>
+              </div>
+              {chatroomUnreadCount > 0 ? (
+                <span className="px-1.5 py-0.5 rounded-full bg-sky-500 text-white font-mono text-[10px] font-semibold shrink-0">
+                  {chatroomUnreadCount > 99 ? "99+" : chatroomUnreadCount}
+                </span>
+              ) : (
+                <span className="text-[10px] font-mono text-slate-500 shrink-0">
+                  {chatroomMessages.length > 0 ? chatroomMessages.length : ""}
+                </span>
+              )}
+            </button>
+          </div>
+
           {/* Sidebar Header */}
           <div className="shrink-0 px-3 py-2 border-b border-slate-800/80 flex items-center justify-between gap-2 relative">
             <div className="flex items-center gap-1.5 min-w-0">
@@ -2057,7 +2278,9 @@ export function FederationWorkbenchView({
                           </div>
                         ) : (
                           shownConvs.map((conv) => {
-                            const isSelected = conv.id === selectedConversationId;
+                            const isSelected =
+                              activePaneMode === "conversation" &&
+                              conv.id === selectedConversationId;
                             const convMenuOpen = openConvMenuId === conv.id;
                             const isExtItem = conv.id === EXTERNAL_HISTORY_CONV_ID;
                             return (
@@ -2234,12 +2457,293 @@ export function FederationWorkbenchView({
           </div>
         </aside>
 
-        {/* Center Pane: Bubble Multi-Turn Conversation Stage + Modern Rounded Composer */}
+        {/* Center Pane: Standalone Federation Chatroom OR Bubble Multi-Turn Conversation Stage */}
         <section
           className={`${
             mobilePane === "chat" ? "flex" : "hidden"
           } md:flex flex-1 min-w-0 min-h-0 flex-col bg-slate-950`}
         >
+          {activePaneMode === "chatroom" ? (
+            <>
+              {/* Federation Chatroom Sub-Header */}
+              <div className="shrink-0 px-4 py-2 border-b border-slate-800/80 bg-slate-900/40 flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2 min-w-0">
+                  <Users className="w-4 h-4 text-sky-400 shrink-0" />
+                  <span className="text-xs font-semibold text-slate-100 truncate">
+                    {chatroomData?.title || "联邦聊天室"}
+                  </span>
+                  <span
+                    className={`px-1.5 py-0.5 rounded border text-[10px] font-medium shrink-0 ${
+                      chatroomData?.bound
+                        ? chatroomData.mirror_status === "connected"
+                          ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/30"
+                          : "bg-amber-500/15 text-amber-300 border-amber-500/30"
+                        : "bg-slate-800 text-slate-400 border-slate-700"
+                    }`}
+                  >
+                    {chatroomData?.bound
+                      ? chatroomData.mirror_status === "connected"
+                        ? "TG 群双向实时镜像"
+                        : "总指挥 IPC 离线"
+                      : "未绑定群聊"}
+                  </span>
+                </div>
+                <div className="flex items-center gap-2 text-[11px] text-slate-400 shrink-0">
+                  <span className="font-mono">{chatroomMessages.length} 条消息</span>
+                  <span className="hidden sm:inline">·</span>
+                  <span className="hidden sm:inline">{chatroomParticipants.length} 位成员</span>
+                </div>
+              </div>
+
+              {/* Clickable @handle Participant Pills */}
+              {chatroomParticipants.length > 0 && (
+                <div className="shrink-0 px-4 py-1.5 border-b border-slate-800/60 bg-slate-900/20 flex items-center gap-1.5 overflow-x-auto">
+                  <span className="text-[10px] text-slate-500 shrink-0">点击 @ 路由：</span>
+                  {chatroomParticipants.map((p) => {
+                    const isExt = p.kind === "external_agent";
+                    return (
+                      <button
+                        key={`${p.kind}:${p.handle}`}
+                        type="button"
+                        disabled={!canEdit || !chatroomData?.bound || !p.can_mention}
+                        onClick={() => handleInsertChatroomMention(p)}
+                        title={`${p.display_name} (${isExt ? "外部联邦节点" : p.role === "coordinator" ? "本机总指挥" : "本机 Bot"} · ${p.runtime_status})`}
+                        className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full border text-[11px] shrink-0 transition-colors ${
+                          isExt
+                            ? "border-violet-500/35 bg-violet-500/10 text-violet-200 hover:bg-violet-500/20"
+                            : "border-sky-500/35 bg-sky-500/10 text-sky-200 hover:bg-sky-500/20"
+                        } disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer`}
+                      >
+                        <span
+                          className={`w-1.5 h-1.5 rounded-full ${
+                            p.online ? "bg-emerald-400" : "bg-slate-500"
+                          }`}
+                        />
+                        <span className="font-mono">@{p.handle}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+
+              {/* Readonly / Error / Notice Banners */}
+              <div className="shrink-0 px-4 pt-2 space-y-1.5">
+                {!canEdit && (
+                  <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-1.5 text-xs text-amber-200 flex items-center gap-2">
+                    <ShieldAlert className="w-4 h-4 shrink-0" />
+                    当前账号为只读权限（readonly），仅可查看脱敏后的联邦聊天室消息，发言功能已禁用。
+                  </div>
+                )}
+                {error && (
+                  <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 py-1.5 text-xs text-rose-200 flex items-center justify-between gap-2">
+                    <span className="flex items-center gap-1.5">
+                      <AlertCircle className="w-4 h-4 shrink-0" />
+                      {error}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setError(null)}
+                      className="text-rose-300 hover:text-rose-100 cursor-pointer"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                )}
+                {notice && (
+                  <div className="rounded-lg border border-emerald-500/35 bg-emerald-500/10 px-3 py-1.5 text-xs text-emerald-200 flex items-center justify-between gap-2">
+                    <span className="flex items-center gap-1.5">
+                      <CheckCircle2 className="w-4 h-4 shrink-0" />
+                      {notice}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setNotice(null)}
+                      className="text-emerald-300 hover:text-emerald-100 cursor-pointer"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {/* Chatroom Message Stream */}
+              <div className="flex-1 min-h-0 overflow-y-auto px-4 py-4 space-y-3">
+                {chatroomLoading && !chatroomData ? (
+                  <div className="py-12 text-center text-xs text-slate-500">加载联邦聊天室记录中…</div>
+                ) : !chatroomData?.bound ? (
+                  <div className="h-full flex flex-col items-center justify-center text-center p-6 space-y-3">
+                    <div className="h-11 w-11 rounded-2xl border border-slate-700 bg-slate-900 flex items-center justify-center text-slate-400">
+                      <Users className="w-5 h-5" />
+                    </div>
+                    <div className="space-y-1.5 max-w-md">
+                      <div className="text-sm font-semibold text-slate-100">
+                        尚未绑定独立「联邦聊天室」Telegram 群
+                      </div>
+                      <p className="text-xs text-slate-400 leading-relaxed">
+                        为保证与主团队群硬隔离，联邦聊天室仅读取独立绑定配置（不会回退到主团队群）。请在服务端配置环境变量{" "}
+                        <code className="px-1 py-0.5 rounded bg-slate-800 text-sky-300 font-mono text-[11px]">
+                          AGY_STUDIO_FEDERATION_MIRROR_CHAT_ID
+                        </code>{" "}
+                        或在{" "}
+                        <code className="px-1 py-0.5 rounded bg-slate-800 text-sky-300 font-mono text-[11px]">
+                          team_config.json
+                        </code>{" "}
+                        中添加{" "}
+                        <code className="px-1 py-0.5 rounded bg-slate-800 text-sky-300 font-mono text-[11px]">
+                          federation_mirror
+                        </code>{" "}
+                        字段。
+                      </p>
+                    </div>
+                  </div>
+                ) : chatroomMessages.length === 0 ? (
+                  <div className="h-full flex flex-col items-center justify-center text-center p-6 space-y-2.5">
+                    <div className="h-10 w-10 rounded-2xl border border-sky-500/30 bg-sky-500/10 flex items-center justify-center text-sky-400">
+                      <MessageSquare className="w-5 h-5" />
+                    </div>
+                    <div className="text-sm font-semibold text-slate-100">联邦聊天室暂无历史消息</div>
+                    <p className="text-xs text-slate-400 max-w-md">
+                      直接发送消息将由本机总指挥接单并同步至 Telegram 联邦群；使用{" "}
+                      <code className="font-mono text-violet-300">@外部节点</code>{" "}
+                      将仅镜像人类消息并直派外部节点、自动脱敏回贴最终结果。
+                    </p>
+                  </div>
+                ) : (
+                  chatroomMessages.map((msg: FederationChatroomMessageItem) => {
+                    const isHuman = msg.sender_kind === "human" || msg.sender_type === "human";
+                    const isExternal = msg.sender_kind === "external_agent";
+                    return (
+                      <div
+                        key={`${msg.msg_id}-${msg.seq}`}
+                        className={`flex ${isHuman ? "justify-end" : "justify-start"}`}
+                      >
+                        <div
+                          className={`max-w-[92%] md:max-w-[82%] rounded-2xl px-3.5 py-2.5 border space-y-1.5 ${
+                            isHuman
+                              ? "bg-sky-600/20 border-sky-500/35 text-slate-100"
+                              : isExternal
+                                ? "bg-violet-950/35 border-violet-500/35 text-slate-100"
+                                : "bg-slate-900/85 border-slate-800/90 text-slate-100"
+                          }`}
+                        >
+                          <div
+                            className={`flex flex-wrap items-center gap-1.5 text-[10px] ${
+                              isHuman ? "justify-end" : "justify-start"
+                            }`}
+                          >
+                            {!isHuman && (
+                              <Bot
+                                className={`w-3 h-3 shrink-0 ${
+                                  isExternal ? "text-violet-300" : "text-emerald-300"
+                                }`}
+                              />
+                            )}
+                            <span className="font-semibold text-slate-200">{msg.sender}</span>
+                            {isHuman ? (
+                              <span className="px-1.5 py-0.2 rounded border border-sky-500/35 bg-sky-500/15 text-sky-200">
+                                {msg.source === "web" ? "主人 · Web" : "主人 · TG"}
+                              </span>
+                            ) : isExternal ? (
+                              <span className="px-1.5 py-0.2 rounded border border-violet-500/35 bg-violet-500/15 text-violet-200">
+                                外部联邦节点
+                              </span>
+                            ) : (
+                              <span className="px-1.5 py-0.2 rounded border border-emerald-500/35 bg-emerald-500/15 text-emerald-200">
+                                {msg.sender_role === "coordinator" ? "本机总指挥" : "本机 Bot"}
+                              </span>
+                            )}
+                            <span className="text-slate-400 font-mono">#{msg.seq}</span>
+                            <span className="text-slate-400">{formatTs(msg.ts)}</span>
+                          </div>
+                          {isHuman ? (
+                            <div className="text-sm whitespace-pre-wrap break-words leading-relaxed">
+                              {msg.content}
+                            </div>
+                          ) : (
+                            <SafeMarkdown content={msg.content || ""} className="text-sm" />
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+                <div ref={chatroomEndRef} />
+              </div>
+
+              {/* Bottom Rounded Chatroom Composer */}
+              <footer className="shrink-0 border-t border-slate-800/90 bg-slate-900/70 p-2.5">
+                <div className="rounded-2xl border border-slate-800 bg-slate-950/95 focus-within:border-sky-500/70 transition-colors p-2 space-y-1.5">
+                  <textarea
+                    rows={2}
+                    value={chatroomInput}
+                    disabled={!canEdit || !chatroomData?.bound || chatroomSending}
+                    onCompositionStart={() => {
+                      isComposingRef.current = true;
+                    }}
+                    onCompositionEnd={() => {
+                      isComposingRef.current = false;
+                    }}
+                    onChange={(e) => setChatroomInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (isComposingRef.current || e.nativeEvent.isComposing) return;
+                      if (e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
+                        e.preventDefault();
+                        void handleSendChatroomMessage();
+                      }
+                    }}
+                    placeholder={
+                      !canEdit
+                        ? "只读权限已禁用联邦聊天室发言"
+                        : !chatroomData?.bound
+                          ? "请先绑定独立联邦聊天室 TG 群后再发言"
+                          : "在联邦聊天室发言（默认路由总指挥；输入 @节点名 可直派本机 Bot 或外部联邦节点，Enter 发送）…"
+                    }
+                    className="w-full resize-none bg-transparent px-1.5 py-1 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none disabled:opacity-50"
+                  />
+                  <div className="pt-1.5 border-t border-slate-800/75 flex items-center justify-between gap-2 flex-wrap">
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      {canEdit ? (
+                        <button
+                          type="button"
+                          disabled={!chatroomData?.bound}
+                          onClick={() => setChatroomIncludeContext((v) => !v)}
+                          title="点名外部联邦节点时自动附带近期已脱敏的群聊上下文"
+                          className={`h-7 px-2 rounded-lg border text-[11px] inline-flex items-center gap-1 cursor-pointer transition-colors disabled:opacity-40 ${
+                            chatroomIncludeContext
+                              ? "bg-indigo-500/15 border-indigo-500/40 text-indigo-200"
+                              : "bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200"
+                          }`}
+                        >
+                          <Layers className="w-3 h-3" />
+                          <span>外部节点附带群聊上下文</span>
+                        </button>
+                      ) : (
+                        <span className="inline-flex items-center gap-1 text-[11px] text-amber-300/90">
+                          <Lock className="w-3 h-3" />
+                          只读模式
+                        </span>
+                      )}
+                    </div>
+                    <button
+                      type="button"
+                      disabled={
+                        !canEdit ||
+                        !chatroomData?.bound ||
+                        chatroomSending ||
+                        !chatroomInput.trim()
+                      }
+                      onClick={() => void handleSendChatroomMessage()}
+                      className="inline-flex items-center gap-1.5 h-8 rounded-xl bg-sky-600 hover:bg-sky-500 px-3.5 text-xs font-medium text-white cursor-pointer disabled:opacity-40 shrink-0"
+                    >
+                      <Send className="w-3.5 h-3.5" />
+                      <span>{chatroomSending ? "发送中…" : "发送并同步群"}</span>
+                    </button>
+                  </div>
+                </div>
+              </footer>
+            </>
+          ) : (
+            <>
           {/* Conversation Sub-Header */}
           {selectedAgent ? (
             <div className="shrink-0 px-4 py-2 border-b border-slate-800/80 bg-slate-900/35 flex flex-wrap items-center justify-between gap-2">
@@ -2569,6 +3073,8 @@ export function FederationWorkbenchView({
                 </div>
               )}
             </footer>
+          )}
+            </>
           )}
         </section>
 

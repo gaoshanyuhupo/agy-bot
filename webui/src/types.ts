@@ -1947,6 +1947,62 @@ export interface FederationWorkbenchStateUpdatePayload {
   state: FederationWorkbenchState;
 }
 
+export interface FederationChatroomMessageItem {
+  seq: number;
+  msg_id: string;
+  ts: number;
+  sender_type: "human" | "bot" | "system" | string;
+  sender: string;
+  sender_role: string;
+  sender_kind?: "human" | "local_bot" | "external_agent" | string;
+  source: "web" | "tg" | "federation" | string;
+  content: string;
+  truncated?: boolean;
+  mentions?: string[];
+  stage_tag?: string;
+  job_id?: string;
+}
+
+export interface FederationChatroomParticipant {
+  id: string;
+  handle: string;
+  display_name: string;
+  kind: "local_bot" | "external_agent" | string;
+  role: string;
+  adapter_type?: string;
+  dispatch_mode?: string;
+  online: boolean;
+  can_mention: boolean;
+  runtime_status: string;
+}
+
+export interface FederationChatroomMessagesResponse {
+  ok: boolean;
+  bound: boolean;
+  title: string;
+  mirror_status: "connected" | "unbound" | "coordinator_offline" | string;
+  participants: FederationChatroomParticipant[];
+  messages: FederationChatroomMessageItem[];
+  last_seq: number;
+  has_more: boolean;
+  can_edit: boolean;
+}
+
+export interface FederationChatroomSendResponse {
+  ok: boolean;
+  mirrored: boolean;
+  seq: number;
+  message?: FederationChatroomMessageItem | null;
+  routed_local: string[];
+  routed_external: string[];
+  external_jobs: {
+    agent_id: string;
+    job_id: string;
+    dispatch_mode: string;
+    status: string;
+  }[];
+}
+
 declare global {
   interface Window {
     Telegram?: {

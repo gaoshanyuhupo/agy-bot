@@ -34,6 +34,10 @@ import type {
   FederationAgentPatchPayload,
   FederationAuditEntry,
   FederationAuditResponse,
+  FederationChatroomMessageItem,
+  FederationChatroomMessagesResponse,
+  FederationChatroomParticipant,
+  FederationChatroomSendResponse,
   FederationHubHealth,
   FederationOverviewResponse,
   FederationTeamCreatePayload,
@@ -4617,6 +4621,210 @@ export async function fetchFederationWorkbench(): Promise<FederationWorkbenchRes
     can_edit: me.role === "admin",
     role: me.role,
     updated_at: new Date().toISOString(),
+  };
+}
+
+let demoFedChatroomSeq = 3;
+const demoFedChatroomMessages: FederationChatroomMessageItem[] = [
+  {
+    seq: 1,
+    msg_id: "tg-1",
+    ts: nowSec() - 420,
+    sender_type: "human",
+    sender: "demo-admin",
+    sender_role: "human",
+    sender_kind: "human",
+    source: "tg",
+    content: "大家好，请汇报一下今天各联邦节点与本机总指挥的在线状态。",
+    truncated: false,
+    mentions: [],
+  },
+  {
+    seq: 2,
+    msg_id: "tg-2",
+    ts: nowSec() - 390,
+    sender_type: "bot",
+    sender: "example_main_bot",
+    sender_role: "coordinator",
+    sender_kind: "local_bot",
+    source: "tg",
+    content: "本机总指挥在线，当前联邦聊天室已开启 Telegram 双向镜像，可直接 `@节点名` 点名派单。",
+    truncated: false,
+    mentions: [],
+  },
+  {
+    seq: 3,
+    msg_id: "tg-3",
+    ts: nowSec() - 310,
+    sender_type: "bot",
+    sender: "pull_worker_demo",
+    sender_role: "worker",
+    sender_kind: "external_agent",
+    source: "federation",
+    content: "外部 Pull Worker 节点心跳正常，最近 1 小时巡检 0 异常。",
+    truncated: false,
+    mentions: [],
+  },
+];
+
+function buildDemoFedChatroomParticipants(): FederationChatroomParticipant[] {
+  const localPart: FederationChatroomParticipant[] = demoBots.map((b) => {
+    const cleanHandle = b.handle.replace(/^@/, "");
+    return {
+      id: cleanHandle,
+      handle: cleanHandle,
+      display_name: b.display_name || cleanHandle,
+      kind: "local_bot",
+      role: b.role,
+      online: Boolean(b.online),
+      can_mention: true,
+      runtime_status: b.online ? "online" : "offline",
+    };
+  });
+  const extPart: FederationChatroomParticipant[] = demoFederationAgents
+    .filter((a) => a.kind !== "agy_local")
+    .map((a) => {
+      const built = demoBuildWorkbenchAgent(a);
+      return {
+        id: built.agent_id,
+        handle: built.agent_id,
+        display_name: built.display_name || built.agent_id,
+        kind: "external_agent",
+        role: "external",
+        adapter_type: built.adapter_type,
+        dispatch_mode: built.dispatch_mode,
+        online: built.runtime_status === "online",
+        can_mention: built.can_dispatch,
+        runtime_status: built.runtime_status,
+      };
+    });
+  return [...localPart, ...extPart];
+}
+
+export async function fetchFederationChatroomMessages(params?: {
+  limit?: number;
+  after_seq?: number;
+  before_seq?: number;
+}): Promise<FederationChatroomMessagesResponse> {
+  await delay(25);
+  const me = requireAuth();
+  let list = [...demoFedChatroomMessages];
+  if (typeof params?.after_seq === "number" && params.after_seq >= 0) {
+    list = list.filter((m) => m.seq > params.after_seq!);
+  }
+  if (typeof params?.before_seq === "number" && params.before_seq > 0) {
+    list = list.filter((m) => m.seq < params.before_seq!);
+  }
+  const lim = Math.min(200, Math.max(1, params?.limit || 120));
+  const hasMore = list.length > lim;
+  const sliced = typeof params?.after_seq === "number" ? list.slice(0, lim) : list.slice(-lim);
+  return {
+    ok: true,
+    bound: true,
+    title: "联邦聊天室（演示镜像）",
+    mirror_status: "connected",
+    participants: buildDemoFedChatroomParticipants(),
+    messages: sliced.map((m) => ({ ...m })),
+    last_seq: demoFedChatroomSeq,
+    has_more: hasMore,
+    can_edit: me.role === "admin",
+  };
+}
+
+export async function sendFederationChatroomMessage(payload: {
+  content: string;
+  include_context?: boolean;
+}): Promise<FederationChatroomSendResponse> {
+  await delay(35);
+  const me = requireAuth();
+  if (me.role !== "admin") {
+    throw new StudioApiError("只读权限（readonly）禁止发送联邦聊天室消息", 403, "studio_auth");
+  }
+  const content = (payload.content || "").trim();
+  if (!content) {
+    throw new StudioApiError("content 不能为空", 400, "studio_api");
+  }
+  const mentions = Array.from(content.matchAll(/@([A-Za-z0-9][A-Za-z0-9._-]{0,63})/g)).map((m) =>
+    m[1].toLowerCase(),
+  );
+  const participants = buildDemoFedChatroomParticipants();
+  const extTargets = participants
+    .filter((p) => p.kind === "external_agent" && mentions.includes(p.handle.toLowerCase()))
+    .map((p) => p.handle);
+  const localTargets = participants
+    .filter((p) => p.kind === "local_bot" && mentions.includes(p.handle.toLowerCase()))
+    .map((p) => p.handle);
+  if (extTargets.length === 0 && localTargets.length === 0) {
+    localTargets.push("example_main_bot");
+  }
+
+  demoFedChatroomSeq += 1;
+  const seq = demoFedChatroomSeq;
+  const msg: FederationChatroomMessageItem = {
+    seq,
+    msg_id: `tg-${seq}`,
+    ts: nowSec(),
+    sender_type: "human",
+    sender: me.username || "demo-admin",
+    sender_role: "human",
+    sender_kind: "human",
+    source: "web",
+    content,
+    truncated: false,
+    mentions,
+  };
+  demoFedChatroomMessages.push(msg);
+  emitDemoEvent("federation_updated", {
+    action: "chatroom_updated",
+    source: "demo",
+    last_seq: seq,
+    ts: msg.ts,
+  });
+
+  const extJobs = extTargets.map((aid) => ({
+    agent_id: aid,
+    job_id: nextDemoId("pull"),
+    dispatch_mode: "pull",
+    status: "queued",
+  }));
+
+  const replyHandle = extTargets[0] || localTargets[0] || "example_main_bot";
+  const replyIsExt = extTargets.length > 0;
+  window.setTimeout(() => {
+    demoFedChatroomSeq += 1;
+    const rseq = demoFedChatroomSeq;
+    const rts = nowSec();
+    demoFedChatroomMessages.push({
+      seq: rseq,
+      msg_id: `tg-${rseq}`,
+      ts: rts,
+      sender_type: "bot",
+      sender: replyHandle,
+      sender_role: replyIsExt ? "worker" : "coordinator",
+      sender_kind: replyIsExt ? "external_agent" : "local_bot",
+      source: replyIsExt ? "federation" : "tg",
+      content: replyIsExt
+        ? `已收到联邦聊天室指令并完成演示处理（自动脱敏回贴至群聊）。`
+        : `总指挥已收到并同步至 Telegram 联邦聊天室，正在协调处理。`,
+      truncated: false,
+      mentions: [],
+    });
+    emitDemoEvent("federation_updated", {
+      action: "chatroom_updated",
+      source: "demo",
+      last_seq: rseq,
+      ts: rts,
+    });
+  }, 900);
+
+  return {
+    ok: true,
+    mirrored: true,
+    seq,
+    message: { ...msg },
+    routed_local: localTargets,
+    routed_external: extTargets,
+    external_jobs: extJobs,
   };
 }
 

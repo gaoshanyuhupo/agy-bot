@@ -14,9 +14,10 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
 import sys
 import time
-from typing import Any
+from typing import Any, Sequence
 import urllib.parse
 
 import aiohttp
@@ -838,6 +839,172 @@ def redact_sensitive_text(raw: Any, max_len: int = 120) -> str:
     return text
 
 
+_FED_MIRROR_DIR_OPEN_FLAGS = (
+    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+)
+_FED_MIRROR_FILE_OPEN_FLAGS = (
+    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+)
+MAX_FED_MIRROR_JSON_BYTES = 4 * 1024 * 1024
+_FED_MIRROR_FORBIDDEN_OUTPUT_KEYS = (
+    "chat_id",
+    "thread_id",
+    "target_chat_id",
+    "target_thread_id",
+    "mirror_chat_id",
+    "mirror_thread_id",
+    "origin_chat_id",
+    "origin_thread_id",
+    "scope_key",
+)
+_TG_SUPERGROUP_LITERAL_RE = re.compile(r"(?<![A-Za-z0-9_.-])-100\d{8,13}(?![A-Za-z0-9_.-])")
+
+
+class SecuritySymlinkError(PermissionError):
+    """Raised when a symlink or non-regular/FIFO file is encountered on a hardened read path."""
+
+
+def _open_dir_chain_no_symlink_ro(
+    base_dir: Path,
+    rel_parts: Sequence[str],
+) -> tuple[bool, int | None, str]:
+    """Traverse `rel_parts` under `base_dir` step-by-step with `O_DIRECTORY | O_NOFOLLOW`.
+
+    Returns `(True, None, "")` when any directory does not exist (zero file/dir creation).
+    Returns `(False, None, reason)` if any component is a symlink or non-directory.
+    """
+    try:
+        base_fd = os.open(str(base_dir), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except FileNotFoundError:
+        return True, None, ""
+    except OSError:
+        return False, None, "SECURITY_SYMLINK_REJECTED: unable to open bus directory safely"
+
+    cur_fd = base_fd
+    try:
+        for part in rel_parts:
+            if not part or part in (".", "..") or "/" in part or "\\" in part or "\x00" in part:
+                os.close(cur_fd)
+                return False, None, f"SECURITY_SYMLINK_REJECTED: invalid directory component {part!r}"
+            try:
+                st = os.lstat(part, dir_fd=cur_fd)
+            except FileNotFoundError:
+                os.close(cur_fd)
+                return True, None, ""
+            except OSError:
+                os.close(cur_fd)
+                return False, None, f"SECURITY_SYMLINK_REJECTED: unable to inspect {part!r}"
+
+            if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+                os.close(cur_fd)
+                return False, None, f"SECURITY_SYMLINK_REJECTED: {part!r} is a symlink or non-directory"
+
+            try:
+                next_fd = os.open(part, _FED_MIRROR_DIR_OPEN_FLAGS, dir_fd=cur_fd)
+            except FileNotFoundError:
+                os.close(cur_fd)
+                return True, None, ""
+            except OSError:
+                os.close(cur_fd)
+                return False, None, f"SECURITY_SYMLINK_REJECTED: refused to open {part!r} safely"
+
+            os.close(cur_fd)
+            cur_fd = next_fd
+            fst = os.fstat(cur_fd)
+            if not stat.S_ISDIR(fst.st_mode):
+                os.close(cur_fd)
+                return False, None, f"SECURITY_SYMLINK_REJECTED: {part!r} is not a directory"
+        return True, cur_fd, ""
+    except Exception:
+        try:
+            os.close(cur_fd)
+        except OSError:
+            pass
+        return False, None, "SECURITY_SYMLINK_REJECTED: directory traversal failed"
+
+
+def _read_json_file_in_dirfd_ro(
+    dir_fd: int,
+    filename: str,
+    *,
+    max_bytes: int = MAX_FED_MIRROR_JSON_BYTES,
+) -> tuple[bool, dict[str, Any] | None, str]:
+    """Open and parse a regular JSON file inside `dir_fd` with `lstat` + `O_NOFOLLOW | O_NONBLOCK` + `S_ISREG`."""
+    if not filename or filename in (".", "..") or "/" in filename or "\\" in filename or "\x00" in filename:
+        return False, None, f"SECURITY_SYMLINK_REJECTED: invalid filename {filename!r}"
+    try:
+        st = os.lstat(filename, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return True, None, ""
+    except OSError:
+        return False, None, f"SECURITY_SYMLINK_REJECTED: unable to inspect {filename!r}"
+
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        return False, None, f"SECURITY_SYMLINK_REJECTED: {filename!r} is a symlink or non-regular file"
+
+    try:
+        fd = os.open(filename, _FED_MIRROR_FILE_OPEN_FLAGS, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return True, None, ""
+    except OSError:
+        return False, None, f"SECURITY_SYMLINK_REJECTED: refused to open {filename!r} safely"
+
+    try:
+        fst = os.fstat(fd)
+        if not stat.S_ISREG(fst.st_mode):
+            return False, None, f"SECURITY_SYMLINK_REJECTED: {filename!r} is not a regular file"
+        chunks: list[bytes] = []
+        remaining = max_bytes
+        while remaining > 0:
+            chunk = os.read(fd, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+    finally:
+        os.close(fd)
+
+    try:
+        obj = json.loads(raw.decode("utf-8", errors="replace"))
+    except Exception:
+        return True, None, ""
+    return True, obj if isinstance(obj, dict) else None, ""
+
+
+def _stat_regular_file_in_dirfd_ro(
+    dir_fd: int,
+    filename: str,
+) -> tuple[bool, tuple[int, int, int] | None, str]:
+    """Safely stat a regular file inside `dir_fd` using `lstat` + `O_NOFOLLOW | O_NONBLOCK` + `S_ISREG`."""
+    if not filename or filename in (".", "..") or "/" in filename or "\\" in filename or "\x00" in filename:
+        return False, None, f"SECURITY_SYMLINK_REJECTED: invalid filename {filename!r}"
+    try:
+        st = os.lstat(filename, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return True, None, ""
+    except OSError:
+        return False, None, f"SECURITY_SYMLINK_REJECTED: unable to inspect {filename!r}"
+
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        return False, None, f"SECURITY_SYMLINK_REJECTED: {filename!r} is a symlink or non-regular file"
+
+    try:
+        fd = os.open(filename, _FED_MIRROR_FILE_OPEN_FLAGS, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return True, None, ""
+    except OSError:
+        return False, None, f"SECURITY_SYMLINK_REJECTED: refused to open {filename!r} safely"
+
+    try:
+        fst = os.fstat(fd)
+        if not stat.S_ISREG(fst.st_mode):
+            return False, None, f"SECURITY_SYMLINK_REJECTED: {filename!r} is not a regular file"
+        return True, (fst.st_ino, fst.st_mtime_ns, fst.st_size), ""
+    finally:
+        os.close(fd)
+
+
 def _read_json_ro(path: Path, default: Any) -> Any:
     if not path.is_file():
         return default
@@ -994,6 +1161,196 @@ class StudioDataSources:
             filtered.append(e)
         filtered.sort(key=lambda x: int(x.get("seq") or 0))
         return filtered, max_seq
+
+    # ------------------------------------------------------------------ Federation TG Mirror (Hardened, Zero Fallback)
+    def resolve_federation_tg_mirror(self) -> dict[str, Any] | None:
+        """Resolve standalone Federation Chatroom TG mirror binding (strictly zero fallback to `team_mirror`).
+
+        Priority:
+        1. `AGY_STUDIO_FEDERATION_MIRROR_CHAT_ID` env (negative int; `0/off/false/none/disabled` -> None).
+        2. Anti-symlink/FIFO read of `<BUS_DIR>/team_config.json["federation_mirror"]`.
+           Raises `SecuritySymlinkError` if `team_config.json` is a symlink/FIFO.
+        """
+        raw_env = os.environ.get("AGY_STUDIO_FEDERATION_MIRROR_CHAT_ID", "").strip()
+        if raw_env:
+            if raw_env.lower() in ("0", "off", "false", "none", "disabled"):
+                return None
+            try:
+                env_cid = int(raw_env)
+            except ValueError:
+                return None
+            if env_cid >= 0:
+                return None
+            raw_tid = os.environ.get("AGY_STUDIO_FEDERATION_MIRROR_THREAD_ID", "").strip()
+            env_tid = bot_bus._norm_tid(raw_tid) if raw_tid else None
+            raw_title = os.environ.get("AGY_STUDIO_FEDERATION_MIRROR_TITLE", "").strip()
+            clean_title = redact_sensitive_text(
+                _SLUG_CTRL_CHARS_RE.sub(" ", raw_title).strip(), max_len=80
+            ) or "联邦聊天室"
+            return {
+                "bound": True,
+                "chat_id": env_cid,
+                "thread_id": env_tid,
+                "title": clean_title,
+                "source": "env",
+            }
+
+        ok_dir, dir_fd, dir_err = _open_dir_chain_no_symlink_ro(self.bus_dir, ())
+        if not ok_dir:
+            raise SecuritySymlinkError(dir_err)
+        if dir_fd is None:
+            return None
+        try:
+            ok_f, cfg_raw, err_f = _read_json_file_in_dirfd_ro(dir_fd, "team_config.json")
+        finally:
+            os.close(dir_fd)
+        if not ok_f:
+            raise SecuritySymlinkError(err_f)
+        if not isinstance(cfg_raw, dict):
+            return None
+
+        fm = cfg_raw.get("federation_mirror")
+        if not isinstance(fm, dict):
+            return None
+        if fm.get("enabled") is False:
+            return None
+        raw_cid = fm.get("chat_id")
+        if isinstance(raw_cid, bool) or raw_cid is None:
+            return None
+        try:
+            cid = int(raw_cid)
+        except (TypeError, ValueError):
+            return None
+        if cid >= 0:
+            return None
+        tid = bot_bus._norm_tid(fm.get("thread_id"))
+        raw_title = str(fm.get("title") or "").strip()
+        clean_title = redact_sensitive_text(
+            _SLUG_CTRL_CHARS_RE.sub(" ", raw_title).strip(), max_len=80
+        ) or "联邦聊天室"
+        return {
+            "bound": True,
+            "chat_id": cid,
+            "thread_id": tid,
+            "title": clean_title,
+            "source": "team_config",
+        }
+
+    def stat_federation_tg_mirror_history_file(
+        self,
+        chat_id: int,
+    ) -> tuple[bool, tuple[int, int, int] | None, str]:
+        """Anti-symlink/FIFO stat of `<BUS_DIR>/group_history/<chat_id>.json` (zero creation)."""
+        cid = int(chat_id or 0)
+        if cid >= 0:
+            return True, None, ""
+        ok_dir, dir_fd, dir_err = _open_dir_chain_no_symlink_ro(self.bus_dir, ("group_history",))
+        if not ok_dir:
+            return False, None, dir_err
+        if dir_fd is None:
+            return True, None, ""
+        try:
+            return _stat_regular_file_in_dirfd_ro(dir_fd, f"{cid}.json")
+        finally:
+            os.close(dir_fd)
+
+    def read_federation_tg_mirror_history(
+        self,
+        limit: int = 120,
+        after_seq: int | None = None,
+        before_seq: int | None = None,
+        *,
+        mirror: dict[str, Any] | None = None,
+    ) -> tuple[list[dict[str, Any]], int, bool]:
+        """Hardened anti-symlink/FIFO reader for standalone Federation Chatroom TG mirror history.
+
+        - Missing `group_history` directory or `<cid>.json` returns `([], 0, False)` with ZERO creation.
+        - Symlink/FIFO along `team_config.json`, `group_history/`, or `<cid>.json` raises `SecuritySymlinkError`.
+        - Output records strictly omit `chat_id`/`thread_id` and scrub any real negative group ID literals.
+        """
+        eff_mirror = mirror if mirror is not None else self.resolve_federation_tg_mirror()
+        if not isinstance(eff_mirror, dict) or not eff_mirror.get("bound"):
+            return [], 0, False
+        cid = int(eff_mirror.get("chat_id") or 0)
+        if cid >= 0:
+            return [], 0, False
+        norm_tid = bot_bus._norm_tid(eff_mirror.get("thread_id"))
+
+        ok_dir, dir_fd, dir_err = _open_dir_chain_no_symlink_ro(self.bus_dir, ("group_history",))
+        if not ok_dir:
+            raise SecuritySymlinkError(dir_err)
+        if dir_fd is None:
+            return [], 0, False
+        try:
+            ok_f, doc, err_f = _read_json_file_in_dirfd_ro(dir_fd, f"{cid}.json")
+        finally:
+            os.close(dir_fd)
+        if not ok_f:
+            raise SecuritySymlinkError(err_f)
+        if not isinstance(doc, dict):
+            return [], 0, False
+        raw_entries = doc.get("entries")
+        if not isinstance(raw_entries, list):
+            return [], 0, False
+
+        matched: list[dict[str, Any]] = []
+        max_seq = 0
+        for e in raw_entries:
+            if not isinstance(e, dict):
+                continue
+            if bot_bus._norm_tid(e.get("thread_id")) != norm_tid:
+                continue
+            seq_val = int(e.get("seq") or 0)
+            if seq_val > max_seq:
+                max_seq = seq_val
+            matched.append(e)
+
+        matched.sort(key=lambda x: int(x.get("seq") or 0))
+        if after_seq is not None:
+            a_seq = int(after_seq)
+            matched = [e for e in matched if int(e.get("seq") or 0) > a_seq]
+        if before_seq is not None:
+            b_seq = int(before_seq)
+            matched = [e for e in matched if int(e.get("seq") or 0) < b_seq]
+
+        safe_limit = max(1, min(200, int(limit or 120)))
+        has_more = len(matched) > safe_limit
+        if after_seq is not None:
+            sliced = matched[:safe_limit]
+        else:
+            sliced = matched[-safe_limit:]
+
+        cid_str = str(cid)
+        out_msgs: list[dict[str, Any]] = []
+        for raw_entry in sliced:
+            mapped = map_group_history_entry_to_room_message(
+                raw_entry, room_id="federation_chatroom"
+            )
+            raw_src = str(raw_entry.get("source") or "").strip().lower()
+            if raw_src == "federation":
+                mapped["source"] = "federation"
+            elif raw_src == "web":
+                mapped["source"] = "web"
+            else:
+                mapped["source"] = "tg"
+            # Scrub real negative group ID literals from content and sender
+            content_s = str(mapped.get("content") or "")
+            if cid_str in content_s:
+                content_s = content_s.replace(cid_str, "[REDACTED]")
+            content_s = _TG_SUPERGROUP_LITERAL_RE.sub("[REDACTED]", content_s)
+            mapped["content"] = content_s
+
+            sender_s = str(mapped.get("sender") or "")
+            if cid_str in sender_s:
+                sender_s = sender_s.replace(cid_str, "[REDACTED]")
+            mapped["sender"] = _TG_SUPERGROUP_LITERAL_RE.sub("[REDACTED]", sender_s)
+
+            for fk in _FED_MIRROR_FORBIDDEN_OUTPUT_KEYS:
+                mapped.pop(fk, None)
+            mapped.pop("room_id", None)
+            out_msgs.append(mapped)
+
+        return out_msgs, max_seq, has_more
 
     # ------------------------------------------------------------------ Bots (Read-Only)
     def get_bots(self) -> dict[str, Any]:

@@ -24,6 +24,8 @@ import type {
   FederationAgentMutationResponse,
   FederationAgentPatchPayload,
   FederationAuditResponse,
+  FederationChatroomMessagesResponse,
+  FederationChatroomSendResponse,
   FederationHubHealth,
   FederationOverviewResponse,
   FederationTeamCreatePayload,
@@ -1444,6 +1446,43 @@ export function fetchFederationAudit(params?: {
 // External Agent Federation Workbench
 export function fetchFederationWorkbench(): Promise<FederationWorkbenchResponse> {
   return requestJson<FederationWorkbenchResponse>("/api/federation/workbench");
+}
+
+export function fetchFederationChatroomMessages(params?: {
+  limit?: number;
+  after_seq?: number;
+  before_seq?: number;
+}): Promise<FederationChatroomMessagesResponse> {
+  const q = new URLSearchParams();
+  if (params?.limit) q.set("limit", String(params.limit));
+  if (params?.after_seq !== undefined && params.after_seq >= 0) {
+    q.set("after_seq", String(params.after_seq));
+  }
+  if (params?.before_seq !== undefined && params.before_seq > 0) {
+    q.set("before_seq", String(params.before_seq));
+  }
+  const qs = q.toString();
+  return requestJson<FederationChatroomMessagesResponse>(
+    `/api/federation/workbench/chatroom/messages${qs ? `?${qs}` : ""}`,
+  );
+}
+
+export function sendFederationChatroomMessage(payload: {
+  content: string;
+  include_context?: boolean;
+}): Promise<FederationChatroomSendResponse> {
+  const body: Record<string, unknown> = { content: payload.content };
+  if (typeof payload.include_context === "boolean") {
+    body.include_context = payload.include_context;
+  }
+  return requestJson<FederationChatroomSendResponse>(
+    "/api/federation/workbench/chatroom/messages",
+    {
+      method: "POST",
+      body: JSON.stringify(body),
+    },
+    true,
+  );
 }
 
 export function fetchFederationWorkbenchState(): Promise<FederationWorkbenchStateResponse> {

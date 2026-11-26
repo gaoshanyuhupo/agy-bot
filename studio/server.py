@@ -355,6 +355,7 @@ def create_app(
         event_hub.start_watcher()
 
     async def _on_cleanup(application: web.Application) -> None:
+        await federation_svc.close_all()
         await google_accounts_svc.close_all()
         await room_service.close_all()
         await event_hub.close_all()
@@ -766,6 +767,14 @@ def create_app(
 
     # External Agent Federation Workbench
     app.router.add_get("/api/federation/workbench", federation_svc.handle_get_workbench)
+    app.router.add_get(
+        "/api/federation/workbench/chatroom/messages",
+        federation_svc.handle_get_workbench_chatroom_messages,
+    )
+    app.router.add_post(
+        "/api/federation/workbench/chatroom/messages",
+        federation_svc.handle_post_workbench_chatroom_message,
+    )
     app.router.add_get(
         "/api/federation/workbench/state",
         federation_svc.handle_get_workbench_state,

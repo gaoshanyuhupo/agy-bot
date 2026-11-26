@@ -33,6 +33,7 @@ from aiohttp import web
 
 from .auth import StudioAuthManager, studio_auth_error
 from .data_sources import (
+    SecuritySymlinkError,
     StudioDataSources,
     _SENSITIVE_HOST_PATH_RE,
     _sanitize_slug,
@@ -165,6 +166,9 @@ class StudioEventHub:
         self._mirror_published_order: deque[int] = deque()
         self._mirror_published_set: set[int] = set()
         self._mirror_bot_reply_seq: dict[str, int] = {}
+        self._fed_mirror_key: tuple[int, int | None] | None = None
+        self._fed_mirror_file_fp: tuple[int, int, int] | None = None
+        self._fed_mirror_last_seq: int = 0
         self._last_jobs_snapshot: dict[str, tuple[str, str]] = {}
         self._last_bots_busy: dict[str, tuple[bool, str, int]] = {}
 
@@ -392,6 +396,80 @@ class StudioEventHub:
         self._mirror_published_set.clear()
         self._mirror_bot_reply_seq.clear()
 
+    def _reset_fed_mirror_state(self) -> None:
+        self._fed_mirror_key = None
+        self._fed_mirror_file_fp = None
+        self._fed_mirror_last_seq = 0
+
+    def _poll_federation_tg_mirror_history(self, *, bootstrap: bool = False) -> None:
+        """Incrementally watch standalone Federation Chatroom TG mirror history (anti-symlink/FIFO, zero creation).
+
+        Strictly isolated from `lobby` (`room_message` / `room_activity`); emits ONLY minimal
+        `federation_updated` notifications with ZERO `chat_id`/`thread_id`/`content`.
+        """
+        try:
+            mirror = self.data_sources.resolve_federation_tg_mirror()
+        except (SecuritySymlinkError, OSError):
+            self._reset_fed_mirror_state()
+            return
+        if not isinstance(mirror, dict) or not mirror.get("bound"):
+            self._reset_fed_mirror_state()
+            return
+
+        mkey = self._norm_mirror_key(int(mirror["chat_id"]), mirror.get("thread_id"))
+        cid = mkey[0]
+        if cid >= 0:
+            self._reset_fed_mirror_state()
+            return
+
+        ok_stat, fp_opt, _err_stat = self.data_sources.stat_federation_tg_mirror_history_file(cid)
+        if not ok_stat:
+            # Symlink or FIFO detected — fail closed and skip safely without hanging
+            return
+        fp = fp_opt if fp_opt is not None else (0, 0, 0)
+
+        if self._fed_mirror_key != mkey or bootstrap:
+            max_seq = 0
+            if fp != (0, 0, 0):
+                try:
+                    _msgs, max_seq, _more = self.data_sources.read_federation_tg_mirror_history(
+                        limit=1,
+                        mirror=mirror,
+                    )
+                except (SecuritySymlinkError, OSError):
+                    return
+            self._fed_mirror_key = mkey
+            self._fed_mirror_file_fp = fp
+            self._fed_mirror_last_seq = int(max_seq or 0)
+            return
+
+        if fp == self._fed_mirror_file_fp:
+            return
+        self._fed_mirror_file_fp = fp
+        if fp == (0, 0, 0):
+            return
+
+        try:
+            _msgs, max_seq, _more = self.data_sources.read_federation_tg_mirror_history(
+                limit=20,
+                after_seq=self._fed_mirror_last_seq,
+                mirror=mirror,
+            )
+        except (SecuritySymlinkError, OSError):
+            return
+
+        if int(max_seq or 0) > self._fed_mirror_last_seq:
+            self._fed_mirror_last_seq = int(max_seq)
+            self.publish(
+                "federation_updated",
+                {
+                    "action": "chatroom_updated",
+                    "source": "watcher",
+                    "last_seq": self._fed_mirror_last_seq,
+                    "ts": round(time.time(), 3),
+                },
+            )
+
     def _record_mirror_published_seq(self, seq: int) -> None:
         if seq <= 0 or seq in self._mirror_published_set:
             return
@@ -615,6 +693,12 @@ class StudioEventHub:
                             raise
                         except Exception as exc:
                             _warn_throttled("tg_mirror_bootstrap", exc)
+                        try:
+                            self._poll_federation_tg_mirror_history(bootstrap=True)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            _warn_throttled("fed_tg_mirror_bootstrap", exc)
                         continue
                     prev_bots, prev_jobs, prev_sched, prev_approvals = self._last_fp
                     cur_bots, cur_jobs, cur_sched, cur_approvals = fp
@@ -787,6 +871,12 @@ class StudioEventHub:
                         raise
                     except Exception as exc:
                         _warn_throttled("tg_mirror", exc)
+                    try:
+                        self._poll_federation_tg_mirror_history(bootstrap=False)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        _warn_throttled("fed_tg_mirror", exc)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
