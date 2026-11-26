@@ -32,6 +32,8 @@ from pathlib import Path
 import re
 import secrets
 import shutil
+import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -251,6 +253,61 @@ _CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
 _CARD_SECRET_REDACT_RE = re.compile(
     r"(?:bot\d+:[A-Za-z0-9_-]{8,}|(?i:x-live-token\s*[:=]\s*)[A-Za-z0-9._-]{6,}|(?i:bearer\s+)[A-Za-z0-9._-]{10,})"
 )
+_HANDBACK_MAX_LEN = 2000
+_HANDBACK_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_HANDBACK_TAG_BREAK_RE = re.compile(
+    r"<\s*/?\s*(?:untrusted_webpage_content|system|assistant|user|developer|tool_call|tool_response)\b[^>]*>",
+    re.IGNORECASE,
+)
+_HANDBACK_ACB_MARKER_RE = re.compile(r"\[\s*/?\s*ACB_[A-Z0-9_]+[^\]]*\]", re.IGNORECASE)
+_OWNER_BOT_HANDLE_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
+_ALLOWED_BROWSER_ENGINES = frozenset({"camoufox", "external_chromium"})
+
+
+def _sanitize_handback_note(raw: Any, max_len: int = _HANDBACK_MAX_LEN) -> str:
+    """Sanitize optional human handback instruction (bounded <=2000 chars, control-char & tag-closure safe)."""
+    if raw is None:
+        return ""
+    if not isinstance(raw, str):
+        raise ValueError("handback instruction must be a string")
+    text = raw.replace("\r\n", "\n").replace("\r", "\n")
+    text = _HANDBACK_CTRL_RE.sub("", text)
+    text = _HANDBACK_TAG_BREAK_RE.sub("[tag-neutralized]", text)
+    text = _HANDBACK_ACB_MARKER_RE.sub("[marker-neutralized]", text)
+    # Defense-in-depth: neutralize any remaining closing angle bracket tag attempting untrusted escape
+    text = re.sub(r"<\s*/\s*untrusted", "&lt;/untrusted", text, flags=re.IGNORECASE)
+    text = text.strip()
+    if len(text) > max_len:
+        text = text[:max_len].rstrip()
+    return text
+
+
+def _normalize_owner_bot_handle(raw: Any) -> str | None:
+    """Validate and normalize an optional owner bot roster handle (strips leading '@', lowercases)."""
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise ValueError("owner_bot must be a string")
+    clean = raw.strip().lstrip("@").lower()
+    if not clean:
+        return None
+    if not _OWNER_BOT_HANDLE_RE.fullmatch(clean):
+        raise ValueError(f"Invalid owner_bot handle: {raw!r}")
+    return clean
+
+
+def _normalize_browser_engine(raw: Any, *, default: str = "") -> str:
+    """Validate optional browser engine identifier (`camoufox` | `external_chromium`)."""
+    if raw is None or raw == "":
+        return default
+    if not isinstance(raw, str):
+        raise ValueError("engine must be a string")
+    clean = raw.strip().lower()
+    if not clean:
+        return default
+    if clean not in _ALLOWED_BROWSER_ENGINES:
+        raise ValueError(f"Unsupported browser engine: {raw!r}")
+    return clean
 
 
 def _sanitize_card_error(raw: Any, max_len: int = 200) -> str:
@@ -862,6 +919,17 @@ def resolve_proxy_bao_ref(bao_ref: str) -> dict[str, str]:
             res = normalize_proxy_config(str(payload["url"]))
         elif "proxy" in payload:
             res = normalize_proxy_config(payload["proxy"])
+        elif payload.get("host") and payload.get("port"):
+            scheme = str(payload.get("scheme") or "socks5h").strip().lower()
+            host_raw = str(payload["host"]).strip()
+            host_fmt = f"[{host_raw}]" if ":" in host_raw and not host_raw.startswith("[") else host_raw
+            port_s = str(payload["port"]).strip()
+            built: dict[str, Any] = {"server": f"{scheme}://{host_fmt}:{port_s}"}
+            if payload.get("username") is not None and str(payload["username"]) != "":
+                built["username"] = str(payload["username"])
+            if payload.get("password") is not None and str(payload["password"]) != "":
+                built["password"] = str(payload["password"])
+            res = normalize_proxy_config(built)
         else:
             raise ValueError(f"OpenBao ref '{ref}' JSON missing 'server'/'url'/'proxy'")
         if not res:
@@ -869,6 +937,221 @@ def resolve_proxy_bao_ref(bao_ref: str) -> dict[str, str]:
         return res
 
     return parse_proxy_url(raw)
+
+
+def resolve_sing_box_bin() -> str | None:
+    """Locate `sing-box` binary via AGY_SING_BOX_BIN, PATH, or standard `/usr/local/bin/sing-box`."""
+    override = os.environ.get("AGY_SING_BOX_BIN", "").strip()
+    if override:
+        cand = Path(override).expanduser()
+        if cand.is_file() and os.access(cand, os.X_OK):
+            return str(cand)
+        return None
+    found = shutil.which("sing-box")
+    if found:
+        return found
+    std_bin = Path("/usr/local/bin/sing-box")
+    if std_bin.is_file() and os.access(std_bin, os.X_OK):
+        return str(std_bin)
+    return None
+
+
+def needs_socks5_auth_bridge(proxy_dict: dict[str, Any] | None) -> bool:
+    """Return True when Playwright/Camoufox needs a local loopback sing-box bridge for authenticated SOCKS5."""
+    if not isinstance(proxy_dict, dict):
+        return False
+    server = str(proxy_dict.get("server") or "").strip().lower()
+    if not (server.startswith("socks5://") or server.startswith("socks5h://")):
+        return False
+    has_user = proxy_dict.get("username") is not None and str(proxy_dict.get("username")) != ""
+    has_pass = proxy_dict.get("password") is not None and str(proxy_dict.get("password")) != ""
+    return has_user or has_pass
+
+
+def _allocate_loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _probe_loopback_port(port: int, timeout: float = 0.2) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+class LoopbackSocks5Bridge:
+    """Managed in-process loopback `sing-box` bridge for authenticated upstream SOCKS5 proxies.
+
+    Security invariants:
+    - Upstream credentials are written ONLY to an `0600` + `O_NOFOLLOW` temp config inside a `0700` dir
+      (NEVER passed in argv, env, or logs).
+    - Config file is unlinked promptly after startup readiness AND cleaned up on stop/error.
+    - Subprocess runs in its own process group (`start_new_session=True`) and is reaped via
+      `SIGTERM` -> `SIGKILL` (`os.killpg`) on stop so zero orphan/zombie processes remain.
+    """
+
+    def __init__(self, proxy_dict: dict[str, str], *, sing_box_bin: str | None = None) -> None:
+        self._proxy = dict(proxy_dict)
+        self._bin_override = sing_box_bin
+        self.port: int = 0
+        self._proc: Any = None
+        self._tmp_dir: Path | None = None
+        self._cfg_path: Path | None = None
+
+    @property
+    def local_server(self) -> str:
+        return f"socks5://127.0.0.1:{self.port}"
+
+    def _build_config(self, listen_port: int) -> dict[str, Any]:
+        parsed = urllib.parse.urlparse(str(self._proxy.get("server") or ""))
+        host = parsed.hostname
+        port = parsed.port
+        if not host or not port:
+            raise ValueError("Authenticated SOCKS5 proxy requires explicit host and port")
+        outbound: dict[str, Any] = {
+            "type": "socks",
+            "tag": "upstream-socks5",
+            "server": host,
+            "server_port": int(port),
+            "version": "5",
+        }
+        user = self._proxy.get("username")
+        pwd = self._proxy.get("password")
+        if user is not None and str(user) != "":
+            outbound["username"] = str(user)
+        if pwd is not None and str(pwd) != "":
+            outbound["password"] = str(pwd)
+        return {
+            "log": {"level": "error"},
+            "inbounds": [
+                {
+                    "type": "mixed",
+                    "tag": "local-in",
+                    "listen": "127.0.0.1",
+                    "listen_port": int(listen_port),
+                }
+            ],
+            "outbounds": [outbound],
+            "route": {"final": "upstream-socks5"},
+        }
+
+    def _write_secure_config(self, cfg_obj: dict[str, Any]) -> Path:
+        tmp_dir = Path(tempfile.mkdtemp(prefix="agy-sb-bridge-"))
+        os.chmod(tmp_dir, 0o700)
+        cfg_path = tmp_dir / "config.json"
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(str(cfg_path), flags, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            os.write(fd, json.dumps(cfg_obj, ensure_ascii=False).encode("utf-8"))
+        finally:
+            os.close(fd)
+        self._tmp_dir = tmp_dir
+        self._cfg_path = cfg_path
+        return cfg_path
+
+    def _cleanup_files(self) -> None:
+        if self._cfg_path is not None:
+            try:
+                self._cfg_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self._cfg_path = None
+        if self._tmp_dir is not None:
+            try:
+                shutil.rmtree(self._tmp_dir, ignore_errors=True)
+            except OSError:
+                pass
+            self._tmp_dir = None
+
+    async def start(self, *, ready_timeout: float = 3.0) -> str:
+        sb_bin = self._bin_override if self._bin_override is not None else resolve_sing_box_bin()
+        if not sb_bin:
+            raise RuntimeError(
+                "Authenticated SOCKS5 egress requires local sing-box loopback bridge, "
+                "but sing-box binary is unavailable (fail-closed)"
+            )
+        listen_port = _allocate_loopback_port()
+        cfg_obj = self._build_config(listen_port)
+        cfg_path = self._write_secure_config(cfg_obj)
+        self.port = listen_port
+        try:
+            self._proc = await asyncio.create_subprocess_exec(
+                sb_bin,
+                "run",
+                "-c",
+                str(cfg_path),
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            deadline = time.monotonic() + max(0.3, float(ready_timeout))
+            ready = False
+            while time.monotonic() < deadline:
+                if self._proc.returncode is not None:
+                    raise RuntimeError(
+                        f"sing-box loopback bridge exited prematurely (code={self._proc.returncode})"
+                    )
+                if await asyncio.to_thread(_probe_loopback_port, listen_port, 0.15):
+                    ready = True
+                    break
+                await asyncio.sleep(0.05)
+            if not ready:
+                raise RuntimeError("sing-box loopback bridge failed to become ready in time")
+            # Config already loaded in memory by sing-box; shred/unlink config file immediately
+            self._cleanup_files()
+            return self.local_server
+        except BaseException:
+            await self.stop()
+            raise
+
+    async def stop(self) -> None:
+        proc = self._proc
+        self._proc = None
+        if proc is not None and getattr(proc, "returncode", None) is None:
+            pid = getattr(proc, "pid", None)
+            if isinstance(pid, int) and pid > 0:
+                try:
+                    os.killpg(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                except Exception:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+            else:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=1.5)
+            except Exception:
+                if isinstance(pid, int) and pid > 0:
+                    try:
+                        os.killpg(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                else:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=1.0)
+                except Exception:
+                    pass
+        self._cleanup_files()
 
 
 def _normalize_window(val: Any) -> list[int]:
@@ -4304,6 +4587,7 @@ class LiveBrowserHub:
         self.active_profile: str = ""
         self.active_profile_dir: Path | None = None
         self._ephemeral_dir: Path | None = None
+        self._socks5_bridge: LoopbackSocks5Bridge | None = None
         self.active_pinned: bool = False
         self.active_pinned_verified: bool = False
         self.active_allow_google: bool = False
@@ -4311,6 +4595,13 @@ class LiveBrowserHub:
         self.active_egress: str = "direct"
         self.active_os: str = ""
         self.active_fingerprint: dict[str, Any] = {}
+        self.active_engine: str = ""
+        self.active_owner_bot: str | None = None
+        self.active_owner_bot_id: int | None = None
+        self.preferred_owner_bot: str | None = None
+        self.preferred_owner_bot_id: int | None = None
+        self.manual_launch: bool = False
+        self._last_takeover_event_watermark: tuple[int, int, bool] | None = None
 
         # Shared display state
         self.latest_jpeg: bytes | None = None
@@ -4443,6 +4734,12 @@ class LiveBrowserHub:
             await asyncio.wait_for(self.stop_hosted(notify_finished=False), timeout=3.5)
         except Exception:
             pass
+        if self._socks5_bridge is not None:
+            try:
+                await asyncio.wait_for(self._socks5_bridge.stop(), timeout=2.5)
+            except Exception:
+                pass
+            self._socks5_bridge = None
         try:
             await self._x11_pointer.close_async()
         except Exception:
@@ -4705,6 +5002,12 @@ class LiveBrowserHub:
             "type": "state",
             "running": self.engine_mode != "idle",
             "engine_mode": self.engine_mode,
+            "engine": self.active_engine
+            or (
+                "camoufox"
+                if self.engine_mode == "async_hosted"
+                else ("external_chromium" if self.engine_mode == "sync_external" else "")
+            ),
             "session_gen": self.session_gen,
             "takeover_gen": self.takeover_gen,
             "profile": self.active_profile or None,
@@ -4713,6 +5016,13 @@ class LiveBrowserHub:
             "egress": self.active_egress or "direct",
             "os": self.active_os or "",
             "fingerprint": dict(self.active_fingerprint),
+            "owner_bot": self.active_owner_bot or self.preferred_owner_bot,
+            "owner_bot_id": (
+                self.active_owner_bot_id
+                if self.active_owner_bot is not None
+                else self.preferred_owner_bot_id
+            ),
+            "manual_launch": bool(self.manual_launch),
             "takeover": self.takeover,
             "takeover_reason": self.takeover_reason,
             "ai_status": self.ai_status,
@@ -4742,6 +5052,7 @@ class LiveBrowserHub:
             "session_restricted": True,
             "restricted_reason": "当前浏览器由其他授权会话占用或仅限本机控制，画面与内容已隔离",
             "engine_mode": "idle",
+            "engine": "",
             "session_gen": self.session_gen,
             "takeover_gen": 0,
             "profile": None,
@@ -4750,6 +5061,9 @@ class LiveBrowserHub:
             "egress": "",
             "os": "",
             "fingerprint": {},
+            "owner_bot": None,
+            "owner_bot_id": None,
+            "manual_launch": False,
             "takeover": False,
             "takeover_reason": "",
             "ai_status": "🔒 当前浏览器由其他授权会话占用",
@@ -4797,6 +5111,8 @@ class LiveBrowserHub:
         out["pinned"] = False
         out["allow_google"] = False
         out["egress"] = ""
+        out["owner_bot"] = None
+        out["owner_bot_id"] = None
         return out
 
     def state_dict_for_viewer(
@@ -5726,6 +6042,93 @@ class LiveBrowserHub:
         self._last_sync_snapshot = snap
         return snap
 
+    async def set_owner_bot(
+        self,
+        owner_bot: str | None,
+        owner_bot_id: int | None = None,
+        *,
+        actor: tuple[str, int] | None = None,
+        expected_session_gen: int | None = None,
+        engine: str | None = None,
+        egress: str | None = None,
+        source: str = "internal",
+    ) -> tuple[bool, str, dict[str, Any]]:
+        """Atomically preset (idle) or hot-rebind (active/takeover) the bound owner AI bot and/or engine/egress metadata without restarting."""
+        norm_bot: str | None = None
+        if owner_bot is not None:
+            try:
+                norm_bot = _normalize_owner_bot_handle(owner_bot)
+            except ValueError as exc:
+                return False, str(exc), {}
+        norm_bid: int | None = None
+        if owner_bot_id is not None:
+            parsed_bid = _parse_positive_int(owner_bot_id)
+            if parsed_bid is None:
+                return False, "owner_bot_id 必须为正整数", {}
+            norm_bid = parsed_bid
+        norm_engine = ""
+        if engine is not None and str(engine).strip():
+            try:
+                norm_engine = _normalize_browser_engine(engine)
+            except ValueError as exc:
+                return False, str(exc), {}
+        has_egress_update = isinstance(egress, str) and bool(egress.strip())
+        if not norm_bot and not norm_engine and not has_egress_update:
+            return False, "owner_bot 不能为空", {}
+
+        async with self._takeover_lock:
+            if expected_session_gen is not None and self.session_gen != expected_session_gen:
+                return False, "会话代次已变更，已拒绝过期改绑请求", {}
+            if actor is not None:
+                a_bot, a_uid = actor
+                live_role = _check_live_user_role(a_bot, a_uid)
+                if live_role != "admin":
+                    return False, "当前用户未授权或权限已撤销", {}
+                if self.engine_mode != "idle" and not self._viewer_can_mutate(a_bot, a_uid, live_role):
+                    return False, "🔒 当前浏览器会话由其他 Bot/用户持有，无权更改绑定 AI", {}
+
+            if norm_bot:
+                self.preferred_owner_bot = norm_bot
+                self.preferred_owner_bot_id = norm_bid
+            if self.engine_mode != "idle":
+                if norm_bot:
+                    self.active_owner_bot = norm_bot
+                    self.active_owner_bot_id = norm_bid
+                if norm_engine:
+                    self.active_engine = norm_engine
+                if has_egress_update:
+                    assert isinstance(egress, str)
+                    self.active_egress = mask_proxy_display(egress.strip()) if "://" in egress else _sanitize_event_text(egress.strip(), max_len=128)
+            log.info(
+                "Owner bot / session metadata updated (mode=%s gen=%d owner_bot=%s owner_bot_id=%s engine=%s source=%s)",
+                self.engine_mode,
+                self.session_gen,
+                norm_bot,
+                norm_bid,
+                norm_engine or self.active_engine,
+                source,
+            )
+            snap = {
+                "owner_bot": self.active_owner_bot or self.preferred_owner_bot,
+                "owner_bot_id": (
+                    self.active_owner_bot_id
+                    if self.active_owner_bot is not None
+                    else self.preferred_owner_bot_id
+                ),
+                "session_gen": self.session_gen,
+                "takeover_gen": self.takeover_gen,
+                "engine_mode": self.engine_mode,
+                "engine": self.active_engine
+                or (
+                    "camoufox"
+                    if self.engine_mode == "async_hosted"
+                    else ("external_chromium" if self.engine_mode == "sync_external" else "")
+                ),
+                "running": self.engine_mode != "idle",
+            }
+        await self.broadcast_state()
+        return True, "ok", snap
+
     async def _emit_takeover_bus_event(
         self,
         *,
@@ -5737,6 +6140,8 @@ class LiveBrowserHub:
         owner_hint: tuple[str, int | None] | None,
         wait_human_active: bool,
         engine_mode: str,
+        handback_note: str = "",
+        manual_launch: bool = False,
     ) -> dict[str, Any] | None:
         """Persist sync screenshot and atomically enqueue `live_browser_takeover_event` (fail-closed)."""
         if not owner_hint or not owner_hint[0]:
@@ -5758,6 +6163,11 @@ class LiveBrowserHub:
             )
             return None
 
+        watermark = (int(session_gen), int(takeover_gen), bool(active))
+        if self._last_takeover_event_watermark == watermark:
+            log.info("Takeover bus event deduplicated for watermark=%s", watermark)
+            return None
+
         snap = await self._collect_sync_snapshot(
             owner_bot_key=owner_bot_key,
             owner_uid=owner_uid,
@@ -5766,20 +6176,42 @@ class LiveBrowserHub:
             active=active,
         )
 
-        target_handle, target_bot_id = _resolve_target_bot_for_bus(owner_bot_key)
-        if not target_handle or not target_bot_id:
-            log.warning(
-                "Takeover bus event fail-closed: unable to uniquely resolve bot_key=%r via roster.json",
-                owner_bot_key,
-            )
-            return None
+        explicit_owner = self.active_owner_bot or self.preferred_owner_bot
+        explicit_owner_id = (
+            self.active_owner_bot_id
+            if self.active_owner_bot is not None
+            else self.preferred_owner_bot_id
+        )
+        if explicit_owner:
+            target_handle = explicit_owner
+            target_bot_id = int(explicit_owner_id) if isinstance(explicit_owner_id, int) and explicit_owner_id > 0 else 0
+            if target_bot_id <= 0:
+                resolved_h, resolved_id = _resolve_target_bot_for_bus(owner_bot_key)
+                if resolved_h == target_handle and resolved_id:
+                    target_bot_id = int(resolved_id)
+        else:
+            target_handle, target_bot_id = _resolve_target_bot_for_bus(owner_bot_key)
+            if not target_handle or not target_bot_id:
+                log.warning(
+                    "Takeover bus event fail-closed: unable to uniquely resolve bot_key=%r via roster.json",
+                    owner_bot_key,
+                )
+                return None
 
         bus = _load_bot_bus_module()
         if bus is None or not hasattr(bus, "enqueue_live_browser_takeover_event"):
             log.warning("Takeover bus event fail-closed: bot_bus unavailable")
             return None
 
-        event = {
+        eff_engine = self.active_engine or (
+            "camoufox"
+            if engine_mode == "async_hosted"
+            else ("external_chromium" if engine_mode == "sync_external" else "")
+        )
+        clean_note = _sanitize_handback_note(handback_note) if (not active and handback_note) else ""
+        eff_manual = bool(manual_launch or self.manual_launch)
+
+        event: dict[str, Any] = {
             "type": "live_browser_takeover_event",
             "session_gen": int(session_gen),
             "takeover_gen": int(takeover_gen),
@@ -5793,6 +6225,11 @@ class LiveBrowserHub:
             "owner_bot_key": owner_bot_key,
             "wait_human_active": bool(wait_human_active),
             "engine_mode": _sanitize_event_text(engine_mode, max_len=32),
+            "engine": _sanitize_event_text(eff_engine, max_len=32),
+            "profile": _sanitize_event_text(self.active_profile or "", max_len=64) or None,
+            "egress": _sanitize_event_text(self.active_egress or "direct", max_len=128),
+            "manual_launch": eff_manual,
+            "readonly_standby": bool(active and eff_manual),
             "screenshot_path": snap["screenshot_path"],
             "url": snap["url"],
             "title": snap["title"],
@@ -5800,7 +6237,11 @@ class LiveBrowserHub:
             "page_summary": snap["page_summary"],
             "ts": snap["ts"],
         }
+        if clean_note:
+            event["handback_note"] = clean_note
+            event["instruction"] = clean_note
         try:
+            self._last_takeover_event_watermark = watermark
             bus.enqueue_live_browser_takeover_event(target_handle, event)
             return event
         except Exception as exc:
@@ -5820,8 +6261,13 @@ class LiveBrowserHub:
         require_card: bool = False,
         source: str = "",
         emit_bus_event: bool = True,
+        handback_note: str = "",
+        manual_launch: bool = False,
     ) -> tuple[bool, str, int, int]:
         want_active = bool(active)
+        clean_handback_note = ""
+        if not want_active and handback_note:
+            clean_handback_note = _sanitize_handback_note(handback_note)
         async with self._takeover_lock:
             if expected_session_gen is not None and self.session_gen != expected_session_gen:
                 return False, "会话代次已变更，已拒绝过期接管/交还请求", self.session_gen, self.takeover_gen
@@ -5860,6 +6306,8 @@ class LiveBrowserHub:
             prev_owner = self.takeover_owner or self.session_owner
             wait_human_active = self._wait_human_waiters > 0
             snap_engine_mode = self.engine_mode
+            if manual_launch and want_active:
+                self.manual_launch = True
 
             if want_active:
                 cur_named = self._normalize_named_owner(self.takeover_owner)
@@ -6002,6 +6450,8 @@ class LiveBrowserHub:
                 owner_hint=event_owner,
                 wait_human_active=wait_human_active,
                 engine_mode=snap_engine_mode,
+                handback_note=clean_handback_note,
+                manual_launch=bool(manual_launch),
             )
         return True, "ok", res_sgen, res_tgen
 
@@ -7000,6 +7450,11 @@ class LiveBrowserHub:
         self.active_egress = "direct"
         self.active_os = ""
         self.active_fingerprint = {}
+        self.active_engine = ""
+        self.active_owner_bot = None
+        self.active_owner_bot_id = None
+        self.manual_launch = False
+        self._last_takeover_event_watermark = None
         self._attached_pages.clear()
         self._closing_unguarded_pages.clear()
         self._unguarded_close_tasks.clear()
@@ -7041,6 +7496,7 @@ class LiveBrowserHub:
         cm = self.camoufox_cm
         fd = self.lock_fd
         ephemeral_dir = self._ephemeral_dir
+        socks5_bridge = self._socks5_bridge
         held_buttons = list(self._mouse_buttons_down)
         held_x11_buttons = sorted(self._x11_buttons_down)
         old_x11_display = self.x11_display or self._x11_pointer.active_display
@@ -7052,6 +7508,7 @@ class LiveBrowserHub:
         self.ctx = None
         self.lock_fd = None
         self._ephemeral_dir = None
+        self._socks5_bridge = None
         self._drain_input_queue()
         self._clear_session_caches()
         self.ai_allowed_event.set()
@@ -7118,6 +7575,11 @@ class LiveBrowserHub:
                 await cm.__aexit__(None, None, None)
             except Exception as exc:
                 log.warning("Error closing AsyncCamoufox: %s", exc)
+        if socks5_bridge is not None:
+            try:
+                await socks5_bridge.stop()
+            except Exception as exc:
+                log.warning("Error stopping loopback sing-box SOCKS5 bridge: %s", type(exc).__name__)
         if fd is not None:
             try:
                 fcntl.flock(fd, fcntl.LOCK_UN)
@@ -7142,7 +7604,19 @@ class LiveBrowserHub:
         actor: tuple[str, int] | None = None,
         source: str = "cli",
         expected_session_gen: int | None = None,
+        manual_launch: bool = False,
+        owner_bot: str | None = None,
+        owner_bot_id: int | None = None,
+        engine: str | None = None,
     ) -> dict[str, Any]:
+        eff_manual_launch = _validate_strict_bool(manual_launch, "manual_launch")
+        norm_owner_bot = _normalize_owner_bot_handle(owner_bot)
+        norm_owner_bot_id: int | None = None
+        if owner_bot_id is not None:
+            norm_owner_bot_id = _parse_positive_int(owner_bot_id)
+            if norm_owner_bot_id is None:
+                raise ValueError("owner_bot_id must be a positive integer")
+        norm_engine = _normalize_browser_engine(engine, default="camoufox")
         async with self._engine_lock:
             if expected_session_gen is not None and self.session_gen != expected_session_gen:
                 raise PermissionError("会话代次已变更，已拒绝过期启动/切换请求")
@@ -7262,6 +7736,7 @@ class LiveBrowserHub:
                 cm: Any = None
                 cm_entered = False
                 ctx: Any = None
+                socks5_bridge: LoopbackSocks5Bridge | None = None
                 published = False
                 startup_guard_failed = False
                 try:
@@ -7315,6 +7790,10 @@ class LiveBrowserHub:
                             raise PermissionError("启动准备期间管理员权限已撤销，已中止启动（fail-closed）")
 
                     kwargs, egress_summary = build_camoufox_kwargs(spec, user_data_dir)
+                    if needs_socks5_auth_bridge(kwargs.get("proxy")):
+                        socks5_bridge = LoopbackSocks5Bridge(kwargs["proxy"])
+                        local_socks = await socks5_bridge.start()
+                        kwargs["proxy"] = {"server": local_socks}
                     vd_size = compute_virtual_display_size(
                         kwargs.get("window") or spec.get("window"),
                         base_env_value=os.environ.get(X11_VIRTUAL_DISPLAY_ENV),
@@ -7396,6 +7875,12 @@ class LiveBrowserHub:
                             timeout=5.0,
                             label="start_hosted.camoufox.__aexit__",
                         )
+                    if socks5_bridge is not None:
+                        await self._shield_cleanup_async(
+                            socks5_bridge.stop(),
+                            timeout=3.0,
+                            label="start_hosted.socks5_bridge.stop",
+                        )
                     try:
                         fcntl.flock(fd, fcntl.LOCK_UN)
                     except Exception:
@@ -7418,7 +7903,20 @@ class LiveBrowserHub:
                 self.lock_fd = fd
                 self.camoufox_cm = cm
                 self.ctx = ctx
+                self._socks5_bridge = socks5_bridge
                 self.engine_mode = "async_hosted"
+                self.active_engine = norm_engine
+                self.active_owner_bot = norm_owner_bot or self.preferred_owner_bot
+                self.active_owner_bot_id = (
+                    norm_owner_bot_id
+                    if norm_owner_bot is not None
+                    else self.preferred_owner_bot_id
+                )
+                if norm_owner_bot is not None:
+                    self.preferred_owner_bot = norm_owner_bot
+                    self.preferred_owner_bot_id = norm_owner_bot_id
+                self.manual_launch = eff_manual_launch
+                self._last_takeover_event_watermark = None
                 self.active_profile = spec["name"]
                 self.active_profile_dir = user_data_dir
                 self._ephemeral_dir = ephemeral_dir
@@ -7434,7 +7932,7 @@ class LiveBrowserHub:
                         fp_summary[fp_key] = spec[fp_key]
                 self.active_fingerprint = fp_summary
 
-                self.ai_status = "已启动安全浏览器"
+                self.ai_status = "手动拉起（人类操作中）" if eff_manual_launch else "已启动安全浏览器"
                 self.x11_display = resolved_display
                 self.x11_screen_size = resolved_screen_size
                 self.last_human_input_backend = ""
@@ -7467,16 +7965,24 @@ class LiveBrowserHub:
                 self._hd_settled = False
                 newly_started = True
                 log.info(
-                    "Started hosted AsyncCamoufox gen=%d profile=%s pinned=%s os=%s egress=%s owner=%s",
+                    "Started hosted AsyncCamoufox gen=%d profile=%s pinned=%s os=%s egress=%s owner=%s owner_bot=%s manual=%s",
                     self.session_gen,
                     self.active_profile,
                     self.active_pinned,
                     self.active_os,
                     self.active_egress,
                     self.session_owner,
+                    self.active_owner_bot,
+                    self.manual_launch,
                 )
+            elif norm_owner_bot is not None:
+                self.active_owner_bot = norm_owner_bot
+                self.active_owner_bot_id = norm_owner_bot_id
+                self.preferred_owner_bot = norm_owner_bot
+                self.preferred_owner_bot_id = norm_owner_bot_id
 
             commit_gen = self.session_gen
+            commit_tgen = self.takeover_gen
             page = self._current_page()
             if initial_url and page:
                 if is_remote_actor:
@@ -7513,6 +8019,24 @@ class LiveBrowserHub:
             await self.broadcast_state()
             result_state = self.state_dict()
             owner_bound = self._has_verified_session_owner()
+
+        # Manual launch (BM6): immediately enter human takeover (wait_human_active=False) & wake bound AI in readonly standby!
+        if eff_manual_launch and self.engine_mode == "async_hosted" and self.session_gen == commit_gen and not self.takeover:
+            tk_owner = self.session_owner
+            ok_ml, err_ml, _, _ = await self.set_takeover(
+                True,
+                reason="manual_launch",
+                owner=tk_owner,
+                expected_session_gen=commit_gen,
+                expected_takeover_gen=commit_tgen,
+                actor=(actor if is_remote_actor else None),
+                source="manual_launch",
+                emit_bus_event=True,
+                manual_launch=True,
+            )
+            if not ok_ml:
+                log.warning("Manual launch takeover transition failed: %s", err_ml)
+            result_state = self.state_dict()
 
         card_sent = False
         card_error: str | None = None
@@ -10438,6 +10962,24 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                             },
                         )
                     continue
+                raw_note = data.get("instruction") if data.get("instruction") is not None else data.get("handback_note")
+                try:
+                    clean_ws_note = _sanitize_handback_note(raw_note) if (not want and raw_note is not None) else ""
+                except ValueError as exc:
+                    if req_id is not None:
+                        await _ws_send_json(
+                            ws,
+                            {
+                                "type": "takeover_ack",
+                                "req_id": str(req_id),
+                                "ok": False,
+                                "takeover": False,
+                                "session_gen": hub.session_gen,
+                                "takeover_gen": hub.takeover_gen,
+                                "error": str(exc),
+                            },
+                        )
+                    continue
                 ok_tk, err_tk, ack_sgen, ack_tgen = await hub.set_takeover(
                     want,
                     str(data.get("reason", "")),
@@ -10446,6 +10988,7 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                     expected_takeover_gen=cli_tgen,
                     actor=(bot_key, user_id),
                     source="miniapp_ws",
+                    handback_note=clean_ws_note,
                 )
                 if not ok_tk and not req_id:
                     await _ws_send_json(ws, {"type": "toast", "message": err_tk})
@@ -10463,6 +11006,57 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                             "owner_bot": bot_key,
                             "owner_uid": user_id,
                             **({} if ok_tk else {"error": err_tk}),
+                        },
+                    )
+            elif mtype == "rebind_owner_bot":
+                req_id = data.get("req_id")
+                if not await _require_live_admin("切换绑定的 AI"):
+                    if ws.closed:
+                        break
+                    if req_id is not None:
+                        await _ws_send_json(
+                            ws,
+                            {
+                                "type": "owner_bot_ack",
+                                "req_id": str(req_id),
+                                "ok": False,
+                                "error": "只读权限不可切换绑定 AI",
+                            },
+                        )
+                    continue
+                cli_sgen = _parse_strict_int(data.get("session_gen"))
+                if cli_sgen is None or cli_sgen != hub.session_gen:
+                    err_msg = "缺少或过期的 session_gen，已拒绝改绑 AI 请求"
+                    if req_id is not None:
+                        await _ws_send_json(
+                            ws,
+                            {
+                                "type": "owner_bot_ack",
+                                "req_id": str(req_id),
+                                "ok": False,
+                                "session_gen": hub.session_gen,
+                                "error": err_msg,
+                            },
+                        )
+                    continue
+                ok_ob, err_ob, snap_ob = await hub.set_owner_bot(
+                    str(data.get("owner_bot") or ""),
+                    data.get("owner_bot_id"),
+                    actor=(bot_key, user_id),
+                    expected_session_gen=cli_sgen,
+                    source="miniapp_ws",
+                )
+                if not ok_ob and not req_id:
+                    await _ws_send_json(ws, {"type": "toast", "message": err_ob})
+                if req_id is not None:
+                    await _ws_send_json(
+                        ws,
+                        {
+                            "type": "owner_bot_ack",
+                            "req_id": str(req_id),
+                            "ok": bool(ok_ob),
+                            **snap_ob,
+                            **({} if ok_ob else {"error": err_ob}),
                         },
                     )
             elif mtype == "set_quality":
@@ -11659,6 +12253,18 @@ async def internal_takeover(request: web.Request) -> web.Response:
         return web.json_response({"ok": False, "error": err_ctrl}, status=403)
     active = _parse_bool_flag(body.get("active", True))
     reason = str(body.get("reason") or "")
+    raw_manual = body.get("manual_launch")
+    manual_launch_flag = False
+    if raw_manual is not None:
+        try:
+            manual_launch_flag = _validate_strict_bool(raw_manual, "manual_launch")
+        except ValueError as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
+    raw_note = body.get("instruction") if body.get("instruction") is not None else body.get("handback_note")
+    try:
+        clean_note = _sanitize_handback_note(raw_note) if (not active and raw_note is not None) else ""
+    except ValueError as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=400)
     exp_tgen: int | None = None
     if body.get("expected_takeover_gen") is not None:
         exp_tgen = _parse_strict_int(body.get("expected_takeover_gen"))
@@ -11675,11 +12281,46 @@ async def internal_takeover(request: web.Request) -> web.Response:
         actor=actor_arg,
         card_message_id=auth_ctx.get("message_id"),
         require_card=bool(auth_ctx.get("from_card")),
-        source=str(auth_ctx.get("source") or ("tg_card" if auth_ctx.get("from_card") else "internal_takeover")),
+        source=str(
+            body.get("source")
+            or auth_ctx.get("source")
+            or ("manual_launch" if manual_launch_flag else ("tg_card" if auth_ctx.get("from_card") else "internal_takeover"))
+        ),
+        handback_note=clean_note,
+        manual_launch=manual_launch_flag,
     )
     if not ok_tk:
         return web.json_response({"ok": False, "error": err_tk}, status=403)
     return web.json_response({"ok": True, **hub.state_dict()})
+
+
+async def internal_owner_bot(request: web.Request) -> web.Response:
+    hub: LiveBrowserHub = request.app["hub"]
+    check_local_auth(request, hub)
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "Invalid JSON body"}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response({"ok": False, "error": "Request body must be a JSON object"}, status=400)
+    ok_ctrl, err_ctrl, _, auth_ctx = _verify_internal_caller_control(hub, body, require_running=False)
+    if not ok_ctrl:
+        return web.json_response({"ok": False, "error": err_ctrl}, status=403)
+    actor_arg = (auth_ctx["bot_key"], auth_ctx["chat_id"]) if auth_ctx.get("is_tg") else None
+    exp_gen = auth_ctx.get("expected_gen")
+    ok_ob, err_ob, snap = await hub.set_owner_bot(
+        body.get("owner_bot"),  # type: ignore[arg-type]
+        body.get("owner_bot_id"),
+        actor=actor_arg,
+        expected_session_gen=exp_gen,
+        engine=body.get("engine"),
+        egress=body.get("egress"),
+        source=str(auth_ctx.get("source") or "internal_owner_bot"),
+    )
+    if not ok_ob:
+        status_code = 403 if ("无权" in err_ob or "未授权" in err_ob or "代次" in err_ob) else 400
+        return web.json_response({"ok": False, "error": err_ob}, status=status_code)
+    return web.json_response({"ok": True, **snap, **hub.state_dict()})
 
 
 async def internal_start(request: web.Request) -> web.Response:
@@ -11721,6 +12362,9 @@ async def internal_start(request: web.Request) -> web.Response:
     raw_allow_override: Any = False
     if "allow_override" in body and body["allow_override"] is not None:
         raw_allow_override = body["allow_override"]
+    raw_manual_launch: Any = False
+    if "manual_launch" in body and body["manual_launch"] is not None:
+        raw_manual_launch = body["manual_launch"]
     pref_uid = _parse_positive_int(body.get("user_id"))
     actor_arg = (auth_ctx["bot_key"], auth_ctx["chat_id"]) if auth_ctx.get("is_tg") else None
     source_arg = str(auth_ctx.get("source") or "tg_cmd") if auth_ctx.get("is_tg") else "cli"
@@ -11739,6 +12383,10 @@ async def internal_start(request: web.Request) -> web.Response:
             actor=actor_arg,
             source=source_arg,
             expected_session_gen=exp_gen,
+            manual_launch=raw_manual_launch,
+            owner_bot=body.get("owner_bot"),
+            owner_bot_id=body.get("owner_bot_id"),
+            engine=body.get("engine"),
         )
         return web.json_response({"ok": True, **st})
     except PermissionError as exc:
@@ -12422,6 +13070,31 @@ async def internal_sync_start(request: web.Request) -> web.Response:
 
         hub.sync_cmd_queue.clear()
         hub.ai_status = str(body.get("ai_status") or "外部脚本运行中")
+        try:
+            hub.active_engine = _normalize_browser_engine(body.get("engine"), default="external_chromium")
+        except ValueError:
+            hub.active_engine = "external_chromium"
+        try:
+            sync_owner_bot = _normalize_owner_bot_handle(body.get("owner_bot"))
+        except ValueError:
+            sync_owner_bot = None
+        sync_owner_bid = _parse_positive_int(body.get("owner_bot_id"))
+        hub.active_owner_bot = sync_owner_bot or hub.preferred_owner_bot
+        hub.active_owner_bot_id = (
+            sync_owner_bid if sync_owner_bot is not None else hub.preferred_owner_bot_id
+        )
+        if sync_owner_bot is not None:
+            hub.preferred_owner_bot = sync_owner_bot
+            hub.preferred_owner_bot_id = sync_owner_bid
+        raw_sync_egress = str(body.get("egress") or "").strip()
+        if raw_sync_egress:
+            hub.active_egress = (
+                mask_proxy_display(raw_sync_egress)
+                if "://" in raw_sync_egress
+                else _sanitize_event_text(raw_sync_egress, max_len=128)
+            )
+        hub.manual_launch = bool(body.get("manual_launch") is True)
+        hub._last_takeover_event_watermark = None
         now = time.monotonic()
         hub.last_activity_ts = now
         hub._sync_last_push_ts = now
@@ -12433,6 +13106,10 @@ async def internal_sync_start(request: web.Request) -> web.Response:
             "session_gen": hub.session_gen,
             "takeover_gen": hub.takeover_gen,
             "sync_lease_id": lease_id,
+            "engine": hub.active_engine,
+            "owner_bot": hub.active_owner_bot,
+            "owner_bot_id": hub.active_owner_bot_id,
+            "manual_launch": hub.manual_launch,
             "pinned": hub.active_pinned,
             "pinned_verified": hub.active_pinned_verified,
             "allow_google": hub.active_allow_google,
@@ -12815,6 +13492,7 @@ def create_app() -> web.Application:
 
     app.router.add_get("/internal/status", internal_status)
     app.router.add_post("/internal/takeover", internal_takeover)
+    app.router.add_post("/internal/owner-bot", internal_owner_bot)
     app.router.add_post("/internal/start", internal_start)
     app.router.add_post("/internal/stop", internal_stop)
     app.router.add_post("/internal/action", internal_action)
@@ -12825,6 +13503,7 @@ def create_app() -> web.Application:
     app.router.add_post("/internal/profiles/switch", internal_profiles_switch)
     app.router.add_delete("/internal/profiles/{name}", internal_profiles_delete)
     app.router.add_post("/internal/sync/start", internal_sync_start)
+    app.router.add_post("/internal/sync/attach", internal_sync_start)
     app.router.add_post("/internal/sync/push", internal_sync_push)
     app.router.add_post("/internal/sync/clipboard", internal_sync_clipboard)
     app.router.add_post("/internal/sync/stop", internal_sync_stop)

@@ -12,12 +12,33 @@ import type {
   BotSkillDetailResponse,
   BotSkillPutPayload,
   BotsResponse,
+  BrowserBotsResponse,
+  BrowserEngineId,
+  BrowserEnginesResponse,
+  BrowserLaunchPayload,
+  BrowserLaunchResponse,
+  BrowserOwnerBotResponse,
+  BrowserProfileDeleteResponse,
+  BrowserProfileMutationResponse,
+  BrowserProfilesResponse,
+  BrowserProfileUpsertPayload,
   BrowserStatusResponse,
+  BrowserStopResponse,
+  BrowserTakeoverPayload,
+  BrowserTakeoverResponse,
   ChatAbortResponse,
   ChatSendPayload,
   ChatSendResponse,
   CheckpointDiffResponse,
   CostsResponse,
+  EgressDrawPayload,
+  EgressJobResponse,
+  EgressJobsResponse,
+  EgressNodeCreatePayload,
+  EgressNodeCreateResponse,
+  EgressNodeDeleteResponse,
+  EgressNodesResponse,
+  EgressPrunePayload,
   EventStreamStatus,
   ExecutionMode,
   FederationAgentCreatePayload,
@@ -654,6 +675,193 @@ export function refreshAllGoogleAccountsQuota(): Promise<GoogleAccountRefreshAll
 
 export function fetchBrowserStatus(): Promise<BrowserStatusResponse> {
   return requestJson<BrowserStatusResponse>("/api/browser/status");
+}
+
+export function fetchBrowserEngines(): Promise<BrowserEnginesResponse> {
+  return requestJson<BrowserEnginesResponse>("/api/browser/engines");
+}
+
+export function fetchBrowserBots(): Promise<BrowserBotsResponse> {
+  return requestJson<BrowserBotsResponse>("/api/browser/bots");
+}
+
+export function setBrowserOwnerBot(payload: {
+  owner_bot: string;
+  expected_session_gen?: number;
+}): Promise<BrowserOwnerBotResponse> {
+  return requestJson<BrowserOwnerBotResponse>(
+    "/api/browser/owner-bot",
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+    true,
+  );
+}
+
+export function fetchBrowserProfiles(
+  engine: "all" | BrowserEngineId = "all",
+): Promise<BrowserProfilesResponse> {
+  const qs = engine && engine !== "all" ? `?engine=${encodeURIComponent(engine)}` : "";
+  return requestJson<BrowserProfilesResponse>(`/api/browser/profiles${qs}`);
+}
+
+export function upsertBrowserProfile(
+  payload: BrowserProfileUpsertPayload,
+): Promise<BrowserProfileMutationResponse> {
+  return requestJson<BrowserProfileMutationResponse>(
+    "/api/browser/profiles",
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+    true,
+  );
+}
+
+export function updateBrowserProfile(
+  engine: BrowserEngineId,
+  name: string,
+  payload: BrowserProfileUpsertPayload,
+): Promise<BrowserProfileMutationResponse> {
+  return requestJson<BrowserProfileMutationResponse>(
+    `/api/browser/profiles/${encodeURIComponent(engine)}/${encodeURIComponent(name)}`,
+    {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    },
+    true,
+  );
+}
+
+export function deleteBrowserProfile(
+  engine: BrowserEngineId,
+  name: string,
+  payload?: { purge_data?: boolean },
+): Promise<BrowserProfileDeleteResponse> {
+  return requestJson<BrowserProfileDeleteResponse>(
+    `/api/browser/profiles/${encodeURIComponent(engine)}/${encodeURIComponent(name)}`,
+    {
+      method: "DELETE",
+      body: JSON.stringify(payload || {}),
+    },
+    true,
+  );
+}
+
+export function launchBrowser(
+  payload: BrowserLaunchPayload,
+): Promise<BrowserLaunchResponse> {
+  return requestJson<BrowserLaunchResponse>(
+    "/api/browser/launch",
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+    true,
+  );
+}
+
+export function stopBrowser(payload?: {
+  force?: boolean;
+  expected_session_gen?: number;
+}): Promise<BrowserStopResponse> {
+  return requestJson<BrowserStopResponse>(
+    "/api/browser/stop",
+    {
+      method: "POST",
+      body: JSON.stringify(payload || {}),
+    },
+    true,
+  );
+}
+
+export function setBrowserTakeover(
+  payload: BrowserTakeoverPayload,
+): Promise<BrowserTakeoverResponse> {
+  return requestJson<BrowserTakeoverResponse>(
+    "/api/browser/takeover",
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+    true,
+  );
+}
+
+export function fetchEgressNodes(): Promise<EgressNodesResponse> {
+  return requestJson<EgressNodesResponse>("/api/egress/nodes");
+}
+
+export function createEgressNode(
+  payload: EgressNodeCreatePayload,
+): Promise<EgressNodeCreateResponse> {
+  return requestJson<EgressNodeCreateResponse>(
+    "/api/egress/nodes",
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+    true,
+  );
+}
+
+export function deleteEgressNode(name: string): Promise<EgressNodeDeleteResponse> {
+  return requestJson<EgressNodeDeleteResponse>(
+    `/api/egress/nodes/${encodeURIComponent(name)}`,
+    {
+      method: "DELETE",
+      body: "{}",
+    },
+    true,
+  );
+}
+
+export function verifyEgressNode(name: string): Promise<EgressJobResponse> {
+  return requestJson<EgressJobResponse>(
+    `/api/egress/nodes/${encodeURIComponent(name)}/verify`,
+    {
+      method: "POST",
+      body: "{}",
+    },
+    true,
+  );
+}
+
+export function drawEgressNodes(
+  payload?: EgressDrawPayload,
+): Promise<EgressJobResponse> {
+  return requestJson<EgressJobResponse>(
+    "/api/egress/draw",
+    {
+      method: "POST",
+      body: JSON.stringify(payload || {}),
+    },
+    true,
+  );
+}
+
+export function pruneEgressNodes(
+  payload?: EgressPrunePayload,
+): Promise<EgressJobResponse> {
+  return requestJson<EgressJobResponse>(
+    "/api/egress/prune",
+    {
+      method: "POST",
+      body: JSON.stringify(payload || {}),
+    },
+    true,
+  );
+}
+
+export function fetchEgressJobs(): Promise<EgressJobsResponse> {
+  return requestJson<EgressJobsResponse>("/api/egress/jobs");
+}
+
+export function fetchEgressJob(jobId: string): Promise<EgressJobResponse> {
+  return requestJson<EgressJobResponse>(
+    `/api/egress/jobs/${encodeURIComponent(jobId)}`,
+  );
 }
 
 export function fetchSessions(params?: {

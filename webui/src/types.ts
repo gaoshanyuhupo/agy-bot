@@ -493,6 +493,8 @@ export interface CostsResponse {
   quota_groups: QuotaGroup[];
 }
 
+export type BrowserEngineId = "camoufox" | "external_chromium";
+
 export interface BrowserStatusResponse {
   ok: boolean;
   readonly: boolean;
@@ -500,11 +502,15 @@ export interface BrowserStatusResponse {
   running: boolean;
   session_restricted?: boolean;
   engine_mode: string;
+  engine?: BrowserEngineId | string;
   profile?: string | null;
   pinned?: boolean;
   egress?: string;
   os?: string;
   takeover?: boolean;
+  manual_launch?: boolean;
+  owner_bot?: string | null;
+  owner_bot_id?: number | null;
   ai_busy?: boolean;
   url?: string;
   title?: string;
@@ -515,6 +521,255 @@ export interface BrowserStatusResponse {
   tabs_count?: number;
   source?: string;
   error?: string;
+}
+
+export interface BrowserEngineInfo {
+  id: BrowserEngineId;
+  label: string;
+  available: boolean;
+}
+
+export interface BrowserEnginesResponse {
+  ok: boolean;
+  can_edit: boolean;
+  engines: BrowserEngineInfo[];
+  active_session: {
+    running: boolean;
+    engine_mode: string;
+    engine: string;
+    profile: string | null;
+    egress: string;
+    takeover: boolean;
+    manual_launch: boolean;
+    owner_bot: string | null;
+    owner_bot_id: number | null;
+  };
+}
+
+export interface BrowserBotItem {
+  handle: string;
+  display_name: string;
+  role: "coordinator" | "worker" | "peer" | string;
+  bot_id: number | null;
+  online: boolean;
+  busy: boolean;
+  specialty: string;
+}
+
+export interface BrowserBotsResponse {
+  ok: boolean;
+  can_edit: boolean;
+  total: number;
+  bots: BrowserBotItem[];
+  active_owner_bot: string | null;
+  active_owner_bot_id: number | null;
+  default_owner_bot: string | null;
+  default_owner_bot_id: number | null;
+}
+
+export interface BrowserOwnerBotResponse {
+  ok: boolean;
+  owner_bot: string;
+  owner_bot_id: number | null;
+  running: boolean;
+  session_gen?: number | null;
+  takeover_gen?: number | null;
+  engine?: string;
+}
+
+export interface BrowserProfileItem {
+  engine: BrowserEngineId;
+  name: string;
+  pinned: boolean;
+  persistent: boolean;
+  allow_google: boolean;
+  egress: string;
+  proxy_bao_ref?: string | null;
+  os?: string;
+  locale?: string;
+  lang?: string;
+  tz?: string;
+  window?: string | [number, number];
+  mobile?: boolean;
+  account?: string;
+  source?: string;
+  active: boolean;
+  editable: boolean;
+  deletable: boolean;
+}
+
+export interface BrowserProfilesResponse {
+  ok: boolean;
+  can_edit: boolean;
+  camoufox_available: boolean;
+  external_chromium_available: boolean;
+  external_chromium_label: string;
+  active_profile?: string | null;
+  active_engine?: string | null;
+  profiles: BrowserProfileItem[];
+  by_engine: {
+    camoufox: BrowserProfileItem[];
+    external_chromium: BrowserProfileItem[];
+  };
+}
+
+export interface BrowserProfileUpsertPayload {
+  engine?: BrowserEngineId;
+  name?: string;
+  overwrite?: boolean;
+  confirm_google_profile_change?: boolean;
+  os?: string;
+  locale?: string;
+  lang?: string;
+  tz?: string;
+  window?: string;
+  mobile?: boolean;
+  persistent?: boolean;
+  allow_google?: boolean;
+  account?: string;
+  proxy?: string | null;
+  proxy_bao_ref?: string | null;
+  egress_node?: string | null;
+}
+
+export interface BrowserProfileMutationResponse {
+  ok: boolean;
+  profile: BrowserProfileItem;
+}
+
+export interface BrowserProfileDeleteResponse {
+  ok: boolean;
+  engine: BrowserEngineId;
+  deleted: string;
+}
+
+export interface BrowserLaunchPayload {
+  engine: BrowserEngineId;
+  profile?: string;
+  url?: string;
+  owner_bot?: string;
+  manual_launch?: boolean;
+  restart?: boolean;
+}
+
+export interface BrowserLaunchResponse {
+  ok: boolean;
+  engine: BrowserEngineId;
+  state: Record<string, unknown>;
+}
+
+export interface BrowserStopResponse {
+  ok: boolean;
+  stopped: boolean;
+  engine?: string;
+  state?: Record<string, unknown>;
+}
+
+export interface BrowserTakeoverPayload {
+  active: boolean;
+  reason?: string;
+  instruction?: string;
+  expected_session_gen?: number;
+  expected_takeover_gen?: number;
+}
+
+export interface BrowserTakeoverResponse {
+  ok: boolean;
+  state: Record<string, unknown>;
+}
+
+export interface EgressNodeItem {
+  name: string;
+  slug: string;
+  ref: string;
+  scheme: string;
+  host: string;
+  port: number | null;
+  server: string;
+  display: string;
+  has_auth: boolean;
+  provider: string;
+  tag: string;
+  exit_ip: string;
+  country: string;
+  region: string;
+  city: string;
+  isp: string;
+  asn: string;
+  ptr: string;
+  mbps: string;
+  latency_ms: string;
+  status: string;
+  drawn_at: string;
+  verified_at: string;
+  note: string;
+  deletable: boolean;
+}
+
+export interface EgressNodesResponse {
+  ok: boolean;
+  can_edit: boolean;
+  vault_ready: boolean;
+  vault_error: string;
+  draw_supported: boolean;
+  prune_supported: boolean;
+  draw_running: boolean;
+  verify_running: number;
+  nodes: EgressNodeItem[];
+  total: number;
+}
+
+export interface EgressNodeCreatePayload {
+  name?: string;
+  slug?: string;
+  proxy_url?: string;
+  scheme?: string;
+  host?: string;
+  port?: number | string;
+  username?: string;
+  password?: string;
+  note?: string;
+}
+
+export interface EgressNodeCreateResponse {
+  ok: boolean;
+  node: EgressNodeItem;
+}
+
+export interface EgressNodeDeleteResponse {
+  ok: boolean;
+  deleted: string;
+}
+
+export interface EgressJobItem {
+  job_id: string;
+  kind: "verify" | "draw" | "prune" | string;
+  target: string;
+  status: "queued" | "running" | "done" | "failed" | string;
+  created_at: string;
+  finished_at: string | null;
+  result?: Record<string, unknown> | null;
+  error?: string;
+}
+
+export interface EgressJobResponse {
+  ok: boolean;
+  job: EgressJobItem;
+}
+
+export interface EgressJobsResponse {
+  ok: boolean;
+  jobs: EgressJobItem[];
+}
+
+export interface EgressDrawPayload {
+  country?: string;
+  want?: number;
+  max_tries?: number;
+}
+
+export interface EgressPrunePayload {
+  dry_run?: boolean;
 }
 
 export interface OverviewResponse {
@@ -560,6 +815,7 @@ export interface LiveBrowserState {
   session_restricted?: boolean;
   restricted_reason?: string;
   engine_mode: string;
+  engine?: BrowserEngineId | string;
   session_gen: number;
   takeover_gen: number;
   profile: string | null;
@@ -568,6 +824,9 @@ export interface LiveBrowserState {
   os: string;
   takeover: boolean;
   takeover_reason: string;
+  manual_launch?: boolean;
+  owner_bot?: string | null;
+  owner_bot_id?: number | null;
   ai_status: string;
   ai_busy: boolean;
   url: string;

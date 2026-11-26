@@ -494,9 +494,15 @@ class TestPAC1SingleWriterIPCAndBridgeHooks(unittest.TestCase):
 
     def test_pa_c1_static_studio_zero_agy_spawn_and_zero_transcript_writes(self) -> None:
         studio_dir = REPO_ROOT / "studio"
+        adapter_files = ("browser_control_service.py", "egress_pool_service.py")
+        seen_adapter_files: set[str] = set()
         for py_file in sorted(studio_dir.glob("*.py")):
             src = py_file.read_text(encoding="utf-8")
             tree = ast.parse(src, filename=str(py_file))
+            create_subproc_attr_hits = 0
+            self_subproc_exec_calls = 0
+            if py_file.name in adapter_files:
+                seen_adapter_files.add(py_file.name)
             for node in ast.walk(tree):
                 if isinstance(node, ast.Import):
                     for alias in node.names:
@@ -506,7 +512,7 @@ class TestPAC1SingleWriterIPCAndBridgeHooks(unittest.TestCase):
                 elif isinstance(node, ast.Attribute):
                     forbidden_attrs = (
                         ("create_subprocess_shell", "Popen")
-                        if py_file.name in ("workspace_files.py", "git_workflow.py")
+                        if py_file.name in ("workspace_files.py", "git_workflow.py", *adapter_files)
                         else ("create_subprocess_exec", "create_subprocess_shell", "Popen")
                     )
                     self.assertNotIn(
@@ -514,29 +520,77 @@ class TestPAC1SingleWriterIPCAndBridgeHooks(unittest.TestCase):
                         forbidden_attrs,
                         f"Forbidden process spawn attribute {node.attr} in {py_file.name}",
                     )
-                elif (
-                    py_file.name in ("workspace_files.py", "git_workflow.py")
-                    and isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "create_subprocess_exec"
-                ):
-                    self.assertTrue(node.args, f"create_subprocess_exec must specify executable in {py_file.name}")
-                    first_arg = node.args[0]
-                    if py_file.name == "workspace_files.py":
-                        # Phase B M1: workspace_files.py may ONLY invoke read-only `git` via create_subprocess_exec
-                        self.assertIsInstance(first_arg, ast.Constant)
-                        self.assertEqual(first_arg.value, "git")
-                    else:
-                        # Coding Trio: git_workflow.py may ONLY invoke `git`, `gh_bin`, or `bao_bin` (never `agy`)
-                        if isinstance(first_arg, ast.Constant):
+                    if py_file.name in adapter_files and node.attr == "create_subprocess_exec":
+                        create_subproc_attr_hits += 1
+                elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                    if (
+                        py_file.name in ("workspace_files.py", "git_workflow.py", *adapter_files)
+                        and node.func.attr == "create_subprocess_exec"
+                    ):
+                        if py_file.name in adapter_files:
+                            self.fail(
+                                f"Direct uncontrolled create_subprocess_exec() call forbidden in {py_file.name}; "
+                                "must go through injected self._subprocess_exec(...)"
+                            )
+                        self.assertTrue(node.args, f"create_subprocess_exec must specify executable in {py_file.name}")
+                        first_arg = node.args[0]
+                        if py_file.name == "workspace_files.py":
+                            # Phase B M1: workspace_files.py may ONLY invoke read-only `git` via create_subprocess_exec
+                            self.assertIsInstance(first_arg, ast.Constant)
                             self.assertEqual(first_arg.value, "git")
-                        elif isinstance(first_arg, ast.Name):
-                            self.assertIn(first_arg.id, ("gh_bin", "bao_bin"))
-                        else:
-                            self.fail(f"Unexpected executable AST in git_workflow.py: {ast.dump(first_arg)}")
+                        elif py_file.name == "git_workflow.py":
+                            # Coding Trio: git_workflow.py may ONLY invoke `git`, `gh_bin`, or `bao_bin` (never `agy`)
+                            if isinstance(first_arg, ast.Constant):
+                                self.assertEqual(first_arg.value, "git")
+                            elif isinstance(first_arg, ast.Name):
+                                self.assertIn(first_arg.id, ("gh_bin", "bao_bin"))
+                            else:
+                                self.fail(f"Unexpected executable AST in git_workflow.py: {ast.dump(first_arg)}")
+                    elif (
+                        py_file.name in adapter_files
+                        and isinstance(node.func.value, ast.Name)
+                        and node.func.value.id == "self"
+                        and node.func.attr == "_subprocess_exec"
+                    ):
+                        self_subproc_exec_calls += 1
+                        self.assertTrue(node.args, f"self._subprocess_exec must specify executable in {py_file.name}")
+                        sns_kws = [kw for kw in node.keywords if kw.arg == "start_new_session"]
+                        self.assertEqual(
+                            len(sns_kws),
+                            1,
+                            f"self._subprocess_exec in {py_file.name} must explicitly pass start_new_session=True",
+                        )
+                        self.assertIsInstance(sns_kws[0].value, ast.Constant)
+                        self.assertIs(
+                            sns_kws[0].value.value,
+                            True,
+                            f"self._subprocess_exec in {py_file.name} must set start_new_session=True",
+                        )
+                        first_arg = node.args[0]
+                        for sub in ast.walk(first_arg):
+                            if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                                sval = sub.value.strip().lower()
+                                self.assertNotEqual(sval, "agy", f"Forbidden agy executable literal in {py_file.name}")
+                                self.assertNotEqual(
+                                    Path(sval).name,
+                                    "agy",
+                                    f"Forbidden agy executable path in {py_file.name}: {sub.value!r}",
+                                )
+            if py_file.name in adapter_files:
+                self.assertEqual(
+                    create_subproc_attr_hits,
+                    1,
+                    f"{py_file.name} must have exactly 1 create_subprocess_exec default injection reference",
+                )
+                self.assertGreater(
+                    self_subproc_exec_calls,
+                    0,
+                    f"{py_file.name} AST scan must hit >=1 self._subprocess_exec() call site (no-op prohibited)",
+                )
             # Zero `readlines()` in studio/data_sources.py (bounded reverse seek required)
             if py_file.name == "data_sources.py":
                 self.assertNotIn(".readlines(", src)
+        self.assertEqual(seen_adapter_files, set(adapter_files))
 
 
 class TestPAC2C3C4StudioChatEndToEnd(unittest.IsolatedAsyncioTestCase):

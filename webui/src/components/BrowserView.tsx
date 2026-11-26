@@ -6,20 +6,42 @@ import {
   Eye,
   Hand,
   Bot,
+  Loader2,
   Maximize2,
   Minimize2,
   Plus,
   RefreshCw,
+  Rocket,
   RotateCw,
+  SlidersHorizontal,
+  Square,
   X,
   ZoomIn,
   ZoomOut,
-  Play,
   Lock,
   Wifi,
   WifiOff,
 } from "lucide-react";
-import type { LiveBrowserState, StudioSession } from "../types";
+import {
+  fetchBrowserBots,
+  fetchBrowserEngines,
+  fetchBrowserProfiles,
+  fetchEgressNodes,
+  launchBrowser,
+  setBrowserOwnerBot,
+  setBrowserTakeover,
+  stopBrowser,
+} from "../api";
+import { BrowserConfigDrawer } from "./BrowserConfigDrawer";
+import type {
+  BrowserBotItem,
+  BrowserEngineId,
+  BrowserEngineInfo,
+  BrowserProfileItem,
+  EgressNodeItem,
+  LiveBrowserState,
+  StudioSession,
+} from "../types";
 
 interface BrowserViewProps {
   session: StudioSession;
@@ -111,6 +133,32 @@ export function BrowserView({
   const [dialogPromptValue, setDialogPromptValue] = useState("");
   const [hasFrame, setHasFrame] = useState(false);
 
+  // Stage 2: Dual-engine, Full-Roster AI selector, Manual Launch, Handback Note & Config Drawer
+  const [engines, setEngines] = useState<BrowserEngineInfo[]>([
+    { id: "camoufox", label: "Camoufox", available: true },
+    { id: "external_chromium", label: "External Chromium", available: false },
+  ]);
+  const [rosterBots, setRosterBots] = useState<BrowserBotItem[]>([]);
+  const [selectedBot, setSelectedBot] = useState<string>("");
+  const [switchingBot, setSwitchingBot] = useState(false);
+  const [profiles, setProfiles] = useState<BrowserProfileItem[]>([]);
+  const [egressNodes, setEgressNodes] = useState<EgressNodeItem[]>([]);
+  const [egressVaultReady, setEgressVaultReady] = useState(false);
+  const [egressVaultError, setEgressVaultError] = useState("");
+  const [drawSupported, setDrawSupported] = useState(false);
+  const [pruneSupported, setPruneSupported] = useState(false);
+
+  const [launchEngine, setLaunchEngine] = useState<BrowserEngineId>("camoufox");
+  const [launchProfile, setLaunchProfile] = useState<string>("default");
+  const [launchUrl, setLaunchUrl] = useState<string>("");
+  const [launching, setLaunching] = useState(false);
+  const [stopping, setStopping] = useState(false);
+
+  const [configDrawerOpen, setConfigDrawerOpen] = useState(false);
+  const [handbackModalOpen, setHandbackModalOpen] = useState(false);
+  const [handbackNote, setHandbackNote] = useState("");
+  const [submittingHandback, setSubmittingHandback] = useState(false);
+
   const stageWrapRef = useRef<HTMLDivElement | null>(null);
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -143,6 +191,61 @@ export function BrowserView({
     if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
     toastTimerRef.current = window.setTimeout(() => setToast(null), 3200);
   }, []);
+
+  const refreshControlMetadata = useCallback(async () => {
+    const [engRes, botsRes, profRes, egRes] = await Promise.allSettled([
+      fetchBrowserEngines(),
+      fetchBrowserBots(),
+      fetchBrowserProfiles("all"),
+      fetchEgressNodes(),
+    ]);
+    if (unmountedRef.current) return;
+
+    if (engRes.status === "fulfilled" && engRes.value.ok) {
+      setEngines(engRes.value.engines);
+      const actOwner = engRes.value.active_session?.owner_bot;
+      if (actOwner) {
+        setSelectedBot(actOwner);
+      }
+    }
+    if (botsRes.status === "fulfilled" && botsRes.value.ok) {
+      const bData = botsRes.value;
+      setRosterBots(bData.bots);
+      const preferred =
+        bData.active_owner_bot ||
+        bData.default_owner_bot ||
+        bData.bots[0]?.handle ||
+        "";
+      setSelectedBot((cur) => cur || preferred);
+    }
+    if (profRes.status === "fulfilled" && profRes.value.ok) {
+      setProfiles(profRes.value.profiles);
+    }
+    if (egRes.status === "fulfilled" && egRes.value.ok) {
+      setEgressNodes(egRes.value.nodes);
+      setEgressVaultReady(egRes.value.vault_ready);
+      setEgressVaultError(egRes.value.vault_error || "");
+      setDrawSupported(egRes.value.draw_supported);
+      setPruneSupported(egRes.value.prune_supported);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshControlMetadata();
+  }, [refreshControlMetadata, liveRole]);
+
+  useEffect(() => {
+    if (state.owner_bot) {
+      setSelectedBot(state.owner_bot);
+    }
+  }, [state.owner_bot]);
+
+  useEffect(() => {
+    const engineProfs = profiles.filter((p) => p.engine === launchEngine);
+    if (engineProfs.length > 0 && !engineProfs.some((p) => p.name === launchProfile)) {
+      setLaunchProfile(engineProfs[0].name);
+    }
+  }, [launchEngine, launchProfile, profiles]);
 
   const sendWsJson = useCallback((payload: Record<string, unknown>) => {
     const ws = wsRef.current;
@@ -569,18 +672,113 @@ export function BrowserView({
 
   const toggleTakeover = () => {
     if (liveRole !== "admin") return;
-    const want = !state.takeover;
-    if (!want) {
-      releaseAllHeldInputs();
+    if (state.takeover) {
+      setHandbackModalOpen(true);
+      return;
     }
     sendWsJson({
       type: "set_takeover",
-      active: want,
-      reason: want ? "Studio 桌面端人工接管" : "Studio 交还 AI",
+      active: true,
+      reason: "Studio 桌面端人工接管",
       session_gen: state.session_gen,
       takeover_gen: state.takeover_gen,
       req_id: `tk-${Date.now()}`,
     });
+  };
+
+  const handleConfirmHandback = async (withInstruction: boolean) => {
+    if (liveRole !== "admin" || submittingHandback) return;
+    releaseAllHeldInputs();
+    setSubmittingHandback(true);
+    try {
+      const note = withInstruction ? handbackNote.trim() : "";
+      await setBrowserTakeover({
+        active: false,
+        reason: "Studio 交还 AI",
+        instruction: note || undefined,
+        expected_session_gen: state.session_gen || undefined,
+        expected_takeover_gen: state.takeover_gen || undefined,
+      });
+      setHandbackNote("");
+      setHandbackModalOpen(false);
+      const targetHandle = (state.owner_bot || selectedBot || "").replace(/^@/, "");
+      showToast(
+        targetHandle
+          ? `▶️ 已交还给 @${targetHandle}${note ? "（已附带下一步指令）" : ""}`
+          : "▶️ 已交还给 AI 继续执行",
+      );
+    } catch (err) {
+      showToast(`⚠️ 交还失败: ${err instanceof Error ? err.message : "未知错误"}`);
+    } finally {
+      setSubmittingHandback(false);
+    }
+  };
+
+  const handleSelectOwnerBot = async (nextHandle: string) => {
+    if (liveRole !== "admin" || !nextHandle || switchingBot) return;
+    setSwitchingBot(true);
+    try {
+      const resp = await setBrowserOwnerBot({ owner_bot: nextHandle });
+      setSelectedBot(resp.owner_bot);
+      setState((prev) => ({
+        ...prev,
+        owner_bot: resp.owner_bot,
+        owner_bot_id: resp.owner_bot_id,
+      }));
+      showToast(
+        resp.running
+          ? `🤖 运行中已原子热改绑至 @${resp.owner_bot}（未重启浏览器）`
+          : `🤖 默认操作 AI 已切换为 @${resp.owner_bot}`,
+      );
+    } catch (err) {
+      showToast(`⚠️ 切换 AI 失败: ${err instanceof Error ? err.message : "未知错误"}`);
+    } finally {
+      setSwitchingBot(false);
+    }
+  };
+
+  const handleManualLaunch = async (e?: React.FormEvent) => {
+    e?.preventDefault();
+    if (liveRole !== "admin" || launching) return;
+    setLaunching(true);
+    try {
+      const rawUrl = launchUrl.trim();
+      const normalizedUrl = rawUrl
+        ? /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(rawUrl)
+          ? rawUrl
+          : `https://${rawUrl}`
+        : undefined;
+      await launchBrowser({
+        engine: launchEngine,
+        profile: launchProfile || "default",
+        url: normalizedUrl,
+        owner_bot: selectedBot || undefined,
+        manual_launch: true,
+      });
+      showToast(
+        `🚀 已手动拉起 ${launchEngine}/${launchProfile || "default"}，已唤醒 @${(selectedBot || "AI").replace(/^@/, "")} 待命`,
+      );
+      await refreshControlMetadata();
+    } catch (err) {
+      showToast(`⚠️ 手动拉起失败: ${err instanceof Error ? err.message : "未知错误"}`);
+    } finally {
+      setLaunching(false);
+    }
+  };
+
+  const handleStopBrowser = async () => {
+    if (liveRole !== "admin" || stopping) return;
+    releaseAllHeldInputs();
+    setStopping(true);
+    try {
+      await stopBrowser();
+      showToast("⏹ 浏览器已安全停止");
+      await refreshControlMetadata();
+    } catch (err) {
+      showToast(`⚠️ 停止失败: ${err instanceof Error ? err.message : "未知错误"}`);
+    } finally {
+      setStopping(false);
+    }
   };
 
   const handleSetQuality = (preset: "hd" | "balanced" | "smooth") => {
@@ -612,15 +810,6 @@ export function BrowserView({
     } catch {
       showToast("当前浏览器环境不支持全屏 API");
     }
-  };
-
-  const handleStartBrowser = () => {
-    if (liveRole !== "admin") return;
-    sendWsJson({
-      type: "start_browser",
-      session_gen: state.session_gen,
-      takeover: true,
-    });
   };
 
   const handleDialogReply = (accept: boolean) => {
@@ -664,6 +853,15 @@ export function BrowserView({
   const cursorTopPct = showCursor ? clamp01(cursorY / state.vh) * 100 : 0;
   const isAiCursor = state.cursor?.actor !== "human";
   const canControl = liveRole === "admin" && state.takeover && state.running;
+  const activeOwnerHandle = (state.owner_bot || selectedBot || "").replace(/^@/, "");
+  const availableEngines = engines.filter((e) => e.available || e.id === "camoufox");
+  const launchProfilesForEngine = profiles.filter((p) => p.engine === launchEngine);
+  const extEngineLabel =
+    engines.find((e) => e.id === "external_chromium")?.label || "External Chromium";
+  const activeEngineDisplay =
+    state.engine === "external_chromium" || state.engine_mode === "sync_external"
+      ? extEngineLabel
+      : "Camoufox";
 
   return (
     <div
@@ -891,30 +1089,92 @@ export function BrowserView({
           </div>
         )}
 
-        {/* Takeover / Readonly indicator */}
-        {liveRole === "admin" ? (
-          <button
-            type="button"
-            disabled={!state.running || Boolean(state.session_restricted)}
-            onClick={toggleTakeover}
-            className={`h-7 px-2.5 rounded-md text-xs font-medium inline-flex items-center gap-1.5 shrink-0 transition-colors cursor-pointer disabled:opacity-40 disabled:pointer-events-none ${
-              state.takeover
-                ? "bg-emerald-600 hover:bg-emerald-500 text-white"
-                : "bg-sky-600/90 hover:bg-sky-500 text-white"
-            }`}
+        {/* Unrestricted Full-Roster AI Selector (permanent in top toolbar) */}
+        <div
+          className="flex items-center gap-1 shrink-0 rounded-md border border-slate-700/80 bg-slate-950/80 px-1.5 h-7"
+          title={
+            liveRole === "admin"
+              ? "选择操作 AI（待机设默认，运行/接管中原子热改绑，不重启浏览器）"
+              : "当前绑定操作 AI（只读）"
+          }
+        >
+          <Bot className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+          <select
+            aria-label="绑定操作 AI"
+            value={selectedBot}
+            disabled={liveRole !== "admin" || switchingBot || rosterBots.length === 0}
+            onChange={(e) => void handleSelectOwnerBot(e.target.value)}
+            className="bg-transparent text-xs text-slate-200 focus:outline-none max-w-[145px] truncate cursor-pointer disabled:cursor-default disabled:opacity-75"
           >
-            {state.takeover ? (
-              <>
-                <Bot className="w-3.5 h-3.5" />
-                <span>交还 AI</span>
-              </>
+            {rosterBots.length === 0 ? (
+              <option value="" className="bg-slate-900">
+                {activeOwnerHandle ? `@${activeOwnerHandle}` : "加载 AI…"}
+              </option>
             ) : (
-              <>
-                <Hand className="w-3.5 h-3.5" />
-                <span>人工接管</span>
-              </>
+              rosterBots.map((b) => (
+                <option key={b.handle} value={b.handle} className="bg-slate-900 text-slate-100">
+                  {b.online ? "● " : "○ "}@{b.handle} ({b.display_name} · {b.role})
+                </option>
+              ))
             )}
-          </button>
+          </select>
+        </div>
+
+        {/* Profile & Egress Config Drawer Trigger */}
+        <button
+          type="button"
+          onClick={() => {
+            void refreshControlMetadata();
+            setConfigDrawerOpen(true);
+          }}
+          title="双浏览器 Profile 与 SOCKS5 出口 IP 池配置"
+          className="h-7 px-2 rounded-md border border-slate-700/80 bg-slate-800/70 hover:bg-slate-800 text-xs text-slate-200 inline-flex items-center gap-1 shrink-0 cursor-pointer"
+        >
+          <SlidersHorizontal className="w-3.5 h-3.5 text-sky-400" />
+          {!compact && !isDrawer && <span>配置</span>}
+        </button>
+
+        {/* Takeover / Stop / Readonly indicator */}
+        {liveRole === "admin" ? (
+          <div className="flex items-center gap-1 shrink-0">
+            <button
+              type="button"
+              disabled={!state.running || Boolean(state.session_restricted)}
+              onClick={toggleTakeover}
+              className={`h-7 px-2.5 rounded-md text-xs font-medium inline-flex items-center gap-1.5 shrink-0 transition-colors cursor-pointer disabled:opacity-40 disabled:pointer-events-none ${
+                state.takeover
+                  ? "bg-emerald-600 hover:bg-emerald-500 text-white"
+                  : "bg-sky-600/90 hover:bg-sky-500 text-white"
+              }`}
+            >
+              {state.takeover ? (
+                <>
+                  <Bot className="w-3.5 h-3.5" />
+                  <span>交还 AI</span>
+                </>
+              ) : (
+                <>
+                  <Hand className="w-3.5 h-3.5" />
+                  <span>人工接管</span>
+                </>
+              )}
+            </button>
+            {state.running && !state.session_restricted && (
+              <button
+                type="button"
+                disabled={stopping}
+                onClick={() => void handleStopBrowser()}
+                title="停止当前浏览器会话"
+                className="h-7 w-7 rounded-md border border-rose-500/40 bg-rose-500/10 hover:bg-rose-500/20 text-rose-300 inline-flex items-center justify-center cursor-pointer disabled:opacity-40"
+              >
+                {stopping ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <Square className="w-3 h-3 fill-current" />
+                )}
+              </button>
+            )}
+          </div>
         ) : (
           <span className="h-7 px-2.5 rounded-md border border-amber-500/30 bg-amber-500/10 text-amber-300 text-xs font-medium inline-flex items-center gap-1 shrink-0">
             <Eye className="w-3.5 h-3.5" />
@@ -1039,29 +1299,103 @@ export function BrowserView({
               </p>
             </div>
           ) : !state.running ? (
-            <div className="absolute inset-0 bg-slate-950/90 backdrop-blur-sm flex flex-col items-center justify-center gap-3.5 p-6 text-center z-30">
-              <div className="h-11 w-11 rounded-2xl border border-slate-800 bg-slate-900 flex items-center justify-center text-sky-400">
+            <div className="absolute inset-0 bg-slate-950/92 backdrop-blur-sm flex flex-col items-center justify-center gap-3.5 p-5 text-center z-30 overflow-y-auto">
+              <div className="h-10 w-10 rounded-2xl border border-slate-800 bg-slate-900 flex items-center justify-center text-sky-400 shrink-0">
                 <RefreshCw className="w-5 h-5" />
               </div>
               <div>
                 <div className="text-sm font-semibold text-slate-100">
                   Live-Browser 当前处于待机状态
                 </div>
-                <p className="text-xs text-slate-400 mt-1 max-w-sm">
+                <p className="text-xs text-slate-400 mt-1 max-w-md">
                   {liveRole === "admin"
-                    ? "当 AI 执行浏览器任务时会自动推流，也可直接点击下方拉起托管浏览器并接管。"
+                    ? "无需先唤醒 AI，可直接选择引擎、Profile 与操作 AI 手动拉起浏览器；拉起后即进入人工接管态并首帧唤醒所选 AI 待命。"
                     : "当前为只读观摩角色，等待管理员或 AI 启动浏览器会话。"}
                 </p>
               </div>
-              {liveRole === "admin" && wsStatus === "connected" && (
-                <button
-                  type="button"
-                  onClick={handleStartBrowser}
-                  className="inline-flex items-center gap-2 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-xs font-medium px-4 py-2 transition-colors cursor-pointer"
+              {liveRole === "admin" && (
+                <form
+                  onSubmit={(e) => void handleManualLaunch(e)}
+                  className="w-full max-w-md rounded-2xl border border-slate-800 bg-slate-900/90 p-3.5 text-left space-y-2.5 shadow-xl select-text"
                 >
-                  <Play className="w-3.5 h-3.5" />
-                  启动托管浏览器并接管
-                </button>
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <label className="block text-[11px] text-slate-400 mb-1">浏览器引擎</label>
+                      <select
+                        value={launchEngine}
+                        onChange={(e) => setLaunchEngine(e.target.value as BrowserEngineId)}
+                        className="w-full h-8 rounded-lg bg-slate-950 border border-slate-700 px-2 text-xs text-slate-100"
+                      >
+                        {availableEngines.map((eng) => (
+                          <option key={eng.id} value={eng.id}>
+                            {eng.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-[11px] text-slate-400 mb-1">指纹 Profile</label>
+                      <select
+                        value={launchProfile}
+                        onChange={(e) => setLaunchProfile(e.target.value)}
+                        className="w-full h-8 rounded-lg bg-slate-950 border border-slate-700 px-2 text-xs text-slate-100"
+                      >
+                        {launchProfilesForEngine.length === 0 ? (
+                          <option value="default">default</option>
+                        ) : (
+                          launchProfilesForEngine.map((p) => (
+                            <option key={p.name} value={p.name}>
+                              {p.pinned ? "🔒 " : p.allow_google ? "⭐ " : ""}
+                              {p.name} ({p.egress || "direct"})
+                            </option>
+                          ))
+                        )}
+                      </select>
+                    </div>
+                  </div>
+                  <div>
+                    <label className="block text-[11px] text-slate-400 mb-1">起始网址（可选）</label>
+                    <input
+                      type="text"
+                      value={launchUrl}
+                      onChange={(e) => setLaunchUrl(e.target.value)}
+                      placeholder="https://example.com（留空打开默认页）"
+                      className="w-full h-8 rounded-lg bg-slate-950 border border-slate-700 px-2.5 text-xs text-slate-100 placeholder:text-slate-500"
+                    />
+                  </div>
+                  <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+                    <span className="text-[11px] text-slate-400">
+                      待命 AI:{" "}
+                      <span className="font-mono text-sky-300">
+                        @{activeOwnerHandle || "默认"}
+                      </span>
+                    </span>
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          void refreshControlMetadata();
+                          setConfigDrawerOpen(true);
+                        }}
+                        className="h-8 px-2.5 rounded-lg border border-slate-700 hover:bg-slate-800 text-xs text-slate-300 cursor-pointer"
+                      >
+                        管理 Profile / 出口池
+                      </button>
+                      <button
+                        type="submit"
+                        disabled={launching}
+                        className="h-8 px-3.5 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-xs font-medium inline-flex items-center gap-1.5 transition-colors disabled:opacity-50 cursor-pointer"
+                      >
+                        {launching ? (
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        ) : (
+                          <Rocket className="w-3.5 h-3.5" />
+                        )}
+                        手动拉起浏览器
+                      </button>
+                    </div>
+                  </div>
+                </form>
               )}
             </div>
           ) : !hasFrame ? (
@@ -1073,7 +1407,7 @@ export function BrowserView({
 
         {/* Subtle Floating Status Pill */}
         {state.running && !state.session_restricted && (
-          <div className="pointer-events-none absolute bottom-3 left-3 z-20 flex items-center gap-2 rounded-full border border-slate-800/90 bg-slate-900/85 backdrop-blur px-2.5 py-1 text-[11px] text-slate-300">
+          <div className="pointer-events-none absolute bottom-3 left-3 z-20 flex flex-wrap items-center gap-1.5 rounded-full border border-slate-800/90 bg-slate-900/90 backdrop-blur px-2.5 py-1 text-[11px] text-slate-300">
             <span
               className={`h-2 w-2 rounded-full ${
                 state.takeover
@@ -1085,21 +1419,104 @@ export function BrowserView({
             />
             <span>
               {state.takeover
-                ? "人工接管中"
+                ? state.manual_launch
+                  ? "手动接管中（AI 待命）"
+                  : "人工接管中"
                 : state.ai_busy
                   ? state.ai_status || "AI 操作中"
                   : "实时镜像"}
             </span>
+            <span className="text-sky-300 font-mono">· {activeEngineDisplay}</span>
+            {activeOwnerHandle && (
+              <span className="text-emerald-300 font-mono">· @{activeOwnerHandle}</span>
+            )}
             {state.profile && (
-              <span className="text-slate-500 font-mono">
-                · {state.profile}
-              </span>
+              <span className="text-slate-400 font-mono">· {state.profile}</span>
+            )}
+            {state.egress && (
+              <span className="text-slate-500 font-mono">· {state.egress}</span>
             )}
             <span className="text-slate-500 font-mono">
               · {state.vw}×{state.vh}
             </span>
           </div>
         )}
+
+        {/* Handback to AI Modal with optional next-step instruction */}
+        {handbackModalOpen && liveRole === "admin" && state.running && state.takeover && (
+          <div className="absolute inset-0 bg-black/60 backdrop-blur-xs z-50 flex items-center justify-center p-4">
+            <div className="w-full max-w-md rounded-2xl border border-slate-700 bg-slate-900 p-4 shadow-2xl space-y-3 select-text">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2 text-xs font-semibold text-emerald-400">
+                  <Bot className="w-4 h-4" />
+                  <span>
+                    交还控制权给 AI：@{activeOwnerHandle || "当前绑定 AI"}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setHandbackModalOpen(false)}
+                  className="text-slate-400 hover:text-slate-200 cursor-pointer"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+              <p className="text-xs text-slate-400">
+                可填写下一步工作指令（留空可直接一键交还）。如需改由其他 AI 接手，请先在顶栏切换操作 AI。
+              </p>
+              <textarea
+                rows={3}
+                maxLength={2000}
+                value={handbackNote}
+                onChange={(e) => setHandbackNote(e.target.value)}
+                placeholder="例如：我已完成登录验证，请继续抓取当前页面订单并导出摘要（选填）"
+                className="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-emerald-500"
+              />
+              <div className="flex items-center justify-end gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={() => setHandbackModalOpen(false)}
+                  className="px-3 py-1.5 rounded-lg border border-slate-700 text-xs text-slate-300 hover:bg-slate-800 cursor-pointer"
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  disabled={submittingHandback}
+                  onClick={() => void handleConfirmHandback(false)}
+                  className="px-3 py-1.5 rounded-lg border border-emerald-500/40 bg-emerald-500/10 hover:bg-emerald-500/20 text-xs text-emerald-300 cursor-pointer disabled:opacity-50"
+                >
+                  直接交还
+                </button>
+                <button
+                  type="button"
+                  disabled={submittingHandback}
+                  onClick={() => void handleConfirmHandback(true)}
+                  className="px-3.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-xs font-medium text-white inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                >
+                  {submittingHandback && <Loader2 className="w-3 h-3 animate-spin" />}
+                  {handbackNote.trim() ? "附带指令交还给 AI" : "确认交还给 AI"}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Dual-Engine Profile & Egress Pool Config Drawer */}
+        <BrowserConfigDrawer
+          open={configDrawerOpen}
+          onClose={() => setConfigDrawerOpen(false)}
+          canEdit={liveRole === "admin"}
+          engines={engines}
+          profiles={profiles}
+          egressNodes={egressNodes}
+          egressVaultReady={egressVaultReady}
+          egressVaultError={egressVaultError}
+          drawSupported={drawSupported}
+          pruneSupported={pruneSupported}
+          onRefreshAll={refreshControlMetadata}
+          onNotify={showToast}
+        />
 
         {/* Floating Toast */}
         {toast && (

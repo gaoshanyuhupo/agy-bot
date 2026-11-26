@@ -18,22 +18,28 @@ import datetime
 import fcntl
 import hashlib
 import html as html_mod
+import ipaddress
 import json
 import math
 import os
 import py_compile
 import random
 import re
+import secrets
 import shlex
 import shutil
 import signal
+import socket
 import sqlite3
+import ssl
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import uuid
 import zlib
 try:
@@ -422,6 +428,7 @@ turn_running_web_id = None  # turn_id if currently executing turn is a Web Studi
 turn_running_cid = None     # conversation_id of currently executing interactive turn
 turn_running_worktree_id = None  # worktree_id if currently executing turn is isolated in a worktree
 turn_running_qid = None     # queue entry qid of currently executing worker job
+turn_running_lb_kind = None # live_browser takeover kind ("takeover_ack" | "handback" | None)
 turn_gen = 0                # Monotonically increasing generation counter per run_agy turn
 turn_waiting_bg = False     # True while current turn finished intermediate step and waits on bg event
 turn_waiting_bg_since = None  # Timestamp (time.time()) when current turn entered waiting_bg
@@ -6732,6 +6739,10 @@ def perform_hot_reload(notify_chat_id=None, notify_thread_id=None):
         send(notify_chat_id, "🔄 正在热重载桥接服务...", thread_id=notify_thread_id)
     close_all_sessions_sync()
     _cleanup_google_login_flows()
+    try:
+        _lb_stop_external_watch(stop_external_profile=False)
+    except Exception as exc:
+        log(f"Hot reload external watch stop warning: {type(exc).__name__}")
     _stop_studio_ipc()
     _stop_gateway_adapter()
     time.sleep(0.3)
@@ -8283,11 +8294,47 @@ def _validate_live_browser_sync_screenshot(raw_path, owner_uid):
         return ""
 
 
+_LB_HANDBACK_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_LB_TAG_BREAK_RE = re.compile(
+    r"<\s*/?\s*(?:untrusted_webpage_content|system|assistant|user|developer|tool_call|tool_response)\b[^>]*>",
+    re.IGNORECASE,
+)
+_LB_ACB_MARKER_RE = re.compile(r"\[\s*/?\s*ACB_[A-Z0-9_]+[^\]]*\]", re.IGNORECASE)
+_LB_USERINFO_RE = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://)([^/\s@]+@)")
+_LB_MAX_HANDBACK_LEN = 2000
+
+
 def _sanitize_live_browser_field(raw, max_len=400):
     s = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]+", " ", str(raw or ""))
+    s = _LB_TAG_BREAK_RE.sub("[tag-neutralized]", s)
+    s = re.sub(r"<\s*/?\s*untrusted", "&lt;/untrusted", s, flags=re.IGNORECASE)
     s = re.sub(r"\s+", " ", s).strip()
     if len(s) > max_len:
         s = s[: max(1, max_len - 1)].rstrip() + "…"
+    return s
+
+
+def _scrub_live_browser_egress(raw, max_len=128):
+    s = str(raw or "").strip()
+    if not s:
+        return "direct"
+    s = _LB_USERINFO_RE.sub(r"\1***@", s)
+    s = re.sub(r"[\x00-\x1f\x7f]+", " ", s)
+    s = " ".join(s.split())
+    return s[:max_len] or "direct"
+
+
+def _sanitize_live_browser_handback_note(raw, max_len=_LB_MAX_HANDBACK_LEN):
+    if raw is None:
+        return ""
+    s = str(raw).replace("\r\n", "\n").replace("\r", "\n")
+    s = _LB_HANDBACK_CTRL_RE.sub("", s)
+    s = _LB_TAG_BREAK_RE.sub("[tag-neutralized]", s)
+    s = _LB_ACB_MARKER_RE.sub("[marker-neutralized]", s)
+    s = re.sub(r"<\s*/\s*untrusted", "&lt;/untrusted", s, flags=re.IGNORECASE)
+    s = s.strip()
+    if len(s) > max_len:
+        s = s[:max_len].rstrip()
     return s
 
 
@@ -8303,12 +8350,30 @@ def _build_live_browser_takeover_prompt(
     title,
     tabs,
     page_summary,
+    engine="",
+    profile="",
+    egress="",
+    manual_launch=False,
+    readonly_standby=False,
+    handback_note="",
+    engine_mode="",
 ):
     safe_reason = _sanitize_live_browser_field(reason, max_len=200)
     safe_source = _sanitize_live_browser_field(source, max_len=48)
     safe_url = _sanitize_live_browser_field(url, max_len=400)
     safe_title = _sanitize_live_browser_field(title, max_len=160)
     safe_summary = _sanitize_live_browser_field(page_summary, max_len=600)
+    safe_engine = _sanitize_live_browser_field(engine, max_len=32).lower()
+    safe_mode = _sanitize_live_browser_field(engine_mode, max_len=32).lower()
+    if not safe_engine:
+        if safe_mode == "sync_external":
+            safe_engine = "external_chromium"
+        elif safe_mode == "async_hosted":
+            safe_engine = "camoufox"
+    safe_profile = _sanitize_live_browser_field(profile, max_len=64)
+    safe_egress = _scrub_live_browser_egress(egress or "direct", max_len=128)
+    clean_note = _sanitize_live_browser_handback_note(handback_note) if (not active and handback_note) else ""
+
     tab_lines = []
     if isinstance(tabs, list):
         for t in tabs[:10]:
@@ -8320,6 +8385,15 @@ def _build_live_browser_takeover_prompt(
             t_url = _sanitize_live_browser_field(t.get("url") or "", max_len=160)
             tab_lines.append(f"  [{mark}] #{t_idx} {t_title} ({t_url})")
     tabs_block = "\n".join(tab_lines) if tab_lines else "  (无标签页信息)"
+
+    meta_lines = []
+    if safe_engine:
+        meta_lines.append(f"- 浏览器引擎：`{safe_engine}`")
+    if safe_profile:
+        meta_lines.append(f"- 当前指纹 Profile：`{safe_profile}`")
+    if safe_egress:
+        meta_lines.append(f"- 脱敏出口摘要：`{safe_egress}`")
+    meta_section = ("\n".join(meta_lines) + "\n") if meta_lines else ""
 
     shot_section = (
         f"- 最新同步画面截图路径：`{screenshot_path}`\n"
@@ -8338,6 +8412,22 @@ def _build_live_browser_takeover_prompt(
     )
 
     if active:
+        if manual_launch or readonly_standby:
+            read_instr = (
+                f"请先使用 `read_file` 只读查看同步截图 `{screenshot_path}` 以对齐当前画面，然后仅简短回复确认"
+                "「已看到当前手动拉起的浏览器画面并待命，等你操作完毕点击【▶️ 交还给 AI】后再接手」即可。"
+                if screenshot_path
+                else "请仅简短回复确认「已收到手动拉起浏览器画面状态并待命，等你操作完毕点击【▶️ 交还给 AI】后再接手」即可。"
+            )
+            return (
+                f"[LIVE_BROWSER_TAKEOVER_EVENT state=human_takeover manual_launch=1 session_gen={session_gen} takeover_gen={takeover_gen} source={safe_source}]\n"
+                f"管理员已手动拉起浏览器并处于人工操作接管状态（原因：{safe_reason or 'manual_launch'}）。\n"
+                f"{meta_section}"
+                f"{shot_section}"
+                f"- 执行约束：{read_instr}\n"
+                "- 强制禁止：人类正在手动操作，本轮严格只读待命，严禁操作、点击、输入、导航或控制浏览器，也严禁修改工作区，等待人类点击【▶️ 交还给 AI】后再接手。\n\n"
+                f"{untrusted_block}"
+            )
         read_instr = (
             f"请先使用 `read_file` 只读查看同步截图 `{screenshot_path}` 以对齐当前画面，然后简短回复用户确认"
             "「已暂停浏览器操作、等你接管完毕交还」即可。"
@@ -8347,6 +8437,7 @@ def _build_live_browser_takeover_prompt(
         return (
             f"[LIVE_BROWSER_TAKEOVER_EVENT state=human_takeover session_gen={session_gen} takeover_gen={takeover_gen} source={safe_source}]\n"
             f"管理员已在 Live Browser 中主动开启人工接管（原因：{safe_reason or '人工接管'}）。\n"
+            f"{meta_section}"
             f"{shot_section}"
             f"- 执行约束：{read_instr}\n"
             f"- 强制禁止：本轮严格只读，严禁调用任何 `live-browser`、浏览器点击/输入/导航或修改工作区的工具。\n\n"
@@ -8359,11 +8450,27 @@ def _build_live_browser_takeover_prompt(
         if screenshot_path
         else "请结合下方最新页面状态与之前的对话上下文，确认人类在接管期间完成的操作并继续推进接下来的任务。"
     )
+    ext_hint = ""
+    if safe_engine == "external_chromium" or (safe_mode == "sync_external" and safe_engine != "camoufox"):
+        ext_hint = (
+            "- 外部 Chromium 直播流提示：当前外部 Chromium 的 CDP 直播流仍保持在线（人类可随时旁观或再次点击人工接管）；"
+            f"请直接通过对应的外部 Chromium CLI 操作当前 Profile（`{safe_profile or 'default'}`）继续推进下一步，**无需**关闭直播流。\n"
+        )
+    admin_note_block = ""
+    if clean_note:
+        admin_note_block = (
+            "\n[管理员交还附言 / 下一步工作指令]\n"
+            f"{clean_note}\n"
+            "[/管理员交还附言]\n"
+        )
     return (
         f"[LIVE_BROWSER_TAKEOVER_EVENT state=handback_to_ai session_gen={session_gen} takeover_gen={takeover_gen} source={safe_source}]\n"
         f"管理员已完成人工接管并将 Live Browser 控制权交还给 AI（原因：{safe_reason or '交还给 AI'}）。\n"
+        f"{meta_section}"
         f"{shot_section}"
-        f"- 衔接要求：{read_instr}\n\n"
+        f"- 衔接要求：{read_instr}\n"
+        f"{ext_hint}"
+        f"{admin_note_block}\n"
         f"{untrusted_block}"
     )
 
@@ -8440,12 +8547,20 @@ def _handle_live_browser_takeover_event(pkt):
 
     wait_human_active = bool(pkt.get("wait_human_active", False))
     engine_mode = str(pkt.get("engine_mode") or "").strip().lower()
+    engine = str(pkt.get("engine") or "").strip().lower()
+    profile = str(pkt.get("profile") or "").strip()
+    egress = str(pkt.get("egress") or "direct").strip()
+    manual_launch = bool(pkt.get("manual_launch", False))
+    readonly_standby = bool(pkt.get("readonly_standby", False))
+    raw_note = pkt.get("instruction") if pkt.get("instruction") is not None else pkt.get("handback_note")
+    clean_note = _sanitize_live_browser_handback_note(raw_note) if (not active and raw_note is not None) else ""
     source = str(pkt.get("source") or "").strip().lower()
     dm_skey = scope_key_for(owner_uid, None)
 
     with session_lock:
         is_busy = bool(turn_running)
         dm_running = bool(turn_running and turn_running_scope == dm_skey)
+        dm_lb_kind = turn_running_lb_kind if dm_running else None
 
     # 7. Dispatch according to active / wait_human_active / busy rules
     if active:
@@ -8471,6 +8586,12 @@ def _handle_live_browser_takeover_event(pkt):
             title=pkt.get("title") or "",
             tabs=pkt.get("tabs") or [],
             page_summary=pkt.get("page_summary") or "",
+            engine=engine,
+            profile=profile,
+            egress=egress,
+            manual_launch=manual_launch,
+            readonly_standby=readonly_standby,
+            engine_mode=engine_mode,
         )
         job_q.put(
             (
@@ -8500,9 +8621,13 @@ def _handle_live_browser_takeover_event(pkt):
     if wait_human_active:
         log("Suppressed live_browser handback wake for uid=%s: wait_human_active=True" % owner_uid)
         return True
+    # Only suppress `sync_external and dm_running` for legacy in-turn SyncLiveBridge polling;
+    # NEVER swallow handback when manual_launch=True, an explicit handback note is present,
+    # or the currently running DM turn is merely replying to `takeover_ack`!
     if engine_mode == "sync_external" and dm_running:
-        log("Suppressed live_browser handback wake for uid=%s: sync_external active polling in DM" % owner_uid)
-        return True
+        if not manual_launch and not clean_note and dm_lb_kind != "takeover_ack":
+            log("Suppressed live_browser handback wake for uid=%s: sync_external active polling in DM" % owner_uid)
+            return True
 
     wake_prompt = _build_live_browser_takeover_prompt(
         active=False,
@@ -8515,6 +8640,13 @@ def _handle_live_browser_takeover_event(pkt):
         title=pkt.get("title") or "",
         tabs=pkt.get("tabs") or [],
         page_summary=pkt.get("page_summary") or "",
+        engine=engine,
+        profile=profile,
+        egress=egress,
+        manual_launch=manual_launch,
+        readonly_standby=False,
+        handback_note=clean_note,
+        engine_mode=engine_mode,
     )
     job_q.put(
         (
@@ -9016,7 +9148,7 @@ _studio_ipc_tg_group_send = studio_ipc_handlers._studio_ipc_tg_group_send
 _studio_ipc_room_turn = studio_ipc_handlers._studio_ipc_room_turn
 
 def worker():
-    global turn_running, turn_running_scope, turn_running_chat, turn_running_web_id, turn_running_cid, turn_running_worktree_id, turn_running_qid
+    global turn_running, turn_running_scope, turn_running_chat, turn_running_web_id, turn_running_cid, turn_running_worktree_id, turn_running_qid, turn_running_lb_kind
     global turn_gen, turn_waiting_bg, turn_waiting_bg_since, turn_preempted_gen, cancel_requested
 
     while True:
@@ -9044,8 +9176,10 @@ def worker():
         claim_scope = skey
         claim_web_id = None
         claim_wt_id = None
+        claim_lb_kind = None
         if is_chat_item and isinstance(prompt[1], dict):
             meta_pre = prompt[1]
+            claim_lb_kind = meta_pre.get("lb_takeover_kind")
             if str(meta_pre.get("user_role") or "admin") == "readonly":
                 ro_uid = meta_pre.get("user_id")
                 claim_scope = f"{skey}:ro:{ro_uid if ro_uid is not None else 'guest'}"
@@ -9070,6 +9204,7 @@ def worker():
             turn_running_cid = None
             turn_running_worktree_id = claim_wt_id
             turn_running_qid = qid
+            turn_running_lb_kind = claim_lb_kind
             turn_waiting_bg = False
             turn_waiting_bg_since = None
             turn_preempted_gen = None
@@ -9223,6 +9358,7 @@ def worker():
                     turn_running_cid = None
                     turn_running_worktree_id = None
                     turn_running_qid = None
+                    turn_running_lb_kind = None
                     turn_waiting_bg = False
                     turn_waiting_bg_since = None
                     if turn_preempted_gen == claimed_turn_gen:
@@ -13499,6 +13635,38 @@ def cmd_guard(chat_id, raw_rest="", thread_id=None, from_user=None):
 
 
 # ---------------------------------------------------------------- live-browser panel (/browser)
+_lb_default_owner_lock = threading.Lock()
+_lb_default_owner_bot = None
+_lb_default_owner_bot_id = None
+
+_lb_ext_lock = threading.Lock()
+_lb_ext_watch_proc = None
+_lb_ext_watch_meta = {}
+
+_LB_EGRESS_ALLOWED_SCHEMES = frozenset({"socks5", "socks5h", "http", "https"})
+_LB_EGRESS_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
+_LB_EGRESS_COUNTRY_RE = re.compile(r"^[A-Z]{2}$")
+_LB_EGRESS_HOSTNAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
+_LB_EGRESS_HEX_LABEL_RE = re.compile(r"^0[xX][0-9A-Fa-f]+$")
+_LB_PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_LB_VAULT_REF_SEG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$")
+_LB_VAULT_REF_FIELD_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+_LB_WINDOW_RE = re.compile(r"^[1-9][0-9]{2,3}[xX,][1-9][0-9]{2,3}$")
+_LB_TZ_RE = re.compile(r"^[A-Za-z0-9_/+.-]{1,64}$")
+_LB_LANG_RE = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8}){0,2}$")
+_LB_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
+_LB_SENSITIVE_LOOPBACK_PORTS = frozenset(
+    {22, 23, 25, 53, 80, 443, 3306, 5432, 6379, 8200, 8201, 18795, 18796, 37701}
+)
+_LB_FORBIDDEN_METADATA_HOSTS = frozenset(
+    {"metadata.google.internal", "metadata.goog", "metadata", "instance-data"}
+)
+_LB_DEFAULT_PROBE_URL = "https://cloudflare.com/cdn-cgi/trace"
+_LB_DEDICATED_GOOGLE_BOUNDARY_KEYS = frozenset(
+    {"user_data_dir", "persistent", "persistent_context", "ephemeral", "pinned", "allow_google", "account", "headless"}
+)
+
+
 def _live_browser_endpoint():
     base_url = (os.environ.get("AGY_LIVE_BROWSER_URL") or "http://127.0.0.1:18795").strip().rstrip("/")
     cfg_dir = (
@@ -13521,12 +13689,20 @@ def _live_browser_request(method, path, json_body=None, timeout=(1.5, 4.0), para
 
     url = f"{base_url}{path}"
     headers = {"X-Live-Token": token}
+    m = method.upper()
     try:
-        if method.upper() == "GET":
+        if m == "GET":
             req_kw = {"headers": headers, "timeout": timeout}
             if params:
                 req_kw["params"] = params
             resp = requests.get(url, **req_kw)
+        elif m == "DELETE":
+            req_kw = {"headers": headers, "timeout": timeout}
+            if params:
+                req_kw["params"] = params
+            resp = requests.delete(url, **req_kw)
+        elif m == "PUT":
+            resp = requests.put(url, headers=headers, json=json_body or {}, timeout=timeout)
         else:
             resp = requests.post(url, headers=headers, json=json_body or {}, timeout=timeout)
         try:
@@ -13543,6 +13719,862 @@ def _live_browser_request(method, path, json_body=None, timeout=(1.5, 4.0), para
         return False, "Live-Browser 服务未运行或本机端口不可达"
     except Exception as exc:
         return False, f"请求 Live-Browser 失败: {type(exc).__name__}"
+
+
+def _lb_is_forbidden_agy_binary(path_str):
+    try:
+        name = os.path.basename(path_str).strip().lower()
+        if name == "agy":
+            return True
+        resolved = os.path.realpath(path_str)
+        if os.path.basename(resolved).strip().lower() == "agy":
+            return True
+    except OSError:
+        return True
+    return False
+
+
+def _lb_external_cli():
+    raw = (os.environ.get("AGY_BROWSER_EXTERNAL_CLI") or "").strip()
+    if not raw:
+        return None
+    cand = os.path.expanduser(raw)
+    if _lb_is_forbidden_agy_binary(cand):
+        return None
+    if os.path.isfile(cand) and os.access(cand, os.X_OK):
+        return cand
+    return None
+
+
+def _lb_external_label():
+    raw = (os.environ.get("AGY_BROWSER_EXTERNAL_LABEL") or "").strip()
+    return _sanitize_live_browser_field(raw, max_len=64) if raw else "External Chromium"
+
+
+def _lb_kill_proc_group(proc):
+    if proc is None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except Exception:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    try:
+        proc.wait(timeout=2.0)
+    except Exception:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        try:
+            proc.wait(timeout=1.0)
+        except Exception:
+            pass
+    for stream in (getattr(proc, "stdout", None), getattr(proc, "stderr", None)):
+        if stream is not None:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+
+def _lb_run_external_cli(args, timeout_sec=25.0):
+    cli = _lb_external_cli()
+    if not cli:
+        return -1, "", "外部 Chromium 适配器未配置（AGY_BROWSER_EXTERNAL_CLI）"
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            [cli, *args],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        out_s, err_s = proc.communicate(timeout=timeout_sec)
+        rc = int(proc.returncode) if proc.returncode is not None else -1
+        return rc, out_s or "", _scrub_live_browser_egress(err_s or "", max_len=300)
+    except subprocess.TimeoutExpired:
+        _lb_kill_proc_group(proc)
+        return -1, "", f"外部浏览器 CLI 超时（>{timeout_sec:.0f}s）"
+    except Exception as exc:
+        if proc is not None and proc.poll() is None:
+            _lb_kill_proc_group(proc)
+        return -1, "", f"外部浏览器 CLI 执行失败: {type(exc).__name__}"
+
+
+def _lb_is_external_watch_active(profile=None):
+    with _lb_ext_lock:
+        proc = _lb_ext_watch_proc
+        meta = dict(_lb_ext_watch_meta)
+    if proc is None or proc.poll() is not None:
+        return False
+    if profile is None:
+        return True
+    return str(meta.get("profile") or "") == str(profile)
+
+
+def _lb_stop_external_watch(stop_external_profile=False):
+    global _lb_ext_watch_proc, _lb_ext_watch_meta
+    with _lb_ext_lock:
+        proc = _lb_ext_watch_proc
+        meta = dict(_lb_ext_watch_meta)
+        _lb_ext_watch_proc = None
+        _lb_ext_watch_meta = {}
+    if proc is None:
+        return False
+    if proc.poll() is None:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except Exception:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        try:
+            proc.wait(timeout=2.0)
+        except Exception:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+    if stop_external_profile:
+        prof = str(meta.get("profile") or "").strip()
+        if prof and _lb_external_cli():
+            _lb_run_external_cli(["--profile", prof, "stop"], timeout_sec=10.0)
+    return True
+
+
+def _lb_list_external_profiles():
+    if not _lb_external_cli():
+        return []
+    rc, out_txt, _err = _lb_run_external_cli(["profile", "list", "--json"], timeout_sec=12.0)
+    if rc != 0:
+        return []
+    try:
+        parsed = json.loads(out_txt)
+    except Exception:
+        return []
+    raw_list = parsed.get("profiles") if isinstance(parsed, dict) else parsed
+    if not isinstance(raw_list, list):
+        return []
+    out = []
+    for p in raw_list:
+        if not isinstance(p, dict):
+            continue
+        name = _sanitize_live_browser_field(p.get("name") or "", max_len=64)
+        if not name:
+            continue
+        out.append({
+            "engine": "external_chromium",
+            "name": name,
+            "pinned": bool(p.get("pinned")) or name == "default",
+            "persistent": p.get("persistent") is not False,
+            "allow_google": bool(p.get("allow_google") or p.get("pinned") or name == "default"),
+            "egress": _scrub_live_browser_egress(p.get("egress") or p.get("egress_display") or "direct"),
+            "proxy_bao_ref": p.get("proxy_bao_ref") or p.get("bao_ref") or None,
+            "os": _sanitize_live_browser_field(p.get("os") or "linux", max_len=32),
+            "tz": _sanitize_live_browser_field(p.get("tz") or "", max_len=64),
+            "lang": _sanitize_live_browser_field(p.get("lang") or p.get("locale") or "", max_len=32),
+            "window": _sanitize_live_browser_field(p.get("window") or "", max_len=32),
+            "account": _sanitize_live_browser_field(p.get("account") or "", max_len=64),
+        })
+    return out
+
+
+def _lb_show_external_profile(name):
+    if not _lb_external_cli():
+        return None
+    rc, out_txt, _err = _lb_run_external_cli(["profile", "show", name, "--json"], timeout_sec=10.0)
+    if rc != 0:
+        return None
+    try:
+        parsed = json.loads(out_txt)
+    except Exception:
+        return None
+    if isinstance(parsed, dict):
+        return parsed.get("profile") if isinstance(parsed.get("profile"), dict) else parsed
+    return None
+
+
+def _lb_list_all_bots():
+    """Return ALL configured local bots from roster.json & team_config.json (zero exclusions)."""
+    bus_dir = _effective_bus_dir()
+    roster_raw = {}
+    cfg_raw = {}
+    try:
+        r_path = os.path.join(bus_dir, "roster.json")
+        if os.path.isfile(r_path):
+            with open(r_path, "r", encoding="utf-8") as fh:
+                roster_raw = json.load(fh)
+    except Exception:
+        roster_raw = {}
+    try:
+        c_path = os.path.join(bus_dir, "team_config.json")
+        if os.path.isfile(c_path):
+            with open(c_path, "r", encoding="utf-8") as fh:
+                cfg_raw = json.load(fh)
+    except Exception:
+        cfg_raw = {}
+
+    r_bots = roster_raw.get("bots") if isinstance(roster_raw, dict) and isinstance(roster_raw.get("bots"), dict) else {}
+    c_bots = cfg_raw.get("bots") if isinstance(cfg_raw, dict) and isinstance(cfg_raw.get("bots"), dict) else {}
+    now = time.time()
+    handles = sorted(set(r_bots.keys()) | set(c_bots.keys()))
+    items = []
+    for h in handles:
+        raw_r = r_bots.get(h) if isinstance(r_bots.get(h), dict) else {}
+        raw_c = c_bots.get(h) if isinstance(c_bots.get(h), dict) else {}
+        try:
+            merged = bot_bus._merge_bot_view(h, raw_r, raw_c, now)
+        except Exception:
+            merged = {"handle": bot_bus.normalize_handle(h), "display_name": h, "role": "worker", "online": False, "busy": False}
+        clean_h = bot_bus.normalize_handle(merged.get("handle") or h)
+        if not clean_h:
+            continue
+        raw_bid = raw_r.get("bot_id") if raw_r.get("bot_id") is not None else raw_c.get("bot_id")
+        bid = _parse_strict_int_no_bool(raw_bid)
+        if bid is not None and bid <= 0:
+            bid = None
+        items.append({
+            "handle": clean_h,
+            "display_name": _sanitize_live_browser_field(merged.get("display_name") or clean_h, max_len=64),
+            "role": str(merged.get("role") or "worker").lower(),
+            "bot_id": bid,
+            "online": bool(merged.get("online")),
+            "busy": bool(merged.get("busy")),
+        })
+
+    # Ensure current bot is always discoverable even in isolated test fixtures
+    my_h = bot_bus.normalize_handle(_current_bot_handle())
+    if my_h and not any(b["handle"] == my_h for b in items):
+        my_bid = _current_bot_numeric_id()
+        items.append({
+            "handle": my_h,
+            "display_name": _sanitize_live_browser_field(BOT_META.get("display_name") or my_h, max_len=64),
+            "role": str(BOT_META.get("role") or "worker").lower(),
+            "bot_id": my_bid if my_bid > 0 else None,
+            "online": True,
+            "busy": False,
+        })
+
+    role_order = {"coordinator": 0, "peer": 1, "worker": 2}
+    items.sort(key=lambda b: (0 if b["online"] else 1, role_order.get(b["role"], 9), b["handle"]))
+    return items
+
+
+def _lb_lookup_bot(raw_handle):
+    target = bot_bus.normalize_handle(str(raw_handle or ""))
+    if not target:
+        return None
+    for b in _lb_list_all_bots():
+        if b["handle"] == target:
+            return b
+    return None
+
+
+def _lb_get_default_owner_bot():
+    with _lb_default_owner_lock:
+        return _lb_default_owner_bot, _lb_default_owner_bot_id
+
+
+def _lb_set_default_owner_bot(handle, bot_id=None):
+    global _lb_default_owner_bot, _lb_default_owner_bot_id
+    with _lb_default_owner_lock:
+        _lb_default_owner_bot = handle
+        _lb_default_owner_bot_id = bot_id if isinstance(bot_id, int) and bot_id > 0 else None
+
+
+# ---------------------------------------------------------------- TG /browser Egress Pool (OpenBao KV v2, zero-plaintext)
+def _lb_validate_vault_ref(raw):
+    if not isinstance(raw, str):
+        raise ValueError("proxy_bao_ref 必须为字符串")
+    s = raw.strip()
+    if (
+        not s
+        or len(s) > 160
+        or _LB_CTRL_RE.search(s)
+        or any(ch.isspace() for ch in s)
+        or ".." in s
+        or s.startswith(("-", "/"))
+        or s.endswith("/")
+        or "//" in s
+        or "\\" in s
+    ):
+        raise ValueError("proxy_bao_ref 格式非法")
+    if "://" in s or "@" in s:
+        raise ValueError("proxy_bao_ref 不允许包含 URL 协议或账密")
+    path_part, sep, field_part = s.partition("#")
+    if sep and not _LB_VAULT_REF_FIELD_RE.fullmatch(field_part):
+        raise ValueError("proxy_bao_ref 字段片段非法")
+    segs = path_part.split("/")
+    if not segs or any(not seg or seg.startswith("-") or not _LB_VAULT_REF_SEG_RE.fullmatch(seg) for seg in segs):
+        raise ValueError("proxy_bao_ref 包含非法路径段")
+    return s
+
+
+def _lb_validate_account(raw):
+    if not isinstance(raw, str):
+        raise ValueError("account 标签必须为字符串")
+    acct_val = raw.strip()
+    if (
+        not acct_val
+        or len(acct_val) > 128
+        or _LB_CTRL_RE.search(acct_val)
+        or any(ch.isspace() for ch in acct_val)
+        or acct_val.startswith("-")
+    ):
+        raise ValueError("account 标签非法（最长 128 字符，禁止空白、控制字符或连字符前缀）")
+    return acct_val
+
+
+def _lb_egress_validate_slug(raw, *, require_custom_prefix=False):
+    if not isinstance(raw, str):
+        raise ValueError("节点名称必须为字符串")
+    s = raw.strip().lower()
+    if not s or ".." in s or "/" in s or "\\" in s or s.startswith("-") or _LB_CTRL_RE.search(s):
+        raise ValueError("节点名称格式非法，禁止路径穿越、连字符前缀或控制字符")
+    if require_custom_prefix and not s.startswith("custom-"):
+        s = f"custom-{s}"
+    if not _LB_EGRESS_SLUG_RE.fullmatch(s):
+        raise ValueError("节点名称仅允许小写字母、数字、下划线与连字符（1-48 字符）")
+    return s
+
+
+def _lb_egress_validate_port(raw):
+    if isinstance(raw, bool) or raw is None:
+        raise ValueError("端口必须为 1..65535 整数")
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s or not s.isascii() or not s.isdigit():
+            raise ValueError("端口必须为 1..65535 整数")
+        val = int(s)
+    elif isinstance(raw, int):
+        val = raw
+    else:
+        raise ValueError("端口必须为 1..65535 整数")
+    if not (1 <= val <= 65535):
+        raise ValueError("端口超出有效范围（1..65535）")
+    return val
+
+
+def _lb_egress_is_forbidden_target(host, port):
+    clean_host = str(host or "").strip().lower().rstrip(".").strip("[]")
+    if not clean_host:
+        return True, "代理主机名不能为空"
+    if "%" in clean_host:
+        return True, "代理主机名禁止包含区域标识符"
+    if clean_host in _LB_FORBIDDEN_METADATA_HOSTS or clean_host.endswith(".internal"):
+        return True, "禁止指向内网元数据或受限主机"
+    if clean_host == "localhost":
+        if port in _LB_SENSITIVE_LOOPBACK_PORTS:
+            return True, "禁止指向本机敏感服务端口"
+        return False, ""
+    try:
+        ip_obj = ipaddress.ip_address(clean_host)
+    except ValueError:
+        return False, ""
+    candidates = [ip_obj]
+    if isinstance(ip_obj, ipaddress.IPv6Address):
+        if ip_obj.ipv4_mapped is not None:
+            candidates.append(ip_obj.ipv4_mapped)
+        if ip_obj.sixtofour is not None:
+            candidates.append(ip_obj.sixtofour)
+    for cand in candidates:
+        if cand.is_link_local or cand.is_unspecified or cand.is_multicast:
+            return True, "禁止指向链路本地（含云元数据）、未指定或多播地址"
+        if cand.is_loopback and port in _LB_SENSITIVE_LOOPBACK_PORTS:
+            return True, "禁止指向本机敏感回环服务端口"
+        if isinstance(cand, ipaddress.IPv6Address) and cand.packed[:4] == bytes.fromhex("fd000ec2"):
+            return True, "禁止指向云元数据地址"
+    return False, ""
+
+
+def _lb_egress_validate_host(raw):
+    if not isinstance(raw, str):
+        raise ValueError("代理主机名必须为字符串")
+    s = raw.strip().strip("[]")
+    if not s or len(s) > 253 or any(ch.isspace() for ch in s) or _LB_CTRL_RE.search(s):
+        raise ValueError("代理主机名包含非法字符或超长")
+    if "/" in s or "@" in s or "?" in s or "#" in s or "%" in s:
+        raise ValueError("代理主机名格式非法")
+    try:
+        ipaddress.ip_address(s)
+        return s
+    except ValueError:
+        pass
+    s_no_dot = s.rstrip(".")
+    if not s_no_dot:
+        raise ValueError("代理主机名格式非法")
+    try:
+        socket.inet_aton(s_no_dot)
+    except OSError:
+        pass
+    else:
+        raise ValueError("禁止使用非标准数值、缩写或进制混淆 IP 地址")
+    for lbl in s_no_dot.split("."):
+        if not lbl or lbl.isdigit() or _LB_EGRESS_HEX_LABEL_RE.fullmatch(lbl):
+            raise ValueError("代理主机名禁止包含纯数字、八进制或十六进制混淆标签")
+    if not _LB_EGRESS_HOSTNAME_RE.fullmatch(s):
+        raise ValueError("代理主机名格式非法")
+    return s.lower()
+
+
+def _lb_egress_parse_manual_url(raw_url, slug_arg=None):
+    if not isinstance(raw_url, str) or not raw_url.strip():
+        raise ValueError("代理 URL 不能为空")
+    url_str = raw_url.strip()
+    if len(url_str) > 1024 or _LB_CTRL_RE.search(url_str) or any(ch.isspace() for ch in url_str):
+        raise ValueError("代理 URL 包含非法空白或控制字符")
+    if "://" not in url_str:
+        raise ValueError("代理 URL 必须包含协议头（如 socks5h://host:1080）")
+    sp = urllib.parse.urlsplit(url_str)
+    scheme = (sp.scheme or "").lower()
+    if scheme not in _LB_EGRESS_ALLOWED_SCHEMES:
+        raise ValueError(f"不支持的代理协议 {scheme!r}，仅允许 socks5/socks5h/http/https")
+    if sp.path not in ("", "/") or sp.query or sp.fragment:
+        raise ValueError("代理 URL 不允许包含路径、查询参数或锚点")
+    host = _lb_egress_validate_host(sp.hostname or "")
+    try:
+        parsed_port = sp.port
+    except ValueError as exc:
+        raise ValueError("代理端口无效") from exc
+    if parsed_port is None:
+        raise ValueError("代理 URL 必须显式指定端口")
+    port = _lb_egress_validate_port(parsed_port)
+    forb, forb_reason = _lb_egress_is_forbidden_target(host, port)
+    if forb:
+        raise ValueError(forb_reason)
+    username = urllib.parse.unquote(sp.username) if sp.username is not None else ""
+    password = urllib.parse.unquote(sp.password) if sp.password is not None else ""
+    if len(username) > 256 or len(password) > 512 or _LB_CTRL_RE.search(username) or _LB_CTRL_RE.search(password):
+        raise ValueError("代理账密长度超限或包含控制字符")
+    if slug_arg and str(slug_arg).strip():
+        slug = _lb_egress_validate_slug(str(slug_arg), require_custom_prefix=True)
+    else:
+        host_tok = re.sub(r"[^a-z0-9]+", "-", host.lower()).strip("-")[:20] or "node"
+        slug = _lb_egress_validate_slug(f"custom-{host_tok}-{port}-{secrets.token_hex(2)}", require_custom_prefix=True)
+    host_fmt = f"[{host}]" if ":" in host else host
+    server = f"{scheme}://{host_fmt}:{port}"
+    now_iso = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    vault_data = {
+        "server": server,
+        "host": host,
+        "port": str(port),
+        "username": username,
+        "password": password,
+        "scheme": scheme,
+        "provider": "custom",
+        "tag": slug,
+        "exit_ip": "",
+        "country": "",
+        "region": "",
+        "city": "",
+        "isp": "",
+        "asn": "",
+        "ptr": "",
+        "mbps": "",
+        "latency_ms": "",
+        "status": "unverified",
+        "drawn_at": now_iso,
+        "verified_at": "",
+        "note": "",
+    }
+    return slug, vault_data
+
+
+def _lb_egress_sanitize_node(slug, raw, ref):
+    if not isinstance(raw, dict):
+        return None
+    status = str(raw.get("status") or "unverified").strip()
+    if status.lower() == "removed":
+        return None
+    scheme = str(raw.get("scheme") or "socks5h").strip().lower()
+    if scheme not in _LB_EGRESS_ALLOWED_SCHEMES:
+        scheme = "socks5h"
+    host = str(raw.get("host") or "").strip()
+    port_str = str(raw.get("port") or "").strip()
+    raw_server = str(raw.get("server") or "").strip()
+    has_url_auth = False
+    if raw_server and "://" in raw_server:
+        try:
+            sp = urllib.parse.urlsplit(raw_server)
+            if not host and sp.hostname:
+                host = sp.hostname
+            if not port_str and sp.port:
+                port_str = str(sp.port)
+            if sp.username or sp.password:
+                has_url_auth = True
+        except Exception:
+            pass
+    host_fmt = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    clean_server = f"{scheme}://{host_fmt}:{port_str}" if (host and port_str.isdigit()) else (f"{scheme}://{host_fmt}" if host else "")
+    has_auth = bool(has_url_auth or str(raw.get("username") or "") or str(raw.get("password") or ""))
+    return {
+        "name": slug,
+        "ref": ref,
+        "server": clean_server,
+        "has_auth": has_auth,
+        "provider": _sanitize_live_browser_field(raw.get("provider") or ("custom" if slug.startswith("custom-") else "pool"), max_len=32),
+        "exit_ip": _sanitize_live_browser_field(raw.get("exit_ip") or "", max_len=64),
+        "country": _sanitize_live_browser_field(raw.get("country") or "", max_len=16),
+        "city": _sanitize_live_browser_field(raw.get("city") or "", max_len=64),
+        "isp": _sanitize_live_browser_field(raw.get("isp") or "", max_len=96),
+        "mbps": _sanitize_live_browser_field(raw.get("mbps") or "", max_len=32),
+        "latency_ms": _sanitize_live_browser_field(raw.get("latency_ms") or "", max_len=32),
+        "status": _sanitize_live_browser_field(status, max_len=64) or "unverified",
+        "verified_at": _sanitize_live_browser_field(raw.get("verified_at") or "", max_len=48),
+        "deletable": bool(slug.startswith("custom-") or str(raw.get("provider") or "").lower() == "custom"),
+    }
+
+
+def _lb_egress_vault_coords():
+    studio_cfg_dir = os.environ.get("AGY_STUDIO_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".config", "agy-studio")
+    cfg = {}
+    try:
+        cfg_file = os.path.join(studio_cfg_dir, "openbao_config.json")
+        if os.path.isfile(cfg_file) and not os.path.islink(cfg_file):
+            with open(cfg_file, "r", encoding="utf-8") as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, dict):
+                cfg = loaded
+    except Exception:
+        cfg = {}
+    addr = (os.environ.get("VAULT_ADDR") or os.environ.get("BAO_ADDR") or str(cfg.get("addr") or "")).strip().rstrip("/")
+    mount = (os.environ.get("AGY_EGRESS_VAULT_MOUNT") or str(cfg.get("kv_mount") or "secret")).strip().strip("/")
+    prefix = (os.environ.get("AGY_EGRESS_VAULT_PREFIX") or "egress").strip().strip("/")
+    ref_prefix = (os.environ.get("AGY_EGRESS_VAULT_REF_PREFIX") or prefix).strip().strip("/")
+    token = (os.environ.get("VAULT_TOKEN") or os.environ.get("BAO_TOKEN") or "").strip()
+    role_id = ""
+    secret_id = ""
+    if not token:
+        # Check studio local credentials or ~/.bao_credentials.json (read-only, never logged)
+        cred_candidates = [
+            os.path.join(studio_cfg_dir, "openbao_credentials.json"),
+            os.path.join(os.path.expanduser("~"), ".bao_credentials.json"),
+        ]
+        for cp in cred_candidates:
+            try:
+                if os.path.isfile(cp) and not os.path.islink(cp):
+                    with open(cp, "r", encoding="utf-8") as fh:
+                        cdata = json.load(fh)
+                    if isinstance(cdata, dict):
+                        if not addr and cdata.get("addr"):
+                            addr = str(cdata["addr"]).strip().rstrip("/")
+                        if cdata.get("token"):
+                            token = str(cdata["token"]).strip()
+                            break
+                        if cdata.get("role_id") and cdata.get("secret_id"):
+                            role_id = str(cdata["role_id"]).strip()
+                            secret_id = str(cdata["secret_id"]).strip()
+                            break
+            except Exception:
+                continue
+    return {
+        "addr": addr,
+        "mount": mount or "secret",
+        "prefix": prefix or "egress",
+        "ref_prefix": ref_prefix or prefix or "egress",
+        "token": token,
+        "role_id": role_id,
+        "secret_id": secret_id,
+        "ready": bool(addr and (token or (role_id and secret_id))),
+    }
+
+
+def _lb_egress_vault_token(coords):
+    if coords.get("token"):
+        return coords["token"]
+    if coords.get("addr") and coords.get("role_id") and coords.get("secret_id"):
+        resp = requests.post(
+            f"{coords['addr']}/v1/auth/approle/login",
+            json={"role_id": coords["role_id"], "secret_id": coords["secret_id"]},
+            timeout=(3.0, 6.0),
+            allow_redirects=False,
+        )
+        if resp.status_code == 200:
+            tok = ((resp.json() or {}).get("auth") or {}).get("client_token")
+            if tok:
+                return str(tok)
+    raise RuntimeError("OpenBao 认证未就绪")
+
+
+def _lb_egress_vault_list():
+    coords = _lb_egress_vault_coords()
+    if not coords["ready"]:
+        return False, "OpenBao 未就绪，无法读取出口 IP 池", []
+    try:
+        tok = _lb_egress_vault_token(coords)
+        url = f"{coords['addr']}/v1/{coords['mount']}/metadata/{coords['prefix']}?list=true"
+        r = requests.get(url, headers={"X-Vault-Token": tok, "Accept": "application/json"}, timeout=(3.0, 8.0), allow_redirects=False)
+        if r.status_code == 404:
+            return True, "", []
+        if r.status_code != 200:
+            return False, f"OpenBao LIST 失败 (HTTP {r.status_code})", []
+        keys = ((r.json() or {}).get("data") or {}).get("keys") or []
+        nodes = []
+        for k in keys:
+            slug = str(k).strip().rstrip("/")
+            if not slug or "/" in slug:
+                continue
+            ok_g, raw = _lb_egress_vault_get(slug, coords=coords, tok=tok)
+            if ok_g and isinstance(raw, dict):
+                san = _lb_egress_sanitize_node(slug, raw, ref=f"{coords['ref_prefix']}/{slug}")
+                if san:
+                    nodes.append(san)
+        nodes.sort(key=lambda n: (0 if n.get("status") == "clean" else 1, n.get("name") or ""))
+        return True, "", nodes
+    except Exception as exc:
+        return False, _scrub_live_browser_egress(f"OpenBao 访问失败: {type(exc).__name__}", max_len=160), []
+
+
+def _lb_egress_vault_get(slug, *, coords=None, tok=None):
+    coords = coords or _lb_egress_vault_coords()
+    if not coords["ready"]:
+        return False, None
+    tok = tok or _lb_egress_vault_token(coords)
+    url = f"{coords['addr']}/v1/{coords['mount']}/data/{coords['prefix']}/{slug}"
+    r = requests.get(url, headers={"X-Vault-Token": tok, "Accept": "application/json"}, timeout=(3.0, 8.0), allow_redirects=False)
+    if r.status_code == 404:
+        return False, None
+    if r.status_code != 200:
+        raise RuntimeError(f"OpenBao GET 失败 (HTTP {r.status_code})")
+    data = ((r.json() or {}).get("data") or {}).get("data")
+    return (True, data) if isinstance(data, dict) else (False, None)
+
+
+def _lb_egress_vault_put(slug, data, *, merge=False):
+    coords = _lb_egress_vault_coords()
+    if not coords["ready"]:
+        raise RuntimeError("OpenBao 未就绪，无法安全写入出口节点")
+    tok = _lb_egress_vault_token(coords)
+    payload = dict(data)
+    if merge:
+        ok_g, existing = _lb_egress_vault_get(slug, coords=coords, tok=tok)
+        if ok_g and isinstance(existing, dict):
+            merged = dict(existing)
+            merged.update(payload)
+            payload = merged
+    url = f"{coords['addr']}/v1/{coords['mount']}/data/{coords['prefix']}/{slug}"
+    r = requests.post(
+        url,
+        headers={"X-Vault-Token": tok, "Content-Type": "application/json"},
+        json={"data": payload},
+        timeout=(3.0, 8.0),
+        allow_redirects=False,
+    )
+    if r.status_code not in (200, 204):
+        raise RuntimeError(f"OpenBao PUT 失败 (HTTP {r.status_code})")
+    return payload, f"{coords['ref_prefix']}/{slug}"
+
+
+def _lb_egress_probe_sync(scheme, host, port, username="", password="", timeout_sec=12.0):
+    """Pure-stdlib SOCKS5 / HTTP CONNECT proxy probe with DNS pinning anti-SSRF guard."""
+    probe_url = (os.environ.get("AGY_EGRESS_PROBE_URL") or _LB_DEFAULT_PROBE_URL).strip()
+    sp = urllib.parse.urlsplit(probe_url)
+    if (sp.scheme or "").lower() != "https" or not sp.hostname:
+        sp = urllib.parse.urlsplit(_LB_DEFAULT_PROBE_URL)
+    target_host = sp.hostname or "cloudflare.com"
+    target_port = sp.port or 443
+    target_path = (sp.path or "/") + (f"?{sp.query}" if sp.query else "")
+
+    clean_host = _lb_egress_validate_host(host)
+    clean_port = _lb_egress_validate_port(port)
+    forb, forb_reason = _lb_egress_is_forbidden_target(clean_host, clean_port)
+    if forb:
+        raise ValueError(forb_reason)
+
+    infos = socket.getaddrinfo(clean_host, clean_port, type=socket.SOCK_STREAM)
+    if not infos:
+        raise RuntimeError("代理主机 DNS 解析无结果")
+    pinned_ip = None
+    for info in infos:
+        sa = info[4]
+        if not sa:
+            continue
+        ip_s = str(sa[0]).split("%", 1)[0]
+        ip_forb, ip_reason = _lb_egress_is_forbidden_target(ip_s, clean_port)
+        if ip_forb:
+            raise ValueError(f"代理目标解析到受限地址（{ip_reason}）")
+        if pinned_ip is None:
+            pinned_ip = ip_s
+    if not pinned_ip:
+        raise RuntimeError("代理主机未解析到有效 IP")
+
+    t0 = time.monotonic()
+    sock = socket.create_connection((pinned_ip, clean_port), timeout=timeout_sec)
+    sock.settimeout(timeout_sec)
+    try:
+        def _recv_exact(s_obj, n):
+            buf = b""
+            while len(buf) < n:
+                chunk = s_obj.recv(n - len(buf))
+                if not chunk:
+                    raise RuntimeError("代理连接意外断开")
+                buf += chunk
+            return buf
+
+        if scheme in ("socks5", "socks5h"):
+            has_auth = bool(username or password)
+            sock.sendall(b"\x05\x02\x00\x02" if has_auth else b"\x05\x01\x00")
+            vm = _recv_exact(sock, 2)
+            if vm[0] != 5 or vm[1] == 0xFF:
+                raise RuntimeError("SOCKS5 握手被拒绝")
+            if vm[1] == 0x02:
+                ub = username.encode("utf-8")
+                pb = password.encode("utf-8")
+                if len(ub) > 255 or len(pb) > 255:
+                    raise RuntimeError("SOCKS5 认证凭据超出 255 字节限制")
+                sock.sendall(bytes([1, len(ub)]) + ub + bytes([len(pb)]) + pb)
+                ar = _recv_exact(sock, 2)
+                if ar[1] != 0:
+                    raise RuntimeError("SOCKS5 认证失败")
+            elif vm[1] != 0x00:
+                raise RuntimeError(f"不支持的 SOCKS5 认证方式 ({vm[1]})")
+            hb = target_host.encode("ascii")
+            sock.sendall(b"\x05\x01\x00\x03" + bytes([len(hb)]) + hb + struct.pack("!H", target_port))
+            hdr = _recv_exact(sock, 4)
+            if hdr[0] != 5 or hdr[1] != 0:
+                raise RuntimeError(f"SOCKS5 CONNECT 失败 (rep={hdr[1]})")
+            if hdr[3] == 1:
+                _recv_exact(sock, 6)
+            elif hdr[3] == 3:
+                alen = _recv_exact(sock, 1)[0]
+                _recv_exact(sock, alen + 2)
+            elif hdr[3] == 4:
+                _recv_exact(sock, 18)
+        else:
+            import base64
+            hdrs = [f"CONNECT {target_host}:{target_port} HTTP/1.1", f"Host: {target_host}:{target_port}"]
+            if username or password:
+                b64 = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+                hdrs.append(f"Proxy-Authorization: Basic {b64}")
+            hdrs.append("\r\n")
+            sock.sendall("\r\n".join(hdrs).encode("ascii"))
+            rbuf = b""
+            while b"\r\n\r\n" not in rbuf and len(rbuf) < 8192:
+                ch = sock.recv(1024)
+                if not ch:
+                    break
+                rbuf += ch
+            first = rbuf.split(b"\r\n", 1)[0].decode("ascii", errors="ignore")
+            if " 200" not in first:
+                raise RuntimeError(f"HTTP 代理 CONNECT 被拒 ({first[:48]})")
+
+        ssl_ctx = ssl.create_default_context()
+        tls_sock = ssl_ctx.wrap_socket(sock, server_hostname=target_host)
+        try:
+            req = (
+                f"GET {target_path} HTTP/1.1\r\nHost: {target_host}\r\n"
+                "User-Agent: agy-bridge-egress-probe/1.0\r\nConnection: close\r\n\r\n"
+            ).encode("ascii")
+            tls_sock.sendall(req)
+            chunks = []
+            tot = 0
+            while tot < 32768:
+                ch = tls_sock.recv(4096)
+                if not ch:
+                    break
+                chunks.append(ch)
+                tot += len(ch)
+            raw_resp = b"".join(chunks)
+        finally:
+            try:
+                tls_sock.close()
+            except Exception:
+                pass
+        latency_ms = int(round((time.monotonic() - t0) * 1000))
+        if b"\r\n\r\n" not in raw_resp:
+            raise RuntimeError("探针 HTTP 响应格式异常")
+        head_b, body_b = raw_resp.split(b"\r\n\r\n", 1)
+        status_parts = head_b.split(b"\r\n", 1)[0].decode("ascii", errors="ignore").split()
+        code = int(status_parts[1]) if len(status_parts) >= 2 and status_parts[1].isdigit() else 0
+        if not (200 <= code < 300):
+            raise RuntimeError(f"探针返回 HTTP {code}")
+        body_txt = body_b.decode("utf-8", errors="ignore").strip()
+        meta = {"exit_ip": "", "country": "", "region": "", "city": "", "isp": "", "latency_ms": str(latency_ms)}
+        if body_txt.startswith("{"):
+            try:
+                obj = json.loads(body_txt)
+                if isinstance(obj, dict):
+                    meta["exit_ip"] = str(obj.get("ip") or obj.get("query") or "")
+                    meta["country"] = str(obj.get("country") or obj.get("countryCode") or "")
+                    meta["city"] = str(obj.get("city") or "")
+                    meta["isp"] = str(obj.get("isp") or obj.get("org") or "")
+            except Exception:
+                pass
+        else:
+            for ln in body_txt.splitlines():
+                if "=" in ln:
+                    k, v = ln.split("=", 1)
+                    kl = k.strip().lower()
+                    if kl == "ip":
+                        meta["exit_ip"] = v.strip()
+                    elif kl == "loc":
+                        meta["country"] = v.strip()
+                    elif kl == "colo":
+                        meta["region"] = v.strip()
+        return meta
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+def _lb_egress_pool_cli():
+    raw = (os.environ.get("AGY_EGRESS_POOL_CLI") or "").strip()
+    if not raw:
+        return None
+    cand = os.path.expanduser(raw)
+    if _lb_is_forbidden_agy_binary(cand):
+        return None
+    if os.path.isfile(cand) and os.access(cand, os.X_OK):
+        return cand
+    return None
+
+
+def _lb_egress_run_pool_cli(args, timeout_sec=120.0):
+    cli = _lb_egress_pool_cli()
+    if not cli:
+        return -1, "", "未配置住宅 IP 池适配器（AGY_EGRESS_POOL_CLI）"
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            [cli, *args],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        out_s, err_s = proc.communicate(timeout=timeout_sec)
+        rc = int(proc.returncode) if proc.returncode is not None else -1
+        return (
+            rc,
+            _scrub_live_browser_egress(out_s or "", max_len=400),
+            _scrub_live_browser_egress(err_s or "", max_len=300),
+        )
+    except subprocess.TimeoutExpired:
+        _lb_kill_proc_group(proc)
+        return -1, "", f"出口池 CLI 超时（>{timeout_sec:.0f}s）"
+    except Exception as exc:
+        if proc is not None and proc.poll() is None:
+            _lb_kill_proc_group(proc)
+        return -1, "", f"出口池 CLI 执行失败: {type(exc).__name__}"
 
 
 def _resolve_live_browser_direct_app_url(st_data=None):
@@ -13576,6 +14608,291 @@ def _resolve_bot_username():
         return handle
     env_uname = (os.environ.get("AGY_TG_BOT_USERNAME") or "").strip().lstrip("@")
     return env_uname
+
+
+def _lb_validate_launch_url(raw):
+    if raw is None or not str(raw).strip():
+        return None
+    s = str(raw).strip()
+    if len(s) > 2048 or _LB_CTRL_RE.search(s) or any(ch.isspace() for ch in s) or s.startswith("-"):
+        raise ValueError("url 包含非法空白、控制字符或连字符前缀")
+    if s.lower() == "about:blank":
+        return s
+    sp = urllib.parse.urlsplit(s)
+    if (sp.scheme or "").lower() not in ("http", "https") or not sp.hostname:
+        raise ValueError("仅允许 http://、https:// 或 about:blank 地址")
+    return s
+
+
+def _lb_validate_credential_free_proxy(raw):
+    if raw is None or not str(raw).strip():
+        return None
+    s = str(raw).strip()
+    if len(s) > 512 or _LB_CTRL_RE.search(s) or any(ch.isspace() for ch in s):
+        raise ValueError("proxy URL 包含非法字符")
+    if "://" not in s:
+        raise ValueError("proxy URL 必须包含协议头（如 socks5h://host:1080）")
+    sp = urllib.parse.urlsplit(s)
+    if (sp.scheme or "").lower() not in _LB_EGRESS_ALLOWED_SCHEMES:
+        raise ValueError("不支持的 proxy 协议")
+    if sp.username is not None or sp.password is not None or "@" in (sp.netloc or ""):
+        raise ValueError("禁止直接传入含 user:pass@ 的裸代理 URL，请先通过 /browser egress add 安全存入 OpenBao 再引用")
+    if sp.path not in ("", "/") or sp.query or sp.fragment:
+        raise ValueError("proxy URL 不允许包含路径、查询参数或锚点")
+    host = _lb_egress_validate_host(sp.hostname or "")
+    try:
+        parsed_port = sp.port
+    except ValueError as exc:
+        raise ValueError("proxy 端口无效") from exc
+    if parsed_port is None:
+        raise ValueError("proxy URL 必须包含有效端口")
+    port = _lb_egress_validate_port(parsed_port)
+    forb, forb_reason = _lb_egress_is_forbidden_target(host, port)
+    if forb:
+        raise ValueError(forb_reason)
+    host_fmt = f"[{host}]" if ":" in host else host
+    return f"{sp.scheme.lower()}://{host_fmt}:{port}"
+
+
+def _lb_resolve_owner_bot_for_launch(status_data=None):
+    def_h, def_id = _lb_get_default_owner_bot()
+    if def_h:
+        return def_h, def_id
+    if isinstance(status_data, dict) and status_data.get("owner_bot"):
+        st_h = bot_bus.normalize_handle(str(status_data.get("owner_bot") or ""))
+        st_id = _parse_strict_int_no_bool(status_data.get("owner_bot_id"))
+        if st_h:
+            return st_h, (st_id if st_id and st_id > 0 else None)
+    my_h = bot_bus.normalize_handle(_current_bot_handle())
+    my_id = _current_bot_numeric_id()
+    return (my_h or None), (my_id if my_id > 0 else None)
+
+
+def _lb_launch_external_chromium(*, bot_hint, owner_uid, profile="default", launch_url=None, owner_bot=None, owner_bot_id=None, manual_launch=True):
+    global _lb_ext_watch_proc, _lb_ext_watch_meta
+    cli = _lb_external_cli()
+    if not cli:
+        return False, "外部 Chromium 适配器未配置（AGY_BROWSER_EXTERNAL_CLI）"
+    if not _LB_PROFILE_NAME_RE.fullmatch(profile) or ".." in profile:
+        return False, "Profile 名称非法"
+    status_params = {"source": "tg_cmd", "chat_scope": "private", "bot": bot_hint}
+    if owner_uid is not None:
+        status_params["user_id"] = str(owner_uid)
+    ok_st, st_data = _live_browser_request("GET", "/internal/status", timeout=(1.5, 3.0), params=status_params)
+    if ok_st and isinstance(st_data, dict) and st_data.get("running"):
+        return False, "已有活跃浏览器会话，请先执行 /browser stop 再拉起外部 Chromium"
+    prof_info = {"name": "default", "pinned": True, "egress": "direct"} if profile == "default" else _lb_show_external_profile(profile)
+    if prof_info is None:
+        return False, f"外部 Chromium Profile '{profile}' 不存在"
+
+    start_args = ["--profile", profile, "open", launch_url] if launch_url else ["--profile", profile, "start"]
+    rc_s, out_s, err_s = _lb_run_external_cli(start_args, timeout_sec=25.0)
+    if rc_s != 0:
+        return False, err_s or _scrub_live_browser_egress(out_s, max_len=200) or f"start exited {rc_s}"
+
+    _lb_stop_external_watch()
+    try:
+        watch_proc = subprocess.Popen(
+            [cli, "--profile", profile, "live", "--watch"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception as exc:
+        return False, f"启动外部 Chromium 直播桥失败: {type(exc).__name__}"
+
+    egress_display = _scrub_live_browser_egress(prof_info.get("egress") or prof_info.get("egress_display") or "direct")
+    with _lb_ext_lock:
+        _lb_ext_watch_proc = watch_proc
+        _lb_ext_watch_meta = {
+            "profile": profile,
+            "owner_bot": owner_bot,
+            "owner_bot_id": owner_bot_id,
+            "egress": egress_display,
+        }
+
+    deadline = time.monotonic() + 8.0
+    attached = False
+    while time.monotonic() < deadline:
+        if watch_proc.poll() is not None:
+            _lb_stop_external_watch()
+            return False, f"外部 Chromium live --watch 提前退出（code={watch_proc.returncode}）"
+        ok_poll, poll_st = _live_browser_request("GET", "/internal/status", timeout=(1.5, 3.0), params=status_params)
+        if ok_poll and isinstance(poll_st, dict) and poll_st.get("running") and poll_st.get("engine_mode") == "sync_external":
+            attached = True
+            break
+        time.sleep(0.2)
+
+    if not attached:
+        _lb_stop_external_watch()
+        return False, "等待外部 Chromium 附着 Live-Browser Hub 超时"
+
+    ob_body = {
+        "engine": "external_chromium",
+        "egress": egress_display or "direct",
+        "source": "tg_cmd",
+        "chat_scope": "private",
+        "bot": bot_hint,
+    }
+    if owner_uid is not None:
+        ob_body["user_id"] = owner_uid
+    if owner_bot:
+        ob_body["owner_bot"] = owner_bot
+        if owner_bot_id:
+            ob_body["owner_bot_id"] = owner_bot_id
+    _live_browser_request("POST", "/internal/owner-bot", json_body=ob_body, timeout=(2.0, 5.0))
+
+    if manual_launch:
+        tk_body = {
+            "active": True,
+            "reason": "manual_launch",
+            "manual_launch": True,
+            "source": "tg_cmd",
+            "chat_scope": "private",
+            "bot": bot_hint,
+        }
+        if owner_uid is not None:
+            tk_body["user_id"] = owner_uid
+        _live_browser_request("POST", "/internal/takeover", json_body=tk_body, timeout=(2.0, 6.0))
+    return True, {"engine": "external_chromium", "profile": profile, "owner_bot": owner_bot}
+
+
+def _lb_egress_verify_node_sync(slug):
+    """Verify a single OpenBao egress node (SSRF-guarded) and persist updated metadata."""
+    clean_slug = _lb_egress_validate_slug(slug, require_custom_prefix=False)
+    ok_g, node_raw = _lb_egress_vault_get(clean_slug)
+    if not ok_g or not isinstance(node_raw, dict) or str(node_raw.get("status") or "").lower() == "removed":
+        return False, f"出口节点 {clean_slug} 不存在"
+
+    host = str(node_raw.get("host") or "").strip()
+    port_s = str(node_raw.get("port") or "").strip()
+    if (not host or not port_s) and node_raw.get("server"):
+        sp = urllib.parse.urlsplit(str(node_raw["server"]))
+        host = host or (sp.hostname or "")
+        port_s = port_s or (str(sp.port) if sp.port else "")
+    clean_host = _lb_egress_validate_host(host)
+    clean_port = _lb_egress_validate_port(port_s)
+    forb, forb_msg = _lb_egress_is_forbidden_target(clean_host, clean_port)
+    if forb:
+        return False, forb_msg
+
+    scheme = str(node_raw.get("scheme") or "socks5h").strip().lower()
+    if scheme not in _LB_EGRESS_ALLOWED_SCHEMES:
+        scheme = "socks5h"
+    username = str(node_raw.get("username") or "")
+    password = str(node_raw.get("password") or "")
+    now_iso = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        meta = _lb_egress_probe_sync(scheme, clean_host, clean_port, username, password)
+        merged, ref = _lb_egress_vault_put(
+            clean_slug,
+            {
+                "exit_ip": meta.get("exit_ip", ""),
+                "country": meta.get("country", ""),
+                "region": meta.get("region", ""),
+                "city": meta.get("city", ""),
+                "isp": meta.get("isp", ""),
+                "latency_ms": meta.get("latency_ms", ""),
+                "status": "clean",
+                "verified_at": now_iso,
+            },
+            merge=True,
+        )
+        return True, _lb_egress_sanitize_node(clean_slug, merged, ref)
+    except Exception as exc:
+        reason = _scrub_live_browser_egress(f"{type(exc).__name__}: {exc}", max_len=48)
+        try:
+            merged, ref = _lb_egress_vault_put(
+                clean_slug,
+                {"status": f"dead:{reason}", "verified_at": now_iso},
+                merge=True,
+            )
+            _lb_egress_sanitize_node(clean_slug, merged, ref)
+        except Exception:
+            pass
+        return False, _scrub_live_browser_egress(str(exc) or type(exc).__name__, max_len=160)
+
+
+def _lb_build_ai_picker_panel(chat_id, from_user=None):
+    bots = _lb_list_all_bots()
+    bot_hint = _live_browser_bot_hint()
+    owner_uid = _live_browser_owner_uid(chat_id, from_user=from_user)
+    params = {"source": "tg_cmd", "chat_scope": "private"}
+    if bot_hint:
+        params["bot"] = str(bot_hint)
+    if owner_uid is not None:
+        params["user_id"] = str(owner_uid)
+    ok_st, st_data = _live_browser_request("GET", "/internal/status", timeout=(1.5, 3.0), params=params)
+    cur_owner = None
+    if ok_st and isinstance(st_data, dict) and not st_data.get("session_restricted"):
+        cur_owner = st_data.get("owner_bot")
+    if not cur_owner:
+        cur_owner, _ = _lb_get_default_owner_bot()
+    cur_norm = bot_bus.normalize_handle(str(cur_owner or ""))
+
+    lines = [
+        "<b>🤖 选择浏览器操作 AI（全量 Roster · 支持运行中热改绑）</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"• <b>当前绑定 AI：</b><code>@{html_mod.escape(cur_norm or _current_bot_handle() or '未指定')}</code>",
+        "",
+    ]
+    buttons = []
+    row = []
+    for b in bots:
+        h = b["handle"]
+        online_dot = "🟢" if b.get("online") else "⚪"
+        role_tag = b.get("role") or "worker"
+        sel = " ✅" if (cur_norm and h == cur_norm) else ""
+        lines.append(f"{online_dot} <code>@{html_mod.escape(h)}</code> ({html_mod.escape(b['display_name'])} · {html_mod.escape(role_tag)}){sel}")
+        row.append({"text": f"{'✅ ' if sel else ''}@{h[:22]}", "callback_data": f"browser:set_ai:{h[:45]}"})
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([{"text": "⬅️ 返回控制面板", "callback_data": "browser:refresh"}])
+    return "\n".join(lines), {"inline_keyboard": buttons}
+
+
+def _lb_build_egress_panel():
+    ok_l, err_l, nodes = _lb_egress_vault_list()
+    draw_ok = bool(_lb_egress_pool_cli())
+    lines = [
+        "<b>🌐 出口 IP 池（OpenBao 脱敏视图）</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+    ]
+    if not ok_l:
+        lines.append(f"⚠️ <i>{html_mod.escape(err_l)}</i>")
+    elif not nodes:
+        lines.append("· <i>暂无已录入出口节点</i>")
+    else:
+        for n in nodes[:15]:
+            st = str(n.get("status") or "unverified")
+            badge = "🟢" if st == "clean" else ("🔴" if st.startswith("dead") else "🟡")
+            loc = " ".join(x for x in (n.get("country"), n.get("city")) if x)
+            extra = " · ".join(x for x in (loc, n.get("exit_ip"), f"{n['latency_ms']}ms" if n.get("latency_ms") else "", n.get("isp")) if x)
+            auth_mark = "🔑" if n.get("has_auth") else "🔓"
+            lines.append(
+                f"{badge} <code>{html_mod.escape(n['name'])}</code> [{html_mod.escape(n['provider'])}] {auth_mark} "
+                f"<code>{html_mod.escape(n['server'] or n['ref'])}</code>"
+                + (f"\n   <i>{html_mod.escape(extra)}</i>" if extra else "")
+            )
+    lines.append("")
+    lines.append("💡 <b>私聊命令：</b>")
+    lines.append("• <code>/browser egress add [slug] socks5h://user:pass@host:port</code>（自动删原消息防留痕）")
+    lines.append("• <code>/browser egress verify &lt;name&gt;</code> · <code>/browser egress del &lt;custom-name&gt;</code>")
+    if draw_ok:
+        lines.append("• <code>/browser egress draw [US]</code> · <code>/browser egress prune</code>")
+    kb = {
+        "inline_keyboard": [
+            [
+                {"text": "🔄 刷新出口池", "callback_data": "browser:egress_list"},
+                {"text": "⬅️ 返回控制面板", "callback_data": "browser:refresh"},
+            ]
+        ]
+    }
+    return "\n".join(lines), kb
 
 
 def build_browser_panel(chat_id, from_user=None):
@@ -13665,17 +14982,23 @@ def build_browser_panel(chat_id, from_user=None):
         else st_data.get("profiles") or []
     )
 
+    caller_role = _get_user_role(chat_id, from_user=from_user, allow_uid_fallback=False) if from_user is not None else "admin"
+    can_write = caller_role == "admin"
+
     restricted = bool(st_data.get("session_restricted"))
     running = bool(st_data.get("running")) and not restricted
     engine_mode = str(st_data.get("engine_mode") or "idle")
+    active_engine = "" if restricted else str(st_data.get("engine") or ("external_chromium" if engine_mode == "sync_external" else ("camoufox" if running else "")))
     active_prof = "" if restricted else str(st_data.get("profile") or "")
     pinned = False if restricted else bool(st_data.get("pinned"))
     os_name = "" if restricted else str(st_data.get("os") or "windows")
-    egress = "" if restricted else str(st_data.get("egress") or "direct")
+    egress = "" if restricted else _scrub_live_browser_egress(st_data.get("egress") or "direct")
     takeover = False if restricted else bool(st_data.get("takeover"))
+    manual_launch_flag = False if restricted else bool(st_data.get("manual_launch"))
     ai_busy = False if restricted else bool(st_data.get("ai_busy"))
     cur_url = "" if restricted else str(st_data.get("url") or "")
     cur_title = "" if restricted else str(st_data.get("title") or "")
+    bound_ai = "" if restricted else str(st_data.get("owner_bot") or _lb_get_default_owner_bot()[0] or _current_bot_handle() or "")
 
     if restricted:
         state_badge = "🔒 已占用（其他授权会话或本机 CLI 持有，详情已隔离）"
@@ -13691,22 +15014,32 @@ def build_browser_panel(chat_id, from_user=None):
         "━━━━━━━━━━━━━━━━━━━━",
         f"• <b>运行状态：</b>{state_badge}",
     ]
+    if not restricted and bound_ai:
+        lines.append(f"• <b>绑定操作 AI：</b><code>@{html_mod.escape(bound_ai.lstrip('@'))}</code>")
     if restricted:
         lines.append("• <b>当前会话：</b><i>由其他授权用户或本机 CLI 持有，当前页面与指纹信息已脱敏隔离</i>")
     elif running and active_prof:
         lock_icon = "🔒 " if pinned else ""
+        eng_label = _lb_external_label() if active_engine == "external_chromium" else "Camoufox"
         lines.append(
             f"• <b>当前指纹：</b>{lock_icon}<code>{html_mod.escape(active_prof)}</code>"
-            f" · <code>{html_mod.escape(os_name)}</code> · <code>{html_mod.escape(egress)}</code>"
+            f" · <code>{html_mod.escape(eng_label)}</code> · <code>{html_mod.escape(os_name)}</code> · <code>{html_mod.escape(egress)}</code>"
         )
-        ctrl_label = "🖐 人工接管中" if takeover else ("🤖 AI 操作中" if ai_busy else "👀 AI / 观看模式")
+        if takeover and manual_launch_flag:
+            ctrl_label = "🖐 手动拉起接管中（AI 已唤醒待命）"
+        elif takeover:
+            ctrl_label = "🖐 人工接管中"
+        elif ai_busy:
+            ctrl_label = "🤖 AI 操作中"
+        else:
+            ctrl_label = "👀 AI / 观看模式"
         lines.append(f"• <b>控制权：</b>{ctrl_label}")
         if cur_title:
             lines.append(f"• <b>页面标题：</b>{html_mod.escape(cur_title[:70])}")
         if cur_url:
             lines.append(f"• <b>当前网址：</b><code>{html_mod.escape(cur_url[:110])}</code>")
     else:
-        lines.append("• <b>当前指纹：</b><i>未启动（可点击下方按钮拉起）</i>")
+        lines.append("• <b>当前指纹：</b><i>未启动（可点击下方按钮手动拉起或切换 AI）</i>")
 
     lines.append("")
     lines.append(f"<b>可用指纹列表 ({len(profiles)})：</b>")
@@ -13715,7 +15048,7 @@ def build_browser_panel(chat_id, from_user=None):
             pname = str(p.get("name") or "")
             p_pinned = bool(p.get("pinned"))
             p_os = str(p.get("os") or "windows")
-            p_egress = str(p.get("egress_display") or p.get("egress") or "direct")
+            p_egress = _scrub_live_browser_egress(p.get("egress_display") or p.get("egress") or "direct")
             p_persist = "Pinned" if p_pinned else ("Persistent" if p.get("persistent", True) else "Ephemeral")
             is_cur = running and not restricted and (bool(p.get("active")) or (active_prof and pname == active_prof))
             mark = "🟢 " if is_cur else ("🔒 " if p_pinned else "· ")
@@ -13730,7 +15063,7 @@ def build_browser_panel(chat_id, from_user=None):
         buttons.append([{"text": "🖥 打开 Live-Browser Mini App", "web_app": {"url": pub_url}}])
 
     action_btns = []
-    if restricted:
+    if restricted or not can_write:
         buttons.append([{"text": "🔄 刷新状态", "callback_data": "browser:refresh"}])
     elif running and engine_mode == "async_hosted":
         for p in profiles[:8]:
@@ -13740,6 +15073,29 @@ def build_browser_panel(chat_id, from_user=None):
             action_btns.append({"text": f"🔄 切到 {pname[:18]}", "callback_data": f"browser:switch:{pname[:45]}"})
         for i in range(0, len(action_btns), 2):
             buttons.append(action_btns[i:i + 2])
+        ctrl_btn = (
+            {"text": "▶️ 交还给 AI", "callback_data": "browser:handback"}
+            if takeover
+            else {"text": "🖐 人工接管", "callback_data": "browser:takeover"}
+        )
+        buttons.append([
+            ctrl_btn,
+            {"text": "🤖 切换操作 AI", "callback_data": "browser:ai_menu"},
+        ])
+        buttons.append([
+            {"text": "⏹ 停止浏览器", "callback_data": "browser:stop"},
+            {"text": "🔄 刷新状态", "callback_data": "browser:refresh"},
+        ])
+    elif running and engine_mode == "sync_external":
+        ctrl_btn = (
+            {"text": "▶️ 交还给 AI", "callback_data": "browser:handback"}
+            if takeover
+            else {"text": "🖐 人工接管", "callback_data": "browser:takeover"}
+        )
+        buttons.append([
+            ctrl_btn,
+            {"text": "🤖 切换操作 AI", "callback_data": "browser:ai_menu"},
+        ])
         buttons.append([
             {"text": "⏹ 停止浏览器", "callback_data": "browser:stop"},
             {"text": "🔄 刷新状态", "callback_data": "browser:refresh"},
@@ -13752,11 +15108,19 @@ def build_browser_panel(chat_id, from_user=None):
             action_btns.append({"text": f"🚀 启动 {pname[:18]}", "callback_data": f"browser:start:{pname[:45]}"})
         for i in range(0, len(action_btns), 2):
             buttons.append(action_btns[i:i + 2])
+        launch_row = [{"text": "🖐 手动拉起 Camoufox", "callback_data": "browser:launch:camoufox:default"}]
+        if _lb_external_cli():
+            launch_row.append({"text": f"🖐 手动拉起 {_lb_external_label()[:12]}", "callback_data": "browser:launch:external_chromium:default"})
+        buttons.append(launch_row)
+        buttons.append([
+            {"text": "🤖 切换操作 AI", "callback_data": "browser:ai_menu"},
+            {"text": "🌐 出口 IP 池", "callback_data": "browser:egress_list"},
+        ])
         buttons.append([{"text": "🔄 刷新状态", "callback_data": "browser:refresh"}])
     else:
         buttons.append([{"text": "🔄 刷新状态", "callback_data": "browser:refresh"}])
 
-    if pub_url.startswith("https://"):
+    if pub_url.startswith("https://") and can_write:
         buttons.append([
             {"text": "📌 设为左下角菜单", "callback_data": "browser:menu_set"},
             {"text": "↩️ 恢复默认菜单", "callback_data": "browser:menu_reset"},
@@ -13779,7 +15143,7 @@ def _live_browser_owner_uid(chat_id, from_user=None):
     return None
 
 
-def cmd_browser(chat_id, arg, thread_id=None, scope_key=None, from_user=None):
+def cmd_browser(chat_id, arg, thread_id=None, scope_key=None, from_user=None, msg_id=0):
     norm_tid = _normalize_thread_id(thread_id)
     raw = (arg or "").strip()
     parts = raw.split()
@@ -13790,17 +15154,613 @@ def cmd_browser(chat_id, arg, thread_id=None, scope_key=None, from_user=None):
         send(chat_id, text, parse_mode="HTML", reply_markup=kb, thread_id=norm_tid)
         return
 
+    try:
+        is_private = int(chat_id) > 0
+    except Exception:
+        is_private = False
+    chat_scope = "private" if is_private else "group"
+
+    # BM3 Hard Security Guard: `/browser egress add ...` NEVER touches Vault or echoes input in group chats,
+    # and in private chats ALWAYS attempts `deleteMessage` on the credential-bearing message regardless of outcome!
+    if sub == "egress":
+        eg_sub = parts[1].lower() if len(parts) > 1 else "list"
+        if eg_sub == "add":
+            if not is_private:
+                send(
+                    chat_id,
+                    "🔒 <b>已拦截：</b>禁止在群聊中录入代理凭据，请立即撤回消息并前往管理员私聊执行 <code>/browser egress add</code>。",
+                    parse_mode="HTML",
+                    thread_id=norm_tid,
+                )
+                return
+            try:
+                strict_role = _get_user_role(chat_id, from_user=from_user, allow_uid_fallback=False) if from_user is not None else "admin"
+                if strict_role != "admin":
+                    send(chat_id, "🔒 仅管理员私聊可执行出口 IP 录入。", parse_mode="HTML", thread_id=norm_tid)
+                    return
+                if len(parts) < 3:
+                    send(
+                        chat_id,
+                        "用法：<code>/browser egress add [slug] socks5h://[user:pass@]host:port</code>",
+                        parse_mode="HTML",
+                        thread_id=norm_tid,
+                    )
+                    return
+                if len(parts) == 3:
+                    slug_arg, url_arg = None, parts[2]
+                else:
+                    slug_arg, url_arg = parts[2], parts[3]
+                try:
+                    slug, vault_data = _lb_egress_parse_manual_url(url_arg, slug_arg=slug_arg)
+                    saved, ref = _lb_egress_vault_put(slug, vault_data, merge=False)
+                    san = _lb_egress_sanitize_node(slug, saved, ref)
+                except Exception as exc:
+                    err_clean = _scrub_live_browser_egress(str(exc) or type(exc).__name__, max_len=200)
+                    send(chat_id, f"❌ 录入出口节点失败：{html_mod.escape(err_clean)}", parse_mode="HTML", thread_id=norm_tid)
+                    return
+                send(
+                    chat_id,
+                    "✅ <b>出口节点已安全写入 OpenBao（原消息已自动清理）：</b>\n"
+                    f"• <b>节点名：</b><code>{html_mod.escape(san['name'])}</code>\n"
+                    f"• <b>Vault 引用：</b><code>{html_mod.escape(san['ref'])}</code>\n"
+                    f"• <b>代理地址：</b><code>{html_mod.escape(san['server'])}</code>\n"
+                    f"• <b>认证：</b>{'已加密托管 (has_auth=true)' if san['has_auth'] else '无账密'}\n"
+                    f"• <b>状态：</b><code>{html_mod.escape(san['status'])}</code>（可执行 <code>/browser egress verify {html_mod.escape(san['name'])}</code> 测活）",
+                    parse_mode="HTML",
+                    thread_id=norm_tid,
+                )
+            finally:
+                if msg_id and int(msg_id) > 0:
+                    try:
+                        tg("deleteMessage", chat_id=chat_id, message_id=int(msg_id))
+                    except Exception:
+                        pass
+            return
+
+        if not is_private:
+            send(
+                chat_id,
+                "🔒 出口 IP 池管理仅限管理员私聊使用（群聊已脱敏隔离）。",
+                parse_mode="HTML",
+                thread_id=norm_tid,
+            )
+            return
+        strict_role = _get_user_role(chat_id, from_user=from_user, allow_uid_fallback=False) if from_user is not None else "admin"
+        if strict_role != "admin":
+            send(chat_id, "🔒 仅管理员私聊可操作出口 IP 池。", parse_mode="HTML", thread_id=norm_tid)
+            return
+
+        if eg_sub in ("list", "ls"):
+            text, kb = _lb_build_egress_panel()
+            send(chat_id, text, parse_mode="HTML", reply_markup=kb, thread_id=norm_tid)
+            return
+
+        if eg_sub == "verify":
+            if len(parts) < 3:
+                send(chat_id, "用法：<code>/browser egress verify &lt;name&gt;</code>", parse_mode="HTML", thread_id=norm_tid)
+                return
+            target_slug = parts[2].strip()
+            ok_v, res_v = _lb_egress_verify_node_sync(target_slug)
+            if not ok_v:
+                send(chat_id, f"❌ 测活失败：{html_mod.escape(str(res_v))}", parse_mode="HTML", thread_id=norm_tid)
+                return
+            send(
+                chat_id,
+                "✅ <b>出口节点测活完成：</b>\n"
+                f"• <b>节点：</b><code>{html_mod.escape(res_v['name'])}</code>\n"
+                f"• <b>状态：</b><code>{html_mod.escape(res_v['status'])}</code>\n"
+                f"• <b>出口 IP：</b><code>{html_mod.escape(res_v.get('exit_ip') or '未知')}</code>\n"
+                f"• <b>地区 / 延迟：</b><code>{html_mod.escape(res_v.get('country') or '-')}</code> · <code>{html_mod.escape(res_v.get('latency_ms') or '-')}ms</code>",
+                parse_mode="HTML",
+                thread_id=norm_tid,
+            )
+            return
+
+        if eg_sub == "draw":
+            country = (parts[2].strip().upper() if len(parts) > 2 else "US")
+            if not _LB_EGRESS_COUNTRY_RE.fullmatch(country):
+                send(chat_id, "❌ country 必须为两位 ISO 国家代码（如 US、JP、GB）", parse_mode="HTML", thread_id=norm_tid)
+                return
+            if not _lb_egress_pool_cli():
+                send(
+                    chat_id,
+                    "ℹ️ 当前未配置住宅 IP 池适配器（<code>AGY_EGRESS_POOL_CLI</code>），仅支持手工录入 SOCKS5 与内置测活。",
+                    parse_mode="HTML",
+                    thread_id=norm_tid,
+                )
+                return
+            rc_d, out_d, err_d = _lb_egress_run_pool_cli(["draw", "--country", country, "--want", "1"])
+            if rc_d != 0:
+                send(chat_id, f"❌ 抽取住宅 IP 失败：{html_mod.escape(err_d or out_d or f'rc={rc_d}')}", parse_mode="HTML", thread_id=norm_tid)
+                return
+            send(
+                chat_id,
+                f"✅ <b>已触发抽取 {html_mod.escape(country)} 住宅 IP：</b>\n<code>{html_mod.escape((out_d or 'done')[:320])}</code>",
+                parse_mode="HTML",
+                thread_id=norm_tid,
+            )
+            return
+
+        if eg_sub == "prune":
+            if not _lb_egress_pool_cli():
+                send(
+                    chat_id,
+                    "ℹ️ 当前未配置住宅 IP 池适配器（<code>AGY_EGRESS_POOL_CLI</code>）。",
+                    parse_mode="HTML",
+                    thread_id=norm_tid,
+                )
+                return
+            rc_p, out_p, err_p = _lb_egress_run_pool_cli(["prune"])
+            if rc_p != 0:
+                send(chat_id, f"❌ 清理闲置节点失败：{html_mod.escape(err_p or out_p or f'rc={rc_p}')}", parse_mode="HTML", thread_id=norm_tid)
+                return
+            send(
+                chat_id,
+                f"✅ <b>出口池清理完成：</b>\n<code>{html_mod.escape((out_p or 'done')[:320])}</code>",
+                parse_mode="HTML",
+                thread_id=norm_tid,
+            )
+            return
+
+        if eg_sub in ("del", "delete", "rm"):
+            if len(parts) < 3:
+                send(chat_id, "用法：<code>/browser egress del &lt;custom-name&gt;</code>", parse_mode="HTML", thread_id=norm_tid)
+                return
+            try:
+                slug = _lb_egress_validate_slug(parts[2], require_custom_prefix=False)
+                ok_g, existing = _lb_egress_vault_get(slug)
+                if not ok_g or not isinstance(existing, dict) or str(existing.get("status") or "").lower() == "removed":
+                    send(chat_id, f"❌ 出口节点 <code>{html_mod.escape(slug)}</code> 不存在", parse_mode="HTML", thread_id=norm_tid)
+                    return
+                if not (slug.startswith("custom-") or str(existing.get("provider") or "").lower() == "custom"):
+                    send(chat_id, "❌ 仅允许作废手工录入的 <code>custom-*</code> 出口节点", parse_mode="HTML", thread_id=norm_tid)
+                    return
+                _lb_egress_vault_put(
+                    slug,
+                    {
+                        "status": "removed",
+                        "username": "",
+                        "password": "",
+                        "removed_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    },
+                    merge=True,
+                )
+            except Exception as exc:
+                send(chat_id, f"❌ 作废节点失败：{html_mod.escape(_scrub_live_browser_egress(str(exc)))}", parse_mode="HTML", thread_id=norm_tid)
+                return
+            send(chat_id, f"✅ 已安全作废出口节点 <code>{html_mod.escape(slug)}</code>", parse_mode="HTML", thread_id=norm_tid)
+            return
+
+        send(
+            chat_id,
+            "<b>🌐 /browser egress 用法：</b>\n"
+            "• <code>/browser egress list</code>\n"
+            "• <code>/browser egress add [slug] socks5h://[user:pass@]host:port</code>\n"
+            "• <code>/browser egress verify &lt;name&gt;</code>\n"
+            "• <code>/browser egress draw [US]</code> · <code>/browser egress prune</code>\n"
+            "• <code>/browser egress del &lt;custom-name&gt;</code>",
+            parse_mode="HTML",
+            thread_id=norm_tid,
+        )
+        return
+
     bot_hint = _live_browser_bot_hint()
     if not bot_hint:
         send(chat_id, "❌ 无法识别当前 Bot 身份，已拒绝操作（fail-closed）", parse_mode="HTML", thread_id=norm_tid)
         return
     owner_uid = _live_browser_owner_uid(chat_id, from_user=from_user)
 
-    try:
-        is_private = int(chat_id) > 0
-    except Exception:
-        is_private = False
-    chat_scope = "private" if is_private else "group"
+    # BM5: Full Bot Roster AI selection & atomic hot-rebind
+    if sub == "ai":
+        if not is_private:
+            send(chat_id, "🔒 请前往管理员私聊选择或改绑浏览器操作 AI。", parse_mode="HTML", thread_id=norm_tid)
+            return
+        strict_role = _get_user_role(chat_id, from_user=from_user, allow_uid_fallback=False) if from_user is not None else "admin"
+        if strict_role != "admin":
+            send(chat_id, "🔒 仅管理员私聊可切换操作 AI。", parse_mode="HTML", thread_id=norm_tid)
+            return
+        if len(parts) < 2:
+            text, kb = _lb_build_ai_picker_panel(chat_id, from_user=from_user)
+            send(chat_id, text, parse_mode="HTML", reply_markup=kb, thread_id=norm_tid)
+            return
+        target_bot = _lb_lookup_bot(parts[1])
+        if target_bot is None:
+            send(chat_id, f"❌ 未在团队 Roster 中找到 AI：<code>{html_mod.escape(parts[1])}</code>", parse_mode="HTML", thread_id=norm_tid)
+            return
+        ob_body = {
+            "owner_bot": target_bot["handle"],
+            "source": "tg_cmd",
+            "chat_scope": "private",
+            "bot": bot_hint,
+        }
+        if owner_uid is not None:
+            ob_body["user_id"] = owner_uid
+        if target_bot.get("bot_id"):
+            ob_body["owner_bot_id"] = target_bot["bot_id"]
+        ok_ob, res_ob = _live_browser_request("POST", "/internal/owner-bot", json_body=ob_body, timeout=(2.0, 6.0))
+        if not ok_ob:
+            send(chat_id, f"❌ 改绑操作 AI 失败：{html_mod.escape(str(res_ob))}", parse_mode="HTML", thread_id=norm_tid)
+            return
+        _lb_set_default_owner_bot(target_bot["handle"], target_bot.get("bot_id"))
+        running_now = bool(isinstance(res_ob, dict) and res_ob.get("running"))
+        mode_hint = "（运行中原子热改绑，未重启浏览器）" if running_now else "（已设为默认操作 AI）"
+        send(
+            chat_id,
+            f"✅ <b>浏览器操作 AI 已绑定为：</b><code>@{html_mod.escape(target_bot['handle'])}</code> {mode_hint}",
+            parse_mode="HTML",
+            thread_id=norm_tid,
+        )
+        return
+
+    # BM6: Manual launch without AI -> takeover=true + immediate standby wakeup to bound AI
+    if sub == "launch":
+        if not is_private:
+            send(chat_id, "🔒 请前往管理员私聊执行手动拉起浏览器。", parse_mode="HTML", thread_id=norm_tid)
+            return
+        strict_role = _get_user_role(chat_id, from_user=from_user, allow_uid_fallback=False) if from_user is not None else "admin"
+        if strict_role != "admin":
+            send(chat_id, "🔒 仅管理员私聊可手动拉起浏览器。", parse_mode="HTML", thread_id=norm_tid)
+            return
+        rest_args = parts[1:]
+        engine = "camoufox"
+        profile = "default"
+        launch_url = None
+        if rest_args:
+            first_low = rest_args[0].lower()
+            if first_low in ("camoufox", "external_chromium", "chromium", "chrome"):
+                engine = "camoufox" if first_low == "camoufox" else "external_chromium"
+                if len(rest_args) > 1:
+                    profile = rest_args[1].strip()
+                if len(rest_args) > 2:
+                    launch_url = rest_args[2].strip()
+            else:
+                profile = rest_args[0].strip()
+                if len(rest_args) > 1:
+                    launch_url = rest_args[1].strip()
+        try:
+            if not _LB_PROFILE_NAME_RE.fullmatch(profile) or ".." in profile:
+                raise ValueError("Profile 名称非法")
+            launch_url = _lb_validate_launch_url(launch_url)
+        except ValueError as exc:
+            send(chat_id, f"❌ 参数非法：{html_mod.escape(str(exc))}", parse_mode="HTML", thread_id=norm_tid)
+            return
+        status_params = {"source": "tg_cmd", "chat_scope": "private", "bot": bot_hint}
+        if owner_uid is not None:
+            status_params["user_id"] = str(owner_uid)
+        ok_st0, st0 = _live_browser_request("GET", "/internal/status", timeout=(1.5, 3.0), params=status_params)
+        bound_h, bound_id = _lb_resolve_owner_bot_for_launch(st0 if ok_st0 else None)
+        if engine == "external_chromium":
+            ok_ext, res_ext = _lb_launch_external_chromium(
+                bot_hint=bot_hint,
+                owner_uid=owner_uid,
+                profile=profile,
+                launch_url=launch_url,
+                owner_bot=bound_h,
+                owner_bot_id=bound_id,
+                manual_launch=True,
+            )
+            if not ok_ext:
+                send(chat_id, f"❌ 手动拉起外部 Chromium 失败：{html_mod.escape(str(res_ext))}", parse_mode="HTML", thread_id=norm_tid)
+                return
+        else:
+            body = {
+                "profile": profile,
+                "engine": "camoufox",
+                "manual_launch": True,
+                "bot": bot_hint,
+                "source": "tg_cmd",
+                "chat_scope": "private",
+            }
+            if owner_uid is not None:
+                body["user_id"] = owner_uid
+            if launch_url:
+                body["url"] = launch_url
+            if bound_h:
+                body["owner_bot"] = bound_h
+            if bound_id:
+                body["owner_bot_id"] = bound_id
+            ok_l, res_l = _live_browser_request("POST", "/internal/start", json_body=body, timeout=(2.5, 25.0))
+            if not ok_l:
+                send(chat_id, f"❌ 手动拉起浏览器失败：{html_mod.escape(str(res_l))}", parse_mode="HTML", thread_id=norm_tid)
+                return
+        text, kb = build_browser_panel(chat_id, from_user=from_user)
+        send(chat_id, text, parse_mode="HTML", reply_markup=kb, thread_id=norm_tid)
+        return
+
+    # BM7: Handback to bound AI with optional instruction/handback_note
+    if sub == "handback":
+        if not is_private:
+            send(chat_id, "🔒 请前往管理员私聊交还浏览器给 AI。", parse_mode="HTML", thread_id=norm_tid)
+            return
+        strict_role = _get_user_role(chat_id, from_user=from_user, allow_uid_fallback=False) if from_user is not None else "admin"
+        if strict_role != "admin":
+            send(chat_id, "🔒 仅管理员私聊可执行交还给 AI。", parse_mode="HTML", thread_id=norm_tid)
+            return
+        raw_note = raw[len(parts[0]):].strip()
+        clean_note = _sanitize_live_browser_handback_note(raw_note) if raw_note else ""
+        hb_body = {
+            "active": False,
+            "reason": "tg_handback",
+            "source": "tg_cmd",
+            "chat_scope": "private",
+            "bot": bot_hint,
+        }
+        if owner_uid is not None:
+            hb_body["user_id"] = owner_uid
+        if clean_note:
+            hb_body["instruction"] = clean_note
+            hb_body["handback_note"] = clean_note
+        ok_hb, res_hb = _live_browser_request("POST", "/internal/takeover", json_body=hb_body, timeout=(2.0, 8.0))
+        if not ok_hb:
+            send(chat_id, f"❌ 交还给 AI 失败：{html_mod.escape(str(res_hb))}", parse_mode="HTML", thread_id=norm_tid)
+            return
+        bound_h = (res_hb.get("owner_bot") if isinstance(res_hb, dict) else None) or _lb_get_default_owner_bot()[0] or _current_bot_handle()
+        note_hint = f"\n📝 <b>附言指令：</b>{html_mod.escape(clean_note[:160])}" if clean_note else ""
+        send(
+            chat_id,
+            f"▶️ <b>已交还给 AI：</b><code>@{html_mod.escape(str(bound_h or '').lstrip('@'))}</code>{note_hint}",
+            parse_mode="HTML",
+            thread_id=norm_tid,
+        )
+        return
+
+    # Dual-engine profiles view & CRUD
+    if sub == "profiles":
+        if not is_private:
+            send(chat_id, "🔒 群聊已脱敏隔离，请前往管理员私聊查看双引擎 Profile 列表。", parse_mode="HTML", thread_id=norm_tid)
+            return
+        strict_role = _get_user_role(chat_id, from_user=from_user, allow_uid_fallback=False) if from_user is not None else "admin"
+        if strict_role != "admin":
+            send(chat_id, "🔒 仅管理员私聊可查看详细 Profile 目录。", parse_mode="HTML", thread_id=norm_tid)
+            return
+        eng_filter = parts[1].lower() if len(parts) > 1 else "all"
+        if eng_filter not in ("all", "camoufox", "external_chromium"):
+            send(chat_id, "用法：<code>/browser profiles [camoufox|external_chromium]</code>", parse_mode="HTML", thread_id=norm_tid)
+            return
+        status_params = {"source": "tg_cmd", "chat_scope": "private", "bot": bot_hint}
+        if owner_uid is not None:
+            status_params["user_id"] = str(owner_uid)
+        lines = ["<b>🎭 双引擎 Profile 列表</b>", "━━━━━━━━━━━━━━━━━━━━"]
+        if eng_filter in ("all", "camoufox"):
+            ok_p, pdata = _live_browser_request("GET", "/internal/profiles", timeout=(1.5, 3.0), params=status_params)
+            cf_list = (pdata.get("profiles") or []) if ok_p and isinstance(pdata, dict) else []
+            lines.append(f"<b>Camoufox ({len(cf_list)})：</b>")
+            for p in cf_list[:12]:
+                mark = "🔒 " if p.get("pinned") else ("⭐ " if p.get("allow_google") else "· ")
+                eg = _scrub_live_browser_egress(p.get("egress_display") or p.get("egress") or "direct")
+                lines.append(f"{mark}<code>{html_mod.escape(str(p.get('name') or ''))}</code> ({html_mod.escape(str(p.get('os') or 'windows'))} · <code>{html_mod.escape(eg)}</code>)")
+        if eng_filter in ("all", "external_chromium"):
+            ext_list = _lb_list_external_profiles()
+            lines.append(f"\n<b>{html_mod.escape(_lb_external_label())} ({len(ext_list)})：</b>")
+            if not _lb_external_cli():
+                lines.append("· <i>未配置外部 Chromium 适配器</i>")
+            else:
+                for p in ext_list[:12]:
+                    mark = "🔒 " if p.get("pinned") else ("⭐ " if p.get("allow_google") else "· ")
+                    lines.append(f"{mark}<code>{html_mod.escape(p['name'])}</code> (<code>{html_mod.escape(p['egress'])}</code>)")
+        send(chat_id, "\n".join(lines), parse_mode="HTML", thread_id=norm_tid)
+        return
+
+    if sub == "profile":
+        if not is_private:
+            send(chat_id, "🔒 Profile 配置仅限管理员私聊执行。", parse_mode="HTML", thread_id=norm_tid)
+            return
+        strict_role = _get_user_role(chat_id, from_user=from_user, allow_uid_fallback=False) if from_user is not None else "admin"
+        if strict_role != "admin":
+            send(chat_id, "🔒 仅管理员私聊可修改 Profile 配置。", parse_mode="HTML", thread_id=norm_tid)
+            return
+        p_act = parts[1].lower() if len(parts) > 1 else ""
+        if p_act not in ("set", "egress", "del", "delete") or len(parts) < 4:
+            send(
+                chat_id,
+                "<b>🎭 /browser profile 用法：</b>\n"
+                "• <code>/browser profile set &lt;camoufox|external_chromium&gt; &lt;name&gt; [os=.. locale=.. window=.. egress=.. --confirm-google]</code>\n"
+                "• <code>/browser profile egress &lt;camoufox|external_chromium&gt; &lt;name&gt; &lt;direct|node|proxy&gt; [--confirm-google]</code>\n"
+                "• <code>/browser profile del &lt;camoufox|external_chromium&gt; &lt;name&gt;</code>",
+                parse_mode="HTML",
+                thread_id=norm_tid,
+            )
+            return
+        eng = parts[2].strip().lower()
+        pname = parts[3].strip()
+        if eng not in ("camoufox", "external_chromium"):
+            send(chat_id, "❌ 引擎仅允许 <code>camoufox</code> 或 <code>external_chromium</code>", parse_mode="HTML", thread_id=norm_tid)
+            return
+        if not _LB_PROFILE_NAME_RE.fullmatch(pname) or ".." in pname:
+            send(chat_id, "❌ Profile 名称非法", parse_mode="HTML", thread_id=norm_tid)
+            return
+        if pname == "default":
+            send(chat_id, "🔒 拒绝操作：主默认/Pinned Profile 不可修改、不可绑定代理或删除。", parse_mode="HTML", thread_id=norm_tid)
+            return
+        status_params = {"source": "tg_cmd", "chat_scope": "private", "bot": bot_hint}
+        if owner_uid is not None:
+            status_params["user_id"] = str(owner_uid)
+        ok_st0, st0 = _live_browser_request("GET", "/internal/status", timeout=(1.5, 3.0), params=status_params)
+        active_p = str(st0.get("profile") or "") if ok_st0 and isinstance(st0, dict) and st0.get("running") else ""
+        active_e = str(st0.get("engine") or "") if ok_st0 and isinstance(st0, dict) and st0.get("running") else ""
+        if (active_p == pname and (not active_e or active_e == eng)) or (eng == "external_chromium" and _lb_is_external_watch_active(pname)):
+            send(chat_id, f"❌ Profile <code>{html_mod.escape(pname)}</code> 正在运行中（409），请先执行 <code>/browser stop</code>。", parse_mode="HTML", thread_id=norm_tid)
+            return
+
+        if p_act in ("del", "delete"):
+            if eng == "camoufox":
+                ok_d, res_d = _live_browser_request("DELETE", f"/internal/profiles/{pname}", params=status_params, timeout=(2.0, 8.0))
+                if not ok_d:
+                    send(chat_id, f"❌ 删除 Profile 失败：{html_mod.escape(str(res_d))}", parse_mode="HTML", thread_id=norm_tid)
+                    return
+            else:
+                ext_p = _lb_show_external_profile(pname)
+                if ext_p is None:
+                    send(chat_id, f"❌ 外部 Profile <code>{html_mod.escape(pname)}</code> 不存在", parse_mode="HTML", thread_id=norm_tid)
+                    return
+                if ext_p.get("pinned"):
+                    send(chat_id, "🔒 主 Pinned Profile 禁止删除", parse_mode="HTML", thread_id=norm_tid)
+                    return
+                rc_d, out_d, err_d = _lb_run_external_cli(["profile", "delete", pname])
+                if rc_d != 0:
+                    send(
+                        chat_id,
+                        f"❌ 删除外部 Profile 失败：{html_mod.escape(err_d or _scrub_live_browser_egress(out_d, max_len=240))}",
+                        parse_mode="HTML",
+                        thread_id=norm_tid,
+                    )
+                    return
+            send(chat_id, f"✅ 已删除 {html_mod.escape(eng)} Profile <code>{html_mod.escape(pname)}</code>", parse_mode="HTML", thread_id=norm_tid)
+            return
+
+        # `set` or `egress`
+        extra_tokens = parts[4:]
+        confirm_google = "--confirm-google" in extra_tokens
+        kv = {}
+        if p_act == "egress":
+            if not extra_tokens:
+                send(chat_id, "用法：<code>/browser profile egress &lt;engine&gt; &lt;name&gt; &lt;direct|node|proxy&gt; [--confirm-google]</code>", parse_mode="HTML", thread_id=norm_tid)
+                return
+            kv["egress"] = extra_tokens[0]
+        else:
+            for tok in extra_tokens:
+                if tok == "--confirm-google":
+                    continue
+                if "=" in tok:
+                    k, v = tok.split("=", 1)
+                    kv[k.strip().lower()] = v.strip()
+
+        bare_proxy = None
+        vault_ref = None
+        clear_egress = False
+        try:
+            eg_val = kv.get("egress") or kv.get("proxy") or kv.get("proxy_bao_ref") or kv.get("egress_node")
+            if eg_val is not None:
+                if eg_val.lower() in ("direct", "none", "-"):
+                    clear_egress = True
+                elif "://" in eg_val or "@" in eg_val:
+                    bare_proxy = _lb_validate_credential_free_proxy(eg_val)
+                else:
+                    clean_ref = _lb_validate_vault_ref(eg_val)
+                    slug = _lb_egress_validate_slug(
+                        clean_ref.rsplit("/", 1)[-1].split("#", 1)[0],
+                        require_custom_prefix=False,
+                    )
+                    coords = _lb_egress_vault_coords()
+                    if coords["ready"]:
+                        ok_g, node_raw = _lb_egress_vault_get(slug, coords=coords)
+                        if not ok_g or not isinstance(node_raw, dict) or str(node_raw.get("status") or "").lower() == "removed":
+                            raise ValueError(f"出口节点 {eg_val!r} 不存在或已作废")
+                        vault_ref = _lb_validate_vault_ref(f"{coords['ref_prefix']}/{slug}")
+                    else:
+                        vault_ref = clean_ref
+        except ValueError as exc:
+            send(chat_id, f"❌ 出口参数非法：{html_mod.escape(_scrub_live_browser_egress(str(exc)))}", parse_mode="HTML", thread_id=norm_tid)
+            return
+
+        if eng == "camoufox":
+            ok_pl, pl_data = _live_browser_request("GET", "/internal/profiles", timeout=(1.5, 3.0), params=status_params)
+            existing = None
+            if ok_pl and isinstance(pl_data, dict):
+                for item in pl_data.get("profiles") or []:
+                    if isinstance(item, dict) and item.get("name") == pname:
+                        existing = item
+                        break
+            if existing is not None:
+                if existing.get("pinned"):
+                    send(chat_id, "🔒 主 Pinned Profile 不可修改", parse_mode="HTML", thread_id=norm_tid)
+                    return
+                if existing.get("allow_google") is True:
+                    if not confirm_google:
+                        send(chat_id, "⚠️ 修改专用 Google Profile 必须显式附加 <code>--confirm-google</code> 参数确认。", parse_mode="HTML", thread_id=norm_tid)
+                        return
+                    for bkey in _LB_DEDICATED_GOOGLE_BOUNDARY_KEYS:
+                        if bkey in kv:
+                            send(chat_id, f"❌ 专用 Google Profile 禁止修改安全边界字段 <code>{html_mod.escape(bkey)}</code>", parse_mode="HTML", thread_id=norm_tid)
+                            return
+            payload = {
+                "name": pname,
+                "overwrite": existing is not None or p_act == "egress",
+                "source": "tg_cmd",
+                "chat_scope": "private",
+                "bot": bot_hint,
+            }
+            if owner_uid is not None:
+                payload["user_id"] = owner_uid
+            if existing is not None:
+                for keep in ("os", "locale", "window", "mobile", "persistent", "allow_google", "account", "proxy", "proxy_bao_ref"):
+                    if keep in existing and existing[keep] is not None:
+                        payload[keep] = existing[keep]
+                if "proxy_bao_ref" not in payload and existing.get("bao_ref"):
+                    payload["proxy_bao_ref"] = existing["bao_ref"]
+                if "proxy" not in payload and "proxy_bao_ref" not in payload:
+                    raw_eg = str(existing.get("egress") or existing.get("egress_display") or "").strip()
+                    if raw_eg and "://" in raw_eg and "@" not in raw_eg and raw_eg.lower() != "direct":
+                        payload["proxy"] = raw_eg
+            for f in ("os", "locale", "window", "account"):
+                if f in kv and kv[f]:
+                    payload[f] = kv[f]
+            if "lang" in kv and kv["lang"] and "locale" not in kv:
+                payload["locale"] = kv["lang"]
+            if "allow_google" in kv and existing is None:
+                payload["allow_google"] = kv["allow_google"].lower() in ("1", "true", "yes")
+            if bare_proxy:
+                payload["proxy"] = bare_proxy
+                payload.pop("proxy_bao_ref", None)
+            elif vault_ref:
+                payload["proxy_bao_ref"] = vault_ref
+                payload.pop("proxy", None)
+            elif clear_egress:
+                payload.pop("proxy", None)
+                payload.pop("proxy_bao_ref", None)
+            ok_up, res_up = _live_browser_request("POST", "/internal/profiles", json_body=payload, timeout=(2.0, 10.0))
+            if not ok_up:
+                send(chat_id, f"❌ 保存 Camoufox Profile 失败：{html_mod.escape(_scrub_live_browser_egress(str(res_up)))}", parse_mode="HTML", thread_id=norm_tid)
+                return
+            send(chat_id, f"✅ 已更新 Camoufox Profile <code>{html_mod.escape(pname)}</code>", parse_mode="HTML", thread_id=norm_tid)
+            return
+
+        # external_chromium profile set/egress
+        existing_ext = _lb_show_external_profile(pname)
+        if existing_ext is not None:
+            if existing_ext.get("pinned"):
+                send(chat_id, "🔒 主 Pinned Profile 不可修改", parse_mode="HTML", thread_id=norm_tid)
+                return
+            if existing_ext.get("allow_google") is True or existing_ext.get("account"):
+                if not confirm_google:
+                    send(chat_id, "⚠️ 修改专用 Google Profile 必须显式附加 <code>--confirm-google</code> 参数确认。", parse_mode="HTML", thread_id=norm_tid)
+                    return
+                for bkey in _LB_DEDICATED_GOOGLE_BOUNDARY_KEYS:
+                    if bkey in kv:
+                        send(chat_id, f"❌ 专用 Google Profile 禁止修改安全边界字段 <code>{html_mod.escape(bkey)}</code>", parse_mode="HTML", thread_id=norm_tid)
+                        return
+        cli_args = ["profile", "create", pname]
+        if existing_ext is not None or p_act == "egress":
+            cli_args.append("--overwrite")
+        if bare_proxy:
+            cli_args.extend(["--proxy", bare_proxy])
+        elif vault_ref:
+            cli_args.extend(["--proxy-bao", vault_ref])
+        if "tz" in kv and _LB_TZ_RE.fullmatch(kv["tz"]) and not kv["tz"].startswith("-"):
+            cli_args.extend(["--tz", kv["tz"]])
+        lang_v = kv.get("lang") or kv.get("locale")
+        if lang_v and _LB_LANG_RE.fullmatch(lang_v):
+            cli_args.extend(["--lang", lang_v])
+        if "window" in kv and _LB_WINDOW_RE.fullmatch(kv["window"]):
+            cli_args.extend(["--window", kv["window"]])
+        if "account" in kv and kv["account"] and existing_ext is None:
+            try:
+                acct_val = _lb_validate_account(kv["account"])
+            except ValueError as exc:
+                send(chat_id, f"❌ {html_mod.escape(str(exc))}", parse_mode="HTML", thread_id=norm_tid)
+                return
+            cli_args.extend(["--account", acct_val])
+        rc_e, out_e, err_e = _lb_run_external_cli(cli_args)
+        if rc_e != 0:
+            send(
+                chat_id,
+                f"❌ 保存外部 Profile 失败：{html_mod.escape(err_e or _scrub_live_browser_egress(out_e, max_len=240))}",
+                parse_mode="HTML",
+                thread_id=norm_tid,
+            )
+            return
+        send(chat_id, f"✅ 已更新外部 Chromium Profile <code>{html_mod.escape(pname)}</code>", parse_mode="HTML", thread_id=norm_tid)
+        return
 
     if sub == "switch":
         if len(parts) < 2:
@@ -13853,6 +15813,10 @@ def cmd_browser(chat_id, arg, thread_id=None, scope_key=None, from_user=None):
         return
 
     if sub == "stop":
+        if is_private and _lb_stop_external_watch(stop_external_profile=True):
+            text, kb = build_browser_panel(chat_id, from_user=from_user)
+            send(chat_id, text, parse_mode="HTML", reply_markup=kb, thread_id=norm_tid)
+            return
         body = {"bot": bot_hint, "source": "tg_cmd", "chat_scope": chat_scope}
         if owner_uid is not None:
             body["user_id"] = owner_uid
@@ -13876,9 +15840,12 @@ def cmd_browser(chat_id, arg, thread_id=None, scope_key=None, from_user=None):
         chat_id,
         "<b>🎭 /browser 用法：</b>\n"
         "• <code>/browser</code> — 查看状态、指纹列表与控制面板\n"
-        "• <code>/browser switch &lt;name&gt; [url]</code> — 切换并重启指定指纹\n"
-        "• <code>/browser start [name] [url]</code> — 启动安全浏览器\n"
-        "• <code>/browser stop</code> — 安全停止托管浏览器",
+        "• <code>/browser ai [@handle]</code> — 选择/热改绑全量 Roster 操作 AI\n"
+        "• <code>/browser launch [camoufox|external_chromium] [profile] [url]</code> — 无 AI 手动拉起并首帧唤醒\n"
+        "• <code>/browser handback [下一步指令]</code> — 交还给当前绑定 AI（支持附言）\n"
+        "• <code>/browser profiles [engine]</code> / <code>/browser profile set|egress|del ...</code>\n"
+        "• <code>/browser egress list|add|verify|draw|prune|del ...</code>\n"
+        "• <code>/browser switch &lt;name&gt; [url]</code> · <code>/browser start [name] [url]</code> · <code>/browser stop</code>",
         parse_mode="HTML",
         thread_id=norm_tid,
     )
@@ -14329,7 +16296,7 @@ def handle_callback(cb):
 
     elif data == "action:browser":
         tg("answerCallbackQuery", callback_query_id=cb_id)
-        cmd_browser(chat_id, "", thread_id=thread_id, scope_key=skey)
+        cmd_browser(chat_id, "", thread_id=thread_id, scope_key=skey, from_user=from_user, msg_id=msg_id or 0)
 
     elif data.startswith("browser:"):
         _handle_browser_callback(cb_id, chat_id, thread_id, msg_id, data, from_user=from_user)
@@ -14714,15 +16681,128 @@ def _handle_browser_callback(cb_id, chat_id, thread_id, msg_id, data, from_user=
             return
         tg("answerCallbackQuery", callback_query_id=cb_id, text="浏览器已启动" if not cb_is_private else f"已启动指纹 {target or 'default'}")
     elif sub == "stop":
-        body = {"bot": bot_hint, "source": "tg_cmd", "chat_scope": cb_chat_scope}
-        if owner_uid is not None:
-            body["user_id"] = owner_uid
-        ok, res = _live_browser_request("POST", "/internal/stop", json_body=body, timeout=(2.0, 10.0))
-        if not ok:
-            err_alert = "停止未完成，请前往私聊查看详情" if not cb_is_private else f"停止失败: {res}"[:180]
-            tg("answerCallbackQuery", callback_query_id=cb_id, text=err_alert, show_alert=True)
+        if cb_is_private and _lb_stop_external_watch(stop_external_profile=True):
+            tg("answerCallbackQuery", callback_query_id=cb_id, text="外部 Chromium 已安全停止")
+        else:
+            body = {"bot": bot_hint, "source": "tg_cmd", "chat_scope": cb_chat_scope}
+            if owner_uid is not None:
+                body["user_id"] = owner_uid
+            ok, res = _live_browser_request("POST", "/internal/stop", json_body=body, timeout=(2.0, 10.0))
+            if not ok:
+                err_alert = "停止未完成，请前往私聊查看详情" if not cb_is_private else f"停止失败: {res}"[:180]
+                tg("answerCallbackQuery", callback_query_id=cb_id, text=err_alert, show_alert=True)
+                return
+            tg("answerCallbackQuery", callback_query_id=cb_id, text="浏览器已安全停止")
+    elif sub == "ai_menu":
+        strict_role = _get_user_role(chat_id, from_user=from_user, allow_uid_fallback=False) if from_user is not None else "admin"
+        if not cb_is_private or strict_role != "admin":
+            tg("answerCallbackQuery", callback_query_id=cb_id, text="🔒 仅管理员私聊可切换操作 AI", show_alert=True)
             return
-        tg("answerCallbackQuery", callback_query_id=cb_id, text="浏览器已安全停止")
+        tg("answerCallbackQuery", callback_query_id=cb_id, text="选择操作 AI")
+        if msg_id:
+            panel_text, panel_kb = _lb_build_ai_picker_panel(chat_id, from_user=from_user)
+            tg("editMessageText", chat_id=chat_id, message_id=msg_id, text=panel_text, parse_mode="HTML", reply_markup=panel_kb)
+        return
+    elif sub.startswith("set_ai:"):
+        strict_role = _get_user_role(chat_id, from_user=from_user, allow_uid_fallback=False) if from_user is not None else "admin"
+        if not cb_is_private or strict_role != "admin":
+            tg("answerCallbackQuery", callback_query_id=cb_id, text="🔒 仅管理员私聊可切换操作 AI", show_alert=True)
+            return
+        target_bot = _lb_lookup_bot(sub[7:].strip())
+        if target_bot is None:
+            tg("answerCallbackQuery", callback_query_id=cb_id, text="目标 AI 不在团队 Roster 中", show_alert=True)
+            return
+        ob_body = {
+            "owner_bot": target_bot["handle"],
+            "source": "tg_cmd",
+            "chat_scope": "private",
+            "bot": bot_hint,
+        }
+        if owner_uid is not None:
+            ob_body["user_id"] = owner_uid
+        if target_bot.get("bot_id"):
+            ob_body["owner_bot_id"] = target_bot["bot_id"]
+        ok_ob, res_ob = _live_browser_request("POST", "/internal/owner-bot", json_body=ob_body, timeout=(2.0, 6.0))
+        if not ok_ob:
+            tg("answerCallbackQuery", callback_query_id=cb_id, text=f"改绑失败: {res_ob}"[:180], show_alert=True)
+            return
+        _lb_set_default_owner_bot(target_bot["handle"], target_bot.get("bot_id"))
+        tg("answerCallbackQuery", callback_query_id=cb_id, text=f"🤖 已绑定操作 AI: @{target_bot['handle']}"[:180])
+    elif sub.startswith("launch:"):
+        strict_role = _get_user_role(chat_id, from_user=from_user, allow_uid_fallback=False) if from_user is not None else "admin"
+        if not cb_is_private or strict_role != "admin":
+            tg("answerCallbackQuery", callback_query_id=cb_id, text="🔒 仅管理员私聊可手动拉起浏览器", show_alert=True)
+            return
+        launch_parts = sub[7:].split(":", 1)
+        eng = (launch_parts[0] or "camoufox").strip().lower()
+        prof = (launch_parts[1] if len(launch_parts) > 1 else "default").strip() or "default"
+        if eng not in ("camoufox", "external_chromium") or not _LB_PROFILE_NAME_RE.fullmatch(prof):
+            tg("answerCallbackQuery", callback_query_id=cb_id, text="拉起参数非法", show_alert=True)
+            return
+        st_params = {"source": "tg_cmd", "chat_scope": "private", "bot": bot_hint}
+        if owner_uid is not None:
+            st_params["user_id"] = str(owner_uid)
+        ok_st0, st0 = _live_browser_request("GET", "/internal/status", timeout=(1.5, 3.0), params=st_params)
+        bound_h, bound_id = _lb_resolve_owner_bot_for_launch(st0 if ok_st0 else None)
+        if eng == "external_chromium":
+            ok_l, res_l = _lb_launch_external_chromium(
+                bot_hint=bot_hint,
+                owner_uid=owner_uid,
+                profile=prof,
+                owner_bot=bound_h,
+                owner_bot_id=bound_id,
+                manual_launch=True,
+            )
+        else:
+            lbody = {
+                "profile": prof,
+                "engine": "camoufox",
+                "manual_launch": True,
+                "bot": bot_hint,
+                "source": "tg_cmd",
+                "chat_scope": "private",
+            }
+            if owner_uid is not None:
+                lbody["user_id"] = owner_uid
+            if bound_h:
+                lbody["owner_bot"] = bound_h
+            if bound_id:
+                lbody["owner_bot_id"] = bound_id
+            ok_l, res_l = _live_browser_request("POST", "/internal/start", json_body=lbody, timeout=(2.5, 25.0))
+        if not ok_l:
+            tg("answerCallbackQuery", callback_query_id=cb_id, text=f"手动拉起失败: {res_l}"[:180], show_alert=True)
+            return
+        tg("answerCallbackQuery", callback_query_id=cb_id, text=f"🖐 已手动拉起 {eng}/{prof} 并唤醒 AI 待命"[:180])
+    elif sub in ("handback", "takeover"):
+        strict_role = _get_user_role(chat_id, from_user=from_user, allow_uid_fallback=False) if from_user is not None else "admin"
+        if not cb_is_private or strict_role != "admin":
+            tg("answerCallbackQuery", callback_query_id=cb_id, text="🔒 仅管理员私聊可切换接管权", show_alert=True)
+            return
+        want_active = sub == "takeover"
+        tk_body = {
+            "active": want_active,
+            "reason": "tg_panel_takeover" if want_active else "tg_panel_handback",
+            "source": "tg_cmd",
+            "chat_scope": "private",
+            "bot": bot_hint,
+        }
+        if owner_uid is not None:
+            tk_body["user_id"] = owner_uid
+        ok_t, res_t = _live_browser_request("POST", "/internal/takeover", json_body=tk_body, timeout=(2.0, 8.0))
+        if not ok_t:
+            tg("answerCallbackQuery", callback_query_id=cb_id, text=f"操作失败: {res_t}"[:180], show_alert=True)
+            return
+        tg("answerCallbackQuery", callback_query_id=cb_id, text="🖐 已开启人工接管" if want_active else "▶️ 已交还给 AI")
+    elif sub == "egress_list":
+        strict_role = _get_user_role(chat_id, from_user=from_user, allow_uid_fallback=False) if from_user is not None else "admin"
+        if not cb_is_private or strict_role != "admin":
+            tg("answerCallbackQuery", callback_query_id=cb_id, text="🔒 仅管理员私聊可查看出口 IP 池", show_alert=True)
+            return
+        tg("answerCallbackQuery", callback_query_id=cb_id, text="出口 IP 池已刷新")
+        if msg_id:
+            panel_text, panel_kb = _lb_build_egress_panel()
+            tg("editMessageText", chat_id=chat_id, message_id=msg_id, text=panel_text, parse_mode="HTML", reply_markup=panel_kb)
+        return
     else:
         tg("answerCallbackQuery", callback_query_id=cb_id)
         return
@@ -15360,7 +17440,7 @@ def handle_message(msg):
         elif cmd == "/model":
             cmd_model(chat_id, raw_rest, thread_id=thread_id, scope_key=skey)
         elif cmd in ("/browser", "/profile"):
-            cmd_browser(chat_id, raw_rest, thread_id=thread_id, scope_key=skey, from_user=from_user)
+            cmd_browser(chat_id, raw_rest, thread_id=thread_id, scope_key=skey, from_user=from_user, msg_id=msg_id)
         elif cmd in ("/webui", "/studio"):
             cmd_webui(chat_id, raw_rest, thread_id=thread_id, scope_key=skey, from_user=from_user)
         elif cmd == "/effort":
@@ -15454,7 +17534,7 @@ def handle_message(msg):
             if cmd == "/start" and int(chat_id) > 0:
                 start_payload = (arg or "").strip().lower()
                 if start_payload in ("browser", "live", "live_browser"):
-                    cmd_browser(chat_id, "", thread_id=thread_id, scope_key=skey)
+                    cmd_browser(chat_id, "", thread_id=thread_id, scope_key=skey, from_user=from_user, msg_id=msg_id)
                     return
             if int(chat_id) < 0:
                 send(chat_id,
@@ -16084,6 +18164,10 @@ def main():
     else:
         close_all_sessions_sync()
     _cleanup_google_login_flows()
+    try:
+        _lb_stop_external_watch(stop_external_profile=False)
+    except Exception as exc:
+        log(f"Shutdown external watch stop warning: {type(exc).__name__}")
     _stop_studio_ipc()
     _stop_gateway_adapter()
 

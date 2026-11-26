@@ -2576,6 +2576,140 @@ class TestLiveBrowserProfiles(unittest.TestCase):
             txt = pf.read_text(encoding="utf-8")
             self.assertNotIn(forbidden_home, txt, f"Hardcoded host path found in public file {pf.name}")
 
+    def test_bm3_socks5_auth_loopback_sing_box_bridge_and_fail_closed(self) -> None:
+        """BM3: Authenticated SOCKS5 (incl. username-only empty pass) uses 0600 loopback sing-box bridge and cleans up."""
+        self.assertTrue(
+            srv.needs_socks5_auth_bridge(
+                {"server": "socks5h://proxy.example.com:1080", "username": "MOCK_U", "password": ""}
+            )
+        )
+        self.assertTrue(
+            srv.needs_socks5_auth_bridge(
+                {"server": "socks5://proxy.example.com:1080", "username": "MOCK_U", "password": "MOCK_P"}
+            )
+        )
+        self.assertFalse(srv.needs_socks5_auth_bridge({"server": "socks5://proxy.example.com:1080"}))
+        self.assertFalse(
+            srv.needs_socks5_auth_bridge(
+                {"server": "http://proxy.example.com:8080", "username": "MOCK_U", "password": "MOCK_P"}
+            )
+        )
+
+        # OpenBao JSON payload with host+port+username (no explicit server key) resolves cleanly
+        fake_bao_proc = subprocess.CompletedProcess(
+            args=["bao", "get", "egress/urn-us-1"],
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "scheme": "socks5h",
+                    "host": "proxy.example.com",
+                    "port": "1080",
+                    "username": "MOCK_URN_USER",
+                    "password": "",
+                }
+            ),
+            stderr="",
+        )
+        with mock.patch.object(srv.subprocess, "run", return_value=fake_bao_proc):
+            resolved = srv.resolve_proxy_bao_ref("egress/urn-us-1")
+            self.assertEqual("socks5h://proxy.example.com:1080", resolved["server"])
+            self.assertEqual("MOCK_URN_USER", resolved["username"])
+            self.assertNotIn("password", resolved)
+
+        srv.create_profile(
+            "socks5-auth-prof",
+            {"os": "linux", "proxy": "socks5h://MOCK_S5_USER:MOCK_S5_PASS@proxy.example.com:1080"},
+        )
+
+        # 1. Fail-closed when sing-box binary unavailable (never leaks credentials)
+        fake_mod = types.ModuleType("camoufox.async_api")
+        fake_mod.AsyncCamoufox = _FakeAsyncCamoufoxCM  # type: ignore[attr-defined]
+        fake_pkg = types.ModuleType("camoufox")
+        fake_pkg.async_api = fake_mod  # type: ignore[attr-defined]
+
+        async def _scenario_fail_closed() -> None:
+            hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "tok")
+            with (
+                mock.patch.dict(sys.modules, {"camoufox": fake_pkg, "camoufox.async_api": fake_mod}),
+                mock.patch.object(srv, "resolve_sing_box_bin", return_value=None),
+            ):
+                with self.assertRaises(RuntimeError) as ctx_err:
+                    await hub.start_hosted(notify_tg=False, profile="socks5-auth-prof")
+                self.assertNotIn("MOCK_S5_USER", str(ctx_err.exception))
+                self.assertNotIn("MOCK_S5_PASS", str(ctx_err.exception))
+                self.assertEqual("idle", hub.engine_mode)
+
+        asyncio.run(_scenario_fail_closed())
+
+        # 2. Happy path with mocked sing-box subprocess: 0600 config written without argv creds,
+        #    unlinked on ready, Camoufox gets credential-free 127.0.0.1 loopback proxy,
+        #    and stop_hosted terminates & reaps bridge cleanly.
+        captured_argv: list[str] = []
+        captured_cfg_mode: list[int] = []
+        captured_cfg_json: list[dict] = []
+        captured_cfg_path: list[Path] = []
+        terminated_flags: list[bool] = []
+
+        class _FakeSingBoxProc:
+            def __init__(self) -> None:
+                self.pid = -1
+                self.returncode: int | None = None
+
+            def terminate(self) -> None:
+                terminated_flags.append(True)
+                self.returncode = -15
+
+            def kill(self) -> None:
+                terminated_flags.append(True)
+                self.returncode = -9
+
+            async def wait(self) -> int:
+                if self.returncode is None:
+                    self.returncode = 0
+                return self.returncode
+
+        async def _fake_exec(*cmd, **kw):
+            self.assertTrue(kw.get("start_new_session"))
+            captured_argv.extend(str(x) for x in cmd)
+            cfg_p = Path(cmd[-1])
+            captured_cfg_path.append(cfg_p)
+            captured_cfg_mode.append(stat.S_IMODE(cfg_p.lstat().st_mode))
+            captured_cfg_json.append(json.loads(cfg_p.read_text(encoding="utf-8")))
+            return _FakeSingBoxProc()
+
+        async def _scenario_bridge_ok() -> None:
+            _FakeAsyncCamoufoxCM.recorded_calls.clear()
+            hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "tok")
+            with (
+                mock.patch.dict(sys.modules, {"camoufox": fake_pkg, "camoufox.async_api": fake_mod}),
+                mock.patch.object(srv, "resolve_sing_box_bin", return_value="/usr/local/bin/sing-box"),
+                mock.patch.object(srv.asyncio, "create_subprocess_exec", side_effect=_fake_exec),
+                mock.patch.object(srv, "_probe_loopback_port", return_value=True),
+            ):
+                st = await hub.start_hosted(notify_tg=False, profile="socks5-auth-prof")
+                self.assertTrue(st["running"])
+                self.assertEqual("socks5h://***@" + "proxy.example.com:1080", st["egress"])
+                self.assertNotIn("MOCK_S5_USER", " ".join(captured_argv))
+                self.assertNotIn("MOCK_S5_PASS", " ".join(captured_argv))
+                self.assertEqual([0o600], captured_cfg_mode)
+                self.assertEqual("socks", captured_cfg_json[0]["outbounds"][0]["type"])
+                self.assertEqual("MOCK_S5_USER", captured_cfg_json[0]["outbounds"][0]["username"])
+                self.assertEqual("MOCK_S5_PASS", captured_cfg_json[0]["outbounds"][0]["password"])
+                # Config file was immediately shredded/unlinked after readiness
+                self.assertFalse(captured_cfg_path[0].exists())
+                # Camoufox received credential-free loopback proxy
+                self.assertTrue(_FakeAsyncCamoufoxCM.recorded_calls)
+                cf_proxy = _FakeAsyncCamoufoxCM.recorded_calls[-1]["proxy"]
+                self.assertTrue(cf_proxy["server"].startswith("socks5://127.0.0.1:"))
+                self.assertNotIn("username", cf_proxy)
+                self.assertNotIn("password", cf_proxy)
+
+                await hub.stop_hosted(notify_finished=False)
+                self.assertTrue(terminated_flags, "sing-box loopback bridge must be terminated on stop")
+                self.assertIsNone(hub._socks5_bridge)
+
+        asyncio.run(_scenario_bridge_ok())
+
 
 if __name__ == "__main__":
     unittest.main()

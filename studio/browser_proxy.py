@@ -35,6 +35,7 @@ WS_CLOSE_ROLE_CHANGED = 4008
 
 _MUTATING_WS_TYPES = frozenset({
     "set_takeover",
+    "rebind_owner_bot",
     "input",
     "start_browser",
     "stop_browser",
@@ -452,9 +453,28 @@ class BrowserProxy:
                                         ensure_ascii=False,
                                     )
                                 )
+                            elif mtype == "rebind_owner_bot" and payload.get("req_id") is not None:
+                                await client_ws.send_str(
+                                    json.dumps(
+                                        {
+                                            "type": "owner_bot_ack",
+                                            "req_id": str(payload.get("req_id")),
+                                            "ok": False,
+                                            "source": "studio_auth",
+                                            "error": "只读权限不可切换绑定 AI",
+                                        },
+                                        ensure_ascii=False,
+                                    )
+                                )
                             continue
+                        # Strip any client-forged `role` key before forwarding upstream
+                        if "role" in payload:
+                            payload.pop("role", None)
+                            forward_str = json.dumps(payload, ensure_ascii=False)
+                        else:
+                            forward_str = msg.data
                         if not upstream_ws.closed and not entry.get("closing"):
-                            await upstream_ws.send_str(msg.data)
+                            await upstream_ws.send_str(forward_str)
                     elif msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED, WSMsgType.ERROR):
                         break
 

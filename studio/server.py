@@ -26,10 +26,12 @@ from .attachment_service import StudioAttachmentService
 from .attention_service import StudioAttentionService
 from .auth import StudioAuthManager, studio_auth_error
 from .bot_control import StudioBotControlService
+from .browser_control_service import StudioBrowserControlService
 from .browser_proxy import BrowserProxy, HTTP_SESSION_KEY
 from .chat_service import StudioChatService
 from .control_plane import StudioControlPlane
 from .data_sources import StudioDataSources
+from .egress_pool_service import StudioEgressPoolService
 from .event_hub import StudioEventHub
 from .federation_service import StudioFederationService
 from .gateway_service import GatewayService
@@ -64,6 +66,12 @@ WORKBENCH_STATE_KEY: web.AppKey[WorkbenchStateService] = web.AppKey(
 )
 FEDERATION_SERVICE_KEY: web.AppKey[StudioFederationService] = web.AppKey(
     "federation_service", StudioFederationService
+)
+EGRESS_POOL_KEY: web.AppKey[StudioEgressPoolService] = web.AppKey(
+    "egress_pool", StudioEgressPoolService
+)
+BROWSER_CONTROL_KEY: web.AppKey[StudioBrowserControlService] = web.AppKey(
+    "browser_control", StudioBrowserControlService
 )
 STATIC_DIST_KEY: web.AppKey[Path] = web.AppKey("static_dist_dir", Path)
 
@@ -224,6 +232,8 @@ def create_app(
     federation_hub_port: int | None = None,
     federation_service: StudioFederationService | None = None,
     federation_workbench_state_path: Path | None = None,
+    egress_pool_service: StudioEgressPoolService | None = None,
+    browser_control_service: StudioBrowserControlService | None = None,
 ) -> web.Application:
     public_url = os.environ.get("AGY_STUDIO_PUBLIC_URL", "").strip()
     auth = auth_mgr or StudioAuthManager(public_url=public_url)
@@ -323,6 +333,15 @@ def create_app(
         hub_port=federation_hub_port,
         workbench_state_path=federation_workbench_state_path,
     )
+    egress_pool_svc = egress_pool_service or StudioEgressPoolService(
+        auth,
+        secrets_config,
+    )
+    browser_control_svc = browser_control_service or StudioBrowserControlService(
+        auth,
+        sources,
+        egress_pool=egress_pool_svc,
+    )
     dist_dir = static_dist_dir or Path(
         os.environ.get("AGY_STUDIO_DIST_DIR", str(DEFAULT_STATIC_DIST_DIR))
     )
@@ -348,6 +367,8 @@ def create_app(
     app[GOOGLE_ACCOUNTS_KEY] = google_accounts_svc
     app[WORKBENCH_STATE_KEY] = workbench_state
     app[FEDERATION_SERVICE_KEY] = federation_svc
+    app[EGRESS_POOL_KEY] = egress_pool_svc
+    app[BROWSER_CONTROL_KEY] = browser_control_svc
     app[STATIC_DIST_KEY] = dist_dir
 
     async def _on_startup(application: web.Application) -> None:
@@ -355,6 +376,8 @@ def create_app(
         event_hub.start_watcher()
 
     async def _on_cleanup(application: web.Application) -> None:
+        await browser_control_svc.close_all()
+        await egress_pool_svc.close_all()
         await federation_svc.close_all()
         await google_accounts_svc.close_all()
         await room_service.close_all()
@@ -795,6 +818,29 @@ def create_app(
         "/api/federation/workbench/agents/{agent_id}/jobs/{job_id}/cancel",
         federation_svc.handle_workbench_cancel,
     )
+
+    # Dual-Engine Browser Control, Profile Isolation & Unrestricted AI Binding
+    app.router.add_get("/api/browser/engines", browser_control_svc.handle_get_engines)
+    app.router.add_get("/api/browser/bots", browser_control_svc.handle_get_bots)
+    app.router.add_post("/api/browser/owner-bot", browser_control_svc.handle_set_owner_bot)
+    app.router.add_get("/api/browser/profiles", browser_control_svc.handle_list_profiles)
+    app.router.add_post("/api/browser/profiles", browser_control_svc.handle_upsert_profile)
+    app.router.add_put("/api/browser/profiles/{engine}/{name}", browser_control_svc.handle_upsert_profile)
+    app.router.add_delete("/api/browser/profiles/{engine}/{name}", browser_control_svc.handle_delete_profile)
+    app.router.add_post("/api/browser/launch", browser_control_svc.handle_launch)
+    app.router.add_post("/api/browser/start", browser_control_svc.handle_launch)
+    app.router.add_post("/api/browser/stop", browser_control_svc.handle_stop)
+    app.router.add_post("/api/browser/takeover", browser_control_svc.handle_takeover)
+
+    # Egress Proxy Pool (OpenBao KV v2 + Manual SOCKS5 + Safe Health Probe + Pluggable Draw)
+    app.router.add_get("/api/egress/nodes", egress_pool_svc.handle_list_nodes)
+    app.router.add_post("/api/egress/nodes", egress_pool_svc.handle_create_node)
+    app.router.add_delete("/api/egress/nodes/{name}", egress_pool_svc.handle_delete_node)
+    app.router.add_post("/api/egress/nodes/{name}/verify", egress_pool_svc.handle_verify_node)
+    app.router.add_post("/api/egress/draw", egress_pool_svc.handle_draw)
+    app.router.add_post("/api/egress/prune", egress_pool_svc.handle_prune)
+    app.router.add_get("/api/egress/jobs", egress_pool_svc.handle_list_jobs)
+    app.router.add_get("/api/egress/jobs/{job_id}", egress_pool_svc.handle_get_job)
 
     app.router.add_get("/ws/browser", proxy.handle_ws_browser)
     app.router.add_post("/api/browser/upload", proxy.handle_upload)

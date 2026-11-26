@@ -1472,6 +1472,629 @@ class TestBridgeBrowserPanelAndRbac(unittest.TestCase):
 
             asyncio.run(_server_check())
 
+    def test_stage2_bm3_tg_egress_add_group_reject_and_private_unconditional_delete(self) -> None:
+        """BM3: TG `/browser egress add` rejects in group (no Vault write/echo) & ALWAYS deletes DM message (ok or fail)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge, _ac = _load_isolated_bridge(tmp, extra_env={"AGY_TG_BOT_USERNAME": "example_bot"})
+            bridge.BOT_META.update({"bot_id": 100, "handle": "example_bot", "bot_key": "main", "resolved": True})
+
+            sent: list[tuple[int, str, dict]] = []
+            tg_calls: list[tuple[str, dict]] = []
+            vault_writes: list[tuple[str, dict]] = []
+
+            def _fake_tg(method: str, **kw):
+                tg_calls.append((method, dict(kw)))
+                return {"ok": True}
+
+            def _fake_vault_put(slug: str, data: dict, merge: bool = False):
+                vault_writes.append((slug, dict(data)))
+                return dict(data), f"egress/{slug}"
+
+            with (
+                mock.patch.object(bridge, "send", side_effect=lambda cid, txt, **kw: sent.append((cid, txt, kw)) or 1),
+                mock.patch.object(bridge, "tg", side_effect=_fake_tg),
+                mock.patch.object(bridge, "_lb_egress_vault_put", side_effect=_fake_vault_put),
+            ):
+                # 1. Group chat `/browser egress add` MUST reject immediately without touching Vault or echoing secrets!
+                bridge.handle_message(
+                    {
+                        "chat": {"id": -1001234567890, "type": "supergroup"},
+                        "from": {"id": 111},
+                        "message_id": 701,
+                        "text": "/browser egress add mynode socks5h://secretuser:SuperSecretPass99@proxy.example.com:1080",
+                    }
+                )
+                self.assertEqual([], vault_writes, "Group egress add must NEVER write to Vault")
+                self.assertEqual(1, len(sent))
+                self.assertIn("禁止在群聊中录入代理凭据", sent[0][1])
+                self.assertNotIn("SuperSecretPass99", sent[0][1])
+                self.assertNotIn("secretuser", sent[0][1])
+
+                # 2. Private DM success: writes to Vault, deletes original msg_id=702, returns sanitized summary only
+                sent.clear()
+                tg_calls.clear()
+                bridge.handle_message(
+                    {
+                        "chat": {"id": 111, "type": "private"},
+                        "from": {"id": 111},
+                        "message_id": 702,
+                        "text": "/browser egress add mynode socks5h://secretuser:SuperSecretPass99@proxy.example.com:1080",
+                    }
+                )
+                self.assertEqual(1, len(vault_writes))
+                self.assertEqual("custom-mynode", vault_writes[0][0])
+                self.assertTrue(
+                    any(m == "deleteMessage" and kw.get("chat_id") == 111 and kw.get("message_id") == 702 for m, kw in tg_calls),
+                    f"Expected deleteMessage for msg_id=702, got {tg_calls}",
+                )
+                self.assertEqual(1, len(sent))
+                self.assertIn("custom-mynode", sent[0][1])
+                self.assertIn("socks5h://proxy.example.com:1080", sent[0][1])
+                self.assertIn("has_auth=true", sent[0][1])
+                self.assertNotIn("SuperSecretPass99", sent[0][1])
+                self.assertNotIn("secretuser", sent[0][1])
+
+                # 3. Private DM validation failure (SSRF metadata IP): Vault NOT written, STILL deletes msg_id=703, zero password echo!
+                sent.clear()
+                tg_calls.clear()
+                vault_writes.clear()
+                meta_ip = ".".join(("169", "254", "169", "254"))
+                bridge.handle_message(
+                    {
+                        "chat": {"id": 111, "type": "private"},
+                        "from": {"id": 111},
+                        "message_id": 703,
+                        "text": f"/browser egress add badnode socks5h://u:BadPass123@{meta_ip}:80",
+                    }
+                )
+                self.assertEqual([], vault_writes, "SSRF target must not be written to Vault")
+                self.assertTrue(
+                    any(m == "deleteMessage" and kw.get("chat_id") == 111 and kw.get("message_id") == 703 for m, kw in tg_calls),
+                    f"Must delete credential message even on validation error; got {tg_calls}",
+                )
+                self.assertEqual(1, len(sent))
+                self.assertIn("录入出口节点失败", sent[0][1])
+                self.assertNotIn("BadPass123", sent[0][1])
+
+    def test_stage2_bm5_bm6_bm7_tg_ai_rebind_manual_launch_handback_and_passthrough(self) -> None:
+        """BM5/BM6/BM7 + QA #5: Full AI selector, atomic hot-rebind, manual launch, handback note, passthrough & RBAC."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_dir = Path(tmp) / "live-cfg"
+            cfg_dir.mkdir(parents=True, exist_ok=True)
+            (cfg_dir / "local.token").write_text("stage2-tg-tok\n", encoding="utf-8")
+            bridge, ac = _load_isolated_bridge(tmp, extra_env={"AGY_TG_BOT_USERNAME": "example_bot"})
+            bridge.BOT_META.update({"bot_id": 100, "handle": "example_bot", "bot_key": "main", "resolved": True})
+
+            # Seed 3 roster bots (coordinator + worker + audit worker) — ALL must be selectable (zero exclusions)
+            bus_dir = Path(bridge._effective_bus_dir())
+            bus_dir.mkdir(parents=True, exist_ok=True)
+            (bus_dir / "roster.json").write_text(
+                json.dumps(
+                    {
+                        "bots": {
+                            "example_bot": {"handle": "example_bot", "bot_id": 100, "role": "coordinator", "last_seen": 9999999999},
+                            "bot_one": {"handle": "bot_one", "bot_id": 200, "role": "worker", "last_seen": 9999999999},
+                            "bot_two": {"handle": "bot_two", "bot_id": 300, "role": "worker", "last_seen": 9999999999},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            # RBAC: readonly MUST be blocked from ALL new write callbacks & subcommands
+            for cb_data in (
+                "browser:ai_menu",
+                "browser:set_ai:bot_two",
+                "browser:launch:camoufox:default",
+                "browser:handback",
+                "browser:takeover",
+                "browser:egress_list",
+            ):
+                ok_cb, _ = ac.is_callback_allowed_for_role("readonly", cb_data)
+                self.assertFalse(ok_cb, f"readonly must NOT be allowed callback {cb_data}")
+            for cmd_arg in ("ai", "ai @bot_two", "launch default", "handback next", "egress list", "egress add a b"):
+                ok_cmd, _ = ac.is_command_allowed_for_role("readonly", "/browser", cmd_arg)
+                self.assertFalse(ok_cmd, f"readonly must NOT be allowed /browser {cmd_arg}")
+
+            class _FakeResp:
+                def __init__(self, status_code: int, payload: dict) -> None:
+                    self.status_code = status_code
+                    self._payload = payload
+
+                def json(self) -> dict:
+                    return self._payload
+
+            post_calls: list[tuple[str, dict]] = []
+            current_owner = {"bot": "example_bot", "id": 100}
+
+            def _fake_get(url: str, **_kw):
+                if url.endswith("/internal/status"):
+                    return _FakeResp(
+                        200,
+                        {
+                            "ok": True,
+                            "running": True,
+                            "engine_mode": "async_hosted",
+                            "engine": "camoufox",
+                            "profile": "default",
+                            "owner_bot": current_owner["bot"],
+                            "owner_bot_id": current_owner["id"],
+                            "takeover": True,
+                            "manual_launch": True,
+                            "egress": "direct",
+                            "os": "windows",
+                            "public_url": "https://live.example.com",
+                        },
+                    )
+                if url.endswith("/internal/profiles"):
+                    return _FakeResp(200, {"ok": True, "profiles": [{"name": "default", "pinned": True, "os": "windows", "egress": "direct"}]})
+                return _FakeResp(404, {"ok": False})
+
+            def _fake_post(url: str, json=None, **_kw):
+                body = dict(json or {})
+                post_calls.append((url, body))
+                if url.endswith("/internal/owner-bot"):
+                    current_owner["bot"] = body.get("owner_bot")
+                    current_owner["id"] = body.get("owner_bot_id")
+                    return _FakeResp(200, {"ok": True, "running": True, "owner_bot": current_owner["bot"], "owner_bot_id": current_owner["id"]})
+                if url.endswith("/internal/start"):
+                    return _FakeResp(200, {"ok": True, "running": True, "takeover": True, "manual_launch": True, "owner_bot": body.get("owner_bot")})
+                if url.endswith("/internal/takeover"):
+                    return _FakeResp(200, {"ok": True, "takeover": body.get("active"), "owner_bot": current_owner["bot"]})
+                return _FakeResp(200, {"ok": True})
+
+            sent: list[tuple[int, str, dict]] = []
+            tg_calls: list[tuple[str, dict]] = []
+
+            with (
+                mock.patch.dict(os.environ, {"AGY_LIVE_BROWSER_CONFIG_DIR": str(cfg_dir)}, clear=False),
+                mock.patch.object(bridge.requests, "get", side_effect=_fake_get),
+                mock.patch.object(bridge.requests, "post", side_effect=_fake_post),
+                mock.patch.object(bridge, "send", side_effect=lambda cid, txt, **kw: sent.append((cid, txt, kw)) or 1),
+                mock.patch.object(bridge, "tg", side_effect=lambda m, **kw: tg_calls.append((m, dict(kw))) or {"ok": True}),
+            ):
+                # 1. `/browser ai` shows ALL 3 bots
+                bridge.handle_message({"chat": {"id": 111, "type": "private"}, "from": {"id": 111}, "message_id": 801, "text": "/browser ai"})
+                self.assertEqual(1, len(sent))
+                for h in ("@example_bot", "@bot_one", "@bot_two"):
+                    self.assertIn(h, sent[0][1])
+
+                # 2. `/browser ai @bot_two` hot-rebinds via /internal/owner-bot
+                sent.clear()
+                post_calls.clear()
+                bridge.handle_message({"chat": {"id": 111, "type": "private"}, "from": {"id": 111}, "message_id": 802, "text": "/browser ai @bot_two"})
+                self.assertTrue(any(u.endswith("/internal/owner-bot") and b.get("owner_bot") == "bot_two" and b.get("owner_bot_id") == 300 for u, b in post_calls))
+                self.assertIn("@bot_two", sent[0][1])
+
+                # 3. `/browser launch camoufox default https://example.com/start` sends manual_launch=True + bound owner_bot
+                sent.clear()
+                post_calls.clear()
+                bridge.handle_message({"chat": {"id": 111, "type": "private"}, "from": {"id": 111}, "message_id": 803, "text": "/browser launch camoufox default https://example.com/start"})
+                start_call = next((b for u, b in post_calls if u.endswith("/internal/start")), None)
+                assert start_call is not None
+                self.assertTrue(start_call.get("manual_launch"))
+                self.assertEqual("camoufox", start_call.get("engine"))
+                self.assertEqual("bot_two", start_call.get("owner_bot"))
+                self.assertEqual("https://example.com/start", start_call.get("url"))
+
+                # 4. `/browser handback 继续完成结账` sends active=False + sanitized instruction
+                sent.clear()
+                post_calls.clear()
+                bridge.handle_message({"chat": {"id": 111, "type": "private"}, "from": {"id": 111}, "message_id": 804, "text": "/browser handback 继续完成结账"})
+                tk_call = next((b for u, b in post_calls if u.endswith("/internal/takeover")), None)
+                assert tk_call is not None
+                self.assertFalse(tk_call.get("active"))
+                self.assertEqual("继续完成结账", tk_call.get("instruction"))
+                self.assertIn("@bot_two", sent[0][1])
+
+                # 5. QA #5: `action:browser` callback passes `from_user` into `cmd_browser`
+                with mock.patch.object(bridge, "cmd_browser") as mock_cmd_browser:
+                    bridge.handle_callback(
+                        {
+                            "id": "cb-act-1",
+                            "from": {"id": 111, "username": "admin_user"},
+                            "message": {"chat": {"id": 111, "type": "private"}, "message_id": 805},
+                            "data": "action:browser",
+                        }
+                    )
+                    mock_cmd_browser.assert_called_once()
+                    _, kw = mock_cmd_browser.call_args
+                    self.assertEqual({"id": 111, "username": "admin_user"}, kw.get("from_user"))
+                    self.assertEqual(805, kw.get("msg_id"))
+
+    def test_stage2_round2_blocker1_vault_ref_validation_when_openbao_not_ready(self) -> None:
+        """Blocker 1 (P0·BM3): Malicious vault_ref MUST be rejected fail-closed even when OpenBao is not ready."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_dir = Path(tmp) / "live-cfg"
+            cfg_dir.mkdir(parents=True, exist_ok=True)
+            (cfg_dir / "local.token").write_text("r2-b1-tok\n", encoding="utf-8")
+            bridge, _ac = _load_isolated_bridge(tmp, extra_env={"AGY_LIVE_BROWSER_CONFIG_DIR": str(cfg_dir)})
+            bridge.BOT_META.update({"bot_id": 100, "handle": "example_bot", "bot_key": "main", "resolved": True})
+
+            # Direct validator counterexamples
+            for bad_ref in (
+                "--evil-flag/validslug",
+                "../../secret/validslug",
+                "/abs/path/validslug",
+                "a/b\x00c/validslug",
+                "a/b c/validslug",
+                "a" * 161,
+                "egress/foo;rm",
+                "egress/-badseg",
+                "https://proxy.example.com:1080",
+                "user@host/validslug",
+            ):
+                with self.assertRaises(ValueError, msg=f"Should reject vault_ref={bad_ref!r}"):
+                    bridge._lb_validate_vault_ref(bad_ref)
+            self.assertEqual("kv/proxies/eu#url", bridge._lb_validate_vault_ref("kv/proxies/eu#url"))
+            self.assertEqual("egress/custom-us1", bridge._lb_validate_vault_ref("egress/custom-us1"))
+
+            sent: list[tuple[int, str, dict]] = []
+            not_ready_coords = {
+                "ready": False,
+                "addr": "",
+                "token": "",
+                "mount": "secret",
+                "prefix": "egress",
+                "ref_prefix": "egress",
+                "error": "not configured",
+            }
+            with (
+                mock.patch.dict(os.environ, {"AGY_LIVE_BROWSER_CONFIG_DIR": str(cfg_dir)}, clear=False),
+                mock.patch.object(bridge, "_lb_egress_vault_coords", return_value=not_ready_coords),
+                mock.patch.object(
+                    bridge,
+                    "_live_browser_request",
+                    side_effect=lambda method, path, **_kw: (
+                        (True, {"ok": True, "running": False})
+                        if method == "GET" and path == "/internal/status"
+                        else self.fail(f"Unexpected Hub call {method} {path}")
+                    ),
+                ),
+                mock.patch.object(bridge, "_lb_run_external_cli") as ext_cli_mock,
+                mock.patch.object(bridge, "send", side_effect=lambda cid, txt, **kw: sent.append((cid, txt, kw)) or 1),
+            ):
+                for eng in ("external_chromium", "camoufox"):
+                    for payload_ref in ("--evil-flag/validslug", "../../secret/validslug"):
+                        sent.clear()
+                        bridge.cmd_browser(
+                            111,
+                            f"profile egress {eng} work {payload_ref}",
+                            from_user={"id": 111},
+                            msg_id=901,
+                        )
+                        self.assertEqual(1, len(sent))
+                        self.assertIn("出口参数非法", sent[0][1])
+                ext_cli_mock.assert_not_called()
+
+    def test_stage2_round2_blocker2_external_cli_failure_stdout_scrubbed(self) -> None:
+        """Blocker 2 (P0·BM3): External Chromium CLI failure stdout containing user:pass@ MUST be scrubbed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_dir = Path(tmp) / "live-cfg"
+            cfg_dir.mkdir(parents=True, exist_ok=True)
+            (cfg_dir / "local.token").write_text("r2-b2-tok\n", encoding="utf-8")
+            bridge, _ac = _load_isolated_bridge(tmp, extra_env={"AGY_LIVE_BROWSER_CONFIG_DIR": str(cfg_dir)})
+            bridge.BOT_META.update({"bot_id": 100, "handle": "example_bot", "bot_key": "main", "resolved": True})
+
+            leaked_stdout = "ERR connect failed via socks5h://alice:UltraSecret99@proxy.example.com:1080"
+            sent: list[tuple[int, str, dict]] = []
+            with (
+                mock.patch.dict(os.environ, {"AGY_LIVE_BROWSER_CONFIG_DIR": str(cfg_dir)}, clear=False),
+                mock.patch.object(bridge, "_live_browser_request", return_value=(True, {"ok": True, "running": False})),
+                mock.patch.object(bridge, "_lb_show_external_profile", return_value={"name": "ext1", "pinned": False}),
+                mock.patch.object(bridge, "_lb_run_external_cli", return_value=(1, leaked_stdout, "")),
+                mock.patch.object(bridge, "send", side_effect=lambda cid, txt, **kw: sent.append((cid, txt, kw)) or 1),
+            ):
+                # 1. profile del failure
+                bridge.cmd_browser(111, "profile del external_chromium ext1", from_user={"id": 111}, msg_id=902)
+                self.assertEqual(1, len(sent))
+                self.assertIn("删除外部 Profile 失败", sent[0][1])
+                self.assertNotIn("UltraSecret99", sent[0][1])
+                self.assertNotIn("alice:UltraSecret99", sent[0][1])
+
+                # 2. profile set / egress failure
+                for sub_args in (
+                    "profile set external_chromium ext1 window=1280x800",
+                    "profile egress external_chromium ext1 direct",
+                ):
+                    sent.clear()
+                    bridge.cmd_browser(111, sub_args, from_user={"id": 111}, msg_id=903)
+                    self.assertEqual(1, len(sent))
+                    self.assertIn("保存外部 Profile 失败", sent[0][1])
+                    self.assertNotIn("UltraSecret99", sent[0][1])
+                    self.assertNotIn("alice:UltraSecret99", sent[0][1])
+
+    def test_stage2_round2_blocker3_start_browser_deeplink_passes_from_user_for_readonly(self) -> None:
+        """Blocker 3 (P1·BM1): Readonly user sending `/start browser` DM gets readonly view with zero write buttons."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_dir = Path(tmp) / "live-cfg"
+            cfg_dir.mkdir(parents=True, exist_ok=True)
+            (cfg_dir / "local.token").write_text("r2-b3-tok\n", encoding="utf-8")
+            bridge, _ac = _load_isolated_bridge(
+                tmp,
+                extra_env={
+                    "AGY_LIVE_BROWSER_CONFIG_DIR": str(cfg_dir),
+                    "AGY_TG_ALLOWED_CHATS": "-1001234567890,111,222",
+                    "AGY_TG_ADMIN_USERS": "111",
+                    "AGY_TG_READONLY_USERS": "222",
+                },
+            )
+            bridge.BOT_META.update({"bot_id": 100, "handle": "example_bot", "bot_key": "main", "resolved": True})
+
+            def _fake_get(url: str, **_kw):
+                if url.endswith("/internal/status"):
+                    return _FakeResp(
+                        200,
+                        {
+                            "ok": True,
+                            "running": True,
+                            "engine_mode": "async_hosted",
+                            "profile": "default",
+                            "os": "windows",
+                            "egress": "direct",
+                            "public_url": "https://live.example.com",
+                        },
+                    )
+                if url.endswith("/internal/profiles"):
+                    return _FakeResp(
+                        200,
+                        {
+                            "ok": True,
+                            "profiles": [
+                                {"name": "default", "pinned": True, "os": "windows", "egress_display": "direct", "active": True},
+                                {"name": "work", "pinned": False, "os": "macos", "egress_display": "direct", "active": False},
+                            ],
+                        },
+                    )
+                return _FakeResp(404, {"ok": False})
+
+            sent: list[tuple[int, str, dict]] = []
+            with (
+                mock.patch.dict(os.environ, {"AGY_LIVE_BROWSER_CONFIG_DIR": str(cfg_dir)}, clear=False),
+                mock.patch.object(bridge.requests, "get", side_effect=_fake_get),
+                mock.patch.object(bridge, "send", side_effect=lambda cid, txt, **kw: sent.append((cid, txt, kw)) or 1),
+            ):
+                bridge.handle_message(
+                    {
+                        "chat": {"id": 222, "type": "private"},
+                        "from": {"id": 222},
+                        "message_id": 910,
+                        "text": "/start browser",
+                    }
+                )
+
+            self.assertEqual(1, len(sent))
+            kb_rows = (sent[0][2].get("reply_markup") or {}).get("inline_keyboard") or []
+            all_btns = [btn for row in kb_rows for btn in row if isinstance(btn, dict)]
+            cb_datas = [str(btn.get("callback_data") or "") for btn in all_btns if btn.get("callback_data")]
+            self.assertEqual(["browser:refresh"], cb_datas, f"readonly got mutating buttons: {cb_datas}")
+            self.assertFalse(
+                any(
+                    cb.startswith(("browser:start:", "browser:switch:", "browser:launch:", "browser:set_ai:"))
+                    or cb
+                    in (
+                        "browser:stop",
+                        "browser:takeover",
+                        "browser:handback",
+                        "browser:ai_menu",
+                        "browser:egress_list",
+                        "browser:menu_set",
+                        "browser:menu_reset",
+                    )
+                    for cb in cb_datas
+                ),
+                f"readonly must never receive admin write buttons: {cb_datas}",
+            )
+
+    def test_stage2_round2_blocker4_process_group_timeout_reaping_and_hot_reload_stop(self) -> None:
+        """Blocker 4 (P1·BM4): CLI timeouts reap entire process group via os.killpg & hot reload stops external watch."""
+        import signal
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge, _ac = _load_isolated_bridge(tmp)
+
+            class _FakeTimedOutPopen:
+                def __init__(self, pid: int, escalate_kill: bool = True) -> None:
+                    self.pid = pid
+                    self.returncode = None
+                    self.stdout = mock.MagicMock()
+                    self.stderr = mock.MagicMock()
+                    self._escalate = escalate_kill
+                    self.wait_calls: list[float] = []
+
+                def communicate(self, timeout=None):
+                    raise subprocess.TimeoutExpired(cmd=["fake-cli"], timeout=timeout or 1.0)
+
+                def wait(self, timeout=None):
+                    self.wait_calls.append(float(timeout or 0.0))
+                    if self._escalate and len(self.wait_calls) == 1:
+                        raise subprocess.TimeoutExpired(cmd=["fake-cli"], timeout=timeout or 2.0)
+                    self.returncode = -9
+                    return -9
+
+                def poll(self):
+                    return self.returncode
+
+            fake_ext_proc = _FakeTimedOutPopen(pid=42421, escalate_kill=True)
+            fake_pool_proc = _FakeTimedOutPopen(pid=42422, escalate_kill=True)
+            killpg_calls: list[tuple[int, int]] = []
+
+            def _record_killpg(pid: int, sig: int) -> None:
+                killpg_calls.append((pid, sig))
+
+            with (
+                mock.patch.object(bridge, "_lb_external_cli", return_value="/usr/local/bin/fake-ext"),
+                mock.patch.object(bridge, "_lb_egress_pool_cli", return_value="/usr/local/bin/fake-pool"),
+                mock.patch.object(
+                    bridge.subprocess,
+                    "Popen",
+                    side_effect=[fake_ext_proc, fake_pool_proc],
+                ) as popen_mock,
+                mock.patch.object(bridge.os, "killpg", side_effect=_record_killpg),
+            ):
+                rc1, _out1, err1 = bridge._lb_run_external_cli(["status"], timeout_sec=1.0)
+                rc2, _out2, err2 = bridge._lb_egress_run_pool_cli(["draw", "US"], timeout_sec=2.0)
+
+            self.assertEqual(-1, rc1)
+            self.assertIn("超时", err1)
+            self.assertEqual(-1, rc2)
+            self.assertIn("超时", err2)
+            self.assertEqual(2, popen_mock.call_count)
+            for call_args in popen_mock.call_args_list:
+                self.assertTrue(call_args.kwargs.get("start_new_session"))
+            self.assertEqual(
+                [
+                    (42421, signal.SIGTERM),
+                    (42421, signal.SIGKILL),
+                    (42422, signal.SIGTERM),
+                    (42422, signal.SIGKILL),
+                ],
+                killpg_calls,
+            )
+
+            # perform_hot_reload MUST call _lb_stop_external_watch(stop_external_profile=False)
+            with (
+                mock.patch.object(bridge, "_pre_reload_self_check", return_value=(True, "ok")),
+                mock.patch.object(bridge, "_snapshot_lkg"),
+                mock.patch.object(bridge, "_read_reload_breadcrumb", return_value={}),
+                mock.patch.object(bridge, "_write_reload_breadcrumb"),
+                mock.patch.object(bridge, "close_all_sessions_sync"),
+                mock.patch.object(bridge, "_cleanup_google_login_flows"),
+                mock.patch.object(bridge, "_lb_stop_external_watch") as stop_watch_mock,
+                mock.patch.object(bridge, "_stop_studio_ipc"),
+                mock.patch.object(bridge, "_stop_gateway_adapter"),
+                mock.patch.object(bridge.time, "sleep"),
+                mock.patch.object(bridge.os, "execv") as execv_mock,
+            ):
+                bridge.perform_hot_reload(notify_chat_id=None)
+            stop_watch_mock.assert_called_once_with(stop_external_profile=False)
+            execv_mock.assert_called_once()
+
+    def test_stage2_round2_blocker6_socks5_camoufox_proxy_retention_and_ext_account_validation(self) -> None:
+        """Blocker 6 (P1): SOCKS5 >255B creds & unknown auth method; Camoufox proxy retention; external account validation."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_dir = Path(tmp) / "live-cfg"
+            cfg_dir.mkdir(parents=True, exist_ok=True)
+            (cfg_dir / "local.token").write_text("r2-b6-tok\n", encoding="utf-8")
+            bridge, _ac = _load_isolated_bridge(tmp, extra_env={"AGY_LIVE_BROWSER_CONFIG_DIR": str(cfg_dir)})
+            bridge.BOT_META.update({"bot_id": 100, "handle": "example_bot", "bot_key": "main", "resolved": True})
+
+            # 6.1 SOCKS5 probe: >255B credential -> RuntimeError (not ValueError); unknown method 0x05 -> RuntimeError
+            class _FakeSocksSocket:
+                def __init__(self, reply: bytes) -> None:
+                    self._buf = bytearray(reply)
+                    self.sent = bytearray()
+
+                def settimeout(self, _t: float) -> None:
+                    return None
+
+                def sendall(self, data: bytes) -> None:
+                    self.sent.extend(data)
+
+                def recv(self, n: int) -> bytes:
+                    chunk = bytes(self._buf[:n])
+                    del self._buf[:n]
+                    return chunk
+
+                def close(self) -> None:
+                    return None
+
+            fake_addrinfo = [(2, 1, 6, "", ("203.0.113.10", 1080))]
+            with (
+                mock.patch.object(bridge.socket, "getaddrinfo", return_value=fake_addrinfo),
+                mock.patch.object(
+                    bridge.socket,
+                    "create_connection",
+                    side_effect=[_FakeSocksSocket(b"\x05\x02"), _FakeSocksSocket(b"\x05\x05")],
+                ),
+            ):
+                with self.assertRaises(RuntimeError) as ctx_len:
+                    bridge._lb_egress_probe_sync(
+                        "socks5h",
+                        "proxy.example.com",
+                        1080,
+                        username="u" * 256,
+                        password="p",
+                        timeout_sec=2.0,
+                    )
+                self.assertIn("255", str(ctx_len.exception))
+
+                with self.assertRaises(RuntimeError) as ctx_meth:
+                    bridge._lb_egress_probe_sync(
+                        "socks5h",
+                        "proxy.example.com",
+                        1080,
+                        username="u",
+                        password="p",
+                        timeout_sec=2.0,
+                    )
+                self.assertIn("认证方式", str(ctx_meth.exception))
+
+            # 6.2 Camoufox `/browser profile set camoufox work os=macos` preserves proxy_bao_ref; `egress=direct` clears it
+            posted_payloads: list[dict] = []
+
+            def _fake_hub_req(method: str, path: str, json_body=None, **_kw):
+                if method == "GET" and path == "/internal/status":
+                    return True, {"ok": True, "running": False}
+                if method == "GET" and path == "/internal/profiles":
+                    return True, {
+                        "ok": True,
+                        "profiles": [
+                            {
+                                "name": "work",
+                                "pinned": False,
+                                "os": "windows",
+                                "locale": "en-US",
+                                "bao_ref": "egress/custom-us1",
+                                "egress": "bao:egress/custom-us1",
+                            }
+                        ],
+                    }
+                if method == "POST" and path == "/internal/profiles":
+                    posted_payloads.append(dict(json_body or {}))
+                    return True, {"ok": True}
+                return False, "unexpected"
+
+            sent: list[tuple[int, str, dict]] = []
+            with (
+                mock.patch.object(bridge, "_live_browser_request", side_effect=_fake_hub_req),
+                mock.patch.object(bridge, "send", side_effect=lambda cid, txt, **kw: sent.append((cid, txt, kw)) or 1),
+            ):
+                bridge.cmd_browser(111, "profile set camoufox work os=macos", from_user={"id": 111}, msg_id=920)
+                self.assertEqual(1, len(posted_payloads))
+                self.assertEqual("macos", posted_payloads[0].get("os"))
+                self.assertEqual("egress/custom-us1", posted_payloads[0].get("proxy_bao_ref"))
+
+                posted_payloads.clear()
+                bridge.cmd_browser(111, "profile set camoufox work egress=direct", from_user={"id": 111}, msg_id=921)
+                self.assertEqual(1, len(posted_payloads))
+                self.assertNotIn("proxy_bao_ref", posted_payloads[0])
+                self.assertNotIn("proxy", posted_payloads[0])
+
+            # 6.3 External Chromium invalid account (too long / whitespace / control char / leading -) rejected fail-closed
+            for bad_acct in ("a" * 129, "user name", "user\x01ctrl", "-evil"):
+                with self.assertRaises(ValueError, msg=f"Should reject account={bad_acct!r}"):
+                    bridge._lb_validate_account(bad_acct)
+
+            with (
+                mock.patch.object(bridge, "_live_browser_request", return_value=(True, {"ok": True, "running": False})),
+                mock.patch.object(bridge, "_lb_show_external_profile", return_value=None),
+                mock.patch.object(bridge, "_lb_run_external_cli") as ext_cli_mock,
+                mock.patch.object(bridge, "send", side_effect=lambda cid, txt, **kw: sent.append((cid, txt, kw)) or 1),
+            ):
+                for bad_acct_cmd in (f"account={'a' * 129}", "account=foo\x01bar", "account=-evil"):
+                    sent.clear()
+                    bridge.cmd_browser(
+                        111,
+                        f"profile set external_chromium extnew {bad_acct_cmd}",
+                        from_user={"id": 111},
+                        msg_id=922,
+                    )
+                    self.assertEqual(1, len(sent))
+                    self.assertIn("account 标签非法", sent[0][1])
+                ext_cli_mock.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

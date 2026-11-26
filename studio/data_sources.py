@@ -117,6 +117,7 @@ MAX_MODEL_SLUG_LEN = 160
 
 _SAFE_SLUG_RE = re.compile(r"[^A-Za-z0-9._:@/-]+")
 _SLUG_CTRL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]+")
+_EGRESS_USERINFO_RE = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://)([^/\s@]+@)")
 _CONTROLLED_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,47}$")
 _ALLOWED_JOB_STATUSES = frozenset({"queued", "running", "done", "error", "failed", "cancelled", "unknown"})
 _ALLOWED_BOT_ROLES = frozenset({"coordinator", "peer", "worker"})
@@ -285,6 +286,18 @@ def _sanitize_slug(raw: Any, max_len: int = 64) -> str:
     if not text.startswith("gw:") and _TG_AND_LONG_ID_RE.search(text):
         return "[REDACTED]"
     return _SAFE_SLUG_RE.sub("_", text)[:max_len]
+
+
+def sanitize_egress_display(raw: Any, max_len: int = 128) -> str:
+    """Strip URL userinfo and redact embedded credentials/host paths without truncating egress refs."""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    text = _EGRESS_USERINFO_RE.sub(r"\1***@", text)
+    text = redact_secrets_only(text)
+    text = _SENSITIVE_HOST_PATH_RE.sub("[REDACTED]", text)
+    text = _SLUG_CTRL_CHARS_RE.sub(" ", text)
+    return " ".join(text.split())[:max_len]
 
 
 def _classify_error_code(raw_error: Any) -> str:
@@ -1402,6 +1415,57 @@ class StudioDataSources:
             "bots": items,
         }
 
+    def get_browser_bots(self) -> dict[str, Any]:
+        """Return ALL configured bots from roster & team_config for browser AI binding (zero exclusions)."""
+        roster_raw = _read_json_ro(self.bus_dir / "roster.json", {"bots": {}})
+        cfg_raw = _read_json_ro(self.bus_dir / "team_config.json", {"bots": {}})
+        r_bots = roster_raw.get("bots") if isinstance(roster_raw, dict) else {}
+        c_bots = cfg_raw.get("bots") if isinstance(cfg_raw, dict) else {}
+        if not isinstance(r_bots, dict):
+            r_bots = {}
+        if not isinstance(c_bots, dict):
+            c_bots = {}
+
+        now = time.time()
+        handles = sorted(set(r_bots.keys()) | set(c_bots.keys()))
+        items: list[dict[str, Any]] = []
+        for h in handles:
+            raw_r = r_bots.get(h) if isinstance(r_bots.get(h), dict) else {}
+            raw_c = c_bots.get(h) if isinstance(c_bots.get(h), dict) else {}
+            merged = bot_bus._merge_bot_view(h, raw_r, raw_c, now)
+            role_val = str(merged.get("role") or "worker").lower()
+            if role_val not in _ALLOWED_BOT_ROLES:
+                role_val = "worker"
+            raw_bid = raw_r.get("bot_id") if raw_r.get("bot_id") is not None else raw_c.get("bot_id")
+            bot_id_val: int | None = None
+            if not isinstance(raw_bid, bool) and raw_bid is not None:
+                try:
+                    bid_int = int(raw_bid)
+                    if bid_int > 0:
+                        bot_id_val = bid_int
+                except (TypeError, ValueError):
+                    bot_id_val = None
+            clean_handle = _sanitize_slug(merged.get("handle") or h, max_len=64)
+            if not clean_handle:
+                continue
+            items.append({
+                "handle": clean_handle,
+                "display_name": redact_sensitive_text(merged.get("display_name") or clean_handle, max_len=64),
+                "role": role_val,
+                "bot_id": bot_id_val,
+                "online": bool(merged["online"]),
+                "busy": bool(merged["busy"]),
+                "specialty": redact_sensitive_text(merged.get("specialty") or "", max_len=100),
+            })
+
+        role_order = {"coordinator": 0, "peer": 1, "worker": 2}
+        items.sort(key=lambda b: (0 if b["online"] else 1, role_order.get(b["role"], 9), b["handle"]))
+        return {
+            "ok": True,
+            "total": len(items),
+            "bots": items,
+        }
+
     # ------------------------------------------------------------------ Jobs (Read-Only)
     def get_jobs(
         self,
@@ -2163,10 +2227,14 @@ class StudioDataSources:
             "running": is_running,
             "session_restricted": restricted,
             "engine_mode": _sanitize_slug(data.get("engine_mode") or "idle", max_len=32),
+            "engine": "" if restricted else _sanitize_slug(data.get("engine") or "", max_len=32),
             "profile": None if restricted else (_sanitize_slug(data.get("profile"), max_len=64) if data.get("profile") else None),
             "pinned": False if restricted else bool(data.get("pinned")),
-            "egress": "" if restricted else _sanitize_slug(data.get("egress") or "direct", max_len=32),
+            "egress": "" if restricted else (sanitize_egress_display(data.get("egress") or "direct", max_len=128) or "direct"),
             "os": "" if restricted else _sanitize_slug(data.get("os") or "", max_len=32),
+            "owner_bot": None if restricted else (_sanitize_slug(data.get("owner_bot"), max_len=64) if data.get("owner_bot") else None),
+            "owner_bot_id": None if restricted else (int(data["owner_bot_id"]) if isinstance(data.get("owner_bot_id"), int) and not isinstance(data.get("owner_bot_id"), bool) and data["owner_bot_id"] > 0 else None),
+            "manual_launch": False if restricted else bool(data.get("manual_launch")),
             "takeover": False if restricted else bool(data.get("takeover")),
             "takeover_reason": "" if restricted else redact_sensitive_text(data.get("takeover_reason") or "", max_len=160),
             "ai_busy": False if restricted else bool(data.get("ai_busy")),

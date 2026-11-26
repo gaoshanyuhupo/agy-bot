@@ -16,7 +16,22 @@ import type {
   BotSkillDetailResponse,
   BotSkillPutPayload,
   BotsResponse,
+  BrowserBotItem,
+  BrowserBotsResponse,
+  BrowserEngineId,
+  BrowserEnginesResponse,
+  BrowserLaunchPayload,
+  BrowserLaunchResponse,
+  BrowserOwnerBotResponse,
+  BrowserProfileDeleteResponse,
+  BrowserProfileItem,
+  BrowserProfileMutationResponse,
+  BrowserProfilesResponse,
+  BrowserProfileUpsertPayload,
   BrowserStatusResponse,
+  BrowserStopResponse,
+  BrowserTakeoverPayload,
+  BrowserTakeoverResponse,
   ChatAbortResponse,
   ChatAttachmentItem,
   ChatMessageItem,
@@ -26,6 +41,16 @@ import type {
   CostAgg,
   CostsResponse,
   DailyCostRow,
+  EgressDrawPayload,
+  EgressJobItem,
+  EgressJobResponse,
+  EgressJobsResponse,
+  EgressNodeCreatePayload,
+  EgressNodeCreateResponse,
+  EgressNodeDeleteResponse,
+  EgressNodeItem,
+  EgressNodesResponse,
+  EgressPrunePayload,
   EventStreamStatus,
   ExecutionMode,
   FederationAgentCreatePayload,
@@ -2315,10 +2340,560 @@ export async function fetchCosts(
   };
 }
 
+let demoBrowserOwnerBot = "example_main_bot";
+let demoBrowserEngine: BrowserEngineId = "camoufox";
+let demoBrowserProfiles: BrowserProfileItem[] = [
+  {
+    engine: "camoufox",
+    name: "default",
+    pinned: true,
+    persistent: true,
+    allow_google: true,
+    egress: "direct",
+    proxy_bao_ref: null,
+    os: "windows",
+    locale: "en-US",
+    window: "1280x800",
+    active: true,
+    editable: false,
+    deletable: false,
+  },
+  {
+    engine: "camoufox",
+    name: "work-us",
+    pinned: false,
+    persistent: true,
+    allow_google: false,
+    egress: "vault:egress/custom-us-demo",
+    proxy_bao_ref: "egress/custom-us-demo",
+    os: "macos",
+    locale: "en-US",
+    window: "1366x820",
+    active: false,
+    editable: true,
+    deletable: true,
+  },
+  {
+    engine: "camoufox",
+    name: "google-alt",
+    pinned: false,
+    persistent: true,
+    allow_google: true,
+    account: "demo-secondary",
+    egress: "vault:egress/custom-us-demo",
+    proxy_bao_ref: "egress/custom-us-demo",
+    os: "windows",
+    locale: "en-US",
+    window: "1280x800",
+    active: false,
+    editable: true,
+    deletable: true,
+  },
+  {
+    engine: "external_chromium",
+    name: "default",
+    pinned: true,
+    persistent: true,
+    allow_google: true,
+    egress: "direct",
+    proxy_bao_ref: null,
+    os: "linux",
+    tz: "America/Los_Angeles",
+    lang: "en-US",
+    window: "1280x800",
+    active: false,
+    editable: false,
+    deletable: false,
+  },
+  {
+    engine: "external_chromium",
+    name: "ext-us-1",
+    pinned: false,
+    persistent: true,
+    allow_google: false,
+    egress: "vault:egress/custom-us-demo",
+    proxy_bao_ref: "egress/custom-us-demo",
+    os: "linux",
+    tz: "America/New_York",
+    lang: "en-US",
+    window: "1280x800",
+    active: false,
+    editable: true,
+    deletable: true,
+  },
+];
+
+let demoEgressNodes: EgressNodeItem[] = [
+  {
+    name: "custom-us-demo",
+    slug: "custom-us-demo",
+    ref: "egress/custom-us-demo",
+    scheme: "socks5h",
+    host: "proxy.example.com",
+    port: 1080,
+    server: "socks5h://proxy.example.com:1080",
+    display: "socks5h://***@" + "proxy.example.com:1080",
+    has_auth: true,
+    provider: "custom",
+    tag: "custom-us-demo",
+    exit_ip: "203.0.113.42",
+    country: "US",
+    region: "CA",
+    city: "Los Angeles",
+    isp: "Example Residential ISP",
+    asn: "AS64512",
+    ptr: "",
+    mbps: "85",
+    latency_ms: "42",
+    status: "clean",
+    drawn_at: isoAgo(7200),
+    verified_at: isoAgo(600),
+    note: "演示美西出口节点",
+    deletable: true,
+  },
+  {
+    name: "pool-jp-demo",
+    slug: "pool-jp-demo",
+    ref: "egress/pool-jp-demo",
+    scheme: "socks5h",
+    host: "jp-exit.example.com",
+    port: 1080,
+    server: "socks5h://jp-exit.example.com:1080",
+    display: "socks5h://***@" + "jp-exit.example.com:1080",
+    has_auth: true,
+    provider: "pool",
+    tag: "pool-jp-demo",
+    exit_ip: "198.51.100.18",
+    country: "JP",
+    region: "13",
+    city: "Tokyo",
+    isp: "Example JP Telecom",
+    asn: "AS64513",
+    ptr: "",
+    mbps: "62",
+    latency_ms: "58",
+    status: "clean",
+    drawn_at: isoAgo(3600),
+    verified_at: isoAgo(300),
+    note: "演示日本住宅池节点",
+    deletable: false,
+  },
+];
+
+const demoEgressJobs: Record<string, EgressJobItem> = {};
+
+function buildDemoBrowserBots(): BrowserBotItem[] {
+  return demoBots.map((b, idx) => ({
+    handle: b.handle.replace(/^@/, ""),
+    display_name: b.display_name,
+    role: b.role,
+    bot_id: 100001 + idx,
+    online: b.online,
+    busy: b.busy,
+    specialty: b.specialty,
+  }));
+}
+
 export async function fetchBrowserStatus(): Promise<BrowserStatusResponse> {
   await delay(25);
   requireAuth();
-  return getDemoBrowserStatus();
+  const base = getDemoBrowserStatus();
+  return {
+    ...base,
+    engine: demoBrowserEngine,
+    owner_bot: demoBrowserOwnerBot,
+  };
+}
+
+export async function fetchBrowserEngines(): Promise<BrowserEnginesResponse> {
+  await delay(25);
+  const me = requireAuth();
+  const st = getDemoBrowserStatus();
+  return {
+    ok: true,
+    can_edit: me.role === "admin",
+    engines: [
+      { id: "camoufox", label: "Camoufox", available: true },
+      { id: "external_chromium", label: "External Chromium", available: true },
+    ],
+    active_session: {
+      running: st.running,
+      engine_mode: st.engine_mode,
+      engine: demoBrowserEngine,
+      profile: st.profile || null,
+      egress: st.egress || "direct",
+      takeover: Boolean(st.takeover),
+      manual_launch: false,
+      owner_bot: demoBrowserOwnerBot,
+      owner_bot_id: 100001,
+    },
+  };
+}
+
+export async function fetchBrowserBots(): Promise<BrowserBotsResponse> {
+  await delay(25);
+  const me = requireAuth();
+  const bots = buildDemoBrowserBots();
+  return {
+    ok: true,
+    can_edit: me.role === "admin",
+    total: bots.length,
+    bots,
+    active_owner_bot: demoBrowserOwnerBot,
+    active_owner_bot_id: 100001,
+    default_owner_bot: demoBrowserOwnerBot,
+    default_owner_bot_id: 100001,
+  };
+}
+
+export async function setBrowserOwnerBot(payload: {
+  owner_bot: string;
+  expected_session_gen?: number;
+}): Promise<BrowserOwnerBotResponse> {
+  await delay(25);
+  const me = requireAuth();
+  if (me.role !== "admin") {
+    throw new StudioApiError("只读权限（readonly）禁止切换操作 AI", 403, "studio_auth");
+  }
+  const clean = String(payload.owner_bot || "").trim().replace(/^@/, "").toLowerCase();
+  const found = buildDemoBrowserBots().find((b) => b.handle.toLowerCase() === clean);
+  if (!found) {
+    throw new StudioApiError("目标 AI 不在当前团队 Roster 中", 400, "studio_api");
+  }
+  demoBrowserOwnerBot = found.handle;
+  const st = getDemoBrowserStatus();
+  return {
+    ok: true,
+    owner_bot: found.handle,
+    owner_bot_id: found.bot_id,
+    running: st.running,
+    engine: demoBrowserEngine,
+  };
+}
+
+export async function fetchBrowserProfiles(
+  engine: "all" | BrowserEngineId = "all",
+): Promise<BrowserProfilesResponse> {
+  await delay(25);
+  const me = requireAuth();
+  if (me.role !== "admin") {
+    return {
+      ok: true,
+      can_edit: false,
+      camoufox_available: false,
+      external_chromium_available: true,
+      external_chromium_label: "External Chromium",
+      profiles: [],
+      by_engine: { camoufox: [], external_chromium: [] },
+    };
+  }
+  const cf = engine === "external_chromium" ? [] : demoBrowserProfiles.filter((p) => p.engine === "camoufox");
+  const ext = engine === "camoufox" ? [] : demoBrowserProfiles.filter((p) => p.engine === "external_chromium");
+  return {
+    ok: true,
+    can_edit: true,
+    camoufox_available: true,
+    external_chromium_available: true,
+    external_chromium_label: "External Chromium",
+    profiles: [...cf, ...ext],
+    by_engine: { camoufox: cf, external_chromium: ext },
+  };
+}
+
+export async function upsertBrowserProfile(
+  payload: BrowserProfileUpsertPayload,
+): Promise<BrowserProfileMutationResponse> {
+  await delay(30);
+  const me = requireAuth();
+  if (me.role !== "admin") {
+    throw new StudioApiError("只读权限（readonly）禁止修改 Profile", 403, "studio_auth");
+  }
+  const engine: BrowserEngineId = payload.engine || "camoufox";
+  const name = String(payload.name || "").trim();
+  if (!name || name === "default") {
+    throw new StudioApiError("主默认/Pinned Profile 不可修改或覆盖", 403, "studio_api");
+  }
+  const existingIdx = demoBrowserProfiles.findIndex((p) => p.engine === engine && p.name === name);
+  if (existingIdx >= 0 && !payload.overwrite) {
+    throw new StudioApiError(`Profile '${name}' 已存在`, 409, "studio_api");
+  }
+  if (
+    existingIdx >= 0 &&
+    demoBrowserProfiles[existingIdx].allow_google &&
+    payload.confirm_google_profile_change !== true
+  ) {
+    throw new StudioApiError("修改专用 Google Profile 必须传入 confirm_google_profile_change=true", 400, "studio_api");
+  }
+  const nextItem: BrowserProfileItem = {
+    engine,
+    name,
+    pinned: false,
+    persistent: true,
+    allow_google: existingIdx >= 0 ? demoBrowserProfiles[existingIdx].allow_google : Boolean(payload.allow_google),
+    egress: payload.proxy_bao_ref
+      ? `vault:${payload.proxy_bao_ref}`
+      : payload.proxy || "direct",
+    proxy_bao_ref: payload.proxy_bao_ref || null,
+    os: payload.os || "windows",
+    locale: payload.locale || payload.lang || "en-US",
+    tz: payload.tz,
+    window: payload.window || "1280x800",
+    account: existingIdx >= 0 ? demoBrowserProfiles[existingIdx].account : payload.account,
+    active: false,
+    editable: true,
+    deletable: true,
+  };
+  if (existingIdx >= 0) {
+    demoBrowserProfiles[existingIdx] = nextItem;
+  } else {
+    demoBrowserProfiles.push(nextItem);
+  }
+  return { ok: true, profile: { ...nextItem } };
+}
+
+export async function updateBrowserProfile(
+  engine: BrowserEngineId,
+  name: string,
+  payload: BrowserProfileUpsertPayload,
+): Promise<BrowserProfileMutationResponse> {
+  return upsertBrowserProfile({ ...payload, engine, name, overwrite: true });
+}
+
+export async function deleteBrowserProfile(
+  engine: BrowserEngineId,
+  name: string,
+  _payload?: { purge_data?: boolean },
+): Promise<BrowserProfileDeleteResponse> {
+  await delay(25);
+  const me = requireAuth();
+  if (me.role !== "admin") {
+    throw new StudioApiError("只读权限（readonly）禁止删除 Profile", 403, "studio_auth");
+  }
+  if (name === "default") {
+    throw new StudioApiError("主默认/Pinned Profile 禁止删除", 403, "studio_api");
+  }
+  demoBrowserProfiles = demoBrowserProfiles.filter((p) => !(p.engine === engine && p.name === name));
+  return { ok: true, engine, deleted: name };
+}
+
+export async function launchBrowser(
+  payload: BrowserLaunchPayload,
+): Promise<BrowserLaunchResponse> {
+  await delay(40);
+  const me = requireAuth();
+  if (me.role !== "admin") {
+    throw new StudioApiError("只读权限（readonly）禁止拉起浏览器", 403, "studio_auth");
+  }
+  demoBrowserEngine = payload.engine || "camoufox";
+  if (payload.owner_bot) {
+    demoBrowserOwnerBot = payload.owner_bot.replace(/^@/, "");
+  }
+  return {
+    ok: true,
+    engine: demoBrowserEngine,
+    state: {
+      running: true,
+      engine: demoBrowserEngine,
+      profile: payload.profile || "default",
+      owner_bot: demoBrowserOwnerBot,
+      takeover: payload.manual_launch !== false,
+      manual_launch: payload.manual_launch !== false,
+    },
+  };
+}
+
+export async function stopBrowser(_payload?: {
+  force?: boolean;
+  expected_session_gen?: number;
+}): Promise<BrowserStopResponse> {
+  await delay(30);
+  const me = requireAuth();
+  if (me.role !== "admin") {
+    throw new StudioApiError("只读权限（readonly）禁止停止浏览器", 403, "studio_auth");
+  }
+  return { ok: true, stopped: true, engine: demoBrowserEngine };
+}
+
+export async function setBrowserTakeover(
+  payload: BrowserTakeoverPayload,
+): Promise<BrowserTakeoverResponse> {
+  await delay(30);
+  const me = requireAuth();
+  if (me.role !== "admin") {
+    throw new StudioApiError("只读权限（readonly）禁止切换接管权", 403, "studio_auth");
+  }
+  return {
+    ok: true,
+    state: {
+      takeover: Boolean(payload.active),
+      owner_bot: demoBrowserOwnerBot,
+      instruction: payload.instruction || "",
+    },
+  };
+}
+
+export async function fetchEgressNodes(): Promise<EgressNodesResponse> {
+  await delay(25);
+  const me = requireAuth();
+  return {
+    ok: true,
+    can_edit: me.role === "admin",
+    vault_ready: true,
+    vault_error: "",
+    draw_supported: true,
+    prune_supported: true,
+    draw_running: false,
+    verify_running: 0,
+    nodes: demoEgressNodes.map((n) => ({ ...n })),
+    total: demoEgressNodes.length,
+  };
+}
+
+export async function createEgressNode(
+  payload: EgressNodeCreatePayload,
+): Promise<EgressNodeCreateResponse> {
+  await delay(35);
+  const me = requireAuth();
+  if (me.role !== "admin") {
+    throw new StudioApiError("只读权限（readonly）禁止录入出口节点", 403, "studio_auth");
+  }
+  const rawSlug = String(payload.slug || payload.name || `node-${Date.now().toString(36).slice(-4)}`)
+    .trim()
+    .toLowerCase();
+  const slug = rawSlug.startsWith("custom-") ? rawSlug : `custom-${rawSlug}`;
+  const host = String(payload.host || "proxy.example.com").trim();
+  const port = Number(payload.port) || 1080;
+  const scheme = String(payload.scheme || "socks5h").trim();
+  const hasAuth = Boolean(payload.username || payload.password || (payload.proxy_url && payload.proxy_url.includes("@")));
+  const node: EgressNodeItem = {
+    name: slug,
+    slug,
+    ref: `egress/${slug}`,
+    scheme,
+    host,
+    port,
+    server: `${scheme}://${host}:${port}`,
+    display: hasAuth ? `${scheme}://***@${host}:${port}` : `${scheme}://${host}:${port}`,
+    has_auth: hasAuth,
+    provider: "custom",
+    tag: slug,
+    exit_ip: "",
+    country: "",
+    region: "",
+    city: "",
+    isp: "",
+    asn: "",
+    ptr: "",
+    mbps: "",
+    latency_ms: "",
+    status: "unverified",
+    drawn_at: new Date().toISOString(),
+    verified_at: "",
+    note: String(payload.note || ""),
+    deletable: true,
+  };
+  demoEgressNodes = [node, ...demoEgressNodes.filter((n) => n.name !== slug)];
+  return { ok: true, node: { ...node } };
+}
+
+export async function deleteEgressNode(name: string): Promise<EgressNodeDeleteResponse> {
+  await delay(25);
+  const me = requireAuth();
+  if (me.role !== "admin") {
+    throw new StudioApiError("只读权限（readonly）禁止作废出口节点", 403, "studio_auth");
+  }
+  demoEgressNodes = demoEgressNodes.filter((n) => n.name !== name);
+  return { ok: true, deleted: name };
+}
+
+export async function verifyEgressNode(name: string): Promise<EgressJobResponse> {
+  await delay(30);
+  const me = requireAuth();
+  if (me.role !== "admin") {
+    throw new StudioApiError("只读权限（readonly）禁止测活", 403, "studio_auth");
+  }
+  const jid = `egjob-${Date.now().toString(36)}`;
+  const job: EgressJobItem = {
+    job_id: jid,
+    kind: "verify",
+    target: name,
+    status: "done",
+    created_at: new Date().toISOString(),
+    finished_at: new Date().toISOString(),
+  };
+  demoEgressNodes = demoEgressNodes.map((n) =>
+    n.name === name
+      ? {
+          ...n,
+          status: "clean",
+          exit_ip: n.exit_ip || "203.0.113.99",
+          country: n.country || "US",
+          latency_ms: "48",
+          verified_at: new Date().toISOString(),
+        }
+      : n,
+  );
+  demoEgressJobs[jid] = job;
+  return { ok: true, job: { ...job } };
+}
+
+export async function drawEgressNodes(
+  payload?: EgressDrawPayload,
+): Promise<EgressJobResponse> {
+  await delay(35);
+  const me = requireAuth();
+  if (me.role !== "admin") {
+    throw new StudioApiError("只读权限（readonly）禁止抽取住宅 IP", 403, "studio_auth");
+  }
+  const country = String(payload?.country || "US").toUpperCase();
+  const jid = `egjob-${Date.now().toString(36)}`;
+  const job: EgressJobItem = {
+    job_id: jid,
+    kind: "draw",
+    target: country,
+    status: "done",
+    created_at: new Date().toISOString(),
+    finished_at: new Date().toISOString(),
+  };
+  demoEgressJobs[jid] = job;
+  return { ok: true, job: { ...job } };
+}
+
+export async function pruneEgressNodes(
+  _payload?: EgressPrunePayload,
+): Promise<EgressJobResponse> {
+  await delay(30);
+  const me = requireAuth();
+  if (me.role !== "admin") {
+    throw new StudioApiError("只读权限（readonly）禁止清理出口池", 403, "studio_auth");
+  }
+  const jid = `egjob-${Date.now().toString(36)}`;
+  const job: EgressJobItem = {
+    job_id: jid,
+    kind: "prune",
+    target: "pool",
+    status: "done",
+    created_at: new Date().toISOString(),
+    finished_at: new Date().toISOString(),
+  };
+  demoEgressJobs[jid] = job;
+  return { ok: true, job: { ...job } };
+}
+
+export async function fetchEgressJobs(): Promise<EgressJobsResponse> {
+  await delay(20);
+  requireAuth();
+  return { ok: true, jobs: Object.values(demoEgressJobs) };
+}
+
+export async function fetchEgressJob(jobId: string): Promise<EgressJobResponse> {
+  await delay(20);
+  requireAuth();
+  const job = demoEgressJobs[jobId];
+  if (!job) {
+    throw new StudioApiError("任务不存在", 404, "studio_api");
+  }
+  return { ok: true, job: { ...job } };
 }
 
 export async function fetchSessions(params?: {
