@@ -34,6 +34,8 @@ import type {
   FederationWorkbenchDispatchPayload,
   FederationWorkbenchDispatchResponse,
   FederationWorkbenchResponse,
+  FederationWorkbenchStateResponse,
+  FederationWorkbenchStateUpdatePayload,
   FederationWorkbenchTimelineResponse,
   FileContentResponse,
   FileDiffResponse,
@@ -1444,12 +1446,31 @@ export function fetchFederationWorkbench(): Promise<FederationWorkbenchResponse>
   return requestJson<FederationWorkbenchResponse>("/api/federation/workbench");
 }
 
+export function fetchFederationWorkbenchState(): Promise<FederationWorkbenchStateResponse> {
+  return requestJson<FederationWorkbenchStateResponse>("/api/federation/workbench/state");
+}
+
+export function updateFederationWorkbenchState(
+  payload: FederationWorkbenchStateUpdatePayload,
+): Promise<FederationWorkbenchStateResponse> {
+  return requestJson<FederationWorkbenchStateResponse>(
+    "/api/federation/workbench/state",
+    {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    },
+    true,
+  );
+}
+
 export function fetchFederationWorkbenchTimeline(
   agentId: string,
-  params?: { limit?: number },
+  params?: { limit?: number; conversation_id?: string; project_id?: string },
 ): Promise<FederationWorkbenchTimelineResponse> {
   const q = new URLSearchParams();
   if (params?.limit) q.set("limit", String(params.limit));
+  if (params?.conversation_id) q.set("conversation_id", params.conversation_id);
+  if (params?.project_id) q.set("project_id", params.project_id);
   const qs = q.toString();
   return requestJson<FederationWorkbenchTimelineResponse>(
     `/api/federation/workbench/agents/${encodeURIComponent(agentId)}/timeline${qs ? `?${qs}` : ""}`,

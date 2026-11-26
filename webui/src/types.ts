@@ -1810,6 +1810,11 @@ export interface FederationTimelineJobItem {
   from_actor: string;
   team_id: string;
   group_id: string;
+  project_id?: string;
+  conversation_id?: string;
+  conversation_title?: string;
+  display_prompt?: string;
+  context_turns?: number;
   prompt: string;
   result_text: string;
   error: string;
@@ -1865,6 +1870,10 @@ export interface FederationWorkbenchDispatchPayload {
   prompt: string;
   label?: string;
   timeout_s?: number;
+  project_id?: string;
+  conversation_id?: string;
+  conversation_title?: string;
+  include_context?: boolean;
 }
 
 export interface FederationWorkbenchDispatchResponse {
@@ -1882,6 +1891,60 @@ export interface FederationWorkbenchCancelResponse {
   already_terminal: boolean;
   cancelled: boolean;
   job: FederationTimelineJobItem;
+}
+
+export interface FederationWorkbenchProject {
+  id: string;
+  name: string;
+  description?: string;
+  createdAt?: number;
+}
+
+export interface FederationWorkbenchConversation {
+  id: string;
+  agentId: string;
+  projectId: string;
+  title: string;
+  createdAt?: number;
+  updatedAt?: number;
+}
+
+export interface FederationWorkbenchUiPrefs {
+  sidebarCollapsed: boolean;
+  showArchived: boolean;
+  onlyPinned: boolean;
+  onlyUnread: boolean;
+  telemetryOpen: boolean;
+  selectedAgentId: string;
+  selectedProjectId: string;
+  selectedConversationId: string;
+}
+
+export interface FederationWorkbenchState {
+  customProjects: FederationWorkbenchProject[];
+  conversations: FederationWorkbenchConversation[];
+  pinnedConversationIds: string[];
+  archivedConversationIds: string[];
+  hiddenConversationIds: string[];
+  collapsedProjectIds: string[];
+  hiddenProjectIds: string[];
+  renamedProjects: Record<string, string>;
+  renamedConversations: Record<string, string>;
+  readAtByConversation: Record<string, number>;
+  uiPrefs: FederationWorkbenchUiPrefs;
+}
+
+export interface FederationWorkbenchStateResponse {
+  ok: boolean;
+  version: number;
+  updated_at: number | null;
+  can_edit: boolean;
+  state: FederationWorkbenchState;
+}
+
+export interface FederationWorkbenchStateUpdatePayload {
+  expected_version?: number;
+  state: FederationWorkbenchState;
 }
 
 declare global {

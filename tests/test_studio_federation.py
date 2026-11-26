@@ -56,10 +56,16 @@ from studio.auth import (  # noqa: E402
 )
 from studio.data_sources import StudioDataSources, redact_secrets_only  # noqa: E402
 from studio.event_hub import _sanitize_event_value  # noqa: E402
+import studio.federation_service as federation_service  # noqa: E402
 from studio.federation_service import (  # noqa: E402
+    MAX_FED_JOB_META_BYTES,
+    MAX_WORKBENCH_JSON_BYTES,
     StudioFederationService,
     _merge_single_timeline_job,
+    _read_job_meta_map_safe,
     _read_presence_map_no_symlink,
+    _strip_context_wrapper,
+    _upsert_job_meta_atomic,
     _validate_hub_public_url,
     _validate_loopback_hub_target,
 )
@@ -191,6 +197,7 @@ class _FederationTestBase(unittest.IsolatedAsyncioTestCase):
             event_watcher_interval=60.0,
             federation_hub_host="127.0.0.1",
             federation_hub_port=1,  # default unreachable closed port unless overridden in test
+            federation_workbench_state_path=self.studio_cfg / "studio_federation_workbench_state.json",
         )
         self.fed_svc: StudioFederationService = self.app[FEDERATION_SERVICE_KEY]
         self.server = TestServer(self.app)
@@ -1665,8 +1672,9 @@ class TestWorkbenchW2FieldInjectionAndTargetEligibility(_FederationTestBase):
             {"prompt": "hi", "timeout_s": True},
             {"prompt": "hi", "timeout_s": "30"},
             {"prompt": "hi", "timeout_s": 0},
-            {"prompt": f"leak {SYNTH_FAKE_SK}"},
-            {"prompt": f"leak {SYNTH_FAKE_FED}"},
+            # FW5: `prompt` containing example Bearer/sk-/agy_fed_ text is now sanitized & accepted 200
+            # (verified in TestFederationWorkbenchUpgradeFW1ToFW7.test_fw5_*), while metadata fields like
+            # `label` still fail-closed 400 on plaintext secrets.
             {"prompt": "hi", "label": f"bad {SYNTH_FAKE_SK}"},
         ]
         for bad in bad_payloads:
@@ -2946,6 +2954,977 @@ class TestWorkbenchPresenceP4AndP6(_FederationTestBase):
         self.assertIn("last_heartbeat_action?: string;", types_ts)
         self.assertIn("last_heartbeat_at:", mock_ts)
         self.assertIn("last_heartbeat_action:", mock_ts)
+
+
+class TestFederationWorkbenchUpgradeFW1ToFW7(_FederationTestBase):
+    """FW1..FW7: Independent state sync, optimistic locking, anti-symlink/FIFO, multi-turn context, Push/Pull compat, and UI guards."""
+
+    async def test_fw1_state_write_gate_live_rbac_128kib_and_get_headers(self) -> None:
+        admin_cookie, admin_csrf = await self._login("AdminUser", ADMIN_PASS)
+        ro_cookie, ro_csrf = await self._login("ViewerUser", RO_PASS)
+        forced_cookie, forced_csrf = await self._login("ForcedPwUser", FORCED_PASS)
+
+        state_file = self.studio_cfg / "studio_federation_workbench_state.json"
+        self.assertFalse(state_file.exists())
+
+        # GET auth gates & Cache-Control
+        r_unauth_get = await self.client.get("/api/federation/workbench/state")
+        self.assertEqual(r_unauth_get.status, 401)
+
+        r_forced_get = await self.client.get(
+            "/api/federation/workbench/state",
+            headers={"Cookie": f"{SESSION_COOKIE_NAME}={forced_cookie}"},
+        )
+        self.assertEqual(r_forced_get.status, 403)
+
+        r_admin_get = await self.client.get(
+            "/api/federation/workbench/state",
+            headers={"Cookie": f"{SESSION_COOKIE_NAME}={admin_cookie}"},
+        )
+        self.assertEqual(r_admin_get.status, 200)
+        self.assertEqual(r_admin_get.headers.get("Cache-Control"), "no-store, max-age=0")
+        d_admin_get = await r_admin_get.json()
+        self.assertTrue(d_admin_get["ok"])
+        self.assertEqual(d_admin_get["version"], 0)
+        self.assertTrue(d_admin_get["can_edit"])
+
+        r_ro_get = await self.client.get(
+            "/api/federation/workbench/state",
+            headers={"Cookie": f"{SESSION_COOKIE_NAME}={ro_cookie}"},
+        )
+        self.assertEqual(r_ro_get.status, 200)
+        self.assertEqual(r_ro_get.headers.get("Cache-Control"), "no-store, max-age=0")
+        d_ro_get = await r_ro_get.json()
+        self.assertFalse(d_ro_get["can_edit"])
+        self.assertFalse(state_file.exists())
+
+        valid_body = json.dumps(
+            {
+                "expected_version": 0,
+                "state": {
+                    "customProjects": [{"id": "proj-alpha", "name": "Alpha Ops", "description": "Edge tasks"}],
+                    "conversations": [
+                        {
+                            "id": "conv-alpha-1",
+                            "agentId": "pull_worker_demo",
+                            "projectId": "proj-alpha",
+                            "title": "Health Check",
+                        }
+                    ],
+                },
+            }
+        )
+
+        # PUT Gate 1a: missing Origin -> 403
+        h_no_origin = self._admin_headers(admin_cookie, admin_csrf)
+        h_no_origin.pop("Origin", None)
+        self.assertEqual(
+            (await self.client.put("/api/federation/workbench/state", headers=h_no_origin, data=valid_body)).status,
+            403,
+        )
+
+        # PUT Gate 1a: cross-site Origin -> 403
+        self.assertEqual(
+            (
+                await self.client.put(
+                    "/api/federation/workbench/state",
+                    headers=self._admin_headers(admin_cookie, admin_csrf, Origin="https://evil.example.com"),
+                    data=valid_body,
+                )
+            ).status,
+            403,
+        )
+
+        # PUT Gate 1b: Sec-Fetch-Site: cross-site -> 403
+        self.assertEqual(
+            (
+                await self.client.put(
+                    "/api/federation/workbench/state",
+                    headers=self._admin_headers(admin_cookie, admin_csrf, **{"Sec-Fetch-Site": "cross-site"}),
+                    data=valid_body,
+                )
+            ).status,
+            403,
+        )
+
+        # PUT Gate 2: Content-Type: text/plain -> 415
+        self.assertEqual(
+            (
+                await self.client.put(
+                    "/api/federation/workbench/state",
+                    headers=self._admin_headers(admin_cookie, admin_csrf, **{"Content-Type": "text/plain"}),
+                    data=valid_body,
+                )
+            ).status,
+            415,
+        )
+
+        # PUT Gate 3: unauthenticated -> 401; must_change_password=True -> 403
+        self.assertEqual(
+            (
+                await self.client.put(
+                    "/api/federation/workbench/state",
+                    headers={"Origin": self.origin, "Content-Type": "application/json"},
+                    data=valid_body,
+                )
+            ).status,
+            401,
+        )
+        self.assertEqual(
+            (
+                await self.client.put(
+                    "/api/federation/workbench/state",
+                    headers=self._admin_headers(forced_cookie, forced_csrf),
+                    data=valid_body,
+                )
+            ).status,
+            403,
+        )
+
+        # PUT Gate 4a: missing/wrong CSRF -> 403
+        h_no_csrf = self._admin_headers(admin_cookie, admin_csrf)
+        h_no_csrf.pop("X-Studio-CSRF", None)
+        self.assertEqual(
+            (await self.client.put("/api/federation/workbench/state", headers=h_no_csrf, data=valid_body)).status,
+            403,
+        )
+        self.assertEqual(
+            (
+                await self.client.put(
+                    "/api/federation/workbench/state",
+                    headers=self._admin_headers(admin_cookie, "wrong-csrf-token"),
+                    data=valid_body,
+                )
+            ).status,
+            403,
+        )
+
+        # PUT Gate 4b: readonly user -> 403 & zero disk write
+        self.assertEqual(
+            (
+                await self.client.put(
+                    "/api/federation/workbench/state",
+                    headers=self._admin_headers(ro_cookie, ro_csrf),
+                    data=valid_body,
+                )
+            ).status,
+            403,
+        )
+        self.assertFalse(state_file.exists())
+
+        # PUT Gate 4b: live RBAC demotion of already-logged-in admin -> 403 & zero disk write
+        users_fp = self.studio_cfg / "users.json"
+        users_by_key = json.loads(users_fp.read_text(encoding="utf-8"))["users"]
+        users_by_key["adminuser"]["role"] = "readonly"
+        save_users_file_atomic(users_fp, users_by_key)
+        self.assertEqual(
+            (
+                await self.client.put(
+                    "/api/federation/workbench/state",
+                    headers=self._admin_headers(admin_cookie, admin_csrf),
+                    data=valid_body,
+                )
+            ).status,
+            403,
+        )
+        self.assertFalse(state_file.exists())
+
+        # Restore admin role
+        users_by_key["adminuser"]["role"] = "admin"
+        save_users_file_atomic(users_fp, users_by_key)
+
+        # Body > 128 KiB -> 413
+        oversized = '{"expected_version":0,"state":{"customProjects":[{"id":"p1","name":"' + ("x" * (129 * 1024)) + '"}]}}'
+        r_big = await self.client.put(
+            "/api/federation/workbench/state",
+            headers=self._admin_headers(admin_cookie, admin_csrf),
+            data=oversized,
+        )
+        self.assertEqual(r_big.status, 413)
+        self.assertFalse(state_file.exists())
+
+        # Valid admin PUT -> 200, audit log, SSE broadcast
+        event_hub = self.app[EVENT_HUB_KEY]
+        with mock.patch.object(event_hub, "publish", wraps=event_hub.publish) as spy_pub:
+            r_ok = await self.client.put(
+                "/api/federation/workbench/state",
+                headers=self._admin_headers(admin_cookie, admin_csrf),
+                data=valid_body,
+            )
+            self.assertEqual(r_ok.status, 200, await r_ok.text())
+            d_ok = await r_ok.json()
+            self.assertEqual(d_ok["version"], 1)
+            self.assertTrue(d_ok["can_edit"])
+            self.assertEqual(len(d_ok["state"]["customProjects"]), 1)
+            self.assertTrue(
+                any(
+                    c.args and c.args[0] == "federation_updated" and (c.args[1] or {}).get("action") == "workbench_state_updated"
+                    for c in spy_pub.call_args_list
+                ),
+                "Expected federation_updated SSE broadcast with action=workbench_state_updated",
+            )
+        audit_text = self.audit_log.read_text(encoding="utf-8")
+        self.assertIn("federation.workbench.state.put", audit_text)
+
+    async def test_fw2_optimistic_lock_409_proto_pollution_host_paths_and_quotas(self) -> None:
+        admin_cookie, admin_csrf = await self._login("AdminUser", ADMIN_PASS)
+        headers = self._admin_headers(admin_cookie, admin_csrf)
+
+        # Initial save -> version 1
+        r1 = await self.client.put(
+            "/api/federation/workbench/state",
+            headers=headers,
+            data=json.dumps(
+                {
+                    "expected_version": 0,
+                    "state": {"customProjects": [{"id": "proj-v1", "name": "V1 Project"}]},
+                }
+            ),
+        )
+        self.assertEqual(r1.status, 200)
+        self.assertEqual((await r1.json())["version"], 1)
+
+        # Stale expected_version=0 -> 409 Conflict with latest snapshot & zero disk overwrite
+        r_conflict = await self.client.put(
+            "/api/federation/workbench/state",
+            headers=headers,
+            data=json.dumps(
+                {
+                    "expected_version": 0,
+                    "state": {"customProjects": [{"id": "proj-stale", "name": "Stale"}]},
+                }
+            ),
+        )
+        self.assertEqual(r_conflict.status, 409)
+        d_c = await r_conflict.json()
+        self.assertEqual(d_c.get("code"), "version_conflict")
+        self.assertEqual(d_c.get("version"), 1)
+        self.assertIsNotNone(d_c.get("updated_at"))
+        self.assertEqual(d_c["state"]["customProjects"][0]["id"], "proj-v1")
+
+        # Verify disk untouched
+        disk_doc = json.loads((self.studio_cfg / "studio_federation_workbench_state.json").read_text(encoding="utf-8"))
+        self.assertEqual(disk_doc["version"], 1)
+        self.assertEqual(disk_doc["state"]["customProjects"][0]["id"], "proj-v1")
+
+        # Invalid expected_version values -> 400
+        for bad_ver in (True, False, -1, 1.5, "1", None):
+            r_bv = await self.client.put(
+                "/api/federation/workbench/state",
+                headers=headers,
+                data=json.dumps({"expected_version": bad_ver, "state": {}}),
+            )
+            self.assertEqual(r_bv.status, 400, f"expected_version={bad_ver!r} should be 400")
+
+        # Prototype pollution keys (top-level, nested, AND space-wrapped) -> 400 & zero disk overwrite
+        for proto_payload in (
+            '{"expected_version":1,"__proto__":{"polluted":true},"state":{}}',
+            '{"expected_version":1," __proto__ ":{"polluted":true},"state":{}}',
+            '{"expected_version":1,"state":{"renamedProjects":{"prototype":"bad"}}}',
+            '{"expected_version":1,"state":{"renamedProjects":{" prototype ":"bad"}}}',
+            '{"expected_version":1,"state":{"renamedProjects":{" constructor ":"bad"}}}',
+            '{"expected_version":1,"state":{"customProjects":[{"id":"p1","name":"ok","constructor":{}}]}}',
+            '{"expected_version":1,"state":{"customProjects":[{"id":"p1","name":"ok"," constructor ":{}}]}}',
+            '{"expected_version":1,"state":{"customProjects":[{"id":"constructor","name":"Bad"}]}}',
+            '{"expected_version":1,"state":{"customProjects":[{"id":"prototype","name":"Bad"}]}}',
+            '{"expected_version":1,"state":{"customProjects":[{"id":"__proto__","name":"Bad"}]}}',
+            '{"expected_version":1,"state":{"conversations":[{"id":"constructor","agentId":"ag1","projectId":"default","title":"T"}]}}',
+            '{"expected_version":1,"state":{"conversations":[{"id":"c1","agentId":"constructor","projectId":"default","title":"T"}]}}',
+            '{"expected_version":1,"state":{"conversations":[{"id":"c1","agentId":"ag1","projectId":"prototype","title":"T"}]}}',
+            '{"expected_version":1,"state":{"uiPrefs":{"selectedAgentId":"constructor"}}}',
+            '{"expected_version":1,"state":{"uiPrefs":{"selectedProjectId":"prototype"}}}',
+            '{"expected_version":1,"state":{"uiPrefs":{"selectedConversationId":"__proto__"}}}',
+        ):
+            r_pp = await self.client.put("/api/federation/workbench/state", headers=headers, data=proto_payload)
+            self.assertEqual(r_pp.status, 400, proto_payload)
+
+        # Verify disk remains untouched at version 1 after all prototype attacks
+        disk_doc_after_proto = json.loads(
+            (self.studio_cfg / "studio_federation_workbench_state.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(disk_doc_after_proto["version"], 1)
+        self.assertEqual(disk_doc_after_proto["state"]["customProjects"][0]["id"], "proj-v1")
+
+        # Host path keys -> 400
+        for path_key in ("workdir", "path", "cwd", "filepath", "dir", "folder_uri"):
+            r_hp = await self.client.put(
+                "/api/federation/workbench/state",
+                headers=headers,
+                data=json.dumps(
+                    {
+                        "expected_version": 1,
+                        "state": {"customProjects": [{"id": "p1", "name": "ok", path_key: "/tmp/x"}]},
+                    }
+                ),
+            )
+            self.assertEqual(r_hp.status, 400, f"forbidden path key {path_key}")
+
+        # Unknown top-level & state fields -> 400
+        self.assertEqual(
+            (
+                await self.client.put(
+                    "/api/federation/workbench/state",
+                    headers=headers,
+                    data=json.dumps({"expected_version": 1, "state": {}, "extraTop": 1}),
+                )
+            ).status,
+            400,
+        )
+        self.assertEqual(
+            (
+                await self.client.put(
+                    "/api/federation/workbench/state",
+                    headers=headers,
+                    data=json.dumps({"expected_version": 1, "state": {"unknownField": 1}}),
+                )
+            ).status,
+            400,
+        )
+
+        # Quotas, control chars, traversal IDs -> 400
+        too_many_projects = [{"id": f"proj-{i}", "name": f"P{i}"} for i in range(65)]
+        self.assertEqual(
+            (
+                await self.client.put(
+                    "/api/federation/workbench/state",
+                    headers=headers,
+                    data=json.dumps({"expected_version": 1, "state": {"customProjects": too_many_projects}}),
+                )
+            ).status,
+            400,
+        )
+        too_many_convs = [
+            {"id": f"conv-{i}", "agentId": "ag1", "projectId": "default", "title": f"C{i}"} for i in range(513)
+        ]
+        self.assertEqual(
+            (
+                await self.client.put(
+                    "/api/federation/workbench/state",
+                    headers=headers,
+                    data=json.dumps({"expected_version": 1, "state": {"conversations": too_many_convs}}),
+                )
+            ).status,
+            400,
+        )
+        for bad_state in (
+            {"customProjects": [{"id": "../escape", "name": "Bad"}]},
+            {"customProjects": [{"id": "p1", "name": "bad\x00ctrl"}]},
+            {"customProjects": [{"id": "p1", "name": "x" * 65}]},
+            {"pinnedConversationIds": ["../etc/passwd"]},
+            {"renamedConversations": {"conv-1": "line1\nline2"}},
+        ):
+            r_bs = await self.client.put(
+                "/api/federation/workbench/state",
+                headers=headers,
+                data=json.dumps({"expected_version": 1, "state": bad_state}),
+            )
+            self.assertEqual(r_bs.status, 400, f"bad_state={bad_state!r}")
+
+    async def test_fw3_anti_symlink_fifo_get_zero_side_effects_and_permissions(self) -> None:
+        admin_cookie, admin_csrf = await self._login("AdminUser", ADMIN_PASS)
+        admin_get = {"Cookie": f"{SESSION_COOKIE_NAME}={admin_cookie}"}
+        headers = self._admin_headers(admin_cookie, admin_csrf)
+
+        # 1. Non-existent parent dir -> GET 200 (version=0) with ZERO dir/file creation
+        nested_dir = self.tmp / "fresh_fed_state_root" / "sub"
+        fresh_state = nested_dir / "studio_federation_workbench_state.json"
+        self.fed_svc.workbench_state_path = fresh_state
+        r_empty = await self.client.get("/api/federation/workbench/state", headers=admin_get)
+        self.assertEqual(r_empty.status, 200)
+        self.assertEqual((await r_empty.json())["version"], 0)
+        self.assertFalse((self.tmp / "fresh_fed_state_root").exists())
+
+        # 2. Normal PUT -> parent 0700, file & .lock 0600, independent from studio_workbench_state.json
+        valid_body = json.dumps({"expected_version": 0, "state": {"customProjects": [{"id": "p1", "name": "P1"}]}})
+        r_save = await self.client.put("/api/federation/workbench/state", headers=headers, data=valid_body)
+        self.assertEqual(r_save.status, 200, await r_save.text())
+        self.assertEqual(os.stat(nested_dir).st_mode & 0o777, 0o700)
+        self.assertEqual(os.stat(fresh_state).st_mode & 0o777, 0o600)
+        lock_file = nested_dir / f".{fresh_state.name}.lock"
+        self.assertTrue(lock_file.exists())
+        self.assertEqual(os.stat(lock_file).st_mode & 0o777, 0o600)
+        self.assertFalse((nested_dir / "studio_workbench_state.json").exists())
+
+        # 3. Symlink state file -> GET & PUT fail-closed 403 SECURITY_SYMLINK_REJECTED
+        outside = self.tmp / "outside_state_canary.json"
+        outside.write_text('{"version":99,"state":{}}', encoding="utf-8")
+        fresh_state.unlink()
+        os.symlink(outside, fresh_state)
+        for method in ("get", "put"):
+            r = (
+                await self.client.get("/api/federation/workbench/state", headers=admin_get)
+                if method == "get"
+                else await self.client.put("/api/federation/workbench/state", headers=headers, data=valid_body)
+            )
+            self.assertEqual(r.status, 403, f"symlink state file {method}")
+            self.assertEqual((await r.json()).get("code"), "SECURITY_SYMLINK_REJECTED")
+        fresh_state.unlink()
+
+        # 4. FIFO state file -> non-blocking immediate 403 SECURITY_SYMLINK_REJECTED
+        os.mkfifo(fresh_state)
+        for method in ("get", "put"):
+            r = await asyncio.wait_for(
+                self.client.get("/api/federation/workbench/state", headers=admin_get)
+                if method == "get"
+                else self.client.put("/api/federation/workbench/state", headers=headers, data=valid_body),
+                timeout=2.0,
+            )
+            self.assertEqual(r.status, 403, f"fifo state file {method}")
+            self.assertEqual((await r.json()).get("code"), "SECURITY_SYMLINK_REJECTED")
+        fresh_state.unlink()
+
+        # 5. Symlink & FIFO .lock -> GET & PUT non-blocking 403 SECURITY_SYMLINK_REJECTED
+        lock_file.unlink()
+        os.symlink(outside, lock_file)
+        for method in ("get", "put"):
+            r = (
+                await self.client.get("/api/federation/workbench/state", headers=admin_get)
+                if method == "get"
+                else await self.client.put("/api/federation/workbench/state", headers=headers, data=valid_body)
+            )
+            self.assertEqual(r.status, 403, f"symlink lock {method}")
+            self.assertEqual((await r.json()).get("code"), "SECURITY_SYMLINK_REJECTED")
+        lock_file.unlink()
+
+        os.mkfifo(lock_file)
+        for method in ("get", "put"):
+            r = await asyncio.wait_for(
+                self.client.get("/api/federation/workbench/state", headers=admin_get)
+                if method == "get"
+                else self.client.put("/api/federation/workbench/state", headers=headers, data=valid_body),
+                timeout=2.0,
+            )
+            self.assertEqual(r.status, 403, f"fifo lock {method}")
+            self.assertEqual((await r.json()).get("code"), "SECURITY_SYMLINK_REJECTED")
+        lock_file.unlink()
+
+        # 6. Symlink parent directory -> GET & PUT 403 SECURITY_SYMLINK_REJECTED
+        sym_parent = self.tmp / "sym_parent_link"
+        os.symlink(nested_dir, sym_parent)
+        self.fed_svc.workbench_state_path = sym_parent / "studio_federation_workbench_state.json"
+        for method in ("get", "put"):
+            r = (
+                await self.client.get("/api/federation/workbench/state", headers=admin_get)
+                if method == "get"
+                else await self.client.put("/api/federation/workbench/state", headers=headers, data=valid_body)
+            )
+            self.assertEqual(r.status, 403, f"symlink parent {method}")
+            self.assertEqual((await r.json()).get("code"), "SECURITY_SYMLINK_REJECTED")
+
+        # 7. Zero residual .lock file created when target state / job_meta file is symlink or FIFO
+        clean_dir = self.tmp / "zero_lock_residue_dir"
+        clean_dir.mkdir(mode=0o700)
+        for kind in ("symlink", "fifo"):
+            st_target = clean_dir / f"state_{kind}.json"
+            st_lock = clean_dir / f".{st_target.name}.lock"
+            if kind == "symlink":
+                os.symlink(outside, st_target)
+            else:
+                os.mkfifo(st_target)
+            self.fed_svc.workbench_state_path = st_target
+            r_rej = await asyncio.wait_for(
+                self.client.put("/api/federation/workbench/state", headers=headers, data=valid_body),
+                timeout=2.0,
+            )
+            self.assertEqual(r_rej.status, 403, f"zero-lock {kind} state")
+            self.assertFalse(st_lock.exists(), f"residual .lock created for {kind} state target")
+
+            jm_target = clean_dir / f"job_meta_{kind}.json"
+            jm_lock = clean_dir / f".{jm_target.name}.lock"
+            if kind == "symlink":
+                os.symlink(outside, jm_target)
+            else:
+                os.mkfifo(jm_target)
+            ok_up, err_up = _upsert_job_meta_atomic(jm_target, "job-x", {"agent_id": "a1"})
+            self.assertFalse(ok_up)
+            self.assertIn("SECURITY_SYMLINK_REJECTED", err_up)
+            self.assertFalse(jm_lock.exists(), f"residual .lock created for {kind} job_meta target")
+
+    async def test_fw4_multiturn_context_isolation_bounds_redaction_and_anti_nesting(self) -> None:
+        admin_cookie, admin_csrf = await self._login("AdminUser", ADMIN_PASS)
+        headers = self._admin_headers(admin_cookie, admin_csrf)
+
+        for aid in ("agent_a", "agent_b"):
+            r_reg = await self.client.post(
+                "/api/federation/agents",
+                headers=headers,
+                data=json.dumps({"agent_id": aid, "kind": "pull_worker"}),
+            )
+            self.assertEqual(r_reg.status, 200, await r_reg.text())
+
+        # Strict bool check on include_context
+        for bad_ic in ("true", 1, 0):
+            r_bad = await self.client.post(
+                "/api/federation/workbench/agents/agent_a/dispatch",
+                headers=headers,
+                data=json.dumps({"prompt": "hi", "conversation_id": "conv-1", "include_context": bad_ic}),
+            )
+            self.assertEqual(r_bad.status, 400, f"include_context={bad_ic!r} must return 400")
+
+        pq_dir = self.bus_dir / "federation" / "pull_queue"
+        pq_dir.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+        synth_ghp = "ghp_" + ("A" * 24)
+
+        # Seed 10 completed turns in (agent_a, conv-1) containing secrets & host paths
+        for i in range(1, 11):
+            jid = f"pull-hist-{i:02d}"
+            (pq_dir / f"{jid}.json").write_text(
+                json.dumps(
+                    {
+                        "job_id": jid,
+                        "target_agent_id": "agent_a",
+                        "prompt": f"Turn {i} prompt with {SYNTH_FAKE_FED} and {SYNTH_HOST_PATH}",
+                        "result_text": f"Turn {i} reply with {SYNTH_FAKE_SK} and {synth_ghp} and {'Z' * 600}",
+                        "status": "done",
+                        "cancelled": False,
+                        "created_at": now - (100 - i),
+                        "finished_at": now - (99 - i),
+                        "metadata": {
+                            "source": "studio",
+                            "project_id": "proj-1",
+                            "conversation_id": "conv-1",
+                            "display_prompt": f"Turn {i} prompt with [REDACTED]",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+        # Seed cross-agent, cross-conversation, unfinished, and cancelled distractors
+        for jid, aid, cid, st, marker in (
+            ("pull-other-agent", "agent_b", "conv-1", "done", "CROSS_AGENT_LEAK_CANARY"),
+            ("pull-other-conv", "agent_a", "conv-2", "done", "CROSS_CONV_LEAK_CANARY"),
+            ("pull-unfinished", "agent_a", "conv-1", "queued", "UNFINISHED_CANARY"),
+            ("pull-cancelled", "agent_a", "conv-1", "cancelled", "CANCELLED_CANARY"),
+        ):
+            (pq_dir / f"{jid}.json").write_text(
+                json.dumps(
+                    {
+                        "job_id": jid,
+                        "target_agent_id": aid,
+                        "prompt": marker,
+                        "result_text": marker,
+                        "status": st,
+                        "cancelled": st == "cancelled",
+                        "created_at": now - 5,
+                        "metadata": {"source": "studio", "conversation_id": cid, "display_prompt": marker},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+        # 1. include_context=False -> context_turns=0
+        r_no_ctx = await self.client.post(
+            "/api/federation/workbench/agents/agent_a/dispatch",
+            headers=headers,
+            data=json.dumps(
+                {
+                    "prompt": "fresh question no context",
+                    "project_id": "proj-1",
+                    "conversation_id": "conv-1",
+                    "include_context": False,
+                }
+            ),
+        )
+        self.assertEqual(r_no_ctx.status, 200, await r_no_ctx.text())
+        d_nc = await r_no_ctx.json()
+        self.assertEqual(d_nc["job"]["context_turns"], 0)
+        raw_nc = json.loads((pq_dir / f"{d_nc['job']['job_id']}.json").read_text(encoding="utf-8"))
+        self.assertEqual(raw_nc["prompt"], "fresh question no context")
+
+        # 2. include_context=True -> <= 6 turns, <= 3600 chars prefix, strict isolation & redaction
+        r_ctx = await self.client.post(
+            "/api/federation/workbench/agents/agent_a/dispatch",
+            headers=headers,
+            data=json.dumps(
+                {
+                    "prompt": "follow up round 11",
+                    "project_id": "proj-1",
+                    "conversation_id": "conv-1",
+                    "conversation_title": "Ops Thread",
+                    "include_context": True,
+                }
+            ),
+        )
+        self.assertEqual(r_ctx.status, 200, await r_ctx.text())
+        d_ctx = await r_ctx.json()
+        ctx_turns = d_ctx["job"]["context_turns"]
+        self.assertGreater(ctx_turns, 0)
+        self.assertLessEqual(ctx_turns, 6)
+        self.assertEqual(d_ctx["job"]["display_prompt"], "follow up round 11")
+
+        raw_ctx_job = json.loads((pq_dir / f"{d_ctx['job']['job_id']}.json").read_text(encoding="utf-8"))
+        dispatched_prompt = raw_ctx_job["prompt"]
+        self.assertIn("[AGY_FED_CONVERSATION_CONTEXT]", dispatched_prompt)
+        self.assertIn("[CURRENT_USER_MESSAGE]", dispatched_prompt)
+        self.assertTrue(dispatched_prompt.endswith("follow up round 11"))
+        prefix_only = dispatched_prompt[: dispatched_prompt.rfind("\nfollow up round 11")]
+        self.assertLessEqual(len(prefix_only), 3600)
+        self.assertIn("Turn 10", prefix_only)
+        self.assertNotIn("Turn 1 ", prefix_only)
+        for forbidden in (
+            "CROSS_AGENT_LEAK_CANARY",
+            "CROSS_CONV_LEAK_CANARY",
+            "UNFINISHED_CANARY",
+            "CANCELLED_CANARY",
+            SYNTH_FAKE_FED,
+            SYNTH_FAKE_SK,
+            synth_ghp,
+            SYNTH_HOST_PATH,
+        ):
+            self.assertNotIn(forbidden, dispatched_prompt)
+
+        # 3. Complete round 11 and send round 12 -> zero recursive header nesting
+        raw_ctx_job["status"] = "done"
+        raw_ctx_job["result_text"] = "round 11 done"
+        raw_ctx_job["finished_at"] = time.time()
+        (pq_dir / f"{d_ctx['job']['job_id']}.json").write_text(json.dumps(raw_ctx_job), encoding="utf-8")
+
+        r_ctx2 = await self.client.post(
+            "/api/federation/workbench/agents/agent_a/dispatch",
+            headers=headers,
+            data=json.dumps(
+                {
+                    "prompt": "follow up round 12",
+                    "project_id": "proj-1",
+                    "conversation_id": "conv-1",
+                    "include_context": True,
+                }
+            ),
+        )
+        self.assertEqual(r_ctx2.status, 200, await r_ctx2.text())
+        raw_ctx2 = json.loads((pq_dir / f"{(await r_ctx2.json())['job']['job_id']}.json").read_text(encoding="utf-8"))
+        self.assertEqual(raw_ctx2["prompt"].count("[AGY_FED_CONVERSATION_CONTEXT]"), 1)
+        self.assertEqual(raw_ctx2["prompt"].count("[CURRENT_USER_MESSAGE]"), 1)
+        self.assertIn("follow up round 11", raw_ctx2["prompt"])
+
+    async def test_fw5_pull_plaintext_secret_compat_push_meta_and_timeline_filtering(self) -> None:
+        admin_cookie, admin_csrf = await self._login("AdminUser", ADMIN_PASS)
+        admin_get = {"Cookie": f"{SESSION_COOKIE_NAME}={admin_cookie}"}
+        headers = self._admin_headers(admin_cookie, admin_csrf)
+
+        for spec in (
+            {"agent_id": "pull_sec_compat", "kind": "pull_worker"},
+            {"agent_id": "push_meta_node", "kind": "hermes_remote", "endpoint_url": "https://node.example.com/a2a"},
+        ):
+            r_reg = await self.client.post("/api/federation/agents", headers=headers, data=json.dumps(spec))
+            self.assertEqual(r_reg.status, 200, await r_reg.text())
+
+        # 1. Pull dispatch whose prompt contains Bearer/Authorization/sk-/ghp_/agy_fed_ MUST NOT trigger 400
+        synth_ghp = "ghp_" + ("B" * 24)
+        secret_prompt = (
+            f"Bearer EXAMPLE_LEAD_TOK_12345678 inspect Authorization: Bearer EXAMPLE_HDR_99887766 "
+            f"and {SYNTH_FAKE_SK} {synth_ghp} {SYNTH_FAKE_FED}"
+        )
+        r_pull_sec = await self.client.post(
+            "/api/federation/workbench/agents/pull_sec_compat/dispatch",
+            headers=headers,
+            data=json.dumps(
+                {
+                    "prompt": secret_prompt,
+                    "label": "secret-redaction-check",
+                    "project_id": "default",
+                    "conversation_id": "conv-sec-1",
+                    "conversation_title": "Audit Auth Header",
+                }
+            ),
+        )
+        self.assertEqual(r_pull_sec.status, 200, await r_pull_sec.text())
+        d_ps = await r_pull_sec.json()
+        for raw_tok in ("EXAMPLE_LEAD_TOK_12345678", "EXAMPLE_HDR_99887766", SYNTH_FAKE_SK, synth_ghp, SYNTH_FAKE_FED):
+            self.assertNotIn(raw_tok, d_ps["job"]["display_prompt"])
+            self.assertNotIn(raw_tok, d_ps["job"]["prompt"])
+        self.assertIn("[REDACTED]", d_ps["job"]["display_prompt"])
+        # Verify timeline & pull_inbox also return sanitized prompt_preview cleanly
+        r_ps_tl = await self.client.get(
+            "/api/federation/workbench/agents/pull_sec_compat/timeline", headers=admin_get
+        )
+        self.assertEqual(r_ps_tl.status, 200)
+        d_ps_tl = await r_ps_tl.json()
+        self.assertTrue(len(d_ps_tl["pull_inbox"]) >= 1)
+        for raw_tok in ("EXAMPLE_LEAD_TOK_12345678", "EXAMPLE_HDR_99887766", SYNTH_FAKE_SK, synth_ghp, SYNTH_FAKE_FED):
+            self.assertNotIn(raw_tok, d_ps_tl["pull_inbox"][0]["prompt_preview"])
+
+        # 2. Push node preserves project_id / conversation_id / conversation_title / context_turns without touching bot_bus.py
+        r_push1 = await self.client.post(
+            "/api/federation/workbench/agents/push_meta_node/dispatch",
+            headers=headers,
+            data=json.dumps(
+                {
+                    "prompt": "push round 1",
+                    "project_id": "proj-push",
+                    "conversation_id": "conv-push-1",
+                    "conversation_title": "Push Multi-Turn",
+                }
+            ),
+        )
+        self.assertEqual(r_push1.status, 200, await r_push1.text())
+        push_jid = (await r_push1.json())["job"]["job_id"]
+
+        # Timeline returns metadata AND keeps node-level has_active_jobs=True even when filtered to an idle conversation
+        r_tl_all = await self.client.get(
+            "/api/federation/workbench/agents/push_meta_node/timeline", headers=admin_get
+        )
+        self.assertEqual(r_tl_all.status, 200)
+        d_all = await r_tl_all.json()
+        item_p = next(it for it in d_all["timeline"] if it["job_id"] == push_jid)
+        self.assertEqual(item_p["project_id"], "proj-push")
+        self.assertEqual(item_p["conversation_id"], "conv-push-1")
+        self.assertEqual(item_p["conversation_title"], "Push Multi-Turn")
+        self.assertEqual(item_p["display_prompt"], "push round 1")
+        self.assertTrue(d_all["has_active_jobs"])
+
+        r_tl_idle = await self.client.get(
+            "/api/federation/workbench/agents/push_meta_node/timeline?conversation_id=conv-empty-other",
+            headers=admin_get,
+        )
+        self.assertEqual(r_tl_idle.status, 200)
+        d_idle = await r_tl_idle.json()
+        self.assertEqual(d_idle["timeline"], [])
+        self.assertTrue(d_idle["has_active_jobs"], "Node-level has_active_jobs must stay True when filtering to idle conv")
+
+        # 3. Legacy dispatch {"prompt": "ping"} 100% compatible
+        r_leg = await self.client.post(
+            "/api/federation/workbench/agents/pull_sec_compat/dispatch",
+            headers=headers,
+            data=json.dumps({"prompt": "ping"}),
+        )
+        self.assertEqual(r_leg.status, 200, await r_leg.text())
+        self.assertEqual((await r_leg.json())["job"]["context_turns"], 0)
+
+        # 4. Invalid timeline query filter params -> 400
+        for bad_q in ("conversation_id=../bad", "project_id=../bad", "project_id=constructor", "conversation_id=prototype"):
+            r_bq = await self.client.get(
+                f"/api/federation/workbench/agents/push_meta_node/timeline?{bad_q}", headers=admin_get
+            )
+            self.assertEqual(r_bq.status, 400, bad_q)
+
+        # 5. Cancel Push job preserves project_id / conversation_id / conversation_title (active & idempotent repeat)
+        r_cancel_push = await self.client.post(
+            f"/api/federation/workbench/agents/push_meta_node/jobs/{push_jid}/cancel",
+            headers=headers,
+            data=json.dumps({"reason": "user_cancelled_test"}),
+        )
+        self.assertEqual(r_cancel_push.status, 200, await r_cancel_push.text())
+        d_cp = await r_cancel_push.json()
+        self.assertTrue(d_cp["cancelled"])
+        self.assertEqual(d_cp["status"], "cancelled")
+        self.assertEqual(d_cp["job"]["project_id"], "proj-push")
+        self.assertEqual(d_cp["job"]["conversation_id"], "conv-push-1")
+        self.assertEqual(d_cp["job"]["conversation_title"], "Push Multi-Turn")
+
+        # Repeat cancel (already-terminal branch) STILL preserves Push sidecar metadata
+        r_cancel_again = await self.client.post(
+            f"/api/federation/workbench/agents/push_meta_node/jobs/{push_jid}/cancel",
+            headers=headers,
+            data=json.dumps({}),
+        )
+        self.assertEqual(r_cancel_again.status, 200, await r_cancel_again.text())
+        d_cp2 = await r_cancel_again.json()
+        self.assertTrue(d_cp2["already_terminal"])
+        self.assertEqual(d_cp2["job"]["project_id"], "proj-push")
+        self.assertEqual(d_cp2["job"]["conversation_id"], "conv-push-1")
+        self.assertEqual(d_cp2["job"]["conversation_title"], "Push Multi-Turn")
+
+        # Cancel fails closed (403 SECURITY_SYMLINK_REJECTED) if job_meta sidecar is replaced by symlink/FIFO
+        r_push_sym = await self.client.post(
+            "/api/federation/workbench/agents/push_meta_node/dispatch",
+            headers=headers,
+            data=json.dumps({"prompt": "push before symlink check", "conversation_id": "conv-sym-1"}),
+        )
+        self.assertEqual(r_push_sym.status, 200)
+        sym_jid = (await r_push_sym.json())["job"]["job_id"]
+        orig_meta_path = self.fed_svc.job_meta_path
+        fifo_meta = self.tmp / "fifo_job_meta.json"
+        os.mkfifo(fifo_meta)
+        try:
+            self.fed_svc.job_meta_path = fifo_meta
+            r_cancel_fifo = await asyncio.wait_for(
+                self.client.post(
+                    f"/api/federation/workbench/agents/push_meta_node/jobs/{sym_jid}/cancel",
+                    headers=headers,
+                    data=json.dumps({}),
+                ),
+                timeout=2.0,
+            )
+            self.assertEqual(r_cancel_fifo.status, 403)
+            self.assertEqual((await r_cancel_fifo.json()).get("code"), "SECURITY_SYMLINK_REJECTED")
+        finally:
+            self.fed_svc.job_meta_path = orig_meta_path
+
+    async def test_fw5_round2_job_meta_budget_45x62kib_and_strip_context_wrapper(self) -> None:
+        """BLOCKER-2 & BLOCKER-3 regression: 45x62KiB sidecar budget never truncates/wipes, and _strip_context_wrapper preserves literal markers."""
+        # 1. Unit tests for _strip_context_wrapper literal preservation & genuine leading wrapper stripping
+        literal_body = "Explain why [AGY_FED_CONVERSATION_CONTEXT] and [CURRENT_USER_MESSAGE] appear in logs."
+        self.assertEqual(_strip_context_wrapper(literal_body), literal_body)
+
+        unclosed_lead = "[AGY_FED_CONVERSATION_CONTEXT] is mentioned at the start without closing tag"
+        self.assertEqual(_strip_context_wrapper(unclosed_lead), unclosed_lead)
+
+        no_marker_after_end = "[AGY_FED_CONVERSATION_CONTEXT]\nhi\n[/AGY_FED_CONVERSATION_CONTEXT]\nRegular text"
+        self.assertEqual(_strip_context_wrapper(no_marker_after_end), no_marker_after_end)
+
+        genuine_wrapped_with_literal_body = (
+            "[AGY_FED_CONVERSATION_CONTEXT]\nUser: prev\nAssistant: ok\n"
+            "[/AGY_FED_CONVERSATION_CONTEXT]\n[CURRENT_USER_MESSAGE]\n"
+            + literal_body
+        )
+        self.assertEqual(_strip_context_wrapper(genuine_wrapped_with_literal_body), literal_body)
+
+        nested_genuine = (
+            "[AGY_FED_CONVERSATION_CONTEXT]\nouter\n[/AGY_FED_CONVERSATION_CONTEXT]\n[CURRENT_USER_MESSAGE]\n"
+            "[AGY_FED_CONVERSATION_CONTEXT]\ninner\n[/AGY_FED_CONVERSATION_CONTEXT]\n[CURRENT_USER_MESSAGE]\n"
+            "Final user prompt"
+        )
+        self.assertEqual(_strip_context_wrapper(nested_genuine), "Final user prompt")
+
+        # 2. 45 consecutive 62 KiB prompt entries via _upsert_job_meta_atomic -> strictly <= 1.5 MiB (< 2 MiB read cap), zero wipe
+        stress_meta = self.tmp / "stress_45x62kib_job_meta.json"
+        payload_62k = "P" * (62 * 1024)
+        for i in range(45):
+            ok_s, err_s = _upsert_job_meta_atomic(
+                stress_meta,
+                f"job-62k-{i:03d}",
+                {
+                    "agent_id": "push_bulk_node",
+                    "project_id": "proj-bulk",
+                    "conversation_id": "conv-bulk-62k",
+                    "conversation_title": "62KiB Sidecar Stress",
+                    "display_prompt": f"turn-{i:03d}-{payload_62k}",
+                    "ts": 1700001000.0 + i,
+                },
+            )
+            self.assertTrue(ok_s, err_s)
+            self.assertLessEqual(stress_meta.stat().st_size, MAX_FED_JOB_META_BYTES)
+            self.assertLess(stress_meta.stat().st_size, MAX_WORKBENCH_JSON_BYTES * 2)
+        ok_srd, srd_map, err_srd = _read_job_meta_map_safe(stress_meta)
+        self.assertTrue(ok_srd, err_srd)
+        self.assertEqual(len(srd_map), 45, "All 45 62KiB entries must stay intact without truncation wipe")
+        self.assertIn("job-62k-000", srd_map)
+        self.assertIn("job-62k-044", srd_map)
+
+        # 3. Direct byte-budget eviction check on _upsert_job_meta_atomic (strictly <= budget, oldest evicted first)
+        budget_meta = self.tmp / "budget_evict_job_meta.json"
+        with mock.patch.object(federation_service, "MAX_FED_JOB_META_BYTES", 8192):
+            for i in range(30):
+                ok_u, err_u = _upsert_job_meta_atomic(
+                    budget_meta,
+                    f"job-ev-{i:03d}",
+                    {
+                        "agent_id": "push_bulk_node",
+                        "project_id": "proj-bulk",
+                        "conversation_id": "conv-bulk",
+                        "conversation_title": "Bulk Test",
+                        "display_prompt": f"item-{i:03d}-" + ("X" * 1024),
+                        "ts": 1700000000.0 + i,
+                    },
+                )
+                self.assertTrue(ok_u, err_u)
+                self.assertLessEqual(budget_meta.stat().st_size, 8192)
+        ok_rd, rd_map, err_rd = _read_job_meta_map_safe(budget_meta)
+        self.assertTrue(ok_rd, err_rd)
+        self.assertGreater(len(rd_map), 0)
+        self.assertIn("job-ev-029", rd_map)
+        self.assertNotIn("job-ev-000", rd_map)
+
+        # 4. E2E HTTP: 45 consecutive 28 KiB prompts to Push node -> zero silent wipe, file <= 1.5 MiB, lossless bubbles
+        admin_cookie, admin_csrf = await self._login("AdminUser", ADMIN_PASS)
+        admin_get = {"Cookie": f"{SESSION_COOKIE_NAME}={admin_cookie}"}
+        headers = self._admin_headers(admin_cookie, admin_csrf)
+
+        r_reg = await self.client.post(
+            "/api/federation/agents",
+            headers=headers,
+            data=json.dumps(
+                {
+                    "agent_id": "push_bulk_node",
+                    "kind": "hermes_remote",
+                    "endpoint_url": "https://bulk.example.com/a2a",
+                }
+            ),
+        )
+        self.assertEqual(r_reg.status, 200, await r_reg.text())
+
+        dispatched_jids: list[str] = []
+        prompt_tail_marker = "TAIL_MARKER_LOSSLESS_CHECK"
+        body_28k_prefix = "A" * (28 * 1024 - 80)
+        for idx in range(45):
+            big_prompt = f"Turn-{idx:02d} {body_28k_prefix} {prompt_tail_marker}-{idx:02d}"
+            r_d = await self.client.post(
+                "/api/federation/workbench/agents/push_bulk_node/dispatch",
+                headers=headers,
+                data=json.dumps(
+                    {
+                        "prompt": big_prompt,
+                        "project_id": "proj-bulk",
+                        "conversation_id": "conv-bulk-45",
+                        "conversation_title": "Large Prompt Stress",
+                        "include_context": False,
+                    }
+                ),
+            )
+            self.assertEqual(r_d.status, 200, await r_d.text())
+            d_j = (await r_d.json())["job"]
+            dispatched_jids.append(d_j["job_id"])
+            self.assertTrue(d_j["display_prompt"].endswith(f"{prompt_tail_marker}-{idx:02d}"))
+
+        meta_size = self.fed_svc.job_meta_path.stat().st_size
+        self.assertLessEqual(meta_size, MAX_FED_JOB_META_BYTES)
+        self.assertLess(meta_size, MAX_WORKBENCH_JSON_BYTES * 2)
+
+        ok_m, m_map, err_m = _read_job_meta_map_safe(self.fed_svc.job_meta_path)
+        self.assertTrue(ok_m, err_m)
+        self.assertEqual(len(m_map), 45, "All 45 entries must remain intact without silent wipe")
+        self.assertIn(dispatched_jids[0], m_map)
+        self.assertIn(dispatched_jids[-1], m_map)
+
+        r_tl = await self.client.get(
+            "/api/federation/workbench/agents/push_bulk_node/timeline?limit=100", headers=admin_get
+        )
+        self.assertEqual(r_tl.status, 200)
+        tl_by_id = {it["job_id"]: it for it in (await r_tl.json())["timeline"]}
+        self.assertEqual(len(tl_by_id), 45)
+        for idx, jid in enumerate(dispatched_jids):
+            self.assertEqual(tl_by_id[jid]["project_id"], "proj-bulk")
+            self.assertEqual(tl_by_id[jid]["conversation_id"], "conv-bulk-45")
+            self.assertEqual(tl_by_id[jid]["conversation_title"], "Large Prompt Stress")
+            self.assertTrue(
+                tl_by_id[jid]["display_prompt"].endswith(f"{prompt_tail_marker}-{idx:02d}"),
+                f"Job {idx} display_prompt must be lossless in timeline",
+            )
+
+    async def test_fw6_and_fw7_frontend_invariants_demo_parity_and_redlines(self) -> None:
+        wb_tsx = (REPO_ROOT / "webui" / "src" / "components" / "FederationWorkbenchView.tsx").read_text(
+            encoding="utf-8"
+        )
+        api_ts = (REPO_ROOT / "webui" / "src" / "api.ts").read_text(encoding="utf-8")
+        mock_ts = (REPO_ROOT / "webui" / "src" / "demo" / "mockApi.ts").read_text(encoding="utf-8")
+
+        # FW6: XSS, proto guard, control-char normalization, race guard, 409 single retry, readonly zero PUT, single polling interval
+        for forbidden in ("dangerouslySetInnerHTML", "innerHTML", "<script", "WorkspaceFilePickerPopover", "worktree"):
+            self.assertNotIn(forbidden, wb_tsx)
+        self.assertIn("FORBIDDEN_PROTO_KEYS", wb_tsx)
+        self.assertIn("CTRL_CHARS_RE", wb_tsx)
+        self.assertIn("normalizeSingleLineText", wb_tsx)
+        self.assertIn("const trimmed = key.trim();", wb_tsx)
+        self.assertIn("Object.prototype.hasOwnProperty.call(wbState.readAtByConversation", wb_tsx)
+        self.assertIn("Object.prototype.hasOwnProperty.call(expandedProjectLists", wb_tsx)
+        self.assertIn("convMatchesAgent", wb_tsx)
+        self.assertIn("belongsToResolved", wb_tsx)
+        self.assertIn("flushStateSyncQueue", wb_tsx)
+        self.assertIn("mergeFedWorkbenchStates", wb_tsx)
+        self.assertIn("if (!canEdit || stateSyncInFlightRef.current) return;", wb_tsx)
+        self.assertIn("const targetAgentId = selectedAgent.agent_id;", wb_tsx)
+        self.assertIn("const targetConversationId =", wb_tsx)
+        self.assertIn("isComposingRef", wb_tsx)
+        self.assertEqual(wb_tsx.count("setInterval("), 1)
+        self.assertEqual(wb_tsx.count("clearInterval("), 1)
+
+        # FW7: API & Demo exports parity for new federation workbench state endpoints
+        for sym in ("fetchFederationWorkbenchState", "updateFederationWorkbenchState"):
+            self.assertIn(sym, api_ts)
+            self.assertIn(sym, mock_ts)
 
 
 if __name__ == "__main__":

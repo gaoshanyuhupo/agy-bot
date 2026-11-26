@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import fcntl
 import ipaddress
 import json
 import logging
@@ -33,6 +34,7 @@ import sys
 import time
 from typing import Any, Sequence
 from urllib.parse import urlsplit
+import uuid
 
 import aiohttp
 from aiohttp import web
@@ -217,8 +219,99 @@ _ALLOWED_PATCH_TEAM_KEYS = frozenset(
 )
 
 _ALLOWED_SET_LEADER_KEYS = frozenset({"leader_agent_id", "co_leaders"})
-_ALLOWED_WORKBENCH_DISPATCH_KEYS = frozenset({"prompt", "label", "timeout_s"})
+_ALLOWED_WORKBENCH_DISPATCH_KEYS = frozenset(
+    {
+        "prompt",
+        "label",
+        "timeout_s",
+        "project_id",
+        "conversation_id",
+        "conversation_title",
+        "include_context",
+    }
+)
 _ALLOWED_WORKBENCH_CANCEL_KEYS = frozenset({"reason"})
+
+# Independent Federation Workbench State Sync & Multi-Turn Context constants
+MAX_FED_WORKBENCH_STATE_BODY_BYTES = 128 * 1024  # 128 KiB
+MAX_FED_WB_CUSTOM_PROJECTS = 64
+MAX_FED_WB_CONVERSATIONS = 512
+MAX_FED_WB_PINNED_CONVS = 256
+MAX_FED_WB_ARCHIVED_CONVS = 512
+MAX_FED_WB_HIDDEN_CONVS = 512
+MAX_FED_WB_COLLAPSED_PROJECTS = 128
+MAX_FED_WB_HIDDEN_PROJECTS = 128
+MAX_FED_WB_RENAMED_PROJECTS = 128
+MAX_FED_WB_RENAMED_CONVS = 512
+MAX_FED_WB_READ_AT_ENTRIES = 512
+MAX_FED_WB_PROJECT_NAME_LEN = 64
+MAX_FED_WB_PROJECT_DESC_LEN = 240
+MAX_FED_WB_CONV_TITLE_LEN = 120
+MAX_FED_JOB_META_ENTRIES = 2000
+MAX_FED_JOB_META_BYTES = 1536 * 1024  # 1.5 MiB hard write budget (well below 2 MiB read cap)
+MAX_FED_JOB_META_DISPLAY_PROMPT_CHARS = 2048
+
+MAX_CONTEXT_TURNS = 6
+MAX_CONTEXT_TOTAL_CHARS = 3600
+MAX_CONTEXT_TURN_PROMPT_CHARS = 360
+MAX_CONTEXT_TURN_REPLY_CHARS = 480
+
+_CONTEXT_HEADER_BEGIN = "[AGY_FED_CONVERSATION_CONTEXT]"
+_CONTEXT_HEADER_END = "[/AGY_FED_CONVERSATION_CONTEXT]"
+_CURRENT_USER_PROMPT_MARKER = "[CURRENT_USER_MESSAGE]"
+
+_FED_WB_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_FED_WB_CONV_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_FED_WB_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
+_FED_WB_RESERVED_CUSTOM_PROJECT_IDS = frozenset(
+    {"default", "__external_history__", "__tmp_projects__", "__unassigned__", "__other__"}
+)
+_FED_WB_BUILTIN_PROJECT_IDS = frozenset({"default", "__external_history__"})
+_FED_WB_FORBIDDEN_PROTO_KEYS = frozenset({"__proto__", "prototype", "constructor"})
+_FED_WB_FORBIDDEN_PATH_KEYS = frozenset(
+    {
+        "workdir",
+        "path",
+        "cwd",
+        "filepath",
+        "file_path",
+        "dir",
+        "directory",
+        "folder_uri",
+        "folderuri",
+        "root",
+    }
+)
+_ALLOWED_FED_WB_STATE_TOP_KEYS = frozenset({"expected_version", "state"})
+_ALLOWED_FED_WB_STATE_KEYS = frozenset(
+    {
+        "customProjects",
+        "conversations",
+        "pinnedConversationIds",
+        "archivedConversationIds",
+        "hiddenConversationIds",
+        "collapsedProjectIds",
+        "hiddenProjectIds",
+        "renamedProjects",
+        "renamedConversations",
+        "readAtByConversation",
+        "uiPrefs",
+    }
+)
+_ALLOWED_FED_WB_PROJECT_KEYS = frozenset({"id", "name", "description", "createdAt"})
+_ALLOWED_FED_WB_CONV_KEYS = frozenset({"id", "agentId", "projectId", "title", "createdAt", "updatedAt"})
+_ALLOWED_FED_WB_UI_PREFS_KEYS = frozenset(
+    {
+        "sidebarCollapsed",
+        "showArchived",
+        "onlyPinned",
+        "onlyUnread",
+        "telemetryOpen",
+        "selectedAgentId",
+        "selectedProjectId",
+        "selectedConversationId",
+    }
+)
 
 THREE_HARD_LOCKS_SUMMARY: list[dict[str, str]] = [
     {
@@ -1018,8 +1111,9 @@ def _merge_single_timeline_job(
     *,
     is_admin: bool,
     now_ts: float,
+    job_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Merge and deeply redact a single job across PullWorkerQueue and bot_bus."""
+    """Merge and deeply redact a single job across PullWorkerQueue, bot_bus, and job_meta sidecar."""
     p_st = str((pull_job or {}).get("status") or "").strip().lower()
     b_st = str((bus_job or {}).get("status") or "").strip().lower()
     if b_st == "failed":
@@ -1072,8 +1166,37 @@ def _merge_single_timeline_job(
     secondary = bus_job if win_src == "pull" else pull_job
 
     p_meta = (pull_job or {}).get("metadata") if isinstance((pull_job or {}).get("metadata"), dict) else {}
+    j_meta = job_meta if isinstance(job_meta, dict) else {}
 
     prompt = str((pull_job or {}).get("prompt") or (bus_job or {}).get("prompt") or "")
+    j_display_prompt = (
+        ""
+        if j_meta.get("display_prompt_truncated")
+        else str(j_meta.get("display_prompt") or "").strip()
+    )
+    raw_display_prompt = str(
+        j_display_prompt
+        or p_meta.get("display_prompt")
+        or ""
+    ).strip()
+    if not raw_display_prompt:
+        raw_display_prompt = _strip_context_wrapper(prompt)
+
+    project_id = str(j_meta.get("project_id") or p_meta.get("project_id") or "").strip()[:64]
+    conversation_id = str(j_meta.get("conversation_id") or p_meta.get("conversation_id") or "").strip()[:128]
+    conversation_title = str(
+        j_meta.get("conversation_title") or p_meta.get("conversation_title") or ""
+    ).strip()[:120]
+
+    raw_ctx_turns = j_meta.get("context_turns")
+    if not isinstance(raw_ctx_turns, int) or isinstance(raw_ctx_turns, bool):
+        raw_ctx_turns = p_meta.get("context_turns")
+    context_turns = (
+        max(0, min(MAX_CONTEXT_TURNS, raw_ctx_turns))
+        if isinstance(raw_ctx_turns, int) and not isinstance(raw_ctx_turns, bool)
+        else 0
+    )
+
     result_text = str(
         (primary or {}).get("result_text")
         or (primary or {}).get("result")
@@ -1128,6 +1251,11 @@ def _merge_single_timeline_job(
         "from_actor": from_actor[:80],
         "team_id": team_id[:64],
         "group_id": group_id[:64],
+        "project_id": project_id,
+        "conversation_id": conversation_id,
+        "conversation_title": conversation_title,
+        "display_prompt": raw_display_prompt,
+        "context_turns": context_turns,
         "prompt": prompt,
         "result_text": result_text,
         "error": error_text,
@@ -1317,6 +1445,965 @@ def _read_federation_audit_no_symlink(
     )
 
 
+def _strip_context_wrapper(raw_prompt: str) -> str:
+    """Strip genuine leading `[AGY_FED_CONVERSATION_CONTEXT]...[/AGY_FED_CONVERSATION_CONTEXT]\\n[CURRENT_USER_MESSAGE]` blocks only.
+
+    Literal mentions of these markers inside normal user content are preserved verbatim.
+    """
+    text = str(raw_prompt or "").strip()
+    for _ in range(4):
+        if not text.startswith(_CONTEXT_HEADER_BEGIN):
+            break
+        end_idx = text.find(_CONTEXT_HEADER_END, len(_CONTEXT_HEADER_BEGIN))
+        if end_idx < 0:
+            break
+        after_end = text[end_idx + len(_CONTEXT_HEADER_END) :].lstrip(" \t\r\n")
+        if not after_end.startswith(_CURRENT_USER_PROMPT_MARKER):
+            break
+        rest = after_end[len(_CURRENT_USER_PROMPT_MARKER) :].lstrip(" \t\r\n")
+        if not rest:
+            break
+        text = rest
+    return text
+
+
+def _sanitize_pull_meta_string(val: str, *, max_len: int | None = None) -> str:
+    """Sanitize a string for PullWorkerQueue metadata so `reject_plaintext_secrets` never false-triggers."""
+    s = str(_sanitize_public_value(str(val or ""), scrub_host_paths=True) or "")
+    # `federation_registry._PLAINTEXT_SECRET_VALUE_RES` matches leading `Bearer <non-space>`
+    # even when the token became `[REDACTED]`, so collapse `Bearer/Basic [REDACTED]` cleanly.
+    s = re.sub(r"(?i)^\s*(?:bearer|basic)\s+\S+", "[REDACTED]", s)
+    s = re.sub(r"(?i)\b(?:bearer|basic)\s+\[REDACTED\]", "[REDACTED]", s)
+    for _rule, pat in federation_registry._PLAINTEXT_SECRET_VALUE_RES:
+        if pat.search(s):
+            s = pat.sub("[REDACTED]", s)
+    s = s.strip()
+    if max_len is not None and len(s) > max_len:
+        s = s[:max_len]
+    return s
+
+
+def _build_conversation_context_block(done_turns: list[dict[str, Any]]) -> tuple[str, int]:
+    """Build a bounded (`<= 6` turns, `<= 3600` chars), secret/host-path scrubbed context prefix."""
+    if not done_turns:
+        return "", 0
+    ordered = sorted(
+        done_turns,
+        key=lambda it: (float(it.get("created_at") or 0.0), str(it.get("job_id") or "")),
+    )
+    recent = ordered[-MAX_CONTEXT_TURNS:]
+
+    header = f"{_CONTEXT_HEADER_BEGIN}\n以下是当前外部节点同一对话的最近历史轮次摘要（仅作上下文参考）：\n"
+    footer = f"\n{_CONTEXT_HEADER_END}\n{_CURRENT_USER_PROMPT_MARKER}"
+    budget = MAX_CONTEXT_TOTAL_CHARS - len(header) - len(footer)
+    if budget <= 64:
+        return "", 0
+
+    formatted_entries: list[str] = []
+    for item in recent:
+        raw_user = str(item.get("display_prompt") or "").strip()
+        if not raw_user:
+            raw_user = _strip_context_wrapper(str(item.get("prompt") or ""))
+        u_clean = str(_sanitize_public_value(raw_user, scrub_host_paths=True) or "").strip()
+        u_clean = u_clean.replace(_CONTEXT_HEADER_BEGIN, "").replace(_CONTEXT_HEADER_END, "").replace(_CURRENT_USER_PROMPT_MARKER, "").strip()
+        if len(u_clean) > MAX_CONTEXT_TURN_PROMPT_CHARS:
+            u_clean = u_clean[: MAX_CONTEXT_TURN_PROMPT_CHARS - 3].rstrip() + "..."
+
+        a_clean = str(_sanitize_public_value(str(item.get("result_text") or ""), scrub_host_paths=True) or "").strip()
+        a_clean = a_clean.replace(_CONTEXT_HEADER_BEGIN, "").replace(_CONTEXT_HEADER_END, "").replace(_CURRENT_USER_PROMPT_MARKER, "").strip()
+        if len(a_clean) > MAX_CONTEXT_TURN_REPLY_CHARS:
+            a_clean = a_clean[: MAX_CONTEXT_TURN_REPLY_CHARS - 3].rstrip() + "..."
+
+        if not u_clean and not a_clean:
+            continue
+        formatted_entries.append(f"User: {u_clean or '(empty)'}\nAssistant: {a_clean or '(no reply)'}")
+
+    if not formatted_entries:
+        return "", 0
+
+    sep = "\n---\n"
+    chosen_rev: list[str] = []
+    used = 0
+    for entry in reversed(formatted_entries):
+        add_len = len(entry) + (len(sep) if chosen_rev else 0)
+        if used + add_len <= budget:
+            chosen_rev.append(entry)
+            used += add_len
+        elif not chosen_rev:
+            clipped = entry[: max(1, budget - 3)].rstrip() + "..."
+            chosen_rev.append(clipped)
+            used = len(clipped)
+            break
+        else:
+            break
+
+    chosen = list(reversed(chosen_rev))
+    body = sep.join(chosen)
+    block = f"{header}{body}{footer}"
+    block = str(_sanitize_public_value(block, scrub_host_paths=True) or "")
+    if len(block) > MAX_CONTEXT_TOTAL_CHARS:
+        max_body = MAX_CONTEXT_TOTAL_CHARS - len(header) - len(footer) - 3
+        block = f"{header}{body[: max(0, max_body)]}...{footer}"
+    return block, len(chosen)
+
+
+def empty_federation_workbench_state() -> dict[str, Any]:
+    return {
+        "customProjects": [],
+        "conversations": [],
+        "pinnedConversationIds": [],
+        "archivedConversationIds": [],
+        "hiddenConversationIds": [],
+        "collapsedProjectIds": [],
+        "hiddenProjectIds": [],
+        "renamedProjects": {},
+        "renamedConversations": {},
+        "readAtByConversation": {},
+        "uiPrefs": {
+            "sidebarCollapsed": False,
+            "showArchived": False,
+            "onlyPinned": False,
+            "onlyUnread": False,
+            "telemetryOpen": True,
+            "selectedAgentId": "",
+            "selectedProjectId": "",
+            "selectedConversationId": "",
+        },
+    }
+
+
+def _find_proto_key_recursive(obj: Any, *, depth: int = 0) -> str | None:
+    if depth > 12:
+        return "max_depth_exceeded"
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            ks = str(k)
+            if ks in _FED_WB_FORBIDDEN_PROTO_KEYS or ks.strip().lower() in _FED_WB_FORBIDDEN_PROTO_KEYS:
+                return ks
+            found = _find_proto_key_recursive(v, depth=depth + 1)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = _find_proto_key_recursive(item, depth=depth + 1)
+            if found is not None:
+                return found
+    return None
+
+
+def _find_forbidden_path_key_recursive(obj: Any, *, depth: int = 0) -> str | None:
+    if depth > 12:
+        return "max_depth_exceeded"
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            ks = str(k)
+            kl = ks.strip().lower()
+            kn = kl.replace("-", "_")
+            if kl in _FED_WB_FORBIDDEN_PATH_KEYS or kn in _FED_WB_FORBIDDEN_PATH_KEYS:
+                return ks
+            found = _find_forbidden_path_key_recursive(v, depth=depth + 1)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = _find_forbidden_path_key_recursive(item, depth=depth + 1)
+            if found is not None:
+                return found
+    return None
+
+
+def _validate_fed_wb_project_id(raw: Any, *, allow_builtin: bool = True) -> tuple[bool, str]:
+    if type(raw) is not str:
+        return False, ""
+    pid = raw.strip()
+    if (
+        not pid
+        or pid.lower() in _FED_WB_FORBIDDEN_PROTO_KEYS
+        or ".." in pid
+        or "/" in pid
+        or "\\" in pid
+        or _FED_WB_CTRL_RE.search(pid)
+    ):
+        return False, ""
+    if allow_builtin and pid in _FED_WB_BUILTIN_PROJECT_IDS:
+        return True, pid
+    if not allow_builtin and pid in _FED_WB_RESERVED_CUSTOM_PROJECT_IDS:
+        return False, ""
+    if not _FED_WB_SLUG_RE.fullmatch(pid):
+        return False, ""
+    return True, pid
+
+
+def _validate_fed_wb_conv_id(raw: Any) -> tuple[bool, str]:
+    if type(raw) is not str:
+        return False, ""
+    cid = raw.strip()
+    if (
+        not cid
+        or cid.lower() in _FED_WB_FORBIDDEN_PROTO_KEYS
+        or ".." in cid
+        or "/" in cid
+        or "\\" in cid
+        or _FED_WB_CTRL_RE.search(cid)
+    ):
+        return False, ""
+    if not _FED_WB_CONV_ID_RE.fullmatch(cid):
+        return False, ""
+    return True, cid
+
+
+def validate_federation_workbench_state(raw: Any) -> tuple[bool, dict[str, Any], str]:
+    """Strictly validate & canonicalize `FederationWorkbenchState`."""
+    if not isinstance(raw, dict):
+        return False, {}, "state 必须为 JSON 对象"
+
+    bad_proto = _find_proto_key_recursive(raw)
+    if bad_proto is not None:
+        return False, {}, f"禁止传入非法原型键：{bad_proto}"
+
+    bad_path = _find_forbidden_path_key_recursive(raw)
+    if bad_path is not None:
+        return False, {}, f"联邦工作台状态禁止携带宿主机路径字段：{bad_path}"
+
+    for key in raw.keys():
+        ks = str(key)
+        if ks not in _ALLOWED_FED_WB_STATE_KEYS:
+            return False, {}, f"联邦工作台状态包含未允许的字段：{ks[:48]}"
+
+    out = empty_federation_workbench_state()
+
+    # 1. customProjects
+    if "customProjects" in raw:
+        cp_raw = raw["customProjects"]
+        if not isinstance(cp_raw, list):
+            return False, {}, "customProjects 必须为数组"
+        if len(cp_raw) > MAX_FED_WB_CUSTOM_PROJECTS:
+            return False, {}, f"customProjects 数量超过上限（最多 {MAX_FED_WB_CUSTOM_PROJECTS} 项）"
+        seen_ids: set[str] = set()
+        clean_cp: list[dict[str, Any]] = []
+        for idx, item in enumerate(cp_raw):
+            if not isinstance(item, dict):
+                return False, {}, f"customProjects[{idx}] 必须为对象"
+            for ik in item.keys():
+                iks = str(ik)
+                if iks not in _ALLOWED_FED_WB_PROJECT_KEYS:
+                    return False, {}, f"customProjects[{idx}] 包含未允许字段：{iks[:48]}"
+            ok_pid, pid = _validate_fed_wb_project_id(item.get("id"), allow_builtin=False)
+            if not ok_pid:
+                return False, {}, f"customProjects[{idx}].id 格式非法"
+            if pid.lower() in seen_ids:
+                return False, {}, f"customProjects 存在重复项目 ID：{pid}"
+            seen_ids.add(pid.lower())
+
+            pname_raw = item.get("name")
+            if type(pname_raw) is not str:
+                return False, {}, f"customProjects[{idx}].name 必须为字符串"
+            pname = pname_raw.strip()
+            if not pname or len(pname) > MAX_FED_WB_PROJECT_NAME_LEN or _FED_WB_CTRL_RE.search(pname):
+                return False, {}, f"customProjects[{idx}].name 为空、超长或含控制字符"
+
+            entry: dict[str, Any] = {"id": pid, "name": pname}
+            if "description" in item and item["description"] is not None:
+                desc_raw = item["description"]
+                if type(desc_raw) is not str:
+                    return False, {}, f"customProjects[{idx}].description 必须为字符串"
+                desc = desc_raw.strip()
+                if len(desc) > MAX_FED_WB_PROJECT_DESC_LEN or _FED_WB_CTRL_RE.search(desc):
+                    return False, {}, f"customProjects[{idx}].description 超长或含控制字符"
+                if desc:
+                    entry["description"] = desc
+            if "createdAt" in item and item["createdAt"] is not None:
+                cat = item["createdAt"]
+                if isinstance(cat, bool) or not isinstance(cat, (int, float)) or not math.isfinite(cat) or cat <= 0:
+                    return False, {}, f"customProjects[{idx}].createdAt 必须为正数时间戳"
+                entry["createdAt"] = int(cat) if isinstance(cat, int) else float(cat)
+            clean_cp.append(entry)
+        out["customProjects"] = clean_cp
+
+    # 2. conversations
+    if "conversations" in raw:
+        cv_raw = raw["conversations"]
+        if not isinstance(cv_raw, list):
+            return False, {}, "conversations 必须为数组"
+        if len(cv_raw) > MAX_FED_WB_CONVERSATIONS:
+            return False, {}, f"conversations 数量超过上限（最多 {MAX_FED_WB_CONVERSATIONS} 项）"
+        seen_cids: set[str] = set()
+        clean_cvs: list[dict[str, Any]] = []
+        for idx, item in enumerate(cv_raw):
+            if not isinstance(item, dict):
+                return False, {}, f"conversations[{idx}] 必须为对象"
+            for ik in item.keys():
+                iks = str(ik)
+                if iks not in _ALLOWED_FED_WB_CONV_KEYS:
+                    return False, {}, f"conversations[{idx}] 包含未允许字段：{iks[:48]}"
+            ok_cid, cid = _validate_fed_wb_conv_id(item.get("id"))
+            if not ok_cid:
+                return False, {}, f"conversations[{idx}].id 格式非法"
+            if cid in seen_cids:
+                return False, {}, f"conversations 存在重复对话 ID：{cid}"
+            seen_cids.add(cid)
+
+            raw_aid = item.get("agentId")
+            if type(raw_aid) is not str:
+                return False, {}, f"conversations[{idx}].agentId 格式非法"
+            aid = raw_aid.strip()
+            if (
+                not aid
+                or aid.lower() in _FED_WB_FORBIDDEN_PROTO_KEYS
+                or ".." in aid
+                or "/" in aid
+                or "\\" in aid
+                or _FED_WB_CTRL_RE.search(raw_aid)
+                or not _FED_WB_SLUG_RE.fullmatch(aid)
+            ):
+                return False, {}, f"conversations[{idx}].agentId 格式非法"
+
+            ok_pid, pid = _validate_fed_wb_project_id(item.get("projectId"), allow_builtin=True)
+            if not ok_pid or pid == "__external_history__":
+                return False, {}, f"conversations[{idx}].projectId 格式非法"
+
+            title_raw = item.get("title")
+            if type(title_raw) is not str:
+                return False, {}, f"conversations[{idx}].title 必须为字符串"
+            title = title_raw.strip()
+            if not title or len(title) > MAX_FED_WB_CONV_TITLE_LEN or _FED_WB_CTRL_RE.search(title):
+                return False, {}, f"conversations[{idx}].title 为空、超长或含控制字符"
+
+            centry: dict[str, Any] = {
+                "id": cid,
+                "agentId": aid,
+                "projectId": pid,
+                "title": title,
+            }
+            for ts_key in ("createdAt", "updatedAt"):
+                if ts_key in item and item[ts_key] is not None:
+                    tv = item[ts_key]
+                    if isinstance(tv, bool) or not isinstance(tv, (int, float)) or not math.isfinite(tv) or tv <= 0:
+                        return False, {}, f"conversations[{idx}].{ts_key} 必须为正数时间戳"
+                    centry[ts_key] = int(tv) if isinstance(tv, int) else float(tv)
+            clean_cvs.append(centry)
+        out["conversations"] = clean_cvs
+
+    # 3-5. Conversation ID arrays
+    for field_name, cap in (
+        ("pinnedConversationIds", MAX_FED_WB_PINNED_CONVS),
+        ("archivedConversationIds", MAX_FED_WB_ARCHIVED_CONVS),
+        ("hiddenConversationIds", MAX_FED_WB_HIDDEN_CONVS),
+    ):
+        if field_name not in raw:
+            continue
+        arr_raw = raw[field_name]
+        if not isinstance(arr_raw, list):
+            return False, {}, f"{field_name} 必须为数组"
+        if len(arr_raw) > cap:
+            return False, {}, f"{field_name} 数量超过上限（最多 {cap} 项）"
+        clean_arr: list[str] = []
+        seen_arr: set[str] = set()
+        for item in arr_raw:
+            ok_cid, cid = _validate_fed_wb_conv_id(item)
+            if not ok_cid:
+                return False, {}, f"{field_name} 包含非法对话 ID"
+            if cid not in seen_arr:
+                seen_arr.add(cid)
+                clean_arr.append(cid)
+        out[field_name] = clean_arr
+
+    # 6-7. Project ID arrays
+    for field_name, cap in (
+        ("collapsedProjectIds", MAX_FED_WB_COLLAPSED_PROJECTS),
+        ("hiddenProjectIds", MAX_FED_WB_HIDDEN_PROJECTS),
+    ):
+        if field_name not in raw:
+            continue
+        arr_raw = raw[field_name]
+        if not isinstance(arr_raw, list):
+            return False, {}, f"{field_name} 必须为数组"
+        if len(arr_raw) > cap:
+            return False, {}, f"{field_name} 数量超过上限（最多 {cap} 项）"
+        clean_arr = []
+        seen_arr = set()
+        for item in arr_raw:
+            ok_pid, pid = _validate_fed_wb_project_id(item, allow_builtin=True)
+            if not ok_pid:
+                return False, {}, f"{field_name} 包含非法项目 ID"
+            if pid not in seen_arr:
+                seen_arr.add(pid)
+                clean_arr.append(pid)
+        out[field_name] = clean_arr
+
+    # 8. renamedProjects
+    if "renamedProjects" in raw:
+        rp_raw = raw["renamedProjects"]
+        if not isinstance(rp_raw, dict):
+            return False, {}, "renamedProjects 必须为对象"
+        if len(rp_raw) > MAX_FED_WB_RENAMED_PROJECTS:
+            return False, {}, f"renamedProjects 超过上限（最多 {MAX_FED_WB_RENAMED_PROJECTS} 项）"
+        clean_rp: dict[str, str] = {}
+        for k, v in rp_raw.items():
+            ok_pid, pid = _validate_fed_wb_project_id(k, allow_builtin=True)
+            if not ok_pid:
+                return False, {}, "renamedProjects 包含非法项目 ID 键"
+            if type(v) is not str:
+                return False, {}, "renamedProjects 值必须为字符串"
+            cv = v.strip()
+            if not cv or len(cv) > MAX_FED_WB_PROJECT_NAME_LEN or _FED_WB_CTRL_RE.search(cv):
+                return False, {}, "renamedProjects 名称不能为空、超长或含控制字符"
+            clean_rp[pid] = cv
+        out["renamedProjects"] = clean_rp
+
+    # 9. renamedConversations
+    if "renamedConversations" in raw:
+        rc_raw = raw["renamedConversations"]
+        if not isinstance(rc_raw, dict):
+            return False, {}, "renamedConversations 必须为对象"
+        if len(rc_raw) > MAX_FED_WB_RENAMED_CONVS:
+            return False, {}, f"renamedConversations 超过上限（最多 {MAX_FED_WB_RENAMED_CONVS} 项）"
+        clean_rc: dict[str, str] = {}
+        for k, v in rc_raw.items():
+            ok_cid, cid = _validate_fed_wb_conv_id(k)
+            if not ok_cid:
+                return False, {}, "renamedConversations 包含非法对话 ID 键"
+            if type(v) is not str:
+                return False, {}, "renamedConversations 值必须为字符串"
+            cv = v.strip()
+            if not cv or len(cv) > MAX_FED_WB_CONV_TITLE_LEN or _FED_WB_CTRL_RE.search(cv):
+                return False, {}, "renamedConversations 标题不能为空、超长或含控制字符"
+            clean_rc[cid] = cv
+        out["renamedConversations"] = clean_rc
+
+    # 10. readAtByConversation
+    if "readAtByConversation" in raw:
+        ra_raw = raw["readAtByConversation"]
+        if not isinstance(ra_raw, dict):
+            return False, {}, "readAtByConversation 必须为对象"
+        if len(ra_raw) > MAX_FED_WB_READ_AT_ENTRIES:
+            return False, {}, f"readAtByConversation 超过上限（最多 {MAX_FED_WB_READ_AT_ENTRIES} 项）"
+        clean_ra: dict[str, float | int] = {}
+        for k, v in ra_raw.items():
+            ok_cid, cid = _validate_fed_wb_conv_id(k)
+            if not ok_cid:
+                return False, {}, "readAtByConversation 包含非法对话 ID 键"
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0:
+                return False, {}, "readAtByConversation 时间戳必须为非负数值"
+            clean_ra[cid] = int(v) if isinstance(v, int) else float(v)
+        out["readAtByConversation"] = clean_ra
+
+    # 11. uiPrefs
+    if "uiPrefs" in raw:
+        up_raw = raw["uiPrefs"]
+        if not isinstance(up_raw, dict):
+            return False, {}, "uiPrefs 必须为对象"
+        for uk in up_raw.keys():
+            uks = str(uk)
+            if uks not in _ALLOWED_FED_WB_UI_PREFS_KEYS:
+                return False, {}, f"uiPrefs 包含未允许字段：{uks[:48]}"
+        clean_up = dict(out["uiPrefs"])
+        for bk in ("sidebarCollapsed", "showArchived", "onlyPinned", "onlyUnread", "telemetryOpen"):
+            if bk in up_raw:
+                if not isinstance(up_raw[bk], bool):
+                    return False, {}, f"uiPrefs.{bk} 必须为严格布尔值"
+                clean_up[bk] = up_raw[bk]
+        if "selectedAgentId" in up_raw:
+            sv = up_raw["selectedAgentId"]
+            if type(sv) is not str:
+                return False, {}, "uiPrefs.selectedAgentId 必须为字符串"
+            svs = sv.strip()
+            if svs:
+                if (
+                    svs.lower() in _FED_WB_FORBIDDEN_PROTO_KEYS
+                    or ".." in svs
+                    or "/" in svs
+                    or "\\" in svs
+                    or _FED_WB_CTRL_RE.search(sv)
+                    or not _FED_WB_SLUG_RE.fullmatch(svs)
+                ):
+                    return False, {}, "uiPrefs.selectedAgentId 格式非法"
+                clean_up["selectedAgentId"] = svs
+            else:
+                clean_up["selectedAgentId"] = ""
+        if "selectedProjectId" in up_raw:
+            sv = up_raw["selectedProjectId"]
+            if type(sv) is not str:
+                return False, {}, "uiPrefs.selectedProjectId 必须为字符串"
+            svs = sv.strip()
+            if svs:
+                ok_pid, pid = _validate_fed_wb_project_id(svs, allow_builtin=True)
+                if not ok_pid:
+                    return False, {}, "uiPrefs.selectedProjectId 格式非法"
+                clean_up["selectedProjectId"] = pid
+            else:
+                clean_up["selectedProjectId"] = ""
+        if "selectedConversationId" in up_raw:
+            sv = up_raw["selectedConversationId"]
+            if type(sv) is not str:
+                return False, {}, "uiPrefs.selectedConversationId 必须为字符串"
+            svs = sv.strip()
+            if svs:
+                ok_cid, cid = _validate_fed_wb_conv_id(svs)
+                if not ok_cid:
+                    return False, {}, "uiPrefs.selectedConversationId 格式非法"
+                clean_up["selectedConversationId"] = cid
+            else:
+                clean_up["selectedConversationId"] = ""
+        out["uiPrefs"] = clean_up
+
+    return True, out, ""
+
+
+def _sanitize_stored_fed_wb_doc(raw: dict[str, Any] | None) -> tuple[int, int | None, dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return 0, None, empty_federation_workbench_state()
+    raw_ver = raw.get("version", 0)
+    version = raw_ver if isinstance(raw_ver, int) and not isinstance(raw_ver, bool) and raw_ver >= 0 else 0
+    raw_upd = raw.get("updated_at")
+    updated_at = raw_upd if isinstance(raw_upd, int) and not isinstance(raw_upd, bool) and raw_upd > 0 else None
+    raw_state = raw.get("state")
+    ok, clean_state, _ = validate_federation_workbench_state(raw_state if isinstance(raw_state, dict) else {})
+    if not ok:
+        clean_state = empty_federation_workbench_state()
+    return version, updated_at, clean_state
+
+
+def _open_parent_dir_no_symlink_abs(
+    target_path: Path,
+    *,
+    create: bool,
+) -> tuple[bool, int | None, str]:
+    """Walk every component of `target_path.parent` using `O_DIRECTORY | O_NOFOLLOW`.
+
+    - Never resolves symlinks via `Path.resolve()`.
+    - When `create=False` and any parent dir does not exist, returns `(True, None, "")` with zero disk creation.
+    - When any existing component is a symlink or non-directory, fails closed with `SECURITY_SYMLINK_REJECTED`.
+    - When `create=True`, creates missing parent dirs with `0700` and ensures the immediate parent is `0700`.
+    """
+    abs_target = Path(os.path.abspath(str(target_path)))
+    parent = abs_target.parent
+    anchor = parent.anchor or "/"
+    rel_parts = parent.parts[1:] if parent.parts and parent.parts[0] == anchor else parent.parts
+
+    try:
+        cur_fd = os.open(anchor, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError:
+        return False, None, "SECURITY_SYMLINK_REJECTED: unable to open root directory safely"
+
+    try:
+        for idx, part in enumerate(rel_parts):
+            if not part or part in (".", "..") or "/" in part or "\\" in part or "\x00" in part:
+                os.close(cur_fd)
+                return False, None, f"SECURITY_SYMLINK_REJECTED: invalid directory component {part!r}"
+            is_last = idx == len(rel_parts) - 1
+            created_this = False
+            try:
+                st = os.lstat(part, dir_fd=cur_fd)
+            except FileNotFoundError:
+                if not create:
+                    os.close(cur_fd)
+                    return True, None, ""
+                try:
+                    os.mkdir(part, 0o700, dir_fd=cur_fd)
+                    created_this = True
+                except FileExistsError:
+                    pass
+                except OSError:
+                    os.close(cur_fd)
+                    return False, None, f"SECURITY_SYMLINK_REJECTED: unable to create directory {part!r}"
+                try:
+                    st = os.lstat(part, dir_fd=cur_fd)
+                except OSError:
+                    os.close(cur_fd)
+                    return False, None, f"SECURITY_SYMLINK_REJECTED: unable to inspect {part!r}"
+            except OSError:
+                os.close(cur_fd)
+                return False, None, f"SECURITY_SYMLINK_REJECTED: unable to inspect {part!r}"
+
+            if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+                os.close(cur_fd)
+                return False, None, f"SECURITY_SYMLINK_REJECTED: {part!r} is a symlink or non-directory"
+
+            try:
+                next_fd = os.open(part, _DIR_OPEN_FLAGS, dir_fd=cur_fd)
+            except FileNotFoundError:
+                os.close(cur_fd)
+                return True, None, ""
+            except OSError:
+                os.close(cur_fd)
+                return False, None, f"SECURITY_SYMLINK_REJECTED: refused to open {part!r} safely"
+
+            os.close(cur_fd)
+            cur_fd = next_fd
+            fst = os.fstat(cur_fd)
+            if not stat.S_ISDIR(fst.st_mode):
+                os.close(cur_fd)
+                return False, None, f"SECURITY_SYMLINK_REJECTED: {part!r} is not a directory"
+            if create and (created_this or is_last):
+                try:
+                    os.fchmod(cur_fd, 0o700)
+                except OSError:
+                    pass
+        return True, cur_fd, ""
+    except Exception:
+        try:
+            os.close(cur_fd)
+        except OSError:
+            pass
+        return False, None, "SECURITY_SYMLINK_REJECTED: parent directory traversal failed"
+
+
+def _read_json_file_abs_safe(
+    target_path: Path,
+    *,
+    max_bytes: int = MAX_WORKBENCH_JSON_BYTES,
+) -> tuple[bool, dict[str, Any] | None, str]:
+    """Fail-closed anti-symlink / anti-FIFO reader for an arbitrary absolute JSON file (zero disk side effects)."""
+    fname = target_path.name
+    if not fname or fname in (".", "..") or "/" in fname or "\\" in fname or "\x00" in fname:
+        return False, None, f"SECURITY_SYMLINK_REJECTED: invalid filename {fname!r}"
+
+    ok_dir, dir_fd, dir_err = _open_parent_dir_no_symlink_abs(target_path, create=False)
+    if not ok_dir:
+        return False, None, dir_err
+    if dir_fd is None:
+        return True, None, ""
+
+    try:
+        lock_name = f".{fname}.lock"
+        try:
+            lst = os.lstat(lock_name, dir_fd=dir_fd)
+        except FileNotFoundError:
+            lst = None
+        except OSError:
+            return False, None, f"SECURITY_SYMLINK_REJECTED: unable to inspect {lock_name!r}"
+        if lst is not None and (stat.S_ISLNK(lst.st_mode) or not stat.S_ISREG(lst.st_mode)):
+            return False, None, f"SECURITY_SYMLINK_REJECTED: {lock_name!r} is a symlink or non-regular file"
+
+        return _read_json_file_in_dirfd(dir_fd, fname, max_bytes=max_bytes)
+    finally:
+        os.close(dir_fd)
+
+
+def _assert_abs_file_safe_for_write(target_path: Path) -> tuple[bool, str]:
+    """Verify existing parent chain, target file, and lock file are not symlinks/FIFOs (zero disk creation)."""
+    fname = target_path.name
+    if not fname or fname in (".", "..") or "/" in fname or "\\" in fname or "\x00" in fname:
+        return False, f"SECURITY_SYMLINK_REJECTED: invalid filename {fname!r}"
+
+    ok_dir, dir_fd, dir_err = _open_parent_dir_no_symlink_abs(target_path, create=False)
+    if not ok_dir:
+        return False, dir_err
+    if dir_fd is None:
+        return True, ""
+
+    try:
+        for check_name in (fname, f".{fname}.lock"):
+            try:
+                st = os.lstat(check_name, dir_fd=dir_fd)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return False, f"SECURITY_SYMLINK_REJECTED: unable to inspect {check_name!r}"
+            if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+                return False, f"SECURITY_SYMLINK_REJECTED: {check_name!r} is a symlink or non-regular file"
+        return True, ""
+    finally:
+        os.close(dir_fd)
+
+
+def _open_lock_in_dirfd_safe(dir_fd: int, lock_name: str) -> tuple[bool, int | None, str]:
+    """Open and fchmod(0600) a lock file inside `dir_fd` rejecting symlinks and FIFOs immediately."""
+    try:
+        st = os.lstat(lock_name, dir_fd=dir_fd)
+    except FileNotFoundError:
+        st = None
+    except OSError:
+        return False, None, f"SECURITY_SYMLINK_REJECTED: unable to inspect {lock_name!r}"
+    if st is not None and (stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode)):
+        return False, None, f"SECURITY_SYMLINK_REJECTED: {lock_name!r} is a symlink or non-regular file"
+
+    lock_flags = (
+        os.O_CREAT
+        | os.O_RDWR
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        lock_fd = os.open(lock_name, lock_flags, 0o600, dir_fd=dir_fd)
+    except OSError:
+        return False, None, f"SECURITY_SYMLINK_REJECTED: refused to open {lock_name!r} safely"
+
+    try:
+        fst = os.fstat(lock_fd)
+        if not stat.S_ISREG(fst.st_mode):
+            os.close(lock_fd)
+            return False, None, f"SECURITY_SYMLINK_REJECTED: {lock_name!r} is not a regular file"
+        try:
+            os.fchmod(lock_fd, 0o600)
+        except OSError:
+            pass
+        return True, lock_fd, ""
+    except OSError:
+        try:
+            os.close(lock_fd)
+        except OSError:
+            pass
+        return False, None, f"SECURITY_SYMLINK_REJECTED: unable to stat {lock_name!r}"
+
+
+def _write_bytes_atomic_in_dirfd(dir_fd: int, target_name: str, data: bytes) -> tuple[bool, str]:
+    """Atomically write `data` to `target_name` inside pinned `dir_fd` (`0600`, `O_CREAT|O_EXCL|O_NOFOLLOW`, `fsync`, `replace`)."""
+    try:
+        st = os.lstat(target_name, dir_fd=dir_fd)
+    except FileNotFoundError:
+        st = None
+    except OSError:
+        return False, f"SECURITY_SYMLINK_REJECTED: unable to inspect {target_name!r}"
+    if st is not None and (stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode)):
+        return False, f"SECURITY_SYMLINK_REJECTED: {target_name!r} is a symlink or non-regular file"
+
+    tmp_name = f".{target_name}.tmp.{os.getpid()}.{uuid.uuid4().hex[:10]}"
+    tmp_flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        tmp_fd = os.open(tmp_name, tmp_flags, 0o600, dir_fd=dir_fd)
+    except OSError:
+        return False, f"SECURITY_SYMLINK_REJECTED: refused to create temp file for {target_name!r}"
+
+    try:
+        os.fchmod(tmp_fd, 0o600)
+        view = memoryview(data)
+        written = 0
+        while written < len(view):
+            n = os.write(tmp_fd, view[written:])
+            if n <= 0:
+                raise OSError("short write")
+            written += n
+        os.fsync(tmp_fd)
+    except OSError:
+        try:
+            os.close(tmp_fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(tmp_name, dir_fd=dir_fd)
+        except OSError:
+            pass
+        return False, "写入临时文件失败"
+    os.close(tmp_fd)
+
+    try:
+        os.replace(tmp_name, target_name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    except OSError:
+        try:
+            os.unlink(tmp_name, dir_fd=dir_fd)
+        except OSError:
+            pass
+        return False, "原子替换目标文件失败"
+
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+    return True, ""
+
+
+def _save_fed_wb_state_atomic(
+    target_path: Path,
+    new_state: dict[str, Any],
+    *,
+    expected_version: int | None,
+) -> tuple[bool, int, dict[str, Any], str]:
+    """Persist `FederationWorkbenchState` atomically with `flock`, `O_NOFOLLOW`, `O_NONBLOCK`, and optimistic lock."""
+    fname = target_path.name
+    lock_name = f".{fname}.lock"
+    ok_dir, dir_fd, dir_err = _open_parent_dir_no_symlink_abs(target_path, create=True)
+    if not ok_dir or dir_fd is None:
+        return False, 403, {}, dir_err or "SECURITY_SYMLINK_REJECTED: parent directory rejected"
+
+    try:
+        try:
+            st_target = os.lstat(fname, dir_fd=dir_fd)
+        except FileNotFoundError:
+            st_target = None
+        except OSError:
+            return False, 403, {}, f"SECURITY_SYMLINK_REJECTED: unable to inspect {fname!r}"
+        if st_target is not None and (
+            stat.S_ISLNK(st_target.st_mode) or not stat.S_ISREG(st_target.st_mode)
+        ):
+            return False, 403, {}, f"SECURITY_SYMLINK_REJECTED: {fname!r} is a symlink or non-regular file"
+
+        ok_lock, lock_fd, lock_err = _open_lock_in_dirfd_safe(dir_fd, lock_name)
+        if not ok_lock or lock_fd is None:
+            return False, 403, {}, lock_err
+
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            try:
+                ok_read, cur_doc, read_err = _read_json_file_in_dirfd(
+                    dir_fd, fname, max_bytes=MAX_FED_WORKBENCH_STATE_BODY_BYTES * 2
+                )
+                if not ok_read:
+                    return False, 403, {}, read_err
+
+                cur_ver, cur_upd, cur_state = _sanitize_stored_fed_wb_doc(cur_doc)
+                if expected_version is not None and expected_version != cur_ver:
+                    return (
+                        False,
+                        409,
+                        {
+                            "version": cur_ver,
+                            "updated_at": cur_upd,
+                            "state": cur_state,
+                        },
+                        "联邦工作台状态已被其他终端更新，已返回服务端最新版本快照",
+                    )
+
+                next_ver = cur_ver + 1
+                now_ts = int(time.time())
+                doc = {
+                    "version": next_ver,
+                    "updated_at": now_ts,
+                    "state": new_state,
+                }
+                serialized = (json.dumps(doc, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+                ok_wr, wr_err = _write_bytes_atomic_in_dirfd(dir_fd, fname, serialized)
+                if not ok_wr:
+                    sc = 403 if "SECURITY_SYMLINK_REJECTED" in wr_err else 500
+                    return False, sc, {}, wr_err
+
+                return (
+                    True,
+                    200,
+                    {
+                        "version": next_ver,
+                        "updated_at": now_ts,
+                        "state": new_state,
+                    },
+                    "",
+                )
+            finally:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def _read_job_meta_map_safe(meta_path: Path) -> tuple[bool, dict[str, dict[str, Any]], str]:
+    """Read the bounded Federation Workbench job metadata sidecar safely (zero disk creation)."""
+    ok_r, doc, err_r = _read_json_file_abs_safe(meta_path, max_bytes=MAX_WORKBENCH_JSON_BYTES * 2)
+    if not ok_r:
+        return False, {}, err_r
+    if not isinstance(doc, dict):
+        return True, {}, ""
+    jobs_map = doc.get("jobs")
+    if not isinstance(jobs_map, dict):
+        return True, {}, ""
+    out: dict[str, dict[str, Any]] = {}
+    for jid, rec in jobs_map.items():
+        if isinstance(jid, str) and isinstance(rec, dict):
+            out[jid] = rec
+    return True, out, ""
+
+
+def _upsert_job_meta_atomic(
+    meta_path: Path,
+    job_id: str,
+    entry: dict[str, Any],
+) -> tuple[bool, str]:
+    """Atomically upsert a sanitized job metadata record into the bounded sidecar index."""
+    fname = meta_path.name
+    lock_name = f".{fname}.lock"
+    ok_dir, dir_fd, dir_err = _open_parent_dir_no_symlink_abs(meta_path, create=True)
+    if not ok_dir or dir_fd is None:
+        return False, dir_err or "SECURITY_SYMLINK_REJECTED: job meta parent rejected"
+
+    try:
+        try:
+            st_target = os.lstat(fname, dir_fd=dir_fd)
+        except FileNotFoundError:
+            st_target = None
+        except OSError:
+            return False, f"SECURITY_SYMLINK_REJECTED: unable to inspect {fname!r}"
+        if st_target is not None and (
+            stat.S_ISLNK(st_target.st_mode) or not stat.S_ISREG(st_target.st_mode)
+        ):
+            return False, f"SECURITY_SYMLINK_REJECTED: {fname!r} is a symlink or non-regular file"
+
+        ok_lock, lock_fd, lock_err = _open_lock_in_dirfd_safe(dir_fd, lock_name)
+        if not ok_lock or lock_fd is None:
+            return False, lock_err
+
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            try:
+                ok_read, cur_doc, read_err = _read_json_file_in_dirfd(
+                    dir_fd, fname, max_bytes=MAX_WORKBENCH_JSON_BYTES * 2
+                )
+                if not ok_read:
+                    return False, read_err
+
+                jobs_map: dict[str, dict[str, Any]] = {}
+                if isinstance(cur_doc, dict) and isinstance(cur_doc.get("jobs"), dict):
+                    for k, v in cur_doc["jobs"].items():
+                        if isinstance(k, str) and isinstance(v, dict):
+                            jobs_map[k] = v
+
+                clean_entry = _sanitize_public_value(entry, scrub_host_paths=True)
+                if not isinstance(clean_entry, dict):
+                    clean_entry = {}
+                raw_dp = clean_entry.get("display_prompt")
+                if isinstance(raw_dp, str) and len(raw_dp) > MAX_FED_JOB_META_DISPLAY_PROMPT_CHARS:
+                    clean_entry["display_prompt"] = raw_dp[:MAX_FED_JOB_META_DISPLAY_PROMPT_CHARS]
+                    clean_entry["display_prompt_truncated"] = True
+                clean_entry["ts"] = float(entry.get("ts") or time.time())
+                jobs_map[job_id] = clean_entry
+
+                # Bounded capacity eviction (keep newest MAX_FED_JOB_META_ENTRIES)
+                sorted_items = sorted(
+                    jobs_map.items(),
+                    key=lambda kv: (float(kv[1].get("ts") or 0.0), kv[0]),
+                )
+                if len(sorted_items) > MAX_FED_JOB_META_ENTRIES:
+                    sorted_items = sorted_items[-MAX_FED_JOB_META_ENTRIES:]
+
+                # Strict UTF-8 serialized byte-budget eviction (<= MAX_FED_JOB_META_BYTES, far below 2 MiB read cap)
+                def _encode_items(items_slice: list[tuple[str, dict[str, Any]]]) -> bytes:
+                    return (
+                        json.dumps({"version": 1, "jobs": dict(items_slice)}, ensure_ascii=False) + "\n"
+                    ).encode("utf-8")
+
+                serialized = _encode_items(sorted_items)
+                if len(serialized) > MAX_FED_JOB_META_BYTES:
+                    if len(sorted_items) > 1:
+                        lo, hi = 1, len(sorted_items) - 1
+                        best_ser: bytes | None = None
+                        while lo <= hi:
+                            mid = (lo + hi) // 2
+                            cand_ser = _encode_items(sorted_items[mid:])
+                            if len(cand_ser) <= MAX_FED_JOB_META_BYTES:
+                                best_ser = cand_ser
+                                hi = mid - 1
+                            else:
+                                lo = mid + 1
+                        if best_ser is not None:
+                            serialized = best_ser
+                        else:
+                            sorted_items = sorted_items[-1:]
+                            serialized = _encode_items(sorted_items)
+                    if len(serialized) > MAX_FED_JOB_META_BYTES and sorted_items:
+                        only_k, only_v = sorted_items[-1]
+                        trimmed_v = dict(only_v)
+                        trimmed_v.pop("display_prompt", None)
+                        trimmed_v["display_prompt_truncated"] = True
+                        serialized = _encode_items([(only_k, trimmed_v)])
+
+                return _write_bytes_atomic_in_dirfd(dir_fd, fname, serialized)
+            finally:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+    finally:
+        os.close(dir_fd)
+
+
 class StudioFederationService:
     """Studio backend service and aiohttp REST handlers for External Agent Bidirectional Federation."""
 
@@ -1331,6 +2418,7 @@ class StudioFederationService:
         hub_port: int | None = None,
         hub_public_url: str | None = None,
         health_timeout_sec: float = DEFAULT_HEALTH_TIMEOUT_SEC,
+        workbench_state_path: Path | None = None,
     ) -> None:
         self.auth_mgr = auth_mgr
         self.data_sources = data_sources
@@ -1340,6 +2428,16 @@ class StudioFederationService:
         self._hub_port_override = hub_port
         self._hub_public_url_override = hub_public_url
         self.health_timeout_sec = max(0.2, min(float(health_timeout_sec), MAX_HEALTH_TIMEOUT_SEC))
+        env_state_path = os.environ.get("AGY_STUDIO_FEDERATION_WORKBENCH_STATE_FILE", "").strip()
+        default_state_path = (
+            Path.home() / ".config" / "agy-tg-bridge" / "studio_federation_workbench_state.json"
+        )
+        self.workbench_state_path = (
+            Path(workbench_state_path)
+            if workbench_state_path is not None
+            else Path(env_state_path or str(default_state_path))
+        )
+        self.job_meta_path = self.workbench_state_path.parent / "studio_federation_job_meta.json"
 
     @property
     def bus_dir(self) -> str:
@@ -1545,6 +2643,7 @@ class StudioFederationService:
         allowed_keys: frozenset[str],
         allow_empty: bool = False,
         target_id: str = "",
+        skip_secret_value_fields: frozenset[str] = frozenset(),
     ) -> tuple[bool, dict[str, Any] | None, web.Response | None]:
         client_ip = self.auth_mgr.extract_client_ip(request)
         safe_tid = _sanitize_slug(target_id, max_len=64) if target_id else ""
@@ -1601,8 +2700,13 @@ class StudioFederationService:
                 _api_error(f"请求包含未允许的字段: {', '.join(unknown)}", status=400, code="UNKNOWN_FIELD"),
             )
 
+        body_for_secret_check = (
+            {k: v for k, v in body.items() if k not in skip_secret_value_fields}
+            if skip_secret_value_fields
+            else body
+        )
         try:
-            federation_registry.reject_plaintext_secrets(body, path="payload")
+            federation_registry.reject_plaintext_secrets(body_for_secret_check, path="payload")
         except ValueError as exc:
             self.audit.record(
                 action=action,
@@ -2903,6 +4007,8 @@ class StudioFederationService:
         *,
         limit: int,
         viewer_role: str,
+        conversation_id: str = "",
+        project_id: str = "",
     ) -> tuple[bool, int, dict[str, Any], str]:
         """Pure read-only, zero-side-effect anti-symlink agent timeline & telemetry builder."""
         ok_ag, agents_map, err_ag = _read_agents_map_no_symlink(self.bus_dir)
@@ -2930,6 +4036,10 @@ class StudioFederationService:
         ok_bj, bus_jobs, err_bj = _scan_json_dir_no_symlink(self.bus_dir, ("jobs",))
         if not ok_bj:
             return False, 403, {}, err_bj
+
+        ok_jm, job_meta_map, err_jm = _read_job_meta_map_safe(self.job_meta_path)
+        if not ok_jm:
+            return False, 403, {}, err_jm
 
         now_ts = time.time()
         ok_pr, presence_map, err_pr = _read_presence_map_no_symlink(self.bus_dir, now_ts=now_ts)
@@ -2995,23 +4105,51 @@ class StudioFederationService:
                 act_ts_list.append(ct)
 
         all_jids = sorted(set(pull_by_jid.keys()) | set(bus_by_jid.keys()))
-        merged_items: list[dict[str, Any]] = [
-            _merge_single_timeline_job(
-                jid,
-                pull_by_jid.get(jid),
-                bus_by_jid.get(jid),
-                is_admin=is_admin,
-                now_ts=now_ts,
+        merged_items: list[dict[str, Any]] = []
+        for jid in all_jids:
+            jm_raw = job_meta_map.get(jid)
+            jm_valid = (
+                jm_raw
+                if isinstance(jm_raw, dict)
+                and (not jm_raw.get("agent_id") or str(jm_raw.get("agent_id")).strip().lower() == aid)
+                else None
             )
-            for jid in all_jids
-        ]
+            merged_items.append(
+                _merge_single_timeline_job(
+                    jid,
+                    pull_by_jid.get(jid),
+                    bus_by_jid.get(jid),
+                    is_admin=is_admin,
+                    now_ts=now_ts,
+                    job_meta=jm_valid,
+                )
+            )
+
+        # Compute node-level `has_active_jobs` BEFORE applying conversation/project query filters
+        has_active_jobs = any(bool(it.get("is_active")) for it in merged_items)
+
+        filtered_items = merged_items
+        if conversation_id:
+            filtered_items = [
+                it for it in filtered_items if str(it.get("conversation_id") or "") == conversation_id
+            ]
+        if project_id:
+            if project_id == "__external_history__":
+                filtered_items = [
+                    it for it in filtered_items if not str(it.get("conversation_id") or "")
+                ]
+            else:
+                filtered_items = [
+                    it for it in filtered_items if str(it.get("project_id") or "") == project_id
+                ]
+
         # Take the most recent `limit` unique jobs, ordered chronologically (oldest -> newest)
-        merged_items.sort(
+        filtered_items.sort(
             key=lambda it: (float(it.get("created_at") or 0.0), str(it.get("job_id") or "")),
             reverse=True,
         )
-        total_jobs = len(merged_items)
-        page_items = list(reversed(merged_items[:limit]))
+        total_jobs = len(filtered_items)
+        page_items = list(reversed(filtered_items[:limit]))
 
         # Active pull_inbox summary (FIFO oldest first)
         pull_inbox: list[dict[str, Any]] = []
@@ -3019,6 +4157,12 @@ class StudioFederationService:
             st = str(pj.get("status") or "queued").strip().lower()
             if st in ("queued", "claimed") and not pj.get("cancelled"):
                 p_meta = pj.get("metadata") if isinstance(pj.get("metadata"), dict) else {}
+                jm_raw = job_meta_map.get(jid) if isinstance(job_meta_map.get(jid), dict) else {}
+                preview_src = str(
+                    (jm_raw or {}).get("display_prompt")
+                    or p_meta.get("display_prompt")
+                    or _strip_context_wrapper(str(pj.get("prompt") or ""))
+                )
                 pull_inbox.append(
                     _sanitize_public_value(
                         {
@@ -3026,7 +4170,7 @@ class StudioFederationService:
                             "status": st,
                             "source": _detect_job_source(pj, bus_by_jid.get(jid)),
                             "label": str(p_meta.get("label") or "")[:120],
-                            "prompt_preview": str(pj.get("prompt") or "")[:200],
+                            "prompt_preview": preview_src[:200],
                             "created_at": _safe_float_ts(pj.get("created_at")) or None,
                             "claimed_at": _safe_float_ts(pj.get("claimed_at")) or None,
                             "can_cancel": is_admin,
@@ -3103,7 +4247,6 @@ class StudioFederationService:
         clean_ag["last_heartbeat_at"] = last_heartbeat_at
         clean_ag["last_heartbeat_action"] = last_heartbeat_action
 
-        has_active_jobs = any(bool(it.get("is_active")) for it in merged_items)
         return (
             True,
             200,
@@ -3140,6 +4283,218 @@ class StudioFederationService:
             headers={"Cache-Control": "no-store, max-age=0"},
         )
 
+    async def handle_get_workbench_state(self, request: web.Request) -> web.Response:
+        ok, sess, err, sc = await self.auth_mgr.authenticate_request(request)
+        if not ok or not sess:
+            return studio_auth_error(err, status=sc)
+
+        ok_r, doc, err_r = await asyncio.to_thread(
+            _read_json_file_abs_safe,
+            self.workbench_state_path,
+            max_bytes=MAX_FED_WORKBENCH_STATE_BODY_BYTES * 2,
+        )
+        if not ok_r:
+            return _api_error(err_r, status=403, code="SECURITY_SYMLINK_REJECTED")
+
+        version, updated_at, state = _sanitize_stored_fed_wb_doc(doc)
+        return web.json_response(
+            {
+                "ok": True,
+                "version": version,
+                "updated_at": updated_at,
+                "can_edit": sess.get("role") == "admin",
+                "state": state,
+            },
+            headers={"Cache-Control": "no-store, max-age=0"},
+        )
+
+    async def handle_put_workbench_state(self, request: web.Request) -> web.Response:
+        ok_gate, sess, err_resp = await self._enforce_write_gate(
+            request,
+            action="federation.workbench.state.put",
+            target_id="federation_workbench_state",
+        )
+        if not ok_gate or not sess:
+            return err_resp  # type: ignore[return-value]
+
+        client_ip = self.auth_mgr.extract_client_ip(request)
+        ok_body, body, body_sc, body_outcome, body_err = await _read_bounded_json_body(
+            request,
+            max_bytes=MAX_FED_WORKBENCH_STATE_BODY_BYTES,
+            allow_empty=False,
+        )
+        if not ok_body or body is None:
+            self.audit.record(
+                action="federation.workbench.state.put",
+                status_code=body_sc,
+                outcome=body_outcome,
+                client_ip=client_ip,
+                target_id="federation_workbench_state",
+                sess=sess,
+            )
+            return _api_error(body_err, status=body_sc)
+
+        bad_proto = _find_proto_key_recursive(body)
+        if bad_proto is not None:
+            self.audit.record(
+                action="federation.workbench.state.put",
+                status_code=400,
+                outcome="denied_proto_key",
+                client_ip=client_ip,
+                target_id="federation_workbench_state",
+                sess=sess,
+            )
+            return _api_error(f"禁止传入非法原型键：{bad_proto}", status=400)
+
+        bad_path = _find_forbidden_path_key_recursive(body)
+        if bad_path is not None:
+            self.audit.record(
+                action="federation.workbench.state.put",
+                status_code=400,
+                outcome="denied_forbidden_path_field",
+                client_ip=client_ip,
+                target_id="federation_workbench_state",
+                sess=sess,
+            )
+            return _api_error(f"联邦工作台状态禁止携带宿主机路径字段：{bad_path}", status=400)
+
+        bad_secret_key = _find_forbidden_client_key(body)
+        if bad_secret_key is not None:
+            self.audit.record(
+                action="federation.workbench.state.put",
+                status_code=400,
+                outcome="denied_forbidden_field",
+                client_ip=client_ip,
+                target_id="federation_workbench_state",
+                sess=sess,
+            )
+            return _api_error(
+                f"PLAINTEXT_SECRET_REJECTED: 禁止提交受限或凭据字段 ({bad_secret_key})",
+                status=400,
+                code="PLAINTEXT_SECRET_REJECTED",
+            )
+
+        extra_top = sorted(set(body.keys()) - _ALLOWED_FED_WB_STATE_TOP_KEYS)
+        if extra_top:
+            self.audit.record(
+                action="federation.workbench.state.put",
+                status_code=400,
+                outcome="denied_unknown_field",
+                client_ip=client_ip,
+                target_id="federation_workbench_state",
+                sess=sess,
+            )
+            return _api_error(f"存在未允许的顶层字段：{extra_top[0]}", status=400)
+
+        if "state" not in body:
+            self.audit.record(
+                action="federation.workbench.state.put",
+                status_code=400,
+                outcome="denied_missing_state",
+                client_ip=client_ip,
+                target_id="federation_workbench_state",
+                sess=sess,
+            )
+            return _api_error("请求体必须包含 state 对象", status=400)
+
+        expected_version: int | None = None
+        if "expected_version" in body:
+            ev = body["expected_version"]
+            if isinstance(ev, bool) or not isinstance(ev, int) or ev < 0:
+                self.audit.record(
+                    action="federation.workbench.state.put",
+                    status_code=400,
+                    outcome="denied_invalid_version",
+                    client_ip=client_ip,
+                    target_id="federation_workbench_state",
+                    sess=sess,
+                )
+                return _api_error("expected_version 必须为严格非负整数", status=400)
+            expected_version = ev
+
+        ok_state, clean_state, err_state = validate_federation_workbench_state(body.get("state"))
+        if not ok_state:
+            self.audit.record(
+                action="federation.workbench.state.put",
+                status_code=400,
+                outcome="denied_validation",
+                client_ip=client_ip,
+                target_id="federation_workbench_state",
+                sess=sess,
+            )
+            return _api_error(err_state, status=400)
+
+        ok_save, save_sc, result_doc, save_err = await asyncio.to_thread(
+            _save_fed_wb_state_atomic,
+            self.workbench_state_path,
+            clean_state,
+            expected_version=expected_version,
+        )
+        if save_sc == 403:
+            self.audit.record(
+                action="federation.workbench.state.put",
+                status_code=403,
+                outcome="denied_symlink",
+                client_ip=client_ip,
+                target_id="federation_workbench_state",
+                sess=sess,
+            )
+            return _api_error(save_err, status=403, code="SECURITY_SYMLINK_REJECTED")
+
+        if save_sc == 409:
+            self.audit.record(
+                action="federation.workbench.state.put",
+                status_code=409,
+                outcome="conflict_version",
+                client_ip=client_ip,
+                target_id="federation_workbench_state",
+                sess=sess,
+            )
+            return web.json_response(
+                {
+                    "ok": False,
+                    "source": "studio_api",
+                    "code": "version_conflict",
+                    "error": save_err,
+                    "version": result_doc["version"],
+                    "updated_at": result_doc["updated_at"],
+                    "state": result_doc["state"],
+                },
+                status=409,
+                headers={"Cache-Control": "no-store, max-age=0"},
+            )
+
+        if not ok_save:
+            self.audit.record(
+                action="federation.workbench.state.put",
+                status_code=save_sc,
+                outcome="io_error",
+                client_ip=client_ip,
+                target_id="federation_workbench_state",
+                sess=sess,
+            )
+            return _api_error(save_err or "保存联邦工作台状态失败", status=save_sc)
+
+        self.audit.record(
+            action="federation.workbench.state.put",
+            status_code=200,
+            outcome="ok",
+            client_ip=client_ip,
+            target_id="federation_workbench_state",
+            sess=sess,
+        )
+        self._publish_federation_updated(action="workbench_state_updated")
+        return web.json_response(
+            {
+                "ok": True,
+                "version": result_doc["version"],
+                "updated_at": result_doc["updated_at"],
+                "can_edit": True,
+                "state": result_doc["state"],
+            },
+            headers={"Cache-Control": "no-store, max-age=0"},
+        )
+
     async def handle_get_workbench_timeline(self, request: web.Request) -> web.Response:
         ok, sess, err, sc = await self.auth_mgr.authenticate_request(request)
         if not ok or not sess:
@@ -3160,12 +4515,28 @@ class StudioFederationService:
             return _api_error("limit 必须 >= 1", status=400)
         limit = min(limit, MAX_TIMELINE_LIMIT)
 
+        conv_filter = ""
+        if "conversation_id" in request.query and request.query.get("conversation_id", "") != "":
+            ok_cf, conv_filter = _validate_fed_wb_conv_id(request.query.get("conversation_id"))
+            if not ok_cf:
+                return _api_error("conversation_id 查询参数格式非法", status=400)
+
+        proj_filter = ""
+        if "project_id" in request.query and request.query.get("project_id", "") != "":
+            ok_pf, proj_filter = _validate_fed_wb_project_id(
+                request.query.get("project_id"), allow_builtin=True
+            )
+            if not ok_pf:
+                return _api_error("project_id 查询参数格式非法", status=400)
+
         viewer_role = str(sess.get("role") or "readonly")
         ok_tl, tl_sc, payload, tl_err = await asyncio.to_thread(
             self._build_agent_timeline_sync,
             aid,
             limit=limit,
             viewer_role=viewer_role,
+            conversation_id=conv_filter,
+            project_id=proj_filter,
         )
         if not ok_tl:
             code = "SECURITY_SYMLINK_REJECTED" if tl_sc == 403 else ("AGENT_NOT_FOUND" if tl_sc == 404 else "")
@@ -3203,6 +4574,7 @@ class StudioFederationService:
             allowed_keys=_ALLOWED_WORKBENCH_DISPATCH_KEYS,
             allow_empty=False,
             target_id=aid,
+            skip_secret_value_fields=frozenset({"prompt"}),
         )
         if not ok_body or body is None:
             return body_resp  # type: ignore[return-value]
@@ -3270,6 +4642,96 @@ class StudioFederationService:
                 return _api_error(f"timeout_s 必须在 1..{int(MAX_DISPATCH_TIMEOUT_SEC)} 秒范围内", status=400)
             timeout_s = float(raw_to)
 
+        clean_project_id = ""
+        if "project_id" in body and body["project_id"] is not None:
+            raw_pid = body["project_id"]
+            if type(raw_pid) is not str:
+                self.audit.record(
+                    action="federation.workbench.dispatch",
+                    status_code=400,
+                    outcome="invalid_project_id",
+                    client_ip=client_ip,
+                    target_id=aid,
+                    sess=sess,
+                )
+                return _api_error("project_id 必须为字符串", status=400)
+            if raw_pid.strip():
+                ok_pid, clean_project_id = _validate_fed_wb_project_id(raw_pid, allow_builtin=True)
+                if not ok_pid or clean_project_id == "__external_history__":
+                    self.audit.record(
+                        action="federation.workbench.dispatch",
+                        status_code=400,
+                        outcome="invalid_project_id",
+                        client_ip=client_ip,
+                        target_id=aid,
+                        sess=sess,
+                    )
+                    return _api_error("project_id 格式非法", status=400)
+
+        clean_conv_id = ""
+        if "conversation_id" in body and body["conversation_id"] is not None:
+            raw_cid = body["conversation_id"]
+            if type(raw_cid) is not str:
+                self.audit.record(
+                    action="federation.workbench.dispatch",
+                    status_code=400,
+                    outcome="invalid_conversation_id",
+                    client_ip=client_ip,
+                    target_id=aid,
+                    sess=sess,
+                )
+                return _api_error("conversation_id 必须为字符串", status=400)
+            if raw_cid.strip():
+                ok_cid, clean_conv_id = _validate_fed_wb_conv_id(raw_cid)
+                if not ok_cid:
+                    self.audit.record(
+                        action="federation.workbench.dispatch",
+                        status_code=400,
+                        outcome="invalid_conversation_id",
+                        client_ip=client_ip,
+                        target_id=aid,
+                        sess=sess,
+                    )
+                    return _api_error("conversation_id 格式非法", status=400)
+
+        clean_conv_title = ""
+        if "conversation_title" in body and body["conversation_title"] is not None:
+            raw_ct = body["conversation_title"]
+            if type(raw_ct) is not str:
+                self.audit.record(
+                    action="federation.workbench.dispatch",
+                    status_code=400,
+                    outcome="invalid_conversation_title",
+                    client_ip=client_ip,
+                    target_id=aid,
+                    sess=sess,
+                )
+                return _api_error("conversation_title 必须为字符串", status=400)
+            ct_str = raw_ct.strip()
+            if len(ct_str) > MAX_FED_WB_CONV_TITLE_LEN or _FED_WB_CTRL_RE.search(ct_str):
+                self.audit.record(
+                    action="federation.workbench.dispatch",
+                    status_code=400,
+                    outcome="invalid_conversation_title",
+                    client_ip=client_ip,
+                    target_id=aid,
+                    sess=sess,
+                )
+                return _api_error("conversation_title 超长或含控制字符", status=400)
+            clean_conv_title = ct_str
+
+        ok_ic, include_context, ic_err = _validate_strict_bool(body, "include_context", default=True)
+        if not ok_ic or include_context is None:
+            self.audit.record(
+                action="federation.workbench.dispatch",
+                status_code=400,
+                outcome="invalid_include_context",
+                client_ip=client_ip,
+                target_id=aid,
+                sess=sess,
+            )
+            return _api_error(ic_err or "include_context 必须为严格布尔值", status=400)
+
         # Anti-symlink check on federation/agents.json before inspecting target
         ok_ag, agents_map, err_ag = await asyncio.to_thread(_read_agents_map_no_symlink, self.bus_dir)
         if not ok_ag:
@@ -3313,6 +4775,96 @@ class StudioFederationService:
         actor_slug = _sanitize_slug(actor_name, max_len=64) or "admin"
 
         def _do_dispatch() -> tuple[bool, int, dict[str, Any], str]:
+            context_turns = 0
+            sanitized_user_prompt = str(
+                _sanitize_public_value(clean_prompt, scrub_host_paths=True) or ""
+            ).strip() or "[REDACTED]"
+            dispatched_prompt = sanitized_user_prompt
+            now_ts = time.time()
+
+            if include_context and clean_conv_id:
+                ok_pq_r, pull_jobs_r, err_pq_r = _scan_json_dir_no_symlink(
+                    self.bus_dir, ("federation", "pull_queue")
+                )
+                if not ok_pq_r:
+                    return False, 403, {}, err_pq_r
+                ok_bj_r, bus_jobs_r, err_bj_r = _scan_json_dir_no_symlink(self.bus_dir, ("jobs",))
+                if not ok_bj_r:
+                    return False, 403, {}, err_bj_r
+                ok_jm_r, jm_map_r, err_jm_r = _read_job_meta_map_safe(self.job_meta_path)
+                if not ok_jm_r:
+                    return False, 403, {}, err_jm_r
+
+                pull_by_jid: dict[str, dict[str, Any]] = {}
+                for pj in pull_jobs_r:
+                    if str(pj.get("target_agent_id") or "").strip().lower() == aid:
+                        pjid = str(pj.get("job_id") or "").strip()
+                        if pjid:
+                            pull_by_jid[pjid] = pj
+                bus_by_jid: dict[str, dict[str, Any]] = {}
+                for bj in bus_jobs_r:
+                    if str(bj.get("target_bot") or "").strip().lower() == aid:
+                        bjid = str(bj.get("job_id") or "").strip()
+                        if bjid:
+                            bus_by_jid[bjid] = bj
+
+                done_conv_turns: list[dict[str, Any]] = []
+                for hist_jid in sorted(set(pull_by_jid.keys()) | set(bus_by_jid.keys())):
+                    jm_raw = jm_map_r.get(hist_jid)
+                    jm_valid = (
+                        jm_raw
+                        if isinstance(jm_raw, dict)
+                        and (not jm_raw.get("agent_id") or str(jm_raw.get("agent_id")).strip().lower() == aid)
+                        else None
+                    )
+                    m_item = _merge_single_timeline_job(
+                        hist_jid,
+                        pull_by_jid.get(hist_jid),
+                        bus_by_jid.get(hist_jid),
+                        is_admin=True,
+                        now_ts=now_ts,
+                        job_meta=jm_valid,
+                    )
+                    if (
+                        str(m_item.get("conversation_id") or "") == clean_conv_id
+                        and str(m_item.get("status") or "") == "done"
+                    ):
+                        done_conv_turns.append(m_item)
+
+                ctx_block, context_turns = _build_conversation_context_block(done_conv_turns)
+                if ctx_block and context_turns > 0:
+                    dispatched_prompt = f"{ctx_block}\n{sanitized_user_prompt}"
+
+            safe_display_prompt = _sanitize_pull_meta_string(clean_prompt)
+            safe_label = _sanitize_pull_meta_string(clean_label, max_len=120) if clean_label else ""
+            safe_conv_title = (
+                _sanitize_pull_meta_string(clean_conv_title, max_len=120) if clean_conv_title else ""
+            )
+            need_meta_index = bool(
+                clean_project_id or clean_conv_id or safe_conv_title or context_turns > 0
+            )
+            if need_meta_index:
+                ok_jm_safe, err_jm_safe = _assert_abs_file_safe_for_write(self.job_meta_path)
+                if not ok_jm_safe:
+                    return False, 403, {}, err_jm_safe
+
+            sidecar_dp_truncated = len(safe_display_prompt) > MAX_FED_JOB_META_DISPLAY_PROMPT_CHARS
+            job_meta_entry: dict[str, Any] = {
+                "agent_id": aid,
+                "project_id": clean_project_id,
+                "conversation_id": clean_conv_id,
+                "conversation_title": safe_conv_title,
+                "display_prompt": (
+                    safe_display_prompt[:MAX_FED_JOB_META_DISPLAY_PROMPT_CHARS]
+                    if sidecar_dp_truncated
+                    else safe_display_prompt
+                ),
+                "context_turns": context_turns,
+                "ts": now_ts,
+            }
+            if sidecar_dp_truncated:
+                job_meta_entry["display_prompt_truncated"] = True
+
             if dispatch_mode == "pull":
                 ok_pq, pq_err = _assert_file_not_symlink(self.bus_dir, ("federation", "pull_queue"), ".lock")
                 if not ok_pq:
@@ -3322,25 +4874,41 @@ class StudioFederationService:
                 meta: dict[str, Any] = {
                     "source": "studio",
                     "from_actor": f"studio:{actor_slug}",
+                    "display_prompt": safe_display_prompt,
+                    "context_turns": context_turns,
                 }
-                if clean_label:
-                    meta["label"] = clean_label
+                if safe_label:
+                    meta["label"] = safe_label
                 if timeout_s is not None:
                     meta["timeout_s"] = timeout_s
+                if clean_project_id:
+                    meta["project_id"] = clean_project_id
+                if clean_conv_id:
+                    meta["conversation_id"] = clean_conv_id
+                if safe_conv_title:
+                    meta["conversation_title"] = safe_conv_title
+
                 rec = federation_registry.PullWorkerQueue(self.bus_dir).enqueue(
                     aid,
-                    clean_prompt,
+                    dispatched_prompt,
                     from_agent_id="",
                     metadata=meta,
                     owner_auth=owner_auth,
                     env={},
                 )
+                jid_str = str(rec["job_id"])
+                if need_meta_index:
+                    ok_up, err_up = _upsert_job_meta_atomic(self.job_meta_path, jid_str, job_meta_entry)
+                    if not ok_up:
+                        sc_up = 403 if "SECURITY_SYMLINK_REJECTED" in err_up else 500
+                        return False, sc_up, {}, err_up
                 merged = _merge_single_timeline_job(
-                    str(rec["job_id"]),
+                    jid_str,
                     rec,
                     None,
                     is_admin=True,
                     now_ts=time.time(),
+                    job_meta=job_meta_entry if need_meta_index else None,
                 )
                 return True, 200, merged, ""
 
@@ -3356,8 +4924,8 @@ class StudioFederationService:
 
             assignment: dict[str, Any] = {
                 "bot": aid,
-                "prompt": clean_prompt,
-                "label": clean_label or clean_prompt[:64],
+                "prompt": dispatched_prompt,
+                "label": safe_label or safe_display_prompt[:64],
             }
             dispatched = bot_bus.dispatch_jobs_in_dir(
                 self.bus_dir,
@@ -3368,12 +4936,19 @@ class StudioFederationService:
             if not jobs_created or not isinstance(jobs_created[0], dict):
                 return False, 500, {}, "派单落盘失败"
             bjob = jobs_created[0]
+            jid_str = str(bjob["job_id"])
+            if need_meta_index:
+                ok_up, err_up = _upsert_job_meta_atomic(self.job_meta_path, jid_str, job_meta_entry)
+                if not ok_up:
+                    sc_up = 403 if "SECURITY_SYMLINK_REJECTED" in err_up else 500
+                    return False, sc_up, {}, err_up
             merged = _merge_single_timeline_job(
-                str(bjob["job_id"]),
+                jid_str,
                 None,
                 bjob,
                 is_admin=True,
                 now_ts=time.time(),
+                job_meta=job_meta_entry if need_meta_index else None,
             )
             return True, 200, merged, ""
 
@@ -3520,6 +5095,17 @@ class StudioFederationService:
             if bus_job is not None and str(bus_job.get("target_bot") or "").strip().lower() != aid:
                 return False, 404, {}, f"任务 {jid} 不属于 Agent {aid}"
 
+            ok_jm, jm_map, err_jm = _read_job_meta_map_safe(self.job_meta_path)
+            if not ok_jm:
+                return False, 403, {}, err_jm
+            jm_raw = jm_map.get(jid)
+            jm_valid = (
+                jm_raw
+                if isinstance(jm_raw, dict)
+                and (not jm_raw.get("agent_id") or str(jm_raw.get("agent_id")).strip().lower() == aid)
+                else None
+            )
+
             p_st = str((pull_job or {}).get("status") or "").strip().lower()
             b_st = str((bus_job or {}).get("status") or "").strip().lower()
             p_term = pull_job is None or p_st in _TERMINAL_JOB_STATUSES
@@ -3534,6 +5120,7 @@ class StudioFederationService:
                     bus_job,
                     is_admin=True,
                     now_ts=time.time(),
+                    job_meta=jm_valid,
                 )
                 return (
                     True,
@@ -3601,6 +5188,7 @@ class StudioFederationService:
                             updated_bus,
                             is_admin=True,
                             now_ts=time.time(),
+                            job_meta=jm_valid,
                         )
                         return (
                             True,
@@ -3636,6 +5224,7 @@ class StudioFederationService:
                 updated_bus,
                 is_admin=True,
                 now_ts=time.time(),
+                job_meta=jm_valid,
             )
             return (
                 True,

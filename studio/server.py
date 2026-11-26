@@ -223,6 +223,7 @@ def create_app(
     federation_hub_host: str | None = None,
     federation_hub_port: int | None = None,
     federation_service: StudioFederationService | None = None,
+    federation_workbench_state_path: Path | None = None,
 ) -> web.Application:
     public_url = os.environ.get("AGY_STUDIO_PUBLIC_URL", "").strip()
     auth = auth_mgr or StudioAuthManager(public_url=public_url)
@@ -320,6 +321,7 @@ def create_app(
         event_hub=event_hub,
         hub_host=federation_hub_host,
         hub_port=federation_hub_port,
+        workbench_state_path=federation_workbench_state_path,
     )
     dist_dir = static_dist_dir or Path(
         os.environ.get("AGY_STUDIO_DIST_DIR", str(DEFAULT_STATIC_DIST_DIR))
@@ -764,6 +766,14 @@ def create_app(
 
     # External Agent Federation Workbench
     app.router.add_get("/api/federation/workbench", federation_svc.handle_get_workbench)
+    app.router.add_get(
+        "/api/federation/workbench/state",
+        federation_svc.handle_get_workbench_state,
+    )
+    app.router.add_put(
+        "/api/federation/workbench/state",
+        federation_svc.handle_put_workbench_state,
+    )
     app.router.add_get(
         "/api/federation/workbench/agents/{agent_id}/timeline",
         federation_svc.handle_get_workbench_timeline,

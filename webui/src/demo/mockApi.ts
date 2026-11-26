@@ -47,6 +47,9 @@ import type {
   FederationWorkbenchDispatchPayload,
   FederationWorkbenchDispatchResponse,
   FederationWorkbenchResponse,
+  FederationWorkbenchState,
+  FederationWorkbenchStateResponse,
+  FederationWorkbenchStateUpdatePayload,
   FederationWorkbenchTimelineResponse,
   FileContentResponse,
   FileDiffResponse,
@@ -4359,6 +4362,58 @@ export async function fetchFederationAudit(params?: {
 }
 
 // External Agent Federation Workbench (Demo Mode)
+let demoFedWorkbenchStateVer = 1;
+let demoFedWorkbenchStateUpdatedAt: number | null = nowSec() - 120;
+let demoFedWorkbenchState: FederationWorkbenchState = {
+  customProjects: [
+    {
+      id: "proj-edge-ops",
+      name: "边缘节点巡检",
+      description: "演示环境外部 Pull Worker 多轮巡检与诊断项目",
+      createdAt: nowSec() - 7200,
+    },
+  ],
+  conversations: [
+    {
+      id: "conv-demo-health",
+      agentId: "pull_worker_demo",
+      projectId: "proj-edge-ops",
+      title: "集群健康与容器巡检",
+      createdAt: nowSec() - 600,
+      updatedAt: nowSec() - 320,
+    },
+    {
+      id: "conv-demo-remote-logs",
+      agentId: "hermes_remote_demo",
+      projectId: "default",
+      title: "网关错误率核查",
+      createdAt: nowSec() - 400,
+      updatedAt: nowSec() - 291,
+    },
+  ],
+  pinnedConversationIds: ["conv-demo-health"],
+  archivedConversationIds: [],
+  hiddenConversationIds: [],
+  collapsedProjectIds: [],
+  hiddenProjectIds: [],
+  renamedProjects: {},
+  renamedConversations: {},
+  readAtByConversation: {
+    "conv-demo-health": nowSec() - 300,
+    "conv-demo-remote-logs": nowSec() - 280,
+  },
+  uiPrefs: {
+    sidebarCollapsed: false,
+    showArchived: false,
+    onlyPinned: false,
+    onlyUnread: false,
+    telemetryOpen: true,
+    selectedAgentId: "pull_worker_demo",
+    selectedProjectId: "proj-edge-ops",
+    selectedConversationId: "conv-demo-health",
+  },
+};
+
 const demoFedWorkbenchTimelines: Record<string, FederationTimelineJobItem[]> = {
   pull_worker_demo: [
     {
@@ -4371,6 +4426,11 @@ const demoFedWorkbenchTimelines: Record<string, FederationTimelineJobItem[]> = {
       from_actor: "studio:demo-admin",
       team_id: "demo-squad",
       group_id: "",
+      project_id: "proj-edge-ops",
+      conversation_id: "conv-demo-health",
+      conversation_title: "集群健康与容器巡检",
+      display_prompt: "检查边缘节点的磁盘剩余空间与核心容器状态。",
+      context_turns: 0,
       prompt: "检查边缘节点的磁盘剩余空间与核心容器状态。",
       result_text:
         "### 巡检完成\n- 根分区剩余空间：**68%**\n- 运行中容器：**6 / 6 健康**\n- 最近 5 分钟无异常重启。",
@@ -4385,6 +4445,34 @@ const demoFedWorkbenchTimelines: Record<string, FederationTimelineJobItem[]> = {
       can_cancel: false,
     },
     {
+      job_id: "pull-demo-002",
+      status: "done",
+      source: "studio",
+      stores: ["pull"],
+      bridged: false,
+      label: "内存与负载复查",
+      from_actor: "studio:demo-admin",
+      team_id: "demo-squad",
+      group_id: "",
+      project_id: "proj-edge-ops",
+      conversation_id: "conv-demo-health",
+      conversation_title: "集群健康与容器巡检",
+      display_prompt: "基于刚才的巡检结果，再补充一下内存水位和 CPU 负载。",
+      context_turns: 1,
+      prompt: "基于刚才的巡检结果，再补充一下内存水位和 CPU 负载。",
+      result_text:
+        "- 内存使用率：**41%**（充足）\n- 15 分钟平均负载：`0.32`\n- 建议：无需扩容，保持当前采样间隔即可。",
+      error: "",
+      cancel_reason: "",
+      created_at: nowSec() - 340,
+      started_at: nowSec() - 337,
+      claimed_at: nowSec() - 337,
+      finished_at: nowSec() - 328,
+      elapsed_s: 9.0,
+      is_active: false,
+      can_cancel: false,
+    },
+    {
       job_id: "job-demo-bridged-002",
       status: "done",
       source: "telegram",
@@ -4394,6 +4482,11 @@ const demoFedWorkbenchTimelines: Record<string, FederationTimelineJobItem[]> = {
       from_actor: "@example_main_bot",
       team_id: "demo-squad",
       group_id: "batch-demo-01",
+      project_id: "",
+      conversation_id: "",
+      conversation_title: "",
+      display_prompt: "汇总今日构建流水线的通过率与耗时。",
+      context_turns: 0,
       prompt: "汇总今日构建流水线的通过率与耗时。",
       result_text: "今日共执行 **14 次构建**，通过率 **100%**，平均耗时 `42s`。",
       error: "",
@@ -4418,6 +4511,11 @@ const demoFedWorkbenchTimelines: Record<string, FederationTimelineJobItem[]> = {
       from_actor: "hermes_local_demo",
       team_id: "demo-squad",
       group_id: "batch-demo-02",
+      project_id: "default",
+      conversation_id: "conv-demo-remote-logs",
+      conversation_title: "网关错误率核查",
+      display_prompt: "统计过去 1 小时 5xx 错误数。",
+      context_turns: 0,
       prompt: "统计过去 1 小时 5xx 错误数。",
       result_text: "过去 1 小时内共检测到 **0** 条 5xx 错误记录。",
       error: "",
@@ -4522,9 +4620,64 @@ export async function fetchFederationWorkbench(): Promise<FederationWorkbenchRes
   };
 }
 
+export async function fetchFederationWorkbenchState(): Promise<FederationWorkbenchStateResponse> {
+  await delay(20);
+  const me = requireAuth();
+  return {
+    ok: true,
+    version: demoFedWorkbenchStateVer,
+    updated_at: demoFedWorkbenchStateUpdatedAt,
+    can_edit: me.role === "admin",
+    state: JSON.parse(JSON.stringify(demoFedWorkbenchState)) as FederationWorkbenchState,
+  };
+}
+
+export async function updateFederationWorkbenchState(
+  payload: FederationWorkbenchStateUpdatePayload,
+): Promise<FederationWorkbenchStateResponse> {
+  await delay(25);
+  const me = requireAuth();
+  if (me.role !== "admin") {
+    throw new StudioApiError("只读权限（readonly）禁止修改联邦工作台状态", 403, "studio_auth");
+  }
+  if (
+    typeof payload.expected_version === "number" &&
+    payload.expected_version !== demoFedWorkbenchStateVer
+  ) {
+    throw new StudioApiError(
+      "联邦工作台状态版本冲突",
+      409,
+      "studio_api",
+      undefined,
+      undefined,
+      "version_conflict",
+      undefined,
+      {
+        version: demoFedWorkbenchStateVer,
+        updated_at: demoFedWorkbenchStateUpdatedAt,
+        state: JSON.parse(JSON.stringify(demoFedWorkbenchState)),
+      },
+    );
+  }
+  demoFedWorkbenchState = JSON.parse(JSON.stringify(payload.state)) as FederationWorkbenchState;
+  demoFedWorkbenchStateVer += 1;
+  demoFedWorkbenchStateUpdatedAt = nowSec();
+  emitDemoEvent("federation_updated", {
+    action: "workbench_state_updated",
+    ts: demoFedWorkbenchStateUpdatedAt,
+  });
+  return {
+    ok: true,
+    version: demoFedWorkbenchStateVer,
+    updated_at: demoFedWorkbenchStateUpdatedAt,
+    can_edit: true,
+    state: JSON.parse(JSON.stringify(demoFedWorkbenchState)) as FederationWorkbenchState,
+  };
+}
+
 export async function fetchFederationWorkbenchTimeline(
   agentId: string,
-  params?: { limit?: number },
+  params?: { limit?: number; conversation_id?: string; project_id?: string },
 ): Promise<FederationWorkbenchTimelineResponse> {
   await delay(25);
   const me = requireAuth();
@@ -4533,19 +4686,31 @@ export async function fetchFederationWorkbenchTimeline(
     throw new StudioApiError(`未找到外部 Agent: ${agentId}`, 404, "studio_api");
   }
   const lim = Math.min(200, Math.max(1, params?.limit || 50));
-  const list = (demoFedWorkbenchTimelines[agentId] || []).map((it) => ({
+  const fullList = (demoFedWorkbenchTimelines[agentId] || []).map((it) => ({
     ...it,
     can_cancel: me.role === "admin" && it.is_active,
   }));
-  const sliced = list.slice(-lim);
-  const pullInbox = sliced
+  const hasActive = fullList.some((it) => it.is_active);
+  let filtered = fullList;
+  if (params?.conversation_id) {
+    filtered = filtered.filter((it) => (it.conversation_id || "") === params.conversation_id);
+  }
+  if (params?.project_id) {
+    if (params.project_id === "__external_history__") {
+      filtered = filtered.filter((it) => !(it.conversation_id || ""));
+    } else {
+      filtered = filtered.filter((it) => (it.project_id || "") === params.project_id);
+    }
+  }
+  const sliced = filtered.slice(-lim);
+  const pullInbox = fullList
     .filter((it) => it.stores.includes("pull") && (it.status === "queued" || it.status === "claimed"))
     .map((it) => ({
       job_id: it.job_id,
       status: it.status,
       source: it.source,
       label: it.label,
-      prompt_preview: it.prompt.slice(0, 120),
+      prompt_preview: (it.display_prompt || it.prompt).slice(0, 120),
       created_at: it.created_at,
       claimed_at: it.claimed_at,
       can_cancel: me.role === "admin",
@@ -4570,9 +4735,9 @@ export async function fetchFederationWorkbenchTimeline(
     ok: true,
     agent: demoBuildWorkbenchAgent(ag),
     timeline: sliced,
-    total: list.length,
+    total: filtered.length,
     limit: lim,
-    has_active_jobs: list.some((it) => it.is_active),
+    has_active_jobs: hasActive,
     pull_inbox: pullInbox,
     leader_events: leaderEvents,
     can_edit: me.role === "admin",
@@ -4598,6 +4763,15 @@ export async function dispatchFederationWorkbenchJob(
   const isPull = ag.transport === "pull_worker" || ag.driver === "pull_worker";
   const ts = nowSec();
   const jid = nextDemoId(isPull ? "pull" : "job");
+  const convId = (payload.conversation_id || "").trim();
+  const existingList = demoFedWorkbenchTimelines[agentId] || [];
+  const ctxTurns =
+    payload.include_context !== false && convId
+      ? Math.min(
+          6,
+          existingList.filter((x) => x.conversation_id === convId && x.status === "done").length,
+        )
+      : 0;
   const item: FederationTimelineJobItem = {
     job_id: jid,
     status: "queued",
@@ -4608,6 +4782,11 @@ export async function dispatchFederationWorkbenchJob(
     from_actor: "studio:demo-admin",
     team_id: "demo-squad",
     group_id: "",
+    project_id: (payload.project_id || "").trim(),
+    conversation_id: convId,
+    conversation_title: (payload.conversation_title || "").trim(),
+    display_prompt: prompt,
+    context_turns: ctxTurns,
     prompt,
     result_text: "",
     error: "",
@@ -4637,7 +4816,9 @@ export async function dispatchFederationWorkbenchJob(
       cur.elapsed_s = Math.max(1, doneTs - ts);
       cur.is_active = false;
       cur.can_cancel = false;
-      cur.result_text = `节点 \`${agentId}\` 已完成演示任务 **${cur.label}**，所有校验通过。`;
+      cur.result_text = `节点 \`${agentId}\` 已完成演示任务 **${cur.label}**${
+        ctxTurns > 0 ? `（已参考前 ${ctxTurns} 轮上下文）` : ""
+      }，所有校验通过。`;
       emitDemoEvent("federation_updated", { action: "workbench_done", agent_id: agentId, ts: doneTs });
     }
   }, 1500);
