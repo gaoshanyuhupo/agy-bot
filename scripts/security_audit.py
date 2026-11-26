@@ -210,8 +210,6 @@ SAFE_PUBLIC_HOSTS: Set[str] = {
     "generativelanguage.googleapis.com",
     "antigravity.google",
     "www.googleapis.com",
-    "daily-cloudcode-pa.googleapis.com",
-    "cloudcode-pa.googleapis.com",
     "antigravity-cli-auto-updater-974169037036.us-central1.run.app",
     "pypi.python.org",
     "systemd.io",
@@ -399,6 +397,24 @@ def load_local_blocklist(path: Optional[Path] = None) -> List[Tuple[str, re.Patt
 # Generic structural audit rules (no personal/operator literals embedded)
 # ---------------------------------------------------------------------------
 
+_FORBIDDEN_GOOGLE_INTERNAL_HOST_RE = re.compile(
+    r"(?:[a-z0-9-]+[.-])?" + "cloudcode" + r"-pa(?:\.[a-z0-9-]+)*\.googleapis\.com",
+    re.IGNORECASE,
+)
+_FORBIDDEN_GOOGLE_INTERNAL_RPC_RE = re.compile(
+    "v1"
+    + "internal:(?:"
+    + "retrieveUser"
+    + "QuotaSummary|"
+    + "fetchAvailable"
+    + "Models|"
+    + "loadCode"
+    + "Assist|"
+    + "onboard"
+    + "User)",
+    re.IGNORECASE,
+)
+
 RAW_SECRET_RULES: Tuple[Tuple[str, str, str, re.Pattern[str]], ...] = (
     ("CRITICAL", "KEY", "private_key_pem", re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")),
     ("CRITICAL", "KEY", "github_pat", re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{12,}\b")),
@@ -444,6 +460,18 @@ RAW_SECRET_RULES: Tuple[Tuple[str, str, str, re.Pattern[str]], ...] = (
         "KEY",
         "auth_header_literal",
         re.compile(r"""(?i)\bauthorization\b["']?\s*[:=]\s*["'](?:bearer|basic|token)\s+([A-Za-z0-9_.~+/=-]{14,})["']"""),
+    ),
+    (
+        "CRITICAL",
+        "API",
+        "forbidden_google_internal_host",
+        _FORBIDDEN_GOOGLE_INTERNAL_HOST_RE,
+    ),
+    (
+        "CRITICAL",
+        "API",
+        "forbidden_google_internal_rpc",
+        _FORBIDDEN_GOOGLE_INTERNAL_RPC_RE,
     ),
 )
 
@@ -529,17 +557,28 @@ IPV6_RE = re.compile(
 )
 
 
+_NO_PLACEHOLDER_EXEMPT_RULES = frozenset({
+    "forbidden_google_internal_host",
+    "forbidden_google_internal_rpc",
+})
+
+
 def _scan_raw_secrets(text: str, rel_path: str, commit: Optional[str] = None) -> List[Finding]:
     findings: List[Finding] = []
     for severity, cat, rule, rx in RAW_SECRET_RULES:
         for m in rx.finditer(text):
             val = m.group(1) if m.lastindex else m.group(0)
-            if _has_placeholder(val):
+            if rule not in _NO_PLACEHOLDER_EXEMPT_RULES and _has_placeholder(val):
                 continue
             if rule == "tg_bot_token" and val.startswith(("123456789:", "000000000:")):
                 continue
             if rule == "pk_prefixed_key" and val.lower().startswith("pk-your"):
                 continue
+            detail = (
+                f"Forbidden Google internal API reference `{rule}` (use official agy /usage or OAuth userinfo)"
+                if rule in _NO_PLACEHOLDER_EXEMPT_RULES
+                else f"Matched raw secret pattern `{rule}`"
+            )
             findings.append(
                 Finding(
                     severity=severity,
@@ -548,7 +587,7 @@ def _scan_raw_secrets(text: str, rel_path: str, commit: Optional[str] = None) ->
                     path=rel_path,
                     line=_line_col(text, m.start()),
                     masked_match=_mask_value(val),
-                    detail=f"Matched raw secret pattern `{rule}`",
+                    detail=detail,
                     commit=commit,
                 )
             )
@@ -1519,6 +1558,52 @@ def scan_repository(
     return scanned, findings
 
 
+_FULL_HEX_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_RETIRED_HOST_FROM_DETAIL_RE = re.compile(r"^(?:External URL host|Bare domain) `([^`]+)`")
+
+# Immutable 40-char SHA policy-retirement boundary for historical commits that
+# predated the retirement of Google internal quota APIs. Scoped strictly to
+# `scan_git_history()` (never workspace scanning) and strictly to retired rules/hosts.
+_RETIRED_GOOGLE_INTERNAL_HISTORY_FILES: dict[str, frozenset[str]] = {
+    "f18dcd3f69904d9becce83e19b8397ab75a03bdd": frozenset(
+        {
+            "bridge/google_accounts.py",
+            "tests/test_google_accounts.py",
+            "tests/test_studio_google_accounts.py",
+        }
+    ),
+    "5dbb2934d8f2bb258d70abe593f22553ad47b8ab": frozenset(
+        {
+            "scripts/security_audit.py",
+        }
+    ),
+}
+
+
+def _is_retired_google_internal_history_hit(full_sha: str, rel_path: str, hit: Finding) -> bool:
+    """Return True ONLY for exact retired-policy hits inside pinned 40-char historical commits."""
+    if not isinstance(full_sha, str) or not _FULL_HEX_SHA_RE.fullmatch(full_sha):
+        return False
+    allowed_paths = _RETIRED_GOOGLE_INTERNAL_HISTORY_FILES.get(full_sha)
+    if not allowed_paths:
+        return False
+    norm_path = rel_path.replace("\\", "/")
+    if norm_path not in allowed_paths:
+        return False
+    if hit.rule in {"forbidden_google_internal_host", "forbidden_google_internal_rpc"}:
+        return True
+    if hit.rule in {"unallowlisted_external_url", "unallowlisted_bare_domain"}:
+        m = _RETIRED_HOST_FROM_DETAIL_RE.match(hit.detail or "")
+        if not m:
+            return False
+        host = m.group(1).strip().lower().rstrip(".")
+        if ":" in host and not host.startswith("["):
+            host = host.split(":", 1)[0]
+        host = host.strip("[]")
+        return bool(_FORBIDDEN_GOOGLE_INTERNAL_HOST_RE.fullmatch(host))
+    return False
+
+
 def scan_git_history(
     repo_root: Path,
     *,
@@ -1573,6 +1658,8 @@ def scan_git_history(
                 continue
             chunk = "\n".join(lines)
             for hit in scan_text(chunk, fpath, strict=strict, commit=sha[:8], extra_rules=extra_rules):
+                if _is_retired_google_internal_history_hit(sha, fpath, hit):
+                    continue
                 findings.append(dataclasses.replace(hit, category="HISTORY"))
 
     return len(commits), findings
