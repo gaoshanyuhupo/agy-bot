@@ -27,6 +27,15 @@ def _import_server_module() -> Any:
 
     return live_browser_server
 
+
+def _import_cdp_bridge_module() -> Any:
+    scripts_dir = str(Path(__file__).resolve().parent)
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    import cdp_live_bridge
+
+    return cdp_live_bridge
+
 CONFIG_DIR = Path(os.environ.get("AGY_LIVE_BROWSER_CONFIG_DIR", str(Path.home() / ".config/agy-live-browser")))
 CONFIG_FILE = CONFIG_DIR / "config.json"
 LOCAL_TOKEN_FILE = CONFIG_DIR / "local.token"
@@ -560,6 +569,14 @@ class SyncLiveBridge:
         self._profile_dir: Path | None = Path(profile_dir) if profile_dir is not None else None
         self._sync_lease_id: str | None = None
         self._sync_session_gen: int | None = None
+        self._last_error: str | None = None if self.enabled else "Live Browser Hub unavailable or missing local token"
+        self._last_status_code: int | None = None
+        self._last_push_ok: bool = False
+        self._last_takeover: bool = False
+        self._last_takeover_gen: int | None = None
+        self._last_commands_count: int = 0
+        self._last_screenshot_error: str | None = None
+        self._last_screenshot_exc_type: str | None = None
         self._x11_display: str | None = self._resolve_display()
         self._last_clip: str = self._read_x11_clip()
         if self.enabled:
@@ -588,16 +605,57 @@ class SyncLiveBridge:
                     timeout=3.0,
                 )
                 status_code = getattr(resp, "status_code", 200)
+                self._last_status_code = status_code
                 start_data = resp.json() if hasattr(resp, "json") else {}
                 if status_code >= 400 or (isinstance(start_data, dict) and start_data.get("ok") is False):
+                    err_val = start_data.get("error") if isinstance(start_data, dict) else None
+                    self._last_error = str(err_val or f"HTTP {status_code}")
                     self.enabled = False
                 elif isinstance(start_data, dict):
+                    self._last_error = None
                     self._sync_lease_id = start_data.get("sync_lease_id")
                     self._sync_session_gen = start_data.get("session_gen")
+                    self._last_takeover = bool(start_data.get("takeover", False))
+                    start_tgen = _parse_strict_int_no_ws(start_data.get("takeover_gen"))
+                    if start_tgen is not None:
+                        self._last_takeover_gen = start_tgen
                     self._pinned_verified = bool(start_data.get("pinned_verified"))
                     self._allow_google_verified = bool(start_data.get("allow_google_verified"))
-            except Exception:
+            except Exception as exc:
+                self._last_error = str(exc) or type(exc).__name__
                 self.enabled = False
+
+    @property
+    def last_error(self) -> str | None:
+        return getattr(self, "_last_error", None)
+
+    @property
+    def last_status_code(self) -> int | None:
+        return getattr(self, "_last_status_code", None)
+
+    @property
+    def last_push_ok(self) -> bool:
+        return bool(getattr(self, "_last_push_ok", False))
+
+    @property
+    def last_takeover(self) -> bool:
+        return bool(getattr(self, "_last_takeover", False))
+
+    @property
+    def last_takeover_gen(self) -> int | None:
+        return getattr(self, "_last_takeover_gen", None)
+
+    @property
+    def last_commands_count(self) -> int:
+        return int(getattr(self, "_last_commands_count", 0))
+
+    @property
+    def last_screenshot_error(self) -> str | None:
+        return getattr(self, "_last_screenshot_error", None)
+
+    @property
+    def last_screenshot_exc_type(self) -> str | None:
+        return getattr(self, "_last_screenshot_exc_type", None)
 
     def _sync_headers(self) -> dict[str, str]:
         hdrs = dict(self.client._headers())
@@ -606,12 +664,13 @@ class SyncLiveBridge:
             hdrs["X-Sync-Lease-Id"] = str(lease_id)
         return hdrs
 
-    def close(self) -> None:
+    def close(self, *, skip_final_checkpoint: bool = False) -> None:
         self._release_held_buttons_sync()
         if not self.enabled:
             return
         try:
-            self.sync_checkpoint(ai_status="会话即将完成", allow_takeover_loop=False)
+            if not skip_final_checkpoint:
+                self.sync_checkpoint(ai_status="会话即将完成", allow_takeover_loop=False)
             self._release_held_buttons_sync()
             stop_body: dict[str, Any] = {}
             if self._sync_lease_id:
@@ -728,6 +787,9 @@ class SyncLiveBridge:
                 timeout=2.5,
             )
             if getattr(resp, "status_code", 200) in (409, 410):
+                self._last_status_code = getattr(resp, "status_code", None)
+                self._last_push_ok = False
+                self._last_error = f"Sync clipboard rejected with HTTP {self._last_status_code}"
                 self._release_held_buttons_sync()
                 self.enabled = False
         except Exception:
@@ -744,20 +806,30 @@ class SyncLiveBridge:
         validated_timeout: float | None = None
         if takeover_timeout is not None:
             validated_timeout = _validate_positive_timeout(takeover_timeout)
-        if not self.enabled or self._in_checkpoint:
+        if self._in_checkpoint:
+            return False
+        if not self.enabled:
+            self._last_push_ok = False
             return False
         deadline = (time.monotonic() + validated_timeout) if validated_timeout is not None else None
         timed_out = False
         self._in_checkpoint = True
         try:
             while True:
+                self._last_push_ok = False
+                self._last_commands_count = 0
                 page = self._active_raw_page()
                 if not page:
+                    self._last_error = "No active page available for sync push"
                     break
                 try:
                     jpeg = page.screenshot(type="jpeg", quality=56, animations="allow", timeout=2500)
-                except Exception:
+                    self._last_screenshot_error = None
+                    self._last_screenshot_exc_type = None
+                except Exception as exc:
                     jpeg = b""
+                    self._last_screenshot_error = str(exc) or type(exc).__name__
+                    self._last_screenshot_exc_type = type(exc).__name__
 
                 pages = list(self.raw_ctx.pages)
                 tabs = []
@@ -816,17 +888,68 @@ class SyncLiveBridge:
                     timeout=4.0,
                 )
                 status_code = getattr(resp, "status_code", 200)
+                self._last_status_code = status_code
                 if status_code in (409, 410):
+                    err_txt = f"HTTP {status_code}"
+                    try:
+                        err_payload = resp.json()
+                        if isinstance(err_payload, dict) and err_payload.get("error"):
+                            err_txt = str(err_payload["error"])
+                    except Exception:
+                        pass
+                    self._last_error = err_txt
                     self._release_held_buttons_sync()
                     self._clear_acked_tab_cmds()
                     self.enabled = False
                     break
-                data = resp.json()
-                if isinstance(data, dict) and data.get("ok") is False:
+                if status_code >= 400:
+                    err_txt = f"HTTP {status_code}"
+                    try:
+                        err_payload = resp.json()
+                        if isinstance(err_payload, dict) and err_payload.get("error"):
+                            err_txt = str(err_payload["error"])
+                    except Exception:
+                        pass
+                    self._last_error = err_txt
+                    break
+                try:
+                    data = resp.json()
+                except Exception as exc:
+                    self._last_error = str(exc) or type(exc).__name__
+                    break
+                if not isinstance(data, dict):
+                    self._last_error = f"Invalid sync push JSON response (HTTP {status_code})"
+                    break
+                if data.get("ok") is False:
+                    self._last_error = str(data.get("error") or f"HTTP {status_code}")
                     self._release_held_buttons_sync()
                     self._clear_acked_tab_cmds()
                     self.enabled = False
                     break
+                if status_code != 200 or data.get("ok") is not True:
+                    self._last_error = str(data.get("error") or f"Unexpected sync push response (HTTP {status_code})")
+                    break
+                resp_lease = data.get("sync_lease_id")
+                if lease_id and resp_lease is not None and str(resp_lease) != str(lease_id):
+                    self._last_error = "Mismatched sync_lease_id"
+                    self._release_held_buttons_sync()
+                    self.enabled = False
+                    break
+                is_takeover = bool(data.get("takeover"))
+                resp_sgen = data.get("session_gen")
+                resp_tgen = data.get("takeover_gen")
+                if sync_sgen is not None and resp_sgen is not None:
+                    try:
+                        if int(resp_sgen) != int(sync_sgen):
+                            self._last_error = "Mismatched sync session_gen"
+                            self._release_held_buttons_sync()
+                            self.enabled = False
+                            break
+                    except (TypeError, ValueError):
+                        self._last_error = "Invalid sync session_gen"
+                        self._release_held_buttons_sync()
+                        self.enabled = False
+                        break
                 if acked_snap:
                     cur_acked = getattr(self, "_acked_tab_cmds", None)
                     if isinstance(cur_acked, list):
@@ -843,29 +966,18 @@ class SyncLiveBridge:
                                 cur_rejected.remove(cid)
                             except ValueError:
                                 pass
+                self._last_push_ok = True
+                self._last_error = None
+                self._last_takeover = is_takeover
+                tgen_parsed = _parse_strict_int_no_ws(resp_tgen)
+                if tgen_parsed is not None:
+                    self._last_takeover_gen = tgen_parsed
                 cur_clip = self._read_x11_clip()
                 if cur_clip and cur_clip != self._last_clip:
                     self._last_clip = cur_clip
                     self._push_clip({"text": cur_clip, "source": "网页复制按钮 / Ctrl+C"})
-                resp_lease = data.get("sync_lease_id")
-                if lease_id and resp_lease is not None and str(resp_lease) != str(lease_id):
-                    self._release_held_buttons_sync()
-                    self.enabled = False
-                    break
-                is_takeover = bool(data.get("takeover"))
-                resp_sgen = data.get("session_gen")
-                resp_tgen = data.get("takeover_gen")
-                if sync_sgen is not None and resp_sgen is not None:
-                    try:
-                        if int(resp_sgen) != int(sync_sgen):
-                            self._release_held_buttons_sync()
-                            self.enabled = False
-                            break
-                    except (TypeError, ValueError):
-                        self._release_held_buttons_sync()
-                        self.enabled = False
-                        break
                 cmds = data.get("commands") or []
+                self._last_commands_count = len(cmds)
                 for cmd in cmds:
                     if not self.enabled:
                         self._release_held_buttons_sync()
@@ -924,7 +1036,9 @@ class SyncLiveBridge:
                     time.sleep(min(0.09, remaining))
                 else:
                     time.sleep(0.09)
-        except Exception:
+        except Exception as exc:
+            self._last_push_ok = False
+            self._last_error = str(exc) or type(exc).__name__
             if not self.enabled:
                 self._release_held_buttons_sync()
         finally:
@@ -1666,91 +1780,146 @@ def build_parser() -> argparse.ArgumentParser:
     p_card = sub.add_parser("notify", help="Force send/refresh Telegram Live Browser card.")
     p_card.add_argument("--new", action="store_true", help="Send a fresh card message.")
 
+    p_cdp = sub.add_parser(
+        "attach-cdp",
+        help="Attach a loopback-only external CDP browser to Live Browser Hub for real-time view & human takeover.",
+    )
+    p_cdp.add_argument(
+        "--cdp-url",
+        required=True,
+        help="Loopback CDP endpoint (ws://127.0.0.1:<port>/devtools/... or http://127.0.0.1:<port>).",
+    )
+    p_cdp_mode = p_cdp.add_mutually_exclusive_group()
+    p_cdp_mode.add_argument(
+        "--wait-human",
+        action="store_true",
+        help="Immediately activate human takeover and wait until user clicks [交还给 AI] (default).",
+    )
+    p_cdp_mode.add_argument(
+        "--watch",
+        action="store_true",
+        help="Stream live frames continuously without forcing immediate takeover.",
+    )
+    p_cdp.add_argument("--reason", default="请在实时面板完成操作后点击【▶️ 交还给 AI】")
+    p_cdp.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help="Wait timeout in seconds (default: 600 for --wait-human; unlimited for --watch).",
+    )
+    p_cdp.add_argument("--url", default=None, help="Optional initial http(s):// URL to open after attaching.")
+    p_cdp.add_argument("--no-notify", action="store_true", help="Skip sending Telegram Live Card.")
+
     return p
 
 
-def main() -> int:
-    args = build_parser().parse_args()
+def main(argv: list[str] | None = None) -> int:
+    raw_argv = list(sys.argv[1:]) if argv is None else list(argv)
+    args = build_parser().parse_args(raw_argv)
     try:
-        cli = LiveBrowserClient(bot=args.bot, user_id=args.user_id)
-        if args.cmd == "status":
-            out = cli.status()
-        elif args.cmd == "start":
-            out = cli.start(
+        if args.cmd == "attach-cdp":
+            cdp_mod = _import_cdp_bridge_module()
+            cdp_mode = "watch" if args.watch else "wait_human"
+            # Pure local validations BEFORE interpreter re-exec, HTTP, or CDP connect.
+            cdp_mod.validate_loopback_cdp_url(args.cdp_url, allow_http=True)
+            if args.url is not None:
+                cdp_mod.validate_navigation_url(args.url)
+            if cdp_mode == "wait_human" or args.timeout is not None:
+                cdp_mod.validate_timeout(args.timeout)
+            resolve_bot_target(args.bot)
+            if args.user_id is not None:
+                resolve_tg_identity(explicit_user_id=args.user_id)
+            cdp_mod.maybe_reexec_into_playwright_python([str(Path(__file__).resolve()), *raw_argv])
+            out = cdp_mod.run_cdp_live_bridge(
+                args.cdp_url,
+                mode=cdp_mode,
+                reason=args.reason,
+                timeout=args.timeout,
                 url=args.url,
-                notify=not args.no_notify,
-                profile=args.profile,
-                os_name=args.os_name,
-                locale=args.locale,
-                window=args.window,
-                mobile=args.mobile,
-                webgl_config=args.webgl_config,
-                block_webrtc=args.block_webrtc,
-                geoip=_parse_geoip_arg(args.geoip),
-                proxy=args.proxy,
-                proxy_bao_ref=args.proxy_bao_ref,
-                ephemeral=args.ephemeral,
-                restart=args.restart,
-                allow_override=args.confirm_override,
+                bot=args.bot,
+                user_id=args.user_id,
+                notify=False if args.no_notify else None,
             )
-        elif args.cmd == "profile":
-            if args.profile_cmd == "list":
-                out = cli.list_profiles()
-            elif args.profile_cmd == "create":
-                out = cli.create_profile(
-                    args.name,
-                    overwrite=args.overwrite,
-                    os=args.os_name,
+        else:
+            cli = LiveBrowserClient(bot=args.bot, user_id=args.user_id)
+            if args.cmd == "status":
+                out = cli.status()
+            elif args.cmd == "start":
+                out = cli.start(
+                    url=args.url,
+                    notify=not args.no_notify,
+                    profile=args.profile,
+                    os_name=args.os_name,
                     locale=args.locale,
                     window=args.window,
-                    mobile=True if args.mobile else None,
+                    mobile=args.mobile,
                     webgl_config=args.webgl_config,
                     block_webrtc=args.block_webrtc,
                     geoip=_parse_geoip_arg(args.geoip),
                     proxy=args.proxy,
                     proxy_bao_ref=args.proxy_bao_ref,
-                    persistent=False if args.ephemeral else True,
-                    allow_google=bool(args.allow_google),
-                    account=args.account,
+                    ephemeral=args.ephemeral,
+                    restart=args.restart,
+                    allow_override=args.confirm_override,
                 )
-            elif args.profile_cmd == "delete":
-                out = cli.delete_profile(args.name)
+            elif args.cmd == "profile":
+                if args.profile_cmd == "list":
+                    out = cli.list_profiles()
+                elif args.profile_cmd == "create":
+                    out = cli.create_profile(
+                        args.name,
+                        overwrite=args.overwrite,
+                        os=args.os_name,
+                        locale=args.locale,
+                        window=args.window,
+                        mobile=True if args.mobile else None,
+                        webgl_config=args.webgl_config,
+                        block_webrtc=args.block_webrtc,
+                        geoip=_parse_geoip_arg(args.geoip),
+                        proxy=args.proxy,
+                        proxy_bao_ref=args.proxy_bao_ref,
+                        persistent=False if args.ephemeral else True,
+                        allow_google=bool(args.allow_google),
+                        account=args.account,
+                    )
+                elif args.profile_cmd == "delete":
+                    out = cli.delete_profile(args.name)
+                else:
+                    raise SystemExit(f"Unknown profile command: {args.profile_cmd}")
+            elif args.cmd == "stop":
+                out = cli.stop()
+            elif args.cmd == "open":
+                out = cli.action("goto", url=args.url)
+            elif args.cmd == "click":
+                out = cli.action("click", target=args.target)
+            elif args.cmd == "fill":
+                out = cli.action("fill", selector=args.selector, text=args.text, submit=args.submit)
+            elif args.cmd == "type":
+                out = cli.action("type", text=args.text, submit=args.submit)
+            elif args.cmd == "press":
+                out = cli.action("press", key=args.key)
+            elif args.cmd == "wait":
+                out = cli.action("wait", target=args.target)
+            elif args.cmd == "text":
+                out = cli.action("text", selector=args.selector)
+            elif args.cmd == "eval":
+                out = cli.action("eval", expression=args.expression)
+            elif args.cmd == "screenshot":
+                out = cli.action("screenshot", path=args.path, full_page=args.full_page)
+            elif args.cmd == "wait-human":
+                timeout_s = _validate_positive_timeout(args.timeout)
+                out = cli.action(
+                    "wait_human",
+                    reason=args.reason,
+                    timeout=timeout_s,
+                    timeout_http=timeout_s + 15.0,
+                )
+            elif args.cmd == "set-public-url":
+                out = cli.update_config(public_url=args.url)
+            elif args.cmd == "notify":
+                out = cli.update_config(ensure_card=True, force_new=args.new)
             else:
-                raise SystemExit(f"Unknown profile command: {args.profile_cmd}")
-        elif args.cmd == "stop":
-            out = cli.stop()
-        elif args.cmd == "open":
-            out = cli.action("goto", url=args.url)
-        elif args.cmd == "click":
-            out = cli.action("click", target=args.target)
-        elif args.cmd == "fill":
-            out = cli.action("fill", selector=args.selector, text=args.text, submit=args.submit)
-        elif args.cmd == "type":
-            out = cli.action("type", text=args.text, submit=args.submit)
-        elif args.cmd == "press":
-            out = cli.action("press", key=args.key)
-        elif args.cmd == "wait":
-            out = cli.action("wait", target=args.target)
-        elif args.cmd == "text":
-            out = cli.action("text", selector=args.selector)
-        elif args.cmd == "eval":
-            out = cli.action("eval", expression=args.expression)
-        elif args.cmd == "screenshot":
-            out = cli.action("screenshot", path=args.path, full_page=args.full_page)
-        elif args.cmd == "wait-human":
-            timeout_s = _validate_positive_timeout(args.timeout)
-            out = cli.action(
-                "wait_human",
-                reason=args.reason,
-                timeout=timeout_s,
-                timeout_http=timeout_s + 15.0,
-            )
-        elif args.cmd == "set-public-url":
-            out = cli.update_config(public_url=args.url)
-        elif args.cmd == "notify":
-            out = cli.update_config(ensure_card=True, force_new=args.new)
-        else:
-            raise SystemExit(f"Unknown command: {args.cmd}")
+                raise SystemExit(f"Unknown command: {args.cmd}")
     except (ValueError, KeyError, RuntimeError, TimeoutError) as exc:
         out = {"ok": False, "error": str(exc)}
 

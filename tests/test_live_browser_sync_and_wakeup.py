@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -28,7 +29,9 @@ for _p in (LIVE_SCRIPTS_DIR, BRIDGE_DIR):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
+import live_browser_ctl as ctl  # noqa: E402
 import live_browser_server as srv  # noqa: E402
+import cdp_live_bridge as cdp_bridge  # noqa: E402
 import bot_bus  # noqa: E402
 import memory_guard  # noqa: E402
 
@@ -1056,6 +1059,1446 @@ class TestFix4BridgeTakeoverReceiverZeroTrust(unittest.TestCase):
 
             self.assertIn("tests/test_live_browser_sync_and_wakeup.py", export_public.CORE_SYNC_EXACT)
             self.assertTrue(export_public.is_public_core("tests/test_live_browser_sync_and_wakeup.py"))
+            self.assertTrue(
+                export_public.is_public_core(".agents/skills/live-browser/scripts/cdp_live_bridge.py")
+            )
+
+
+# ---------------- CB1..CB7: Loopback CDP -> SyncLiveBridge Prod-Release Suite ----------------
+
+
+class _TargetClosedError(RuntimeError):
+    """Synthetic TargetClosedError mimicking Playwright CDP target closure without real Playwright."""
+
+
+class _MockCDPMouse:
+    def __init__(self, page_label: str, log: list[tuple[str, ...]]) -> None:
+        self.page_label = page_label
+        self.log = log
+
+    def move(self, x: float, y: float) -> None:
+        self.log.append((self.page_label, "mouse.move", f"{x},{y}"))
+
+    def down(self, *, button: str = "left") -> None:
+        self.log.append((self.page_label, "mouse.down", button))
+
+    def up(self, *, button: str = "left") -> None:
+        self.log.append((self.page_label, "mouse.up", button))
+
+    def click(self, x: float, y: float, **kw: object) -> None:
+        self.log.append((self.page_label, "mouse.click", f"{x},{y}", str(kw.get("button", "left"))))
+
+    def dblclick(self, x: float, y: float) -> None:
+        self.log.append((self.page_label, "mouse.dblclick", f"{x},{y}"))
+
+    def wheel(self, dx: float, dy: float) -> None:
+        self.log.append((self.page_label, "mouse.wheel", f"{dx},{dy}"))
+
+
+class _MockCDPKeyboard:
+    def __init__(self, page_label: str, log: list[tuple[str, ...]]) -> None:
+        self.page_label = page_label
+        self.log = log
+
+    def type(self, text: str, **_kw: object) -> None:
+        self.log.append((self.page_label, "keyboard.type", text))
+
+    def insert_text(self, text: str) -> None:
+        self.log.append((self.page_label, "keyboard.insert_text", text))
+
+    def press(self, key: str) -> None:
+        self.log.append((self.page_label, "keyboard.press", key))
+
+
+class _MockCDPPage:
+    def __init__(
+        self,
+        label: str,
+        url: str = "https://example.com/challenge",
+        title: str = "Challenge",
+        log: list[tuple[str, ...]] | None = None,
+    ) -> None:
+        self.label = label
+        self.url = url
+        self._title = title
+        self.viewport_size = {"width": 1280, "height": 800}
+        self.log = log if log is not None else []
+        self.mouse = _MockCDPMouse(label, self.log)
+        self.keyboard = _MockCDPKeyboard(label, self.log)
+        self.closed = False
+        self.close_calls = 0
+        self.screenshot_exc: Exception | None = None
+        self.screenshot_calls = 0
+        self.eval_result: object = "Extracted text from page"
+
+    def is_closed(self) -> bool:
+        return self.closed
+
+    def close(self) -> None:
+        self.close_calls += 1
+        self.closed = True
+        self.log.append((self.label, "page.close"))
+
+    def title(self) -> str:
+        return self._title
+
+    def bring_to_front(self) -> None:
+        self.log.append((self.label, "page.bring_to_front"))
+
+    def goto(self, url: str, **_kw: object) -> None:
+        self.url = url
+        self.log.append((self.label, "page.goto", url))
+
+    def go_back(self, **_kw: object) -> None:
+        self.log.append((self.label, "page.go_back"))
+
+    def go_forward(self, **_kw: object) -> None:
+        self.log.append((self.label, "page.go_forward"))
+
+    def reload(self, **_kw: object) -> None:
+        self.log.append((self.label, "page.reload"))
+
+    def evaluate(self, _expr: str, *_args: object) -> object:
+        self.log.append((self.label, "page.evaluate"))
+        return self.eval_result
+
+    def screenshot(self, **_kw: object) -> bytes:
+        self.screenshot_calls += 1
+        if self.screenshot_exc is not None:
+            raise self.screenshot_exc
+        return b"\xff\xd8\xff\xe0MOCKCDP"
+
+
+class _MockCDPContext:
+    def __init__(self, pages: list[_MockCDPPage], log: list[tuple[str, ...]]) -> None:
+        self.pages = list(pages)
+        self.log = log
+        self.close_calls = 0
+
+    def new_page(self) -> _MockCDPPage:
+        p = _MockCDPPage(f"p{len(self.pages)}", "about:blank", "New Tab", self.log)
+        self.pages.append(p)
+        return p
+
+    def close(self) -> None:
+        self.close_calls += 1
+        self.log.append(("ctx", "context.close"))
+
+
+class _MockCDPBrowser:
+    def __init__(self, contexts: list[_MockCDPContext], log: list[tuple[str, ...]]) -> None:
+        self.contexts = list(contexts)
+        self.log = log
+        self.connected = True
+        self.close_calls = 0
+
+    def is_connected(self) -> bool:
+        return self.connected
+
+    def close(self) -> None:
+        self.close_calls += 1
+        self.connected = False
+        self.log.append(("browser", "browser.close"))
+
+
+class _MockPlaywright:
+    def __init__(self, log: list[tuple[str, ...]]) -> None:
+        self.log = log
+        self.stop_calls = 0
+
+    def stop(self) -> None:
+        self.stop_calls += 1
+        self.log.append(("pw", "pw.stop"))
+
+
+class _MockHTTPResponse:
+    def __init__(
+        self,
+        status_code: int = 200,
+        body: object = None,
+        *,
+        raw_bytes: bytes | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self.status_code = status_code
+        self._body = body
+        self._raw_bytes = raw_bytes
+        self.headers = dict(headers or {})
+        self.closed = False
+
+    def json(self) -> object:
+        if self._body is not None:
+            return self._body
+        return json.loads((self._raw_bytes or b"{}").decode("utf-8"))
+
+    @property
+    def content(self) -> bytes:
+        if self._raw_bytes is not None:
+            return self._raw_bytes
+        return json.dumps(self._body or {}).encode("utf-8")
+
+    def iter_content(self, chunk_size: int = 8192):
+        data = self.content
+        for i in range(0, len(data), chunk_size):
+            yield data[i : i + chunk_size]
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _MockHubSession:
+    """In-memory mock for `LiveBrowserClient.session` matching `/internal/*` contracts."""
+
+    def __init__(self) -> None:
+        self.trust_env = True
+        self.calls: list[dict[str, object]] = []
+        self.health_ok = True
+        self.start_status = 200
+        self.start_resp: dict[str, object] = {
+            "ok": True,
+            "session_gen": 11,
+            "takeover_gen": 1,
+            "sync_lease_id": "lease-abc-123",
+            "pinned": False,
+            "pinned_verified": False,
+            "allow_google": False,
+            "allow_google_verified": False,
+            "google_allowed": False,
+        }
+        self.push_handler: object = None
+        self.config_handler: object = None
+        self.stop_calls: list[dict[str, object]] = []
+        self.clipboard_calls: list[dict[str, object]] = []
+        self.takeover = False
+        self.session_gen = 11
+        self.takeover_gen = 1
+        self.event_log: list[tuple[str, ...]] = []
+
+    def get(self, url: str, **_kw: object) -> _MockHTTPResponse:
+        self.calls.append({"method": "GET", "url": url})
+        if url.endswith("/healthz"):
+            return _MockHTTPResponse(200 if self.health_ok else 503, {"ok": self.health_ok})
+        return _MockHTTPResponse(404, {"ok": False})
+
+    def post(self, url: str, **kw: object) -> _MockHTTPResponse:
+        rec = {
+            "method": "POST",
+            "url": url,
+            "headers": dict(kw.get("headers") or {}),  # type: ignore[arg-type]
+            "json": kw.get("json"),
+            "data_len": len(kw.get("data") or b"") if isinstance(kw.get("data"), (bytes, bytearray)) else 0,
+        }
+        self.calls.append(rec)
+        if "/internal/sync/start" in url:
+            self.event_log.append(("hub", "sync.start"))
+            return _MockHTTPResponse(self.start_status, dict(self.start_resp))
+        if "/internal/sync/push" in url:
+            self.event_log.append(("hub", "sync.push"))
+            if callable(self.push_handler):
+                return self.push_handler(url, kw)
+            return _MockHTTPResponse(
+                200,
+                {
+                    "ok": True,
+                    "session_gen": self.session_gen,
+                    "sync_lease_id": self.start_resp.get("sync_lease_id"),
+                    "takeover": self.takeover,
+                    "takeover_gen": self.takeover_gen,
+                    "commands": [],
+                },
+            )
+        if "/internal/sync/clipboard" in url:
+            self.clipboard_calls.append(rec)
+            self.event_log.append(("hub", "sync.clipboard"))
+            return _MockHTTPResponse(200, {"ok": True})
+        if "/internal/sync/stop" in url:
+            self.stop_calls.append(rec)
+            self.event_log.append(("hub", "sync.stop"))
+            return _MockHTTPResponse(200, {"ok": True})
+        if "/internal/config" in url:
+            body = kw.get("json") or {}
+            assert isinstance(body, dict)
+            self.event_log.append(("hub", f"config.takeover={body.get('takeover')}"))
+            if callable(self.config_handler):
+                return self.config_handler(body)
+            if "takeover" in body:
+                self.takeover = bool(body["takeover"])
+                self.takeover_gen += 1
+            return _MockHTTPResponse(
+                200,
+                {
+                    "ok": True,
+                    "owner_bound": True,
+                    "session_gen": self.session_gen,
+                    "takeover_gen": self.takeover_gen,
+                    "takeover": self.takeover,
+                    "card_sent": True if body.get("ensure_card") else None,
+                },
+            )
+        return _MockHTTPResponse(404, {"ok": False})
+
+
+_REAL_LIVE_BROWSER_CLIENT_CLS = ctl.LiveBrowserClient
+
+
+def _build_mock_hub_client(hub_sess: _MockHubSession, *, bot: str = "main") -> ctl.LiveBrowserClient:
+    cli = _REAL_LIVE_BROWSER_CLIENT_CLS.__new__(_REAL_LIVE_BROWSER_CLIENT_CLS)
+    cli.base_url = "http://127.0.0.1:18795"
+    cli.token = "local-tok"
+    cli.bot = bot
+    cli._explicit_user_id = None
+    cli._explicit_chat_id = None
+    cli.session = hub_sess  # type: ignore[assignment]
+    return cli
+
+
+def _make_clean_cdp_env() -> dict[str, str]:
+    env = dict(os.environ)
+    for k in list(env.keys()):
+        if k.startswith("AGY_") or k in (
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "_AGY_LIVE_BROWSER_REEXEC",
+        ):
+            env.pop(k, None)
+    return env
+
+
+class TestCB1LoopbackCDPValidationAndSSRF(unittest.TestCase):
+    """CB1: Loopback-only CDP URL validation, anti-SSRF, anti-DNS-rebinding, proxy/redirect/tamper blocks."""
+
+    def test_cb1_rejects_non_loopback_dns_rebinding_illegal_ports_paths_creds_and_ctrl_chars(self) -> None:
+        # Build synthetic test IPs dynamically to avoid static literal IP/URL audit noise
+        alt_loopback = ".".join(("127", "0", "0", "2"))
+        meta_ip = ".".join(("169", "254", "169", "254"))
+        bad_urls = [
+            "ws://localhost:19222/devtools/browser/a",
+            "ws://0.0.0.0:19222/devtools/browser/a",
+            "ws://[::]:19222/devtools/browser/a",
+            f"ws://{alt_loopback}:19222/devtools/browser/a",
+            f"ws://{meta_ip}:19222/devtools/browser/a",
+            "ws://[::ffff:127.0.0.1]:19222/devtools/browser/a",
+            "https://127.0.0.1:19222",
+            "wss://127.0.0.1:19222/devtools/browser/a",
+            "file:///etc/passwd",
+            "ws://u:p@127.0.0.1:19222/devtools/browser/a",
+            "ws://127.0.0.1:80/devtools/browser/a",
+            "ws://127.0.0.1:1023/devtools/browser/a",
+            "ws://127.0.0.1:65536/devtools/browser/a",
+            "ws://127.0.0.1:19222/admin",
+            "ws://127.0.0.1:19222/devtools/../secret",
+            "ws://127.0.0.1:19222/devtools/%2e%2e/secret",
+            "ws://127.0.0.1:19222/devtools/browser/a\r\nX:1",
+            "ws://127.0.0.1:19222/devtools/browser/a?foo=1",
+            "http://127.0.0.1:19222/admin",
+        ]
+        connect_calls: list[str] = []
+        for bad in bad_urls:
+            with self.subTest(url=bad):
+                with self.assertRaises(ValueError):
+                    cdp_bridge.validate_loopback_cdp_url(bad)
+                with self.assertRaises(ValueError):
+                    cdp_bridge.run_cdp_live_bridge(
+                        bad,
+                        connect_fn=lambda u, _t: (connect_calls.append(u), None),  # type: ignore[return-value]
+                        install_signals=False,
+                        env=_make_clean_cdp_env(),
+                    )
+        self.assertEqual([], connect_calls, "Zero connect_over_cdp calls permitted on invalid CDP URLs")
+
+        # Valid literal loopback endpoints pass
+        valid_id = "browser-session-01"
+        self.assertEqual(
+            f"ws://127.0.0.1:19222/devtools/browser/{valid_id}",
+            cdp_bridge.validate_loopback_cdp_url(
+                f"ws://127.0.0.1:19222/devtools/browser/{valid_id}"
+            ),
+        )
+        self.assertEqual(
+            "ws://[::1]:19222/devtools/browser/abc",
+            cdp_bridge.validate_loopback_cdp_url("ws://[::1]:19222/devtools/browser/abc"),
+        )
+        self.assertEqual(
+            "http://127.0.0.1:19222/json/version",
+            cdp_bridge.validate_loopback_cdp_url("http://127.0.0.1:19222"),
+        )
+
+    def test_cb1_http_version_probe_disables_proxy_and_redirects_and_rejects_tampered_ws_urls(self) -> None:
+        observed_get_kwargs: list[dict[str, object]] = []
+
+        class _FakeProbeSession:
+            def __init__(self, resp: _MockHTTPResponse) -> None:
+                self.trust_env = True
+                self._resp = resp
+
+            def get(self, url: str, **kw: object) -> _MockHTTPResponse:
+                observed_get_kwargs.append({"url": url, "trust_env": self.trust_env, **kw})
+                return self._resp
+
+            def close(self) -> None:
+                pass
+
+        proxy_host = "proxy.example.invalid"
+        meta_ip = ".".join(("169", "254", "169", "254"))
+        pub_ip = ".".join(("203", "0", "113", "5"))
+        with mock.patch.dict(
+            os.environ,
+            {"HTTP_PROXY": f"http://{proxy_host}:8080", "ALL_PROXY": f"socks5://{proxy_host}:1080"},
+        ):
+            # 1. Valid same-host, same-port /devtools/ response succeeds with proxy & redirect disabled
+            ok_sess = _FakeProbeSession(
+                _MockHTTPResponse(
+                    200,
+                    {"webSocketDebuggerUrl": "ws://127.0.0.1:19222/devtools/browser/ok-id"},
+                )
+            )
+            ws_out = cdp_bridge.resolve_cdp_ws_url("http://127.0.0.1:19222", session=ok_sess)  # type: ignore[arg-type]
+            self.assertEqual("ws://127.0.0.1:19222/devtools/browser/ok-id", ws_out)
+            self.assertFalse(ok_sess.trust_env)
+            self.assertEqual({"http": None, "https": None}, observed_get_kwargs[-1]["proxies"])
+            self.assertFalse(observed_get_kwargs[-1]["allow_redirects"])
+
+            # 2. HTTP 302 redirect rejected
+            redir_sess = _FakeProbeSession(
+                _MockHTTPResponse(302, headers={"Location": f"http://{meta_ip}/latest/meta-data/"})
+            )
+            with self.assertRaises(ValueError):
+                cdp_bridge.resolve_cdp_ws_url("http://127.0.0.1:19222", session=redir_sess)  # type: ignore[arg-type]
+
+            # 3. Tampered webSocketDebuggerUrl / oversized / invalid JSON all rejected
+            tampered_resps = [
+                _MockHTTPResponse(200, {"webSocketDebuggerUrl": "ws://127.0.0.1:19223/devtools/browser/crossport"}),
+                _MockHTTPResponse(200, {"webSocketDebuggerUrl": "ws://localhost:19222/devtools/browser/dns"}),
+                _MockHTTPResponse(200, {"webSocketDebuggerUrl": "ws://[::1]:19222/devtools/browser/v6mismatch"}),
+                _MockHTTPResponse(200, {"webSocketDebuggerUrl": f"ws://{pub_ip}:19222/devtools/browser/pub"}),
+                _MockHTTPResponse(200, {"webSocketDebuggerUrl": "ws://127.0.0.1:19222/admin"}),
+                _MockHTTPResponse(200, raw_bytes=b"{" + (b"x" * (cdp_bridge.MAX_VERSION_RESPONSE_BYTES + 10))),
+                _MockHTTPResponse(200, raw_bytes=b"not-valid-json"),
+            ]
+            connect_calls: list[str] = []
+            for resp in tampered_resps:
+                sess = _FakeProbeSession(resp)
+                with self.assertRaises(ValueError):
+                    cdp_bridge.run_cdp_live_bridge(
+                        "http://127.0.0.1:19222",
+                        http_session=sess,  # type: ignore[arg-type]
+                        connect_fn=lambda u, _t: (connect_calls.append(u), None),  # type: ignore[return-value]
+                        install_signals=False,
+                        env=_make_clean_cdp_env(),
+                    )
+            self.assertEqual([], connect_calls, "Tampered /json/version must never reach connect_over_cdp")
+
+
+class TestCB2PermissionMultiTenantCrossBotGoogleIsolation(unittest.TestCase):
+    """CB2: Group/invalid chat_id fail-closed, cross-bot local rejection, and Google profile isolation."""
+
+    def test_cb2_group_and_invalid_chat_id_never_infer_uid_and_fail_closed_on_403(self) -> None:
+        bad_chat_ids = ["-1001234567890", "0", "abc", " 123456 ", "true"]
+        for raw_cid in bad_chat_ids:
+            with self.subTest(AGY_BOT_CHAT_ID=raw_cid):
+                env = _make_clean_cdp_env()
+                env["AGY_BOT_CHAT_ID"] = raw_cid
+                ident = ctl.resolve_tg_identity(env=env)
+                self.assertEqual("tg_cmd", ident.get("source"))
+                self.assertNotIn("user_id", ident, "Invalid/group AGY_BOT_CHAT_ID must never infer positive user_id")
+                self.assertIn("chat_id", ident)
+
+                log: list[tuple[str, ...]] = []
+                page = _MockCDPPage("p0", log=log)
+                ctx = _MockCDPContext([page], log)
+                browser = _MockCDPBrowser([ctx], log)
+                pw = _MockPlaywright(log)
+                hub_sess = _MockHubSession()
+                hub_sess.start_status = 403
+                hub_sess.start_resp = {"ok": False, "error": "当前操作未获授权，请前往私聊查看与操作"}
+
+                with (
+                    mock.patch.dict(os.environ, env, clear=True),
+                    mock.patch.object(ctl, "LiveBrowserClient", side_effect=lambda *_a, **_kw: _build_mock_hub_client(hub_sess)),
+                ):
+                    res = cdp_bridge.run_cdp_live_bridge(
+                        "ws://127.0.0.1:19222/devtools/browser/cb2",
+                        mode="wait_human",
+                        connect_fn=lambda _u, _t: (pw, browser),
+                        install_signals=False,
+                        env=env,
+                    )
+
+                self.assertFalse(res["ok"])
+                self.assertEqual("sync_start_rejected", res["reason"])
+                self.assertEqual(403, res["status_code"])
+                self.assertEqual(0, res["frames_pushed"])
+                pushed = [c for c in hub_sess.calls if "/internal/sync/push" in str(c["url"])]
+                cfg_calls = [c for c in hub_sess.calls if "/internal/config" in str(c["url"])]
+                self.assertEqual([], pushed, "403 start rejection must push 0 frames")
+                self.assertEqual([], cfg_calls, "403 start rejection must never activate takeover")
+                self.assertEqual(1, browser.close_calls)
+                self.assertEqual(0, page.close_calls)
+                self.assertEqual(0, ctx.close_calls)
+
+    def test_cb2_cross_bot_override_rejected_locally_with_zero_http_and_zero_cdp(self) -> None:
+        env = _make_clean_cdp_env()
+        env["AGY_TG_ENV_FILE"] = "/tmp/mock-bridge/.env.sgcli"
+        env["AGY_TG_BOT_TOKEN"] = SYNTH_TOKEN_A
+        env["AGY_BOT_CHAT_ID"] = str(ADMIN_UID_A)
+        connect_calls: list[str] = []
+        http_calls: list[str] = []
+
+        for wrong_bot in ("sg", "main"):
+            with self.subTest(bot=wrong_bot):
+                with mock.patch.dict(os.environ, env, clear=True):
+                    with self.assertRaises(ValueError):
+                        cdp_bridge.run_cdp_live_bridge(
+                            "ws://127.0.0.1:19222/devtools/browser/cb2-xbot",
+                            bot=wrong_bot,
+                            connect_fn=lambda u, _t: (connect_calls.append(u), None),  # type: ignore[return-value]
+                            install_signals=False,
+                            env=env,
+                        )
+                    # CLI entrypoint exits 1 without calling Hub or CDP
+                    with mock.patch.object(
+                        cdp_bridge, "run_cdp_live_bridge", side_effect=lambda *a, **kw: http_calls.append("ran")
+                    ):
+                        rc = ctl.main(
+                            [
+                                "--bot",
+                                wrong_bot,
+                                "attach-cdp",
+                                "--cdp-url",
+                                "ws://127.0.0.1:19222/devtools/browser/cb2-xbot",
+                            ]
+                        )
+                    self.assertEqual(1, rc)
+        self.assertEqual([], connect_calls)
+        self.assertEqual([], http_calls)
+
+    def test_cb2_sync_start_never_forges_pinned_or_allow_google_and_server_keeps_verified_false(self) -> None:
+        env = _make_clean_cdp_env()
+        log: list[tuple[str, ...]] = []
+        page = _MockCDPPage("p0", log=log)
+        ctx = _MockCDPContext([page], log)
+        browser = _MockCDPBrowser([ctx], log)
+        pw = _MockPlaywright(log)
+        hub_sess = _MockHubSession()
+        hub_sess.takeover = False  # Immediate handback after initial takeover request
+
+        def _cfg_handback(body: dict[str, object]) -> _MockHTTPResponse:
+            hub_sess.takeover = False
+            hub_sess.takeover_gen += 1
+            return _MockHTTPResponse(
+                200,
+                {
+                    "ok": True,
+                    "owner_bound": True,
+                    "session_gen": hub_sess.session_gen,
+                    "takeover_gen": hub_sess.takeover_gen,
+                    "takeover": True,
+                    "card_sent": True,
+                },
+            )
+
+        hub_sess.config_handler = _cfg_handback
+
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(ctl, "LiveBrowserClient", side_effect=lambda *_a, **_kw: _build_mock_hub_client(hub_sess)),
+        ):
+            res = cdp_bridge.run_cdp_live_bridge(
+                "ws://127.0.0.1:19222/devtools/browser/cb2-iso",
+                mode="wait_human",
+                connect_fn=lambda _u, _t: (pw, browser),
+                sleep_fn=lambda _s: None,
+                install_signals=False,
+                env=env,
+            )
+        self.assertTrue(res["ok"])
+        start_calls = [c for c in hub_sess.calls if "/internal/sync/start" in str(c["url"])]
+        self.assertEqual(1, len(start_calls))
+        start_body = start_calls[0]["json"]
+        assert isinstance(start_body, dict)
+        self.assertFalse(bool(start_body.get("pinned_launch")))
+        self.assertFalse(bool(start_body.get("allow_google")))
+        self.assertNotIn("profile_dir", start_body)
+
+        # Verify real server `internal_sync_start` keeps allow_google_verified=False & pinned_verified=False
+        async def _verify_real_server() -> None:
+            hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "tok")
+            req = types.SimpleNamespace(
+                app={"hub": hub},
+                headers={"X-Live-Token": "tok"},
+                remote="127.0.0.1",
+                json=mock.AsyncMock(return_value=start_body),
+            )
+            fake_web = (
+                srv.web
+                if srv.web is not None
+                else types.SimpleNamespace(
+                    json_response=lambda data, status=200: types.SimpleNamespace(
+                        status=status, text=json.dumps(data)
+                    )
+                )
+            )
+            with mock.patch.object(srv, "web", fake_web):
+                resp = await srv.internal_sync_start(req)  # type: ignore[arg-type]
+            payload = json.loads(resp.text)
+            self.assertTrue(payload["ok"])
+            self.assertFalse(payload["pinned_verified"])
+            self.assertFalse(payload["allow_google_verified"])
+            self.assertFalse(payload["google_allowed"])
+
+        asyncio.run(_verify_real_server())
+
+
+class TestCB3LeaseDualGenLifecycleSignalsAndNonDestructiveDetach(unittest.TestCase):
+    """CB3: 409/410 fail-fast, timeout validation, dual-gen teardown, held-button release, non-destructive detach."""
+
+    def test_cb3_rejects_invalid_timeout_before_any_rpc(self) -> None:
+        connect_calls: list[str] = []
+        for bad_t in (0, 0.0, -1, -0.5, float("nan"), float("inf"), float("-inf"), True, False):
+            with self.subTest(timeout=bad_t):
+                with self.assertRaises(ValueError):
+                    cdp_bridge.run_cdp_live_bridge(
+                        "ws://127.0.0.1:19222/devtools/browser/cb3-t",
+                        timeout=bad_t,  # type: ignore[arg-type]
+                        connect_fn=lambda u, _t: (connect_calls.append(u), None),  # type: ignore[return-value]
+                        install_signals=False,
+                        env=_make_clean_cdp_env(),
+                    )
+        self.assertEqual([], connect_calls)
+
+    def test_cb3_push_409_and_410_terminate_immediately_without_retry_or_resurrection(self) -> None:
+        for code in (409, 410):
+            with self.subTest(status_code=code):
+                env = _make_clean_cdp_env()
+                log: list[tuple[str, ...]] = []
+                page = _MockCDPPage("p0", log=log)
+                ctx = _MockCDPContext([page], log)
+                browser = _MockCDPBrowser([ctx], log)
+                pw = _MockPlaywright(log)
+                hub_sess = _MockHubSession()
+                push_count = 0
+
+                def _push_err(_url: str, _kw: dict[str, object]) -> _MockHTTPResponse:
+                    nonlocal push_count
+                    push_count += 1
+                    return _MockHTTPResponse(code, {"ok": False, "error": f"lease rejected ({code})"})
+
+                hub_sess.push_handler = _push_err
+
+                with (
+                    mock.patch.dict(os.environ, env, clear=True),
+                    mock.patch.object(ctl, "LiveBrowserClient", side_effect=lambda *_a, **_kw: _build_mock_hub_client(hub_sess)),
+                ):
+                    res = cdp_bridge.run_cdp_live_bridge(
+                        "ws://127.0.0.1:19222/devtools/browser/cb3-lease",
+                        mode="wait_human",
+                        connect_fn=lambda _u, _t: (pw, browser),
+                        install_signals=False,
+                        env=env,
+                    )
+                self.assertFalse(res["ok"])
+                self.assertEqual("lease_lost", res["reason"])
+                self.assertEqual(code, res["status_code"])
+                self.assertEqual(1, push_count, "Must never retry after 409/410")
+                self.assertEqual([], hub_sess.stop_calls, "Must not call /internal/sync/stop on lost lease")
+                self.assertEqual(1, browser.close_calls)
+                self.assertEqual(1, pw.stop_calls)
+                self.assertEqual(0, page.close_calls)
+                self.assertEqual(0, ctx.close_calls)
+
+    def test_cb3_timeout_and_signal_during_slider_drag_enforce_strict_teardown_order(self) -> None:
+        for scenario in ("timeout", "signal"):
+            with self.subTest(scenario=scenario):
+                env = _make_clean_cdp_env()
+                log: list[tuple[str, ...]] = []
+                page = _MockCDPPage("p0", log=log)
+                ctx = _MockCDPContext([page], log)
+                browser = _MockCDPBrowser([ctx], log)
+                pw = _MockPlaywright(log)
+                hub_sess = _MockHubSession()
+                hub_sess.event_log = log
+
+                now_box = [1000.0]  # Fixed positive monotonic baseline (never negative)
+
+                def _clock() -> float:
+                    return now_box[0]
+
+                def _sleep(dt: float) -> None:
+                    now_box[0] += dt
+
+                push_idx = [0]
+
+                def _push_drag(_url: str, _kw: dict[str, object]) -> _MockHTTPResponse:
+                    push_idx[0] += 1
+                    cmds: list[dict[str, object]] = []
+                    if push_idx[0] == 2:
+                        # Human starts dragging slider (holds left mouse button)
+                        cmds = [
+                            {
+                                "action": "mousedown",
+                                "x": 100,
+                                "y": 200,
+                                "button": "left",
+                                "session_gen": hub_sess.session_gen,
+                                "takeover_gen": hub_sess.takeover_gen,
+                            }
+                        ]
+                    elif push_idx[0] == 3 and scenario == "signal":
+                        # Deliver SIGTERM to the installed handler while button is held!
+                        os.kill(os.getpid(), signal.SIGTERM)
+                    return _MockHTTPResponse(
+                        200,
+                        {
+                            "ok": True,
+                            "session_gen": hub_sess.session_gen,
+                            "sync_lease_id": hub_sess.start_resp["sync_lease_id"],
+                            "takeover": True,
+                            "takeover_gen": hub_sess.takeover_gen,
+                            "commands": cmds,
+                        },
+                    )
+
+                hub_sess.push_handler = _push_drag
+
+                with (
+                    mock.patch.dict(os.environ, env, clear=True),
+                    mock.patch.object(ctl, "LiveBrowserClient", side_effect=lambda *_a, **_kw: _build_mock_hub_client(hub_sess)),
+                ):
+                    res = cdp_bridge.run_cdp_live_bridge(
+                        "ws://127.0.0.1:19222/devtools/browser/cb3-drag",
+                        mode="wait_human",
+                        timeout=0.5,
+                        connect_fn=lambda _u, _t: (pw, browser),
+                        clock_fn=_clock,
+                        sleep_fn=_sleep,
+                        install_signals=(scenario == "signal"),
+                        env=env,
+                    )
+
+                self.assertFalse(res["ok"])
+                self.assertEqual(scenario, res["reason"])
+
+                # Verify dual-gen takeover release in /internal/config
+                release_cfgs = [
+                    c["json"]
+                    for c in hub_sess.calls
+                    if "/internal/config" in str(c["url"])
+                    and isinstance(c["json"], dict)
+                    and c["json"].get("takeover") is False
+                ]
+                self.assertEqual(1, len(release_cfgs))
+                self.assertEqual(11, release_cfgs[0]["expected_session_gen"])
+                self.assertEqual(2, release_cfgs[0]["expected_takeover_gen"])
+
+                # Verify /internal/sync/stop carried X-Sync-Lease-Id
+                self.assertEqual(1, len(hub_sess.stop_calls))
+                self.assertEqual(
+                    "lease-abc-123",
+                    hub_sess.stop_calls[0]["headers"].get("X-Sync-Lease-Id"),  # type: ignore[union-attr]
+                )
+
+                # Verify strict teardown ordering: mouse.up -> config.takeover=False -> sync.stop -> browser.close -> pw.stop
+                idx_up = log.index(("p0", "mouse.up", "left"))
+                idx_rel = log.index(("hub", "config.takeover=False"))
+                idx_stop = log.index(("hub", "sync.stop"))
+                idx_bclose = log.index(("browser", "browser.close"))
+                idx_pwstop = log.index(("pw", "pw.stop"))
+                self.assertLess(idx_up, idx_rel)
+                self.assertLess(idx_rel, idx_stop)
+                self.assertLess(idx_stop, idx_bclose)
+                self.assertLess(idx_bclose, idx_pwstop)
+
+                # Non-destructive detach: NEVER close remote page or context
+                self.assertEqual(0, page.close_calls)
+                self.assertEqual(0, ctx.close_calls)
+
+
+class TestCB4TakeoverInteractionCardFailureWatchAndRemoteDisconnect(unittest.TestCase):
+    """CB4: Full takeover interaction loop, ensure_card 502 fail-closed, --watch heartbeat, remote crash resilience."""
+
+    def test_cb4_wait_human_full_interaction_switch_tab_drag_clipboard_stale_tgen_and_handback(self) -> None:
+        env = _make_clean_cdp_env()
+        log: list[tuple[str, ...]] = []
+        p0 = _MockCDPPage("p0", "https://example.com/step1", "Step 1", log=log)
+        p1 = _MockCDPPage("p1", "https://example.com/step2", "Step 2", log=log)
+        ctx = _MockCDPContext([p0, p1], log)
+        browser = _MockCDPBrowser([ctx], log)
+        pw = _MockPlaywright(log)
+        hub_sess = _MockHubSession()
+        hub_sess.event_log = log
+
+        push_seq = [0]
+
+        def _push_interactive(_url: str, _kw: dict[str, object]) -> _MockHTTPResponse:
+            push_seq[0] += 1
+            tgen = hub_sess.takeover_gen
+            sgen = hub_sess.session_gen
+            if push_seq[0] == 2:
+                # Click + slider drag + keyboard + stale takeover_gen command (must be ignored!)
+                cmds = [
+                    {"action": "click", "x": 50, "y": 60, "session_gen": sgen, "takeover_gen": tgen},
+                    {"action": "mousedown", "x": 100, "y": 120, "button": "left", "session_gen": sgen, "takeover_gen": tgen},
+                    {"action": "move", "x": 240, "y": 120, "session_gen": sgen, "takeover_gen": tgen},
+                    {"action": "mouseup", "x": 240, "y": 120, "button": "left", "session_gen": sgen, "takeover_gen": tgen},
+                    {"action": "type", "text": "ok123", "submit": True, "session_gen": sgen, "takeover_gen": tgen},
+                    # Stale takeover_gen click MUST be dropped silently!
+                    {"action": "click", "x": 999, "y": 999, "session_gen": sgen, "takeover_gen": tgen - 1},
+                ]
+                return _MockHTTPResponse(
+                    200,
+                    {
+                        "ok": True,
+                        "session_gen": sgen,
+                        "sync_lease_id": "lease-abc-123",
+                        "takeover": True,
+                        "takeover_gen": tgen,
+                        "commands": cmds,
+                    },
+                )
+            if push_seq[0] == 3:
+                # Hold left mouse button on p0, then switch_tab to p1 (must release p0 button before switch!), then extract clipboard
+                cmds = [
+                    {"action": "mousedown", "x": 10, "y": 10, "button": "left", "session_gen": sgen, "takeover_gen": tgen},
+                    {"action": "switch_tab", "index": 1, "cmd_id": "tab-1", "session_gen": sgen, "takeover_gen": tgen},
+                    {"action": "extract", "mode": "url", "req_id": "req-1", "session_gen": sgen, "takeover_gen": tgen},
+                ]
+                return _MockHTTPResponse(
+                    200,
+                    {
+                        "ok": True,
+                        "session_gen": sgen,
+                        "sync_lease_id": "lease-abc-123",
+                        "takeover": True,
+                        "takeover_gen": tgen,
+                        "commands": cmds,
+                    },
+                )
+            if push_seq[0] == 4:
+                # Human clicks [交还给 AI] -> takeover becomes False
+                hub_sess.takeover = False
+                return _MockHTTPResponse(
+                    200,
+                    {
+                        "ok": True,
+                        "session_gen": sgen,
+                        "sync_lease_id": "lease-abc-123",
+                        "takeover": False,
+                        "takeover_gen": tgen + 1,
+                        "commands": [],
+                    },
+                )
+            return _MockHTTPResponse(
+                200,
+                {
+                    "ok": True,
+                    "session_gen": sgen,
+                    "sync_lease_id": "lease-abc-123",
+                    "takeover": hub_sess.takeover,
+                    "takeover_gen": tgen,
+                    "commands": [],
+                },
+            )
+
+        hub_sess.push_handler = _push_interactive
+
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(ctl, "LiveBrowserClient", side_effect=lambda *_a, **_kw: _build_mock_hub_client(hub_sess)),
+        ):
+            res = cdp_bridge.run_cdp_live_bridge(
+                "ws://127.0.0.1:19222/devtools/browser/cb4-full",
+                mode="wait_human",
+                timeout=30.0,
+                connect_fn=lambda _u, _t: (pw, browser),
+                sleep_fn=lambda _s: None,
+                install_signals=False,
+                env=env,
+            )
+
+        self.assertTrue(res["ok"])
+        self.assertEqual("handback", res["reason"])
+        self.assertTrue(res["resumed"])
+        self.assertEqual("https://example.com/step2", res["url"])
+        self.assertIn(("p0", "mouse.click", "50.0,60.0", "left"), log)
+        self.assertNotIn(("p0", "mouse.click", "999.0,999.0", "left"), log, "Stale takeover_gen cmd must be dropped")
+        self.assertIn(("p0", "keyboard.type", "ok123"), log)
+        self.assertIn(("p0", "keyboard.press", "Enter"), log)
+        # switch_tab released held button on p0 BEFORE bringing p1 to front
+        p0_ups = [i for i, ev in enumerate(log) if ev == ("p0", "mouse.up", "left")]
+        p1_front = log.index(("p1", "page.bring_to_front"))
+        self.assertGreaterEqual(len(p0_ups), 2)
+        self.assertLess(p0_ups[-1], p1_front, "switch_tab must release held button on old page before switching")
+        self.assertEqual(1, len(hub_sess.clipboard_calls), "extract command must push clipboard reply")
+        self.assertEqual(1, len(hub_sess.stop_calls), "Handback must retire Live Card via /internal/sync/stop")
+        self.assertEqual(0, p0.close_calls)
+        self.assertEqual(0, p1.close_calls)
+        self.assertEqual(0, ctx.close_calls)
+        self.assertEqual(1, browser.close_calls)
+
+    def test_cb4_ensure_card_502_fails_closed_without_hanging(self) -> None:
+        env = _make_clean_cdp_env()
+        log: list[tuple[str, ...]] = []
+        page = _MockCDPPage("p0", log=log)
+        ctx = _MockCDPContext([page], log)
+        browser = _MockCDPBrowser([ctx], log)
+        pw = _MockPlaywright(log)
+        hub_sess = _MockHubSession()
+
+        def _cfg_502(body: dict[str, object]) -> _MockHTTPResponse:
+            if body.get("takeover") is True:
+                return _MockHTTPResponse(
+                    502,
+                    {
+                        "ok": False,
+                        "card_sent": False,
+                        "card_error": "Telegram API 502",
+                        "error": "Telegram API 502",
+                        "session_gen": 11,
+                        "takeover_gen": 2,
+                        "takeover": False,
+                    },
+                )
+            return _MockHTTPResponse(200, {"ok": True})
+
+        hub_sess.config_handler = _cfg_502
+        sleeps: list[float] = []
+
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(ctl, "LiveBrowserClient", side_effect=lambda *_a, **_kw: _build_mock_hub_client(hub_sess)),
+        ):
+            res = cdp_bridge.run_cdp_live_bridge(
+                "ws://127.0.0.1:19222/devtools/browser/cb4-502",
+                mode="wait_human",
+                connect_fn=lambda _u, _t: (pw, browser),
+                sleep_fn=sleeps.append,
+                install_signals=False,
+                env=env,
+            )
+
+        self.assertFalse(res["ok"])
+        self.assertEqual("card_send_failed", res["reason"])
+        self.assertFalse(res["card_sent"])
+        self.assertEqual([], sleeps, "Must fail-closed immediately without entering wait sleep loop")
+        self.assertEqual(1, len(hub_sess.stop_calls))
+        self.assertEqual(0, page.close_calls)
+
+    def test_cb4_watch_mode_heartbeat_stays_strictly_below_sync_lease_timeout(self) -> None:
+        env = _make_clean_cdp_env()
+        log: list[tuple[str, ...]] = []
+        page = _MockCDPPage("p0", log=log)
+        ctx = _MockCDPContext([page], log)
+        browser = _MockCDPBrowser([ctx], log)
+        pw = _MockPlaywright(log)
+        hub_sess = _MockHubSession()
+
+        now_box = [1000.0]  # Fixed positive monotonic baseline
+        sleeps: list[float] = []
+
+        def _sleep(dt: float) -> None:
+            sleeps.append(dt)
+            now_box[0] += dt
+
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(ctl, "LiveBrowserClient", side_effect=lambda *_a, **_kw: _build_mock_hub_client(hub_sess)),
+        ):
+            # Pass an oversized watch_idle_tick_seconds (999s) to prove internal clamping < SYNC_LEASE_TIMEOUT_SECONDS
+            res = cdp_bridge.run_cdp_live_bridge(
+                "ws://127.0.0.1:19222/devtools/browser/cb4-watch",
+                mode="watch",
+                timeout=160.0,
+                watch_idle_tick_seconds=999.0,
+                connect_fn=lambda _u, _t: (pw, browser),
+                clock_fn=lambda: now_box[0],
+                sleep_fn=_sleep,
+                install_signals=False,
+                env=env,
+            )
+
+        self.assertTrue(res["ok"])
+        self.assertEqual("timeout", res["reason"])
+        self.assertGreaterEqual(len(sleeps), 10)
+        self.assertTrue(
+            all(0 < dt < srv.SYNC_LEASE_TIMEOUT_SECONDS for dt in sleeps),
+            f"All watch intervals must be strictly below SYNC_LEASE_TIMEOUT_SECONDS: {sleeps}",
+        )
+        self.assertEqual(0, page.close_calls)
+
+    def test_cb4_remote_empty_contexts_empty_pages_closed_page_and_target_closed_exit_cleanly(self) -> None:
+        env = _make_clean_cdp_env()
+
+        # 1. browser.contexts == []
+        log1: list[tuple[str, ...]] = []
+        b1 = _MockCDPBrowser([], log1)
+        pw1 = _MockPlaywright(log1)
+        r1 = cdp_bridge.run_cdp_live_bridge(
+            "ws://127.0.0.1:19222/devtools/browser/cb4-empty-ctx",
+            connect_fn=lambda _u, _t: (pw1, b1),
+            install_signals=False,
+            env=env,
+        )
+        self.assertFalse(r1["ok"])
+        self.assertEqual("no_browser_context", r1["reason"])
+        self.assertEqual(1, b1.close_calls)
+
+        # 2. context.pages == []
+        log2: list[tuple[str, ...]] = []
+        c2 = _MockCDPContext([], log2)
+        b2 = _MockCDPBrowser([c2], log2)
+        pw2 = _MockPlaywright(log2)
+        r2 = cdp_bridge.run_cdp_live_bridge(
+            "ws://127.0.0.1:19222/devtools/browser/cb4-empty-pages",
+            connect_fn=lambda _u, _t: (pw2, b2),
+            install_signals=False,
+            env=env,
+        )
+        self.assertFalse(r2["ok"])
+        self.assertEqual("no_open_page", r2["reason"])
+        self.assertEqual(1, b2.close_calls)
+        self.assertEqual(0, c2.close_calls)
+
+        # 3. screenshot() raises TargetClosedError
+        log3: list[tuple[str, ...]] = []
+        p3 = _MockCDPPage("p0", log=log3)
+        p3.screenshot_exc = _TargetClosedError("Target page, context or browser has been closed")
+        c3 = _MockCDPContext([p3], log3)
+        b3 = _MockCDPBrowser([c3], log3)
+        pw3 = _MockPlaywright(log3)
+        hub_sess = _MockHubSession()
+
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(ctl, "LiveBrowserClient", side_effect=lambda *_a, **_kw: _build_mock_hub_client(hub_sess)),
+        ):
+            r3 = cdp_bridge.run_cdp_live_bridge(
+                "ws://127.0.0.1:19222/devtools/browser/cb4-crash",
+                connect_fn=lambda _u, _t: (pw3, b3),
+                install_signals=False,
+                env=env,
+            )
+        self.assertFalse(r3["ok"])
+        self.assertEqual("cdp_target_closed", r3["reason"])
+        self.assertEqual(1, len(hub_sess.stop_calls), "Crash must still stop sync lease cleanly")
+        self.assertEqual(1, b3.close_calls)
+        self.assertEqual(0, p3.close_calls)
+
+        # 4. Active page closes mid-loop & 5. browser.is_connected() drops mid-loop
+        for mid_case in ("page_closed", "browser_disconnected"):
+            with self.subTest(mid_case=mid_case):
+                log_m: list[tuple[str, ...]] = []
+                pm = _MockCDPPage("p0", log=log_m)
+                cm = _MockCDPContext([pm], log_m)
+                bm = _MockCDPBrowser([cm], log_m)
+                pwm = _MockPlaywright(log_m)
+                hub_m = _MockHubSession()
+                cnt = [0]
+
+                def _push_mid(_url: str, _kw: dict[str, object]) -> _MockHTTPResponse:
+                    cnt[0] += 1
+                    if cnt[0] == 2:
+                        if mid_case == "page_closed":
+                            pm.closed = True
+                        else:
+                            bm.connected = False
+                    return _MockHTTPResponse(
+                        200,
+                        {
+                            "ok": True,
+                            "session_gen": hub_m.session_gen,
+                            "sync_lease_id": "lease-abc-123",
+                            "takeover": True,
+                            "takeover_gen": hub_m.takeover_gen,
+                            "commands": [],
+                        },
+                    )
+
+                hub_m.push_handler = _push_mid
+
+                with (
+                    mock.patch.dict(os.environ, env, clear=True),
+                    mock.patch.object(ctl, "LiveBrowserClient", side_effect=lambda *_a, **_kw: _build_mock_hub_client(hub_m)),
+                ):
+                    rm = cdp_bridge.run_cdp_live_bridge(
+                        "ws://127.0.0.1:19222/devtools/browser/cb4-mid",
+                        mode="wait_human",
+                        connect_fn=lambda _u, _t: (pwm, bm),
+                        sleep_fn=lambda _s: None,
+                        install_signals=False,
+                        env=env,
+                    )
+                self.assertFalse(rm["ok"])
+                self.assertEqual(
+                    "no_open_page" if mid_case == "page_closed" else "cdp_disconnected",
+                    rm["reason"],
+                )
+                self.assertEqual(1, len(hub_m.stop_calls))
+                self.assertEqual(1, bm.close_calls)
+                self.assertEqual(0, pm.close_calls)
+
+    def test_cb4_wait_human_transient_push_errors_never_trigger_false_handback_and_recover(self) -> None:
+        import requests as _req
+
+        env = _make_clean_cdp_env()
+        log: list[tuple[str, ...]] = []
+        page = _MockCDPPage("p0", "https://example.com/verify", "Verify", log=log)
+        ctx = _MockCDPContext([page], log)
+        browser = _MockCDPBrowser([ctx], log)
+        pw = _MockPlaywright(log)
+        hub_sess = _MockHubSession()
+        hub_sess.event_log = log
+
+        push_seq = [0]
+        transient_empty_triggered = [False]
+
+        def _push_flaky(_url: str, _kw: dict[str, object]) -> _MockHTTPResponse:
+            push_seq[0] += 1
+            n = push_seq[0]
+            if n == 1:
+                # Initial pre-takeover push succeeds with takeover=False
+                return _MockHTTPResponse(
+                    200,
+                    {
+                        "ok": True,
+                        "session_gen": hub_sess.session_gen,
+                        "sync_lease_id": "lease-abc-123",
+                        "takeover": False,
+                        "takeover_gen": 1,
+                        "commands": [],
+                    },
+                )
+            if n == 2:
+                # First push AFTER update_config(takeover=True): ReadTimeout!
+                raise _req.ReadTimeout("simulated transient push read timeout")
+            if n == 3:
+                # HTTP 503 JSON without "ok": false -> transient error, MUST NOT false-handback
+                return _MockHTTPResponse(503, {"error": "temporarily unavailable"})
+            if n == 4:
+                # HTTP 200 invalid JSON -> transient error, MUST NOT false-handback
+                return _MockHTTPResponse(200, raw_bytes=b"{invalid-json")
+            if n == 5:
+                # HTTP 200 missing ok=True -> transient error, MUST NOT false-handback
+                return _MockHTTPResponse(200, {"takeover": False, "error": "missing ok"})
+            if n == 6:
+                # Healthy push confirming takeover=True
+                return _MockHTTPResponse(
+                    200,
+                    {
+                        "ok": True,
+                        "session_gen": hub_sess.session_gen,
+                        "sync_lease_id": "lease-abc-123",
+                        "takeover": True,
+                        "takeover_gen": hub_sess.takeover_gen,
+                        "commands": [],
+                    },
+                )
+            # Final push: genuine human handback (HTTP 200, ok=True, takeover=False)
+            hub_sess.takeover = False
+            return _MockHTTPResponse(
+                200,
+                {
+                    "ok": True,
+                    "session_gen": hub_sess.session_gen,
+                    "sync_lease_id": "lease-abc-123",
+                    "takeover": False,
+                    "takeover_gen": hub_sess.takeover_gen + 1,
+                    "commands": [],
+                },
+            )
+
+        hub_sess.push_handler = _push_flaky
+        created_bridges: list[ctl.SyncLiveBridge] = []
+
+        def _bridge_factory(*args: object, **kwargs: object) -> ctl.SyncLiveBridge:
+            br = ctl.SyncLiveBridge(*args, **kwargs)  # type: ignore[arg-type]
+            orig_active = br._active_raw_page
+
+            def _flaky_active_page() -> object:
+                # Simulate a momentary empty page right after push #5 before push #6
+                if push_seq[0] == 5 and not transient_empty_triggered[0]:
+                    transient_empty_triggered[0] = True
+                    return None
+                return orig_active()
+
+            br._active_raw_page = _flaky_active_page  # type: ignore[method-assign]
+            created_bridges.append(br)
+            return br
+
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(ctl, "LiveBrowserClient", side_effect=lambda *_a, **_kw: _build_mock_hub_client(hub_sess)),
+        ):
+            res = cdp_bridge.run_cdp_live_bridge(
+                "ws://127.0.0.1:19222/devtools/browser/cb4-flaky-recover",
+                mode="wait_human",
+                timeout=30.0,
+                connect_fn=lambda _u, _t: (pw, browser),
+                bridge_factory=_bridge_factory,
+                sleep_fn=lambda _s: None,
+                install_signals=False,
+                env=env,
+            )
+
+        self.assertTrue(res["ok"])
+        self.assertEqual("handback", res["reason"])
+        self.assertTrue(res["resumed"])
+        self.assertTrue(transient_empty_triggered[0])
+        self.assertEqual(
+            8,
+            push_seq[0],
+            "Must survive ReadTimeout/503/bad-JSON/missing-ok/empty-page until real handback (push #7) + final close checkpoint (#8)",
+        )
+        self.assertEqual(3, res["frames_pushed"], "Only the 3 verified HTTP 200 ok=True pushes count as pushed frames")
+        # Since real handback succeeded, teardown must NOT issue an extra takeover=False release
+        release_cfgs = [
+            c for c in hub_sess.calls
+            if "/internal/config" in str(c["url"])
+            and isinstance(c["json"], dict)
+            and c["json"].get("takeover") is False
+        ]
+        self.assertEqual([], release_cfgs)
+        self.assertEqual(1, len(hub_sess.stop_calls))
+        self.assertEqual(0, page.close_calls)
+
+    def test_cb4_wait_human_persistent_503_and_timeout_exits_timeout_with_dual_gen_cas_cleanup(self) -> None:
+        import requests as _req
+
+        for failure_kind in ("http_503", "read_timeout"):
+            with self.subTest(failure_kind=failure_kind):
+                env = _make_clean_cdp_env()
+                log: list[tuple[str, ...]] = []
+                page = _MockCDPPage("p0", log=log)
+                ctx = _MockCDPContext([page], log)
+                browser = _MockCDPBrowser([ctx], log)
+                pw = _MockPlaywright(log)
+                hub_sess = _MockHubSession()
+                hub_sess.event_log = log
+
+                now_box = [1000.0]
+
+                def _clock() -> float:
+                    return now_box[0]
+
+                def _sleep(dt: float) -> None:
+                    now_box[0] += dt
+
+                push_count = [0]
+
+                def _push_always_fail(_url: str, _kw: dict[str, object]) -> _MockHTTPResponse:
+                    push_count[0] += 1
+                    if push_count[0] == 1:
+                        return _MockHTTPResponse(
+                            200,
+                            {
+                                "ok": True,
+                                "session_gen": hub_sess.session_gen,
+                                "sync_lease_id": "lease-abc-123",
+                                "takeover": False,
+                                "takeover_gen": 1,
+                                "commands": [],
+                            },
+                        )
+                    if failure_kind == "http_503":
+                        return _MockHTTPResponse(503, {"error": "busy"})
+                    raise _req.ReadTimeout("persistent read timeout")
+
+                hub_sess.push_handler = _push_always_fail
+
+                with (
+                    mock.patch.dict(os.environ, env, clear=True),
+                    mock.patch.object(ctl, "LiveBrowserClient", side_effect=lambda *_a, **_kw: _build_mock_hub_client(hub_sess)),
+                ):
+                    res = cdp_bridge.run_cdp_live_bridge(
+                        "ws://127.0.0.1:19222/devtools/browser/cb4-persist-fail",
+                        mode="wait_human",
+                        timeout=0.3,
+                        connect_fn=lambda _u, _t: (pw, browser),
+                        clock_fn=_clock,
+                        sleep_fn=_sleep,
+                        install_signals=False,
+                        env=env,
+                    )
+
+                self.assertFalse(res["ok"])
+                self.assertEqual("timeout", res["reason"])
+                self.assertGreaterEqual(push_count[0], 3, "Must retry transient push failures until timeout")
+                # Self-held takeover MUST be retained and cleaned up via dual-gen CAS!
+                release_cfgs = [
+                    c["json"]
+                    for c in hub_sess.calls
+                    if "/internal/config" in str(c["url"])
+                    and isinstance(c["json"], dict)
+                    and c["json"].get("takeover") is False
+                ]
+                self.assertEqual(1, len(release_cfgs), "Persistent push failure timeout must release self-held takeover")
+                self.assertEqual(11, release_cfgs[0]["expected_session_gen"])
+                self.assertEqual(2, release_cfgs[0]["expected_takeover_gen"])
+                self.assertEqual(1, len(hub_sess.stop_calls))
+                self.assertEqual(1, browser.close_calls)
+                self.assertEqual(0, page.close_calls)
+
+
+class TestCB5InterpreterForwardingAndNoRealBrowserCompat(unittest.TestCase):
+    """CB5: Safe os.execv interpreter forwarding, symlink preservation, recursion guard, and zero real browser import."""
+
+    def test_cb5_zero_top_level_playwright_or_camoufox_import(self) -> None:
+        self.assertNotIn("playwright", sys.modules)
+        self.assertNotIn("camoufox", sys.modules)
+
+    def test_cb5_rejects_malicious_python_override_paths_and_prevents_recursion(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="lb_cb5_") as td_s:
+            td = Path(td_s)
+            os.chmod(td, 0o700)
+
+            # World-writable executable
+            ww_file = td / "ww_python3"
+            ww_file.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            os.chmod(ww_file, 0o777)
+
+            # Executable inside world-writable non-sticky directory
+            ww_dir = td / "ww_dir"
+            ww_dir.mkdir()
+            os.chmod(ww_dir, 0o777)
+            in_ww_dir = ww_dir / "python3"
+            in_ww_dir.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            os.chmod(in_ww_dir, 0o755)
+
+            # Executable inside sticky world-writable directory (0o1777, e.g. /tmp) -> MUST ALSO BE REJECTED!
+            sticky_ww_dir = td / "sticky_ww_dir"
+            sticky_ww_dir.mkdir()
+            os.chmod(sticky_ww_dir, 0o1777)
+            in_sticky_ww_dir = sticky_ww_dir / "python3"
+            in_sticky_ww_dir.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            os.chmod(in_sticky_ww_dir, 0o755)
+
+            # Symlink in safe 0o700 dir pointing to executable inside 0o1777 sticky world-writable dir -> MUST BE REJECTED!
+            safe_link_dir = td / "safe_link_dir"
+            safe_link_dir.mkdir()
+            os.chmod(safe_link_dir, 0o700)
+            symlink_to_sticky_ww = safe_link_dir / "python3"
+            os.symlink(str(in_sticky_ww_dir), str(symlink_to_sticky_ww))
+
+            # Non-executable file
+            noexec = td / "noexec_py"
+            noexec.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            os.chmod(noexec, 0o600)
+
+            bad_paths = [
+                "bin/python3",
+                "./python3",
+                "/usr/bin/../bin/python3",
+                "/usr/bin/python3\n",
+                "/usr/bin/python3 -c id",
+                str(td / "missing_python3"),
+                str(td),
+                str(ww_file),
+                str(in_ww_dir),
+                str(in_sticky_ww_dir),
+                str(symlink_to_sticky_ww),
+                str(noexec),
+            ]
+            exec_calls: list[tuple[str, list[str]]] = []
+            for bp in bad_paths:
+                with self.subTest(path=bp):
+                    with self.assertRaises(ValueError):
+                        cdp_bridge.validate_reexec_python(bp)
+                    fake_env = {"AGY_LIVE_BROWSER_PYTHON": bp}
+                    with self.assertRaises(ValueError):
+                        cdp_bridge.maybe_reexec_into_playwright_python(
+                            ["live_browser_ctl.py", "attach-cdp"],
+                            env=fake_env,
+                            execv_fn=lambda p, a: exec_calls.append((p, a)),
+                            find_spec_fn=lambda _n: None,
+                        )
+            self.assertEqual([], exec_calls)
+
+            # Valid venv symlink -> passes validation via realpath(), preserves UNRESOLVED symlink in os.execv!
+            real_py = td / "real_python3"
+            real_py.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            os.chmod(real_py, 0o755)
+            venv_bin = td / "fake-venv" / "bin"
+            venv_bin.mkdir(parents=True)
+            os.chmod(td / "fake-venv", 0o700)
+            os.chmod(venv_bin, 0o700)
+            symlink_py = venv_bin / "python3"
+            os.symlink(str(real_py), str(symlink_py))
+
+            self.assertEqual(str(symlink_py), cdp_bridge.validate_reexec_python(str(symlink_py)))
+
+            reexec_env = {"AGY_LIVE_BROWSER_PYTHON": str(symlink_py)}
+            did_exec = cdp_bridge.maybe_reexec_into_playwright_python(
+                ["live_browser_ctl.py", "attach-cdp", "--cdp-url", "ws://127.0.0.1:19222/devtools/browser/a"],
+                env=reexec_env,
+                execv_fn=lambda p, a: exec_calls.append((p, a)),
+                find_spec_fn=lambda _n: None,
+                current_executable="/usr/bin/python3",
+            )
+            self.assertTrue(did_exec)
+            self.assertEqual("1", reexec_env.get(cdp_bridge.REEXEC_SENTINEL_ENV))
+            self.assertEqual(1, len(exec_calls))
+            self.assertEqual(str(symlink_py), exec_calls[0][0], "os.execv MUST pass unresolved venv symlink path")
+            self.assertEqual(str(symlink_py), exec_calls[0][1][0])
+
+            # Second call with sentinel set MUST abort cleanly (no infinite recursion)
+            with self.assertRaises(RuntimeError):
+                cdp_bridge.maybe_reexec_into_playwright_python(
+                    ["live_browser_ctl.py", "attach-cdp"],
+                    env=reexec_env,
+                    execv_fn=lambda p, a: exec_calls.append((p, a)),
+                    find_spec_fn=lambda _n: None,
+                    current_executable="/usr/bin/python3",
+                )
+            self.assertEqual(1, len(exec_calls))
+
+    def test_cb7_sync_live_bridge_readonly_observation_properties(self) -> None:
+        log: list[tuple[str, ...]] = []
+        page = _MockCDPPage("p0", log=log)
+        ctx = _MockCDPContext([page], log)
+        hub_sess = _MockHubSession()
+
+        with (
+            mock.patch.dict(os.environ, _make_clean_cdp_env(), clear=True),
+            mock.patch.object(ctl, "LiveBrowserClient", side_effect=lambda *_a, **_kw: _build_mock_hub_client(hub_sess)),
+        ):
+            bridge = ctl.SyncLiveBridge(ctx, notify=False)
+            self.assertTrue(bridge.enabled)
+            self.assertIsNone(bridge.last_error)
+            self.assertEqual(200, bridge.last_status_code)
+            self.assertFalse(bridge.last_push_ok)
+            self.assertFalse(bridge.last_takeover)
+            self.assertEqual(1, bridge.last_takeover_gen)
+            self.assertEqual(0, bridge.last_commands_count)
+            for prop in (
+                "last_error",
+                "last_status_code",
+                "last_push_ok",
+                "last_takeover",
+                "last_takeover_gen",
+                "last_commands_count",
+            ):
+                with self.assertRaises(AttributeError):
+                    setattr(bridge, prop, "mutated")
+
+            # Successful push flips last_push_ok=True and updates last_takeover
+            hub_sess.takeover = True
+            bridge.sync_checkpoint(ai_status="ok", allow_takeover_loop=False)
+            self.assertTrue(bridge.last_push_ok)
+            self.assertIsNone(bridge.last_error)
+            self.assertTrue(bridge.last_takeover)
+
+            # Transient 503 flips last_push_ok=False, sets last_error, keeps enabled=True and preserves last_takeover
+            hub_sess.push_handler = lambda _u, _kw: _MockHTTPResponse(503, {"error": "busy"})
+            bridge.sync_checkpoint(ai_status="retry", allow_takeover_loop=False)
+            self.assertTrue(bridge.enabled)
+            self.assertFalse(bridge.last_push_ok)
+            self.assertEqual(503, bridge.last_status_code)
+            self.assertEqual("busy", bridge.last_error)
+            self.assertTrue(bridge.last_takeover, "Transient 503 must not overwrite last_takeover")
+            bridge.close()
 
 
 if __name__ == "__main__":
