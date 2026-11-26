@@ -37,6 +37,7 @@ import secrets
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -738,6 +739,12 @@ _EVENTS_ACK_ALLOWED_KEYS = frozenset({"event_ids", "all"})
 MAX_ACK_EVENT_IDS = 200
 MAX_ACK_EVENT_ID_LEN = 128
 MAX_RESULT_TEXT_CHARS = 65536
+DEFAULT_PRESENCE_FLUSH_SEC = 30.0
+PRESENCE_FUTURE_SKEW_SEC = 60.0
+PRESENCE_FILENAME = "presence.json"
+MAX_PRESENCE_READ_BYTES = 1 * 1024 * 1024
+VALID_PRESENCE_ACTIONS = frozenset({"peek", "inbox", "claim", "result", "events_ack", "mcp"})
+_PRESENCE_ENTRY_ALLOWED_KEYS = frozenset({"last_seen_at", "last_action", "last_peek_at"})
 
 
 class HubError(Exception):
@@ -1042,6 +1049,305 @@ class AuditLogger:
             finally:
                 fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
         return sanitized
+
+
+# ---------------------------------------------------------------- External Agent Presence Tracker
+def _parse_presence_flush_interval(
+    flush_interval_sec: Optional[float],
+    env: Optional[Mapping[str, str]] = None,
+) -> float:
+    if flush_interval_sec is not None:
+        val = float(flush_interval_sec)
+        if math.isfinite(val) and val >= 0.0:
+            return val
+        return DEFAULT_PRESENCE_FLUSH_SEC
+    src = os.environ if env is None else env
+    raw = str(src.get("AGY_FEDERATION_PRESENCE_FLUSH_SEC") or "").strip()
+    if raw:
+        try:
+            val = float(raw)
+            if math.isfinite(val) and val >= 0.0:
+                return val
+        except ValueError:
+            pass
+    return DEFAULT_PRESENCE_FLUSH_SEC
+
+
+def _sanitize_presence_entry(
+    raw_entry: Any,
+    *,
+    max_ts: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    """Keep ONLY strict allowlisted presence fields (`last_seen_at`, `last_action`, `last_peek_at`)."""
+    if not isinstance(raw_entry, Mapping):
+        return None
+    raw_seen = raw_entry.get("last_seen_at")
+    if not isinstance(raw_seen, (int, float)) or isinstance(raw_seen, bool):
+        return None
+    seen_f = float(raw_seen)
+    if not math.isfinite(seen_f) or seen_f <= 0.0:
+        return None
+    if max_ts is not None and seen_f > max_ts:
+        return None
+
+    raw_action = raw_entry.get("last_action")
+    act = raw_action.strip().lower() if isinstance(raw_action, str) else ""
+    if act not in VALID_PRESENCE_ACTIONS:
+        return None
+
+    clean: Dict[str, Any] = {
+        "last_seen_at": round(seen_f, 3),
+        "last_action": act,
+    }
+    raw_peek = raw_entry.get("last_peek_at")
+    if isinstance(raw_peek, (int, float)) and not isinstance(raw_peek, bool):
+        peek_f = float(raw_peek)
+        if math.isfinite(peek_f) and peek_f > 0.0 and (max_ts is None or peek_f <= max_ts):
+            clean["last_peek_at"] = round(peek_f, 3)
+    return clean
+
+
+class PresenceTracker:
+    """Thread-safe, throttled, anti-symlink atomic presence tracker (`<BUS_DIR>/federation/presence.json`)."""
+
+    def __init__(
+        self,
+        bus_dir: Optional[str] = None,
+        *,
+        flush_interval_sec: Optional[float] = None,
+        env: Optional[Mapping[str, str]] = None,
+    ):
+        self.bus_dir = federation_registry._resolve_bus_dir(bus_dir)
+        self.flush_interval_sec = _parse_presence_flush_interval(flush_interval_sec, env=env)
+        self._lock = threading.Lock()
+        self._entries: Dict[str, Dict[str, Any]] = {}
+        self._last_flush_mono: Dict[str, float] = {}
+        self._loaded_from_disk = False
+
+    @property
+    def presence_path(self) -> str:
+        return os.path.join(federation_registry.federation_dir(self.bus_dir), PRESENCE_FILENAME)
+
+    def snapshot(self) -> Dict[str, Dict[str, Any]]:
+        with self._lock:
+            return {aid: dict(entry) for aid, entry in self._entries.items()}
+
+    def _open_federation_dir_fd(self) -> int:
+        """Open `<BUS_DIR>/federation` step-by-step with `O_DIRECTORY | O_NOFOLLOW` (mode `0700` on creation)."""
+        dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        bus_fd = os.open(self.bus_dir, dir_flags)
+        try:
+            created_dir = False
+            try:
+                st_fed = os.lstat("federation", dir_fd=bus_fd)
+            except FileNotFoundError:
+                try:
+                    os.mkdir("federation", 0o700, dir_fd=bus_fd)
+                    created_dir = True
+                except FileExistsError:
+                    pass
+                st_fed = os.lstat("federation", dir_fd=bus_fd)
+            if stat.S_ISLNK(st_fed.st_mode) or not stat.S_ISDIR(st_fed.st_mode):
+                raise OSError("SECURITY_SYMLINK_REJECTED: federation path is symlink or non-directory")
+            fed_fd = os.open("federation", dir_flags, dir_fd=bus_fd)
+            try:
+                fst = os.fstat(fed_fd)
+                if not stat.S_ISDIR(fst.st_mode):
+                    raise OSError("SECURITY_SYMLINK_REJECTED: federation path is not a directory")
+                try:
+                    if created_dir:
+                        os.fchmod(fed_fd, 0o700)
+                    elif (fst.st_mode & 0o077) != 0:
+                        os.fchmod(fed_fd, stat.S_IMODE(fst.st_mode) & 0o700)
+                except OSError:
+                    pass
+                return fed_fd
+            except Exception:
+                os.close(fed_fd)
+                raise
+        finally:
+            os.close(bus_fd)
+
+    def _read_existing_entries_in_dirfd(
+        self,
+        dir_fd: int,
+        *,
+        now_ts: Optional[float] = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Safely read existing valid presence entries inside `dir_fd` with `O_NOFOLLOW`."""
+        try:
+            st_target = os.lstat(PRESENCE_FILENAME, dir_fd=dir_fd)
+        except FileNotFoundError:
+            return {}
+        if stat.S_ISLNK(st_target.st_mode) or not stat.S_ISREG(st_target.st_mode):
+            raise OSError("SECURITY_SYMLINK_REJECTED: presence.json is symlink or non-regular file")
+        file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        fd = os.open(PRESENCE_FILENAME, file_flags, dir_fd=dir_fd)
+        try:
+            fst = os.fstat(fd)
+            if not stat.S_ISREG(fst.st_mode):
+                raise OSError("SECURITY_SYMLINK_REJECTED: presence.json is not a regular file")
+            chunks: List[bytes] = []
+            remaining = MAX_PRESENCE_READ_BYTES + 1
+            while remaining > 0:
+                chunk = os.read(fd, min(65536, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            raw = b"".join(chunks)
+            if len(raw) > MAX_PRESENCE_READ_BYTES:
+                return {}
+        finally:
+            os.close(fd)
+
+        try:
+            parsed = json.loads(raw.decode("utf-8", errors="replace"))
+        except Exception:
+            return {}
+        if not isinstance(parsed, dict):
+            return {}
+
+        eff_now = time.time() if now_ts is None else float(now_ts)
+        max_ts = eff_now + PRESENCE_FUTURE_SKEW_SEC
+        clean_map: Dict[str, Dict[str, Any]] = {}
+        for raw_aid, raw_ent in parsed.items():
+            if not isinstance(raw_aid, str):
+                continue
+            try:
+                aid = federation_registry.validate_agent_id(raw_aid)
+            except ValueError:
+                continue
+            clean_ent = _sanitize_presence_entry(raw_ent, max_ts=max_ts)
+            if clean_ent is not None:
+                clean_map[aid] = clean_ent
+        return clean_map
+
+    def _flush_locked(self, *, now_ts: Optional[float] = None) -> bool:
+        """Atomically persist `self._entries` into `presence.json` (`0600`) with full anti-symlink checks."""
+        eff_now = time.time() if now_ts is None else float(now_ts)
+        max_ts = eff_now + PRESENCE_FUTURE_SKEW_SEC
+        dir_fd = self._open_federation_dir_fd()
+        try:
+            try:
+                st_target = os.lstat(PRESENCE_FILENAME, dir_fd=dir_fd)
+            except FileNotFoundError:
+                st_target = None
+            if st_target is not None:
+                if stat.S_ISLNK(st_target.st_mode) or not stat.S_ISREG(st_target.st_mode):
+                    raise OSError("SECURITY_SYMLINK_REJECTED: presence.json is symlink or non-regular file")
+
+            if not self._loaded_from_disk:
+                if st_target is not None:
+                    disk_entries = self._read_existing_entries_in_dirfd(dir_fd, now_ts=eff_now)
+                    for d_aid, d_ent in disk_entries.items():
+                        cur = self._entries.get(d_aid)
+                        if cur is None:
+                            self._entries[d_aid] = d_ent
+                        else:
+                            # Preserve older valid last_peek_at if current in-memory entry has none
+                            if "last_peek_at" not in cur and "last_peek_at" in d_ent:
+                                cur["last_peek_at"] = d_ent["last_peek_at"]
+                self._loaded_from_disk = True
+
+            # Build strictly allowlisted payload
+            payload: Dict[str, Dict[str, Any]] = {}
+            for aid in sorted(self._entries.keys()):
+                clean_ent = _sanitize_presence_entry(self._entries[aid], max_ts=max_ts)
+                if clean_ent is not None:
+                    payload[aid] = clean_ent
+
+            tmp_name = f".presence.{os.getpid()}.{threading.get_ident()}.{secrets.token_hex(6)}.tmp"
+            open_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+            tmp_created = False
+            fd = -1
+            try:
+                fd = os.open(tmp_name, open_flags, 0o600, dir_fd=dir_fd)
+                tmp_created = True
+                os.fchmod(fd, 0o600)
+                data_bytes = (
+                    json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+                ).encode("utf-8")
+                view = memoryview(data_bytes)
+                written = 0
+                while written < len(data_bytes):
+                    n = os.write(fd, view[written:])
+                    if n <= 0:
+                        raise OSError("short write to presence temp file")
+                    written += n
+                os.fsync(fd)
+                os.close(fd)
+                fd = -1
+
+                try:
+                    st_again = os.lstat(PRESENCE_FILENAME, dir_fd=dir_fd)
+                except FileNotFoundError:
+                    st_again = None
+                if st_again is not None and (stat.S_ISLNK(st_again.st_mode) or not stat.S_ISREG(st_again.st_mode)):
+                    raise OSError("SECURITY_SYMLINK_REJECTED: presence.json became symlink or non-regular file")
+
+                os.replace(tmp_name, PRESENCE_FILENAME, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+                tmp_created = False
+                return True
+            finally:
+                if fd >= 0:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                if tmp_created:
+                    try:
+                        os.unlink(tmp_name, dir_fd=dir_fd)
+                    except OSError:
+                        pass
+        finally:
+            os.close(dir_fd)
+
+    def record(self, agent_id: str, action: str, *, now: Optional[float] = None) -> bool:
+        """Record a verified agent heartbeat in memory and flush atomically when outside throttle window."""
+        try:
+            aid = federation_registry.validate_agent_id(agent_id)
+            act = str(action or "").strip().lower()
+            if act not in VALID_PRESENCE_ACTIONS:
+                return False
+            raw_now = time.time() if now is None else now
+            if isinstance(raw_now, bool) or not isinstance(raw_now, (int, float)):
+                return False
+            ts = float(raw_now)
+            if not math.isfinite(ts) or ts <= 0.0:
+                return False
+            ts_rounded = round(ts, 3)
+            now_mono = time.monotonic()
+
+            with self._lock:
+                prev = self._entries.get(aid)
+                next_entry: Dict[str, Any] = {
+                    "last_seen_at": ts_rounded,
+                    "last_action": act,
+                }
+                if act == "peek":
+                    next_entry["last_peek_at"] = ts_rounded
+                elif isinstance(prev, dict) and "last_peek_at" in prev:
+                    prev_peek = prev.get("last_peek_at")
+                    if isinstance(prev_peek, (int, float)) and not isinstance(prev_peek, bool) and math.isfinite(prev_peek) and prev_peek > 0.0:
+                        next_entry["last_peek_at"] = round(float(prev_peek), 3)
+                self._entries[aid] = next_entry
+
+                prev_flush = self._last_flush_mono.get(aid)
+                should_flush = (
+                    prev_flush is None
+                    or self.flush_interval_sec <= 0.0
+                    or (now_mono - prev_flush) >= self.flush_interval_sec
+                )
+                if not should_flush:
+                    return True
+
+                if self._flush_locked(now_ts=ts):
+                    self._last_flush_mono[aid] = now_mono
+                    return True
+                return False
+        except Exception:
+            return False
 
 
 # ---------------------------------------------------------------- Host Server Bridge & Three Hard Locks (M2-C2, M2-C3)
@@ -3730,6 +4036,7 @@ class FederationHubServer(http.server.ThreadingHTTPServer):
         nonce_cache_max: int = DEFAULT_NONCE_CACHE_MAX,
         start_dispatcher: bool = False,
         dispatcher_poll_interval: float = 0.2,
+        presence_flush_interval_sec: Optional[float] = None,
         env: Optional[Mapping[str, str]] = None,
     ):
         e = os.environ if env is None else env
@@ -3769,6 +4076,11 @@ class FederationHubServer(http.server.ThreadingHTTPServer):
             window_sec=rate_limit_window_sec,
         )
         self.audit = AuditLogger(self.bus_dir)
+        self.presence = PresenceTracker(
+            self.bus_dir,
+            flush_interval_sec=presence_flush_interval_sec,
+            env=e,
+        )
         self.host_bridge = HostServerBridge(
             bus_dir=self.bus_dir,
             repo_root=self.repo_root,
@@ -3805,6 +4117,26 @@ class FederationHubServer(http.server.ThreadingHTTPServer):
             self.server_close()
         except Exception:
             pass
+
+    def record_presence(self, auth: Dict[str, Any], action: str) -> bool:
+        if not isinstance(auth, dict):
+            return False
+        if not auth.get("authorized") or not auth.get("token_verified"):
+            return False
+        agent = auth.get("agent")
+        if not isinstance(agent, dict):
+            return False
+        if agent.get("revoked") or not bool(agent.get("enabled", True)):
+            return False
+        if str(agent.get("kind") or "").strip().lower() == "agy_local":
+            return False
+        actor_id = str(auth.get("actor_id") or agent.get("agent_id") or "").strip()
+        if not actor_id:
+            return False
+        try:
+            return self.presence.record(actor_id, action)
+        except Exception:
+            return False
 
     # --- Domain action helpers shared by REST & MCP
     def op_me(self, auth: Dict[str, Any]) -> Dict[str, Any]:
@@ -4160,6 +4492,7 @@ class FederationHubServer(http.server.ThreadingHTTPServer):
         except PermissionError as exc:
             raise HubError(403, "PRIVILEGE_ESCALATION_DENIED", str(exc), rpc_code=-32003) from exc
         events = list_leader_events(self.bus_dir, target_aid)
+        self.record_presence(auth, "inbox")
         return {"ok": True, "agent_id": target_aid, "jobs": jobs, "events": events}
 
     def op_pull_peek(self, auth: Dict[str, Any], raw_path_agent_id: str, *, raw_token: str) -> Dict[str, Any]:
@@ -4241,6 +4574,7 @@ class FederationHubServer(http.server.ThreadingHTTPServer):
             )
             raise HubError(401, "UNAUTHORIZED", "Invalid, expired, or revoked federation token", rpc_code=-32001) from exc
 
+        self.record_presence(auth, "peek")
         return {
             "ok": True,
             "agent_id": str(summary["agent_id"]),
@@ -4409,6 +4743,7 @@ class FederationHubServer(http.server.ThreadingHTTPServer):
             detail={"acked": len(acked_ids), "remaining": remaining},
             extra_secrets=extra_sec,
         )
+        self.record_presence(auth, "events_ack")
         return {
             "ok": True,
             "agent_id": target_aid,
@@ -4482,6 +4817,7 @@ class FederationHubServer(http.server.ThreadingHTTPServer):
                     f"Pull job {clean_jid!r} is already claimed, terminal, or cancelled",
                     rpc_code=-32009,
                 )
+            self.record_presence(auth, "claim")
             return {"ok": True, "job": None}
 
         # Sync running status to bot_bus if a matching bot_bus job exists
@@ -4500,6 +4836,7 @@ class FederationHubServer(http.server.ThreadingHTTPServer):
             detail={"job_id": claimed_jid},
             extra_secrets=extra_sec,
         )
+        self.record_presence(auth, "claim")
         return {"ok": True, "job": claimed}
 
     def op_pull_result(
@@ -4616,9 +4953,16 @@ class FederationHubServer(http.server.ThreadingHTTPServer):
             detail={"job_id": clean_jid, "status": status, "bus_synced": bus_synced},
             extra_secrets=extra_sec,
         )
+        self.record_presence(auth, "result")
         return {"ok": True, "job": completed, "bus_synced": bus_synced}
 
     def op_mcp(self, auth: Dict[str, Any], payload: Dict[str, Any], *, raw_token: str) -> Tuple[int, Dict[str, Any]]:
+        code, resp = self._execute_mcp(auth, payload, raw_token=raw_token)
+        if code in (200, 202):
+            self.record_presence(auth, "mcp")
+        return code, resp
+
+    def _execute_mcp(self, auth: Dict[str, Any], payload: Dict[str, Any], *, raw_token: str) -> Tuple[int, Dict[str, Any]]:
         if not isinstance(payload, dict):
             return 400, {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Invalid JSON-RPC request"}}
         req_id = payload.get("id")

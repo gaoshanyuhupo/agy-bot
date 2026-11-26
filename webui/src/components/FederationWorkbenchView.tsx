@@ -46,7 +46,47 @@ interface FederationWorkbenchViewProps {
 
 type MobilePane = "agents" | "timeline" | "telemetry";
 
-const POLL_INTERVAL_MS = 4000;
+const POLL_ACTIVE_INTERVAL_MS = 4000;
+const POLL_IDLE_INTERVAL_MS = 30000;
+
+const HEARTBEAT_ACTION_LABELS: Record<string, string> = {
+  peek: "peek",
+  inbox: "inbox",
+  claim: "claim",
+  result: "result",
+  events_ack: "events_ack",
+  mcp: "mcp",
+};
+
+function formatHeartbeatLabel(
+  lastHeartbeatAt?: number | null,
+  lastHeartbeatAction?: string | null,
+): string {
+  if (
+    typeof lastHeartbeatAt !== "number" ||
+    !Number.isFinite(lastHeartbeatAt) ||
+    lastHeartbeatAt <= 0
+  ) {
+    return "";
+  }
+  const deltaSec = Math.max(0, Math.floor(Date.now() / 1000 - lastHeartbeatAt));
+  let agoText: string;
+  if (deltaSec < 60) {
+    agoText = `${deltaSec}s 前`;
+  } else if (deltaSec < 3600) {
+    agoText = `${Math.floor(deltaSec / 60)}m 前`;
+  } else if (deltaSec < 86400) {
+    agoText = `${Math.floor(deltaSec / 3600)}h 前`;
+  } else {
+    agoText = `${Math.floor(deltaSec / 86400)}d 前`;
+  }
+  const rawAct =
+    typeof lastHeartbeatAction === "string" ? lastHeartbeatAction.trim().toLowerCase() : "";
+  const safeAct = Object.prototype.hasOwnProperty.call(HEARTBEAT_ACTION_LABELS, rawAct)
+    ? HEARTBEAT_ACTION_LABELS[rawAct]
+    : "";
+  return safeAct ? `心跳 ${agoText} · ${safeAct}` : `心跳 ${agoText}`;
+}
 
 function formatTs(ts?: number | null): string {
   if (!ts || !Number.isFinite(ts)) return "-";
@@ -298,14 +338,16 @@ export function FederationWorkbenchView({
     [hasActiveJobs, agents],
   );
 
+  // Single mutually-exclusive polling loop: 4s while active jobs exist (list + timeline),
+  // 30s silent presence refresh while idle (list only); always cleared on unmount or transition.
   useEffect(() => {
-    if (!anyActiveInRoster) return;
+    const intervalMs = anyActiveInRoster ? POLL_ACTIVE_INTERVAL_MS : POLL_IDLE_INTERVAL_MS;
     const timer = window.setInterval(() => {
       void loadWorkbench(true);
-      if (selectedAgentId) {
+      if (anyActiveInRoster && selectedAgentId) {
         void loadTimeline(selectedAgentId, true);
       }
-    }, POLL_INTERVAL_MS);
+    }, intervalMs);
     return () => {
       window.clearInterval(timer);
     };
@@ -515,6 +557,10 @@ export function FederationWorkbenchView({
                   (ag.pull_queue_counts?.claimed || 0) +
                   (ag.bus_job_counts?.queued || 0) +
                   (ag.bus_job_counts?.running || 0);
+                const hbLabel = formatHeartbeatLabel(
+                  ag.last_heartbeat_at,
+                  ag.last_heartbeat_action,
+                );
                 return (
                   <button
                     key={ag.agent_id}
@@ -546,6 +592,21 @@ export function FederationWorkbenchView({
                         {ag.adapter_type}
                       </span>
                     </div>
+
+                    {hbLabel && (
+                      <div
+                        className={`text-[10px] font-mono truncate ${
+                          ag.runtime_status === "online"
+                            ? "text-emerald-300/90"
+                            : ag.runtime_status === "stale"
+                              ? "text-amber-300/90"
+                              : "text-slate-400"
+                        }`}
+                        title={formatTs(ag.last_heartbeat_at)}
+                      >
+                        {hbLabel}
+                      </div>
+                    )}
 
                     <div className="flex items-center flex-wrap gap-1.5 text-[10px]">
                       <span className="px-1.5 py-0.5 rounded bg-slate-950/70 border border-slate-800 text-slate-300">
@@ -601,6 +662,30 @@ export function FederationWorkbenchView({
                   <span>派单通道: {selectedAgent.dispatch_mode}</span>
                   <span>·</span>
                   <span>最近活跃: {formatTs(selectedAgent.last_activity_at)}</span>
+                  {(() => {
+                    const selectedHbLabel = formatHeartbeatLabel(
+                      selectedAgent.last_heartbeat_at,
+                      selectedAgent.last_heartbeat_action,
+                    );
+                    if (!selectedHbLabel) return null;
+                    return (
+                      <>
+                        <span>·</span>
+                        <span
+                          className={`font-mono ${
+                            selectedAgent.runtime_status === "online"
+                              ? "text-emerald-300/90"
+                              : selectedAgent.runtime_status === "stale"
+                                ? "text-amber-300/90"
+                                : "text-slate-400"
+                          }`}
+                          title={formatTs(selectedAgent.last_heartbeat_at)}
+                        >
+                          {selectedHbLabel}
+                        </span>
+                      </>
+                    );
+                  })()}
                 </div>
               </div>
               <div className="text-[11px] font-mono text-slate-400">

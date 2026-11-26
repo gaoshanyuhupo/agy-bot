@@ -1787,6 +1787,8 @@ export interface FederationWorkbenchAgentItem extends FederationAgentItem {
   bus_job_counts: FederationBusJobCounts;
   leader_events_count: number;
   last_activity_at: number | null;
+  last_heartbeat_at?: number | null;
+  last_heartbeat_action?: string;
 }
 
 export interface FederationWorkbenchResponse {

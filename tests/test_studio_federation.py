@@ -59,6 +59,7 @@ from studio.event_hub import _sanitize_event_value  # noqa: E402
 from studio.federation_service import (  # noqa: E402
     StudioFederationService,
     _merge_single_timeline_job,
+    _read_presence_map_no_symlink,
     _validate_hub_public_url,
     _validate_loopback_hub_target,
 )
@@ -2731,6 +2732,220 @@ class TestWorkbenchW7NavigationSpaShellDemoAndRedlines(_FederationTestBase):
             content = (REPO_ROOT / rel).read_text(encoding="utf-8")
             for ptok in personal_tokens:
                 self.assertNotIn(ptok, content, f"Personal marker {ptok!r} found in {rel}")
+
+
+class TestWorkbenchPresenceP4AndP6(_FederationTestBase):
+    """P4 & P6: Studio read-only presence anti-symlink, dirty/future sanitization, status sync, Hub E2E, and WebUI guards."""
+
+    async def test_p4_studio_presence_readonly_anti_symlink_sanitization_and_status_sync(self) -> None:
+        admin_cookie, admin_csrf = await self._login("AdminUser", ADMIN_PASS)
+        admin_get = {"Cookie": f"{SESSION_COOKIE_NAME}={admin_cookie}"}
+        headers = self._admin_headers(admin_cookie, admin_csrf)
+
+        # 1. Empty BUS_DIR -> 200 OK, zero creation of federation/ or presence.json
+        self.assertEqual(list(self.bus_dir.iterdir()), [])
+        r_empty = await self.client.get("/api/federation/workbench", headers=admin_get)
+        self.assertEqual(r_empty.status, 200, await r_empty.text())
+        self.assertEqual((await r_empty.json())["agents"], [])
+        self.assertFalse((self.bus_dir / "federation").exists())
+
+        # Register agents covering online, stale, offline, revoked, disabled, dirty, future
+        for spec in (
+            {"agent_id": "pull_worker_demo", "kind": "pull_worker"},
+            {"agent_id": "node_stale", "kind": "pull_worker"},
+            {"agent_id": "node_offline", "kind": "pull_worker"},
+            {"agent_id": "node_revoked", "kind": "pull_worker"},
+            {"agent_id": "node_disabled", "kind": "pull_worker", "enabled": False},
+            {"agent_id": "node_dirty", "kind": "pull_worker"},
+            {"agent_id": "node_future", "kind": "pull_worker"},
+        ):
+            r_reg = await self.client.post("/api/federation/agents", headers=headers, data=json.dumps(spec))
+            self.assertEqual(r_reg.status, 200, await r_reg.text())
+        r_rev = await self.client.post("/api/federation/agents/node_revoked/revoke", headers=headers, data="{}")
+        self.assertEqual(r_rev.status, 200)
+
+        fed_dir = self.bus_dir / "federation"
+        presence_path = fed_dir / "presence.json"
+        canary = "TOP_SECRET_PRESENCE_CANARY_P4"
+        outside_file = self.tmp / "outside_presence_canary.json"
+        outside_file.write_text(json.dumps({"pull_worker_demo": {"last_seen_at": time.time(), "token": canary}}), encoding="utf-8")
+
+        # 2. Symlink / FIFO / Dir at presence.json -> BOTH workbench & timeline fail-closed 403 SECURITY_SYMLINK_REJECTED
+        os.symlink(outside_file, presence_path)
+        for path in ("/api/federation/workbench", "/api/federation/workbench/agents/pull_worker_demo/timeline"):
+            r = await self.client.get(path, headers=admin_get)
+            self.assertEqual(r.status, 403, f"symlink presence.json {path}")
+            body_txt = await r.text()
+            self.assertIn("SECURITY_SYMLINK_REJECTED", body_txt)
+            self.assertNotIn(canary, body_txt)
+        presence_path.unlink()
+
+        os.mkfifo(presence_path)
+        for path in ("/api/federation/workbench", "/api/federation/workbench/agents/pull_worker_demo/timeline"):
+            r = await self.client.get(path, headers=admin_get)
+            self.assertEqual(r.status, 403, f"fifo presence.json {path}")
+            self.assertEqual((await r.json()).get("code"), "SECURITY_SYMLINK_REJECTED")
+        presence_path.unlink()
+
+        presence_path.mkdir()
+        for path in ("/api/federation/workbench", "/api/federation/workbench/agents/pull_worker_demo/timeline"):
+            r = await self.client.get(path, headers=admin_get)
+            self.assertEqual(r.status, 403, f"dir presence.json {path}")
+            self.assertEqual((await r.json()).get("code"), "SECURITY_SYMLINK_REJECTED")
+        presence_path.rmdir()
+
+        # 3. Corrupted JSON & >1 MiB oversized file -> gracefully skipped (200 OK, null heartbeat)
+        presence_path.write_text("{corrupted_json", encoding="utf-8")
+        r_bad_json = await self.client.get("/api/federation/workbench", headers=admin_get)
+        self.assertEqual(r_bad_json.status, 200)
+        ag_bad = next(a for a in (await r_bad_json.json())["agents"] if a["agent_id"] == "pull_worker_demo")
+        self.assertIsNone(ag_bad["last_heartbeat_at"])
+        self.assertEqual(ag_bad["last_heartbeat_action"], "")
+
+        now_int = int(time.time())
+        oversized_blob = (
+            f'{{"pull_worker_demo":{{"last_seen_at":{now_int},"pad":"' + ("A" * (1024 * 1024 + 512)) + '"}}'
+        )
+        presence_path.write_text(oversized_blob, encoding="utf-8")
+        r_big = await self.client.get("/api/federation/workbench", headers=admin_get)
+        self.assertEqual(r_big.status, 200)
+        ag_big = next(a for a in (await r_big.json())["agents"] if a["agent_id"] == "pull_worker_demo")
+        self.assertIsNone(ag_big["last_heartbeat_at"])
+
+        # 4. Unit sanitization of NaN / Infinity / bool / negative / string / future timestamps
+        now = time.time()
+        presence_path.write_text(
+            '{'
+            '"pull_worker_demo":{"last_seen_at":NaN,"last_action":"peek"},'
+            '"node_stale":{"last_seen_at":Infinity,"last_action":"inbox"},'
+            '"node_offline":{"last_seen_at":true,"last_action":"claim"},'
+            '"node_dirty":{"last_seen_at":-1,"last_action":"result"},'
+            f'"node_future":{{"last_seen_at":"{int(now)}","last_action":"mcp"}}'
+            '}',
+            encoding="utf-8",
+        )
+        ok_p, parsed_dirty, err_p = _read_presence_map_no_symlink(str(self.bus_dir), now_ts=now)
+        self.assertTrue(ok_p, err_p)
+        self.assertEqual(parsed_dirty, {})
+
+        # 5. Full status window mapping, revocation/disabled precedence, XSS/secret/future scrubbing, and list==timeline parity
+        now = time.time()
+        presence_payload = {
+            "pull_worker_demo": {"last_seen_at": round(now - 12.0, 3), "last_peek_at": round(now - 12.0, 3), "last_action": "peek"},
+            "node_stale": {"last_seen_at": round(now - 301.0, 3), "last_action": "inbox"},
+            "node_offline": {"last_seen_at": round(now - 3601.0, 3), "last_action": "claim"},
+            "node_revoked": {"last_seen_at": round(now - 5.0, 3), "last_action": "peek"},
+            "node_disabled": {"last_seen_at": round(now - 5.0, 3), "last_action": "peek"},
+            "node_dirty": {
+                "last_seen_at": round(now - 15.0, 3),
+                "last_action": "<script>alert(1)</script>",
+                "token": SYNTH_FAKE_FED,
+                "ip": "198.51.100.77",
+            },
+            "node_future": {"last_seen_at": round(now + 86400.0, 3), "last_action": SYNTH_FAKE_FED},
+        }
+        presence_path.write_text(json.dumps(presence_payload), encoding="utf-8")
+
+        r_list = await self.client.get("/api/federation/workbench", headers=admin_get)
+        self.assertEqual(r_list.status, 200, await r_list.text())
+        list_raw_txt = await r_list.text()
+        for forbidden in ("<script>", SYNTH_FAKE_FED, "198.51.100.77"):
+            self.assertNotIn(forbidden, list_raw_txt)
+        list_by_id = {a["agent_id"]: a for a in (await r_list.json())["agents"]}
+
+        expected_statuses = {
+            "pull_worker_demo": ("online", "peek", True),
+            "node_stale": ("stale", "inbox", True),
+            "node_offline": ("offline", "claim", True),
+            "node_revoked": ("revoked", "peek", True),
+            "node_disabled": ("disabled", "peek", True),
+            "node_dirty": ("online", "", True),
+            "node_future": ("offline", "", False),
+        }
+
+        for aid, (exp_status, exp_action, expect_hb_ts) in expected_statuses.items():
+            list_ag = list_by_id[aid]
+            self.assertEqual(list_ag["runtime_status"], exp_status, f"list status mismatch for {aid}")
+            self.assertEqual(list_ag["last_heartbeat_action"], exp_action, f"list action mismatch for {aid}")
+            if expect_hb_ts:
+                self.assertIsInstance(list_ag["last_heartbeat_at"], float)
+            else:
+                self.assertIsNone(list_ag["last_heartbeat_at"])
+
+            # Verify 100% parity with detail timeline endpoint
+            r_tl = await self.client.get(f"/api/federation/workbench/agents/{aid}/timeline", headers=admin_get)
+            self.assertEqual(r_tl.status, 200, f"timeline {aid}: {await r_tl.text()}")
+            tl_raw = await r_tl.text()
+            for forbidden in ("<script>", SYNTH_FAKE_FED, "198.51.100.77"):
+                self.assertNotIn(forbidden, tl_raw)
+            tl_ag = (await r_tl.json())["agent"]
+            self.assertEqual(tl_ag["runtime_status"], list_ag["runtime_status"], aid)
+            self.assertEqual(tl_ag["last_heartbeat_at"], list_ag["last_heartbeat_at"], aid)
+            self.assertEqual(tl_ag["last_heartbeat_action"], list_ag["last_heartbeat_action"], aid)
+            self.assertEqual(tl_ag["last_activity_at"], list_ag["last_activity_at"], aid)
+
+        # 6. End-to-end Hub /peek -> presence.json -> Studio workbench & timeline both show online + peek
+        presence_path.unlink()
+        owner = federation_registry.make_owner_auth("owner")
+        tok_peek = federation_registry.mint_agent_token(
+            "pull_worker_demo", owner_auth=owner, scope="peek", bus_dir=str(self.bus_dir)
+        )["token"]
+        hub_srv = federation_hub.FederationHubServer(
+            host="127.0.0.1", port=0, bus_dir=str(self.bus_dir), presence_flush_interval_sec=0.0
+        )
+        hub_thread = threading.Thread(target=hub_srv.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True)
+        hub_thread.start()
+        try:
+            async with aiohttp.ClientSession() as sess:
+                async with sess.get(
+                    f"http://127.0.0.1:{hub_srv.bound_port}/hub/v1/agents/pull_worker_demo/peek",
+                    headers={"Authorization": f"Bearer {tok_peek}"},
+                ) as hub_resp:
+                    self.assertEqual(hub_resp.status, 200)
+        finally:
+            hub_srv.close_hub()
+            hub_thread.join(timeout=2.0)
+
+        r_wb_e2e = await self.client.get("/api/federation/workbench", headers=admin_get)
+        self.assertEqual(r_wb_e2e.status, 200)
+        wb_ag = next(a for a in (await r_wb_e2e.json())["agents"] if a["agent_id"] == "pull_worker_demo")
+        self.assertEqual(wb_ag["runtime_status"], "online")
+        self.assertEqual(wb_ag["last_heartbeat_action"], "peek")
+        self.assertIsInstance(wb_ag["last_heartbeat_at"], float)
+
+        r_tl_e2e = await self.client.get("/api/federation/workbench/agents/pull_worker_demo/timeline", headers=admin_get)
+        self.assertEqual(r_tl_e2e.status, 200)
+        tl_ag_e2e = (await r_tl_e2e.json())["agent"]
+        self.assertEqual(tl_ag_e2e["runtime_status"], "online")
+        self.assertEqual(tl_ag_e2e["last_heartbeat_action"], "peek")
+        self.assertEqual(tl_ag_e2e["last_heartbeat_at"], wb_ag["last_heartbeat_at"])
+
+    async def test_p6_frontend_presence_xss_guard_polling_and_demo_invariants(self) -> None:
+        wb_tsx = (REPO_ROOT / "webui" / "src" / "components" / "FederationWorkbenchView.tsx").read_text(encoding="utf-8")
+        types_ts = (REPO_ROOT / "webui" / "src" / "types.ts").read_text(encoding="utf-8")
+        mock_ts = (REPO_ROOT / "webui" / "src" / "demo" / "mockApi.ts").read_text(encoding="utf-8")
+
+        # Pure text rendering + strict action whitelist + zero dangerous HTML sinks
+        for forbidden in ("dangerouslySetInnerHTML", "innerHTML", "<script"):
+            self.assertNotIn(forbidden, wb_tsx)
+        self.assertIn("HEARTBEAT_ACTION_LABELS", wb_tsx)
+        self.assertIn("hasOwnProperty.call(HEARTBEAT_ACTION_LABELS", wb_tsx)
+        for act in ("peek", "inbox", "claim", "result", "events_ack", "mcp"):
+            self.assertIn(f'{act}: "{act}"', wb_tsx)
+
+        # Single mutually-exclusive polling useEffect (4s active / 30s idle) + clearInterval + monotonic gen refs
+        self.assertIn("POLL_ACTIVE_INTERVAL_MS = 4000", wb_tsx)
+        self.assertIn("POLL_IDLE_INTERVAL_MS = 30000", wb_tsx)
+        self.assertEqual(wb_tsx.count("setInterval("), 1)
+        self.assertEqual(wb_tsx.count("clearInterval("), 1)
+        self.assertIn("listGenRef", wb_tsx)
+        self.assertIn("reqGenRef", wb_tsx)
+
+        # TypeScript interface & Demo mockApi parity
+        self.assertIn("last_heartbeat_at?: number | null;", types_ts)
+        self.assertIn("last_heartbeat_action?: string;", types_ts)
+        self.assertIn("last_heartbeat_at:", mock_ts)
+        self.assertIn("last_heartbeat_action:", mock_ts)
 
 
 if __name__ == "__main__":

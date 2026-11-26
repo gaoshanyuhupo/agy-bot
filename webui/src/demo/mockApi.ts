@@ -4456,6 +4456,20 @@ function demoBuildWorkbenchAgent(ag: FederationAgentItem): FederationWorkbenchAg
       }
     }
   }
+  const demoHeartbeatMap: Record<
+    string,
+    { last_heartbeat_at: number; last_heartbeat_action: string }
+  > = {
+    pull_worker_demo: { last_heartbeat_at: nowSec() - 12, last_heartbeat_action: "peek" },
+    hermes_remote_demo: { last_heartbeat_at: nowSec() - 45, last_heartbeat_action: "mcp" },
+    hermes_local_demo: { last_heartbeat_at: nowSec() - 25, last_heartbeat_action: "mcp" },
+  };
+  const hbInfo = demoHeartbeatMap[ag.agent_id];
+  const lastHeartbeatAt = hbInfo ? hbInfo.last_heartbeat_at : null;
+  const lastHeartbeatAction = hbInfo ? hbInfo.last_heartbeat_action : "";
+  if (lastHeartbeatAt && (!lastAct || lastHeartbeatAt > lastAct)) {
+    lastAct = lastHeartbeatAt;
+  }
   const canDispatch =
     ag.kind !== "agy_local" &&
     ag.kind !== "mcp_inbound_only" &&
@@ -4480,6 +4494,8 @@ function demoBuildWorkbenchAgent(ag: FederationAgentItem): FederationWorkbenchAg
     bus_job_counts: busCounts,
     leader_events_count: ag.agent_id === "pull_worker_demo" ? 1 : 0,
     last_activity_at: lastAct,
+    last_heartbeat_at: lastHeartbeatAt,
+    last_heartbeat_action: lastHeartbeatAction,
   };
 }
 

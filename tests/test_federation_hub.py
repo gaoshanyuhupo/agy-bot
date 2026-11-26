@@ -3432,5 +3432,525 @@ class TestHubEventsAckAndResultAliasProdRelease(unittest.TestCase):
                 self.assertEqual("JOB_STATE_CONFLICT", body_unc.get("error"))
 
 
+# ==============================================================================
+# Presence Contract Tests (P1, P2, P3, P5)
+# ==============================================================================
+class TestPresenceContractP1ToP3AndP5(unittest.TestCase):
+    def _register_pull_agent(
+        self,
+        tmp: str,
+        owner: fed.OwnerAuth,
+        agent_id: str,
+        *,
+        kind: str = "http_a2a",
+        driver: str = "pull_worker",
+        transport: str = "pull_worker",
+        enabled: bool = True,
+        trust_level: str = "remote_trusted",
+        capabilities: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        caps = capabilities or {
+            "coordinator_peer": False,
+            "host_server_invoke": False,
+            "can_dispatch": False,
+            "can_receive": True,
+        }
+        fed.register_agent(
+            agent_id,
+            kind=kind,
+            driver=driver,
+            transport=transport,
+            trust_level=trust_level,
+            capabilities=caps,
+            enabled=enabled,
+            owner_auth=owner,
+            bus_dir=tmp,
+        )
+
+    def test_p1_presence_auth_cross_agent_lifecycle_isolation(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, _clean_env({"AGY_BOT_BUS_DIR": tmp}), clear=True
+        ):
+            owner = fed.make_owner_auth("owner")
+            self._register_pull_agent(tmp, owner, "worker_a")
+            self._register_pull_agent(tmp, owner, "worker_b")
+            self._register_pull_agent(tmp, owner, "worker_revoked")
+            self._register_pull_agent(tmp, owner, "worker_disabled", enabled=False)
+            fed.register_agent("local_agy_bot", kind="agy_local", owner_auth=owner, bus_dir=tmp)
+            fed.register_agent(
+                "ext_lead",
+                kind="hermes_remote",
+                endpoint_url="https://ext-lead.example.com",
+                trust_level="remote_trusted",
+                capabilities={"coordinator_peer": True, "can_dispatch": True, "can_receive": True},
+                owner_auth=owner,
+                bus_dir=tmp,
+            )
+
+            tok_a_full = fed.mint_agent_token("worker_a", owner_auth=owner, scope="full", bus_dir=tmp)["token"]
+            tok_a_peek = fed.mint_agent_token("worker_a", owner_auth=owner, scope="peek", bus_dir=tmp)["token"]
+            tok_b_full = fed.mint_agent_token("worker_b", owner_auth=owner, scope="full", bus_dir=tmp)["token"]
+            tok_rev = fed.mint_agent_token("worker_revoked", owner_auth=owner, scope="full", bus_dir=tmp)["token"]
+            fed.revoke_agent("worker_revoked", owner_auth=owner, bus_dir=tmp)
+            tok_dis = fed.mint_agent_token("worker_disabled", owner_auth=owner, scope="full", bus_dir=tmp)["token"]
+            tok_local_full = fed.mint_agent_token("local_agy_bot", owner_auth=owner, scope="full", bus_dir=tmp)["token"]
+            tok_local_peek = fed.mint_agent_token("local_agy_bot", owner_auth=owner, scope="peek", bus_dir=tmp)["token"]
+            tok_ext_lead = fed.mint_agent_token("ext_lead", owner_auth=owner, scope="full", bus_dir=tmp)["token"]
+
+            q = fed.PullWorkerQueue(tmp)
+            q.enqueue("worker_b", "task for b", job_id="job-p1-b1", owner_auth=owner)
+            q.enqueue("worker_a", "unclaimed for a", job_id="job-p1-a-unclaimed", owner_auth=owner)
+
+            presence_path = Path(fed.federation_dir(tmp)) / "presence.json"
+
+            # 1. Negative paths: auth / lifecycle / scope / cross-agent / business errors / MCP denied
+            with _RunningHub(bus_dir=tmp, presence_flush_interval_sec=0.0) as rh:
+                # Missing / forged / revoked / disabled -> 401
+                forged_tok = fed.TOKEN_PREFIX + "EXAMPLE_FORGED_000000"
+                self.assertEqual(401, rh.request("GET", "/hub/v1/agents/worker_a/peek")[0])
+                self.assertEqual(401, rh.request("GET", "/hub/v1/agents/worker_a/peek", token=forged_tok)[0])
+                self.assertEqual(401, rh.request("GET", "/hub/v1/agents/worker_revoked/peek", token=tok_rev)[0])
+                self.assertEqual(401, rh.request("GET", "/hub/v1/agents/worker_disabled/peek", token=tok_dis)[0])
+
+                # scope='peek' attempting non-peek routes -> 401
+                self.assertEqual(401, rh.request("GET", "/hub/v1/agents/worker_a/inbox", token=tok_a_peek)[0])
+                self.assertEqual(401, rh.request("POST", "/hub/v1/agents/worker_a/events/ack", token=tok_a_peek, body={"all": True})[0])
+                self.assertEqual(401, rh.request("POST", "/hub/v1/jobs/claim", token=tok_a_peek, body={})[0])
+                self.assertEqual(401, rh.request("POST", "/hub/mcp", token=tok_a_peek, body={"jsonrpc": "2.0", "id": 1, "method": "ping"})[0])
+
+                # Cross-agent 403 across peek/inbox/events_ack/claim/result
+                self.assertEqual(403, rh.request("GET", "/hub/v1/agents/worker_b/peek", token=tok_a_full)[0])
+                self.assertEqual(403, rh.request("GET", "/hub/v1/agents/worker_b/inbox", token=tok_a_full)[0])
+                self.assertEqual(403, rh.request("POST", "/hub/v1/agents/worker_b/events/ack", token=tok_a_full, body={"all": True})[0])
+                self.assertEqual(403, rh.request("POST", "/hub/v1/jobs/job-p1-b1/claim", token=tok_a_full, body={})[0])
+                self.assertEqual(403, rh.request("POST", "/hub/v1/jobs/job-p1-b1/result", token=tok_a_full, body={"status": "done", "result": "x"})[0])
+
+                # Business errors 400 / 404 / 409
+                self.assertEqual(400, rh.request("POST", "/hub/v1/agents/worker_a/events/ack", token=tok_a_full, body={})[0])
+                self.assertEqual(404, rh.request("POST", "/hub/v1/jobs/job-missing-404/claim", token=tok_a_full, body={})[0])
+                self.assertEqual(404, rh.request("POST", "/hub/v1/jobs/job-missing-404/result", token=tok_a_full, body={"status": "done"})[0])
+                self.assertEqual(400, rh.request("POST", "/hub/v1/jobs/job-p1-a-unclaimed/result", token=tok_a_full, body={"status": "invalid"})[0])
+                self.assertEqual(409, rh.request("POST", "/hub/v1/jobs/job-p1-a-unclaimed/result", token=tok_a_full, body={"status": "done", "result": "early"})[0])
+
+                # MCP failures: unauthorized tool (403), unknown tool (404), unknown method (404), invalid JSON (400)
+                self.assertEqual(
+                    403,
+                    rh.request(
+                        "POST",
+                        "/hub/mcp",
+                        token=tok_a_full,
+                        body={"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "host_exec", "arguments": {"command": "pwd"}}},
+                    )[0],
+                )
+                self.assertEqual(
+                    404,
+                    rh.request(
+                        "POST",
+                        "/hub/mcp",
+                        token=tok_a_full,
+                        body={"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "no_such_tool", "arguments": {}}},
+                    )[0],
+                )
+                self.assertEqual(
+                    404,
+                    rh.request(
+                        "POST",
+                        "/hub/mcp",
+                        token=tok_a_full,
+                        body={"jsonrpc": "2.0", "id": 3, "method": "no/such/method"},
+                    )[0],
+                )
+                self.assertEqual(
+                    400,
+                    rh.request(
+                        "POST",
+                        "/hub/mcp",
+                        token=tok_a_full,
+                        raw_body=b"[1,2,3]",
+                        headers={"Content-Type": "application/json"},
+                    )[0],
+                )
+                # External agent MCP tools/call with invalid params (team_job invalid action) -> 400 & 0 presence
+                self.assertEqual(
+                    400,
+                    rh.request(
+                        "POST",
+                        "/hub/mcp",
+                        token=tok_ext_lead,
+                        body={
+                            "jsonrpc": "2.0",
+                            "id": 4,
+                            "method": "tools/call",
+                            "params": {"name": "team_job", "arguments": {"action": "invalid_action"}},
+                        },
+                    )[0],
+                )
+
+                # Local agy_local agent with valid token returns 200 on /peek, /inbox, /hub/mcp (ping) with 0 presence
+                self.assertEqual(200, rh.request("GET", "/hub/v1/agents/local_agy_bot/peek", token=tok_local_peek)[0])
+                self.assertEqual(200, rh.request("GET", "/hub/v1/agents/local_agy_bot/peek", token=tok_local_full)[0])
+                self.assertEqual(200, rh.request("GET", "/hub/v1/agents/local_agy_bot/inbox", token=tok_local_full)[0])
+                self.assertEqual(
+                    200,
+                    rh.request("POST", "/hub/mcp", token=tok_local_full, body={"jsonrpc": "2.0", "id": 5, "method": "ping"})[0],
+                )
+
+                # Zero memory or disk presence updates after ALL negative & agy_local paths
+                self.assertEqual({}, rh.server.presence.snapshot())
+                self.assertFalse(presence_path.exists())
+
+            # 2. Replay failure (401) & Rate limit (429) must NEVER record presence
+            with _RunningHub(bus_dir=tmp, require_replay_headers=True, presence_flush_interval_sec=0.0) as rh_rep:
+                self.assertEqual(401, rh_rep.request("GET", "/hub/v1/agents/worker_a/peek", token=tok_a_peek)[0])
+                bad_hdrs = hub.build_replay_headers(tok_a_peek, "GET", "/hub/v1/agents/worker_a/peek", b"", nonce="p1-bad-sig")
+                bad_hdrs["X-Agy-Signature"] = "0" * 64
+                self.assertEqual(401, rh_rep.request("GET", "/hub/v1/agents/worker_a/peek", token=tok_a_peek, headers=bad_hdrs)[0])
+                self.assertEqual({}, rh_rep.server.presence.snapshot())
+                self.assertFalse(presence_path.exists())
+
+            with _RunningHub(bus_dir=tmp, rate_limit_max_requests=1, rate_limit_window_sec=60.0, presence_flush_interval_sec=0.0) as rh_rl:
+                # Consume 1 quota slot on /hub/v1/me (non-presence endpoint), then /peek hits 429
+                self.assertEqual(200, rh_rl.request("GET", "/hub/v1/me", token=tok_a_full)[0])
+                self.assertEqual(429, rh_rl.request("GET", "/hub/v1/agents/worker_a/peek", token=tok_a_full)[0])
+                self.assertEqual({}, rh_rl.server.presence.snapshot())
+                self.assertFalse(presence_path.exists())
+
+            # 3. Positive 200/202 paths: verify all 6 actions record presence cleanly
+            with _RunningHub(bus_dir=tmp, presence_flush_interval_sec=0.0) as rh:
+                # peek
+                self.assertEqual(200, rh.request("GET", "/hub/v1/agents/worker_a/peek", token=tok_a_peek)[0])
+                snap = rh.server.presence.snapshot()["worker_a"]
+                self.assertEqual("peek", snap["last_action"])
+                self.assertIn("last_peek_at", snap)
+                peek_ts = snap["last_peek_at"]
+
+                # inbox (preserves last_peek_at)
+                self.assertEqual(200, rh.request("GET", "/hub/v1/agents/worker_a/inbox", token=tok_a_full)[0])
+                snap = rh.server.presence.snapshot()["worker_a"]
+                self.assertEqual("inbox", snap["last_action"])
+                self.assertEqual(peek_ts, snap["last_peek_at"])
+
+                # claim
+                st_c, _, _ = rh.request("POST", "/hub/v1/jobs/job-p1-a-unclaimed/claim", token=tok_a_full, body={})
+                self.assertEqual(200, st_c)
+                self.assertEqual("claim", rh.server.presence.snapshot()["worker_a"]["last_action"])
+
+                # duplicate claim -> 409 must NOT overwrite last_action after we move it via inbox
+                self.assertEqual(200, rh.request("GET", "/hub/v1/agents/worker_a/inbox", token=tok_a_full)[0])
+                self.assertEqual(409, rh.request("POST", "/hub/v1/jobs/job-p1-a-unclaimed/claim", token=tok_a_full, body={})[0])
+                self.assertEqual("inbox", rh.server.presence.snapshot()["worker_a"]["last_action"])
+
+                # result
+                st_r, _, _ = rh.request(
+                    "POST",
+                    "/hub/v1/jobs/job-p1-a-unclaimed/result",
+                    token=tok_a_full,
+                    body={"status": "done", "result": "ok"},
+                )
+                self.assertEqual(200, st_r)
+                self.assertEqual("result", rh.server.presence.snapshot()["worker_a"]["last_action"])
+
+                # events_ack
+                st_ack, _, _ = rh.request(
+                    "POST",
+                    "/hub/v1/agents/worker_a/events/ack",
+                    token=tok_a_full,
+                    body={"all": True},
+                )
+                self.assertEqual(200, st_ack)
+                self.assertEqual("events_ack", rh.server.presence.snapshot()["worker_a"]["last_action"])
+
+                # mcp 200 (ping) & 202 (notifications/initialized)
+                self.assertEqual(
+                    200,
+                    rh.request("POST", "/hub/mcp", token=tok_a_full, body={"jsonrpc": "2.0", "id": 10, "method": "ping"})[0],
+                )
+                self.assertEqual("mcp", rh.server.presence.snapshot()["worker_a"]["last_action"])
+                self.assertEqual(
+                    202,
+                    rh.request("POST", "/hub/mcp", token=tok_b_full, body={"jsonrpc": "2.0", "method": "notifications/initialized"})[0],
+                )
+                self.assertEqual("mcp", rh.server.presence.snapshot()["worker_b"]["last_action"])
+
+    def test_p2_presence_anti_symlink_fifo_dir_min_schema_and_fault_isolation(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, _clean_env({"AGY_BOT_BUS_DIR": tmp}), clear=True
+        ):
+            owner = fed.make_owner_auth("owner")
+            self._register_pull_agent(tmp, owner, "worker_a")
+            self._register_pull_agent(tmp, owner, "worker_b")
+            tok_a_full = fed.mint_agent_token("worker_a", owner_auth=owner, scope="full", bus_dir=tmp)["token"]
+            tok_a_peek = fed.mint_agent_token("worker_a", owner_auth=owner, scope="peek", bus_dir=tmp)["token"]
+            tok_b_full = fed.mint_agent_token("worker_b", owner_auth=owner, scope="full", bus_dir=tmp)["token"]
+            tok_b_peek = fed.mint_agent_token("worker_b", owner_auth=owner, scope="peek", bus_dir=tmp)["token"]
+
+            fed_dir = Path(fed.federation_dir(tmp))
+            presence_path = fed_dir / "presence.json"
+            canary = Path(tmp) / "outside_canary.txt"
+            canary_bytes = b"DO_NOT_OVERWRITE_CANARY_P2\n"
+            canary.write_bytes(canary_bytes)
+
+            with _RunningHub(bus_dir=tmp, presence_flush_interval_sec=0.0) as rh:
+                # 1. Symlink presence.json -> external canary: rejected, canary untouched, /peek still 200 OK
+                os.symlink(canary, presence_path)
+                st_sym, _, _ = rh.request("GET", "/hub/v1/agents/worker_a/peek", token=tok_a_peek)
+                self.assertEqual(200, st_sym)
+                self.assertTrue(presence_path.is_symlink())
+                self.assertEqual(canary_bytes, canary.read_bytes())
+                self.assertEqual([], [p.name for p in fed_dir.iterdir() if p.name.endswith(".tmp")])
+                presence_path.unlink()
+
+                # 2. Directory at presence.json: rejected, /peek still 200 OK
+                presence_path.mkdir()
+                st_dir, _, _ = rh.request("GET", "/hub/v1/agents/worker_a/peek", token=tok_a_peek)
+                self.assertEqual(200, st_dir)
+                self.assertTrue(presence_path.is_dir())
+                self.assertEqual([], [p.name for p in fed_dir.iterdir() if p.name.endswith(".tmp")])
+                presence_path.rmdir()
+
+                # 3. FIFO at presence.json: rejected without hanging, /peek still 200 OK
+                os.mkfifo(presence_path)
+                st_fifo, _, _ = rh.request("GET", "/hub/v1/agents/worker_a/peek", token=tok_a_peek)
+                self.assertEqual(200, st_fifo)
+                self.assertTrue(stat.S_ISFIFO(os.lstat(presence_path).st_mode))
+                self.assertEqual([], [p.name for p in fed_dir.iterdir() if p.name.endswith(".tmp")])
+                presence_path.unlink()
+
+                # 4. Symlinked federation dir fails closed with 0 writes to outside dir
+                outside_dir = Path(tmp) / "outside_fed_sink"
+                outside_dir.mkdir()
+                alt_bus = Path(tmp) / "alt_bus"
+                alt_bus.mkdir()
+                os.symlink(outside_dir, alt_bus / "federation")
+                tracker_bad = hub.PresenceTracker(str(alt_bus), flush_interval_sec=0.0)
+                self.assertFalse(tracker_bad.record("worker_a", "peek"))
+                self.assertEqual([], list(outside_dir.iterdir()))
+
+                # 4b. Read-only (0o500) existing federation dir: MUST NOT fchmod to 0o700,
+                #     /peek stays 200 OK, record() degrades to False, zero presence.json / .tmp created
+                ro_bus = Path(tmp) / "ro_bus"
+                ro_fed = ro_bus / "federation"
+                ro_fed.mkdir(parents=True)
+                os.chmod(ro_fed, 0o500)
+                orig_presence = rh.server.presence
+                try:
+                    ro_tracker = hub.PresenceTracker(str(ro_bus), flush_interval_sec=0.0)
+                    rh.server.presence = ro_tracker
+                    st_ro, _, _ = rh.request("GET", "/hub/v1/agents/worker_a/peek", token=tok_a_peek)
+                    self.assertEqual(200, st_ro)
+                    self.assertFalse(ro_tracker.record("worker_a", "peek"))
+                    self.assertEqual(0o500, stat.S_IMODE(os.lstat(ro_fed).st_mode))
+                    self.assertFalse((ro_fed / "presence.json").exists())
+                    self.assertEqual([], [p.name for p in ro_fed.iterdir() if p.name.endswith(".tmp")])
+                    # Also verify overly permissive read-only 0o555 strips group/other bits to 0o500 without adding 0o200
+                    os.chmod(ro_fed, 0o555)
+                    self.assertFalse(ro_tracker.record("worker_a", "peek"))
+                    self.assertEqual(0o500, stat.S_IMODE(os.lstat(ro_fed).st_mode))
+                    self.assertFalse((ro_fed / "presence.json").exists())
+                    self.assertEqual([], [p.name for p in ro_fed.iterdir() if p.name.endswith(".tmp")])
+                finally:
+                    rh.server.presence = orig_presence
+                    os.chmod(ro_fed, 0o700)
+
+                # 5. Valid atomic persistence: mode 0o600, strict minimal schema, zero secrets/IPs/headers
+                st_ok, _, _ = rh.request("GET", "/hub/v1/agents/worker_a/inbox", token=tok_a_full)
+                self.assertEqual(200, st_ok)
+                self.assertTrue(presence_path.is_file() and not presence_path.is_symlink())
+                self.assertEqual(0o600, stat.S_IMODE(os.lstat(presence_path).st_mode))
+                raw_txt = presence_path.read_text(encoding="utf-8")
+                for forbidden in (tok_a_full, tok_a_peek, fed.TOKEN_PREFIX, "127.0.0.1", "Authorization", "Bearer"):
+                    self.assertNotIn(forbidden, raw_txt)
+                disk_data = json.loads(raw_txt)
+                self.assertEqual({"worker_a"}, set(disk_data.keys()))
+                self.assertTrue(set(disk_data["worker_a"].keys()).issubset({"last_seen_at", "last_action", "last_peek_at"}))
+                self.assertEqual("inbox", disk_data["worker_a"]["last_action"])
+
+            # 6. Hub restart safe read-merge: worker_b writes without clobbering worker_a
+            with _RunningHub(bus_dir=tmp, presence_flush_interval_sec=0.0) as rh2:
+                self.assertEqual(200, rh2.request("GET", "/hub/v1/agents/worker_b/peek", token=tok_b_peek)[0])
+                disk_data2 = json.loads(presence_path.read_text(encoding="utf-8"))
+                self.assertEqual({"worker_a", "worker_b"}, set(disk_data2.keys()))
+                self.assertEqual({"last_seen_at", "last_action", "last_peek_at"}, set(disk_data2["worker_b"].keys()))
+                self.assertEqual("peek", disk_data2["worker_b"]["last_action"])
+                self.assertEqual([], [p.name for p in fed_dir.iterdir() if p.name.endswith(".tmp")])
+
+            # 7. Hub restart read-merge sanitization: dirty keys, bad action, bad agent_id, far-future timestamps
+            now_ts = round(time.time(), 3)
+            polluted_disk = {
+                "worker_a": {
+                    "last_seen_at": now_ts - 5.0,
+                    "last_action": "inbox",
+                    "last_peek_at": now_ts + 86400.0,
+                    "token": tok_a_full,
+                    "ip": "198.51.100.10",
+                },
+                "worker_b": {
+                    "last_seen_at": now_ts - 10.0,
+                    "last_action": "peek",
+                    "last_peek_at": now_ts + 86400.0,
+                },
+                "worker_xss": {
+                    "last_seen_at": now_ts - 5.0,
+                    "last_action": "<script>alert(1)</script>",
+                },
+                "../evil": {
+                    "last_seen_at": now_ts - 5.0,
+                    "last_action": "peek",
+                },
+                "worker_future": {
+                    "last_seen_at": now_ts + 86400.0,
+                    "last_action": "peek",
+                },
+            }
+            presence_path.write_text(json.dumps(polluted_disk), encoding="utf-8")
+            os.chmod(presence_path, 0o600)
+
+            with _RunningHub(bus_dir=tmp, presence_flush_interval_sec=0.0) as rh3:
+                self.assertEqual(200, rh3.request("GET", "/hub/v1/agents/worker_b/inbox", token=tok_b_full)[0])
+                clean_raw = presence_path.read_text(encoding="utf-8")
+                clean_disk = json.loads(clean_raw)
+                self.assertEqual({"worker_a", "worker_b"}, set(clean_disk.keys()))
+                self.assertEqual({"last_seen_at", "last_action"}, set(clean_disk["worker_a"].keys()))
+                self.assertEqual({"last_seen_at", "last_action"}, set(clean_disk["worker_b"].keys()))
+                self.assertEqual("inbox", clean_disk["worker_b"]["last_action"])
+                for bad_str in (tok_a_full, "198.51.100.10", "<script>", "../evil", "worker_future", "worker_xss"):
+                    self.assertNotIn(bad_str, clean_raw)
+
+            # 8. Oversized (> 1 MiB) presence.json safely skipped on restart read-merge and cleanly replaced
+            pad_len = hub.MAX_PRESENCE_READ_BYTES + 2048
+            oversized_payload = '{"worker_a":{"last_seen_at":' + str(now_ts - 2.0) + ',"last_action":"peek","pad":"' + ("x" * pad_len) + '"}}'
+            presence_path.write_text(oversized_payload, encoding="utf-8")
+            os.chmod(presence_path, 0o600)
+            self.assertGreater(presence_path.stat().st_size, hub.MAX_PRESENCE_READ_BYTES)
+
+            with _RunningHub(bus_dir=tmp, presence_flush_interval_sec=0.0) as rh4:
+                self.assertEqual(200, rh4.request("GET", "/hub/v1/agents/worker_b/peek", token=tok_b_peek)[0])
+                replaced_disk = json.loads(presence_path.read_text(encoding="utf-8"))
+                self.assertEqual({"worker_b"}, set(replaced_disk.keys()))
+                self.assertEqual({"last_seen_at", "last_action", "last_peek_at"}, set(replaced_disk["worker_b"].keys()))
+                self.assertLess(presence_path.stat().st_size, 1024)
+                self.assertEqual(0o600, stat.S_IMODE(os.lstat(presence_path).st_mode))
+                self.assertEqual([], [p.name for p in fed_dir.iterdir() if p.name.endswith(".tmp")])
+
+    def test_p3_presence_throttle_concurrency_and_zero_audit_agents_churn(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, _clean_env({"AGY_BOT_BUS_DIR": tmp}), clear=True
+        ):
+            owner = fed.make_owner_auth("owner")
+            self._register_pull_agent(tmp, owner, "worker_a")
+            tok_a_peek = fed.mint_agent_token("worker_a", owner_auth=owner, scope="peek", bus_dir=tmp)["token"]
+
+            fed_dir = Path(fed.federation_dir(tmp))
+            presence_path = fed_dir / "presence.json"
+            audit_path = fed_dir / "audit.jsonl"
+            agents_path = Path(fed.agents_file_path(tmp))
+            agents_before = agents_path.read_bytes()
+            audit_before = audit_path.read_text(encoding="utf-8").splitlines() if audit_path.is_file() else []
+
+            # Deterministic positive monotonic clock baseline (CI-safe)
+            clock = {"mono": 1000.0, "wall": 1760000000.0}
+
+            with (
+                mock.patch("federation_hub.time.monotonic", side_effect=lambda: clock["mono"]),
+                mock.patch("federation_hub.time.time", side_effect=lambda: clock["wall"]),
+                _RunningHub(bus_dir=tmp) as rh,
+            ):
+                self.assertEqual(30.0, rh.server.presence.flush_interval_sec)
+                with mock.patch.object(
+                    rh.server.presence, "_flush_locked", wraps=rh.server.presence._flush_locked
+                ) as spy_flush:
+                    # 1st /peek -> immediate flush
+                    self.assertEqual(200, rh.request("GET", "/hub/v1/agents/worker_a/peek", token=tok_a_peek)[0])
+                    self.assertEqual(1, spy_flush.call_count)
+                    first_disk = json.loads(presence_path.read_text(encoding="utf-8"))
+                    self.assertEqual(1760000000.0, first_disk["worker_a"]["last_seen_at"])
+
+                    # 9 more /peek calls within 30s window -> 0 additional disk writes, memory updated
+                    for i in range(1, 10):
+                        clock["mono"] = 1000.0 + i * 3.0
+                        clock["wall"] = 1760000000.0 + i * 3.0
+                        self.assertEqual(200, rh.request("GET", "/hub/v1/agents/worker_a/peek", token=tok_a_peek)[0])
+                    self.assertEqual(1, spy_flush.call_count)
+                    self.assertEqual(1760000027.0, rh.server.presence.snapshot()["worker_a"]["last_seen_at"])
+                    self.assertEqual(first_disk, json.loads(presence_path.read_text(encoding="utf-8")))
+
+                    # Cross 30s window -> triggers exactly 1 more atomic flush
+                    clock["mono"] = 1030.5
+                    clock["wall"] = 1760000030.5
+                    self.assertEqual(200, rh.request("GET", "/hub/v1/agents/worker_a/peek", token=tok_a_peek)[0])
+                    self.assertEqual(2, spy_flush.call_count)
+                    second_disk = json.loads(presence_path.read_text(encoding="utf-8"))
+                    self.assertEqual(1760000030.5, second_disk["worker_a"]["last_seen_at"])
+
+            # Zero audit.jsonl growth and zero agents.json mutation across all 11 legitimate /peek calls
+            audit_after = audit_path.read_text(encoding="utf-8").splitlines() if audit_path.is_file() else []
+            self.assertEqual(len(audit_before), len(audit_after))
+            self.assertEqual(agents_before, agents_path.read_bytes())
+
+            # 8-thread concurrent mixed traffic -> valid JSON, 0600, 0 leftover .tmp files
+            tokens_full: Dict[str, str] = {}
+            for idx in range(4):
+                aid = f"conc_worker_{idx}"
+                self._register_pull_agent(tmp, owner, aid)
+                tokens_full[aid] = fed.mint_agent_token(aid, owner_auth=owner, scope="full", bus_dir=tmp)["token"]
+
+            with mock.patch.dict(
+                os.environ, _clean_env({"AGY_BOT_BUS_DIR": tmp, "AGY_FEDERATION_PRESENCE_FLUSH_SEC": "0"}), clear=True
+            ), _RunningHub(bus_dir=tmp) as rh_conc:
+                self.assertEqual(0.0, rh_conc.server.presence.flush_interval_sec)
+
+                def _worker_call(i: int) -> int:
+                    aid = f"conc_worker_{i % 4}"
+                    tok = tokens_full[aid]
+                    kind = i % 3
+                    if kind == 0:
+                        return rh_conc.request("GET", f"/hub/v1/agents/{aid}/peek", token=tok)[0]
+                    if kind == 1:
+                        return rh_conc.request("GET", f"/hub/v1/agents/{aid}/inbox", token=tok)[0]
+                    return rh_conc.request(
+                        "POST", "/hub/mcp", token=tok, body={"jsonrpc": "2.0", "id": i, "method": "ping"}
+                    )[0]
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                    statuses = list(pool.map(_worker_call, range(24)))
+                self.assertTrue(all(s == 200 for s in statuses), statuses)
+
+            final_disk = json.loads(presence_path.read_text(encoding="utf-8"))
+            for idx in range(4):
+                aid = f"conc_worker_{idx}"
+                self.assertIn(aid, final_disk)
+                self.assertTrue(set(final_disk[aid].keys()).issubset({"last_seen_at", "last_action", "last_peek_at"}))
+            self.assertEqual(0o600, stat.S_IMODE(os.lstat(presence_path).st_mode))
+            self.assertEqual([], [p.name for p in fed_dir.iterdir() if p.name.endswith(".tmp")])
+
+    def test_p5_peek_contract_invariant_with_presence(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, _clean_env({"AGY_BOT_BUS_DIR": tmp}), clear=True
+        ):
+            owner = fed.make_owner_auth("owner")
+            self._register_pull_agent(tmp, owner, "pull_worker_demo")
+            tok_peek = fed.mint_agent_token("pull_worker_demo", owner_auth=owner, scope="peek", bus_dir=tmp)["token"]
+            tok_full = fed.mint_agent_token("pull_worker_demo", owner_auth=owner, scope="full", bus_dir=tmp)["token"]
+            expected_keys = {
+                "ok",
+                "agent_id",
+                "pending",
+                "pending_jobs",
+                "pending_events",
+                "watermark",
+                "latest_created_at_ms",
+                "oldest_created_at",
+            }
+            with _RunningHub(bus_dir=tmp, presence_flush_interval_sec=0.0) as rh:
+                for label, tok in (("peek", tok_peek), ("full", tok_full)):
+                    with self.subTest(scope=label):
+                        st, hdrs, body = rh.request("GET", "/hub/v1/agents/pull_worker_demo/peek", token=tok)
+                        self.assertEqual(200, st, body)
+                        self.assertEqual(expected_keys, set(body.keys()))
+                        self.assertIn("no-store", hdrs.get("cache-control", "").lower())
+                        self.assertTrue(body["ok"])
+                        self.assertEqual("pull_worker_demo", body["agent_id"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -77,6 +77,8 @@ MAX_DISPATCH_PROMPT_CHARS = 65536
 MAX_DISPATCH_TIMEOUT_SEC = 3600.0
 WORKBENCH_ONLINE_WINDOW_SEC = 300.0
 WORKBENCH_STALE_WINDOW_SEC = 3600.0
+PRESENCE_FUTURE_SKEW_SEC = 60.0
+PRESENCE_VALID_ACTIONS = frozenset({"peek", "inbox", "claim", "result", "events_ack", "mcp"})
 
 _FED_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9])agy_fed_[A-Za-z0-9._-]{12,}")
 _DOMAIN_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
@@ -800,6 +802,108 @@ def _read_roster_last_seen_no_symlink(bus_dir: str) -> dict[str, float]:
             if isinstance(ts, (int, float)) and not isinstance(ts, bool) and ts > 0:
                 out[handle.strip().lower()] = float(ts)
     return out
+
+
+def _sanitize_presence_ts(val: Any, *, max_ts: float) -> float | None:
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        fval = float(val)
+        if math.isfinite(fval) and 0.0 < fval <= max_ts:
+            return fval
+    return None
+
+
+def _read_presence_map_no_symlink(
+    bus_dir: str,
+    *,
+    now_ts: float | None = None,
+) -> tuple[bool, dict[str, dict[str, Any]], str]:
+    """Read and sanitize `<bus_dir>/federation/presence.json` strictly read-only with anti-symlink checks.
+
+    - Missing `<bus_dir>`, `federation/`, or `presence.json` returns `(True, {}, "")` with zero disk creation.
+    - Symlink or non-regular `presence.json` (or symlink `federation/`) fails closed with `SECURITY_SYMLINK_REJECTED`.
+    - Files exceeding `MAX_WORKBENCH_JSON_BYTES` (1 MiB) or malformed JSON are skipped safely.
+    - Validates finite positive timestamps `<= now_ts + 60s`, strict action allowlist, and ignores unknown keys.
+    """
+    ok_dir, dir_fd, dir_err = _open_dir_chain_no_symlink(bus_dir, ("federation",))
+    if not ok_dir:
+        return False, {}, dir_err
+    if dir_fd is None:
+        return True, {}, ""
+    try:
+        try:
+            st = os.lstat("presence.json", dir_fd=dir_fd)
+        except FileNotFoundError:
+            return True, {}, ""
+        except OSError:
+            return False, {}, "SECURITY_SYMLINK_REJECTED: unable to inspect 'presence.json'"
+
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+            return False, {}, "SECURITY_SYMLINK_REJECTED: 'presence.json' is a symlink or non-regular file"
+
+        try:
+            fd = os.open("presence.json", _FILE_OPEN_FLAGS, dir_fd=dir_fd)
+        except FileNotFoundError:
+            return True, {}, ""
+        except OSError:
+            return False, {}, "SECURITY_SYMLINK_REJECTED: refused to open 'presence.json' safely"
+
+        try:
+            fst = os.fstat(fd)
+            if not stat.S_ISREG(fst.st_mode):
+                return False, {}, "SECURITY_SYMLINK_REJECTED: 'presence.json' is not a regular file"
+            if fst.st_size > MAX_WORKBENCH_JSON_BYTES:
+                return True, {}, ""
+            chunks: list[bytes] = []
+            remaining = MAX_WORKBENCH_JSON_BYTES + 1
+            while remaining > 0:
+                chunk = os.read(fd, min(65536, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            raw = b"".join(chunks)
+            if len(raw) > MAX_WORKBENCH_JSON_BYTES:
+                return True, {}, ""
+        finally:
+            os.close(fd)
+    finally:
+        os.close(dir_fd)
+
+    try:
+        data = json.loads(raw.decode("utf-8", errors="replace"))
+    except Exception:
+        return True, {}, ""
+    if not isinstance(data, dict):
+        return True, {}, ""
+
+    eff_now = time.time() if now_ts is None else float(now_ts)
+    max_allowed_ts = eff_now + PRESENCE_FUTURE_SKEW_SEC
+    out: dict[str, dict[str, Any]] = {}
+    for raw_aid, raw_entry in data.items():
+        if not isinstance(raw_aid, str) or not isinstance(raw_entry, dict):
+            continue
+        try:
+            aid = federation_registry.validate_agent_id(raw_aid)
+        except ValueError:
+            continue
+        last_seen_at = _sanitize_presence_ts(raw_entry.get("last_seen_at"), max_ts=max_allowed_ts)
+        last_peek_at = _sanitize_presence_ts(raw_entry.get("last_peek_at"), max_ts=max_allowed_ts)
+        ts_candidates = [t for t in (last_seen_at, last_peek_at) if t is not None]
+        if not ts_candidates:
+            continue
+        raw_act = raw_entry.get("last_action")
+        clean_act = (
+            raw_act.strip().lower()
+            if isinstance(raw_act, str) and raw_act.strip().lower() in PRESENCE_VALID_ACTIONS
+            else ""
+        )
+        out[aid] = {
+            "last_seen_at": last_seen_at,
+            "last_peek_at": last_peek_at,
+            "last_heartbeat_at": max(ts_candidates),
+            "last_action": clean_act,
+        }
+    return True, out, ""
 
 
 def _classify_workbench_agent(agent: dict[str, Any]) -> tuple[str, str, bool, str]:
@@ -2634,6 +2738,11 @@ class StudioFederationService:
         if not ok_bj:
             return False, {}, err_bj
 
+        now_ts = time.time()
+        ok_pr, presence_map, err_pr = _read_presence_map_no_symlink(self.bus_dir, now_ts=now_ts)
+        if not ok_pr:
+            return False, {}, err_pr
+
         roster_last_seen = _read_roster_last_seen_no_symlink(self.bus_dir)
 
         pull_by_agent: dict[str, list[dict[str, Any]]] = {}
@@ -2648,7 +2757,6 @@ class StudioFederationService:
             if t_bot:
                 bus_by_agent.setdefault(t_bot, []).append(bj)
 
-        now_ts = time.time()
         workbench_agents: list[dict[str, Any]] = []
         for aid in sorted(agents_map.keys()):
             raw_ag = agents_map[aid]
@@ -2718,6 +2826,19 @@ class StudioFederationService:
                 live_timestamps.append(roster_last_seen[aid])
                 activity_timestamps.append(roster_last_seen[aid])
 
+            last_heartbeat_at: float | None = None
+            last_heartbeat_action = ""
+            pres = presence_map.get(aid)
+            if isinstance(pres, dict):
+                for p_ts in (pres.get("last_seen_at"), pres.get("last_peek_at")):
+                    if isinstance(p_ts, float) and p_ts > 0:
+                        live_timestamps.append(p_ts)
+                        activity_timestamps.append(p_ts)
+                p_hb = pres.get("last_heartbeat_at")
+                if isinstance(p_hb, float) and p_hb > 0:
+                    last_heartbeat_at = p_hb
+                    last_heartbeat_action = str(pres.get("last_action") or "")
+
             ag_meta = raw_ag.get("metadata") if isinstance(raw_ag.get("metadata"), dict) else {}
             for meta_ts_key in ("last_seen", "last_heartbeat_at"):
                 m_ts = _safe_float_ts(raw_ag.get(meta_ts_key)) or _safe_float_ts(ag_meta.get(meta_ts_key))
@@ -2760,6 +2881,8 @@ class StudioFederationService:
             clean_ag["bus_job_counts"] = bj_counts
             clean_ag["leader_events_count"] = len(ev_list)
             clean_ag["last_activity_at"] = last_activity_at
+            clean_ag["last_heartbeat_at"] = last_heartbeat_at
+            clean_ag["last_heartbeat_action"] = last_heartbeat_action
             workbench_agents.append(clean_ag)
 
         return (
@@ -2808,12 +2931,16 @@ class StudioFederationService:
         if not ok_bj:
             return False, 403, {}, err_bj
 
+        now_ts = time.time()
+        ok_pr, presence_map, err_pr = _read_presence_map_no_symlink(self.bus_dir, now_ts=now_ts)
+        if not ok_pr:
+            return False, 403, {}, err_pr
+
         raw_ag = agents_map.get(aid)
         if not isinstance(raw_ag, dict):
             return False, 404, {}, f"未找到外部 Agent: {aid}"
 
         is_admin = viewer_role == "admin"
-        now_ts = time.time()
 
         pull_by_jid: dict[str, dict[str, Any]] = {}
         pq_counts = {"queued": 0, "claimed": 0, "done": 0, "error": 0, "cancelled": 0, "total": 0}
@@ -2925,6 +3052,26 @@ class StudioFederationService:
             live_ts_list.append(roster_last_seen[aid])
             act_ts_list.append(roster_last_seen[aid])
 
+        last_heartbeat_at: float | None = None
+        last_heartbeat_action = ""
+        pres = presence_map.get(aid)
+        if isinstance(pres, dict):
+            for p_ts in (pres.get("last_seen_at"), pres.get("last_peek_at")):
+                if isinstance(p_ts, float) and p_ts > 0:
+                    live_ts_list.append(p_ts)
+                    act_ts_list.append(p_ts)
+            p_hb = pres.get("last_heartbeat_at")
+            if isinstance(p_hb, float) and p_hb > 0:
+                last_heartbeat_at = p_hb
+                last_heartbeat_action = str(pres.get("last_action") or "")
+
+        ag_meta = raw_ag.get("metadata") if isinstance(raw_ag.get("metadata"), dict) else {}
+        for meta_ts_key in ("last_seen", "last_heartbeat_at"):
+            m_ts = _safe_float_ts(raw_ag.get(meta_ts_key)) or _safe_float_ts(ag_meta.get(meta_ts_key))
+            if m_ts > 0:
+                live_ts_list.append(m_ts)
+                act_ts_list.append(m_ts)
+
         adapter_type, dispatch_mode, target_can_dispatch, disabled_reason = _classify_workbench_agent(raw_ag)
         runtime_status = _compute_runtime_status(
             raw_ag,
@@ -2953,6 +3100,8 @@ class StudioFederationService:
         clean_ag["bus_job_counts"] = bj_counts
         clean_ag["leader_events_count"] = len(leader_events)
         clean_ag["last_activity_at"] = max(act_ts_list) if act_ts_list else None
+        clean_ag["last_heartbeat_at"] = last_heartbeat_at
+        clean_ag["last_heartbeat_action"] = last_heartbeat_action
 
         has_active_jobs = any(bool(it.get("is_active")) for it in merged_items)
         return (
