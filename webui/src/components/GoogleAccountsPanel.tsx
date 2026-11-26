@@ -101,7 +101,7 @@ function QuotaMiniBar({ label, pct, resetAt, poolHint }: QuotaMiniBarProps) {
       <div className="flex items-center justify-between gap-2 text-[11px]">
         <span className="text-slate-300 truncate">{label}</span>
         <span className="font-mono text-slate-400 shrink-0">
-          {pct !== null ? `${pct.toFixed(0)}%` : "待刷新"}
+          {pct !== null ? `${pct.toFixed(0)}%` : "仅身份同步"}
           {poolHint ? ` · ${poolHint}` : ""}
           {countdown ? ` · ${countdown}` : ""}
         </span>
@@ -271,11 +271,11 @@ export function GoogleAccountsPanel({
       const errCount = Object.keys(res.errors || {}).length;
       setNotice(
         errCount === 0
-          ? `已刷新 ${res.refreshed.length} 个账号的套餐与配额状态。`
-          : `已刷新 ${res.refreshed.length} 个账号，${errCount} 个账号刷新异常。`,
+          ? `已同步 ${res.refreshed.length} 个账号的 Google 身份信息（实时配额请通过官方 agy /usage 查看）。`
+          : `已同步 ${res.refreshed.length} 个账号身份，${errCount} 个账号同步异常。`,
       );
     } catch (e) {
-      setError(handleApiError(e, "批量刷新配额失败"));
+      setError(handleApiError(e, "批量同步账号身份失败"));
     } finally {
       setBusyAction(null);
     }
@@ -307,9 +307,9 @@ export function GoogleAccountsPanel({
     try {
       const res = await refreshGoogleAccountQuota(accountId);
       applySnapshot(res.snapshot);
-      setNotice(`已更新 ${accountId} 的套餐与实时配额。`);
+      setNotice(`已同步 ${accountId} 的 Google 账号身份信息（实时配额请使用官方 agy /usage）。`);
     } catch (e) {
-      setError(handleApiError(e, "刷新单账号配额失败"));
+      setError(handleApiError(e, "同步单账号身份失败"));
     } finally {
       setBusyAction(null);
     }
@@ -482,7 +482,7 @@ export function GoogleAccountsPanel({
           <div>
             <div className="flex items-center gap-2">
               <h3 className="text-sm font-semibold text-slate-100">
-                Google 多账号与多套餐额度池
+                Google 多账号与套餐管理
               </h3>
               {snapshot && (
                 <span className="text-[11px] font-mono px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-700">
@@ -494,7 +494,7 @@ export function GoogleAccountsPanel({
               )}
             </div>
             <p className="text-xs text-slate-400">
-              参考 T3 Code 无头 PKCE 登录与凭据指纹去重 · 按 Ultra / Pro / Enterprise / Free 独立统计额度
+              无头 PKCE OAuth 登录与凭据指纹去重 · 仅通过官方 Google userinfo 同步身份，查看当前激活账号配额请使用官方 agy /usage
             </p>
           </div>
         </div>
@@ -519,7 +519,7 @@ export function GoogleAccountsPanel({
                 <RefreshCw
                   className={`w-3.5 h-3.5 ${busyAction === "refresh_all" ? "animate-spin" : ""}`}
                 />
-                全部刷新
+                全部同步
               </button>
             </>
           )}
@@ -533,6 +533,17 @@ export function GoogleAccountsPanel({
           </button>
         </div>
       </div>
+
+      {/* Unofficial Quota Probe Disabled Notice */}
+      {snapshot?.quota_probe_disabled !== false && (
+        <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-3.5 py-2.5 text-xs text-amber-100 flex items-start gap-2">
+          <AlertTriangle className="w-4 h-4 text-amber-300 shrink-0 mt-0.5" />
+          <span>
+            {snapshot?.quota_probe_notice ||
+              "已停用非官方内部配额 API 探测以防 Google 账号风控；刷新操作仅通过官方 Google userinfo 同步账号身份，查看当前激活账号配额请使用官方 agy /usage。"}
+          </span>
+        </div>
+      )}
 
       {error && (
         <div className="rounded-xl border border-rose-500/30 bg-rose-500/10 px-3.5 py-2.5 text-xs text-rose-200 flex items-center justify-between gap-2">
@@ -824,7 +835,7 @@ export function GoogleAccountsPanel({
                             className="inline-flex items-center gap-1 rounded-lg border border-slate-700 bg-slate-900 hover:bg-slate-800 disabled:opacity-50 px-2.5 py-1 text-xs text-slate-200 cursor-pointer"
                           >
                             <RefreshCw className={`w-3 h-3 ${isBusyThis ? "animate-spin" : ""}`} />
-                            刷新额度
+                            同步身份
                           </button>
                         )}
                         <button

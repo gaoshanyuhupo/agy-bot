@@ -260,66 +260,18 @@ class TestStudioGoogleAccountsM2(unittest.IsolatedAsyncioTestCase):
 
         self.spawned_procs: list[_FakeOAuthProc] = []
         self.recycle_calls: list[dict] = []
+        self.http_calls: list[str] = []
 
         def _fake_http(method: str, url: str, *, access_token: str, json_body=None, timeout_sec=10.0):
+            self.http_calls.append(url)
+            ga.assert_allowed_google_url(url)
             is_beta = access_token == SYNTH_ACCESS_B
-            if "userinfo" in url:
+            if url == ga.GOOGLE_USERINFO_URL:
                 return {
                     "id": "uid-beta-002" if is_beta else "uid-alpha-001",
                     "email": "bob.beta@example.com" if is_beta else "alice.alpha@example.com",
                 }
-            if "loadCodeAssist" in url:
-                return {
-                    "paidTier": {"id": "google-ai-pro" if is_beta else "google-ai-ultra"},
-                    "currentTier": {"id": "pro" if is_beta else "ultra"},
-                    "cloudaicompanionProject": "proj-demo",
-                }
-            if "retrieveUserQuotaSummary" in url:
-                rst_5h = (
-                    datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=3)
-                ).strftime("%Y-%m-%dT%H:%M:%SZ")
-                rst_wk = (
-                    datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=4)
-                ).strftime("%Y-%m-%dT%H:%M:%SZ")
-                return {
-                    "groups": [
-                        {
-                            "displayName": "Gemini",
-                            "buckets": [
-                                {
-                                    "bucketId": "gemini-5h",
-                                    "window": "5h",
-                                    "remainingFraction": 0.9 if is_beta else 0.7,
-                                    "resetTime": rst_5h,
-                                },
-                                {
-                                    "bucketId": "gemini-weekly",
-                                    "window": "weekly",
-                                    "remainingFraction": 0.85 if is_beta else 0.65,
-                                    "resetTime": rst_wk,
-                                },
-                            ],
-                        },
-                        {
-                            "displayName": "Claude & GPT",
-                            "buckets": [
-                                {
-                                    "bucketId": "3p-5h",
-                                    "window": "5h",
-                                    "remainingFraction": 0.95 if is_beta else 0.4,
-                                    "resetTime": rst_5h,
-                                },
-                                {
-                                    "bucketId": "3p-weekly",
-                                    "window": "weekly",
-                                    "remainingFraction": 0.92 if is_beta else 0.35,
-                                    "resetTime": rst_wk,
-                                },
-                            ],
-                        },
-                    ]
-                }
-            return {}
+            raise AssertionError(f"Unexpected outbound URL: {url}")
 
         def _fake_popen(cmd, **kwargs):
             # Locate --gemini-dir argument
@@ -615,7 +567,13 @@ class TestStudioGoogleAccountsM2(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(r_ok.status, 200, await r_ok.text())
             ok_data = await r_ok.json()
             self.assertEqual(ok_data["flow"]["status"], "completed")
-            self.assertEqual(ok_data["flow"]["account"]["plan_tier"], "pro")
+            # New account defaults to unknown plan with zero fabricated quota & userinfo-only sync (GA2/GA5)
+            self.assertEqual(ok_data["flow"]["account"]["plan_tier"], "unknown")
+            self.assertFalse(ok_data["flow"]["account"]["quota_summary"]["has_quota"])
+            for pk in ("gemini_5h_pct", "gemini_weekly_pct", "claude_gpt_5h_pct", "claude_gpt_weekly_pct"):
+                self.assertIsNone(ok_data["flow"]["account"]["quota_summary"][pk])
+            self.assertLessEqual(set(self.http_calls), {ga.GOOGLE_USERINFO_URL})
+            self.assertGreaterEqual(len(self.http_calls), 1)
 
             # Replay submit on completed flow -> 409
             r_replay = await admin_a.post(
@@ -643,6 +601,8 @@ class TestStudioGoogleAccountsM2(unittest.IsolatedAsyncioTestCase):
             ):
                 self.assertNotIn(forbidden, list_txt, f"Leak detected in GET /api/google-accounts: {forbidden}")
             list_json = json.loads(list_txt)
+            self.assertTrue(list_json.get("quota_probe_disabled"))
+            self.assertIn("/usage", str(list_json.get("quota_probe_notice") or ""))
             masked_emails = {a["email_masked"] for a in list_json["accounts"]}
             self.assertIn("b***a@example.com", masked_emails)
 
@@ -734,7 +694,14 @@ class TestStudioGoogleAccountsM2(unittest.IsolatedAsyncioTestCase):
             hub = self.app[EVENT_HUB_KEY]
             seq_before = hub._next_seq
 
-            # Refresh all (offline mocked) to populate multi-plan summary
+            # Single-account refresh & refresh-all (offline mocked) emit strictly userinfo only (GA2)
+            self.http_calls.clear()
+            r_ref_one = await admin_a.post(
+                "/api/google-accounts/primary/refresh-quota",
+                headers=self._write_headers(csrf_a),
+                json={},
+            )
+            self.assertEqual(r_ref_one.status, 200, await r_ref_one.text())
             r_ref_all = await admin_a.post(
                 "/api/google-accounts/refresh-all",
                 headers=self._write_headers(csrf_a),
@@ -743,8 +710,12 @@ class TestStudioGoogleAccountsM2(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(r_ref_all.status, 200, await r_ref_all.text())
             ref_data = await r_ref_all.json()
             self.assertTrue(ref_data["all_succeeded"])
+            self.assertTrue(ref_data["snapshot"].get("quota_probe_disabled"))
+            self.assertIn("/usage", str(ref_data["snapshot"].get("quota_probe_notice") or ""))
+            self.assertLessEqual(set(self.http_calls), {ga.GOOGLE_USERINFO_URL})
+            self.assertEqual(len(self.http_calls), 3)
             tier_ids = [t["plan_tier"] for t in ref_data["snapshot"]["by_plan"]["tiers"]]
-            self.assertEqual(tier_ids, ["ultra", "pro"])
+            self.assertEqual(tier_ids, ["unknown"])
 
             # Activate pro_two
             r_act = await admin_a.post(
@@ -950,6 +921,83 @@ class TestStudioGoogleAccountsM2(unittest.IsolatedAsyncioTestCase):
         logger = _AccountsAuditLogger(symlink_audit)
         logger.record(action="add", ok=True, account_id="primary")
         self.assertEqual(victim.read_text(encoding="utf-8"), "KEEP_INTACT\n")
+
+    async def test_ga5_legacy_registry_compat_for_data_sources_costs_and_refresh(self) -> None:
+        admin_a, csrf_a = await self._login_client("admin_a", PASS_ADMIN_A)
+        try:
+            # Seed official /usage quota cache sentinel
+            sentinel = '{"source":"official_usage","groups":[{"name":"Gemini","buckets":[]}]}\n'
+            self.quota_cache_file.write_text(sentinel, encoding="utf-8")
+
+            # Seed legacy registry with ultra + historical quota, null quota, and missing quota key
+            with self.ga_mgr._exclusive_lock():
+                reg = self.ga_mgr._load_registry_locked()
+                reg["accounts"]["primary"].update({
+                    "plan_tier": "ultra",
+                    "plan_label": "Google AI Ultra",
+                    "quota": {
+                        "fetched_at_iso": "2026-11-20T00:00:00Z",
+                        "groups": [
+                            {
+                                "name": "Gemini Models",
+                                "buckets": [
+                                    {
+                                        "id": "gemini-weekly",
+                                        "name": "Weekly",
+                                        "window": "weekly",
+                                        "remaining_fraction": 0.72,
+                                        "reset_time": "2026-11-28T00:00:00Z",
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                })
+                reg["accounts"]["legacy_null"] = {
+                    "account_id": "legacy_null",
+                    "alias": "Legacy Null",
+                    "plan_tier": "pro",
+                    "plan_label": "Google AI Pro",
+                    "quota": None,
+                    "status": "ready",
+                }
+                reg["accounts"]["legacy_missing"] = {
+                    "account_id": "legacy_missing",
+                    "alias": "Legacy Missing",
+                    "plan_tier": "free",
+                    "plan_label": "Free",
+                    "status": "ready",
+                }
+                self.ga_mgr._save_registry_locked(reg)
+
+            # StudioDataSources._read_accounts_quota_ro() and GET /api/costs handle all legacy records cleanly
+            summary_ro, aliases_ro = self.data_sources._read_accounts_quota_ro()
+            self.assertEqual(summary_ro["total_unique_accounts"], 3)
+            self.assertEqual(aliases_ro.get("legacy_missing"), "Legacy Missing")
+            tier_map = {t["plan_tier"]: t for t in summary_ro["tiers"]}
+            self.assertEqual(tier_map["ultra"]["pools"]["gemini_weekly"]["avg_remaining_pct"], 72.0)
+
+            r_costs = await admin_a.get("/api/costs?scope=all")
+            self.assertEqual(r_costs.status, 200)
+            costs_data = await r_costs.json()
+            self.assertEqual(costs_data["accounts_quota"]["total_unique_accounts"], 3)
+
+            # Refreshing legacy primary preserves plan_tier="ultra" and leaves quota_cache_file untouched
+            self.http_calls.clear()
+            r_ref = await admin_a.post(
+                "/api/google-accounts/primary/refresh-quota",
+                headers=self._write_headers(csrf_a),
+                json={},
+            )
+            self.assertEqual(r_ref.status, 200, await r_ref.text())
+            ref_body = await r_ref.json()
+            self.assertEqual(ref_body["account"]["plan_tier"], "ultra")
+            self.assertEqual(ref_body["account"]["plan_label"], "Google AI Ultra")
+            self.assertEqual(ref_body["account"]["quota_summary"]["gemini_weekly_pct"], 72.0)
+            self.assertLessEqual(set(self.http_calls), {ga.GOOGLE_USERINFO_URL})
+            self.assertEqual(self.quota_cache_file.read_text(encoding="utf-8"), sentinel)
+        finally:
+            await admin_a.close()
 
 
 if __name__ == "__main__":

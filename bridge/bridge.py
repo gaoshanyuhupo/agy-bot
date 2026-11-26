@@ -10705,8 +10705,9 @@ def build_accounts_panel(chat_id, from_user=None):
     active_acct = mgr.get_active_account(for_group=is_group)
 
     lines = [
-        "<b>🔐 多 Google 账号与多套餐额度面板 (/accounts)</b>",
+        "<b>🔐 多 Google 账号与套餐管理面板 (/accounts)</b>",
         "<code>模式: 群聊脱敏只读视图（变更仅限管理员私聊）</code>" if is_group else "<code>模式: 管理员私聊控制面板</code>",
+        "<i>ℹ️ 为防 Google 账号风控，已停用非官方内部配额探测；刷新仅同步身份，当前激活账号实时配额请使用官方 <code>/usage</code>。</i>",
         "━━━━━━━━━━━━━━━━━━━━",
     ]
     if not accounts:
@@ -10767,7 +10768,7 @@ def build_accounts_panel(chat_id, from_user=None):
         if switch_row:
             rows.append(switch_row)
         rows.append([
-            {"text": "🔄 刷新全部额度", "callback_data": "accounts:refresh:all"},
+            {"text": "🔄 同步全部身份", "callback_data": "accounts:refresh:all"},
             {"text": "📊 配额卡片 (/usage)", "callback_data": "action:usage"},
         ])
         kb = {"inline_keyboard": rows}
@@ -10869,7 +10870,7 @@ def cmd_accounts(chat_id, raw_rest="", thread_id=None, scope_key=None, from_user
                 f"• 槽位：<code>{html_mod.escape(str(acct.get('account_id') or flow['account_id']))}</code>\n"
                 f"• 邮箱：<code>{em}</code>\n"
                 f"• 套餐：<code>{html_mod.escape(str(acct.get('plan_label') or 'Unknown'))}</code>\n"
-                f"可使用 <code>/accounts refresh {html_mod.escape(str(acct.get('account_id') or flow['account_id']))}</code> 同步配额或 <code>/accounts switch</code> 切换。",
+                f"可使用 <code>/accounts refresh {html_mod.escape(str(acct.get('account_id') or flow['account_id']))}</code> 同步身份信息或 <code>/accounts switch</code> 切换（查看当前激活账号配额请用官方 <code>/usage</code>）。",
                 parse_mode="HTML",
                 thread_id=norm_tid,
             )
@@ -10909,8 +10910,9 @@ def cmd_accounts(chat_id, raw_rest="", thread_id=None, scope_key=None, from_user
                 acct = mgr.refresh_account(target_id)
                 send(
                     chat_id,
-                    f"🔄 已刷新账号 <code>{html_mod.escape(acct['account_id'])}</code> · "
-                    f"套餐 <code>{html_mod.escape(acct['plan_label'])}</code>。",
+                    f"🔄 已同步账号 <code>{html_mod.escape(acct['account_id'])}</code> 身份信息 · "
+                    f"套餐 <code>{html_mod.escape(acct['plan_label'])}</code>。\n"
+                    f"<i>已停用非官方内部配额探测以防 Google 账号风控，当前激活账号配额请使用官方 <code>/usage</code>。</i>",
                     parse_mode="HTML",
                     thread_id=norm_tid,
                 )
@@ -10920,7 +10922,8 @@ def cmd_accounts(chat_id, raw_rest="", thread_id=None, scope_key=None, from_user
                 ok_cnt = len(res.get("refreshed") or [])
                 send(
                     chat_id,
-                    f"🔄 已刷新全部账号：成功 <code>{ok_cnt}</code>，失败 <code>{err_cnt}</code>。",
+                    f"🔄 已同步全部账号身份信息：成功 <code>{ok_cnt}</code>，失败 <code>{err_cnt}</code>。\n"
+                    f"<i>已停用非官方内部配额探测以防 Google 账号风控，当前激活账号配额请使用官方 <code>/usage</code>。</i>",
                     parse_mode="HTML",
                     thread_id=norm_tid,
                 )
@@ -10954,13 +10957,13 @@ def cmd_accounts(chat_id, raw_rest="", thread_id=None, scope_key=None, from_user
         send(
             chat_id,
             "<b>🔐 /accounts 用法（管理员私聊）：</b>\n"
-            "• <code>/accounts</code> — 查看账号列表与多套餐去重额度池\n"
+            "• <code>/accounts</code> — 查看账号列表与多套餐状态\n"
             "• <code>/accounts add &lt;id&gt; [别名]</code> — 创建隔离账号槽位\n"
             "• <code>/accounts login &lt;id&gt;</code> — 发起无头 Google OAuth 登录\n"
             "• <code>/accounts code &lt;flow_id&gt; &lt;code_or_url&gt;</code> — 提交回调地址或授权码\n"
             "• <code>/accounts cancel &lt;flow_id&gt;</code> — 取消登录流\n"
             "• <code>/accounts switch &lt;id&gt;</code> — 切换活跃账号并回收空闲会话\n"
-            "• <code>/accounts refresh [id]</code> — 刷新指定或全部账号配额\n"
+            "• <code>/accounts refresh [id]</code> — 同步指定或全部账号身份信息（已停用内部配额探测，配额请使用官方 <code>/usage</code>）\n"
             "• <code>/accounts logout &lt;id&gt;</code> / <code>delete &lt;id&gt;</code> — 登出或删除槽位",
             parse_mode="HTML",
             thread_id=norm_tid,
@@ -14126,7 +14129,7 @@ def handle_callback(cb):
                 tg("editMessageText", chat_id=chat_id, message_id=msg_id,
                    text=panel_text, parse_mode="HTML", reply_markup=panel_kb)
         elif sub == "refresh":
-            tg("answerCallbackQuery", callback_query_id=cb_id, text="正在刷新账号配额...")
+            tg("answerCallbackQuery", callback_query_id=cb_id, text="正在同步账号身份（配额请看 /usage）...")
             try:
                 mgr = _get_google_account_manager()
                 if arg and arg != "all":

@@ -408,6 +408,11 @@ class StudioGoogleAccountsService:
                 "claude_gpt": rec_cg,
                 "gemini": rec_gem,
             },
+            "quota_probe_disabled": True,
+            "quota_probe_notice": (
+                "已停用非官方内部配额 API 探测以防 Google 账号风控；"
+                "刷新操作仅通过官方 Google userinfo 同步账号身份，查看当前激活账号配额请使用官方 agy /usage。"
+            ),
             "can_edit": bool(can_edit),
             "updated_at": _utc_iso_now(),
         }
@@ -1360,14 +1365,14 @@ class StudioGoogleAccountsService:
             msg = _sanitize_audit_error(exc)
             self.audit.record(action="refresh", ok=False, sess=sess, account_id=aid, error=msg)
             return web.json_response(
-                {"ok": False, "source": "upstream", "error": msg or "Google 额度探测失败"},
+                {"ok": False, "source": "upstream", "error": msg or "Google 身份同步失败"},
                 status=502,
             )
         except Exception as exc:
             msg = _sanitize_audit_error(exc)
             self.audit.record(action="refresh", ok=False, sess=sess, account_id=aid, error=msg)
             return web.json_response(
-                {"ok": False, "source": "studio_api", "error": msg or "刷新账号额度失败"},
+                {"ok": False, "source": "studio_api", "error": msg or "同步账号身份失败"},
                 status=500,
             )
 
@@ -1406,7 +1411,7 @@ class StudioGoogleAccountsService:
             msg = _sanitize_audit_error(exc)
             self.audit.record(action="refresh_all", ok=False, sess=sess, error=msg)
             return web.json_response(
-                {"ok": False, "source": "studio_api", "error": msg or "批量刷新账号额度失败"},
+                {"ok": False, "source": "studio_api", "error": msg or "批量同步账号身份失败"},
                 status=500,
             )
 

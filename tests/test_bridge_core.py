@@ -27,6 +27,7 @@ if str(BRIDGE_DIR) not in sys.path:
 def _load_isolated_bridge(tmp: str, extra_env: dict[str, str] | None = None):
     env_patch = {
         "AGY_BOT_BUS_DIR": os.path.join(tmp, "bus"),
+        "AGY_BOT_PROFILES_DIR": os.path.join(tmp, "bot_profiles"),
         "AGY_TG_STATE_FILE": os.path.join(tmp, "state.json"),
         "AGY_TG_WORKDIR": os.path.join(tmp, "workdir"),
         "AGY_TG_LOCK_DIR": os.path.join(tmp, "locks"),
@@ -2180,6 +2181,18 @@ class TestRecoveredAttemptErrorHandling(unittest.TestCase):
 
 class TestCoordinatorFirstTurnPrefix(unittest.TestCase):
     """Verify C1-C6 for coordinator first-turn compact role & `acb-team` dispatch header."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._profiles_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._profiles_tmp.cleanup)
+        self._profiles_env_patch = mock.patch.dict(
+            os.environ,
+            {"AGY_BOT_PROFILES_DIR": os.path.join(self._profiles_tmp.name, "bot_profiles")},
+            clear=False,
+        )
+        self._profiles_env_patch.start()
+        self.addCleanup(self._profiles_env_patch.stop)
 
     @staticmethod
     def _make_fake_streamer_cls():

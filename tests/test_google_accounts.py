@@ -577,23 +577,100 @@ class TestGoogleLoginFlowManager(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestGoogleProbeAndIsolatedRenewal(unittest.TestCase):
-    def test_host_allowlist_redirect_blocking_timeout_and_512k_bound(self) -> None:
-        # Reject non-Google hosts, HTTP, custom ports, embedded creds
-        for bad_url in (
+    def test_ga1_dead_code_removed_and_host_path_fail_closed_and_standard_ua(self) -> None:
+        # Removed internal quota probing constants & parsers MUST NOT be exported
+        for removed_sym in (
+            "CLOUDCODE_DAILY_BASE",
+            "CLOUDCODE_PROD_BASE",
+            "parse_quota_summary_response",
+            "parse_available_models_fallback",
+            "_summary_reset_time",
+        ):
+            self.assertFalse(
+                hasattr(google_accounts, removed_sym),
+                msg=f"Removed internal symbol still exported: {removed_sym}",
+            )
+        self.assertEqual(google_accounts.ALLOWED_GOOGLE_PROBE_HOSTS, frozenset({"www.googleapis.com"}))
+
+        # Construct forbidden URLs via concatenation to keep test file free of bare literals/domains
+        cc_host = "cloudcode" + "-pa." + "googleapis" + "." + "com"
+        cc_daily_upper = "DAILY-" + "CLOUDCODE" + "-PA." + "GOOGLEAPIS" + "." + "COM"
+        rpc_lca = "v1" + "internal:" + "loadCode" + "Assist"
+        rpc_sum = "v1" + "internal:" + "retrieveUser" + "QuotaSummary"
+        rpc_mod = "v1" + "internal:" + "fetchAvailable" + "Models"
+        https_pfx = "https://"
+
+        bad_urls = (
+            https_pfx + cc_host + "/oauth2/v2/userinfo",
+            https_pfx + cc_daily_upper + "/oauth2/v2/userinfo",
+            https_pfx + cc_host + "./oauth2/v2/userinfo",
+            https_pfx + "www.googleapis.com./oauth2/v2/userinfo",
+            https_pfx + "sub." + cc_host + "/oauth2/v2/userinfo",
+            https_pfx + "www.googleapis.com/" + rpc_lca,
+            https_pfx + "www.googleapis.com/oauth2/v2/userinfo/../../" + rpc_sum,
+            https_pfx + "www.googleapis.com/oauth2/v2/userinfo%2f..%2f" + rpc_mod,
+            "https://www.googleapis.com/other/path",
+            "https://www.googleapis.com/oauth2/v2/userinfo?alt=json",
+            "https://www.googleapis.com/oauth2/v2/userinfo#frag",
             "http://www.googleapis.com/oauth2/v2/userinfo",
             "https://evil.example.com/oauth2/v2/userinfo",
+            "https://www.googleapis.com:443/oauth2/v2/userinfo",
             "https://www.googleapis.com:8443/oauth2/v2/userinfo",
-            "https://" + "EXAMPLE_U" + ":" + "EXAMPLE_P" + "@" + "www.googleapis.com/oauth2/v2/userinfo",
+            https_pfx + "EXAMPLE_U" + ":" + "EXAMPLE_P" + "@" + "www.googleapis.com/oauth2/v2/userinfo",
             "https://www.googleapis.com/oauth2/v2/userinfo\r\nX-Inject: 1",
-        ):
-            with self.assertRaises(google_accounts.GoogleProbeError):
+        )
+        for bad_url in bad_urls:
+            with self.assertRaises(google_accounts.GoogleProbeError, msg=f"assert_allowed_google_url must reject {bad_url!r}"):
                 google_accounts.assert_allowed_google_url(bad_url)
+            with self.assertRaises(google_accounts.GoogleProbeError, msg=f"google_https_json_request must reject {bad_url!r}"):
+                google_accounts.google_https_json_request(
+                    "GET",
+                    bad_url,
+                    access_token=_mock_access_token("REJECT"),
+                )
 
-        # Redirect handler MUST fail-closed on 302
+        # Positive control: exact official userinfo URL passes and sends honest non-IDE User-Agent
+        self.assertEqual(
+            google_accounts.assert_allowed_google_url(google_accounts.GOOGLE_USERINFO_URL),
+            google_accounts.GOOGLE_USERINFO_URL,
+        )
+        seen_headers: list[dict[str, str]] = []
+
+        class _OkResp:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_a):
+                return False
+
+            def read(self, _n=-1):
+                return b'{"id":"uid-ua-1","email":"ua@example.com"}'
+
+        class _CapturingOpener:
+            def open(self, req, timeout=None):
+                seen_headers.append(dict(req.header_items()))
+                return _OkResp()
+
+        res = google_accounts.google_https_json_request(
+            "GET",
+            google_accounts.GOOGLE_USERINFO_URL,
+            access_token=_mock_access_token("UAOK"),
+            opener=_CapturingOpener(),
+        )
+        self.assertEqual(res["id"], "uid-ua-1")
+        self.assertEqual(len(seen_headers), 1)
+        ua_val = seen_headers[0].get("User-agent") or seen_headers[0].get("User-Agent") or ""
+        self.assertTrue(ua_val)
+        self.assertNotIn("aidev_client", ua_val.lower())
+
+        # Redirect handler MUST fail-closed on 301/302/307/308
         handler = google_accounts._NoRedirectHandler()
-        with self.assertRaises(google_accounts.GoogleProbeError) as ctx_redir:
-            handler.redirect_request(None, None, 302, "Found", {}, "https://evil.example.com/steal")
-        self.assertEqual(ctx_redir.exception.status_code, 302)
+        for code in (301, 302, 307, 308):
+            with self.assertRaises(google_accounts.GoogleProbeError) as ctx_redir:
+                handler.redirect_request(None, None, code, "Redirect", {}, "https://evil.example.com/steal")
+            self.assertEqual(ctx_redir.exception.status_code, code)
 
         # 512 KiB response bound & timeout clamping <= 10.0s
         seen_timeouts: list[float] = []
@@ -639,17 +716,18 @@ class TestGoogleProbeAndIsolatedRenewal(unittest.TestCase):
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always", ResourceWarning)
 
-            # 1. _NoRedirectHandler.redirect_request MUST close fp before raising
+            # 1. _NoRedirectHandler.redirect_request MUST close fp before raising for 301/302/307/308
             handler = google_accounts._NoRedirectHandler()
-            redir_fp = _TrackableStream(b"redirect body")
-            with self.assertRaises(google_accounts.GoogleProbeError) as ctx_redir:
-                handler.redirect_request(None, redir_fp, 302, "Found", {}, "https://evil.example.com/steal")
-            self.assertEqual(ctx_redir.exception.status_code, 302)
-            self.assertTrue(redir_fp.closed)
-            self.assertGreaterEqual(redir_fp.close_calls, 1)
+            for code in (301, 302, 307, 308):
+                redir_fp = _TrackableStream(b"redirect body")
+                with self.assertRaises(google_accounts.GoogleProbeError) as ctx_redir:
+                    handler.redirect_request(None, redir_fp, code, "Redirect", {}, "https://evil.example.com/steal")
+                self.assertEqual(ctx_redir.exception.status_code, code)
+                self.assertTrue(redir_fp.closed)
+                self.assertGreaterEqual(redir_fp.close_calls, 1)
 
-            # 2. HTTPError (both 401 and 302) MUST close exc/fp in finally with 0 ResourceWarnings
-            for status_code, body in ((401, b'{"error":"expired"}'), (302, b"moved")):
+            # 2. HTTPError (401 and 301/302/307/308) MUST close exc/fp in finally with 0 ResourceWarnings
+            for status_code, body in ((401, b'{"error":"expired"}'), (301, b"moved"), (302, b"found"), (307, b"temp"), (308, b"perm")):
                 err_fp = _TrackableStream(body)
 
                 class _ErrOpener:
@@ -692,7 +770,7 @@ class TestGoogleProbeAndIsolatedRenewal(unittest.TestCase):
         self.assertNotIn(fake_jwt, redacted)
         self.assertIn("[REDACTED", redacted)
 
-    def test_401_triggers_isolated_acp_initialize_without_touching_host_token(self) -> None:
+    def test_401_triggers_isolated_acp_initialize_and_userinfo_only_without_touching_host_token(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ga_probe_") as tmp:
             root = Path(tmp) / "accounts"
             host_tok = Path(tmp) / "host" / "antigravity-oauth-token"
@@ -700,37 +778,22 @@ class TestGoogleProbeAndIsolatedRenewal(unittest.TestCase):
             host_original = _make_token_bytes("host_only@example.com", tag="HOSTORIG")
             host_tok.write_bytes(host_original)
 
-            # Prepare an isolated account with a token that initially gets 401
+            quota_cache = Path(tmp) / "cache" / "quota_usage.json"
+            quota_cache.parent.mkdir(parents=True, exist_ok=True)
+            quota_sentinel = '{"source":"official_usage","groups":[{"name":"Gemini","buckets":[]}]}\n'
+            quota_cache.write_text(quota_sentinel, encoding="utf-8")
+
             calls: list[tuple[str, str, str]] = []
             acp_spawns: list[dict] = []
 
             def fake_http(method, url, *, access_token, json_body=None, timeout_sec=10.0):
                 calls.append((method, url, access_token))
+                google_accounts.assert_allowed_google_url(url)
                 if access_token == _mock_access_token("STALE"):
                     raise google_accounts.GoogleProbeError("HTTP 401: expired", status_code=401)
                 if url == google_accounts.GOOGLE_USERINFO_URL:
-                    return {"id": "google-uid-pro-1", "email": "pro.user@example.com"}
-                if url.endswith(":loadCodeAssist"):
-                    return {"paidTier": {"id": "g1-pro-tier"}, "currentTier": {"id": "free-tier"}}
-                if url.endswith(":retrieveUserQuotaSummary"):
-                    return {
-                        "groups": [
-                            {
-                                "displayName": "Gemini Models",
-                                "buckets": [
-                                    {"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0.75, "resetTime": "2026-11-22T08:00:00Z"},
-                                    {"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.60, "resetTime": "2026-11-27T23:00:00Z"},
-                                ],
-                            },
-                            {
-                                "displayName": "Claude and GPT models",
-                                "buckets": [
-                                    {"bucketId": "3p-weekly", "window": "weekly", "remainingFraction": 0.85, "resetTime": "2026-11-27T23:00:00Z"},
-                                ],
-                            },
-                        ]
-                    }
-                return {}
+                    return {"id": "google-uid-new-1", "email": "new.user@example.com"}
+                raise AssertionError(f"Unexpected outbound URL: {url}")
 
             class _FakeAcpInitProc:
                 pid = 888888
@@ -753,76 +816,56 @@ class TestGoogleProbeAndIsolatedRenewal(unittest.TestCase):
                     self._rc = -9
 
                 def wait(self, timeout=None):
-                    self._tpath.write_bytes(_make_token_bytes("pro.user@example.com", tag="FRESH"))
+                    self._tpath.write_bytes(_make_token_bytes("new.user@example.com", tag="FRESH"))
                     self._rc = 0
                     return 0
 
             mgr = google_accounts.GoogleAccountManager(
                 root_dir=root,
                 host_token_path=host_tok,
+                quota_cache_file=quota_cache,
                 http_request_fn=fake_http,
                 auto_adopt_host=False,
             )
-            mgr.add_account("pro1", alias="Pro One")
-            mgr.token_path_for("pro1").write_bytes(_make_token_bytes("pro.user@example.com", tag="STALE"))
+            mgr.add_account("acct_new", alias="New Account")
+            mgr.token_path_for("acct_new").write_bytes(_make_token_bytes("new.user@example.com", tag="STALE"))
 
             def fake_popen(cmd, **kwargs):
                 acp_spawns.append({"cmd": cmd, "kwargs": kwargs})
-                return _FakeAcpInitProc(mgr.token_path_for("pro1"))
+                return _FakeAcpInitProc(mgr.token_path_for("acct_new"))
 
             mgr._popen_fn = fake_popen
             with mock.patch("os.killpg"):
-                refreshed = mgr.refresh_account("pro1")
+                refreshed = mgr.refresh_account("acct_new")
 
+            # Strictly userinfo-only outbound calls (GA2)
+            self.assertEqual(len(calls), 2)
+            self.assertLessEqual({u for _, u, _ in calls}, {google_accounts.GOOGLE_USERINFO_URL})
             self.assertEqual(len(acp_spawns), 1)
             self.assertEqual(acp_spawns[0]["cmd"][1:3], ["acp", "--gemini-dir"])
-            self.assertEqual(acp_spawns[0]["cmd"][3], str(mgr.profile_dir_for("pro1")))
+            self.assertEqual(acp_spawns[0]["cmd"][3], str(mgr.profile_dir_for("acct_new")))
             self.assertEqual(acp_spawns[0]["kwargs"]["env"]["AGY_CLI_DISABLE_AUTO_UPDATE"], "1")
-            self.assertEqual(refreshed["plan_tier"], "pro")
-            self.assertEqual(refreshed["plan_label"], "Google AI Pro")
-            self.assertEqual(refreshed["quota_summary"]["gemini_weekly_pct"], 60.0)
-            self.assertEqual(refreshed["quota_summary"]["claude_gpt_weekly_pct"], 85.0)
-            # Host token file MUST remain completely untouched!
+
+            # New account defaults to unknown plan with zero fabricated quota (GA5)
+            self.assertEqual(refreshed["plan_tier"], "unknown")
+            self.assertEqual(refreshed["plan_label"], "Unknown")
+            self.assertEqual(refreshed["email_masked"], "n***r@example.com")
+            self.assertFalse(refreshed["quota_summary"]["has_quota"])
+            for pct_key in ("gemini_5h_pct", "gemini_weekly_pct", "claude_gpt_5h_pct", "claude_gpt_weekly_pct"):
+                self.assertIsNone(refreshed["quota_summary"][pct_key])
+            # Host token & official /usage quota_cache_file MUST remain completely untouched!
             self.assertEqual(host_tok.read_bytes(), host_original)
+            self.assertEqual(quota_cache.read_text(encoding="utf-8"), quota_sentinel)
 
-
-# ---------------------------------------------------------------------------
-# C6: Fingerprint Deduplication, Multi-Plan Pools, Recommendation, & Cost Compat
-# ---------------------------------------------------------------------------
-
-class TestMultiPlanDedupAndCostLedgerCompat(unittest.TestCase):
-    def test_fingerprint_dedup_summary_and_recommendation(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="ga_dedup_") as tmp:
+    def test_ga2_login_auto_probe_and_refresh_all_emit_userinfo_only(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ga_ga2_") as tmp:
             root = Path(tmp) / "accounts"
-            token_to_profile = {
-                _mock_access_token("U1"): ("uid-shared-001", "shared@example.com", "g1-ultra-tier", 0.20, 0.03),
-                _mock_access_token("U1DUP"): ("uid-shared-001", "shared@example.com", "g1-ultra-tier", 0.20, 0.03),
-                _mock_access_token("P2"): ("uid-pro-002", "pro2@example.com", "g1-pro-tier", 0.90, 0.80),
-                _mock_access_token("F3"): ("uid-free-003", "free3@example.com", "free-tier", 0.50, 0.40),
-            }
+            called_urls: list[str] = []
 
-            def fake_http(_method, url, *, access_token, json_body=None, timeout_sec=10.0):
-                uid, em, tier_id, gem_rem, claude_rem = token_to_profile[access_token]
-                if url == google_accounts.GOOGLE_USERINFO_URL:
-                    return {"id": uid, "email": em}
-                if url.endswith(":loadCodeAssist"):
-                    if tier_id == "free-tier":
-                        return {"currentTier": {"id": "free-tier"}}
-                    return {"paidTier": {"id": tier_id}, "currentTier": {"id": "free-tier"}}
-                if url.endswith(":retrieveUserQuotaSummary"):
-                    return {
-                        "groups": [
-                            {
-                                "displayName": "Gemini Models",
-                                "buckets": [{"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": gem_rem, "resetTime": "2026-11-27T23:00:00Z"}],
-                            },
-                            {
-                                "displayName": "Claude and GPT models",
-                                "buckets": [{"bucketId": "3p-weekly", "window": "weekly", "remainingFraction": claude_rem, "resetTime": "2026-11-27T23:00:00Z"}],
-                            },
-                        ]
-                    }
-                return {}
+            def fake_http(method, url, *, access_token, json_body=None, timeout_sec=10.0):
+                called_urls.append(url)
+                google_accounts.assert_allowed_google_url(url)
+                return {"id": "uid-login-auto-1", "email": "auto.user@example.com"}
 
             mgr = google_accounts.GoogleAccountManager(
                 root_dir=root,
@@ -830,6 +873,107 @@ class TestMultiPlanDedupAndCostLedgerCompat(unittest.TestCase):
                 http_request_fn=fake_http,
                 auto_adopt_host=False,
             )
+            expected_state = "STATE_GA2_AUTO_PROBE_001"
+            auth_url = (
+                "https://accounts.google.com/o/oauth2/auth"
+                "?client_id=example&redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback"
+                f"&state={expected_state}"
+            )
+
+            def fake_popen(_cmd, **_kwargs):
+                return _FakeLoginProc(auth_url, mgr.token_path_for("auto1"))
+
+            fmgr = google_accounts.GoogleLoginFlowManager(
+                mgr,
+                popen_fn=fake_popen,
+                auto_probe_on_login=True,
+            )
+            started = fmgr.start_login("auto1", alias="Auto One", owner_session_id="sess-ga2")
+            cb = f"https://antigravity.google/oauth-callback?state={expected_state}&code=4/0AEXAMPLE_GA2_CODE_123"
+            done = fmgr.submit_code(started["flow_id"], cb, owner_session_id="sess-ga2")
+            self.assertEqual(done["status"], "completed")
+            self.assertEqual(done["account"]["plan_tier"], "unknown")
+            self.assertFalse(done["account"]["quota_summary"]["has_quota"])
+            self.assertLessEqual(set(called_urls), {google_accounts.GOOGLE_USERINFO_URL})
+            self.assertEqual(len(called_urls), 1)
+
+            # refresh_all_accounts also emits strictly userinfo only
+            res_all = mgr.refresh_all_accounts()
+            self.assertTrue(res_all["ok"])
+            self.assertEqual(len(res_all["refreshed"]), 1)
+            self.assertLessEqual(set(called_urls), {google_accounts.GOOGLE_USERINFO_URL})
+            self.assertEqual(len(called_urls), 2)
+
+
+# ---------------------------------------------------------------------------
+# C6: Fingerprint Deduplication, Multi-Plan Pools, Recommendation, & Cost Compat
+# ---------------------------------------------------------------------------
+
+class TestMultiPlanDedupAndCostLedgerCompat(unittest.TestCase):
+    def test_ga5_fingerprint_dedup_legacy_registry_compat_and_refresh_preserves_legacy_plan(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ga_dedup_") as tmp:
+            root = Path(tmp) / "accounts"
+            quota_cache = Path(tmp) / "cache" / "quota_usage.json"
+            quota_cache.parent.mkdir(parents=True, exist_ok=True)
+            quota_sentinel = '{"source":"official_usage","groups":[]}\n'
+            quota_cache.write_text(quota_sentinel, encoding="utf-8")
+
+            called_urls: list[str] = []
+            token_to_profile = {
+                _mock_access_token("U1"): ("uid-shared-001", "shared@example.com"),
+                _mock_access_token("U1DUP"): ("uid-shared-001", "shared@example.com"),
+                _mock_access_token("P2"): ("uid-pro-002", "pro2@example.com"),
+                _mock_access_token("F3"): ("uid-free-003", "free3@example.com"),
+            }
+
+            def fake_http(_method, url, *, access_token, json_body=None, timeout_sec=10.0):
+                called_urls.append(url)
+                google_accounts.assert_allowed_google_url(url)
+                uid, em = token_to_profile[access_token]
+                return {"id": uid, "email": em}
+
+            def _legacy_quota(gem_rem: float, claude_rem: float) -> dict:
+                return {
+                    "fetched_at_epoch": 1700000000.0,
+                    "fetched_at_iso": "2026-11-21T00:00:00Z",
+                    "description": "",
+                    "groups": [
+                        {
+                            "name": "Gemini Models",
+                            "buckets": [
+                                {
+                                    "id": "gemini-weekly",
+                                    "name": "Weekly",
+                                    "window": "weekly",
+                                    "remaining_fraction": gem_rem,
+                                    "reset_time": "2026-11-27T23:00:00Z",
+                                }
+                            ],
+                        },
+                        {
+                            "name": "Claude and GPT models",
+                            "buckets": [
+                                {
+                                    "id": "3p-weekly",
+                                    "name": "Weekly",
+                                    "window": "weekly",
+                                    "remaining_fraction": claude_rem,
+                                    "reset_time": "2026-11-27T23:00:00Z",
+                                }
+                            ],
+                        },
+                    ],
+                }
+
+            mgr = google_accounts.GoogleAccountManager(
+                root_dir=root,
+                host_token_path=Path(tmp) / "host" / "token",
+                quota_cache_file=quota_cache,
+                http_request_fn=fake_http,
+                auto_adopt_host=False,
+            )
+
+            # Seed legacy registry.json containing historical plan_tier/quota, quota=None, and missing quota key
             for aid, tag, em in (
                 ("ultra_main", "U1", "shared@example.com"),
                 ("ultra_dup", "U1DUP", "shared@example.com"),
@@ -838,9 +982,61 @@ class TestMultiPlanDedupAndCostLedgerCompat(unittest.TestCase):
             ):
                 mgr.add_account(aid, alias=aid)
                 mgr.token_path_for(aid).write_bytes(_make_token_bytes(em, tag=tag))
+
+            with mgr._exclusive_lock():
+                reg = mgr._load_registry_locked()
+                reg["active_account_id"] = "ultra_main"
+                reg["accounts"]["ultra_main"].update({
+                    "plan_tier": "ultra",
+                    "plan_label": "Google AI Ultra",
+                    "quota": _legacy_quota(0.20, 0.03),
+                    "status": "ready",
+                })
+                reg["accounts"]["ultra_dup"].update({
+                    "plan_tier": "ultra",
+                    "plan_label": "Google AI Ultra",
+                    "quota": _legacy_quota(0.20, 0.03),
+                    "status": "ready",
+                })
+                reg["accounts"]["pro_work"].update({
+                    "plan_tier": "pro",
+                    "plan_label": "Google AI Pro",
+                    "quota": _legacy_quota(0.90, 0.80),
+                    "status": "ready",
+                })
+                reg["accounts"]["free_alt"].update({
+                    "plan_tier": "free",
+                    "plan_label": "Free",
+                    "quota": None,
+                    "status": "ready",
+                })
+                # Also add a legacy slot missing the `quota` key altogether
+                reg["accounts"]["legacy_nokey"] = {
+                    "account_id": "legacy_nokey",
+                    "alias": "Legacy NoKey",
+                    "plan_tier": "enterprise",
+                    "plan_label": "Enterprise",
+                    "status": "ready",
+                }
+                mgr._save_registry_locked(reg)
+
+            # Refresh identity for the 4 tokenized accounts: ONLY userinfo is called, legacy plan/quota preserved!
+            for aid in ("ultra_main", "ultra_dup", "pro_work", "free_alt"):
                 mgr.refresh_account(aid)
 
+            self.assertLessEqual(set(called_urls), {google_accounts.GOOGLE_USERINFO_URL})
+            self.assertEqual(len(called_urls), 4)
+            # quota_cache_file MUST NOT be overwritten by refresh_account
+            self.assertEqual(quota_cache.read_text(encoding="utf-8"), quota_sentinel)
+
             accts = {a["account_id"]: a for a in mgr.list_accounts()}
+            self.assertEqual(mgr.get_account("ultra_main")["plan_tier"], "ultra")
+            self.assertEqual(mgr.get_account("ultra_main")["plan_label"], "Google AI Ultra")
+            self.assertEqual(mgr.get_account("legacy_nokey")["plan_tier"], "enterprise")
+            self.assertFalse(mgr.get_account("legacy_nokey")["quota_summary"]["has_quota"])
+            self.assertFalse(mgr.get_account("free_alt")["quota_summary"]["has_quota"])
+            self.assertEqual(mgr.get_active_account_context(), ("ultra_main", "ultra"))
+
             expected_fp = hashlib.sha256(b"google-account\x00uid-shared-001").hexdigest()
             self.assertEqual(accts["ultra_main"]["credential_fingerprint"], expected_fp)
             self.assertEqual(accts["ultra_dup"]["credential_fingerprint"], expected_fp)
@@ -849,8 +1045,8 @@ class TestMultiPlanDedupAndCostLedgerCompat(unittest.TestCase):
             self.assertEqual(sorted(dup_flags), [False, True])
 
             summary = mgr.summarize_plan_quotas()
-            self.assertEqual(summary["total_slots"], 4)
-            self.assertEqual(summary["total_unique_accounts"], 3)
+            self.assertEqual(summary["total_slots"], 5)
+            self.assertEqual(summary["total_unique_accounts"], 4)
             self.assertEqual(summary["duplicate_slot_count"], 1)
             tiers = {t["plan_tier"]: t for t in summary["tiers"]}
             self.assertEqual(tiers["ultra"]["unique_accounts"], 1)
@@ -862,9 +1058,14 @@ class TestMultiPlanDedupAndCostLedgerCompat(unittest.TestCase):
             rec_cg = mgr.recommend_account("claude_gpt")
             self.assertEqual(rec_cg["recommended"]["account_id"], "pro_work")
 
-            # Recommend gemini: pro_work (90%) beats free_alt (50%) and ultra_main (20%)
+            # Recommend gemini: pro_work (90%) beats ultra_main (20%)
             rec_gem = mgr.recommend_account("gemini")
             self.assertEqual(rec_gem["recommended"]["account_id"], "pro_work")
+
+            # GA7: format_multi_plan_summary with no quota data uses honest degraded copy, never "待刷新配额"
+            rendered_summary = cost_usage.format_multi_plan_summary(summary)
+            self.assertIn("仅身份同步（配额请看 /usage）", rendered_summary)
+            self.assertNotIn("待刷新配额", rendered_summary)
 
     def test_cost_ledger_v2_and_cost_config_backward_compatibility(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ga_cost_") as tmp:
@@ -1374,6 +1575,104 @@ class TestBridgeAccountsAndStudioIPC(unittest.TestCase):
             self.assertEqual(len(sent), 1)
             self.assertIn("账号操作失败", sent[0])
             _assert_zero_leak(sent[0], "cmd_accounts(group)")
+
+    def test_ga2_ga3_ga7_telegram_dm_accounts_refresh_honest_copy_and_official_usage_cli(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ga_tg_honest_") as tmp:
+            bridge = _load_isolated_bridge(tmp)
+            bridge.BOT_META.update({"bot_id": 100, "handle": "example_bot", "resolved": True})
+
+            host_tok = Path(bridge.HOST_OAUTH_TOKEN_FILE)
+            host_tok.parent.mkdir(parents=True, exist_ok=True)
+            host_tok.write_bytes(_make_token_bytes("dm.owner@example.com", tag="DM1"))
+
+            called_urls: list[str] = []
+
+            def fake_http(_method, url, *, access_token, json_body=None, timeout_sec=10.0):
+                called_urls.append(url)
+                google_accounts.assert_allowed_google_url(url)
+                return {"id": "uid-dm-001", "email": "dm.owner@example.com"}
+
+            mgr = bridge._get_google_account_manager()
+            mgr._http_request_fn = fake_http
+
+            sent: list[str] = []
+            tg_calls: list[dict] = []
+
+            with (
+                mock.patch.object(bridge, "send", side_effect=lambda cid, txt, **kw: sent.append(txt) or 1),
+                mock.patch.object(bridge, "tg", side_effect=lambda method, **kw: tg_calls.append({"method": method, **kw}) or None),
+            ):
+                # 1. Admin DM /accounts panel shows honest degraded copy and never "待刷新配额"
+                bridge.handle_message({
+                    "chat": {"id": 111, "type": "private"},
+                    "from": {"id": 111},
+                    "text": "/accounts",
+                })
+                self.assertEqual(len(sent), 1)
+                self.assertIn("已停用非官方内部配额探测", sent[0])
+                self.assertIn("/usage", sent[0])
+                self.assertNotIn("待刷新配额", sent[0])
+
+                # 2. Admin DM /accounts refresh hits userinfo ONLY and displays honest copy
+                sent.clear()
+                bridge.handle_message({
+                    "chat": {"id": 111, "type": "private"},
+                    "from": {"id": 111},
+                    "text": "/accounts refresh",
+                })
+                self.assertGreaterEqual(len(sent), 2)
+                combined_refresh = "\n".join(sent)
+                self.assertIn("已停用非官方内部配额探测", combined_refresh)
+                self.assertIn("/usage", combined_refresh)
+                self.assertNotIn("待刷新配额", combined_refresh)
+                self.assertLessEqual(set(called_urls), {google_accounts.GOOGLE_USERINFO_URL})
+                self.assertEqual(len(called_urls), 1)
+
+                # 3. Admin DM callback `accounts:refresh:all` hits userinfo ONLY and displays honest copy
+                tg_calls.clear()
+                bridge.handle_callback({
+                    "id": "cb-dm-refresh-all",
+                    "from": {"id": 111},
+                    "message": {"chat": {"id": 111}, "message_id": 77},
+                    "data": "accounts:refresh:all",
+                })
+                self.assertLessEqual(set(called_urls), {google_accounts.GOOGLE_USERINFO_URL})
+                self.assertEqual(len(called_urls), 2)
+                self.assertTrue(
+                    any("同步账号身份" in str(c.get("text", "")) for c in tg_calls if c.get("method") == "answerCallbackQuery")
+                )
+                edited = [c.get("text", "") for c in tg_calls if c.get("method") == "editMessageText"]
+                self.assertEqual(len(edited), 1)
+                self.assertIn("已停用非官方内部配额探测", edited[0])
+                self.assertNotIn("待刷新配额", edited[0])
+
+            # 4. GA3: bridge.fetch_plan_quota_data still invokes official `agy -p /usage --output-format json`
+            recorded_cmds: list[list[str]] = []
+
+            def _fake_run_group(cmd, **kwargs):
+                recorded_cmds.append(list(cmd))
+                out = json.dumps({
+                    "command": {
+                        "data": {
+                            "description": "Official CLI",
+                            "groups": [
+                                {
+                                    "name": "Gemini Models",
+                                    "buckets": [{"id": "gemini-weekly", "window": "weekly", "remaining_fraction": 0.9}],
+                                }
+                            ],
+                        }
+                    }
+                })
+                return 0, out, ""
+
+            with mock.patch.object(bridge, "_run_subprocess_group", side_effect=_fake_run_group):
+                snap, is_fallback, err_str = bridge.fetch_plan_quota_data(force_live=True)
+            self.assertEqual(len(recorded_cmds), 1)
+            self.assertEqual(recorded_cmds[0][1:5], ["-p", "/usage", "--output-format", "json"])
+            self.assertIsNotNone(snap)
+            self.assertFalse(is_fallback)
+            self.assertEqual(err_str, "")
 
 
 if __name__ == "__main__":

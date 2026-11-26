@@ -397,6 +397,8 @@ export interface GoogleAccountsResponse {
     claude_gpt: AccountRecommendationBucket;
     gemini: AccountRecommendationBucket;
   };
+  quota_probe_disabled?: boolean;
+  quota_probe_notice?: string;
   can_edit: boolean;
   updated_at: string;
 }

@@ -241,6 +241,160 @@ class TestSecurityAuditWebuiControls(unittest.TestCase):
         )
         self.assertEqual(ok_lock_fund, [])
 
+    def test_ga4_google_internal_cloudcode_and_v1internal_guardrails_critical(self) -> None:
+        # 1. SAFE_PUBLIC_HOSTS MUST NOT allow Google internal quota hosts
+        gapis_dom = "googleapis" + "." + "com"
+        cc_prod = "cloudcode" + "-pa." + gapis_dom
+        cc_daily = "daily-" + "cloudcode" + "-pa." + gapis_dom
+        cc_autopush_upper = "AUTOPUSH-" + "CLOUDCODE" + "-PA." + gapis_dom.upper()
+        cc_sandbox = "cloudcode" + "-pa.sandbox." + gapis_dom
+        cc_daily_sandbox = "daily-" + "cloudcode" + "-pa.sandbox." + gapis_dom
+        cc_autopush_sandbox = "autopush-" + "cloudcode" + "-pa.sandbox." + gapis_dom
+        self.assertNotIn(cc_prod, security_audit.SAFE_PUBLIC_HOSTS)
+        self.assertNotIn(cc_daily, security_audit.SAFE_PUBLIC_HOSTS)
+
+        rpc_summary = "v1" + "internal:" + "retrieveUser" + "QuotaSummary"
+        rpc_models = "v1" + "internal:" + "fetchAvailable" + "Models"
+        rpc_lca = "v1" + "internal:" + "loadCode" + "Assist"
+        rpc_lca_upper = "V1" + "INTERNAL:" + "LOADCODE" + "ASSIST"
+        rpc_onboard = "v1" + "internal:" + "onboard" + "User"
+        rpc_onboard_upper = "V1" + "INTERNAL:" + "ONBOARD" + "USER"
+
+        samples = [
+            (f"https://{cc_prod}/api", "forbidden_google_internal_host"),
+            (f"const H = '{cc_daily}';", "forbidden_google_internal_host"),
+            (f"HOST = '{cc_autopush_upper}'", "forbidden_google_internal_host"),
+            (f"https://{cc_sandbox}/v1", "forbidden_google_internal_host"),
+            (f"https://{cc_daily_sandbox}/v1", "forbidden_google_internal_host"),
+            (f"HOST = '{cc_autopush_sandbox}'", "forbidden_google_internal_host"),
+            (f"endpoint = '/{rpc_summary}'", "forbidden_google_internal_rpc"),
+            (f"endpoint = '/{rpc_models}'", "forbidden_google_internal_rpc"),
+            (f"endpoint = '/{rpc_lca}'", "forbidden_google_internal_rpc"),
+            (f"endpoint = '/{rpc_lca_upper}'", "forbidden_google_internal_rpc"),
+            (f"endpoint = '/{rpc_onboard}'", "forbidden_google_internal_rpc"),
+            (f"endpoint = '/{rpc_onboard_upper}'", "forbidden_google_internal_rpc"),
+            (f"url = 'https://www.googleapis.com/oauth2/v2/userinfo%2f..%2f{rpc_models}'", "forbidden_google_internal_rpc"),
+        ]
+        target_paths = (
+            "bridge/google_accounts.py",
+            "webui/src/api.ts",
+            "webui/src/components/GoogleAccountsPanel.tsx",
+            "README.md",
+            "webui/dist/assets/index-test.js",
+        )
+
+        # Must block as CRITICAL in BOTH strict=False (secret-guard on private files) and strict=True
+        for strict_flag in (False, True):
+            for rel_path in target_paths:
+                for content, expected_rule in samples:
+                    hits = security_audit.scan_text(content, rel_path, strict=strict_flag)
+                    matching = [h for h in hits if h.rule == expected_rule]
+                    self.assertTrue(
+                        matching,
+                        f"Expected `{expected_rule}` in {rel_path} (strict={strict_flag}) for {content!r}, got {hits}",
+                    )
+                    self.assertTrue(
+                        all(h.severity == "CRITICAL" for h in matching),
+                        f"Expected CRITICAL severity for `{expected_rule}`, got {matching}",
+                    )
+
+    def test_retired_google_internal_history_filter_strict_boundaries(self) -> None:
+        sha_ga = "f18dcd3f69904d9becce83e19b8397ab75a03bdd"
+        sha_audit = "5dbb2934d8f2bb258d70abe593f22553ad47b8ab"
+        sha_other = "f18dcd3f69904d9becce83e19b8397ab75a03bde"
+        sha_future = "0123456789abcdef0123456789abcdef01234567"
+
+        gapis_dom = "googleapis" + "." + "com"
+        cc_prod = "cloudcode" + "-pa." + gapis_dom
+        cc_daily = "daily-" + "cloudcode" + "-pa." + gapis_dom
+        cc_sandbox = "autopush-" + "cloudcode" + "-pa.sandbox." + gapis_dom
+        rpc_models = "v1" + "internal:" + "fetchAvailable" + "Models"
+        rpc_onboard = "v1" + "internal:" + "onboard" + "User"
+
+        # Positive controls: exact 40-char SHA + exact retired path + retired rule/host -> True
+        retired_samples = [
+            (sha_ga, "bridge/google_accounts.py", f"URL = 'https://{cc_daily}/{rpc_models}'"),
+            (sha_ga, "tests/test_google_accounts.py", f"HOST = '{cc_sandbox}'\nRPC = '{rpc_onboard}'"),
+            (sha_ga, "tests/test_studio_google_accounts.py", f"https://{cc_prod}:443/api"),
+            (sha_audit, "scripts/security_audit.py", f'    "{cc_daily}",\n    "{cc_prod}",\n'),
+        ]
+        for sha, rel_path, text in retired_samples:
+            hits = security_audit.scan_text(text, rel_path, strict=True, commit=sha[:8])
+            self.assertTrue(hits, f"Expected scan_text to flag retired text in {rel_path}")
+            for h in hits:
+                self.assertTrue(
+                    security_audit._is_retired_google_internal_history_hit(sha, rel_path, h),
+                    f"Expected pinned historical retired hit to be filtered: {sha} {rel_path} {h}",
+                )
+
+        # Negative control 1: same SHA + same retired file, but real secret / PII / non-retired domain -> MUST return False
+        fake_ghp = "ghp_" + "AbCdEf1234567890XyZ99"
+        fake_email = "operator.real" + "@" + "privatecorp.io"
+        fake_handle = "@" + "real_operator_bot"
+        evil_dom = "evil-panel." + "privatecorp." + "xyz"
+        spoofed_dom = cc_prod + ".attacker." + "xyz"
+        non_retired_texts = [
+            (f'TOKEN = "{fake_ghp}"', "github_pat"),
+            (f'EMAIL = "{fake_email}"', "personal_or_real_email"),
+            (f'HANDLE = "{fake_handle}"', "unallowlisted_handle"),
+            (f'URL = "https://{evil_dom}/v1"', "unallowlisted_external_url"),
+            (f'DOM = "{evil_dom}"', "unallowlisted_bare_domain"),
+            (f'URL = "https://{spoofed_dom}/v1"', "unallowlisted_external_url"),
+            (f'DOM = "{spoofed_dom}"', "unallowlisted_bare_domain"),
+        ]
+        for content, expected_rule in non_retired_texts:
+            hits = security_audit.scan_text(content, "bridge/google_accounts.py", strict=True, commit=sha_ga[:8])
+            matching = [h for h in hits if h.rule == expected_rule]
+            self.assertTrue(matching, f"Expected `{expected_rule}` for {content!r}, got {hits}")
+            for h in matching:
+                self.assertFalse(
+                    security_audit._is_retired_google_internal_history_hit(sha_ga, "bridge/google_accounts.py", h),
+                    f"Non-retired hit MUST NOT be exempted in pinned SHA: {h}",
+                )
+
+        # Negative control 2: same SHA, but path NOT in retired file set (incl. <commit-message>) -> MUST return False
+        disallowed_paths = [
+            (sha_ga, "bridge/bridge.py"),
+            (sha_ga, "<commit-message>"),
+            (sha_ga, "scripts/security_audit.py"),
+            (sha_audit, "bridge/google_accounts.py"),
+            (sha_audit, "<commit-message>"),
+        ]
+        for sha, bad_path in disallowed_paths:
+            hits = security_audit.scan_text(f"https://{cc_daily}/{rpc_models}", bad_path, strict=True, commit=sha[:8])
+            self.assertTrue(hits)
+            for h in hits:
+                self.assertFalse(
+                    security_audit._is_retired_google_internal_history_hit(sha, bad_path, h),
+                    f"Disallowed path `{bad_path}` MUST NOT be exempted for {sha}: {h}",
+                )
+
+        # Negative control 3: short SHA / near-miss SHA / any future SHA + retired path -> MUST return False
+        for bad_sha in (sha_ga[:8], sha_ga[:16], sha_ga.upper(), sha_other, sha_future, ""):
+            hits = security_audit.scan_text(
+                f"https://{cc_daily}/{rpc_models}",
+                "bridge/google_accounts.py",
+                strict=True,
+                commit=bad_sha[:8] or None,
+            )
+            self.assertTrue(hits)
+            for h in hits:
+                self.assertFalse(
+                    security_audit._is_retired_google_internal_history_hit(bad_sha, "bridge/google_accounts.py", h),
+                    f"Non-pinned SHA `{bad_sha}` MUST NOT be exempted: {h}",
+                )
+
+        # Negative control 4: workspace scan_text() on identical retired text MUST STILL return CRITICAL
+        for rel_path in ("bridge/google_accounts.py", "scripts/security_audit.py"):
+            ws_hits = security_audit.scan_text(
+                f"https://{cc_daily}/{rpc_models} and {rpc_onboard}",
+                rel_path,
+                strict=True,
+            )
+            critical_rules = {h.rule for h in ws_hits if h.severity == "CRITICAL"}
+            self.assertIn("forbidden_google_internal_host", critical_rules)
+            self.assertIn("forbidden_google_internal_rpc", critical_rules)
+
 
 if __name__ == "__main__":
     unittest.main()

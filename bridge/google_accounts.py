@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Multi-Google-Account OAuth login, isolated profile storage, quota probing, and multi-plan aggregation.
+"""Multi-Google-Account OAuth login, isolated profile storage, identity sync, and multi-plan compatibility.
 
 Shared core module for both Telegram Bridge (M1) and AGY Studio (M2).
 
@@ -13,9 +13,10 @@ Security invariants:
   `start_new_session=True`, `AGY_CLI_DISABLE_AUTO_UPDATE=1`, `SSH_CONNECTION="127.0.0.1 0 127.0.0.1 0"`,
   stripped GUI/keyring env vars, constant-time `owner_session_id` + `oauth_state` validation,
   TTL expiry + anti-replay, and `os.killpg` teardown.
-- Direct HTTPS probing strictly restricted to hardcoded Google official hosts, `HTTPRedirectHandler` blocking all
-  3xx redirects fail-closed, `timeout <= 10.0s`, and bounded `<= 512 KiB` reads.
-- Credential-fingerprint (`sha256(b"google-account\\x00" + userinfo_id)`) deduplication across multi-plan quota pools.
+- Direct HTTPS requests strictly restricted to `https://www.googleapis.com/oauth2/v2/userinfo` only
+  (host + exact path fail-closed), `HTTPRedirectHandler` blocking all 3xx redirects fail-closed,
+  `timeout <= 10.0s`, and bounded `<= 512 KiB` reads. Unofficial internal quota probing is permanently disabled.
+- Credential-fingerprint (`sha256(b"google-account\\x00" + userinfo_id)`) deduplication across account slots.
 """
 
 from __future__ import annotations
@@ -29,7 +30,6 @@ import json
 import math
 import os
 from pathlib import Path
-import platform
 import re
 import secrets
 import shutil
@@ -54,13 +54,10 @@ OAUTH_CODE_RE = re.compile(r"^[A-Za-z0-9/_.~+=-]{8,512}$")
 GOOGLE_AUTH_URL_RE = re.compile(re.escape("https://accounts.google.com/o/oauth2/auth?") + r"[^\s\"'<>]+")
 
 GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
-CLOUDCODE_DAILY_BASE = "https://daily-cloudcode-pa.googleapis.com"
-CLOUDCODE_PROD_BASE = "https://cloudcode-pa.googleapis.com"
+ALLOWED_GOOGLE_USERINFO_PATH = "/oauth2/v2/userinfo"
 
 ALLOWED_GOOGLE_PROBE_HOSTS = frozenset({
     "www.googleapis.com",
-    "daily-cloudcode-pa.googleapis.com",
-    "cloudcode-pa.googleapis.com",
 })
 
 ALLOWED_OAUTH_CALLBACK_HOST = "antigravity.google"
@@ -73,11 +70,6 @@ MAX_LOGIN_TIMEOUT_SEC = 300.0
 DEFAULT_URL_WAIT_TIMEOUT_SEC = 15.0
 DEFAULT_SUBMIT_WAIT_TIMEOUT_SEC = 30.0
 DEFAULT_REFRESH_SUBPROC_TIMEOUT_SEC = 15.0
-
-SUMMARY_WINDOW_MINS = {
-    "5h": 5 * 60,
-    "weekly": 7 * 24 * 60,
-}
 
 PLAN_TIER_LABELS = {
     "ultra": "Google AI Ultra",
@@ -283,26 +275,9 @@ def classify_plan_tier(paid_tier: Any = None, current_tier: Any = None) -> tuple
     return "unknown", PLAN_TIER_LABELS["unknown"]
 
 
-def antigravity_user_agent() -> str:
-    """Return T3-aligned Antigravity client User-Agent string."""
-    plat = sys.platform
-    if plat.startswith("linux"):
-        os_type = "linux"
-    elif plat == "darwin":
-        os_type = "darwin"
-    elif plat.startswith("win"):
-        os_type = "win32"
-    else:
-        os_type = plat
-    mach = (platform.machine() or "x64").lower()
-    if mach in ("x86_64", "amd64"):
-        arch = "x64"
-    elif mach in ("aarch64", "arm64"):
-        arch = "arm64"
-    else:
-        arch = mach
-    cl_ver = f"{963137}{146}"
-    return f"antigravity/hub/2.24.0 (aidev_client; os_type={os_type}; arch={arch}; cl={cl_ver})"
+def google_userinfo_user_agent() -> str:
+    """Return an honest standard User-Agent for official Google OAuth userinfo requests."""
+    return f"agy-cli-bot/1.0 (Python/{sys.version_info.major}.{sys.version_info.minor}; OAuth-Userinfo)"
 
 
 def _parse_iso_utc(ts_str: Any) -> datetime.datetime | None:
@@ -757,21 +732,31 @@ def terminate_process_group(proc: Any, *, grace_sec: float = 1.0) -> None:
 # ---------------------------------------------------------------------------
 
 def assert_allowed_google_url(url: str) -> str:
-    """Strictly verify URL uses HTTPS against the hardcoded Google official host whitelist."""
+    """Strictly verify URL is HTTPS targeting `www.googleapis.com` with exact path `/oauth2/v2/userinfo`."""
     if not isinstance(url, str) or not url.strip():
         raise GoogleProbeError("Empty probe URL rejected")
-    if any(ord(c) < 0x20 or ord(c) == 0x7f for c in url):
-        raise GoogleProbeError("Control characters in probe URL rejected")
+    if url != url.strip() or any(ord(c) <= 0x20 or ord(c) == 0x7f for c in url):
+        raise GoogleProbeError("Control or whitespace characters in probe URL rejected")
+    if "?" in url or "#" in url:
+        raise GoogleProbeError("Query parameters and fragments are forbidden on Google userinfo URLs")
+    if "%" in url or "\\" in url:
+        raise GoogleProbeError("Encoded or backslash path characters are forbidden on Google userinfo URLs")
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme != "https":
         raise GoogleProbeError("Only HTTPS Google probe URLs are allowed")
-    if parsed.username or parsed.password:
+    if parsed.username or parsed.password or "@" in parsed.netloc:
         raise GoogleProbeError("Embedded credentials in URL are forbidden")
+    if parsed.port is not None or ":" in parsed.netloc:
+        raise GoogleProbeError("Custom ports are forbidden on Google probe URLs")
     host = (parsed.hostname or "").lower()
+    if not host or host.endswith(".") or parsed.netloc.lower() != host:
+        raise GoogleProbeError(f"Host not in hardcoded Google allowlist: {host}")
     if host not in ALLOWED_GOOGLE_PROBE_HOSTS:
         raise GoogleProbeError(f"Host not in hardcoded Google allowlist: {host}")
-    if parsed.port is not None:
-        raise GoogleProbeError("Custom ports are forbidden on Google probe URLs")
+    if parsed.path != ALLOWED_GOOGLE_USERINFO_PATH or ".." in parsed.path:
+        raise GoogleProbeError(f"Path not in hardcoded Google userinfo allowlist: {parsed.path}")
+    if parsed.query or parsed.fragment:
+        raise GoogleProbeError("Query parameters and fragments are forbidden on Google userinfo URLs")
     return url
 
 
@@ -808,7 +793,7 @@ def google_https_json_request(
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Accept": "application/json",
-        "User-Agent": antigravity_user_agent(),
+        "User-Agent": google_userinfo_user_agent(),
     }
     data_bytes: bytes | None = None
     if json_body is not None:
@@ -868,180 +853,11 @@ def google_https_json_request(
 
 
 # ---------------------------------------------------------------------------
-# Quota Parsing (T3 Code `antigravityUsageLimits.ts` Parity + Bridge Format)
-# ---------------------------------------------------------------------------
-
-def _summary_reset_time(bucket: dict[str, Any], window_duration_mins: int | None, requested_at_ms: float) -> str | None:
-    """Suppress rolling full-window reset times on untouched buckets (T3 Code parity)."""
-    rem = bucket.get("remainingFraction")
-    desc = bucket.get("description")
-    reset_time = bucket.get("resetTime")
-    if not isinstance(reset_time, str) or not reset_time.strip():
-        return None
-    if rem == 1 and desc is None and window_duration_mins is not None:
-        dt = _parse_iso_utc(reset_time)
-        if dt is not None:
-            reset_ms = dt.timestamp() * 1000.0
-            if abs(reset_ms - requested_at_ms - (window_duration_mins * 60_000.0)) <= 60_000.0:
-                return None
-    return reset_time.strip()
-
-
-def parse_quota_summary_response(response: dict[str, Any], *, requested_at_ms: float | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Parse `v1internal:retrieveUserQuotaSummary` into `(groups, windows)`."""
-    req_ms = time.time() * 1000.0 if requested_at_ms is None else float(requested_at_ms)
-    raw_groups = response.get("groups")
-    if isinstance(raw_groups, list) and any(isinstance(g, dict) and g.get("buckets") for g in raw_groups):
-        iter_groups = raw_groups
-    else:
-        iter_groups = [{"displayName": "", "buckets": response.get("buckets") or []}]
-
-    windows_by_id: dict[str, dict[str, Any]] = {}
-    groups_map: dict[str, dict[str, Any]] = {}
-
-    for grp in iter_groups:
-        if not isinstance(grp, dict):
-            continue
-        g_display = str(grp.get("displayName") or "").strip()
-        for bucket in (grp.get("buckets") or []):
-            if not isinstance(bucket, dict) or bucket.get("disabled"):
-                continue
-            bid = str(bucket.get("bucketId") or "").strip()
-            if not bid:
-                continue
-            raw_rem = bucket.get("remainingFraction")
-            if raw_rem is None:
-                continue
-            try:
-                rem_frac = float(raw_rem)
-            except (TypeError, ValueError):
-                continue
-            if not math.isfinite(rem_frac):
-                continue
-            rem_frac = max(0.0, min(1.0, rem_frac))
-
-            if bid.startswith("gemini-argon-"):
-                family = g_display or "Gemini Argon"
-                group_key = "Gemini Models"
-            elif bid.startswith("gemini-carbon-"):
-                family = g_display or "Gemini Carbon"
-                group_key = "Gemini Models"
-            elif bid.startswith("gemini-"):
-                family = "Gemini"
-                group_key = "Gemini Models"
-            elif bid.startswith("3p-"):
-                family = "Claude & GPT (shared)"
-                group_key = "Claude and GPT models"
-            else:
-                family = g_display or bid
-                group_key = g_display or ("Claude and GPT models" if ("claude" in family.lower() or "gpt" in family.lower()) else "Gemini Models")
-
-            win_raw = str(bucket.get("window") or "").strip().lower()
-            is_weekly = win_raw == "weekly"
-            is_5h = win_raw == "5h"
-            win_mins = SUMMARY_WINDOW_MINS.get(win_raw)
-            reset_iso = _summary_reset_time(bucket, win_mins, req_ms)
-            b_disp = str(bucket.get("displayName") or "").strip()
-            label = f"{family} · {'Weekly' if is_weekly else '5-hour' if is_5h else (b_disp or 'Quota')}"
-            win_entry: dict[str, Any] = {
-                "id": bid,
-                "label": label,
-                "kind": "weekly" if is_weekly else ("session" if is_5h else "other"),
-                "used_percent": round((1.0 - rem_frac) * 100.0, 2),
-                "remaining_fraction": rem_frac,
-            }
-            if reset_iso:
-                win_entry["resets_at"] = reset_iso
-            if win_mins is not None:
-                win_entry["window_duration_mins"] = win_mins
-            windows_by_id[bid] = win_entry
-
-            g_obj = groups_map.setdefault(group_key, {"name": group_key, "description": "", "buckets": []})
-            g_obj["buckets"].append({
-                "id": bid,
-                "name": b_disp or ("Weekly" if is_weekly else ("5-hour" if is_5h else bid)),
-                "window": win_raw or ("weekly" if is_weekly else ("5h" if is_5h else "other")),
-                "remaining_fraction": rem_frac,
-                "reset_time": reset_iso or "",
-            })
-
-    return list(groups_map.values()), list(windows_by_id.values())
-
-
-def parse_available_models_fallback(response: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Parse `v1internal:fetchAvailableModels` fallback quota payload into `(groups, windows)`."""
-    models = response.get("models")
-    if not isinstance(models, dict):
-        return [], []
-    windows_by_id: dict[str, dict[str, Any]] = {}
-    for model_id, model_obj in models.items():
-        if not isinstance(model_obj, dict):
-            continue
-        mid = str(model_id or "").lower()
-        provider = str(model_obj.get("modelProvider") or "")
-        if provider == "MODEL_PROVIDER_GOOGLE" or mid.startswith("gemini-"):
-            family = "Gemini"
-        elif provider == "MODEL_PROVIDER_ANTHROPIC" or mid.startswith("claude-"):
-            family = "Claude"
-        elif provider == "MODEL_PROVIDER_OPENAI" or mid.startswith("gpt-"):
-            family = "GPT"
-        else:
-            continue
-        for suffix, q_key in (("quota", "quotaInfo"), ("weekly", "weeklyQuotaInfo")):
-            q_obj = model_obj.get(q_key)
-            if not isinstance(q_obj, dict):
-                continue
-            raw_rem = q_obj.get("remainingFraction")
-            if raw_rem is None:
-                continue
-            try:
-                rem_frac = float(raw_rem)
-            except (TypeError, ValueError):
-                continue
-            if not math.isfinite(rem_frac):
-                continue
-            rem_frac = max(0.0, min(1.0, rem_frac))
-            wid = f"{family.lower()}-{suffix}"
-            used_pct = round((1.0 - rem_frac) * 100.0, 2)
-            prev = windows_by_id.get(wid)
-            if prev is None or used_pct > prev["used_percent"]:
-                entry: dict[str, Any] = {
-                    "id": wid,
-                    "label": f"{family} · {'Weekly' if suffix == 'weekly' else 'Reported quota'}",
-                    "kind": "weekly" if suffix == "weekly" else "other",
-                    "used_percent": used_pct,
-                    "remaining_fraction": rem_frac,
-                    "family": family,
-                }
-                rst = str(q_obj.get("resetTime") or "").strip()
-                if rst:
-                    entry["resets_at"] = rst
-                if suffix == "weekly":
-                    entry["window_duration_mins"] = 7 * 24 * 60
-                windows_by_id[wid] = entry
-
-    groups_map: dict[str, dict[str, Any]] = {}
-    for w in windows_by_id.values():
-        fam = w.get("family") or ""
-        g_key = "Gemini Models" if fam == "Gemini" else "Claude and GPT models"
-        g_obj = groups_map.setdefault(g_key, {"name": g_key, "description": "", "buckets": []})
-        g_obj["buckets"].append({
-            "id": w["id"],
-            "name": w["label"],
-            "window": "weekly" if w["kind"] == "weekly" else "5h",
-            "remaining_fraction": w["remaining_fraction"],
-            "reset_time": w.get("resets_at") or "",
-        })
-    clean_windows = [{k: v for k, v in w.items() if k != "family"} for w in windows_by_id.values()]
-    return list(groups_map.values()), clean_windows
-
-
-# ---------------------------------------------------------------------------
 # Core Account Manager (`GoogleAccountManager`)
 # ---------------------------------------------------------------------------
 
 class GoogleAccountManager:
-    """Manages isolated Google OAuth profiles, host token switching, probing, and plan aggregation."""
+    """Manages isolated Google OAuth profiles, host token switching, identity sync, and plan compatibility."""
 
     def __init__(
         self,
@@ -1573,15 +1389,17 @@ class GoogleAccountManager:
         os.chmod(tpath, 0o600)
         return parse_oauth_token_bytes(raw)
 
-    # -- Direct Google Metadata & Quota Probing -----------------------------
+    # -- Direct Google Identity Sync (Official Userinfo Only) ---------------
 
     def _probe_endpoints_for_token(
         self,
         access_token: str,
-        auth_method: str,
+        auth_method: str = "oauth-personal",
         *,
         timeout_sec: float = MAX_PROBE_TIMEOUT_SEC,
     ) -> dict[str, Any]:
+        """Fetch official Google OAuth userinfo identity fields only (zero internal quota API calls)."""
+        _ = auth_method
         userinfo = self._http_request_fn(
             "GET",
             GOOGLE_USERINFO_URL,
@@ -1591,143 +1409,19 @@ class GoogleAccountManager:
         google_uid = str(userinfo.get("id") or "").strip()
         email = str(userinfo.get("email") or "").strip()
         fingerprint = compute_credential_fingerprint(google_uid) if google_uid else ""
-
-        endpoints = (
-            [CLOUDCODE_PROD_BASE, CLOUDCODE_DAILY_BASE]
-            if auth_method == "oauth-business"
-            else [CLOUDCODE_DAILY_BASE, CLOUDCODE_PROD_BASE]
-        )
-
-        # 1. loadCodeAssist for tier classification & optional project_id
-        paid_tier = None
-        current_tier = None
-        project_id = None
-        for base in endpoints:
-            try:
-                lca = self._http_request_fn(
-                    "POST",
-                    f"{base}/v1internal:loadCodeAssist",
-                    access_token=access_token,
-                    json_body={"metadata": {"ideType": "ANTIGRAVITY"}},
-                    timeout_sec=timeout_sec,
-                )
-                paid_tier = lca.get("paidTier")
-                current_tier = lca.get("currentTier")
-                proj = lca.get("cloudaicompanionProject")
-                if isinstance(proj, str) and proj.strip():
-                    project_id = proj.strip()
-                break
-            except GoogleProbeError as exc:
-                if exc.status_code == 401:
-                    raise
-                continue
-
-        plan_tier, plan_label = classify_plan_tier(paid_tier, current_tier)
-
-        def _tier_id_str(val: Any) -> str:
-            if isinstance(val, dict):
-                return str(val.get("id") or val.get("name") or "").strip()
-            return str(val or "").strip()
-
-        # 2. retrieveUserQuotaSummary across primary/backup endpoints (first host wins per bucketId)
-        merged_groups: dict[str, dict[str, Any]] = {}
-        merged_windows: dict[str, dict[str, Any]] = {}
-        seen_bucket_ids: set[str] = set()
-        quota_body = {"project": project_id} if project_id else {}
-
-        for base in endpoints:
-            req_ms = time.time() * 1000.0
-            try:
-                summary_resp = self._http_request_fn(
-                    "POST",
-                    f"{base}/v1internal:retrieveUserQuotaSummary",
-                    access_token=access_token,
-                    json_body=quota_body,
-                    timeout_sec=timeout_sec,
-                )
-            except GoogleProbeError as exc:
-                if exc.status_code == 401:
-                    raise
-                continue
-            grps, wins = parse_quota_summary_response(summary_resp, requested_at_ms=req_ms)
-            for w in wins:
-                if w["id"] not in merged_windows:
-                    merged_windows[w["id"]] = w
-            for g in grps:
-                g_out = merged_groups.setdefault(g["name"], {"name": g["name"], "description": g.get("description") or "", "buckets": []})
-                for b in g.get("buckets") or []:
-                    if b["id"] not in seen_bucket_ids:
-                        seen_bucket_ids.add(b["id"])
-                        g_out["buckets"].append(b)
-
-        # 3. Fallback to fetchAvailableModels if summary returned empty
-        if not merged_windows:
-            for base in endpoints:
-                try:
-                    models_resp = self._http_request_fn(
-                        "POST",
-                        f"{base}/v1internal:fetchAvailableModels",
-                        access_token=access_token,
-                        json_body=quota_body,
-                        timeout_sec=timeout_sec,
-                    )
-                except GoogleProbeError as exc:
-                    if exc.status_code == 401:
-                        raise
-                    continue
-                grps, wins = parse_available_models_fallback(models_resp)
-                for w in wins:
-                    if w["id"] not in merged_windows:
-                        merged_windows[w["id"]] = w
-                for g in grps:
-                    g_out = merged_groups.setdefault(g["name"], {"name": g["name"], "description": "", "buckets": []})
-                    for b in g.get("buckets") or []:
-                        if b["id"] not in seen_bucket_ids:
-                            seen_bucket_ids.add(b["id"])
-                            g_out["buckets"].append(b)
-
-        groups_list = [g for g in merged_groups.values() if g.get("buckets")]
-        windows_list = list(merged_windows.values())
-
-        # Extract weekly reset UTC anchor from Gemini weekly bucket if available
-        weekly_reset_utc = None
-        for g in groups_list:
-            for b in g.get("buckets") or []:
-                if b.get("id") == "gemini-weekly" or ("gemini" in (g.get("name") or "").lower() and b.get("window") == "weekly"):
-                    rst_dt = _parse_iso_utc(b.get("reset_time"))
-                    if rst_dt is not None:
-                        weekly_reset_utc = {
-                            "weekday": rst_dt.weekday(),
-                            "hour": rst_dt.hour,
-                            "minute": rst_dt.minute,
-                        }
-                    break
-            if weekly_reset_utc is not None:
-                break
-
-        now_epoch = time.time()
-        quota_obj = {
-            "fetched_at_epoch": now_epoch,
-            "fetched_at_iso": _iso_utc_now(),
-            "description": "",
-            "groups": groups_list,
-            "windows": windows_list,
-            "weekly_reset_utc": weekly_reset_utc,
-        }
-
         return {
             "google_user_id": google_uid,
             "email": email,
             "credential_fingerprint": fingerprint,
-            "plan_tier": plan_tier,
-            "plan_label": plan_label,
-            "paid_tier_id": _tier_id_str(paid_tier),
-            "current_tier_id": _tier_id_str(current_tier),
-            "quota": quota_obj,
         }
 
     def refresh_account(self, account_id: str | None = None, *, timeout_sec: float = MAX_PROBE_TIMEOUT_SEC) -> dict[str, Any]:
-        """Refresh userinfo, plan tier, and quota for `account_id` (defaults to active account)."""
+        """Sync Google OAuth userinfo identity for `account_id` (defaults to active account).
+
+        Unofficial internal quota probing is permanently disabled to prevent Google account suspension.
+        Preserves any existing legacy `plan_tier`/`plan_label`/`quota`, defaults new accounts to
+        `"unknown"`/`"Unknown"`, never fabricates quota percentages, and never overwrites `quota_cache_file`.
+        """
         with self._exclusive_lock():
             reg = self._load_registry_locked()
             aid = validate_account_id(account_id) if account_id is not None else reg.get("active_account_id")
@@ -1750,9 +1444,18 @@ class GoogleAccountManager:
             probe_data = self._probe_endpoints_for_token(access_token, auth_method, timeout_sec=timeout_sec)
         except GoogleProbeError as exc:
             if exc.status_code == 401:
-                tok_doc = self.refresh_token_isolated(aid)
-                access_token = str(tok_doc["token"]["access_token"])
-                probe_data = self._probe_endpoints_for_token(access_token, auth_method, timeout_sec=timeout_sec)
+                try:
+                    tok_doc = self.refresh_token_isolated(aid)
+                    access_token = str(tok_doc["token"]["access_token"])
+                    probe_data = self._probe_endpoints_for_token(access_token, auth_method, timeout_sec=timeout_sec)
+                except GoogleProbeError as retry_exc:
+                    with self._exclusive_lock():
+                        reg = self._load_registry_locked()
+                        if aid in (reg.get("accounts") or {}):
+                            reg["accounts"][aid]["last_error"] = scrub_paths_for_public(str(retry_exc))[:240]
+                            reg["accounts"][aid]["last_checked_at"] = _iso_utc_now()
+                            self._save_registry_locked(reg)
+                    raise
             else:
                 with self._exclusive_lock():
                     reg = self._load_registry_locked()
@@ -1775,18 +1478,18 @@ class GoogleAccountManager:
                 rec["google_user_id"] = probe_data["google_user_id"]
             if probe_data.get("credential_fingerprint"):
                 rec["credential_fingerprint"] = probe_data["credential_fingerprint"]
-            rec["plan_tier"] = probe_data["plan_tier"]
-            rec["plan_label"] = probe_data["plan_label"]
-            rec["paid_tier_id"] = probe_data["paid_tier_id"]
-            rec["current_tier_id"] = probe_data["current_tier_id"]
-            rec["quota"] = probe_data["quota"]
+            # Preserve existing valid plan_tier/plan_label; default new/missing accounts to "unknown"/"Unknown"
+            existing_tier = str(rec.get("plan_tier") or "").strip().lower()
+            if existing_tier not in PLAN_TIER_LABELS:
+                rec["plan_tier"] = "unknown"
+                rec["plan_label"] = PLAN_TIER_LABELS["unknown"]
+            elif not str(rec.get("plan_label") or "").strip():
+                rec["plan_label"] = PLAN_TIER_LABELS[existing_tier]
             rec["status"] = "ready"
             rec["last_error"] = ""
             rec["last_checked_at"] = now_iso
             rec["updated_at"] = now_iso
             self._save_registry_locked(reg)
-            if reg.get("active_account_id") == aid:
-                self._sync_quota_and_cost_caches(aid, rec)
             dup_map = self._compute_duplicates(reg)
             return to_public_dict(
                 rec,

@@ -728,7 +728,7 @@ def format_multi_plan_summary(
                             parts.append(f"{short_lbl} {avg_p:.0f}% (池{tot_f * 100:.0f}%{rst_txt})")
                         else:
                             parts.append(f"{short_lbl} {avg_p:.0f}%{rst_txt}")
-                pool_desc = " · ".join(parts) if parts else "待刷新配额"
+                pool_desc = " · ".join(parts) if parts else "仅身份同步（配额请看 /usage）"
                 lines.append(
                     f"• <b>{html_mod.escape(tlbl)}</b> ×{u_cnt}：<code>{html_mod.escape(pool_desc)}</code>"
                 )

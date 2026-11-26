@@ -1679,8 +1679,22 @@ const DEMO_PLAN_PRIORITY: Record<string, number> = {
   unknown: 0,
 };
 
-const isoAhead = (secAhead: number): string =>
-  new Date((nowSec() + secAhead) * 1000).toISOString();
+const DEMO_QUOTA_PROBE_NOTICE =
+  "已停用非官方内部配额 API 探测以防 Google 账号风控；刷新操作仅通过官方 Google userinfo 同步账号身份，查看当前激活账号配额请使用官方 agy /usage。";
+
+const emptyDemoQuotaSummary = () => ({
+  has_quota: false,
+  fetched_at_iso: "",
+  gemini_5h_pct: null,
+  gemini_5h_reset_at: null,
+  gemini_weekly_pct: null,
+  gemini_weekly_reset_at: null,
+  claude_gpt_5h_pct: null,
+  claude_gpt_5h_reset_at: null,
+  claude_gpt_weekly_pct: null,
+  claude_gpt_weekly_reset_at: null,
+  groups: [],
+});
 
 let demoActiveGoogleAccountId: string | null = "ultra_main";
 let demoGoogleAccounts: GoogleAccountItem[] = [
@@ -1700,19 +1714,7 @@ let demoGoogleAccounts: GoogleAccountItem[] = [
     last_checked_at: isoAgo(120),
     last_error: "",
     weekly_reset_utc: { weekday: 4, hour: 23, minute: 0 },
-    quota_summary: {
-      has_quota: true,
-      fetched_at_iso: isoAgo(120),
-      gemini_5h_pct: 92,
-      gemini_5h_reset_at: isoAhead(3 * 3600 + 25 * 60),
-      gemini_weekly_pct: 78,
-      gemini_weekly_reset_at: isoAhead(4 * 86400 + 6 * 3600),
-      claude_gpt_5h_pct: 64,
-      claude_gpt_5h_reset_at: isoAhead(2 * 3600 + 18 * 60),
-      claude_gpt_weekly_pct: 58,
-      claude_gpt_weekly_reset_at: isoAhead(4 * 86400 + 6 * 3600),
-      groups: [],
-    },
+    quota_summary: emptyDemoQuotaSummary(),
   },
   {
     account_id: "pro_work",
@@ -1730,19 +1732,7 @@ let demoGoogleAccounts: GoogleAccountItem[] = [
     last_checked_at: isoAgo(300),
     last_error: "",
     weekly_reset_utc: { weekday: 1, hour: 8, minute: 0 },
-    quota_summary: {
-      has_quota: true,
-      fetched_at_iso: isoAgo(300),
-      gemini_5h_pct: 86,
-      gemini_5h_reset_at: isoAhead(4 * 3600 + 10 * 60),
-      gemini_weekly_pct: 84,
-      gemini_weekly_reset_at: isoAhead(2 * 86400 + 14 * 3600),
-      claude_gpt_5h_pct: 95,
-      claude_gpt_5h_reset_at: isoAhead(4 * 3600 + 10 * 60),
-      claude_gpt_weekly_pct: 88,
-      claude_gpt_weekly_reset_at: isoAhead(2 * 86400 + 14 * 3600),
-      groups: [],
-    },
+    quota_summary: emptyDemoQuotaSummary(),
   },
   {
     account_id: "free_lab",
@@ -1760,19 +1750,7 @@ let demoGoogleAccounts: GoogleAccountItem[] = [
     last_checked_at: isoAgo(600),
     last_error: "",
     weekly_reset_utc: null,
-    quota_summary: {
-      has_quota: true,
-      fetched_at_iso: isoAgo(600),
-      gemini_5h_pct: 70,
-      gemini_5h_reset_at: isoAhead(1 * 3600 + 45 * 60),
-      gemini_weekly_pct: 62,
-      gemini_weekly_reset_at: isoAhead(5 * 86400 + 2 * 3600),
-      claude_gpt_5h_pct: 40,
-      claude_gpt_5h_reset_at: isoAhead(1 * 3600 + 45 * 60),
-      claude_gpt_weekly_pct: 35,
-      claude_gpt_weekly_reset_at: isoAhead(5 * 86400 + 2 * 3600),
-      groups: [],
-    },
+    quota_summary: emptyDemoQuotaSummary(),
   },
 ];
 
@@ -1909,6 +1887,8 @@ function buildDemoGoogleAccountsSnapshot(): GoogleAccountsResponse {
       claude_gpt: pickBest("claude_gpt"),
       gemini: pickBest("gemini"),
     },
+    quota_probe_disabled: true,
+    quota_probe_notice: DEMO_QUOTA_PROBE_NOTICE,
     can_edit: true,
     updated_at: new Date().toISOString(),
   };
@@ -2067,8 +2047,8 @@ export async function submitGoogleLoginCode(
       account_id: flow.account_id,
       alias: flow.alias,
       email_masked: `${flow.account_id[0] || "u"}***@example.com`,
-      plan_tier: "pro",
-      plan_label: "Google AI Pro",
+      plan_tier: "unknown",
+      plan_label: "Unknown",
       is_active: false,
       is_duplicate: false,
       duplicate_of: null,
@@ -2077,38 +2057,13 @@ export async function submitGoogleLoginCode(
       last_checked_at: new Date().toISOString(),
       last_error: "",
       weekly_reset_utc: null,
-      quota_summary: {
-        has_quota: true,
-        fetched_at_iso: new Date().toISOString(),
-        gemini_5h_pct: 98,
-        gemini_5h_reset_at: isoAhead(5 * 3600),
-        gemini_weekly_pct: 96,
-        gemini_weekly_reset_at: isoAhead(6 * 86400),
-        claude_gpt_5h_pct: 95,
-        claude_gpt_5h_reset_at: isoAhead(5 * 3600),
-        claude_gpt_weekly_pct: 94,
-        claude_gpt_weekly_reset_at: isoAhead(6 * 86400),
-        groups: [],
-      },
+      quota_summary: emptyDemoQuotaSummary(),
     };
     demoGoogleAccounts = [...demoGoogleAccounts, target];
   } else {
     target.status = "ready";
     target.email_masked = target.email_masked || `${target.account_id[0] || "u"}***@example.com`;
-    if (target.plan_tier === "unknown") {
-      target.plan_tier = "pro";
-      target.plan_label = "Google AI Pro";
-    }
     target.last_checked_at = new Date().toISOString();
-    target.quota_summary = {
-      ...target.quota_summary,
-      has_quota: true,
-      fetched_at_iso: new Date().toISOString(),
-      gemini_5h_pct: target.quota_summary.gemini_5h_pct ?? 96,
-      gemini_weekly_pct: target.quota_summary.gemini_weekly_pct ?? 92,
-      claude_gpt_5h_pct: target.quota_summary.claude_gpt_5h_pct ?? 94,
-      claude_gpt_weekly_pct: target.quota_summary.claude_gpt_weekly_pct ?? 90,
-    };
   }
   flow.status = "completed";
   flow.account = { ...target };
@@ -2202,7 +2157,6 @@ export async function refreshGoogleAccountQuota(
     throw new StudioApiError(`账号 '${accountId}' 不存在`, 404, "studio_api");
   }
   target.last_checked_at = new Date().toISOString();
-  target.quota_summary.fetched_at_iso = target.last_checked_at;
   emitDemoEvent("accounts_updated", { action: "refresh", account_id: accountId, ts: nowSec() });
   return { ok: true, account: { ...target }, snapshot: buildDemoGoogleAccountsSnapshot() };
 }
@@ -2214,7 +2168,6 @@ export async function refreshAllGoogleAccountsQuota(): Promise<GoogleAccountRefr
   for (const a of demoGoogleAccounts) {
     if (a.status === "ready") {
       a.last_checked_at = nowIso;
-      a.quota_summary.fetched_at_iso = nowIso;
     }
   }
   emitDemoEvent("accounts_updated", { action: "refresh_all", ts: nowSec() });
