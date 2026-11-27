@@ -166,6 +166,9 @@ async function requestJson<T>(
   includeCsrf = false,
 ): Promise<T> {
   const headers = new Headers(init.headers || {});
+  if (!headers.has("Accept")) {
+    headers.set("Accept", "application/json");
+  }
   const method = (init.method || "GET").toUpperCase();
   const isMutating = method === "POST" || method === "PATCH" || method === "PUT" || method === "DELETE";
   if ((init.body || isMutating) && !headers.has("Content-Type")) {

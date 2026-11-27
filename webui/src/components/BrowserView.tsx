@@ -301,7 +301,8 @@ export function BrowserView({
   const showToast = useCallback((msg: string) => {
     setToast(msg);
     if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
-    toastTimerRef.current = window.setTimeout(() => setToast(null), 3200);
+    const durationMs = msg.startsWith("⚠️") ? 5200 : 3200;
+    toastTimerRef.current = window.setTimeout(() => setToast(null), durationMs);
   }, []);
 
   const showDebouncedHint = useCallback(
@@ -2348,7 +2349,7 @@ export function BrowserView({
             </p>
           </div>
         ) : !state.running ? (
-          <div className="absolute inset-0 bg-slate-950/92 backdrop-blur-sm flex flex-col items-center justify-start sm:justify-center gap-3.5 p-4 sm:p-5 text-center z-30 overflow-y-auto">
+          <div className="absolute inset-0 bg-slate-950/92 backdrop-blur-sm flex flex-col items-center justify-start sm:justify-center gap-3.5 px-4 pb-4 pt-12 sm:px-5 sm:pb-5 sm:pt-6 text-center z-30 overflow-y-auto">
             <div className="h-10 w-10 rounded-2xl border border-slate-800 bg-slate-900 flex items-center justify-center text-sky-400 shrink-0 mt-2 sm:mt-0">
               <RefreshCw className="w-5 h-5" />
             </div>
@@ -2523,7 +2524,7 @@ export function BrowserView({
 
         {/* Floating Toast */}
         {toast && (
-          <div className="pointer-events-none absolute top-3 left-1/2 -translate-x-1/2 z-40 max-w-[92%] truncate rounded-full border border-slate-700 bg-slate-900/95 px-3.5 py-1.5 text-xs text-slate-100 shadow-xl">
+          <div className="pointer-events-none absolute top-2.5 left-1/2 -translate-x-1/2 z-40 max-w-[92%] rounded-2xl border border-slate-700 bg-slate-900/95 px-3.5 py-1.5 text-xs text-slate-100 text-center leading-snug break-words line-clamp-2 shadow-xl">
             {toast}
           </div>
         )}

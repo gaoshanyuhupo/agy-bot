@@ -105,6 +105,25 @@ class _InMemoryVaultClient:
         self.nodes[slug] = base
 
 
+class _FakeAsyncBytesStream:
+    """Minimal async stream mock supporting chunked `.read(n)` for stderr drain tests."""
+
+    def __init__(self, data: bytes = b"") -> None:
+        self._buf = data
+        self._offset = 0
+
+    async def read(self, n: int = -1) -> bytes:
+        if self._offset >= len(self._buf):
+            return b""
+        if n < 0:
+            chunk = self._buf[self._offset :]
+            self._offset = len(self._buf)
+            return chunk
+        chunk = self._buf[self._offset : self._offset + n]
+        self._offset += len(chunk)
+        return chunk
+
+
 class _FakeSubprocess:
     """Offline mock subprocess with process-group termination tracking."""
 
@@ -123,6 +142,8 @@ class _FakeSubprocess:
         self._final_rc = rc
         self._stdout = stdout
         self._stderr = stderr
+        self.stdout = _FakeAsyncBytesStream(stdout) if stdout else None
+        self.stderr = _FakeAsyncBytesStream(stderr)
         self._ev = asyncio.Event()
         if not block_until_terminated:
             self._ev.set()
@@ -1440,6 +1461,358 @@ class TestStudioBrowserControlStage1(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(watch_procs[0].terminated)
         self.assertIn((str(fake_ext_cli), "--profile", "ext-no-bot", "stop"), ext_cmds)
 
+    async def test_external_chromium_direct_live_watch_self_heal_conflict_and_stderr_scrub(self) -> None:
+        """External Chromium launches `live --watch` directly (no start/open), self-heals cdp=disabled, guards Live active, scrubs stderr."""
+        from studio.browser_control_service import _EXT_ATTACH_TIMEOUT_SEC
+
+        self.assertEqual(30.0, _EXT_ATTACH_TIMEOUT_SEC)
+        admin_hdrs, _ = await self._login("admin", PASS_ADMIN)
+
+        fake_ext_cli = self.tmp / "fake_ext_watch_fix.sh"
+        fake_ext_cli.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        os.chmod(fake_ext_cli, 0o700)
+        self.browser_svc._external_cli_override = str(fake_ext_cli)
+
+        # Case 1: Idle container running WITHOUT loopback CDP (cdp=disabled + Live view: inactive)
+        # -> MUST call `status`, then `stop`, then direct `live --watch --url ... --bot ... --user-id ... --no-notify`
+        # -> MUST NEVER call `start`, `open`, or `--wait-human`
+        cmds_case1: list[tuple[str, ...]] = []
+        watch_procs_case1: list[_FakeSubprocess] = []
+
+        async def _exec_case1(*cmd, **kw):
+            self.assertTrue(kw.get("start_new_session"))
+            tcmd = tuple(str(c) for c in cmd)
+            cmds_case1.append(tcmd)
+            if "status" in tcmd:
+                return _FakeSubprocess(
+                    tcmd,
+                    stdout=(
+                        b"Profile:   default (pinned/direct)\n"
+                        b"Live view: inactive\n"
+                        b"Container: sg-goutuizi-browser (running, image=goutuizi-chromium:156, cdp=disabled)\n"
+                    ),
+                )
+            if "stop" in tcmd:
+                return _FakeSubprocess(tcmd, stdout=b"Stopped and removed sg-goutuizi-browser.\n")
+            if "live" in tcmd:
+                self.assertEqual(asyncio.subprocess.PIPE, kw.get("stdout"))
+                self.assertEqual(asyncio.subprocess.STDOUT, kw.get("stderr"))
+                self.mock_hub.running = True
+                self.mock_hub.engine_mode = "sync_external"
+                self.mock_hub.profile = "default"
+                wp = _FakeSubprocess(tcmd, block_until_terminated=True)
+                watch_procs_case1.append(wp)
+                return wp
+            return _FakeSubprocess(tcmd, stdout=b"ok\n")
+
+        self.browser_svc._subprocess_exec = _exec_case1
+        r1 = await self.client.post(
+            "/api/browser/launch",
+            json={
+                "engine": "external_chromium",
+                "profile": "default",
+                "url": "https://example.org/app",
+                "owner_bot": "coord_bot",
+                "manual_launch": True,
+            },
+            headers=admin_hdrs,
+        )
+        self.assertEqual(200, r1.status)
+        self.assertEqual(1, len(watch_procs_case1))
+        self.assertFalse(any("start" in c or "open" in c for c in cmds_case1), f"Forbidden start/open called: {cmds_case1}")
+        self.assertEqual((str(fake_ext_cli), "--profile", "default", "status"), cmds_case1[0])
+        self.assertEqual((str(fake_ext_cli), "--profile", "default", "stop"), cmds_case1[1])
+        live_cmd = cmds_case1[2]
+        self.assertEqual((str(fake_ext_cli), "--profile", "default", "live", "--watch"), live_cmd[:5])
+        self.assertIn("--url", live_cmd)
+        self.assertIn("https://example.org/app", live_cmd)
+        self.assertIn("--bot", live_cmd)
+        self.assertIn("main", live_cmd)
+        self.assertIn("--user-id", live_cmd)
+        self.assertIn(str(ADMIN_UID_A), live_cmd)
+        self.assertIn("--no-notify", live_cmd)
+        self.assertNotIn("--wait-human", live_cmd)
+
+        # Clean up session 1
+        r_stop1 = await self.client.post("/api/browser/stop", json={}, headers=admin_hdrs)
+        self.assertEqual(200, r_stop1.status)
+        self.mock_hub.running = False
+        self.mock_hub.engine_mode = "idle"
+
+        # Case 1b: notify=True & url="about:blank" -> omits --url and --no-notify
+        cmds_case1b: list[tuple[str, ...]] = []
+
+        async def _exec_case1b(*cmd, **kw):
+            tcmd = tuple(str(c) for c in cmd)
+            cmds_case1b.append(tcmd)
+            if "status" in tcmd:
+                return _FakeSubprocess(tcmd, stdout=b"Live view: inactive\nContainer: sg-goutuizi-browser (stopped)\n")
+            if "live" in tcmd:
+                self.mock_hub.running = True
+                self.mock_hub.engine_mode = "sync_external"
+                self.mock_hub.profile = "default"
+                return _FakeSubprocess(tcmd, block_until_terminated=True)
+            return _FakeSubprocess(tcmd, stdout=b"ok\n")
+
+        self.browser_svc._subprocess_exec = _exec_case1b
+        r1b = await self.client.post(
+            "/api/browser/launch",
+            json={
+                "engine": "external_chromium",
+                "profile": "default",
+                "url": "about:blank",
+                "notify": True,
+                "manual_launch": False,
+            },
+            headers=admin_hdrs,
+        )
+        self.assertEqual(200, r1b.status)
+        self.assertFalse(any("stop" in c for c in cmds_case1b), "Stopped container must not invoke redundant stop")
+        live_cmd_1b = [c for c in cmds_case1b if "live" in c][0]
+        self.assertNotIn("--url", live_cmd_1b, "about:blank must not be passed to goutuizi --url")
+        self.assertNotIn("--no-notify", live_cmd_1b, "notify=True must omit --no-notify")
+
+        await self.client.post("/api/browser/stop", json={}, headers=admin_hdrs)
+        self.mock_hub.running = False
+        self.mock_hub.engine_mode = "idle"
+
+        # Case 2: External `status` shows `Live view: active (pid=98765)` -> 409 Conflict, NEVER stop or spawn live
+        cmds_case2: list[tuple[str, ...]] = []
+
+        async def _exec_case2(*cmd, **kw):
+            tcmd = tuple(str(c) for c in cmd)
+            cmds_case2.append(tcmd)
+            if "status" in tcmd:
+                return _FakeSubprocess(
+                    tcmd,
+                    stdout=(
+                        b"Live view: active (pid=98765)\n"
+                        b"Container: sg-goutuizi-browser (running, image=goutuizi-chromium:156, cdp=127.0.0.1:19222)\n"
+                    ),
+                )
+            return _FakeSubprocess(tcmd, stdout=b"ok\n")
+
+        self.browser_svc._subprocess_exec = _exec_case2
+        r2 = await self.client.post(
+            "/api/browser/launch",
+            json={"engine": "external_chromium", "profile": "default", "owner_bot": "dev_worker"},
+            headers=admin_hdrs,
+        )
+        self.assertEqual(409, r2.status)
+        d2 = await r2.json()
+        self.assertIn("Live", d2["error"])
+        self.assertEqual([(str(fake_ext_cli), "--profile", "default", "status")], cmds_case2)
+
+        # Case 3: `watch_proc` exits early with sensitive proxy credentials + host path on stderr
+        # -> returns HTTP 500 (not Cloudflare-swallowed 502), includes scrubbed diagnostic, zero secret leakage in body/audit
+        leaked_stderr = (
+            b"WARN bootstrapping proxy bridge\n"
+            b"ERROR: dial failed via socks5h://alice:SuperSecretProxy99"
+            + b"@"
+            + b"proxy.example.com:1080 "
+            b"using /home/exampleuser/.local/share/chromium-profiles/secret.lock\n"
+        )
+
+        async def _exec_case3(*cmd, **kw):
+            tcmd = tuple(str(c) for c in cmd)
+            if "status" in tcmd:
+                return _FakeSubprocess(tcmd, stdout=b"Live view: inactive\nContainer: sg-goutuizi-browser (stopped)\n")
+            if "live" in tcmd:
+                return _FakeSubprocess(tcmd, rc=1, stderr=leaked_stderr, block_until_terminated=False)
+            return _FakeSubprocess(tcmd, stdout=b"ok\n")
+
+        self.browser_svc._subprocess_exec = _exec_case3
+        r3 = await self.client.post(
+            "/api/browser/launch",
+            json={"engine": "external_chromium", "profile": "default", "owner_bot": "audit_peer"},
+            headers=admin_hdrs,
+        )
+        self.assertEqual(500, r3.status)
+        d3 = await r3.json()
+        self.assertIn("code=1", d3["error"])
+        self.assertIn("dial failed", d3["error"])
+        self.assertIn("socks5h://***" + "@" + "proxy.example.com:1080", d3["error"])
+        self.assertNotIn("SuperSecretProxy99", d3["error"])
+        self.assertNotIn("alice:SuperSecretProxy99", d3["error"])
+        self.assertNotIn("/home/exampleuser", d3["error"])
+
+        audit_lines = [
+            json.loads(ln)
+            for ln in self.browser_audit_path.read_text(encoding="utf-8").splitlines()
+            if ln.strip()
+        ]
+        last_audit = audit_lines[-1]
+        self.assertEqual("browser_launch", last_audit["action"])
+        self.assertFalse(last_audit["ok"])
+        self.assertEqual("audit_peer", last_audit["owner_bot"])
+        self.assertIn("watch_exited_early", last_audit["error"])
+        self.assertNotIn("SuperSecretProxy99", json.dumps(last_audit))
+
+        # Case 4: `live-browser attach-cdp` outputs pretty-printed JSON error to stdout (merged via stdout=PIPE, stderr=STDOUT)
+        # -> extracts clean scrubbed `error` field into both HTTP 500 body and audit log with zero secret/path leak
+        json_payload = json.dumps(
+            {
+                "ok": False,
+                "mode": "watch",
+                "reason": "sync_start_rejected",
+                "status_code": 403,
+                "frames_pushed": 0,
+                "error": (
+                    "同步会话被拒绝: socks5h://bob:JsonSecret42"
+                    + "@"
+                    + "proxy.example.com:1080 "
+                    "Bearer EXAMPLE_JSON_SECRET_TOKEN_999 "
+                    "/home/exampleuser/.local/share/chromium-profiles/session.lock"
+                ),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        merged_stdout = ("WARN bootstrapping external cdp bridge\n" + json_payload + "\n").encode("utf-8")
+
+        async def _exec_case4(*cmd, **kw):
+            tcmd = tuple(str(c) for c in cmd)
+            if "status" in tcmd:
+                return _FakeSubprocess(tcmd, stdout=b"Live view: inactive\nContainer: sg-goutuizi-browser (stopped)\n")
+            if "live" in tcmd:
+                self.assertEqual(asyncio.subprocess.PIPE, kw.get("stdout"))
+                self.assertEqual(asyncio.subprocess.STDOUT, kw.get("stderr"))
+                wp = _FakeSubprocess(tcmd, rc=1, stdout=merged_stdout, block_until_terminated=False)
+                wp.stderr = None  # Mirror real subprocess behavior when stderr=STDOUT
+                return wp
+            return _FakeSubprocess(tcmd, stdout=b"ok\n")
+
+        self.browser_svc._subprocess_exec = _exec_case4
+        r4 = await self.client.post(
+            "/api/browser/launch",
+            json={"engine": "external_chromium", "profile": "default", "owner_bot": "audit_peer"},
+            headers=admin_hdrs,
+        )
+        self.assertEqual(500, r4.status)
+        d4 = await r4.json()
+        self.assertIn("code=1", d4["error"])
+        self.assertIn("同步会话被拒绝", d4["error"])
+        self.assertIn("socks5h://***" + "@" + "proxy.example.com:1080", d4["error"])
+        self.assertIn("[REDACTED]", d4["error"])
+        self.assertNotIn("JsonSecret42", d4["error"])
+        self.assertNotIn("bob:JsonSecret42", d4["error"])
+        self.assertNotIn("EXAMPLE_JSON_SECRET_TOKEN_999", d4["error"])
+        self.assertNotIn("/home/exampleuser", d4["error"])
+        self.assertNotIn('"sync_start_rejected"', d4["error"])
+
+        audit_lines_4 = [
+            json.loads(ln)
+            for ln in self.browser_audit_path.read_text(encoding="utf-8").splitlines()
+            if ln.strip()
+        ]
+        last_audit_4 = audit_lines_4[-1]
+        self.assertEqual("browser_launch", last_audit_4["action"])
+        self.assertFalse(last_audit_4["ok"])
+        self.assertIn("watch_exited_early:同步会话被拒绝", last_audit_4["error"])
+        self.assertNotIn("JsonSecret42", json.dumps(last_audit_4))
+        self.assertNotIn("EXAMPLE_JSON_SECRET_TOKEN_999", json.dumps(last_audit_4))
+        self.assertNotIn("/home/exampleuser", json.dumps(last_audit_4))
+
+    async def test_external_watch_graceful_single_pid_sigterm_and_sigkill_escalation(self) -> None:
+        """Defect A: graceful stop sends single-PID proc.terminate() with 6.0s grace (NEVER killpg SIGTERM), escalating to killpg SIGKILL only on timeout."""
+        import signal
+        from unittest import mock
+
+        from studio.browser_control_service import _EXT_WATCH_STOP_GRACE_SEC, StudioBrowserControlService
+
+        self.assertEqual(6.0, _EXT_WATCH_STOP_GRACE_SEC)
+        self.assertEqual(6.0, self.browser_svc._external_watch_stop_grace)
+
+        # 1. Graceful exit within grace period: single-PID terminate() only, 0 os.killpg calls, default 6.0s timeout
+        class _GracefulWatchProc:
+            def __init__(self, pid: int) -> None:
+                self.pid = pid
+                self.returncode: int | None = None
+                self.terminate_count = 0
+                self.kill_count = 0
+                self._ev = asyncio.Event()
+
+            def terminate(self) -> None:
+                self.terminate_count += 1
+                self.returncode = 143
+                self._ev.set()
+
+            def kill(self) -> None:
+                self.kill_count += 1
+                self.returncode = -9
+                self._ev.set()
+
+            async def wait(self) -> int:
+                await self._ev.wait()
+                return self.returncode if self.returncode is not None else 0
+
+        graceful_proc = _GracefulWatchProc(pid=54321)
+        killpg_calls: list[tuple[int, int]] = []
+        observed_timeouts: list[float] = []
+        orig_wait_for = asyncio.wait_for
+
+        async def _spy_wait_for(aw, timeout=None):
+            if timeout is not None:
+                observed_timeouts.append(float(timeout))
+            return await orig_wait_for(aw, timeout=timeout)
+
+        with (
+            mock.patch("studio.browser_control_service.os.killpg", side_effect=lambda p, s: killpg_calls.append((p, s))),
+            mock.patch("studio.browser_control_service.asyncio.wait_for", side_effect=_spy_wait_for),
+        ):
+            await StudioBrowserControlService._terminate_proc_group(graceful_proc)
+
+        self.assertEqual(1, graceful_proc.terminate_count)
+        self.assertEqual(0, graceful_proc.kill_count)
+        self.assertEqual([], killpg_calls, "Graceful stop MUST NEVER call os.killpg(..., SIGTERM)")
+        self.assertEqual([6.0], observed_timeouts)
+
+        # 2. Stubborn process ignores SIGTERM past grace_sec -> escalates ONLY to os.killpg(pid, SIGKILL) + wait(timeout=1.0)
+        class _StubbornWatchProc:
+            def __init__(self, pid: int) -> None:
+                self.pid = pid
+                self.returncode: int | None = None
+                self.terminate_count = 0
+                self.kill_count = 0
+                self._killed_ev = asyncio.Event()
+
+            def terminate(self) -> None:
+                self.terminate_count += 1
+
+            def kill(self) -> None:
+                self.kill_count += 1
+                self.returncode = -9
+                self._killed_ev.set()
+
+            async def wait(self) -> int:
+                await self._killed_ev.wait()
+                return self.returncode if self.returncode is not None else -9
+
+        stubborn_proc = _StubbornWatchProc(pid=54322)
+        killpg_calls_2: list[tuple[int, int]] = []
+        observed_timeouts_2: list[float] = []
+
+        def _fake_killpg_reap(pid: int, sig: int) -> None:
+            killpg_calls_2.append((pid, sig))
+            if sig == signal.SIGKILL:
+                stubborn_proc.returncode = -9
+                stubborn_proc._killed_ev.set()
+
+        async def _spy_wait_for_2(aw, timeout=None):
+            if timeout is not None:
+                observed_timeouts_2.append(float(timeout))
+            return await orig_wait_for(aw, timeout=timeout)
+
+        with (
+            mock.patch("studio.browser_control_service.os.killpg", side_effect=_fake_killpg_reap),
+            mock.patch("studio.browser_control_service.asyncio.wait_for", side_effect=_spy_wait_for_2),
+        ):
+            await StudioBrowserControlService._terminate_proc_group(stubborn_proc, grace_sec=0.05)
+
+        self.assertEqual(1, stubborn_proc.terminate_count)
+        self.assertEqual([(54322, signal.SIGKILL)], killpg_calls_2)
+        self.assertEqual([0.05, 1.0], observed_timeouts_2)
+
     def test_bm8_stage1_core_files_zero_private_literals(self) -> None:
         """BM8: Stage 1 core modules contain zero hardcoded host paths or private vault prefixes."""
         forbidden_tokens = (
@@ -1627,6 +2000,11 @@ class TestBrowserPortraitCameraAndInvariants(unittest.TestCase):
         self.assertIn("singleTouchRef.current.lastY", pinch_rel_body)
         self.assertIn("stageToRemotePoint(", pinch_rel_body)
         self.assertIn("mapClientToRemote(e.clientX, e.clientY", pinch_rel_body)
+
+        # Toast wrapping & idle top-clearance invariants (prevents overlap over idle icon on mobile)
+        self.assertIn("pt-12 sm:px-5 sm:pb-5 sm:pt-6", src)
+        self.assertIn("rounded-2xl", src)
+        self.assertIn("leading-snug break-words", src)
 
 
 if __name__ == "__main__":

@@ -2095,6 +2095,479 @@ class TestBridgeBrowserPanelAndRbac(unittest.TestCase):
                     self.assertIn("account 标签非法", sent[0][1])
                 ext_cli_mock.assert_not_called()
 
+    def test_external_chromium_bridge_direct_live_watch_self_heal_conflict_and_stderr_scrub(self) -> None:
+        """Bridge _lb_launch_external_chromium: direct live --watch, cdp=disabled self-heal, Live active conflict, scrubbed stderr."""
+        import io
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_dir = Path(tmp) / "live-cfg"
+            cfg_dir.mkdir(parents=True, exist_ok=True)
+            (cfg_dir / "local.token").write_text("ext-watch-tok\n", encoding="utf-8")
+            bridge, _ac = _load_isolated_bridge(tmp, extra_env={"AGY_LIVE_BROWSER_CONFIG_DIR": str(cfg_dir)})
+            bridge.BOT_META.update({"bot_id": 100, "handle": "example_bot", "bot_key": "main", "resolved": True})
+
+            self.assertEqual(30.0, bridge._LB_EXT_ATTACH_TIMEOUT_SEC)
+            self.assertEqual(6.0, bridge._LB_EXT_WATCH_STOP_GRACE_SEC)
+
+            class _FakeWatchPopen:
+                def __init__(self, *, rc=None, stdout_bytes=b"", stderr_bytes=b"") -> None:
+                    self.pid = -1
+                    self.returncode = rc
+                    self.stdout = io.BytesIO(stdout_bytes) if stdout_bytes else None
+                    self.stderr = io.BytesIO(stderr_bytes) if stderr_bytes else None
+
+                def poll(self):
+                    return self.returncode
+
+                def terminate(self):
+                    self.returncode = -15
+
+                def kill(self):
+                    self.returncode = -9
+
+                def wait(self, timeout=None):
+                    return self.returncode if self.returncode is not None else 0
+
+            # 1. Container running with cdp=disabled & Live view: inactive -> stops first, spawns direct `live --watch`
+            #    Inside TG bridge env (AGY_TG_BOT_TOKEN set) -> MUST omit `--bot` to respect live_browser_ctl isolation!
+            cli_calls: list[list[str]] = []
+            popen_cmds: list[list[str]] = []
+            hub_running = {"active": False}
+
+            def _fake_cli_case1(args, timeout_sec=25.0):
+                cli_calls.append(list(args))
+                if args[-1] == "status":
+                    return (
+                        0,
+                        "Profile: default\nLive view: inactive\nContainer: sg-goutuizi-browser (running, image=goutuizi-chromium:156, cdp=disabled)\n",
+                        "",
+                    )
+                if args[-1] == "stop":
+                    return 0, "Stopped.\n", ""
+                return 0, "ok\n", ""
+
+            def _fake_popen_case1(cmd, **kw):
+                self.assertEqual(bridge.subprocess.PIPE, kw.get("stdout"))
+                self.assertEqual(bridge.subprocess.STDOUT, kw.get("stderr"))
+                self.assertTrue(kw.get("start_new_session"))
+                popen_cmds.append(list(cmd))
+                hub_running["active"] = True
+                return _FakeWatchPopen(rc=None, stdout_bytes=b"")
+
+            def _fake_hub_case1(method, path, **_kw):
+                if method == "GET" and path == "/internal/status":
+                    if hub_running["active"]:
+                        return True, {"ok": True, "running": True, "engine_mode": "sync_external"}
+                    return True, {"ok": True, "running": False, "engine_mode": "idle"}
+                return True, {"ok": True}
+
+            with (
+                mock.patch.dict(os.environ, {"AGY_TG_BOT_TOKEN": "123:DUMMY_TOKEN", "AGY_TG_ENV_FILE": ""}, clear=False),
+                mock.patch.object(bridge, "_lb_external_cli", return_value="/usr/local/bin/goutuizi-browser.sh"),
+                mock.patch.object(bridge, "_lb_run_external_cli", side_effect=_fake_cli_case1),
+                mock.patch.object(bridge.subprocess, "Popen", side_effect=_fake_popen_case1),
+                mock.patch.object(bridge, "_live_browser_request", side_effect=_fake_hub_case1),
+            ):
+                ok1, res1 = bridge._lb_launch_external_chromium(
+                    bot_hint="sg",
+                    owner_uid=111,
+                    profile="default",
+                    launch_url="https://example.org",
+                    owner_bot="example_bot",
+                    owner_bot_id=100,
+                    manual_launch=True,
+                )
+                bridge._lb_stop_external_watch(stop_external_profile=False)
+
+            self.assertTrue(ok1, f"Expected launch success, got: {res1}")
+            self.assertEqual([["--profile", "default", "status"], ["--profile", "default", "stop"]], cli_calls)
+            self.assertEqual(1, len(popen_cmds))
+            cmd1 = popen_cmds[0]
+            self.assertEqual(["/usr/local/bin/goutuizi-browser.sh", "--profile", "default", "live", "--watch"], cmd1[:5])
+            self.assertIn("--url", cmd1)
+            self.assertIn("https://example.org", cmd1)
+            self.assertIn("--user-id", cmd1)
+            self.assertIn("111", cmd1)
+            self.assertNotIn("--bot", cmd1, "Must omit --bot when AGY_TG_BOT_TOKEN is set")
+            self.assertNotIn("--wait-human", cmd1)
+            self.assertFalse(any("start" in c or "open" in c for c in cli_calls))
+
+            # 2. Without AGY_TG_BOT_TOKEN / AGY_TG_ENV_FILE -> passes `--bot <bot_hint>`
+            popen_cmds.clear()
+            hub_running["active"] = False
+            with (
+                mock.patch.dict(os.environ, {"AGY_TG_BOT_TOKEN": "", "AGY_TG_ENV_FILE": ""}, clear=False),
+                mock.patch.object(bridge, "_lb_external_cli", return_value="/usr/local/bin/goutuizi-browser.sh"),
+                mock.patch.object(
+                    bridge,
+                    "_lb_run_external_cli",
+                    return_value=(0, "Live view: inactive\nContainer: sg-goutuizi-browser (stopped)\n", ""),
+                ),
+                mock.patch.object(bridge.subprocess, "Popen", side_effect=_fake_popen_case1),
+                mock.patch.object(bridge, "_live_browser_request", side_effect=_fake_hub_case1),
+            ):
+                ok2, _res2 = bridge._lb_launch_external_chromium(
+                    bot_hint="sg",
+                    owner_uid=111,
+                    profile="default",
+                    launch_url="about:blank",
+                    owner_bot="example_bot",
+                    owner_bot_id=100,
+                    manual_launch=False,
+                )
+                bridge._lb_stop_external_watch(stop_external_profile=False)
+            self.assertTrue(ok2)
+            self.assertIn("--bot", popen_cmds[0])
+            self.assertIn("sg", popen_cmds[0])
+            self.assertNotIn("--url", popen_cmds[0], "about:blank must not be passed to --url")
+
+            # 3. `Live view: active` -> rejects without calling stop or Popen
+            cli_calls_3: list[list[str]] = []
+
+            def _fake_cli_case3(args, timeout_sec=25.0):
+                cli_calls_3.append(list(args))
+                return (
+                    0,
+                    "Live view: active (pid=5555)\nContainer: sg-goutuizi-browser (running, cdp=127.0.0.1:19222)\n",
+                    "",
+                )
+
+            with (
+                mock.patch.object(bridge, "_lb_external_cli", return_value="/usr/local/bin/goutuizi-browser.sh"),
+                mock.patch.object(bridge, "_lb_run_external_cli", side_effect=_fake_cli_case3),
+                mock.patch.object(bridge.subprocess, "Popen") as popen_mock_3,
+                mock.patch.object(bridge, "_live_browser_request", return_value=(True, {"ok": True, "running": False})),
+            ):
+                ok3, err3 = bridge._lb_launch_external_chromium(
+                    bot_hint="sg",
+                    owner_uid=111,
+                    profile="default",
+                )
+            self.assertFalse(ok3)
+            self.assertIn("Live", err3)
+            self.assertEqual([["--profile", "default", "status"]], cli_calls_3)
+            popen_mock_3.assert_not_called()
+
+            # 4. Early exit with proxy credentials in stderr -> returns scrubbed error message without leaking password
+            leaked_err = (
+                b"ERROR: failed via socks5h://bob:TopSecret88"
+                + b"@"
+                + b"proxy.example.com:1080 at /home/exampleuser/lock\n"
+            )
+            with (
+                mock.patch.object(bridge, "_lb_external_cli", return_value="/usr/local/bin/goutuizi-browser.sh"),
+                mock.patch.object(
+                    bridge,
+                    "_lb_run_external_cli",
+                    return_value=(0, "Live view: inactive\nContainer: sg-goutuizi-browser (stopped)\n", ""),
+                ),
+                mock.patch.object(
+                    bridge.subprocess,
+                    "Popen",
+                    return_value=_FakeWatchPopen(rc=1, stderr_bytes=leaked_err),
+                ),
+                mock.patch.object(bridge, "_live_browser_request", return_value=(True, {"ok": True, "running": False})),
+            ):
+                ok4, err4 = bridge._lb_launch_external_chromium(
+                    bot_hint="sg",
+                    owner_uid=111,
+                    profile="default",
+                )
+            self.assertFalse(ok4)
+            self.assertIn("code=1", err4)
+            self.assertIn("socks5h://***" + "@" + "proxy.example.com:1080", err4)
+            self.assertNotIn("TopSecret88", err4)
+            self.assertNotIn("bob:TopSecret88", err4)
+            self.assertNotIn("/home/exampleuser", err4)
+
+            # 5. Early exit with pretty-printed JSON error on stdout (stderr=None, merged via stdout=PIPE, stderr=STDOUT)
+            #    -> extracts clean scrubbed `error` field without leaking proxy creds, Bearer token, or host paths
+            json_err_payload = json.dumps(
+                {
+                    "ok": False,
+                    "mode": "watch",
+                    "reason": "sync_start_rejected",
+                    "status_code": 403,
+                    "frames_pushed": 0,
+                    "error": (
+                        "同步被拒绝: socks5h://alice:BridgeJsonPass77"
+                        + "@"
+                        + "proxy.example.com:1080 "
+                        "Bearer EXAMPLE_BRIDGE_JSON_TOKEN_555 "
+                        "/home/exampleuser/.config/live-browser/state.lock"
+                    ),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            merged_stdout_bytes = ("INFO attach-cdp starting\n" + json_err_payload + "\n").encode("utf-8")
+            seen_popen_kwargs: list[dict] = []
+
+            def _fake_popen_case5(cmd, **kw):
+                seen_popen_kwargs.append(dict(kw))
+                return _FakeWatchPopen(rc=1, stdout_bytes=merged_stdout_bytes, stderr_bytes=b"")
+
+            with (
+                mock.patch.object(bridge, "_lb_external_cli", return_value="/usr/local/bin/goutuizi-browser.sh"),
+                mock.patch.object(
+                    bridge,
+                    "_lb_run_external_cli",
+                    return_value=(0, "Live view: inactive\nContainer: sg-goutuizi-browser (stopped)\n", ""),
+                ),
+                mock.patch.object(bridge.subprocess, "Popen", side_effect=_fake_popen_case5),
+                mock.patch.object(bridge, "_live_browser_request", return_value=(True, {"ok": True, "running": False})),
+            ):
+                ok5, err5 = bridge._lb_launch_external_chromium(
+                    bot_hint="sg",
+                    owner_uid=111,
+                    profile="default",
+                )
+            self.assertFalse(ok5)
+            self.assertEqual(1, len(seen_popen_kwargs))
+            self.assertEqual(bridge.subprocess.PIPE, seen_popen_kwargs[0].get("stdout"))
+            self.assertEqual(bridge.subprocess.STDOUT, seen_popen_kwargs[0].get("stderr"))
+            self.assertIn("code=1", err5)
+            self.assertIn("同步被拒绝", err5)
+            self.assertIn("socks5h://***" + "@" + "proxy.example.com:1080", err5)
+            self.assertIn("[REDACTED]", err5)
+            self.assertNotIn("BridgeJsonPass77", err5)
+            self.assertNotIn("alice:BridgeJsonPass77", err5)
+            self.assertNotIn("EXAMPLE_BRIDGE_JSON_TOKEN_555", err5)
+            self.assertNotIn("/home/exampleuser", err5)
+            self.assertNotIn('"sync_start_rejected"', err5)
+
+    def test_round2_real_external_cli_scrub_empty_stderr_and_launch_url_defense_in_depth(self) -> None:
+        """Round 2 P1-1/P1-2 + Follow-up #1: real _lb_run_external_cli scrubbing, launch_url entry guard, SIGKILL wait."""
+        import signal
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_dir = Path(tmp) / "live-cfg"
+            cfg_dir.mkdir(parents=True, exist_ok=True)
+            (cfg_dir / "local.token").write_text("r2-ext-tok\n", encoding="utf-8")
+            bridge, _ac = _load_isolated_bridge(tmp, extra_env={"AGY_LIVE_BROWSER_CONFIG_DIR": str(cfg_dir)})
+            bridge.BOT_META.update({"bot_id": 100, "handle": "example_bot", "bot_key": "main", "resolved": True})
+
+            # 1. _lb_scrub_external_text: empty/whitespace/ctrl strictly returns "" (never "direct")
+            self.assertEqual("", bridge._lb_scrub_external_text(""))
+            self.assertEqual("", bridge._lb_scrub_external_text("   \n\t  "))
+            self.assertEqual("", bridge._lb_scrub_external_text("\x00\x01\r\n"))
+
+            class _FakeCliPopen:
+                def __init__(self, rc: int, out_s: str = "", err_s: str = "") -> None:
+                    self.pid = 43210
+                    self.returncode = rc
+                    self._out = out_s
+                    self._err = err_s
+                    self.stdout = None
+                    self.stderr = None
+
+                def communicate(self, timeout=None):
+                    return self._out, self._err
+
+                def poll(self):
+                    return self.returncode
+
+            # 2. Real _lb_run_external_cli (only subprocess.Popen mocked):
+            #    - non-zero exit with stderr="" returns "" (NEVER "direct")
+            #    - stderr with host path + proxy creds + Bearer token is completely scrubbed
+            raw_proxy = "socks5h://bob:ProxyPass99" + "@" + "proxy.example.com:1080"
+            raw_bearer = "Bearer " + "EXAMPLE_SECRET_TOKEN_123456"
+            dirty_err = f"ERR at /home/exampleuser/lock via {raw_proxy}\nAuthorization: {raw_bearer}\x07"
+            with (
+                mock.patch.object(bridge, "_lb_external_cli", return_value="/usr/local/bin/goutuizi-browser.sh"),
+                mock.patch.object(
+                    bridge.subprocess,
+                    "Popen",
+                    side_effect=[
+                        _FakeCliPopen(rc=1, out_s="", err_s=""),
+                        _FakeCliPopen(rc=1, out_s="", err_s="   \n"),
+                        _FakeCliPopen(rc=2, out_s="", err_s=dirty_err),
+                    ],
+                ),
+            ):
+                rc_empty, _out_e, err_empty = bridge._lb_run_external_cli(["--profile", "default", "stop"])
+                rc_ws, _out_w, err_ws = bridge._lb_run_external_cli(["--profile", "default", "stop"])
+                rc_dirty, _out_d, err_dirty = bridge._lb_run_external_cli(["--profile", "default", "stop"])
+
+            self.assertEqual(1, rc_empty)
+            self.assertEqual("", err_empty)
+            self.assertEqual(1, rc_ws)
+            self.assertEqual("", err_ws)
+            self.assertEqual(2, rc_dirty)
+            self.assertIn("[REDACTED]", err_dirty)
+            self.assertIn("socks5h://***" + "@" + "proxy.example.com:1080", err_dirty)
+            self.assertNotIn("/home/exampleuser", err_dirty)
+            self.assertNotIn("ProxyPass99", err_dirty)
+            self.assertNotIn("EXAMPLE_SECRET_TOKEN_123456", err_dirty)
+            self.assertNotIn("\n", err_dirty)
+            self.assertNotIn("\x07", err_dirty)
+
+            # 3. Real _lb_launch_external_chromium + real _lb_run_external_cli:
+            #    self-heal `stop` fails with empty stderr -> falls back to scrubbed out_stop or `stop exited <rc>`
+            idle_nocdp_status = (
+                "Profile: default\nLive view: inactive\n"
+                "Container: sg-goutuizi-browser (running, image=goutuizi-chromium:156, cdp=disabled)\n"
+            )
+            out_proxy = "http" + "://u1:OutPass77" + "@" + "proxy.example.com:8080"
+            out_bearer = "Bearer " + "EXAMPLE_OUT_TOKEN_987654"
+            dirty_out = f"stop failed at /home/exampleuser/cdp.sock via {out_proxy} {out_bearer}\n"
+
+            with (
+                mock.patch.object(bridge, "_lb_external_cli", return_value="/usr/local/bin/goutuizi-browser.sh"),
+                mock.patch.object(bridge, "_live_browser_request", return_value=(True, {"ok": True, "running": False})),
+                mock.patch.object(
+                    bridge.subprocess,
+                    "Popen",
+                    side_effect=[
+                        _FakeCliPopen(rc=0, out_s=idle_nocdp_status, err_s=""),
+                        _FakeCliPopen(rc=2, out_s=dirty_out, err_s=""),
+                        _FakeCliPopen(rc=0, out_s=idle_nocdp_status, err_s=""),
+                        _FakeCliPopen(rc=3, out_s="   ", err_s=""),
+                    ],
+                ),
+            ):
+                ok_a, err_a = bridge._lb_launch_external_chromium(
+                    bot_hint="sg",
+                    owner_uid=111,
+                    profile="default",
+                )
+                ok_b, err_b = bridge._lb_launch_external_chromium(
+                    bot_hint="sg",
+                    owner_uid=111,
+                    profile="default",
+                )
+
+            self.assertFalse(ok_a)
+            self.assertIn("回收无 CDP 闲置容器失败", err_a)
+            self.assertNotIn("direct", err_a)
+            self.assertNotIn("/home/exampleuser", err_a)
+            self.assertNotIn("OutPass77", err_a)
+            self.assertNotIn("EXAMPLE_OUT_TOKEN_987654", err_a)
+            self.assertIn("http://***" + "@" + "proxy.example.com:8080", err_a)
+            self.assertIn("Bearer [REDACTED]", err_a)
+
+            self.assertFalse(ok_b)
+            self.assertIn("stop exited 3", err_b)
+            self.assertNotIn("direct", err_b)
+
+            # 4. Defense-in-depth: _lb_launch_external_chromium rejects illegal launch_url at entry with 0 subprocess calls
+            for bad_url in (
+                "--wait-human",
+                "javascript:alert(1)",
+                "https://example.com/a\nb",
+                "https://example.com/\x00bad",
+            ):
+                with (
+                    mock.patch.object(bridge, "_lb_external_cli", return_value="/usr/local/bin/goutuizi-browser.sh"),
+                    mock.patch.object(bridge, "_live_browser_request") as hub_mock,
+                    mock.patch.object(bridge, "_lb_run_external_cli") as cli_mock,
+                    mock.patch.object(bridge.subprocess, "Popen") as popen_mock,
+                ):
+                    ok_u, err_u = bridge._lb_launch_external_chromium(
+                        bot_hint="sg",
+                        owner_uid=111,
+                        profile="default",
+                        launch_url=bad_url,
+                    )
+                self.assertFalse(ok_u, f"Expected launch_url={bad_url!r} to be rejected")
+                self.assertTrue(bool(err_u))
+                hub_mock.assert_not_called()
+                cli_mock.assert_not_called()
+                popen_mock.assert_not_called()
+
+            # 5. Defect A: _lb_stop_external_watch sends single-PID proc.terminate() + 6.0s grace (NEVER killpg SIGTERM),
+            #    and escalates to os.killpg(pid, SIGKILL) + proc.wait(timeout=1.0) ONLY when grace period expires
+            self.assertEqual(6.0, bridge._LB_EXT_WATCH_STOP_GRACE_SEC)
+
+            class _FakeGracefulWatchPopen:
+                def __init__(self) -> None:
+                    self.pid = 43298
+                    self.returncode = None
+                    self.stdout = None
+                    self.stderr = None
+                    self.terminate_count = 0
+                    self.kill_count = 0
+                    self.wait_timeouts: list[float] = []
+
+                def poll(self):
+                    return self.returncode
+
+                def terminate(self):
+                    self.terminate_count += 1
+
+                def kill(self):
+                    self.kill_count += 1
+
+                def wait(self, timeout=None):
+                    self.wait_timeouts.append(float(timeout or 0.0))
+                    self.returncode = 143
+                    return 143
+
+            graceful = _FakeGracefulWatchPopen()
+            graceful_killpg: list[tuple[int, int]] = []
+            with bridge._lb_ext_lock:
+                bridge._lb_ext_watch_proc = graceful
+                bridge._lb_ext_watch_meta = {"profile": "default"}
+                bridge._lb_ext_watch_stderr_thread = None
+            with mock.patch.object(
+                bridge.os,
+                "killpg",
+                side_effect=lambda pid, sig: graceful_killpg.append((pid, sig)),
+            ):
+                stopped_graceful = bridge._lb_stop_external_watch(stop_external_profile=False)
+            self.assertTrue(stopped_graceful)
+            self.assertEqual(1, graceful.terminate_count)
+            self.assertEqual(0, graceful.kill_count)
+            self.assertEqual([], graceful_killpg, "Graceful stop MUST NEVER call os.killpg(..., SIGTERM)")
+            self.assertEqual([6.0], graceful.wait_timeouts)
+
+            class _FakeStubbornWatchPopen:
+                def __init__(self, second_exc=None) -> None:
+                    self.pid = 43299
+                    self.returncode = None
+                    self.stdout = None
+                    self.stderr = None
+                    self.terminate_count = 0
+                    self.wait_timeouts: list[float] = []
+                    self._second_exc = second_exc
+
+                def poll(self):
+                    return self.returncode
+
+                def wait(self, timeout=None):
+                    self.wait_timeouts.append(float(timeout or 0.0))
+                    if len(self.wait_timeouts) == 1:
+                        raise subprocess.TimeoutExpired(cmd=["watch"], timeout=timeout or 6.0)
+                    if self._second_exc is not None:
+                        raise self._second_exc
+                    self.returncode = -9
+                    return -9
+
+                def terminate(self):
+                    self.terminate_count += 1
+
+                def kill(self):
+                    pass
+
+            for second_exc in (None, subprocess.TimeoutExpired(cmd=["watch"], timeout=1.0), OSError("already reaped")):
+                stubborn = _FakeStubbornWatchPopen(second_exc=second_exc)
+                killpg_sigs: list[tuple[int, int]] = []
+                with bridge._lb_ext_lock:
+                    bridge._lb_ext_watch_proc = stubborn
+                    bridge._lb_ext_watch_meta = {"profile": "default"}
+                    bridge._lb_ext_watch_stderr_thread = None
+                with mock.patch.object(
+                    bridge.os,
+                    "killpg",
+                    side_effect=lambda pid, sig: killpg_sigs.append((pid, sig)),
+                ):
+                    stopped = bridge._lb_stop_external_watch(stop_external_profile=False)
+                self.assertTrue(stopped)
+                self.assertEqual(1, stubborn.terminate_count)
+                self.assertEqual([(43299, signal.SIGKILL)], killpg_sigs)
+                self.assertEqual([6.0, 1.0], stubborn.wait_timeouts)
+
 
 if __name__ == "__main__":
     unittest.main()

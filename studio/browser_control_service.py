@@ -28,6 +28,7 @@ Provides:
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import datetime
 import fcntl
 import json
@@ -67,6 +68,7 @@ DEFAULT_EXTERNAL_LABEL = "External Chromium"
 
 _VALID_ENGINES = frozenset({"camoufox", "external_chromium"})
 _PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_BOT_FLAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]{0,31}$")
 _TZ_RE = re.compile(r"^[A-Za-z0-9_/+.-]{1,64}$")
 _LANG_RE = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8}){0,2}$")
 _WINDOW_RE = re.compile(r"^[1-9][0-9]{2,3}[xX,][1-9][0-9]{2,3}$")
@@ -174,7 +176,40 @@ _ALLOWED_TAKEOVER_KEYS = frozenset(
 _MAX_HANDBACK_LEN = 2000
 _HUB_HTTP_TIMEOUT_SEC = 12.0
 _EXT_CLI_TIMEOUT_SEC = 25.0
-_EXT_ATTACH_TIMEOUT_SEC = 8.0
+_EXT_ATTACH_TIMEOUT_SEC = 30.0
+_EXT_WATCH_STOP_GRACE_SEC = 6.0
+_EXT_STDERR_MAX_LINES = 40
+
+
+def _parse_external_status_output(status_text: str) -> dict[str, bool]:
+    """Parse `external_chromium --profile <p> status` output for live view & CDP state."""
+    live_active = False
+    live_inactive = False
+    container_running = False
+    cdp_disabled = False
+    for raw_line in (status_text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        low = line.lower()
+        if low.startswith("live view:"):
+            val = low.split(":", 1)[1].strip()
+            if val == "inactive" or val.startswith(("inactive ", "inactive(")):
+                live_inactive = True
+            elif val == "active" or val.startswith(("active ", "active(")):
+                live_active = True
+        elif low.startswith("container:"):
+            val = low.split(":", 1)[1].strip()
+            if "(running" in val or " running," in val or " running)" in val:
+                container_running = True
+            if "cdp=disabled" in val:
+                cdp_disabled = True
+    return {
+        "live_active": live_active,
+        "live_inactive": live_inactive,
+        "container_running": container_running,
+        "cdp_disabled": cdp_disabled,
+    }
 
 
 def _utc_iso_now() -> str:
@@ -435,6 +470,7 @@ class StudioBrowserControlService:
         subprocess_exec: Callable[..., Awaitable[Any]] | None = None,
         external_attach_timeout: float = _EXT_ATTACH_TIMEOUT_SEC,
         external_attach_poll_interval: float = 0.2,
+        external_watch_stop_grace: float = _EXT_WATCH_STOP_GRACE_SEC,
     ) -> None:
         self.auth_mgr = auth_mgr
         self.data_sources = data_sources
@@ -444,6 +480,7 @@ class StudioBrowserControlService:
         self._subprocess_exec = subprocess_exec or asyncio.create_subprocess_exec
         self._external_attach_timeout = float(external_attach_timeout)
         self._external_attach_poll_interval = max(0.02, float(external_attach_poll_interval))
+        self._external_watch_stop_grace = max(0.01, float(external_watch_stop_grace))
 
         default_audit = Path(
             os.environ.get(
@@ -461,6 +498,8 @@ class StudioBrowserControlService:
         self._ext_lock = asyncio.Lock()
         self._ext_watch_proc: Any | None = None
         self._ext_watch_meta: dict[str, Any] = {}
+        self._ext_watch_stderr_buf: deque[str] = deque(maxlen=_EXT_STDERR_MAX_LINES)
+        self._ext_watch_stderr_task: asyncio.Task[None] | None = None
         self._transient_procs: set[Any] = set()
 
         if self.egress_pool is not None:
@@ -495,35 +534,29 @@ class StudioBrowserControlService:
 
     # ------------------------------------------------------------------ Process-Group Management
     @staticmethod
-    async def _terminate_proc_group(proc: Any) -> None:
+    async def _terminate_proc_group(proc: Any, *, grace_sec: float = _EXT_WATCH_STOP_GRACE_SEC) -> None:
         if proc is None or getattr(proc, "returncode", None) is not None:
             return
-        pid = getattr(proc, "pid", None)
-        if isinstance(pid, int) and pid > 0:
-            try:
-                os.killpg(pid, signal.SIGTERM)
-            except ProcessLookupError:
-                return
-            except Exception:
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
-        else:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
+        # Send single-PID SIGTERM first (NEVER os.killpg(..., SIGTERM)) so child drivers
+        # such as Playwright's internal Node driver stay alive while the wrapper/bridge
+        # flushes /internal/sync/stop cleanly.
         try:
-            await asyncio.wait_for(proc.wait(), timeout=2.0)
+            proc.terminate()
+        except ProcessLookupError:
             return
         except Exception:
             pass
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=grace_sec)
+            return
+        except Exception:
+            pass
+        pid = getattr(proc, "pid", None)
         if isinstance(pid, int) and pid > 0:
             try:
                 os.killpg(pid, signal.SIGKILL)
             except ProcessLookupError:
-                return
+                pass
             except Exception:
                 try:
                     proc.kill()
@@ -539,6 +572,89 @@ class StudioBrowserControlService:
         except Exception:
             pass
 
+    @staticmethod
+    async def _drain_stream_lines(stream: Any, buf: deque[str]) -> None:
+        """Continuously drain merged child stdout/stderr into a bounded ring buffer without blocking PIPE."""
+        if stream is None:
+            return
+        read_fn = getattr(stream, "read", None)
+        if not callable(read_fn):
+            return
+        pending = ""
+        try:
+            while True:
+                chunk = await read_fn(4096)
+                if not chunk:
+                    break
+                if isinstance(chunk, (bytes, bytearray)):
+                    text = chunk.decode("utf-8", errors="ignore")
+                else:
+                    text = str(chunk)
+                combined = pending + text
+                if "\n" in combined or "\r" in combined:
+                    parts = re.split(r"[\r\n]+", combined)
+                    pending = parts.pop()
+                    for part in parts:
+                        line = part.strip()
+                        if line:
+                            buf.append(line[:512])
+                else:
+                    pending = combined[-1024:]
+            tail = pending.strip()
+            if tail:
+                buf.append(tail[:512])
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+
+    @staticmethod
+    def _extract_json_error(lines: list[str]) -> str | None:
+        """Extract non-empty string `error` field if merged watch output contains a JSON dict."""
+        for line in reversed(lines):
+            if line.startswith("{") and line.endswith("}"):
+                try:
+                    parsed = json.loads(line)
+                except Exception:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    err_val = parsed.get("error")
+                    if isinstance(err_val, str) and err_val.strip():
+                        return err_val.strip()
+        joined = "\n".join(lines)
+        end = joined.rfind("}")
+        end_attempts = 0
+        while end != -1 and end_attempts < 4:
+            end_attempts += 1
+            pos = joined.rfind("{", 0, end)
+            start_attempts = 0
+            while pos != -1 and start_attempts < 16:
+                start_attempts += 1
+                try:
+                    parsed = json.loads(joined[pos : end + 1])
+                except Exception:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    err_val = parsed.get("error")
+                    if isinstance(err_val, str) and err_val.strip():
+                        return err_val.strip()
+                pos = joined.rfind("{", 0, pos)
+            end = joined.rfind("}", 0, end)
+        return None
+
+    @classmethod
+    def _format_stderr_tail(cls, buf: deque[str], *, max_lines: int = 3, max_len: int = 240) -> str:
+        lines = [line for line in list(buf) if line]
+        if not lines:
+            return ""
+        json_err = cls._extract_json_error(lines)
+        if json_err:
+            scrubbed = _scrub_egress_text(json_err, max_len=max_len)
+            if scrubbed:
+                return scrubbed
+        tail = lines[-max_lines:]
+        return _scrub_egress_text(" | ".join(tail), max_len=max_len)
+
     def _is_external_watch_active(self, profile: str | None = None) -> bool:
         proc = self._ext_watch_proc
         if proc is None or getattr(proc, "returncode", None) is not None:
@@ -551,11 +667,22 @@ class StudioBrowserControlService:
         async with self._ext_lock:
             proc = self._ext_watch_proc
             meta = dict(self._ext_watch_meta)
+            stderr_task = self._ext_watch_stderr_task
             self._ext_watch_proc = None
             self._ext_watch_meta = {}
+            self._ext_watch_stderr_task = None
+            self._ext_watch_stderr_buf.clear()
+        if proc is not None:
+            await self._terminate_proc_group(proc, grace_sec=self._external_watch_stop_grace)
+        if stderr_task is not None:
+            if not stderr_task.done():
+                stderr_task.cancel()
+            try:
+                await asyncio.wait_for(stderr_task, timeout=1.0)
+            except (asyncio.CancelledError, Exception):
+                pass
         if proc is None:
             return False
-        await self._terminate_proc_group(proc)
         if stop_external_profile:
             prof = str(meta.get("profile") or "").strip()
             if prof and self.external_available():
@@ -1692,6 +1819,7 @@ class StudioBrowserControlService:
             owner_bot_id=owner_bot_id,
             manual_launch=manual_launch,
             restart=restart,
+            notify=bool(body.get("notify", False)),
         )
 
     async def _launch_external_chromium(
@@ -1705,6 +1833,7 @@ class StudioBrowserControlService:
         owner_bot_id: int | None,
         manual_launch: bool,
         restart: bool,
+        notify: bool = False,
     ) -> web.Response:
         cli = self._resolve_external_cli()
         if not cli:
@@ -1714,14 +1843,15 @@ class StudioBrowserControlService:
             )
 
         hub_st = await self._fetch_hub_status(http_session, sess)
-        if hub_st.get("running"):
+        local_watch_active = self._is_external_watch_active()
+        if hub_st.get("running") or local_watch_active:
             if not restart:
                 return web.json_response(
                     {"ok": False, "source": "studio_api", "error": "已有活跃浏览器会话，请先停止或传入 restart=true"},
                     status=409,
                 )
             await self._stop_external_watch()
-            if hub_st.get("engine_mode") == "async_hosted":
+            if hub_st.get("running") and hub_st.get("engine_mode") == "async_hosted":
                 await self._hub_request(
                     http_session,
                     "POST",
@@ -1741,39 +1871,110 @@ class StudioBrowserControlService:
                 status=404,
             )
 
-        # 1. Start / open URL in the selected external profile
-        start_args = ["--profile", profile, "open", launch_url] if launch_url else ["--profile", profile, "start"]
+        # 1. Inspect external profile status: reject active external live bridge (409),
+        #    and safely self-heal idle containers started without a loopback CDP port.
         try:
-            rc_start, out_s, err_s = await self._run_external_cli(start_args)
+            rc_st, out_st, _err_st = await self._run_external_cli(
+                ["--profile", profile, "status"],
+                timeout_sec=15.0,
+            )
         except Exception as exc:
-            err_msg = _scrub_egress_text(exc)
-            self.audit.record(action="browser_launch", ok=False, sess=sess, engine="external_chromium", profile=profile, error=err_msg)
-            return web.json_response({"ok": False, "source": "upstream", "error": err_msg}, status=502)
-        if rc_start != 0:
-            err_msg = err_s or _scrub_egress_text(out_s, max_len=240) or f"start exited {rc_start}"
-            self.audit.record(action="browser_launch", ok=False, sess=sess, engine="external_chromium", profile=profile, error=err_msg)
-            return web.json_response({"ok": False, "source": "upstream", "error": err_msg}, status=502)
+            log.warning("External chromium status probe failed for %s: %s", profile, type(exc).__name__)
+            rc_st, out_st = -1, ""
 
-        # 2. Spawn managed `--watch` bridge in isolated process group (NEVER `--wait-human`!)
+        if rc_st == 0:
+            st_flags = _parse_external_status_output(out_st)
+            if st_flags["live_active"]:
+                err_msg = f"外部 Chromium Profile '{profile}' 已有活跃的 Live 直播桥在运行，请先停止后再试"
+                self.audit.record(
+                    action="browser_launch",
+                    ok=False,
+                    sess=sess,
+                    engine="external_chromium",
+                    profile=profile,
+                    owner_bot=owner_bot or "",
+                    error="external_live_active",
+                )
+                return web.json_response({"ok": False, "source": "studio_api", "error": err_msg}, status=409)
+            if st_flags["container_running"] and st_flags["cdp_disabled"] and st_flags["live_inactive"]:
+                try:
+                    rc_stop, out_stop, err_stop = await self._run_external_cli(
+                        ["--profile", profile, "stop"],
+                        timeout_sec=20.0,
+                    )
+                except Exception as exc:
+                    err_msg = f"回收无 CDP 闲置容器失败: {_scrub_egress_text(exc)}"
+                    self.audit.record(
+                        action="browser_launch",
+                        ok=False,
+                        sess=sess,
+                        engine="external_chromium",
+                        profile=profile,
+                        owner_bot=owner_bot or "",
+                        error=err_msg,
+                    )
+                    return web.json_response({"ok": False, "source": "upstream", "error": err_msg}, status=500)
+                if rc_stop != 0:
+                    detail = err_stop or _scrub_egress_text(out_stop, max_len=240) or f"stop exited {rc_stop}"
+                    err_msg = f"回收无 CDP 闲置容器失败: {detail}"
+                    self.audit.record(
+                        action="browser_launch",
+                        ok=False,
+                        sess=sess,
+                        engine="external_chromium",
+                        profile=profile,
+                        owner_bot=owner_bot or "",
+                        error=err_msg,
+                    )
+                    return web.json_response({"ok": False, "source": "upstream", "error": err_msg}, status=500)
+
+        # 2. Spawn managed `live --watch` bridge directly in an isolated process group (NEVER `--wait-human`!)
         await self._stop_external_watch()
-        watch_cmd = [cli, "--profile", profile, "live", "--watch"]
+        watch_cmd: list[str] = [cli, "--profile", profile, "live", "--watch"]
+        if launch_url and launch_url.lower() != "about:blank":
+            watch_cmd.extend(["--url", launch_url])
+        sess_bot = str(sess.get("bot") or "").strip()
+        if _BOT_FLAG_RE.fullmatch(sess_bot):
+            watch_cmd.extend(["--bot", sess_bot])
+        sess_uid = sess.get("user_id")
+        if isinstance(sess_uid, int) and not isinstance(sess_uid, bool) and sess_uid > 0:
+            watch_cmd.extend(["--user-id", str(sess_uid)])
+        if not notify:
+            watch_cmd.append("--no-notify")
+
         try:
             watch_proc = await self._subprocess_exec(
                 *watch_cmd,
                 stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
                 start_new_session=True,
             )
         except Exception as exc:
             err_msg = _scrub_egress_text(exc)
-            self.audit.record(action="browser_launch", ok=False, sess=sess, engine="external_chromium", profile=profile, error=err_msg)
-            return web.json_response({"ok": False, "source": "upstream", "error": err_msg}, status=502)
+            self.audit.record(
+                action="browser_launch",
+                ok=False,
+                sess=sess,
+                engine="external_chromium",
+                profile=profile,
+                owner_bot=owner_bot or "",
+                error=err_msg,
+            )
+            return web.json_response({"ok": False, "source": "upstream", "error": err_msg}, status=500)
+
+        stderr_buf: deque[str] = deque(maxlen=_EXT_STDERR_MAX_LINES)
+        stderr_task: asyncio.Task[None] | None = None
+        proc_stream = getattr(watch_proc, "stdout", None) or getattr(watch_proc, "stderr", None)
+        if proc_stream is not None and callable(getattr(proc_stream, "read", None)):
+            stderr_task = asyncio.create_task(self._drain_stream_lines(proc_stream, stderr_buf))
 
         egress_ref = str(prof_info.get("proxy_bao_ref") or prof_info.get("bao_ref") or "")
         egress_display = _scrub_egress_text(prof_info.get("egress") or prof_info.get("egress_display") or "direct", max_len=128)
         async with self._ext_lock:
             self._ext_watch_proc = watch_proc
+            self._ext_watch_stderr_buf = stderr_buf
+            self._ext_watch_stderr_task = stderr_task
             self._ext_watch_meta = {
                 "profile": profile,
                 "owner_bot": owner_bot,
@@ -1789,11 +1990,32 @@ class StudioBrowserControlService:
         latest_st: dict[str, Any] = {}
         while time.monotonic() < deadline:
             if getattr(watch_proc, "returncode", None) is not None:
+                if stderr_task is not None and not stderr_task.done():
+                    try:
+                        await asyncio.wait_for(asyncio.shield(stderr_task), timeout=0.3)
+                    except Exception:
+                        pass
+                diag = self._format_stderr_tail(stderr_buf)
+                exit_rc = watch_proc.returncode
                 await self._stop_external_watch()
-                self.audit.record(action="browser_launch", ok=False, sess=sess, engine="external_chromium", profile=profile, error="watch_exited_early")
+                audit_err = f"watch_exited_early:{diag}" if diag else "watch_exited_early"
+                self.audit.record(
+                    action="browser_launch",
+                    ok=False,
+                    sess=sess,
+                    engine="external_chromium",
+                    profile=profile,
+                    owner_bot=owner_bot or "",
+                    error=audit_err,
+                )
+                err_msg = (
+                    f"外部 Chromium live --watch 提前退出（code={exit_rc}）: {diag}"
+                    if diag
+                    else f"外部 Chromium live --watch 提前退出（code={exit_rc}）"
+                )
                 return web.json_response(
-                    {"ok": False, "source": "upstream", "error": f"外部 Chromium live --watch 提前退出（code={watch_proc.returncode}）"},
-                    status=502,
+                    {"ok": False, "source": "upstream", "error": err_msg},
+                    status=500,
                 )
             latest_st = await self._fetch_hub_status(http_session, sess)
             if latest_st.get("running") and latest_st.get("engine_mode") == "sync_external":
@@ -1802,11 +2024,26 @@ class StudioBrowserControlService:
             await asyncio.sleep(self._external_attach_poll_interval)
 
         if not attached:
+            diag = self._format_stderr_tail(stderr_buf)
             await self._stop_external_watch()
-            self.audit.record(action="browser_launch", ok=False, sess=sess, engine="external_chromium", profile=profile, error="attach_timeout")
+            audit_err = f"attach_timeout:{diag}" if diag else "attach_timeout"
+            self.audit.record(
+                action="browser_launch",
+                ok=False,
+                sess=sess,
+                engine="external_chromium",
+                profile=profile,
+                owner_bot=owner_bot or "",
+                error=audit_err,
+            )
+            err_msg = (
+                f"等待外部 Chromium 附着 Live-Browser Hub 超时: {diag}"
+                if diag
+                else "等待外部 Chromium 附着 Live-Browser Hub 超时"
+            )
             return web.json_response(
-                {"ok": False, "source": "upstream", "error": "等待外部 Chromium 附着 Live-Browser Hub 超时"},
-                status=504,
+                {"ok": False, "source": "upstream", "error": err_msg},
+                status=500,
             )
 
         # 4. Atomically sync engine/egress metadata (and optional owner_bot) on Hub even when owner_bot is None

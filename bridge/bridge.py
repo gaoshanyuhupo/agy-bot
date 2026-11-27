@@ -14,6 +14,7 @@ Key Real-Time Architecture:
     and auto-push referenced/generated images via `sendPhoto`
 - Persistent warm `--input-format stream-json --output-format stream-json` process pool
 """
+from collections import deque
 import datetime
 import fcntl
 import hashlib
@@ -13642,6 +13643,13 @@ _lb_default_owner_bot_id = None
 _lb_ext_lock = threading.Lock()
 _lb_ext_watch_proc = None
 _lb_ext_watch_meta = {}
+_lb_ext_watch_stderr_buf = deque(maxlen=40)
+_lb_ext_watch_stderr_thread = None
+
+_LB_EXT_ATTACH_TIMEOUT_SEC = 30.0
+_LB_EXT_WATCH_STOP_GRACE_SEC = 6.0
+_LB_BOT_FLAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]{0,31}$")
+_LB_EXT_HOST_PATH_RE = re.compile(r"/(?:home|Users|root)/[^\s:'\"()<>]+")
 
 _LB_EGRESS_ALLOWED_SCHEMES = frozenset({"socks5", "socks5h", "http", "https"})
 _LB_EGRESS_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
@@ -13803,7 +13811,7 @@ def _lb_run_external_cli(args, timeout_sec=25.0):
         )
         out_s, err_s = proc.communicate(timeout=timeout_sec)
         rc = int(proc.returncode) if proc.returncode is not None else -1
-        return rc, out_s or "", _scrub_live_browser_egress(err_s or "", max_len=300)
+        return rc, out_s or "", _lb_scrub_external_text(err_s or "", max_len=300)
     except subprocess.TimeoutExpired:
         _lb_kill_proc_group(proc)
         return -1, "", f"外部浏览器 CLI 超时（>{timeout_sec:.0f}s）"
@@ -13811,6 +13819,135 @@ def _lb_run_external_cli(args, timeout_sec=25.0):
         if proc is not None and proc.poll() is None:
             _lb_kill_proc_group(proc)
         return -1, "", f"外部浏览器 CLI 执行失败: {type(exc).__name__}"
+
+
+def _lb_parse_external_status_output(status_text):
+    live_active = False
+    live_inactive = False
+    container_running = False
+    cdp_disabled = False
+    for raw_line in (status_text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        low = line.lower()
+        if low.startswith("live view:"):
+            val = low.split(":", 1)[1].strip()
+            if val == "inactive" or val.startswith(("inactive ", "inactive(")):
+                live_inactive = True
+            elif val == "active" or val.startswith(("active ", "active(")):
+                live_active = True
+        elif low.startswith("container:"):
+            val = low.split(":", 1)[1].strip()
+            if "(running" in val or " running," in val or " running)" in val:
+                container_running = True
+            if "cdp=disabled" in val:
+                cdp_disabled = True
+    return {
+        "live_active": live_active,
+        "live_inactive": live_inactive,
+        "container_running": container_running,
+        "cdp_disabled": cdp_disabled,
+    }
+
+
+def _lb_drain_watch_stderr(stream, buf):
+    if stream is None:
+        return
+    read_fn = getattr(stream, "read", None)
+    if not callable(read_fn):
+        return
+    pending = ""
+    try:
+        while True:
+            chunk = read_fn(4096)
+            if not chunk:
+                break
+            if isinstance(chunk, (bytes, bytearray)):
+                text = chunk.decode("utf-8", errors="ignore")
+            else:
+                text = str(chunk)
+            combined = pending + text
+            if "\n" in combined or "\r" in combined:
+                parts = re.split(r"[\r\n]+", combined)
+                pending = parts.pop()
+                for part in parts:
+                    line = part.strip()
+                    if line:
+                        buf.append(line[:512])
+            else:
+                pending = combined[-1024:]
+        tail = pending.strip()
+        if tail:
+            buf.append(tail[:512])
+    except Exception:
+        pass
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            pass
+
+
+def _lb_scrub_external_text(raw, max_len=240):
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    text = _LB_USERINFO_RE.sub(r"\1***@", text)
+    try:
+        if "google_accounts" in globals() and hasattr(google_accounts, "redact_secrets"):
+            text = google_accounts.redact_secrets(text)
+    except Exception:
+        pass
+    text = _LB_EXT_HOST_PATH_RE.sub("[REDACTED]", text)
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", text)
+    return " ".join(text.split())[:max_len]
+
+
+def _lb_extract_json_error(lines):
+    for line in reversed(lines):
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                parsed = json.loads(line)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, dict):
+                err_val = parsed.get("error")
+                if isinstance(err_val, str) and err_val.strip():
+                    return err_val.strip()
+    joined = "\n".join(lines)
+    end = joined.rfind("}")
+    end_attempts = 0
+    while end != -1 and end_attempts < 4:
+        end_attempts += 1
+        pos = joined.rfind("{", 0, end)
+        start_attempts = 0
+        while pos != -1 and start_attempts < 16:
+            start_attempts += 1
+            try:
+                parsed = json.loads(joined[pos : end + 1])
+            except Exception:
+                parsed = None
+            if isinstance(parsed, dict):
+                err_val = parsed.get("error")
+                if isinstance(err_val, str) and err_val.strip():
+                    return err_val.strip()
+            pos = joined.rfind("{", 0, pos)
+        end = joined.rfind("}", 0, end)
+    return None
+
+
+def _lb_scrub_external_stderr(buf, max_lines=3, max_len=240):
+    lines = [line for line in list(buf) if line]
+    if not lines:
+        return ""
+    json_err = _lb_extract_json_error(lines)
+    if json_err:
+        scrubbed = _lb_scrub_external_text(json_err, max_len=max_len)
+        if scrubbed:
+            return scrubbed
+    tail = lines[-max_lines:]
+    return _lb_scrub_external_text(" | ".join(tail), max_len=max_len)
 
 
 def _lb_is_external_watch_active(profile=None):
@@ -13825,32 +13962,60 @@ def _lb_is_external_watch_active(profile=None):
 
 
 def _lb_stop_external_watch(stop_external_profile=False):
-    global _lb_ext_watch_proc, _lb_ext_watch_meta
+    global _lb_ext_watch_proc, _lb_ext_watch_meta, _lb_ext_watch_stderr_thread
     with _lb_ext_lock:
         proc = _lb_ext_watch_proc
         meta = dict(_lb_ext_watch_meta)
+        stderr_thread = _lb_ext_watch_stderr_thread
         _lb_ext_watch_proc = None
         _lb_ext_watch_meta = {}
+        _lb_ext_watch_stderr_thread = None
+        _lb_ext_watch_stderr_buf.clear()
     if proc is None:
         return False
     if proc.poll() is None:
+        # Send single-PID SIGTERM first (NEVER os.killpg(..., SIGTERM)) so child drivers
+        # such as Playwright's internal Node driver remain alive to flush /internal/sync/stop.
         try:
-            os.killpg(proc.pid, signal.SIGTERM)
+            proc.terminate()
+        except ProcessLookupError:
+            pass
         except Exception:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
+            pass
         try:
-            proc.wait(timeout=2.0)
+            proc.wait(timeout=_LB_EXT_WATCH_STOP_GRACE_SEC)
         except Exception:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except Exception:
+            pid = getattr(proc, "pid", None)
+            if isinstance(pid, int) and pid > 0:
+                try:
+                    os.killpg(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+            else:
                 try:
                     proc.kill()
                 except Exception:
                     pass
+            try:
+                proc.wait(timeout=1.0)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+    if stderr_thread is not None and stderr_thread.is_alive():
+        try:
+            stderr_thread.join(timeout=0.3)
+        except Exception:
+            pass
+    for stream in (getattr(proc, "stdout", None), getattr(proc, "stderr", None)):
+        if stream is not None:
+            try:
+                stream.close()
+            except Exception:
+                pass
     if stop_external_profile:
         prof = str(meta.get("profile") or "").strip()
         if prof and _lb_external_cli():
@@ -14669,42 +14834,82 @@ def _lb_resolve_owner_bot_for_launch(status_data=None):
 
 
 def _lb_launch_external_chromium(*, bot_hint, owner_uid, profile="default", launch_url=None, owner_bot=None, owner_bot_id=None, manual_launch=True):
-    global _lb_ext_watch_proc, _lb_ext_watch_meta
+    global _lb_ext_watch_proc, _lb_ext_watch_meta, _lb_ext_watch_stderr_buf, _lb_ext_watch_stderr_thread
     cli = _lb_external_cli()
     if not cli:
         return False, "外部 Chromium 适配器未配置（AGY_BROWSER_EXTERNAL_CLI）"
     if not _LB_PROFILE_NAME_RE.fullmatch(profile) or ".." in profile:
         return False, "Profile 名称非法"
+    try:
+        launch_url = _lb_validate_launch_url(launch_url)
+    except ValueError as exc:
+        return False, str(exc)
     status_params = {"source": "tg_cmd", "chat_scope": "private", "bot": bot_hint}
     if owner_uid is not None:
         status_params["user_id"] = str(owner_uid)
     ok_st, st_data = _live_browser_request("GET", "/internal/status", timeout=(1.5, 3.0), params=status_params)
-    if ok_st and isinstance(st_data, dict) and st_data.get("running"):
+    if (ok_st and isinstance(st_data, dict) and st_data.get("running")) or _lb_is_external_watch_active():
         return False, "已有活跃浏览器会话，请先执行 /browser stop 再拉起外部 Chromium"
     prof_info = {"name": "default", "pinned": True, "egress": "direct"} if profile == "default" else _lb_show_external_profile(profile)
     if prof_info is None:
         return False, f"外部 Chromium Profile '{profile}' 不存在"
 
-    start_args = ["--profile", profile, "open", launch_url] if launch_url else ["--profile", profile, "start"]
-    rc_s, out_s, err_s = _lb_run_external_cli(start_args, timeout_sec=25.0)
-    if rc_s != 0:
-        return False, err_s or _scrub_live_browser_egress(out_s, max_len=200) or f"start exited {rc_s}"
+    # 1. Inspect external profile status: reject active live bridge, self-heal idle no-CDP container
+    rc_st, out_st, _err_st = _lb_run_external_cli(["--profile", profile, "status"], timeout_sec=15.0)
+    if rc_st == 0:
+        st_flags = _lb_parse_external_status_output(out_st)
+        if st_flags["live_active"]:
+            return False, f"外部 Chromium Profile '{profile}' 已有活跃的 Live 直播桥在运行，请先停止后再试"
+        if st_flags["container_running"] and st_flags["cdp_disabled"] and st_flags["live_inactive"]:
+            rc_stop, out_stop, err_stop = _lb_run_external_cli(["--profile", profile, "stop"], timeout_sec=20.0)
+            if rc_stop != 0:
+                detail = err_stop or _lb_scrub_external_text(out_stop, max_len=200) or f"stop exited {rc_stop}"
+                return False, f"回收无 CDP 闲置容器失败: {detail}"
 
+    # 2. Spawn `live --watch` directly (NEVER `start`/`open`, NEVER `--wait-human`!)
     _lb_stop_external_watch()
+    watch_cmd = [cli, "--profile", profile, "live", "--watch"]
+    if launch_url and launch_url.lower() != "about:blank":
+        watch_cmd.extend(["--url", launch_url])
+    has_ambient_tg_bot = bool(
+        (os.environ.get("AGY_TG_BOT_TOKEN") or "").strip()
+        or (os.environ.get("AGY_TG_ENV_FILE") or "").strip()
+    )
+    if not has_ambient_tg_bot:
+        bh = str(bot_hint or "").strip()
+        if _LB_BOT_FLAG_RE.fullmatch(bh):
+            watch_cmd.extend(["--bot", bh])
+    if isinstance(owner_uid, int) and not isinstance(owner_uid, bool) and owner_uid > 0:
+        watch_cmd.extend(["--user-id", str(owner_uid)])
+
     try:
         watch_proc = subprocess.Popen(
-            [cli, "--profile", profile, "live", "--watch"],
+            watch_cmd,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             start_new_session=True,
         )
     except Exception as exc:
         return False, f"启动外部 Chromium 直播桥失败: {type(exc).__name__}"
 
+    stderr_buf = deque(maxlen=40)
+    stderr_thread = None
+    proc_stream = getattr(watch_proc, "stdout", None) or getattr(watch_proc, "stderr", None)
+    if proc_stream is not None and callable(getattr(proc_stream, "read", None)):
+        stderr_thread = threading.Thread(
+            target=_lb_drain_watch_stderr,
+            args=(proc_stream, stderr_buf),
+            name="lb-ext-stderr-drain",
+            daemon=True,
+        )
+        stderr_thread.start()
+
     egress_display = _scrub_live_browser_egress(prof_info.get("egress") or prof_info.get("egress_display") or "direct")
     with _lb_ext_lock:
         _lb_ext_watch_proc = watch_proc
+        _lb_ext_watch_stderr_buf = stderr_buf
+        _lb_ext_watch_stderr_thread = stderr_thread
         _lb_ext_watch_meta = {
             "profile": profile,
             "owner_bot": owner_bot,
@@ -14712,12 +14917,21 @@ def _lb_launch_external_chromium(*, bot_hint, owner_uid, profile="default", laun
             "egress": egress_display,
         }
 
-    deadline = time.monotonic() + 8.0
+    deadline = time.monotonic() + _LB_EXT_ATTACH_TIMEOUT_SEC
     attached = False
     while time.monotonic() < deadline:
         if watch_proc.poll() is not None:
+            if stderr_thread is not None and stderr_thread.is_alive():
+                try:
+                    stderr_thread.join(timeout=0.3)
+                except Exception:
+                    pass
+            diag = _lb_scrub_external_stderr(stderr_buf)
+            exit_rc = watch_proc.returncode
             _lb_stop_external_watch()
-            return False, f"外部 Chromium live --watch 提前退出（code={watch_proc.returncode}）"
+            if diag:
+                return False, f"外部 Chromium live --watch 提前退出（code={exit_rc}）: {diag}"
+            return False, f"外部 Chromium live --watch 提前退出（code={exit_rc}）"
         ok_poll, poll_st = _live_browser_request("GET", "/internal/status", timeout=(1.5, 3.0), params=status_params)
         if ok_poll and isinstance(poll_st, dict) and poll_st.get("running") and poll_st.get("engine_mode") == "sync_external":
             attached = True
@@ -14725,7 +14939,10 @@ def _lb_launch_external_chromium(*, bot_hint, owner_uid, profile="default", laun
         time.sleep(0.2)
 
     if not attached:
+        diag = _lb_scrub_external_stderr(stderr_buf)
         _lb_stop_external_watch()
+        if diag:
+            return False, f"等待外部 Chromium 附着 Live-Browser Hub 超时: {diag}"
         return False, "等待外部 Chromium 附着 Live-Browser Hub 超时"
 
     ob_body = {
@@ -15600,7 +15817,7 @@ def cmd_browser(chat_id, arg, thread_id=None, scope_key=None, from_user=None, ms
                 if rc_d != 0:
                     send(
                         chat_id,
-                        f"❌ 删除外部 Profile 失败：{html_mod.escape(err_d or _scrub_live_browser_egress(out_d, max_len=240))}",
+                        f"❌ 删除外部 Profile 失败：{html_mod.escape(err_d or _lb_scrub_external_text(out_d, max_len=240) or f'exit {rc_d}')}",
                         parse_mode="HTML",
                         thread_id=norm_tid,
                     )
@@ -15754,7 +15971,7 @@ def cmd_browser(chat_id, arg, thread_id=None, scope_key=None, from_user=None, ms
         if rc_e != 0:
             send(
                 chat_id,
-                f"❌ 保存外部 Profile 失败：{html_mod.escape(err_e or _scrub_live_browser_egress(out_e, max_len=240))}",
+                f"❌ 保存外部 Profile 失败：{html_mod.escape(err_e or _lb_scrub_external_text(out_e, max_len=240) or f'exit {rc_e}')}",
                 parse_mode="HTML",
                 thread_id=norm_tid,
             )
