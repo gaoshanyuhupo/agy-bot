@@ -1460,5 +1460,174 @@ class TestStudioBrowserControlStage1(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn(tok, content, f"Forbidden private literal {tok!r} found in {fp.name}")
 
 
+class TestBrowserPortraitCameraAndInvariants(unittest.TestCase):
+    """Prod-Release unit tests for portrait virtual camera projection & WebUI security invariants."""
+
+    def test_browser_camera_ts_node_suite(self) -> None:
+        """Run Node native test suite directly against `webui/src/utils/browserCamera.ts`."""
+        import shutil
+        import subprocess
+
+        node_bin = shutil.which("node")
+        if not node_bin:
+            self.skipTest("node executable not available on PATH")
+
+        test_file = REPO_ROOT / "webui/tests/browserCamera.test.mjs"
+        self.assertTrue(test_file.is_file(), f"Missing camera test file: {test_file}")
+        res = subprocess.run(
+            [node_bin, "--test", str(test_file)],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(
+            0,
+            res.returncode,
+            f"browserCamera.test.mjs failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}",
+        )
+
+    def test_browser_view_and_config_drawer_portrait_security_invariants(self) -> None:
+        """Verify zero regression on RBAC, gen guards, input release, secret clearing, and zero XSS."""
+        browser_view = (REPO_ROOT / "webui/src/components/BrowserView.tsx").read_text(encoding="utf-8")
+        config_drawer = (REPO_ROOT / "webui/src/components/BrowserConfigDrawer.tsx").read_text(encoding="utf-8")
+        camera_mod = (REPO_ROOT / "webui/src/utils/browserCamera.ts").read_text(encoding="utf-8")
+
+        # Zero dangerouslySetInnerHTML across modified WebUI components
+        for label, src in (
+            ("BrowserView.tsx", browser_view),
+            ("BrowserConfigDrawer.tsx", config_drawer),
+            ("browserCamera.ts", camera_mod),
+        ):
+            self.assertNotIn("dangerouslySetInnerHTML", src, f"XSS sink found in {label}")
+
+        # BrowserView security & lifecycle redlines preserved
+        for required in (
+            'liveRole === "admin"',
+            "session_gen",
+            "takeover_gen",
+            'mtype === "role_changed"',
+            "ev.code === 4008",
+            'window.addEventListener("blur"',
+            'document.addEventListener("visibilitychange"',
+            "onPointerCancel={handleCanvasPointerCancel}",
+            "onLostPointerCapture={handleCanvasLostPointerCapture}",
+            "window.visualViewport",
+            "text-[16px]",
+            "computeCameraTransform",
+            "stageToRemotePoint",
+            "remoteToStagePoint",
+            "zoomCameraAroundAnchor",
+        ):
+            self.assertIn(required, browser_view, f"Missing required invariant {required!r} in BrowserView.tsx")
+
+        # Stretching CSS aspectRatio + height:100% wrapper must be completely eliminated
+        self.assertNotIn("aspectRatio", browser_view, "Legacy CSS aspectRatio distortion hack must stay removed")
+
+        # BrowserConfigDrawer secret clearing hooks must remain intact on all exit/submit/switch paths
+        self.assertGreaterEqual(
+            config_drawer.count("clearSensitiveEgressInputs()"),
+            8,
+            "BrowserConfigDrawer must preserve all clearSensitiveEgressInputs() calls",
+        )
+        self.assertIn("text-[16px]", config_drawer, "BrowserConfigDrawer inputs should prevent iOS Safari zoom")
+
+    def test_browser_view_round2_touch_boundary_invariants(self) -> None:
+        """Round 2 Prod-Release regression invariants for P1-1, P1-2, P1-3, Safari IME & drag-to-pinch."""
+        import re
+
+        src = (REPO_ROOT / "webui/src/components/BrowserView.tsx").read_text(encoding="utf-8")
+
+        # P1-1: touchMode switch releases held inputs/timers AND 500ms longPressTimer checks touchModeRef
+        m_touch_mode_eff = re.search(
+            r"useEffect\(\(\)\s*=>\s*\{[\s\S]*?prevTouchModeRef\.current !== touchMode[\s\S]*?\},\s*\[touchMode,\s*releaseAllHeldInputs\]\);",
+            src,
+        )
+        self.assertIsNotNone(m_touch_mode_eff, "P1-1: missing touchMode transition release effect")
+        assert m_touch_mode_eff is not None
+        self.assertIn("releaseAllHeldInputs()", m_touch_mode_eff.group(0))
+
+        m_mode_btn = re.search(
+            r"Touch Mode Toggle: Tap\+Scroll vs Drag[\s\S]*?setTouchMode\(next\);",
+            src,
+        )
+        self.assertIsNotNone(m_mode_btn, "P1-1: missing bottom-bar touch mode toggle button")
+        assert m_mode_btn is not None
+        self.assertIn("releaseAllHeldInputs()", m_mode_btn.group(0))
+        self.assertIn("touchModeRef.current = next;", m_mode_btn.group(0))
+
+        m_longpress = re.search(
+            r"longPressTimer = window\.setTimeout\(\(\)\s*=>\s*\{[\s\S]*?\},\s*500\);",
+            src,
+        )
+        self.assertIsNotNone(m_longpress, "P1-1: missing 500ms longPressTimer callback")
+        assert m_longpress is not None
+        self.assertIn(
+            'if (touchModeRef.current !== "tap_scroll") return;',
+            m_longpress.group(0),
+            "P1-1: longPressTimer callback must guard touchModeRef.current === tap_scroll",
+        )
+
+        # P1-2: handleCanvasContextMenu prevents native menu & suppresses touch/pen/active-pointer/700ms touch echoes
+        m_ctx = re.search(
+            r"const handleCanvasContextMenu = \(e: React\.MouseEvent<HTMLCanvasElement>\) => \{[\s\S]*?\n  \};",
+            src,
+        )
+        self.assertIsNotNone(m_ctx, "P1-2: missing handleCanvasContextMenu")
+        assert m_ctx is not None
+        ctx_body = m_ctx.group(0)
+        self.assertIn("e.preventDefault();", ctx_body)
+        self.assertIn('=== "touch"', ctx_body)
+        self.assertIn('=== "pen"', ctx_body)
+        self.assertIn("activePointersRef.current.size > 0", ctx_body)
+        self.assertIn("lastTouchActivityTsRef.current", ctx_body)
+        self.assertIn("< 700", ctx_body)
+        self.assertIn('action: "rightclick"', ctx_body, "P1-2: desktop mouse right-click must remain intact")
+        self.assertGreaterEqual(
+            src.count("lastTouchActivityTsRef.current = performance.now();"),
+            4,
+            "P1-2: touch pointerdown/move/finish and longpress must stamp lastTouchActivityTsRef",
+        )
+
+        # P1-3: tabChanged ignores SPA tab.url mutations & calls releaseAllHeldInputs() on real transitions
+        m_tab_eff = re.search(
+            r"const activeTabIdx = state\.tabs\.findIndex[\s\S]*?\},\s*\[state\.session_gen,\s*state\.takeover_gen,\s*state\.tabs,\s*releaseAllHeldInputs\]\);",
+            src,
+        )
+        self.assertIsNotNone(
+            m_tab_eff,
+            "P1-3: session/takeover/tab transition effect must not depend on state.url and must use releaseAllHeldInputs",
+        )
+        assert m_tab_eff is not None
+        tab_eff_body = m_tab_eff.group(0)
+        self.assertIn("`${activeTabIdx}:${state.tabs.length}:${activeTabId}`", tab_eff_body)
+        self.assertNotIn("?.url", tab_eff_body, "P1-3: activeTabKey must never include tab.url")
+        self.assertNotIn("state.url", tab_eff_body, "P1-3: tabChanged must never depend on state.url")
+        self.assertIn("releaseAllHeldInputs()", tab_eff_body)
+
+        # Follow-up 4: Safari IME kbComposingRef reset & triple Enter guard
+        self.assertGreaterEqual(
+            src.count("kbComposingRef.current = false;"),
+            4,
+            "Follow-up 4: kbComposingRef must be reset on kbSheetOpen toggle/cleanup, closeKbSheet, and compositionEnd",
+        )
+        self.assertIn("!e.nativeEvent.isComposing", src)
+        self.assertIn("!kbComposingRef.current", src)
+        self.assertIn("e.keyCode !== 229", src)
+
+        # Follow-up 5: drag -> two-finger pinch mouseup uses 1st finger lastX/lastY (fallback clientX/Y)
+        m_pinch_rel = re.search(
+            r'if \(singleTouchRef\.current\?\.mode === "drag" && heldMouseButtonsRef\.current\.has\("left"\)\) \{[\s\S]*?heldPointerButtonsRef\.current\.delete\(singleTouchRef\.current\.pointerId\);\s*\}',
+            src,
+        )
+        self.assertIsNotNone(m_pinch_rel, "Follow-up 5: missing drag-to-pinch release block")
+        assert m_pinch_rel is not None
+        pinch_rel_body = m_pinch_rel.group(0)
+        self.assertIn("singleTouchRef.current.lastX", pinch_rel_body)
+        self.assertIn("singleTouchRef.current.lastY", pinch_rel_body)
+        self.assertIn("stageToRemotePoint(", pinch_rel_body)
+        self.assertIn("mapClientToRemote(e.clientX, e.clientY", pinch_rel_body)
+
+
 if __name__ == "__main__":
     unittest.main()

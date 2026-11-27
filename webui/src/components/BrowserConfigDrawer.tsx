@@ -428,23 +428,23 @@ export function BrowserConfigDrawer({
 
   return (
     <div className="fixed inset-0 z-50 flex justify-end bg-black/60 backdrop-blur-xs">
-      <div className="w-full max-w-2xl h-full bg-slate-900 border-l border-slate-700/80 shadow-2xl flex flex-col text-slate-100 select-text">
+      <div className="w-full sm:max-w-lg md:max-w-2xl h-full bg-slate-900 border-l border-slate-700/80 shadow-2xl flex flex-col text-slate-100 select-text">
         {/* Header */}
-        <div className="h-12 px-4 border-b border-slate-800 flex items-center justify-between shrink-0">
-          <div className="flex items-center gap-2">
-            <Layers className="w-4 h-4 text-sky-400" />
-            <span className="text-sm font-semibold">双浏览器 Profile 与出口 IP 池配置</span>
+        <div className="min-h-12 py-2 px-3 sm:px-4 border-b border-slate-800 flex items-center justify-between gap-2 shrink-0">
+          <div className="flex items-center gap-2 min-w-0">
+            <Layers className="w-4 h-4 text-sky-400 shrink-0" />
+            <span className="text-sm font-semibold truncate">双浏览器 Profile 与出口 IP 池配置</span>
             {!canEdit && (
-              <span className="px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-300 text-[10px] border border-amber-500/30">
+              <span className="px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-300 text-[10px] border border-amber-500/30 shrink-0">
                 只读视图
               </span>
             )}
           </div>
-          <div className="flex items-center gap-1.5">
+          <div className="flex items-center gap-1.5 shrink-0">
             <button
               type="button"
               onClick={() => void onRefreshAll()}
-              className="h-7 w-7 rounded-md inline-flex items-center justify-center text-slate-400 hover:bg-slate-800 hover:text-slate-100 cursor-pointer"
+              className="h-8 w-8 sm:h-7 sm:w-7 rounded-md inline-flex items-center justify-center text-slate-400 hover:bg-slate-800 hover:text-slate-100 cursor-pointer"
               title="刷新配置"
             >
               <RefreshCw className="w-3.5 h-3.5" />
@@ -455,7 +455,7 @@ export function BrowserConfigDrawer({
                 clearSensitiveEgressInputs();
                 onClose();
               }}
-              className="h-7 w-7 rounded-md inline-flex items-center justify-center text-slate-400 hover:bg-slate-800 hover:text-slate-100 cursor-pointer"
+              className="h-8 w-8 sm:h-7 sm:w-7 rounded-md inline-flex items-center justify-center text-slate-400 hover:bg-slate-800 hover:text-slate-100 cursor-pointer"
               title="关闭"
             >
               <X className="w-4 h-4" />
@@ -464,7 +464,7 @@ export function BrowserConfigDrawer({
         </div>
 
         {/* Tabs */}
-        <div className="px-4 pt-2.5 pb-2 border-b border-slate-800/80 flex items-center gap-2 shrink-0">
+        <div className="px-3 sm:px-4 pt-2.5 pb-2 border-b border-slate-800/80 flex flex-wrap items-center gap-2 shrink-0">
           <button
             type="button"
             onClick={() => {
@@ -511,7 +511,7 @@ export function BrowserConfigDrawer({
         )}
 
         {/* Body */}
-        <div className="flex-1 overflow-y-auto p-4 space-y-4">
+        <div className="flex-1 overflow-y-auto p-3 sm:p-4 pb-[max(1.5rem,env(safe-area-inset-bottom))] space-y-4">
           {tab === "profiles" ? (
             <>
               {/* Engine switcher + Create button */}
@@ -586,7 +586,7 @@ export function BrowserConfigDrawer({
                     </button>
                   </div>
 
-                  <div className="grid grid-cols-2 gap-2.5">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                     <div>
                       <label className="block text-[11px] text-slate-400 mb-1">Profile 名称</label>
                       <input
@@ -595,7 +595,7 @@ export function BrowserConfigDrawer({
                         disabled={Boolean(editingProfile)}
                         onChange={(e) => setProfName(e.target.value)}
                         placeholder="如 work-us / google-alt"
-                        className="w-full h-8 rounded-lg bg-slate-900 border border-slate-700 px-2.5 text-xs text-slate-100 disabled:opacity-60"
+                        className="w-full h-10 sm:h-8 rounded-lg bg-slate-900 border border-slate-700 px-2.5 text-[16px] sm:text-xs text-slate-100 disabled:opacity-60"
                       />
                     </div>
                     <div>
@@ -605,7 +605,7 @@ export function BrowserConfigDrawer({
                         value={profWindow}
                         onChange={(e) => setProfWindow(e.target.value)}
                         placeholder="1280x800"
-                        className="w-full h-8 rounded-lg bg-slate-900 border border-slate-700 px-2.5 text-xs text-slate-100 font-mono"
+                        className="w-full h-10 sm:h-8 rounded-lg bg-slate-900 border border-slate-700 px-2.5 text-[16px] sm:text-xs text-slate-100 font-mono"
                       />
                     </div>
 
@@ -616,7 +616,7 @@ export function BrowserConfigDrawer({
                           <select
                             value={profOs}
                             onChange={(e) => setProfOs(e.target.value)}
-                            className="w-full h-8 rounded-lg bg-slate-900 border border-slate-700 px-2 text-xs text-slate-100"
+                            className="w-full h-10 sm:h-8 rounded-lg bg-slate-900 border border-slate-700 px-2 text-[16px] sm:text-xs text-slate-100"
                           >
                             <option value="windows">windows</option>
                             <option value="macos">macos</option>
@@ -630,7 +630,7 @@ export function BrowserConfigDrawer({
                             value={profLocale}
                             onChange={(e) => setProfLocale(e.target.value)}
                             placeholder="en-US"
-                            className="w-full h-8 rounded-lg bg-slate-900 border border-slate-700 px-2.5 text-xs text-slate-100"
+                            className="w-full h-10 sm:h-8 rounded-lg bg-slate-900 border border-slate-700 px-2.5 text-[16px] sm:text-xs text-slate-100"
                           />
                         </div>
                       </>
@@ -643,7 +643,7 @@ export function BrowserConfigDrawer({
                             value={profTz}
                             onChange={(e) => setProfTz(e.target.value)}
                             placeholder="America/Los_Angeles"
-                            className="w-full h-8 rounded-lg bg-slate-900 border border-slate-700 px-2.5 text-xs text-slate-100"
+                            className="w-full h-10 sm:h-8 rounded-lg bg-slate-900 border border-slate-700 px-2.5 text-[16px] sm:text-xs text-slate-100"
                           />
                         </div>
                         <div>
@@ -653,7 +653,7 @@ export function BrowserConfigDrawer({
                             value={profLocale}
                             onChange={(e) => setProfLocale(e.target.value)}
                             placeholder="en-US"
-                            className="w-full h-8 rounded-lg bg-slate-900 border border-slate-700 px-2.5 text-xs text-slate-100"
+                            className="w-full h-10 sm:h-8 rounded-lg bg-slate-900 border border-slate-700 px-2.5 text-[16px] sm:text-xs text-slate-100"
                           />
                         </div>
                       </>
@@ -689,7 +689,7 @@ export function BrowserConfigDrawer({
                           value={profAccount}
                           onChange={(e) => setProfAccount(e.target.value)}
                           placeholder="绑定账号标签（绝不填密码）"
-                          className="w-full h-8 rounded-lg bg-slate-900 border border-slate-700 px-2.5 text-xs text-slate-100"
+                          className="w-full h-10 sm:h-8 rounded-lg bg-slate-900 border border-slate-700 px-2.5 text-[16px] sm:text-xs text-slate-100"
                         />
                       )}
                     </div>
@@ -725,7 +725,7 @@ export function BrowserConfigDrawer({
                           key={mode}
                           type="button"
                           onClick={() => setEgressBindMode(mode)}
-                          className={`px-2.5 py-1 rounded-md text-[11px] border cursor-pointer ${
+                          className={`px-2.5 py-1.5 sm:py-1 rounded-md text-[11px] border cursor-pointer ${
                             egressBindMode === mode
                               ? "border-sky-500 bg-sky-500/15 text-sky-200"
                               : "border-slate-700 bg-slate-900 text-slate-400"
@@ -739,7 +739,7 @@ export function BrowserConfigDrawer({
                       <select
                         value={selectedEgressNode}
                         onChange={(e) => setSelectedEgressNode(e.target.value)}
-                        className="w-full h-8 rounded-lg bg-slate-900 border border-slate-700 px-2 text-xs text-slate-100"
+                        className="w-full h-10 sm:h-8 rounded-lg bg-slate-900 border border-slate-700 px-2 text-[16px] sm:text-xs text-slate-100"
                       >
                         <option value="">-- 请选择 OpenBao 出口节点 --</option>
                         {egressNodes.map((n) => (
@@ -755,7 +755,7 @@ export function BrowserConfigDrawer({
                         value={bareProxyUrl}
                         onChange={(e) => setBareProxyUrl(e.target.value)}
                         placeholder="socks5h://proxy.example.com:1080（禁止含 user:pass@）"
-                        className="w-full h-8 rounded-lg bg-slate-900 border border-slate-700 px-2.5 text-xs text-slate-100 font-mono"
+                        className="w-full h-10 sm:h-8 rounded-lg bg-slate-900 border border-slate-700 px-2.5 text-[16px] sm:text-xs text-slate-100 font-mono"
                       />
                     )}
                   </div>
@@ -925,7 +925,7 @@ export function BrowserConfigDrawer({
                         <select
                           value={drawCountry}
                           onChange={(e) => setDrawCountry(e.target.value)}
-                          className="h-7 rounded-md bg-slate-900 border border-slate-700 px-2 text-xs text-slate-200"
+                          className="h-9 sm:h-7 rounded-md bg-slate-900 border border-slate-700 px-2 text-[16px] sm:text-xs text-slate-200"
                         >
                           {DRAW_COUNTRIES.map((cc) => (
                             <option key={cc} value={cc}>
@@ -977,13 +977,13 @@ export function BrowserConfigDrawer({
                   autoComplete="off"
                   className="rounded-xl border border-sky-500/35 bg-slate-950/85 p-3.5 space-y-3"
                 >
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 min-w-0">
                       <span className="text-xs font-semibold text-sky-300">
                         安全录入出口代理（直写 OpenBao，提交即清空明文）
                       </span>
                     </div>
-                    <div className="inline-flex rounded-md border border-slate-700 bg-slate-900 p-0.5">
+                    <div className="inline-flex rounded-md border border-slate-700 bg-slate-900 p-0.5 shrink-0">
                       <button
                         type="button"
                         onClick={() => {
@@ -1023,10 +1023,10 @@ export function BrowserConfigDrawer({
                           value={egPasteUrl}
                           onChange={(e) => setEgPasteUrl(e.target.value)}
                           placeholder="socks5h://user:pass@proxy.example.com:1080"
-                          className="w-full h-8 rounded-lg bg-slate-900 border border-slate-700 px-2.5 text-xs text-slate-100 font-mono"
+                          className="w-full h-10 sm:h-8 rounded-lg bg-slate-900 border border-slate-700 px-2.5 text-[16px] sm:text-xs text-slate-100 font-mono"
                         />
                       </div>
-                      <div className="grid grid-cols-2 gap-2">
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                         <div>
                           <label className="block text-[11px] text-slate-400 mb-1">节点标识 Slug（可选）</label>
                           <input
@@ -1034,7 +1034,7 @@ export function BrowserConfigDrawer({
                             value={egSlug}
                             onChange={(e) => setEgSlug(e.target.value)}
                             placeholder="自动加 custom- 前缀"
-                            className="w-full h-8 rounded-lg bg-slate-900 border border-slate-700 px-2.5 text-xs text-slate-100"
+                            className="w-full h-10 sm:h-8 rounded-lg bg-slate-900 border border-slate-700 px-2.5 text-[16px] sm:text-xs text-slate-100"
                           />
                         </div>
                         <div>
@@ -1044,13 +1044,13 @@ export function BrowserConfigDrawer({
                             value={egNote}
                             onChange={(e) => setEgNote(e.target.value)}
                             placeholder="如 US 住宅出口"
-                            className="w-full h-8 rounded-lg bg-slate-900 border border-slate-700 px-2.5 text-xs text-slate-100"
+                            className="w-full h-10 sm:h-8 rounded-lg bg-slate-900 border border-slate-700 px-2.5 text-[16px] sm:text-xs text-slate-100"
                           />
                         </div>
                       </div>
                     </div>
                   ) : (
-                    <div className="grid grid-cols-2 gap-2.5">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                       <div>
                         <label className="block text-[11px] text-slate-400 mb-1">节点标识 Slug（可选）</label>
                         <input
@@ -1058,7 +1058,7 @@ export function BrowserConfigDrawer({
                           value={egSlug}
                           onChange={(e) => setEgSlug(e.target.value)}
                           placeholder="如 us-home1"
-                          className="w-full h-8 rounded-lg bg-slate-900 border border-slate-700 px-2.5 text-xs text-slate-100"
+                          className="w-full h-10 sm:h-8 rounded-lg bg-slate-900 border border-slate-700 px-2.5 text-[16px] sm:text-xs text-slate-100"
                         />
                       </div>
                       <div>
@@ -1066,7 +1066,7 @@ export function BrowserConfigDrawer({
                         <select
                           value={egScheme}
                           onChange={(e) => setEgScheme(e.target.value)}
-                          className="w-full h-8 rounded-lg bg-slate-900 border border-slate-700 px-2 text-xs text-slate-100"
+                          className="w-full h-10 sm:h-8 rounded-lg bg-slate-900 border border-slate-700 px-2 text-[16px] sm:text-xs text-slate-100"
                         >
                           <option value="socks5h">socks5h (推荐)</option>
                           <option value="socks5">socks5</option>
@@ -1081,7 +1081,7 @@ export function BrowserConfigDrawer({
                           value={egHost}
                           onChange={(e) => setEgHost(e.target.value)}
                           placeholder="proxy.example.com"
-                          className="w-full h-8 rounded-lg bg-slate-900 border border-slate-700 px-2.5 text-xs text-slate-100 font-mono"
+                          className="w-full h-10 sm:h-8 rounded-lg bg-slate-900 border border-slate-700 px-2.5 text-[16px] sm:text-xs text-slate-100 font-mono"
                         />
                       </div>
                       <div>
@@ -1091,7 +1091,7 @@ export function BrowserConfigDrawer({
                           value={egPort}
                           onChange={(e) => setEgPort(e.target.value)}
                           placeholder="1080"
-                          className="w-full h-8 rounded-lg bg-slate-900 border border-slate-700 px-2.5 text-xs text-slate-100 font-mono"
+                          className="w-full h-10 sm:h-8 rounded-lg bg-slate-900 border border-slate-700 px-2.5 text-[16px] sm:text-xs text-slate-100 font-mono"
                         />
                       </div>
                       <div>
@@ -1101,7 +1101,7 @@ export function BrowserConfigDrawer({
                           autoComplete="off"
                           value={egUsername}
                           onChange={(e) => setEgUsername(e.target.value)}
-                          className="w-full h-8 rounded-lg bg-slate-900 border border-slate-700 px-2.5 text-xs text-slate-100"
+                          className="w-full h-10 sm:h-8 rounded-lg bg-slate-900 border border-slate-700 px-2.5 text-[16px] sm:text-xs text-slate-100"
                         />
                       </div>
                       <div>
@@ -1111,17 +1111,17 @@ export function BrowserConfigDrawer({
                           autoComplete="new-password"
                           value={egPassword}
                           onChange={(e) => setEgPassword(e.target.value)}
-                          className="w-full h-8 rounded-lg bg-slate-900 border border-slate-700 px-2.5 text-xs text-slate-100"
+                          className="w-full h-10 sm:h-8 rounded-lg bg-slate-900 border border-slate-700 px-2.5 text-[16px] sm:text-xs text-slate-100"
                         />
                       </div>
-                      <div className="col-span-2">
+                      <div className="sm:col-span-2">
                         <label className="block text-[11px] text-slate-400 mb-1">备注（可选）</label>
                         <input
                           type="text"
                           value={egNote}
                           onChange={(e) => setEgNote(e.target.value)}
                           placeholder="如 美西住宅出口"
-                          className="w-full h-8 rounded-lg bg-slate-900 border border-slate-700 px-2.5 text-xs text-slate-100"
+                          className="w-full h-10 sm:h-8 rounded-lg bg-slate-900 border border-slate-700 px-2.5 text-[16px] sm:text-xs text-slate-100"
                         />
                       </div>
                     </div>
