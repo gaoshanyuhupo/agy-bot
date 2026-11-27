@@ -319,6 +319,160 @@ def _sanitize_card_error(raw: Any, max_len: int = 200) -> str:
     return re.sub(r"\s+", " ", text).strip()[:max_len]
 
 
+MAX_NAV_TOAST_LEN = 160
+MAX_TOAST_INPUT_CHARS = 2048
+MAX_SYNC_TOAST_BODY_BYTES = 4096
+_SAFE_TOAST_HOST_RE = re.compile(
+    r"^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*|\[[0-9A-Fa-f:.]{2,45}\])$"
+)
+_TOAST_ANSI_CSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+_TOAST_URL_CREDS_RE = re.compile(r"(?<![A-Za-z0-9+.-])([a-zA-Z][a-zA-Z0-9+.-]{0,31}://)([^\s/@]+)@")
+_TOAST_URL_QUERY_RE = re.compile(r"(?<![A-Za-z0-9+.-])([a-zA-Z][a-zA-Z0-9+.-]{0,31}://[^\s?#]+)[?#][^\s]*")
+_TOAST_BARE_CREDS_RE = re.compile(r"(?<![^\s(\['\"<>=,;])[^\s:@/]{1,64}:[^\s/]{1,128}@(?=[A-Za-z0-9\[])")
+_TOAST_BARE_URL_QUERY_RE = re.compile(
+    r"(?<![^\s(\['\"<>=,;@])([A-Za-z0-9_~:%-]*[./][A-Za-z0-9._~:/%-]*)[?#][^\s)\]'\"<>]+"
+)
+_TOAST_UNIX_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_:])/(?:home|root|etc|var|tmp|usr|opt|srv|proc|sys|mnt|Users)/[^\s,;)'\"`]+"
+)
+_TOAST_WIN_PATH_RE = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z]:\\[^\s,;)'\"`]+")
+_TOAST_SECRET_REDACT_RE = re.compile(
+    r"(?:"
+    r"bot\d+:[A-Za-z0-9_-]{8,}"
+    r"|(?i:x-live-token\s*[:=]\s*)[A-Za-z0-9._-]{6,}"
+    r"|(?i:bearer\s+)[A-Za-z0-9._-]{10,}"
+    r"|(?<![A-Za-z0-9_])hvs\.[A-Za-z0-9._-]{8,}"
+    r"|(?<![A-Za-z0-9_])gh[pousr]_[A-Za-z0-9_]{10,}"
+    r"|(?<![A-Za-z0-9_])github_pat_[A-Za-z0-9_]{10,}"
+    r"|(?<![A-Za-z0-9_])sk-[A-Za-z0-9._-]{12,}"
+    r"|(?<![A-Za-z0-9_])AIza[A-Za-z0-9_-]{16,}"
+    r"|(?<![A-Za-z0-9_])AKIA[0-9A-Z]{16}"
+    r"|(?<![A-Za-z0-9_])xox[baprs]-[A-Za-z0-9-]{10,}"
+    r")"
+)
+
+
+def _extract_safe_toast_host(url: str | None) -> str:
+    """Return a validated bare hostname from an http(s) URL (no userinfo, path, or query)."""
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    try:
+        parts = urllib.parse.urlsplit(raw)
+    except Exception:
+        return ""
+    if (parts.scheme or "").lower() not in ("http", "https"):
+        return ""
+    host = (parts.hostname or "").strip().lower()
+    if not host:
+        return ""
+    if ":" in host and not (host.startswith("[") and host.endswith("]")):
+        host = f"[{host}]"
+    if len(host) > 60 or not _SAFE_TOAST_HOST_RE.fullmatch(host):
+        return ""
+    return host
+
+
+def sanitize_toast_text(raw: Any, *, max_len: int = MAX_NAV_TOAST_LEN) -> str:
+    """Defense-in-depth linear-time toast sanitizer: strips ANSI, control chars, creds/queries, host paths, tokens, and bounds length."""
+    limit = max(1, min(int(max_len), MAX_NAV_TOAST_LEN))
+    if isinstance(raw, str):
+        text = raw[:MAX_TOAST_INPUT_CHARS]
+    else:
+        text = str(raw or "")[:MAX_TOAST_INPUT_CHARS]
+    text = _TOAST_ANSI_CSI_RE.sub("", text)
+    text = _CONTROL_CHAR_RE.sub(" ", text)
+    text = _TOAST_URL_CREDS_RE.sub(r"\1", text)
+    text = _TOAST_URL_QUERY_RE.sub(r"\1", text)
+    text = _TOAST_BARE_CREDS_RE.sub("[REDACTED]@", text)
+    text = _TOAST_BARE_URL_QUERY_RE.sub(r"\1", text)
+    text = _TOAST_UNIX_PATH_RE.sub("[path]", text)
+    text = _TOAST_WIN_PATH_RE.sub("[path]", text)
+    text = _TOAST_SECRET_REDACT_RE.sub("[REDACTED]", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return ""
+    if len(text) > limit:
+        text = text[: max(1, limit - 1)].rstrip() + "…"
+    return text
+
+
+def sanitize_navigation_error_toast(
+    exc_or_msg: Any = None,
+    *,
+    url: str | None = None,
+    blocked_google: bool = False,
+) -> str:
+    """Map navigation exceptions or policy blocks to a controlled, sanitized Chinese toast (<=160 chars)."""
+    host = _extract_safe_toast_host(url)
+    host_suffix = f"（{host}）" if host else ""
+    if blocked_google:
+        return sanitize_toast_text(
+            f"⚠️ 安全策略拦截：当前 Profile 未获 Google/Gmail/YouTube 域访问授权{host_suffix}",
+            max_len=MAX_NAV_TOAST_LEN,
+        )
+
+    raw = str(exc_or_msg or "")
+    upper = raw.upper()
+    if "安全策略拦截" in raw or "GOOGLE_NAV_BLOCKED" in upper or "未获 GOOGLE" in upper:
+        msg = f"⚠️ 安全策略拦截：当前 Profile 未获 Google/Gmail/YouTube 域访问授权{host_suffix}"
+    elif "ERR_NAME_NOT_RESOLVED" in upper or "NS_ERROR_UNKNOWN_HOST" in upper:
+        msg = f"⚠️ 无法解析域名{host_suffix}，请检查网址拼写或网络连接"
+    elif (
+        "ERR_PROXY_CONNECTION_FAILED" in upper
+        or "ERR_TUNNEL_CONNECTION_FAILED" in upper
+        or "NS_ERROR_PROXY_CONNECTION_REFUSED" in upper
+        or "ERR_SOCKS_CONNECTION_FAILED" in upper
+    ):
+        msg = f"⚠️ 代理节点连接失败{host_suffix}，请检查当前出口节点状态"
+    elif "ERR_CONNECTION_REFUSED" in upper or "NS_ERROR_CONNECTION_REFUSED" in upper:
+        msg = f"⚠️ 目标站点拒绝连接{host_suffix}，请稍后重试"
+    elif (
+        "ERR_CONNECTION_TIMED_OUT" in upper
+        or "ERR_TIMED_OUT" in upper
+        or "NS_ERROR_NET_TIMEOUT" in upper
+        or "TIMEOUT" in upper
+        or "TIMED OUT" in upper
+    ):
+        msg = f"⚠️ 页面加载超时{host_suffix}，请检查网络或代理出口后重试"
+    elif (
+        "ERR_INTERNET_DISCONNECTED" in upper
+        or "ERR_NETWORK_CHANGED" in upper
+        or "NS_ERROR_OFFLINE" in upper
+    ):
+        msg = "⚠️ 网络连接中断，无法打开目标网页"
+    elif (
+        "ERR_CERT_" in upper
+        or "ERR_SSL_" in upper
+        or "SEC_ERROR_" in upper
+        or "SSL_ERROR_" in upper
+        or "MOZILLA_PKIX_ERROR_" in upper
+    ):
+        msg = f"⚠️ 目标站点证书校验失败{host_suffix}，已终止访问"
+    elif "ERR_TOO_MANY_REDIRECTS" in upper or "NS_ERROR_REDIRECT_LOOP" in upper:
+        msg = f"⚠️ 网页重定向次数过多{host_suffix}，无法完成跳转"
+    elif "ERR_ABORTED" in upper or "NS_BINDING_ABORTED" in upper:
+        msg = f"⚠️ 页面跳转已取消或被新导航中断{host_suffix}"
+    elif (
+        "INVALID URL" in upper
+        or "CANNOT NAVIGATE" in upper
+        or "NS_ERROR_MALFORMED_URI" in upper
+    ):
+        msg = "⚠️ 网址格式无效，请检查后重新输入"
+    elif (
+        "ERR_CONNECTION_RESET" in upper
+        or "ERR_CONNECTION_CLOSED" in upper
+        or "ERR_EMPTY_RESPONSE" in upper
+    ):
+        msg = f"⚠️ 与目标站点的连接被重置{host_suffix}，请稍后重试"
+    elif "ERR_BLOCKED_BY_CLIENT" in upper or "ERR_BLOCKED_BY_RESPONSE" in upper:
+        msg = f"⚠️ 目标请求被浏览器策略拦截{host_suffix}"
+    else:
+        msg = f"⚠️ 打开网页失败{host_suffix}，请检查网址或网络连接后重试"
+
+    return sanitize_toast_text(msg, max_len=MAX_NAV_TOAST_LEN)
+
+
 def _validate_positive_timeout(raw: Any, default: float = 600.0) -> float:
     """Validate that timeout is a positive finite number (rejects bool, <=0, NaN, inf)."""
     val = default if raw is None else raw
@@ -9627,6 +9781,41 @@ class LiveBrowserHub:
                         expected_takeover_gen=orig_tgen,
                     )
                 return
+            if act == "goto":
+                # Safe log ONLY (never log raw exception text that may contain file paths, proxy creds, or URL query params)
+                log.warning(
+                    "Human goto execution failed (error_type=%s, session_gen=%d, takeover_gen=%d)",
+                    type(exc).__name__,
+                    self.session_gen,
+                    self.takeover_gen,
+                )
+                orig_sgen = exec_state.get("orig_sgen")
+                orig_tgen = exec_state.get("orig_tgen")
+                orig_owner = exec_state.get("orig_owner")
+                if (
+                    self.engine_mode == "async_hosted"
+                    and self.takeover
+                    and orig_owner is not None
+                    and orig_sgen is not None
+                    and orig_tgen is not None
+                    and self.session_gen == orig_sgen
+                    and self.takeover_gen == orig_tgen
+                    and self._normalize_named_owner(self.takeover_owner) == orig_owner
+                    and self._has_verified_session_owner()
+                    and self._normalize_named_owner(self.session_owner) == orig_owner
+                    and await self._enforce_human_cmd_live_auth_locked(cmd)
+                    and _check_live_user_role(orig_owner[0], orig_owner[1]) == "admin"
+                ):
+                    toast_msg = sanitize_navigation_error_toast(exc, url=str(cmd.get("url", "")))
+                    await self.broadcast_json_to_owners(
+                        {"type": "toast", "message": toast_msg},
+                        owner_bot=orig_owner[0],
+                        owner_uid=orig_owner[1],
+                        require_admin=True,
+                        expected_session_gen=orig_sgen,
+                        expected_takeover_gen=orig_tgen,
+                    )
+                return
             raise
 
     async def _execute_human_cmd_async_impl(
@@ -10038,14 +10227,35 @@ class LiveBrowserHub:
                             profile_dir=self.active_profile_dir,
                         )
                     except ValueError as exc:
-                        owner_bot, owner_uid = self._effective_resource_owner()
-                        if owner_bot is not None and owner_uid is not None:
+                        orig_sgen = exec_state.get("orig_sgen") if exec_state else cmd.get("_session_gen")
+                        orig_tgen = exec_state.get("orig_tgen") if exec_state else cmd.get("_takeover_gen")
+                        orig_owner = (
+                            exec_state.get("orig_owner")
+                            if exec_state
+                            else self._normalize_named_owner(self.takeover_owner)
+                        )
+                        if (
+                            self.takeover
+                            and orig_owner is not None
+                            and orig_sgen is not None
+                            and orig_tgen is not None
+                            and self.session_gen == orig_sgen
+                            and self.takeover_gen == orig_tgen
+                            and self._normalize_named_owner(self.takeover_owner) == orig_owner
+                            and self._has_verified_session_owner()
+                            and self._normalize_named_owner(self.session_owner) == orig_owner
+                            and _check_live_user_role(orig_owner[0], orig_owner[1]) == "admin"
+                        ):
+                            toast_msg = sanitize_navigation_error_toast(
+                                exc, url=url, blocked_google=True
+                            )
                             await self.broadcast_json_to_owners(
-                                {"type": "toast", "message": str(exc)},
-                                owner_bot=owner_bot,
-                                owner_uid=owner_uid,
-                                require_admin=False,
-                                expected_session_gen=cmd.get("_session_gen"),
+                                {"type": "toast", "message": toast_msg},
+                                owner_bot=orig_owner[0],
+                                owner_uid=orig_owner[1],
+                                require_admin=True,
+                                expected_session_gen=orig_sgen,
+                                expected_takeover_gen=orig_tgen,
                             )
                         return
                     await page.goto(url, wait_until="domcontentloaded", timeout=45000)
@@ -13666,6 +13876,135 @@ async def internal_sync_clipboard(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+async def internal_sync_toast(request: web.Request) -> web.Response:
+    """Deliver a sanitized sync-mode navigation toast strictly to the active verified admin takeover owner."""
+    hub: LiveBrowserHub = request.app["hub"]
+    check_local_auth(request, hub)
+    hdr_lease = str(request.headers.get("X-Sync-Lease-Id") or "").strip()
+    hdr_sgen_raw = request.headers.get("X-Sync-Session-Gen")
+    hdr_sgen = _parse_strict_int(hdr_sgen_raw) if hdr_sgen_raw is not None else None
+    if hdr_sgen_raw is not None and hdr_sgen is None:
+        return web.json_response({"ok": False, "error": "Invalid X-Sync-Session-Gen header"}, status=400)
+
+    # 1. Mandatory pre-read lease validation BEFORE reading request body!
+    if not hdr_lease:
+        return web.json_response({"ok": False, "error": "Missing required X-Sync-Lease-Id header"}, status=409)
+    ok_pre, st_pre, err_pre = _check_sync_lease_active(hub, hdr_lease, expected_gen=hdr_sgen)
+    if not ok_pre:
+        return web.json_response({"ok": False, "error": err_pre}, status=st_pre)
+    start_gen = hub.session_gen
+
+    # 1b. Strict request body size cap (<= 4096 bytes) BEFORE JSON decoding or sanitization!
+    cl_val = getattr(request, "content_length", None)
+    if cl_val is None:
+        raw_cl_hdr = request.headers.get("Content-Length")
+        if raw_cl_hdr is not None:
+            parsed_cl = _parse_strict_int(raw_cl_hdr)
+            if parsed_cl is None or parsed_cl < 0:
+                return web.json_response({"ok": False, "error": "Invalid Content-Length"}, status=400)
+            cl_val = parsed_cl
+    if cl_val is not None:
+        if isinstance(cl_val, bool) or not isinstance(cl_val, int) or cl_val < 0:
+            return web.json_response({"ok": False, "error": "Invalid Content-Length"}, status=400)
+        if cl_val > MAX_SYNC_TOAST_BODY_BYTES:
+            return web.json_response({"ok": False, "error": "Payload Too Large"}, status=413)
+
+    body: Any
+    req_content = getattr(request, "content", None)
+    if req_content is not None and hasattr(req_content, "iter_chunked"):
+        buf = bytearray()
+        try:
+            async for chunk in req_content.iter_chunked(1024):
+                buf.extend(chunk)
+                if len(buf) > MAX_SYNC_TOAST_BODY_BYTES:
+                    return web.json_response({"ok": False, "error": "Payload Too Large"}, status=413)
+        except Exception:
+            return web.json_response({"ok": False, "error": "Failed to read request body"}, status=400)
+        try:
+            body = json.loads(buf.decode("utf-8"))
+        except Exception:
+            return web.json_response({"ok": False, "error": "Invalid JSON body"}, status=400)
+    elif hasattr(request, "read"):
+        try:
+            raw_body = await request.read()
+        except Exception:
+            return web.json_response({"ok": False, "error": "Failed to read request body"}, status=400)
+        if not isinstance(raw_body, (bytes, bytearray)):
+            return web.json_response({"ok": False, "error": "Invalid request body"}, status=400)
+        if len(raw_body) > MAX_SYNC_TOAST_BODY_BYTES:
+            return web.json_response({"ok": False, "error": "Payload Too Large"}, status=413)
+        try:
+            body = json.loads(raw_body.decode("utf-8"))
+        except Exception:
+            return web.json_response({"ok": False, "error": "Invalid JSON body"}, status=400)
+    else:
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "Invalid JSON body"}, status=400)
+        try:
+            if len(json.dumps(body, ensure_ascii=False).encode("utf-8")) > MAX_SYNC_TOAST_BODY_BYTES:
+                return web.json_response({"ok": False, "error": "Payload Too Large"}, status=413)
+        except Exception:
+            return web.json_response({"ok": False, "error": "Invalid JSON body"}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response({"ok": False, "error": "JSON body must be an object"}, status=400)
+
+    body_lease = str(body.get("lease_id") or "").strip()
+    if body_lease and not hmac.compare_digest(body_lease, hdr_lease):
+        return web.json_response({"ok": False, "error": "Mismatched sync_lease_id"}, status=409)
+
+    raw_sgen = body.get("session_gen")
+    if not isinstance(raw_sgen, int) or isinstance(raw_sgen, bool):
+        return web.json_response({"ok": False, "error": "Missing or invalid sync session_gen"}, status=400)
+    req_sgen = raw_sgen
+    if req_sgen != start_gen:
+        return web.json_response({"ok": False, "error": "Stale sync session_gen"}, status=409)
+
+    raw_tgen = body.get("takeover_gen")
+    if not isinstance(raw_tgen, int) or isinstance(raw_tgen, bool):
+        return web.json_response({"ok": False, "error": "Missing or invalid sync takeover_gen"}, status=400)
+    req_tgen = raw_tgen
+
+    # 2. Post-read lease, takeover, and verified-owner validation BEFORE broadcasting!
+    ok_post, st_post, err_post = _check_sync_lease_active(hub, hdr_lease, expected_gen=start_gen)
+    if not ok_post:
+        return web.json_response({"ok": False, "error": err_post}, status=st_post)
+
+    if not hub.takeover or hub.takeover_gen != req_tgen:
+        return web.json_response(
+            {"ok": False, "error": "Sync takeover inactive or takeover_gen mismatch"},
+            status=409,
+        )
+
+    if not hub._has_verified_session_owner() or hub.session_owner is None:
+        return web.json_response({"ok": False, "error": "No verified session owner"}, status=409)
+
+    o_bot, o_uid = hub.session_owner
+    if hub._normalize_named_owner(hub.takeover_owner) != (o_bot, int(o_uid)):
+        return web.json_response(
+            {"ok": False, "error": "Takeover owner mismatch"},
+            status=409,
+        )
+
+    raw_msg = body.get("message")
+    if not isinstance(raw_msg, str):
+        return web.json_response({"ok": False, "error": "Missing toast message"}, status=400)
+    sanitized_msg = sanitize_toast_text(raw_msg, max_len=MAX_NAV_TOAST_LEN)
+    if not sanitized_msg:
+        return web.json_response({"ok": False, "error": "Empty toast message"}, status=400)
+
+    await hub.broadcast_json_to_owners(
+        {"type": "toast", "message": sanitized_msg},
+        owner_bot=o_bot,
+        owner_uid=o_uid,
+        require_admin=True,
+        expected_session_gen=start_gen,
+        expected_takeover_gen=req_tgen,
+    )
+    return web.json_response({"ok": True, "message": sanitized_msg})
+
+
 async def internal_sync_stop(request: web.Request) -> web.Response:
     hub: LiveBrowserHub = request.app["hub"]
     check_local_auth(request, hub)
@@ -13760,6 +14099,7 @@ def create_app() -> web.Application:
     app.router.add_post("/internal/sync/attach", internal_sync_start)
     app.router.add_post("/internal/sync/push", internal_sync_push)
     app.router.add_post("/internal/sync/clipboard", internal_sync_clipboard)
+    app.router.add_post("/internal/sync/toast", internal_sync_toast)
     app.router.add_post("/internal/sync/stop", internal_sync_stop)
     return app
 

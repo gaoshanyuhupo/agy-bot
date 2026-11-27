@@ -2441,6 +2441,108 @@ class TestBrowserPortraitCameraAndInvariants(unittest.TestCase):
             self.assertIn("mobile-topbar-stop-btn", bundle_txt)
             self.assertIn("mobile-stop-confirm-modal", bundle_txt)
 
+    def test_workstream_f_c1_c2_c3_c6_c7_mobile_url_bar_kb_sheet_and_validation_invariants(self) -> None:
+        """Workstream F (C1, C2, C3, C6, C7): Blank URL bar UX, clear btn, kb-sheet anti-confusion & mutex, URL validation, zero XSS/private literals."""
+        import re
+
+        src = (REPO_ROOT / "webui/src/components/BrowserView.tsx").read_text(encoding="utf-8")
+        cam_src = (REPO_ROOT / "webui/src/utils/browserCamera.ts").read_text(encoding="utf-8")
+
+        # C7: Zero XSS sinks & zero private host/vault literals
+        for label, body in (("BrowserView.tsx", src), ("browserCamera.ts", cam_src)):
+            self.assertNotIn("dangerouslySetInnerHTML", body, f"XSS sink in {label}")
+            for forbidden in ("/" + "home" + "/" + "ubuntu", "lv" + "1/", "lv" + "2/"):
+                self.assertNotIn(forbidden, body, f"Private literal {forbidden!r} in {label}")
+
+        # C1: Blank URL detection, pill prompt, clear-on-focus, one-tap clear button & 375px flex safety
+        self.assertIn("export function isBlankBrowserUrl", cam_src)
+        self.assertIn("export function normalizeNavigableUrl", cam_src)
+        self.assertIn("isBlankBrowserUrl(state.url)", src)
+        self.assertIn("空白页 · 点此输入网址", src)
+        self.assertIn("flex-1 min-w-0 h-8 rounded-lg", src)
+        m_clear = re.search(
+            r'\{urlInput\.length > 0 && \(\s*<button[\s\S]*?data-testid="mobile-url-clear-btn"[\s\S]*?aria-label="清空网址"[\s\S]*?shrink-0[\s\S]*?</button>\s*\)\}',
+            src,
+        )
+        self.assertIsNotNone(m_clear, "C1: mobile URL editing form must render one-tap clear button with shrink-0")
+        assert m_clear is not None
+        self.assertIn('setUrlInput("")', m_clear.group(0))
+        self.assertIn("mobileUrlInputRef.current?.focus()", m_clear.group(0))
+
+        # C2: Overlay mutual exclusion, auto-close on lost control/restriction/4008, keyboard anti-confusion hint & switch button
+        self.assertIn("智能键盘输入（向当前网页焦点发送）", src)
+        self.assertIn('data-testid="kb-switch-to-url-btn"', src)
+        self.assertIn('data-testid="kb-blank-url-hint"', src)
+        self.assertIn("当前为空白页，无网页输入框", src)
+
+        m_switch = re.search(
+            r"const handleSwitchKbToUrlBar = \(\) => \{[\s\S]*?\n  \};",
+            src,
+        )
+        self.assertIsNotNone(m_switch, "C2: missing handleSwitchKbToUrlBar")
+        assert m_switch is not None
+        switch_body = m_switch.group(0)
+        self.assertIn("setKbSheetOpen(false);", switch_body)
+        self.assertIn("setUrlInput(draft);", switch_body)
+        self.assertIn('setKbText("");', switch_body)
+        self.assertIn("setMobileUrlEditing(true);", switch_body)
+        self.assertNotIn("sendInput", switch_body, "C2: switching from keyboard sheet to URL bar must NEVER auto-trigger goto")
+
+        # P1-2: Desktop/tablet (>= 768px) switching from keyboard sheet to desktop URL bar preserves draft on focus
+        self.assertIn("preserveDesktopDraftOnFocusRef = useRef<boolean>(false)", src)
+        self.assertIn("preserveDesktopDraftOnFocusRef.current = Boolean(draft);", switch_body)
+        self.assertIn("desktopUrlInputRef.current?.select();", switch_body)
+        m_desktop_input = re.search(
+            r"<input\s+ref=\{desktopUrlInputRef\}[\s\S]*?onChange=\{\(e\) => setUrlInput\(e\.target\.value\)\}",
+            src,
+        )
+        self.assertIsNotNone(m_desktop_input, "P1-2: missing desktopUrlInputRef <input>")
+        assert m_desktop_input is not None
+        desktop_input_body = m_desktop_input.group(0)
+        preserve_idx = desktop_input_body.find("if (preserveDesktopDraftOnFocusRef.current)")
+        overwrite_idx = desktop_input_body.find("setUrlInput(isBlankBrowserUrl(state.url)")
+        self.assertGreater(preserve_idx, -1, "P1-2: desktop onFocus must check preserveDesktopDraftOnFocusRef")
+        self.assertGreater(overwrite_idx, preserve_idx, "P1-2: preserve guard must short-circuit BEFORE setUrlInput(state.url)")
+        self.assertIn("preserveDesktopDraftOnFocusRef.current = false;", desktop_input_body)
+        self.assertIn("return;", desktop_input_body)
+
+        # Auto-close on !canControl || !state.running || state.session_restricted
+        m_autoclose = re.search(
+            r"if \(!canControl \|\| !state\.running \|\| state\.session_restricted\) \{[\s\S]*?\}",
+            src,
+        )
+        self.assertIsNotNone(m_autoclose, "C2: missing auto-close effect on lost control / restricted session")
+        assert m_autoclose is not None
+        self.assertIn("preserveDesktopDraftOnFocusRef.current = false;", m_autoclose.group(0))
+        self.assertIn("setKbSheetOpen(false);", m_autoclose.group(0))
+        self.assertIn("setMobileUrlEditing(false);", m_autoclose.group(0))
+        self.assertIn("setEditingUrl(false);", m_autoclose.group(0))
+
+        # C3: handleNavigate strictly validates with normalizeNavigableUrl before sending WS input
+        m_nav = re.search(
+            r"const handleNavigate = \(e: React\.FormEvent\) => \{[\s\S]*?\n  \};",
+            src,
+        )
+        self.assertIsNotNone(m_nav, "C3: missing handleNavigate")
+        assert m_nav is not None
+        nav_body = m_nav.group(0)
+        self.assertIn("normalizeNavigableUrl(urlInput)", nav_body)
+        self.assertIn("if (!res.ok)", nav_body)
+        self.assertIn("showToast(`⚠️ ${res.error}`)", nav_body)
+        self.assertIn('sendInput({ action: "goto", url: res.url })', nav_body)
+        self.assertIn("rounded-2xl", src)
+        self.assertIn("leading-snug break-words", src)
+
+        # C6/C8: Guarded dist bundle check (safe in public CI checkouts without webui/dist)
+        dist_dir = REPO_ROOT / "webui/dist/assets"
+        if dist_dir.is_dir():
+            js_bundles = list(dist_dir.glob("*.js"))
+            self.assertTrue(js_bundles, "webui/dist/assets must contain built JS bundle")
+            bundle_txt = "".join(p.read_text(encoding="utf-8", errors="ignore") for p in js_bundles)
+            self.assertIn("mobile-url-clear-btn", bundle_txt)
+            self.assertIn("kb-switch-to-url-btn", bundle_txt)
+            self.assertIn("kb-blank-url-hint", bundle_txt)
+
 
 if __name__ == "__main__":
     unittest.main()

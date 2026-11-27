@@ -45,6 +45,8 @@ import {
   cycleMobileViewMode,
   formatCompactUrlLabel,
   getDefaultViewMode,
+  isBlankBrowserUrl,
+  normalizeNavigableUrl,
   remoteToStagePoint,
   stageToRemotePoint,
   zoomCameraAroundAnchor,
@@ -254,6 +256,8 @@ export function BrowserView({
   const stageWrapRef = useRef<HTMLDivElement | null>(null);
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const desktopUrlInputRef = useRef<HTMLInputElement | null>(null);
+  const preserveDesktopDraftOnFocusRef = useRef<boolean>(false);
   const mobileUrlInputRef = useRef<HTMLInputElement | null>(null);
   const kbInputRef = useRef<HTMLInputElement | null>(null);
   const kbComposingRef = useRef<boolean>(false);
@@ -290,8 +294,8 @@ export function BrowserView({
 
   useEffect(() => {
     stateRef.current = state;
-    if (!editingUrl && !mobileUrlEditing && state.url) {
-      setUrlInput(state.url);
+    if (!editingUrl && !mobileUrlEditing) {
+      setUrlInput(isBlankBrowserUrl(state.url) ? "" : state.url || "");
     }
   }, [state, editingUrl, mobileUrlEditing]);
 
@@ -623,8 +627,10 @@ export function BrowserView({
     if (sessionChanged) {
       lastSessionGenRef.current = state.session_gen;
       userSelectedViewRef.current = false;
+      preserveDesktopDraftOnFocusRef.current = false;
       setKbSheetOpen(false);
       setMobileUrlEditing(false);
+      setEditingUrl(false);
       setConfirmMobileStop(false);
     }
     if (takeoverChanged) {
@@ -638,15 +644,18 @@ export function BrowserView({
     }
   }, [state.session_gen, state.takeover_gen, state.tabs, releaseAllHeldInputs]);
 
-  const canControl = liveRole === "admin" && state.takeover && state.running;
+  const canControl =
+    liveRole === "admin" && state.takeover && state.running && !state.session_restricted;
 
-  // Auto-close keyboard sheet & mobile URL editor when control is lost
+  // Auto-close keyboard sheet & URL editors when control is lost or session is restricted
   useEffect(() => {
-    if (!canControl) {
+    if (!canControl || !state.running || state.session_restricted) {
+      preserveDesktopDraftOnFocusRef.current = false;
       setKbSheetOpen(false);
       setMobileUrlEditing(false);
+      setEditingUrl(false);
     }
-  }, [canControl]);
+  }, [canControl, state.running, state.session_restricted]);
 
   // Track window.visualViewport for top-anchored smart keyboard overlay
   useEffect(() => {
@@ -762,6 +771,7 @@ export function BrowserView({
           setState((prev) => ({ ...prev, takeover: false }));
           setKbSheetOpen(false);
           setMobileUrlEditing(false);
+          setEditingUrl(false);
           setStopConfirmModalOpen(false);
           setConfirmMobileStop(false);
           const infoMsg =
@@ -844,6 +854,7 @@ export function BrowserView({
         setState((prev) => ({ ...prev, takeover: false }));
         setKbSheetOpen(false);
         setMobileUrlEditing(false);
+        setEditingUrl(false);
         setStopConfirmModalOpen(false);
         setConfirmMobileStop(false);
         if (reconnectTimerRef.current) window.clearTimeout(reconnectTimerRef.current);
@@ -1569,6 +1580,37 @@ export function BrowserView({
     setKbSheetOpen(false);
   };
 
+  const handleSwitchKbToUrlBar = () => {
+    kbComposingRef.current = false;
+    kbInputRef.current?.blur();
+    setKbSheetOpen(false);
+    if (!canControl) return;
+    const draft = kbText.trim();
+    if (draft) {
+      setUrlInput(draft);
+      setKbText("");
+    } else {
+      setUrlInput(isBlankBrowserUrl(state.url) ? "" : state.url || "");
+    }
+    const isDesktopToolbarVisible =
+      !forceMobileChrome && typeof window !== "undefined" && window.innerWidth >= 768;
+    if (isDesktopToolbarVisible) {
+      preserveDesktopDraftOnFocusRef.current = Boolean(draft);
+      setMobileUrlEditing(false);
+      setEditingUrl(true);
+      window.setTimeout(() => {
+        desktopUrlInputRef.current?.focus();
+        if (draft) {
+          desktopUrlInputRef.current?.select();
+        }
+      }, 20);
+    } else {
+      preserveDesktopDraftOnFocusRef.current = false;
+      setEditingUrl(false);
+      setMobileUrlEditing(true);
+    }
+  };
+
   // ---------------- Browser Lifecycle & Takeover Actions ----------------
 
   const toggleTakeover = () => {
@@ -1644,11 +1686,15 @@ export function BrowserView({
     setLaunching(true);
     try {
       const rawUrl = launchUrl.trim();
-      const normalizedUrl = rawUrl
-        ? /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(rawUrl)
-          ? rawUrl
-          : `https://${rawUrl}`
-        : undefined;
+      let normalizedUrl: string | undefined;
+      if (rawUrl) {
+        const res = normalizeNavigableUrl(rawUrl);
+        if (!res.ok) {
+          showToast(`⚠️ ${res.error}`);
+          return;
+        }
+        normalizedUrl = res.url;
+      }
       await launchBrowser({
         engine: launchEngine,
         profile: launchProfile || "default",
@@ -1705,12 +1751,19 @@ export function BrowserView({
 
   const handleNavigate = (e: React.FormEvent) => {
     e.preventDefault();
+    if (!canControl) {
+      setEditingUrl(false);
+      setMobileUrlEditing(false);
+      return;
+    }
+    const res = normalizeNavigableUrl(urlInput);
+    if (!res.ok) {
+      showToast(`⚠️ ${res.error}`);
+      return;
+    }
     setEditingUrl(false);
     setMobileUrlEditing(false);
-    const raw = urlInput.trim();
-    if (!raw) return;
-    const dest = /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(raw) ? raw : `https://${raw}`;
-    sendInput({ action: "goto", url: dest });
+    sendInput({ action: "goto", url: res.url });
   };
 
   const toggleFullscreen = async () => {
@@ -1784,7 +1837,10 @@ export function BrowserView({
     state.engine === "external_chromium" || state.engine_mode === "sync_external"
       ? extEngineLabel
       : "Camoufox";
+  const isBlankUrl = isBlankBrowserUrl(state.url);
   const compactUrlLabel = formatCompactUrlLabel(state.url, state.title, state.running);
+  const mobileUrlPillLabel =
+    state.running && isBlankUrl && canControl ? "空白页 · 点此输入网址" : compactUrlLabel;
   const statusModeText = !state.running
     ? "待机中"
     : state.takeover
@@ -1840,16 +1896,33 @@ export function BrowserView({
         {/* Address bar */}
         <form onSubmit={handleNavigate} className="flex-1 min-w-0">
           <input
+            ref={desktopUrlInputRef}
             type="text"
-            value={editingUrl ? urlInput : state.url || ""}
+            value={editingUrl ? urlInput : isBlankUrl ? "" : state.url || ""}
             onFocus={() => {
-              setUrlInput(state.url || "");
+              setKbSheetOpen(false);
+              if (preserveDesktopDraftOnFocusRef.current) {
+                preserveDesktopDraftOnFocusRef.current = false;
+                setEditingUrl(true);
+                desktopUrlInputRef.current?.select();
+                return;
+              }
+              setUrlInput(isBlankBrowserUrl(state.url) ? "" : state.url || "");
               setEditingUrl(true);
             }}
-            onBlur={() => setEditingUrl(false)}
+            onBlur={() => {
+              preserveDesktopDraftOnFocusRef.current = false;
+              setEditingUrl(false);
+            }}
             onChange={(e) => setUrlInput(e.target.value)}
             disabled={!canControl}
-            placeholder={state.running ? "输入网址并回车跳转…" : "浏览器待机中（未启动）"}
+            placeholder={
+              state.running
+                ? isBlankUrl && canControl
+                  ? "空白页 · 输入网址并回车跳转（如 example.com）"
+                  : "输入网址并回车跳转…"
+                : "浏览器待机中（未启动）"
+            }
             className="w-full h-7 rounded-lg bg-slate-950/90 border border-slate-700/80 px-2.5 text-xs text-slate-200 placeholder:text-slate-500 focus:outline-none focus:border-sky-500 disabled:opacity-75 select-text"
           />
         </form>
@@ -2169,9 +2242,24 @@ export function BrowserView({
                   setMobileUrlEditing(false);
                 }
               }}
-              placeholder="输入网址并前往…"
+              placeholder="输入网址（如 example.com）"
               className="flex-1 min-w-0 h-9 rounded-lg bg-slate-950 border border-sky-500/80 px-2.5 text-[16px] text-slate-100 placeholder:text-slate-500 focus:outline-none select-text"
             />
+            {urlInput.length > 0 && (
+              <button
+                type="button"
+                onClick={() => {
+                  setUrlInput("");
+                  mobileUrlInputRef.current?.focus();
+                }}
+                data-testid="mobile-url-clear-btn"
+                aria-label="清空网址"
+                title="清空网址"
+                className="h-9 px-2 rounded-lg border border-slate-700 bg-slate-800/80 hover:bg-slate-700 text-xs text-slate-300 inline-flex items-center justify-center shrink-0 cursor-pointer"
+              >
+                清空
+              </button>
+            )}
             <button
               type="submit"
               className="h-9 px-3 rounded-lg bg-sky-600 hover:bg-sky-500 text-xs font-medium text-white shrink-0 cursor-pointer"
@@ -2216,7 +2304,8 @@ export function BrowserView({
               type="button"
               onClick={() => {
                 if (canControl) {
-                  setUrlInput(state.url || "");
+                  setKbSheetOpen(false);
+                  setUrlInput(isBlankBrowserUrl(state.url) ? "" : state.url || "");
                   setMobileUrlEditing(true);
                 } else if (liveRole === "admin" && state.running && !state.takeover) {
                   showDebouncedHint("请先点击底部【接管】后再编辑网址");
@@ -2225,7 +2314,7 @@ export function BrowserView({
                 }
               }}
               className="flex-1 min-w-0 h-8 rounded-lg border border-slate-700/80 bg-slate-950/90 px-2.5 flex items-center gap-1.5 text-left active:bg-slate-900 cursor-pointer"
-              title={state.url || compactUrlLabel}
+              title={state.url || mobileUrlPillLabel}
             >
               <span
                 className={`h-2 w-2 rounded-full shrink-0 ${
@@ -2240,8 +2329,12 @@ export function BrowserView({
                           : "bg-sky-300"
                 }`}
               />
-              <span className="text-xs text-slate-200 truncate font-medium">
-                {compactUrlLabel}
+              <span
+                className={`text-xs truncate font-medium ${
+                  state.running && isBlankUrl && canControl ? "text-sky-300" : "text-slate-200"
+                }`}
+              >
+                {mobileUrlPillLabel}
               </span>
             </button>
 
@@ -2680,7 +2773,16 @@ export function BrowserView({
         <button
           type="button"
           disabled={!canControl}
-          onClick={() => setKbSheetOpen((v) => !v)}
+          onClick={() => {
+            setKbSheetOpen((v) => {
+              const next = !v;
+              if (next) {
+                setMobileUrlEditing(false);
+                setEditingUrl(false);
+              }
+              return next;
+            });
+          }}
           className={`min-h-[44px] rounded-xl px-1 flex flex-col items-center justify-center gap-0.5 text-[10px] font-medium transition-colors cursor-pointer disabled:opacity-35 disabled:pointer-events-none ${
             kbSheetOpen && canControl
               ? "bg-sky-500/25 border border-sky-500/50 text-sky-200"
@@ -2718,19 +2820,45 @@ export function BrowserView({
           className="fixed left-2 right-2 z-50 mx-auto max-w-xl rounded-2xl border border-sky-500/45 bg-slate-900/98 backdrop-blur-md p-3 shadow-2xl space-y-2.5 overflow-y-auto select-text"
         >
           <div className="flex items-center justify-between gap-2">
-            <div className="flex items-center gap-1.5 text-xs font-semibold text-sky-300">
-              <Keyboard className="w-4 h-4" />
-              <span>智能键盘输入（向当前网页焦点发送）</span>
+            <div className="flex items-center gap-1.5 text-xs font-semibold text-sky-300 min-w-0">
+              <Keyboard className="w-4 h-4 shrink-0" />
+              <span className="truncate">智能键盘输入（向当前网页焦点发送）</span>
             </div>
-            <button
-              type="button"
-              onClick={closeKbSheet}
-              aria-label="关闭软键盘输入"
-              className="h-7 w-7 rounded-lg inline-flex items-center justify-center text-slate-400 hover:bg-slate-800 hover:text-slate-100 cursor-pointer"
-            >
-              <X className="w-4 h-4" />
-            </button>
+            <div className="flex items-center gap-1.5 shrink-0">
+              <button
+                type="button"
+                onClick={handleSwitchKbToUrlBar}
+                data-testid="kb-switch-to-url-btn"
+                className="h-7 px-2 rounded-lg border border-sky-500/45 bg-sky-500/15 hover:bg-sky-500/25 text-[11px] font-medium text-sky-200 inline-flex items-center gap-1 shrink-0 cursor-pointer"
+              >
+                <span>改用地址栏</span>
+              </button>
+              <button
+                type="button"
+                onClick={closeKbSheet}
+                aria-label="关闭软键盘输入"
+                className="h-7 w-7 rounded-lg inline-flex items-center justify-center text-slate-400 hover:bg-slate-800 hover:text-slate-100 shrink-0 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
           </div>
+
+          {isBlankUrl && (
+            <div
+              data-testid="kb-blank-url-hint"
+              className="rounded-xl border border-amber-500/40 bg-amber-500/10 px-2.5 py-2 text-[11px] text-amber-200 leading-snug flex items-center justify-between gap-2"
+            >
+              <span>当前为空白页，无网页输入框；如需打开网址请改用顶部地址栏。</span>
+              <button
+                type="button"
+                onClick={handleSwitchKbToUrlBar}
+                className="px-2 py-1 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-100 font-medium shrink-0 cursor-pointer"
+              >
+                前往网址
+              </button>
+            </div>
+          )}
 
           <div className="flex items-center gap-1.5">
             <input

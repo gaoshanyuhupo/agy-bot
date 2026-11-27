@@ -41,6 +41,128 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 LOCAL_TOKEN_FILE = CONFIG_DIR / "local.token"
 DEFAULT_BASE_URL = "http://127.0.0.1:18795"
 _TAB_CMD_ID_RE = re.compile(r"^[A-Za-z0-9_:-]{1,48}$")
+MAX_NAV_TOAST_LEN = 160
+_MAX_PENDING_TOASTS = 4
+_CTL_MAX_TOAST_INPUT_CHARS = 2048
+_CTL_ANSI_CSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+_CTL_CTRL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]+")
+_CTL_SAFE_HOST_RE = re.compile(
+    r"^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*|\[[0-9A-Fa-f:.]{2,45}\])$"
+)
+_CTL_URL_CREDS_RE = re.compile(r"(?<![A-Za-z0-9+.-])([a-zA-Z][a-zA-Z0-9+.-]{0,31}://)([^\s/@]+)@")
+_CTL_URL_QUERY_RE = re.compile(r"(?<![A-Za-z0-9+.-])([a-zA-Z][a-zA-Z0-9+.-]{0,31}://[^\s?#]+)[?#][^\s]*")
+_CTL_BARE_CREDS_RE = re.compile(r"(?<![^\s(\['\"<>=,;])[^\s:@/]{1,64}:[^\s/]{1,128}@(?=[A-Za-z0-9\[])")
+_CTL_BARE_URL_QUERY_RE = re.compile(
+    r"(?<![^\s(\['\"<>=,;@])([A-Za-z0-9_~:%-]*[./][A-Za-z0-9._~:/%-]*)[?#][^\s)\]'\"<>]+"
+)
+_CTL_UNIX_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_:])/(?:home|root|etc|var|tmp|usr|opt|srv|proc|sys|mnt|Users)/[^\s,;)'\"`]+"
+)
+_CTL_WIN_PATH_RE = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z]:\\[^\s,;)'\"`]+")
+_CTL_SECRET_REDACT_RE = re.compile(
+    r"(?:"
+    r"bot\d+:[A-Za-z0-9_-]{8,}"
+    r"|(?i:x-live-token\s*[:=]\s*)[A-Za-z0-9._-]{6,}"
+    r"|(?i:bearer\s+)[A-Za-z0-9._-]{10,}"
+    r"|(?<![A-Za-z0-9_])hvs\.[A-Za-z0-9._-]{8,}"
+    r"|(?<![A-Za-z0-9_])gh[pousr]_[A-Za-z0-9_]{10,}"
+    r"|(?<![A-Za-z0-9_])github_pat_[A-Za-z0-9_]{10,}"
+    r"|(?<![A-Za-z0-9_])sk-[A-Za-z0-9._-]{12,}"
+    r"|(?<![A-Za-z0-9_])AIza[A-Za-z0-9_-]{16,}"
+    r"|(?<![A-Za-z0-9_])AKIA[0-9A-Z]{16}"
+    r"|(?<![A-Za-z0-9_])xox[baprs]-[A-Za-z0-9-]{10,}"
+    r")"
+)
+
+
+def sanitize_toast_text(raw: Any, *, max_len: int = MAX_NAV_TOAST_LEN) -> str:
+    """Linear-time toast sanitizer (strips ANSI, control chars, creds/queries, host paths, tokens; bounds <= 160 chars)."""
+    try:
+        srv = _import_server_module()
+        if hasattr(srv, "sanitize_toast_text"):
+            return str(srv.sanitize_toast_text(raw, max_len=max_len))
+    except Exception:
+        pass
+    limit = max(1, min(int(max_len), MAX_NAV_TOAST_LEN))
+    if isinstance(raw, str):
+        text = raw[:_CTL_MAX_TOAST_INPUT_CHARS]
+    else:
+        text = str(raw or "")[:_CTL_MAX_TOAST_INPUT_CHARS]
+    text = _CTL_ANSI_CSI_RE.sub("", text)
+    text = _CTL_CTRL_CHAR_RE.sub(" ", text)
+    text = _CTL_URL_CREDS_RE.sub(r"\1", text)
+    text = _CTL_URL_QUERY_RE.sub(r"\1", text)
+    text = _CTL_BARE_CREDS_RE.sub("[REDACTED]@", text)
+    text = _CTL_BARE_URL_QUERY_RE.sub(r"\1", text)
+    text = _CTL_UNIX_PATH_RE.sub("[path]", text)
+    text = _CTL_WIN_PATH_RE.sub("[path]", text)
+    text = _CTL_SECRET_REDACT_RE.sub("[REDACTED]", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return ""
+    if len(text) > limit:
+        text = text[: max(1, limit - 1)].rstrip() + "…"
+    return text
+
+
+def sanitize_navigation_error_toast(
+    exc_or_msg: Any = None,
+    *,
+    url: str | None = None,
+    blocked_google: bool = False,
+) -> str:
+    """Map navigation exceptions or policy blocks to a controlled, sanitized Chinese toast (<=160 chars)."""
+    try:
+        srv = _import_server_module()
+        if hasattr(srv, "sanitize_navigation_error_toast"):
+            return str(
+                srv.sanitize_navigation_error_toast(
+                    exc_or_msg,
+                    url=url,
+                    blocked_google=blocked_google,
+                )
+            )
+    except Exception:
+        pass
+    host = ""
+    raw_url = str(url or "").strip()
+    if raw_url:
+        try:
+            parts = urllib.parse.urlsplit(raw_url)
+            if (parts.scheme or "").lower() in ("http", "https"):
+                cand = (parts.hostname or "").strip().lower()
+                if ":" in cand and not (cand.startswith("[") and cand.endswith("]")):
+                    cand = f"[{cand}]"
+                if cand and len(cand) <= 60 and _CTL_SAFE_HOST_RE.fullmatch(cand):
+                    host = cand
+        except Exception:
+            host = ""
+    host_suffix = f"（{host}）" if host else ""
+    if blocked_google:
+        return sanitize_toast_text(
+            f"⚠️ 安全策略拦截：当前 Profile 未获 Google/Gmail/YouTube 域访问授权{host_suffix}",
+            max_len=MAX_NAV_TOAST_LEN,
+        )
+    upper = str(exc_or_msg or "").upper()
+    if "ERR_NAME_NOT_RESOLVED" in upper or "NS_ERROR_UNKNOWN_HOST" in upper:
+        msg = f"⚠️ 无法解析域名{host_suffix}，请检查网址拼写或网络连接"
+    elif "ERR_PROXY_CONNECTION_FAILED" in upper or "ERR_TUNNEL_CONNECTION_FAILED" in upper:
+        msg = f"⚠️ 代理节点连接失败{host_suffix}，请检查当前出口节点状态"
+    elif "ERR_CONNECTION_REFUSED" in upper or "NS_ERROR_CONNECTION_REFUSED" in upper:
+        msg = f"⚠️ 目标站点拒绝连接{host_suffix}，请稍后重试"
+    elif "TIMED_OUT" in upper or "TIMEOUT" in upper or "TIMED OUT" in upper:
+        msg = f"⚠️ 页面加载超时{host_suffix}，请检查网络或代理出口后重试"
+    elif "ERR_INTERNET_DISCONNECTED" in upper or "NS_ERROR_OFFLINE" in upper:
+        msg = "⚠️ 网络连接中断，无法打开目标网页"
+    elif "ERR_CERT_" in upper or "ERR_SSL_" in upper or "SEC_ERROR_" in upper:
+        msg = f"⚠️ 目标站点证书校验失败{host_suffix}，已终止访问"
+    elif "ERR_TOO_MANY_REDIRECTS" in upper:
+        msg = f"⚠️ 网页重定向次数过多{host_suffix}，无法完成跳转"
+    elif "INVALID URL" in upper or "CANNOT NAVIGATE" in upper:
+        msg = "⚠️ 网址格式无效，请检查后重新输入"
+    else:
+        msg = f"⚠️ 打开网页失败{host_suffix}，请检查网址或网络连接后重试"
+    return sanitize_toast_text(msg, max_len=MAX_NAV_TOAST_LEN)
 
 
 def _sanitize_tab_cmd_id(raw: Any) -> str | None:
@@ -563,6 +685,7 @@ class SyncLiveBridge:
         self._held_buttons: dict[str, Any] = {}
         self._acked_tab_cmds: list[str] = []
         self._rejected_tab_cmds: list[str] = []
+        self._pending_toasts: list[dict[str, Any]] = []
         self._pinned_verified: bool = False
         self._allow_google_verified: bool = False
         self._profile_name: str | None = str(profile_name).strip() if profile_name else None
@@ -666,6 +789,7 @@ class SyncLiveBridge:
 
     def close(self, *, skip_final_checkpoint: bool = False) -> None:
         self._release_held_buttons_sync()
+        self._clear_pending_toasts()
         if not self.enabled:
             return
         try:
@@ -688,6 +812,7 @@ class SyncLiveBridge:
         finally:
             self._release_held_buttons_sync()
             self._clear_acked_tab_cmds()
+            self._clear_pending_toasts()
             self.enabled = False
 
     def _record_acked_tab_cmd(self, raw_cmd_id: Any) -> None:
@@ -729,6 +854,106 @@ class SyncLiveBridge:
         rejected = getattr(self, "_rejected_tab_cmds", None)
         if isinstance(rejected, list):
             rejected.clear()
+
+    def _clear_pending_toasts(self) -> None:
+        pending = getattr(self, "_pending_toasts", None)
+        if isinstance(pending, list):
+            pending.clear()
+
+    def _enqueue_nav_toast(
+        self,
+        message: str,
+        *,
+        session_gen: Any = None,
+        takeover_gen: Any = None,
+    ) -> None:
+        clean = sanitize_toast_text(message, max_len=MAX_NAV_TOAST_LEN)
+        if not clean:
+            return
+        sgen = _parse_strict_int_no_ws(session_gen)
+        if sgen is None:
+            sgen = _parse_strict_int_no_ws(getattr(self, "_sync_session_gen", None))
+        tgen = _parse_strict_int_no_ws(takeover_gen)
+        if tgen is None:
+            tgen = _parse_strict_int_no_ws(getattr(self, "_last_takeover_gen", None))
+        if sgen is None or tgen is None:
+            return
+        pending = getattr(self, "_pending_toasts", None)
+        if pending is None:
+            pending = []
+            self._pending_toasts = pending
+        pending.append({"message": clean, "session_gen": sgen, "takeover_gen": tgen})
+        if len(pending) > _MAX_PENDING_TOASTS:
+            del pending[:-_MAX_PENDING_TOASTS]
+
+    def _flush_pending_toasts(self) -> None:
+        pending = getattr(self, "_pending_toasts", None)
+        if not pending:
+            return
+        if not self.enabled or not self._last_takeover:
+            pending.clear()
+            return
+        items = list(pending)
+        pending.clear()
+        for item in items:
+            if not self.enabled or not self._last_takeover:
+                self._clear_pending_toasts()
+                break
+            lease_id = getattr(self, "_sync_lease_id", None)
+            cur_sgen = _parse_strict_int_no_ws(getattr(self, "_sync_session_gen", None))
+            cur_tgen = _parse_strict_int_no_ws(getattr(self, "_last_takeover_gen", None))
+            if not lease_id or cur_sgen is None or cur_tgen is None:
+                self._clear_pending_toasts()
+                break
+            item_sgen = item.get("session_gen")
+            item_tgen = item.get("takeover_gen")
+            if (
+                not isinstance(item_sgen, int)
+                or isinstance(item_sgen, bool)
+                or not isinstance(item_tgen, int)
+                or isinstance(item_tgen, bool)
+                or item_sgen != cur_sgen
+                or item_tgen != cur_tgen
+            ):
+                continue
+            body: dict[str, Any] = {
+                "message": str(item.get("message") or ""),
+                "lease_id": str(lease_id),
+                "session_gen": item_sgen,
+                "takeover_gen": item_tgen,
+            }
+            try:
+                resp = self.client.session.post(
+                    f"{self.client.base_url}/internal/sync/toast",
+                    headers={**self._sync_headers(), "X-Sync-Session-Gen": str(item_sgen)},
+                    json=body,
+                    timeout=2.5,
+                )
+                sc = getattr(resp, "status_code", 200)
+                if sc == 409:
+                    # Takeover/generation conflict on best-effort toast: clear queue & abort flush
+                    # without killing a healthy live mirror (real lease conflicts are fenced by sync/push).
+                    self._clear_pending_toasts()
+                    break
+                if sc == 410:
+                    err_txt = ""
+                    try:
+                        err_payload = resp.json()
+                        if isinstance(err_payload, dict):
+                            err_txt = str(err_payload.get("error") or "")
+                    except Exception:
+                        pass
+                    self._clear_pending_toasts()
+                    self._last_status_code = sc
+                    self._last_push_ok = False
+                    self._last_error = err_txt or f"Sync toast rejected with HTTP {sc}"
+                    self._release_held_buttons_sync()
+                    self._clear_acked_tab_cmds()
+                    self.enabled = False
+                    break
+            except Exception:
+                self._clear_pending_toasts()
+                break
 
     def _active_raw_page(self) -> Any | None:
         pages = list(self.raw_ctx.pages)
@@ -791,6 +1016,7 @@ class SyncLiveBridge:
                 self._last_push_ok = False
                 self._last_error = f"Sync clipboard rejected with HTTP {self._last_status_code}"
                 self._release_held_buttons_sync()
+                self._clear_pending_toasts()
                 self.enabled = False
         except Exception:
             pass
@@ -900,6 +1126,7 @@ class SyncLiveBridge:
                     self._last_error = err_txt
                     self._release_held_buttons_sync()
                     self._clear_acked_tab_cmds()
+                    self._clear_pending_toasts()
                     self.enabled = False
                     break
                 if status_code >= 400:
@@ -924,6 +1151,7 @@ class SyncLiveBridge:
                     self._last_error = str(data.get("error") or f"HTTP {status_code}")
                     self._release_held_buttons_sync()
                     self._clear_acked_tab_cmds()
+                    self._clear_pending_toasts()
                     self.enabled = False
                     break
                 if status_code != 200 or data.get("ok") is not True:
@@ -933,6 +1161,7 @@ class SyncLiveBridge:
                 if lease_id and resp_lease is not None and str(resp_lease) != str(lease_id):
                     self._last_error = "Mismatched sync_lease_id"
                     self._release_held_buttons_sync()
+                    self._clear_pending_toasts()
                     self.enabled = False
                     break
                 is_takeover = bool(data.get("takeover"))
@@ -943,11 +1172,13 @@ class SyncLiveBridge:
                         if int(resp_sgen) != int(sync_sgen):
                             self._last_error = "Mismatched sync session_gen"
                             self._release_held_buttons_sync()
+                            self._clear_pending_toasts()
                             self.enabled = False
                             break
                     except (TypeError, ValueError):
                         self._last_error = "Invalid sync session_gen"
                         self._release_held_buttons_sync()
+                        self._clear_pending_toasts()
                         self.enabled = False
                         break
                 if acked_snap:
@@ -1018,8 +1249,11 @@ class SyncLiveBridge:
                             except (TypeError, ValueError):
                                 continue
                     cursor = self._exec_human_sync(cmd)
-                if not is_takeover or not self.enabled:
+                if self.enabled and self._last_takeover and getattr(self, "_pending_toasts", None):
+                    self._flush_pending_toasts()
+                if not is_takeover or not self._last_takeover or not self.enabled:
                     self._release_held_buttons_sync()
+                    self._clear_pending_toasts()
                 if not allow_takeover_loop or not is_takeover or not self.enabled:
                     break
                 if deadline is not None and time.monotonic() >= deadline:
@@ -1225,8 +1459,22 @@ class SyncLiveBridge:
                 page.keyboard.press("Backspace")
             elif act == "goto":
                 u = str(cmd.get("url", "")).strip()
-                if u and not self._is_sync_google_nav_blocked(u):
-                    page.goto(u, wait_until="domcontentloaded", timeout=45000)
+                if u:
+                    if self._is_sync_google_nav_blocked(u):
+                        self._enqueue_nav_toast(
+                            sanitize_navigation_error_toast(None, url=u, blocked_google=True),
+                            session_gen=cmd.get("session_gen"),
+                            takeover_gen=cmd.get("takeover_gen"),
+                        )
+                    else:
+                        try:
+                            page.goto(u, wait_until="domcontentloaded", timeout=45000)
+                        except Exception as goto_exc:
+                            self._enqueue_nav_toast(
+                                sanitize_navigation_error_toast(goto_exc, url=u),
+                                session_gen=cmd.get("session_gen"),
+                                takeover_gen=cmd.get("takeover_gen"),
+                            )
             elif act == "back":
                 page.go_back(wait_until="domcontentloaded", timeout=15000)
             elif act == "forward":

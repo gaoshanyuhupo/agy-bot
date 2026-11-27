@@ -338,6 +338,142 @@ export function cycleMobileViewMode(current: CameraViewMode): CameraViewMode {
 }
 
 /**
+ * Returns true when the browser URL represents an empty/blank/new-tab page.
+ */
+export function isBlankBrowserUrl(url?: string | null): boolean {
+  if (!url) return true;
+  const cleaned = url.trim().toLowerCase();
+  if (!cleaned) return true;
+  const normalized = cleaned.replace(/\/+$/, "");
+  return (
+    normalized === "about:blank" ||
+    normalized === "about:newtab" ||
+    normalized === "chrome://newtab"
+  );
+}
+
+const BLOCKED_URL_SCHEMES = new Set([
+  "javascript",
+  "data",
+  "file",
+  "vbscript",
+  "blob",
+  "chrome",
+  "edge",
+  "view-source",
+  "filesystem",
+  "ftp",
+  "ws",
+  "wss",
+  "mailto",
+  "tel",
+  "about",
+]);
+
+/**
+ * Validates and normalizes a user-entered navigation URL.
+ * Allows http(s) URLs, `about:blank`, and scheme-less host/path strings (auto-prefixed with `https://`).
+ * Rejects control characters, whitespace, dangerous/non-navigable schemes, and malformed hosts.
+ */
+export function normalizeNavigableUrl(
+  raw: string,
+): { ok: true; url: string } | { ok: false; error: string } {
+  if (typeof raw !== "string") {
+    return { ok: false, error: "请输入有效网址" };
+  }
+  if (/[\u0000-\u001f\u007f]/.test(raw)) {
+    return { ok: false, error: "网址包含非法控制字符，请检查后重试" };
+  }
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return { ok: false, error: "请输入有效网址" };
+  }
+  if (/\s/.test(trimmed)) {
+    return { ok: false, error: "网址格式不正确，不能包含空格" };
+  }
+  if (trimmed.toLowerCase() === "about:blank") {
+    return { ok: true, url: "about:blank" };
+  }
+  if (
+    trimmed.startsWith("//") ||
+    trimmed.startsWith("\\") ||
+    trimmed.startsWith(":") ||
+    trimmed.startsWith("/") ||
+    trimmed.startsWith("?") ||
+    trimmed.startsWith("#") ||
+    trimmed.startsWith("@")
+  ) {
+    return { ok: false, error: "网址格式不正确，请输入完整域名（如 example.com）" };
+  }
+
+  let candidate = trimmed;
+  let hasExplicitHttpScheme = false;
+  const schemeMatch = /^([a-zA-Z][a-zA-Z0-9+.-]*):(.*)$/.exec(trimmed);
+  if (schemeMatch) {
+    const scheme = schemeMatch[1].toLowerCase();
+    const rest = schemeMatch[2];
+    if (scheme === "http" || scheme === "https") {
+      if (!rest.startsWith("//") || rest.startsWith("///") || rest.startsWith("//\\")) {
+        return { ok: false, error: "网址格式不正确，缺少有效域名" };
+      }
+      hasExplicitHttpScheme = true;
+      candidate = trimmed;
+    } else if (
+      !BLOCKED_URL_SCHEMES.has(scheme) &&
+      (scheme.includes(".") || scheme === "localhost") &&
+      /^\d{1,5}(?:[/?#]|$)/.test(rest)
+    ) {
+      // Treat host:port/path (e.g. example.com:8080/app or localhost:3000) as scheme-less HTTPS URL
+      candidate = `https://${trimmed}`;
+    } else {
+      const displayScheme = scheme.length > 24 ? `${scheme.slice(0, 24)}…` : scheme;
+      return {
+        ok: false,
+        error: `不支持的协议（${displayScheme}:），仅支持 http/https 网址`,
+      };
+    }
+  } else {
+    candidate = `https://${trimmed}`;
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(candidate);
+  } catch {
+    return { ok: false, error: "网址格式无效，请检查域名与端口后重试" };
+  }
+
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return { ok: false, error: "仅支持 http 或 https 协议网址" };
+  }
+
+  if (parsed.port === "0") {
+    return { ok: false, error: "网址端口无效，请检查端口范围后重试" };
+  }
+
+  const host = parsed.hostname.toLowerCase();
+  if (
+    !host ||
+    host === "." ||
+    host === ".." ||
+    host.startsWith(".") ||
+    host.endsWith(".") ||
+    host.includes("..")
+  ) {
+    return { ok: false, error: "网址缺少有效主机名，请检查后重试" };
+  }
+
+  if (!hasExplicitHttpScheme) {
+    const isIpv6 = host.startsWith("[") && host.endsWith("]");
+    if (!isIpv6 && host !== "localhost" && !host.includes(".")) {
+      return { ok: false, error: "请输入有效域名或完整网址（如 example.com）" };
+    }
+  }
+
+  return { ok: true, url: parsed.href };
+}
+
+/**
  * Formats a concise human-readable host/label for the compact mobile URL pill.
  */
 export function formatCompactUrlLabel(url: string, title: string, running: boolean): string {

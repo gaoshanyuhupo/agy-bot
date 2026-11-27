@@ -1266,9 +1266,11 @@ class _MockHubSession:
             "google_allowed": False,
         }
         self.push_handler: object = None
+        self.toast_handler: object = None
         self.config_handler: object = None
         self.stop_calls: list[dict[str, object]] = []
         self.clipboard_calls: list[dict[str, object]] = []
+        self.toast_calls: list[dict[str, object]] = []
         self.takeover = False
         self.session_gen = 11
         self.takeover_gen = 1
@@ -1310,6 +1312,12 @@ class _MockHubSession:
         if "/internal/sync/clipboard" in url:
             self.clipboard_calls.append(rec)
             self.event_log.append(("hub", "sync.clipboard"))
+            return _MockHTTPResponse(200, {"ok": True})
+        if "/internal/sync/toast" in url:
+            self.toast_calls.append(rec)
+            self.event_log.append(("hub", "sync.toast"))
+            if callable(self.toast_handler):
+                return self.toast_handler(url, kw)
             return _MockHTTPResponse(200, {"ok": True})
         if "/internal/sync/stop" in url:
             self.stop_calls.append(rec)
@@ -2530,7 +2538,7 @@ class TestStage1OwnerBotManualLaunchAndHandback(unittest.TestCase):
     def _make_fake_web(self):
         return types.SimpleNamespace(
             json_response=lambda data, status=200: types.SimpleNamespace(data=data, status=status),
-            HTTPForbidden=PermissionError,
+            HTTPForbidden=lambda text="": PermissionError(text),
         )
 
     def test_bm5_bm6_bm7_manual_launch_hot_rebind_and_handback_note(self) -> None:
@@ -3223,6 +3231,671 @@ class TestWorkstreamEExternalCdpGoogleAndFastFail(unittest.TestCase):
         self.assertEqual(0, ctx.close_calls)
         self.assertEqual(1, browser.close_calls)
         self.assertEqual(1, pw.stop_calls)
+
+
+class TestWorkstreamFGotoToastAndFence(unittest.TestCase):
+    """Workstream F (C4 & C5): Navigation error toast sanitization, /internal/sync/toast fence, hosted goto alignment, and SyncLiveBridge queue cleanup."""
+
+    def _make_fake_web(self):
+        return types.SimpleNamespace(
+            json_response=lambda data, status=200: types.SimpleNamespace(data=data, status=status),
+            HTTPForbidden=lambda text="": PermissionError(text),
+        )
+
+    def test_workstream_f_c4_sanitize_navigation_error_toast_and_fallback_scrubber(self) -> None:
+        # 1. Playwright/browser navigation error mapping + strict secret/path/query/control-char stripping
+        cases = [
+            (
+                "Page.goto: net::ERR_NAME_NOT_RESOLVED at https://u:s3cr3t@bad.example.com/p?token=SECRET_Q\nTraceback /var/lib/app/secret.py",
+                "https://u:s3cr3t@bad.example.com/p?token=SECRET_Q",
+                "无法解析域名",
+            ),
+            (
+                "net::ERR_PROXY_CONNECTION_FAILED socks5h://alice:PROXY_PASS@proxy.example.com:1080",
+                "https://target.example.com/login?code=999",
+                "代理节点连接失败",
+            ),
+            (
+                "net::ERR_CONNECTION_REFUSED",
+                "https://refused.example.com:8443/a?k=v",
+                "目标站点拒绝连接",
+            ),
+            (
+                "Timeout 45000ms exceeded waiting for navigation",
+                "https://slow.example.com/cb?jwt=eyJabc",
+                "页面加载超时",
+            ),
+            (
+                "net::ERR_INTERNET_DISCONNECTED",
+                "https://offline.example.com/",
+                "网络连接中断",
+            ),
+            (
+                "net::ERR_CERT_AUTHORITY_INVALID",
+                "https://cert.example.com/",
+                "证书校验失败",
+            ),
+            (
+                "net::ERR_TOO_MANY_REDIRECTS",
+                "https://loop.example.com/",
+                "重定向次数过多",
+            ),
+            (
+                "Protocol error (Page.navigate): Cannot navigate to invalid URL",
+                "javascript:alert(1)",
+                "网址格式无效",
+            ),
+        ]
+        for raw_err, raw_url, expected_sub in cases:
+            msg = srv.sanitize_navigation_error_toast(raw_err, url=raw_url)
+            self.assertTrue(msg.startswith("⚠️ "), f"Expected warning prefix, got {msg!r}")
+            self.assertIn(expected_sub, msg)
+            self.assertLessEqual(len(msg), 160)
+            for forbidden in ("s3cr3t", "SECRET_Q", "PROXY_PASS", "alice:", "token=", "code=999", "jwt=", "/var/lib", "\n", "\r", "\t", "javascript:"):
+                self.assertNotIn(forbidden, msg, f"Leaked {forbidden!r} in toast {msg!r}")
+
+        # Google policy block mapping
+        g_msg = srv.sanitize_navigation_error_toast(None, url="https://mail.google.com/mail?authuser=0", blocked_google=True)
+        self.assertTrue(g_msg.startswith("⚠️ 安全策略拦截"))
+        self.assertNotIn("authuser=0", g_msg)
+        self.assertLessEqual(len(g_msg), 160)
+
+        # 2. Server-side defense-in-depth sanitize_toast_text on raw hostile payload
+        hostile = (
+            "⚠️ err socks5h://bob:MY_SECRET@proxy.example.com:1080 "
+            "https://app.example.com/cb?access_token=TOK123#frag "
+            "/etc/shadow /var/run/secret.sock\r\n\t"
+            + ("X" * 300)
+        )
+        cleaned = srv.sanitize_toast_text(hostile)
+        self.assertLessEqual(len(cleaned), 160)
+        for leak in ("bob:MY_SECRET", "MY_SECRET", "access_token", "TOK123", "#frag", "/etc/shadow", "/var/run/secret.sock", "\r", "\n", "\t"):
+            self.assertNotIn(leak, cleaned, f"Fallback scrubber leaked {leak!r} in {cleaned!r}")
+
+    def test_workstream_f_c4_internal_sync_toast_strict_fence_and_owner_isolation(self) -> None:
+        async def _scenario() -> None:
+            hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "sec-tok")
+            hub.engine_mode = "sync_external"
+            hub._sync_lease_id = "lease-sync-99"
+            hub._sync_last_push_ts = srv.time.monotonic()
+            hub.session_gen = 15
+            hub.takeover = True
+            hub.takeover_gen = 4
+            hub.session_owner = ("main", ADMIN_UID_A)
+            hub.takeover_owner = ("main", ADMIN_UID_A)
+
+            ws_owner_admin = _BufferedWS()
+            ws_owner_readonly = _BufferedWS()
+            ws_other_admin = _BufferedWS()
+            hub.viewers.update({ws_owner_admin, ws_owner_readonly, ws_other_admin})  # type: ignore[arg-type]
+            hub.viewer_meta[ws_owner_admin] = {"bot_key": "main", "user_id": ADMIN_UID_A, "role": "admin"}
+            hub.viewer_meta[ws_owner_readonly] = {"bot_key": "main", "user_id": ADMIN_UID_A + 50, "role": "readonly"}
+            hub.viewer_meta[ws_other_admin] = {"bot_key": "sg", "user_id": ADMIN_UID_B, "role": "admin"}
+
+            role_map = {
+                ("main", ADMIN_UID_A): "admin",
+                ("main", ADMIN_UID_A + 50): "readonly",
+                ("sg", ADMIN_UID_B): "admin",
+            }
+
+            def _make_req(body: object, *, headers: dict[str, str] | None = None):
+                hdrs = {"X-Live-Token": "sec-tok", "X-Sync-Lease-Id": "lease-sync-99"}
+                if headers is not None:
+                    hdrs = headers
+                return types.SimpleNamespace(
+                    headers=hdrs,
+                    remote="127.0.0.1",
+                    app={"hub": hub},
+                    json=mock.AsyncMock(return_value=body),
+                )
+
+            with (
+                mock.patch.object(srv, "web", self._make_fake_web()),
+                mock.patch.object(srv, "_check_live_user_role", side_effect=lambda b, u: role_map.get((b, u), "denied")),
+            ):
+                # 1. Bad local token -> PermissionError (HTTPForbidden)
+                with self.assertRaises(PermissionError):
+                    await srv.internal_sync_toast(
+                        _make_req(
+                            {"message": "hi", "session_gen": 15, "takeover_gen": 4},
+                            headers={"X-Live-Token": "wrong", "X-Sync-Lease-Id": "lease-sync-99"},
+                        )  # type: ignore[arg-type]
+                    )
+
+                # 2. Missing X-Sync-Lease-Id -> 409
+                r_no_lease = await srv.internal_sync_toast(
+                    _make_req(
+                        {"message": "hi", "session_gen": 15, "takeover_gen": 4},
+                        headers={"X-Live-Token": "sec-tok"},
+                    )  # type: ignore[arg-type]
+                )
+                self.assertEqual(409, r_no_lease.status)
+
+                # 3. Mismatched body lease_id -> 409
+                r_bad_lease = await srv.internal_sync_toast(
+                    _make_req({"message": "hi", "lease_id": "other-lease", "session_gen": 15, "takeover_gen": 4})  # type: ignore[arg-type]
+                )
+                self.assertEqual(409, r_bad_lease.status)
+
+                # 4. Stale session_gen -> 409
+                r_bad_sgen = await srv.internal_sync_toast(
+                    _make_req({"message": "hi", "lease_id": "lease-sync-99", "session_gen": 14, "takeover_gen": 4})  # type: ignore[arg-type]
+                )
+                self.assertEqual(409, r_bad_sgen.status)
+
+                # 5. Missing takeover_gen -> 400; mismatched takeover_gen -> 409
+                r_no_tgen = await srv.internal_sync_toast(
+                    _make_req({"message": "hi", "lease_id": "lease-sync-99", "session_gen": 15})  # type: ignore[arg-type]
+                )
+                self.assertEqual(400, r_no_tgen.status)
+                r_bad_tgen = await srv.internal_sync_toast(
+                    _make_req({"message": "hi", "lease_id": "lease-sync-99", "session_gen": 15, "takeover_gen": 3})  # type: ignore[arg-type]
+                )
+                self.assertEqual(409, r_bad_tgen.status)
+
+                # 6. Takeover inactive -> 409 and 0 broadcasts
+                hub.takeover = False
+                r_no_tk = await srv.internal_sync_toast(
+                    _make_req({"message": "hi", "lease_id": "lease-sync-99", "session_gen": 15, "takeover_gen": 4})  # type: ignore[arg-type]
+                )
+                self.assertEqual(409, r_no_tk.status)
+                hub.takeover = True
+
+                # 7. Unverified session owner -> 409 and 0 broadcasts
+                hub.session_owner = None
+                r_no_owner = await srv.internal_sync_toast(
+                    _make_req({"message": "hi", "lease_id": "lease-sync-99", "session_gen": 15, "takeover_gen": 4})  # type: ignore[arg-type]
+                )
+                self.assertEqual(409, r_no_owner.status)
+                hub.session_owner = ("main", ADMIN_UID_A)
+
+                self.assertEqual([], ws_owner_admin.events)
+                self.assertEqual([], ws_owner_readonly.events)
+                self.assertEqual([], ws_other_admin.events)
+
+                # 8. Valid call delivers server-sanitized toast ONLY to verified admin owner (0 to readonly / non-owner admin)
+                r_ok = await srv.internal_sync_toast(
+                    _make_req(
+                        {
+                            "message": "⚠️ 打开失败 socks5h://u:TOPSECRET@proxy.example.com:1080 https://app.example.com/a?tok=QSEC /etc/passwd\r\n" + ("Z" * 200),
+                            "lease_id": "lease-sync-99",
+                            "session_gen": 15,
+                            "takeover_gen": 4,
+                        }
+                    )  # type: ignore[arg-type]
+                )
+                self.assertEqual(200, r_ok.status)
+                self.assertEqual(1, len(ws_owner_admin.events))
+                ev_type, ev_payload = ws_owner_admin.events[0]
+                self.assertEqual("json", ev_type)
+                assert isinstance(ev_payload, dict)
+                self.assertEqual("toast", ev_payload["type"])
+                self.assertLessEqual(len(ev_payload["message"]), 160)
+                for secret in ("TOPSECRET", "QSEC", "/etc/passwd", "\r", "\n"):
+                    self.assertNotIn(secret, ev_payload["message"])
+                self.assertEqual([], ws_owner_readonly.events, "Readonly spectator must receive 0 sync toasts")
+                self.assertEqual([], ws_other_admin.events, "Non-owner admin must receive 0 sync toasts")
+
+        asyncio.run(_scenario())
+
+    def test_workstream_f_c4_hosted_camoufox_goto_error_and_google_block_toast(self) -> None:
+        async def _scenario() -> None:
+            hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "tok")
+            hub.engine_mode = "async_hosted"
+            hub.session_gen = 21
+            hub.takeover = True
+            hub.takeover_gen = 6
+            hub.session_owner = ("main", ADMIN_UID_A)
+            hub.takeover_owner = ("main", ADMIN_UID_A)
+
+            page = _FakePage("about:blank", "Blank", [b"F1"], hub_ref=hub)
+
+            async def _fail_goto(_url: str, **_kw: object) -> None:
+                raise RuntimeError(
+                    "Page.goto: net::ERR_PROXY_CONNECTION_FAILED socks5h://usr:PASS_HOSTED@proxy.example.com:1080"
+                )
+
+            page.goto = _fail_goto  # type: ignore[method-assign]
+            hub.ctx = types.SimpleNamespace(pages=[page])
+
+            ws_owner_admin = _BufferedWS()
+            ws_readonly = _BufferedWS()
+            ws_other_admin = _BufferedWS()
+            hub.viewers.update({ws_owner_admin, ws_readonly, ws_other_admin})  # type: ignore[arg-type]
+            hub.viewer_meta[ws_owner_admin] = {"bot_key": "main", "user_id": ADMIN_UID_A, "role": "admin"}
+            hub.viewer_meta[ws_readonly] = {"bot_key": "main", "user_id": ADMIN_UID_A + 77, "role": "readonly"}
+            hub.viewer_meta[ws_other_admin] = {"bot_key": "sg", "user_id": ADMIN_UID_B, "role": "admin"}
+
+            role_map = {
+                ("main", ADMIN_UID_A): "admin",
+                ("main", ADMIN_UID_A + 77): "readonly",
+                ("sg", ADMIN_UID_B): "admin",
+            }
+
+            with mock.patch.object(srv, "_check_live_user_role", side_effect=lambda b, u: role_map.get((b, u), "denied")):
+                # 1. Hosted page.goto exception -> sanitized ⚠️ toast ONLY to verified admin owner
+                await hub._execute_human_cmd_async(
+                    {
+                        "action": "goto",
+                        "url": "https://user:pw@target.example.com/path?token=HOSTED_Q",
+                        "_session_gen": 21,
+                        "_takeover_gen": 6,
+                        "_bot_key": "main",
+                        "_user_id": ADMIN_UID_A,
+                    }
+                )
+                self.assertEqual(1, len(ws_owner_admin.events))
+                toast1 = ws_owner_admin.events[0][1]
+                assert isinstance(toast1, dict)
+                self.assertEqual("toast", toast1["type"])
+                self.assertIn("代理节点连接失败", toast1["message"])
+                self.assertNotIn("PASS_HOSTED", toast1["message"])
+                self.assertNotIn("HOSTED_Q", toast1["message"])
+                self.assertEqual([], ws_readonly.events)
+                self.assertEqual([], ws_other_admin.events)
+
+                # 2. Hosted Google policy block -> sanitized ⚠️ toast ONLY to verified admin owner
+                ws_owner_admin.events.clear()
+                google_query_key = "sec" + "ret"
+                with mock.patch.object(
+                    srv,
+                    "enforce_google_profile_policy",
+                    side_effect=ValueError("安全策略拦截：禁止访问 Google 域"),
+                ):
+                    await hub._execute_human_cmd_async(
+                        {
+                            "action": "goto",
+                            "url": f"https://mail.google.com/mail?{google_query_key}=1",
+                            "_session_gen": 21,
+                            "_takeover_gen": 6,
+                            "_bot_key": "main",
+                            "_user_id": ADMIN_UID_A,
+                        }
+                    )
+                self.assertEqual(1, len(ws_owner_admin.events))
+                toast2 = ws_owner_admin.events[0][1]
+                assert isinstance(toast2, dict)
+                self.assertEqual("toast", toast2["type"])
+                self.assertTrue(toast2["message"].startswith("⚠️ 安全策略拦截"))
+                self.assertNotIn(f"{google_query_key}=1", toast2["message"])
+                self.assertEqual([], ws_readonly.events)
+                self.assertEqual([], ws_other_admin.events)
+
+                # 3. Takeover generation changes mid-goto -> 0 toast leaked
+                ws_owner_admin.events.clear()
+
+                async def _fail_after_tgen_bump(_url: str, **_kw: object) -> None:
+                    hub.takeover_gen = 7
+                    raise RuntimeError("net::ERR_CONNECTION_TIMED_OUT")
+
+                page.goto = _fail_after_tgen_bump  # type: ignore[method-assign]
+                await hub._execute_human_cmd_async(
+                    {
+                        "action": "goto",
+                        "url": "https://example.com/",
+                        "_session_gen": 21,
+                        "_takeover_gen": 6,
+                        "_bot_key": "main",
+                        "_user_id": ADMIN_UID_A,
+                    }
+                )
+                self.assertEqual([], ws_owner_admin.events, "Stale takeover_gen must emit 0 toast")
+
+        asyncio.run(_scenario())
+
+    def test_workstream_f_c5_sync_bridge_goto_toast_delivery_and_409_410_stop_cleanup(self) -> None:
+        env = _make_clean_cdp_env()
+        env["AGY_LIVE_BROWSER_REQUIRE_PINNED"] = "1"
+        log: list[tuple[str, ...]] = []
+        page = _MockCDPPage("p0", url="about:blank", log=log)
+        ctx = _MockCDPContext([page], log)
+        hub_sess = _MockHubSession()
+        hub_sess.takeover = True
+        hub_sess.session_gen = 11
+        hub_sess.takeover_gen = 2
+        hub_sess.start_resp["takeover"] = True
+        hub_sess.start_resp["takeover_gen"] = 2
+
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(ctl, "LiveBrowserClient", side_effect=lambda *_a, **_kw: _build_mock_hub_client(hub_sess)),
+        ):
+            bridge = ctl.SyncLiveBridge(ctx, notify=False)
+            self.assertTrue(bridge.enabled)
+
+            # 1. Normal checkpoint without goto failure makes ZERO /internal/sync/toast requests
+            bridge.sync_checkpoint(ai_status="ok", allow_takeover_loop=False)
+            self.assertEqual([], hub_sess.toast_calls, "Normal sync_push must make 0 extra toast requests")
+
+            # 2. Blocked Google goto + failed page.goto both enqueue and deliver sanitized JSON toasts
+            def _boom_goto(_u: str, **_kw: object) -> None:
+                raise RuntimeError("net::ERR_NAME_NOT_RESOLVED https://u:pw@missing.example.com/?tok=S1")
+
+            page.goto = _boom_goto  # type: ignore[method-assign]
+            hub_sess.push_handler = lambda _u, _kw: _MockHTTPResponse(
+                200,
+                {
+                    "ok": True,
+                    "session_gen": 11,
+                    "sync_lease_id": "lease-abc-123",
+                    "takeover": True,
+                    "takeover_gen": 2,
+                    "commands": [
+                        {"action": "goto", "url": "https://mail.google.com/mail?k=GSECRET", "session_gen": 11, "takeover_gen": 2},
+                        {"action": "goto", "url": "https://missing.example.com/a?tok=S1", "session_gen": 11, "takeover_gen": 2},
+                    ],
+                },
+            )
+            bridge.sync_checkpoint(ai_status="nav", allow_takeover_loop=False)
+            self.assertEqual(2, len(hub_sess.toast_calls))
+            for tc in hub_sess.toast_calls:
+                self.assertNotIn("?", str(tc["url"]), "Toast must be sent in JSON body, never query string")
+                hdrs = tc["headers"]
+                assert isinstance(hdrs, dict)
+                self.assertEqual("lease-abc-123", hdrs.get("X-Sync-Lease-Id"))
+                body = tc["json"]
+                assert isinstance(body, dict)
+                self.assertEqual(11, body["session_gen"])
+                self.assertEqual(2, body["takeover_gen"])
+                self.assertLessEqual(len(body["message"]), 160)
+                self.assertNotIn("GSECRET", body["message"])
+                self.assertNotIn("S1", body["message"])
+            self.assertIn("安全策略拦截", hub_sess.toast_calls[0]["json"]["message"])  # type: ignore[index]
+            self.assertIn("无法解析域名", hub_sess.toast_calls[1]["json"]["message"])  # type: ignore[index]
+            self.assertEqual([], bridge._pending_toasts)
+
+            # 3. /internal/sync/toast returning 410 immediately clears remaining queue, disables bridge,
+            #    never retries or revives lease, and keeps detach non-destructive (0 page/ctx close)
+            hub_sess.toast_calls.clear()
+            hub_sess.toast_handler = lambda _u, _kw: _MockHTTPResponse(410, {"ok": False, "error": "Sync lease expired"})
+            hub_sess.push_handler = lambda _u, _kw: _MockHTTPResponse(
+                200,
+                {
+                    "ok": True,
+                    "session_gen": 11,
+                    "sync_lease_id": "lease-abc-123",
+                    "takeover": True,
+                    "takeover_gen": 2,
+                    "commands": [
+                        {"action": "goto", "url": "https://bad1.example.com/", "session_gen": 11, "takeover_gen": 2},
+                        {"action": "goto", "url": "https://bad2.example.com/", "session_gen": 11, "takeover_gen": 2},
+                    ],
+                },
+            )
+            bridge.sync_checkpoint(ai_status="exp", allow_takeover_loop=False)
+            self.assertFalse(bridge.enabled, "HTTP 410 on /internal/sync/toast must disable bridge")
+            self.assertEqual(1, len(hub_sess.toast_calls), "Must abort remaining queued toasts immediately after 410")
+            self.assertEqual([], bridge._pending_toasts, "Pending toast queue must be emptied on 410")
+            self.assertEqual(0, page.close_calls)
+            self.assertEqual(0, ctx.close_calls)
+
+            # 4. Bounded queue (<=4), close() clears queue, and new session starts with 0 residual toasts
+            hub_sess2 = _MockHubSession()
+            hub_sess2.takeover = True
+            hub_sess2.session_gen = 12
+            hub_sess2.takeover_gen = 1
+            hub_sess2.start_resp["session_gen"] = 12
+            hub_sess2.start_resp["takeover"] = True
+            hub_sess2.start_resp["takeover_gen"] = 1
+            with mock.patch.object(ctl, "LiveBrowserClient", side_effect=lambda *_a, **_kw: _build_mock_hub_client(hub_sess2)):
+                bridge2 = ctl.SyncLiveBridge(ctx, notify=False)
+                for i in range(6):
+                    bridge2._enqueue_nav_toast(f"⚠️ err-{i}", session_gen=12, takeover_gen=1)
+                self.assertEqual(4, len(bridge2._pending_toasts), "Pending toast queue must be bounded to <= 4")
+                bridge2.close(skip_final_checkpoint=True)
+                self.assertEqual([], bridge2._pending_toasts, "close() must clear pending toasts")
+                self.assertEqual([], hub_sess2.toast_calls, "close() must not flush stale toasts")
+                self.assertEqual(0, page.close_calls)
+                self.assertEqual(0, ctx.close_calls)
+
+                # Fresh session starts completely clean with 0 residual toasts
+                bridge3 = ctl.SyncLiveBridge(ctx, notify=False)
+                self.assertEqual([], bridge3._pending_toasts)
+                bridge3.sync_checkpoint(ai_status="fresh", allow_takeover_loop=False)
+                self.assertEqual([], hub_sess2.toast_calls)
+                bridge3.close(skip_final_checkpoint=True)
+
+    def test_workstream_f_p1_1_and_p1_5_linear_redos_sanitization_body_limit_and_strict_int(self) -> None:
+        """P1-1 & P1-5: Linear-time sanitize_toast_text (<0.05s on 50k chars), ANSI/token/bare-creds/bare-query scrubbing, 413 cap, and strict JSON int check."""
+        import time
+
+        # 1. P1-1: Linear-time performance (< 0.05s) on 50k adversarial inputs for BOTH server and ctl fallback
+        adversarial_inputs = [
+            "A" * 50000,
+            "a:b" * 20000,
+            "a.b/" * 20000,
+            ("\x1b[31m" + "Z" * 1000) * 50,
+        ]
+        for payload in adversarial_inputs:
+            t0 = time.perf_counter()
+            out_srv = srv.sanitize_toast_text(payload)
+            dt_srv = time.perf_counter() - t0
+            self.assertLess(dt_srv, 0.05, f"srv.sanitize_toast_text took {dt_srv:.4f}s (ReDoS regression)")
+            self.assertLessEqual(len(out_srv), 160)
+
+        with mock.patch.object(ctl, "_import_server_module", side_effect=ImportError("force ctl fallback")):
+            for payload in adversarial_inputs:
+                t0 = time.perf_counter()
+                out_ctl = ctl.sanitize_toast_text(payload)
+                dt_ctl = time.perf_counter() - t0
+                self.assertLess(dt_ctl, 0.05, f"ctl fallback sanitize_toast_text took {dt_ctl:.4f}s (ReDoS regression)")
+                self.assertLessEqual(len(out_ctl), 160)
+
+        # 2. P1-5: Comprehensive scrubbing across server AND ctl fallback (using concatenated synthetic tokens to avoid static secret scanner false positives)
+        syn_hvs = "hvs." + "CAESI" + "FakeTest123456"
+        syn_ghp = "gh" + "p_" + ("1234567890" * 3) + "abcdef"
+        syn_sk = "sk" + "-" + "proj-" + "FakeKey9876543210"
+        syn_aiza = "AI" + "za" + "SyFakeGoogleKey1234567890123"
+
+        def _assert_sanitizer_suite(fn) -> None:
+            # ANSI CSI stripping (no leftover [31m / [0m)
+            ansi_out = fn("\x1b[31m⚠️ Error\x1b[0m \x1b[1;33mCheck\x1b[0m")
+            self.assertEqual("⚠️ Error Check", ansi_out)
+            for leftover in ("\x1b", "[31m", "[0m", "[1;33m"):
+                self.assertNotIn(leftover, ansi_out)
+
+            # Bare user:pass@host redaction
+            bare_creds = fn("proxy auth failed alice:SuperSecret99@proxy.example.com:1080")
+            self.assertNotIn("alice:SuperSecret99", bare_creds)
+            self.assertNotIn("SuperSecret99", bare_creds)
+            self.assertIn("proxy.example.com:1080", bare_creds)
+
+            # Scheme-less ?query & #frag stripping
+            bare_q = fn("callback example.com/cb?code=OAUTH_SECRET_1&state=9 and sub.example.com/p#id_token=JWT_SECRET")
+            self.assertIn("example.com/cb", bare_q)
+            self.assertIn("sub.example.com/p", bare_q)
+            for leak in ("OAUTH_SECRET_1", "state=9", "JWT_SECRET", "code=", "id_token="):
+                self.assertNotIn(leak, bare_q)
+
+            # High-risk token prefixes (hvs., gh*_, sk-, AIza)
+            for tok in (syn_hvs, syn_ghp, syn_sk, syn_aiza):
+                redacted = fn(f"⚠️ auth error {tok} end")
+                self.assertNotIn(tok, redacted, f"Token prefix leaked: {redacted!r}")
+                self.assertIn("[REDACTED]", redacted)
+
+        _assert_sanitizer_suite(srv.sanitize_toast_text)
+        with mock.patch.object(ctl, "_import_server_module", side_effect=ImportError("force ctl fallback")):
+            _assert_sanitizer_suite(ctl.sanitize_toast_text)
+
+        # 3. P1-1 & P1-5: internal_sync_toast body size cap (413 with/without Content-Length) & strict JSON int check (400 on strings/bools)
+        async def _scenario() -> None:
+            hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "sec-tok")
+            hub.engine_mode = "sync_external"
+            hub._sync_lease_id = "lease-sync-99"
+            hub._sync_last_push_ts = srv.time.monotonic()
+            hub.session_gen = 15
+            hub.takeover = True
+            hub.takeover_gen = 4
+            hub.session_owner = ("main", ADMIN_UID_A)
+            hub.takeover_owner = ("main", ADMIN_UID_A)
+
+            ws_owner = _BufferedWS()
+            hub.viewers.add(ws_owner)  # type: ignore[arg-type]
+            hub.viewer_meta[ws_owner] = {"bot_key": "main", "user_id": ADMIN_UID_A, "role": "admin"}
+
+            class _ChunkedStream:
+                def __init__(self, chunks: list[bytes]) -> None:
+                    self._chunks = chunks
+                    self.chunks_read = 0
+
+                async def iter_chunked(self, _size: int):
+                    for ch in self._chunks:
+                        self.chunks_read += 1
+                        yield ch
+
+            with (
+                mock.patch.object(srv, "web", self._make_fake_web()),
+                mock.patch.object(srv, "_check_live_user_role", return_value="admin"),
+            ):
+                # 3a. Oversized Content-Length -> 413 BEFORE read() is called
+                read_spy = mock.AsyncMock(return_value=b"{}")
+                req_cl_413 = types.SimpleNamespace(
+                    headers={"X-Live-Token": "sec-tok", "X-Sync-Lease-Id": "lease-sync-99", "Content-Length": "5000"},
+                    content_length=5000,
+                    remote="127.0.0.1",
+                    app={"hub": hub},
+                    read=read_spy,
+                )
+                r_cl = await srv.internal_sync_toast(req_cl_413)  # type: ignore[arg-type]
+                self.assertEqual(413, r_cl.status)
+                self.assertEqual(0, read_spy.call_count, "Must reject >4096 Content-Length before reading body")
+
+                # 3b. Oversized body WITHOUT Content-Length via read() -> 413
+                big_raw = json.dumps({"message": "A" * 5000, "lease_id": "lease-sync-99", "session_gen": 15, "takeover_gen": 4}).encode("utf-8")
+                req_read_413 = types.SimpleNamespace(
+                    headers={"X-Live-Token": "sec-tok", "X-Sync-Lease-Id": "lease-sync-99"},
+                    content_length=None,
+                    remote="127.0.0.1",
+                    app={"hub": hub},
+                    read=mock.AsyncMock(return_value=big_raw),
+                )
+                r_read = await srv.internal_sync_toast(req_read_413)  # type: ignore[arg-type]
+                self.assertEqual(413, r_read.status)
+
+                # 3c. Oversized chunked stream WITHOUT Content-Length -> 413 and stops early
+                stream = _ChunkedStream([b"x" * 1024] * 10)
+                req_stream_413 = types.SimpleNamespace(
+                    headers={"X-Live-Token": "sec-tok", "X-Sync-Lease-Id": "lease-sync-99"},
+                    content_length=None,
+                    remote="127.0.0.1",
+                    app={"hub": hub},
+                    content=stream,
+                )
+                r_stream = await srv.internal_sync_toast(req_stream_413)  # type: ignore[arg-type]
+                self.assertEqual(413, r_stream.status)
+                self.assertEqual(5, stream.chunks_read, "Chunked reader must abort as soon as >4096 bytes")
+
+                # 3d. String/bool session_gen or takeover_gen in JSON body -> 400 and 0 broadcasts
+                for bad_body in (
+                    {"message": "hi", "lease_id": "lease-sync-99", "session_gen": "15", "takeover_gen": 4},
+                    {"message": "hi", "lease_id": "lease-sync-99", "session_gen": 15, "takeover_gen": "4"},
+                    {"message": "hi", "lease_id": "lease-sync-99", "session_gen": True, "takeover_gen": 4},
+                    {"message": "hi", "lease_id": "lease-sync-99", "session_gen": 15, "takeover_gen": True},
+                ):
+                    raw_bytes = json.dumps(bad_body).encode("utf-8")
+                    req_bad_type = types.SimpleNamespace(
+                        headers={"X-Live-Token": "sec-tok", "X-Sync-Lease-Id": "lease-sync-99"},
+                        content_length=len(raw_bytes),
+                        remote="127.0.0.1",
+                        app={"hub": hub},
+                        read=mock.AsyncMock(return_value=raw_bytes),
+                    )
+                    r_bad = await srv.internal_sync_toast(req_bad_type)  # type: ignore[arg-type]
+                    self.assertEqual(400, r_bad.status, f"Expected 400 for {bad_body!r}, got {r_bad.status}")
+
+                self.assertEqual([], ws_owner.events, "Rejected 413/400 requests must emit 0 broadcasts")
+
+        asyncio.run(_scenario())
+
+    def test_workstream_f_p1_4_flush_pending_toasts_local_gate_and_nonfatal_409(self) -> None:
+        """P1-4: _flush_pending_toasts enforces local takeover/gen before every HTTP send; 409 clears without killing mirror; 410 & push 409/410 stop cleanly."""
+        env = _make_clean_cdp_env()
+        env["AGY_LIVE_BROWSER_REQUIRE_PINNED"] = "1"
+        log: list[tuple[str, ...]] = []
+        page = _MockCDPPage("p0", url="about:blank", log=log)
+        ctx = _MockCDPContext([page], log)
+        hub_sess = _MockHubSession()
+        hub_sess.takeover = True
+        hub_sess.session_gen = 20
+        hub_sess.takeover_gen = 3
+        hub_sess.start_resp["session_gen"] = 20
+        hub_sess.start_resp["takeover"] = True
+        hub_sess.start_resp["takeover_gen"] = 3
+
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(ctl, "LiveBrowserClient", side_effect=lambda *_a, **_kw: _build_mock_hub_client(hub_sess)),
+        ):
+            bridge = ctl.SyncLiveBridge(ctx, notify=False)
+            self.assertTrue(bridge.enabled)
+
+            # 1a. Local _last_takeover flips False during failing goto -> 0 HTTP requests to /internal/sync/toast
+            def _goto_flip_takeover(_u: str, **_kw: object) -> None:
+                bridge._last_takeover = False
+                raise RuntimeError("net::ERR_CONNECTION_REFUSED")
+
+            page.goto = _goto_flip_takeover  # type: ignore[method-assign]
+            hub_sess.push_handler = lambda _u, _kw: _MockHTTPResponse(
+                200,
+                {
+                    "ok": True,
+                    "session_gen": 20,
+                    "sync_lease_id": "lease-abc-123",
+                    "takeover": True,
+                    "takeover_gen": 3,
+                    "commands": [{"action": "goto", "url": "https://a.example.com/", "session_gen": 20, "takeover_gen": 3}],
+                },
+            )
+            bridge.sync_checkpoint(ai_status="tk-off", allow_takeover_loop=False)
+            self.assertEqual([], hub_sess.toast_calls, "Local _last_takeover=False must emit 0 /internal/sync/toast requests")
+            self.assertEqual([], bridge._pending_toasts)
+            self.assertTrue(bridge.enabled)
+
+            # 1b. Local _last_takeover_gen bumps during failing goto -> 0 HTTP requests to /internal/sync/toast
+            def _goto_bump_tgen(_u: str, **_kw: object) -> None:
+                bridge._last_takeover_gen = 4
+                raise RuntimeError("net::ERR_CONNECTION_TIMED_OUT")
+
+            page.goto = _goto_bump_tgen  # type: ignore[method-assign]
+            bridge.sync_checkpoint(ai_status="tgen-bump", allow_takeover_loop=False)
+            self.assertEqual([], hub_sess.toast_calls, "Mismatched local _last_takeover_gen must emit 0 /internal/sync/toast requests")
+            self.assertEqual([], bridge._pending_toasts)
+            self.assertTrue(bridge.enabled)
+
+            # 1c. Mid-flush local takeover_gen bump between item 1 and item 2 -> item 2 skipped with 0 extra HTTP request
+            bridge._last_takeover = True
+            bridge._last_takeover_gen = 4
+            bridge._enqueue_nav_toast("⚠️ first", session_gen=20, takeover_gen=4)
+            bridge._enqueue_nav_toast("⚠️ second", session_gen=20, takeover_gen=4)
+
+            def _toast_bump_on_first(_u: str, _kw: object):
+                bridge._last_takeover_gen = 5
+                return _MockHTTPResponse(200, {"ok": True})
+
+            hub_sess.toast_handler = _toast_bump_on_first
+            bridge._flush_pending_toasts()
+            self.assertEqual(1, len(hub_sess.toast_calls), "Must re-verify local takeover_gen before every HTTP toast send")
+
+            # 2. /internal/sync/toast returning 409 (even with non-'takeover' error text) clears queue, 0 retries, and keeps bridge.enabled=True!
+            hub_sess.toast_calls.clear()
+            bridge._last_takeover = True
+            bridge._last_takeover_gen = 5
+            bridge._enqueue_nav_toast("⚠️ err-a", session_gen=20, takeover_gen=5)
+            bridge._enqueue_nav_toast("⚠️ err-b", session_gen=20, takeover_gen=5)
+            hub_sess.toast_handler = lambda _u, _kw: _MockHTTPResponse(409, {"ok": False, "error": "No verified session owner"})
+            bridge._flush_pending_toasts()
+            self.assertEqual(1, len(hub_sess.toast_calls), "409 must abort flush immediately with 0 retries")
+            self.assertEqual([], bridge._pending_toasts, "409 must clear pending toasts")
+            self.assertTrue(bridge.enabled, "409 on /internal/sync/toast MUST NOT disable a healthy live mirror")
+
+            # 3. /internal/sync/push returning 409 cleanly disables bridge with 0 page/ctx close
+            bridge._enqueue_nav_toast("⚠️ queued", session_gen=20, takeover_gen=5)
+            hub_sess.push_handler = lambda _u, _kw: _MockHTTPResponse(409, {"ok": False, "error": "Lease conflict"})
+            bridge.sync_checkpoint(ai_status="push-409", allow_takeover_loop=False)
+            self.assertFalse(bridge.enabled, "sync/push 409 must cleanly disable bridge")
+            self.assertEqual([], bridge._pending_toasts)
+            self.assertEqual(0, page.close_calls)
+            self.assertEqual(0, ctx.close_calls)
 
 
 if __name__ == "__main__":

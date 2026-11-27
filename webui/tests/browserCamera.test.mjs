@@ -10,7 +10,9 @@ import {
   cycleMobileViewMode,
   formatCompactUrlLabel,
   getDefaultViewMode,
+  isBlankBrowserUrl,
   isPortraitNarrowViewport,
+  normalizeNavigableUrl,
   remoteToStagePoint,
   stageToRemotePoint,
   zoomCameraAroundAnchor,
@@ -250,4 +252,112 @@ test("cycleMobileViewMode and formatCompactUrlLabel behave predictably", () => {
   assert.equal(formatCompactUrlLabel("https://example.com/", "Home", true), "example.com");
   assert.equal(formatCompactUrlLabel("", "My Tab", true), "My Tab");
   assert.equal(formatCompactUrlLabel("https://example.com", "Home", false), "浏览器待机中");
+});
+
+test("isBlankBrowserUrl detects blank and new-tab URLs case-insensitively with trailing slashes", () => {
+  for (const blank of [
+    "",
+    "   ",
+    null,
+    undefined,
+    "about:blank",
+    "ABOUT:BLANK",
+    "  about:blank/  ",
+    "about:newtab",
+    "About:NewTab/",
+    "chrome://newtab",
+    "CHROME://NEWTAB/",
+    "chrome://newtab///",
+  ]) {
+    assert.equal(isBlankBrowserUrl(blank), true, `Expected blank for ${String(blank)}`);
+  }
+
+  for (const nonBlank of [
+    "https://example.com",
+    "http://localhost:3000/app",
+    "about:blank?x=1",
+    "chrome://settings",
+    "example.com",
+  ]) {
+    assert.equal(isBlankBrowserUrl(nonBlank), false, `Expected non-blank for ${nonBlank}`);
+  }
+});
+
+test("normalizeNavigableUrl accepts valid URLs and rejects dangerous schemes, control chars, and invalid hosts", () => {
+  const validCases = [
+    ["https://example.com/path?q=1", "https://example.com/path?q=1"],
+    ["http://example.com:8080/test", "http://example.com:8080/test"],
+    ["  ABOUT:BLANK  ", "about:blank"],
+    ["example.com", "https://example.com/"],
+    ["example.com/search?q=1", "https://example.com/search?q=1"],
+    ["example.com:8443/login", "https://example.com:8443/login"],
+    ["localhost:3000/dashboard", "https://localhost:3000/dashboard"],
+    ["127.0.0.1:8080/health", "https://127.0.0.1:8080/health"],
+  ];
+  for (const [input, expected] of validCases) {
+    const res = normalizeNavigableUrl(input);
+    assert.equal(res.ok, true, `Expected valid for ${JSON.stringify(input)}, got ${JSON.stringify(res)}`);
+    if (res.ok) {
+      assert.equal(res.url, expected);
+    }
+  }
+
+  const invalidCases = [
+    "",
+    "   ",
+    "javascript:alert(1)",
+    "JAVASCRIPT:alert(1)",
+    "data:text/html,<script>alert(1)</script>",
+    "DATA:text/plain;base64,SGVsbG8=",
+    "file:///etc/passwd",
+    "FILE:///etc/hosts",
+    "vbscript:msgbox(1)",
+    "blob:https://example.com/uuid",
+    "chrome://settings",
+    "about:srcdoc",
+    "ftp://example.com/file",
+    "http://",
+    "https://",
+    "https://:80",
+    "http:example.com",
+    "foo bar",
+    "example.com/a b",
+    "https://example.com\nX-Injected: 1",
+    "https://example.com\r\n",
+    "\x00https://example.com",
+    "//example.com",
+    "\\\\example.com",
+    "\\\\example.com/path",
+    "\\example.com",
+    "https:///example.com",
+    "http:///example.com",
+    "https://\\example.com",
+    "http://\\example.com",
+    "https:/\\example.com",
+    "https://example.com:0",
+    "http://example.com:0/path",
+    "example.com:0",
+    "example.com:0/app",
+    "localhost:0",
+    ":8080",
+    "justword",
+  ];
+  for (const bad of invalidCases) {
+    const res = normalizeNavigableUrl(bad);
+    assert.equal(res.ok, false, `Expected invalid for ${JSON.stringify(bad)}, got ${JSON.stringify(res)}`);
+    if (!res.ok) {
+      assert.ok(res.error.length > 0, `Expected non-empty error for ${JSON.stringify(bad)}`);
+      assert.ok(!/https?:\/\//i.test(res.error), `Error message must not contain raw external URL: ${res.error}`);
+    }
+  }
+
+  // P1-3: Oversized unsupported scheme name must be truncated in error message (<= 24 chars + ellipsis)
+  const longScheme = "a".repeat(200);
+  const longSchemeRes = normalizeNavigableUrl(`${longScheme}:payload`);
+  assert.equal(longSchemeRes.ok, false);
+  if (!longSchemeRes.ok) {
+    assert.ok(longSchemeRes.error.includes(`${"a".repeat(24)}…`), `Expected truncated scheme in ${longSchemeRes.error}`);
+    assert.ok(!longSchemeRes.error.includes("a".repeat(30)), `Scheme must not echo >24 chars: ${longSchemeRes.error}`);
+    assert.ok(longSchemeRes.error.length < 80, `Error message too long: ${longSchemeRes.error.length}`);
+  }
 });
