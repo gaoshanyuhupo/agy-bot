@@ -1813,6 +1813,385 @@ class TestStudioBrowserControlStage1(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([(54322, signal.SIGKILL)], killpg_calls_2)
         self.assertEqual([0.05, 1.0], observed_timeouts_2)
 
+    async def test_workstream_e_c2_placeholder_skip_no_fake_200_orphan_cleanup_and_owner_bot_id(self) -> None:
+        """C2 & owner_bot_id: skip placeholder ai_status, prevent fake 200 after attach, cleanup orphan container, normalize owner_bot_id."""
+        admin_hdrs, _ = await self._login("admin", PASS_ADMIN)
+
+        fake_ext_cli = self.tmp / "fake_ext_wse.sh"
+        fake_ext_cli.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        os.chmod(fake_ext_cli, 0o700)
+        self.browser_svc._external_cli_override = str(fake_ext_cli)
+        self.browser_svc._external_attach_poll_interval = 0.02
+
+        # Patch mock_hub status to support optional `ai_status` / `has_frame` / `url`
+        extra_status: dict[str, object] = {}
+        orig_fetch = self.browser_svc._fetch_hub_status
+
+        async def _fetch_with_extra(http_session, sess):
+            st = await orig_fetch(http_session, sess)
+            st.update(extra_status)
+            return st
+
+        self.browser_svc._fetch_hub_status = _fetch_with_extra  # type: ignore[method-assign]
+
+        # 1. Placeholder `ai_status == "已启动同步浏览器会话"` is skipped; when watch_proc exits during placeholder
+        #    -> returns scrubbed HTTP 500 (NOT fake 200!) and invokes `cli --profile default stop` to clean up container
+        cmds_1: list[tuple[str, ...]] = []
+        poll_ticks = [0]
+
+        async def _exec_placeholder_fail(*cmd, **kw):
+            tcmd = tuple(str(c) for c in cmd)
+            cmds_1.append(tcmd)
+            if "status" in tcmd:
+                return _FakeSubprocess(tcmd, stdout=b"Live view: inactive\nContainer: ext-browser (stopped)\n")
+            if "live" in tcmd:
+                self.mock_hub.running = True
+                self.mock_hub.engine_mode = "sync_external"
+                self.mock_hub.profile = "default"
+                extra_status.clear()
+                extra_status.update({"ai_status": "已启动同步浏览器会话", "has_frame": False, "url": ""})
+                err_json = json.dumps(
+                    {"ok": False, "reason": "google_nav_blocked", "error": "外部 CDP 会话未获 Google 域白名单授权"},
+                    ensure_ascii=False,
+                ).encode("utf-8")
+                wp = _FakeSubprocess(tcmd, rc=1, stdout=err_json, block_until_terminated=True)
+
+                async def _kill_soon() -> None:
+                    await asyncio.sleep(0.05)
+                    wp.returncode = 1
+                    self.mock_hub.running = False
+                    self.mock_hub.engine_mode = "idle"
+
+                asyncio.create_task(_kill_soon())
+                return wp
+            return _FakeSubprocess(tcmd, stdout=b"ok\n")
+
+        self.browser_svc._subprocess_exec = _exec_placeholder_fail
+        r_ph = await self.client.post(
+            "/api/browser/launch",
+            json={"engine": "external_chromium", "profile": "default", "url": "https://mail.google.com/"},
+            headers=admin_hdrs,
+        )
+        self.assertEqual(500, r_ph.status, "Placeholder sync_start followed by early exit MUST return 500, never fake 200")
+        d_ph = await r_ph.json()
+        self.assertIn("Google 域白名单", d_ph["error"])
+        self.assertIn(
+            (str(fake_ext_cli), "--profile", "default", "stop"),
+            cmds_1,
+            "Failed external launch must invoke `cli --profile default stop` to reclaim newly started container",
+        )
+
+        # 2. Watch exits right AFTER `/internal/takeover` -> post-liveness check catches it, returns 500 + stops container
+        cmds_2: list[tuple[str, ...]] = []
+        extra_status.clear()
+        orig_hub_req = self.browser_svc._hub_request
+        watch_holder: list[_FakeSubprocess] = []
+
+        async def _hub_req_kill_after_takeover(http_session, method, path, **kw):
+            sc, data = await orig_hub_req(http_session, method, path, **kw)
+            if path == "/internal/takeover" and watch_holder:
+                watch_holder[0].returncode = 1
+                self.mock_hub.running = False
+                self.mock_hub.engine_mode = "idle"
+            return sc, data
+
+        async def _exec_die_post_takeover(*cmd, **kw):
+            tcmd = tuple(str(c) for c in cmd)
+            cmds_2.append(tcmd)
+            if "status" in tcmd:
+                return _FakeSubprocess(tcmd, stdout=b"Live view: inactive\nContainer: ext-browser (stopped)\n")
+            if "live" in tcmd:
+                self.mock_hub.running = True
+                self.mock_hub.engine_mode = "sync_external"
+                self.mock_hub.profile = "default"
+                extra_status.update({"ai_status": "已接入外部 CDP 实时镜像", "has_frame": True, "url": "https://example.org"})
+                wp = _FakeSubprocess(tcmd, rc=1, stderr=b"CDP target died post-takeover\n", block_until_terminated=True)
+                watch_holder.append(wp)
+                return wp
+            return _FakeSubprocess(tcmd, stdout=b"ok\n")
+
+        self.browser_svc._subprocess_exec = _exec_die_post_takeover
+        with mock.patch.object(self.browser_svc, "_hub_request", side_effect=_hub_req_kill_after_takeover):
+            r_post = await self.client.post(
+                "/api/browser/launch",
+                json={"engine": "external_chromium", "profile": "default", "manual_launch": True},
+                headers=admin_hdrs,
+            )
+        self.assertEqual(500, r_post.status, "Watch dying right after takeover MUST return 500, never fake 200")
+        self.assertIn((str(fake_ext_cli), "--profile", "default", "stop"), cmds_2)
+
+        # 3. owner_bot_id string normalization across HTTP /api/browser/owner-bot and WS rebind_owner_bot
+        with mock.patch.object(
+            self.browser_svc,
+            "_lookup_roster_bot",
+            return_value={"handle": "dev_worker", "bot_id": "202002"},
+        ):
+            r_ob = await self.client.post(
+                "/api/browser/owner-bot",
+                json={"owner_bot": "dev_worker"},
+                headers=admin_hdrs,
+            )
+            self.assertEqual(200, r_ob.status)
+            d_ob = await r_ob.json()
+            self.assertEqual(202002, d_ob["owner_bot_id"])
+            self.assertEqual(202002, self.mock_hub.owner_bot_calls[-1].get("owner_bot_id"))
+
+        # WS rebind_owner_bot without owner_bot_id gets canonical int owner_bot_id injected from roster
+        with mock.patch.object(
+            self.browser_svc.data_sources,
+            "get_browser_bots",
+            return_value={"ok": True, "total": 1, "bots": [{"handle": "dev_worker", "bot_id": "303003"}]},
+        ):
+            async with self.client.ws_connect(
+                "/ws/browser",
+                headers={"Cookie": admin_hdrs["Cookie"], "Origin": admin_hdrs["Origin"]},
+            ) as ws:
+                auth_msg = await ws.receive_json()
+                self.assertEqual("auth_ok", auth_msg["type"])
+                self.mock_hub.ws_received.clear()
+                await ws.send_json({"type": "rebind_owner_bot", "owner_bot": "@" + "dev_worker", "req_id": "rb-wse"})
+                ack_msg = await ws.receive_json()
+                self.assertEqual("echo", ack_msg["type"])
+                rb_sent = [m for m in self.mock_hub.ws_received if m.get("type") == "rebind_owner_bot"]
+                self.assertEqual(1, len(rb_sent))
+                self.assertEqual(303003, rb_sent[0].get("owner_bot_id"))
+
+        self.assertEqual(0, poll_ticks[0])
+
+    async def test_workstream_e_round2_f1_ws_rebind_roster_authority_and_dirty_bot_id_strip(self) -> None:
+        """F1: WS rebind_owner_bot enforces Studio Roster authoritative bot_id and strips invalid/forged owner_bot_id."""
+        admin_hdrs, _ = await self._login("admin", PASS_ADMIN)
+
+        roster_fixture = {
+            "ok": True,
+            "total": 3,
+            "bots": [
+                {"handle": "main_bot", "bot_id": 101},
+                {"handle": "str_bot", "bot_id": "404"},
+                {"handle": "bad_id_bot", "bot_id": "0123"},
+            ],
+        }
+
+        with mock.patch.object(
+            self.browser_svc.data_sources,
+            "get_browser_bots",
+            return_value=roster_fixture,
+        ):
+            async with self.client.ws_connect(
+                "/ws/browser",
+                headers={"Cookie": admin_hdrs["Cookie"], "Origin": admin_hdrs["Origin"]},
+            ) as ws:
+                auth_msg = await ws.receive_json()
+                self.assertEqual("auth_ok", auth_msg["type"])
+
+                # 1. Forged client owner_bot_id=202 for roster member main_bot -> forcibly overwritten with authoritative 101
+                self.mock_hub.ws_received.clear()
+                await ws.send_json(
+                    {
+                        "type": "rebind_owner_bot",
+                        "owner_bot": "main_bot",
+                        "owner_bot_id": 202,
+                        "req_id": "f1-forge",
+                    }
+                )
+                ack = await ws.receive_json()
+                self.assertEqual("echo", ack["type"])
+                sent = [m for m in self.mock_hub.ws_received if m.get("type") == "rebind_owner_bot"]
+                self.assertEqual(1, len(sent))
+                self.assertEqual(101, sent[0].get("owner_bot_id"))
+                self.assertIs(type(sent[0].get("owner_bot_id")), int)
+
+                # 2. Roster string bot_id "404" overrides invalid client "0123" with canonical int 404
+                self.mock_hub.ws_received.clear()
+                await ws.send_json(
+                    {
+                        "type": "rebind_owner_bot",
+                        "owner_bot": "@" + "str_bot",
+                        "owner_bot_id": "0123",
+                        "req_id": "f1-str",
+                    }
+                )
+                await ws.receive_json()
+                sent = [m for m in self.mock_hub.ws_received if m.get("type") == "rebind_owner_bot"]
+                self.assertEqual(404, sent[0].get("owner_bot_id"))
+
+                # 3. Roster entry with invalid leading-zero bot_id "0123" -> strips forged client owner_bot_id
+                self.mock_hub.ws_received.clear()
+                await ws.send_json(
+                    {
+                        "type": "rebind_owner_bot",
+                        "owner_bot": "bad_id_bot",
+                        "owner_bot_id": 999,
+                        "req_id": "f1-bad-roster-id",
+                    }
+                )
+                await ws.receive_json()
+                sent = [m for m in self.mock_hub.ws_received if m.get("type") == "rebind_owner_bot"]
+                self.assertNotIn("owner_bot_id", sent[0])
+
+                # 4. Unlisted owner_bot while Roster is configured -> strips client owner_bot_id (aligned with HTTP)
+                self.mock_hub.ws_received.clear()
+                await ws.send_json(
+                    {
+                        "type": "rebind_owner_bot",
+                        "owner_bot": "unlisted_bot",
+                        "owner_bot_id": 888,
+                        "req_id": "f1-unlisted",
+                    }
+                )
+                await ws.receive_json()
+                sent = [m for m in self.mock_hub.ws_received if m.get("type") == "rebind_owner_bot"]
+                self.assertNotIn("owner_bot_id", sent[0])
+
+                # 5. Missing owner_bot with dirty "0123" / bool / negative -> stripped
+                for bad_bid in ("0123", True, 0, -5, "abc"):
+                    self.mock_hub.ws_received.clear()
+                    await ws.send_json(
+                        {
+                            "type": "rebind_owner_bot",
+                            "owner_bot_id": bad_bid,
+                            "req_id": f"f1-dirty-{bad_bid}",
+                        }
+                    )
+                    await ws.receive_json()
+                    sent = [m for m in self.mock_hub.ws_received if m.get("type") == "rebind_owner_bot"]
+                    self.assertNotIn(
+                        "owner_bot_id",
+                        sent[0],
+                        f"Dirty owner_bot_id={bad_bid!r} must be stripped",
+                    )
+
+        # 6. Empty Roster fallback still strips invalid "0123"/bool/<=0 and normalizes valid string int
+        with mock.patch.object(
+            self.browser_svc.data_sources,
+            "get_browser_bots",
+            return_value={"ok": True, "total": 0, "bots": []},
+        ):
+            async with self.client.ws_connect(
+                "/ws/browser",
+                headers={"Cookie": admin_hdrs["Cookie"], "Origin": admin_hdrs["Origin"]},
+            ) as ws:
+                await ws.receive_json()
+                for bad_bid in ("0123", True, 0, -9, " 123 "):
+                    self.mock_hub.ws_received.clear()
+                    await ws.send_json(
+                        {
+                            "type": "rebind_owner_bot",
+                            "owner_bot": "any_bot",
+                            "owner_bot_id": bad_bid,
+                        }
+                    )
+                    await ws.receive_json()
+                    sent = [m for m in self.mock_hub.ws_received if m.get("type") == "rebind_owner_bot"]
+                    self.assertNotIn("owner_bot_id", sent[0], f"Empty roster must strip dirty {bad_bid!r}")
+
+    async def test_workstream_e_round2_f2_preserve_preexisting_cdp_container_and_cas_expected_proc(self) -> None:
+        """F2: Launch failure must NEVER stop a pre-existing running CDP container; _stop_external_watch CAS protects newer sessions."""
+        admin_hdrs, _ = await self._login("admin", PASS_ADMIN)
+
+        fake_ext_cli = self.tmp / "fake_ext_f2.sh"
+        fake_ext_cli.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        os.chmod(fake_ext_cli, 0o700)
+        self.browser_svc._external_cli_override = str(fake_ext_cli)
+        self.browser_svc._external_attach_poll_interval = 0.02
+
+        # 1. Pre-existing running CDP container (Container: running, CDP: 127.0.0.1:19222, Live view: inactive)
+        #    Launch fails early -> HTTP 500, watch_proc cleaned up, ZERO `cli --profile default stop`!
+        cmds_pre: list[tuple[str, ...]] = []
+
+        async def _exec_preexisting_fail(*cmd, **kw):
+            tcmd = tuple(str(c) for c in cmd)
+            cmds_pre.append(tcmd)
+            if "status" in tcmd:
+                return _FakeSubprocess(
+                    tcmd,
+                    stdout=b"Container: ext-browser (running)\nCDP: 127.0.0.1:19222\nLive view: inactive\n",
+                )
+            if "live" in tcmd:
+                wp = _FakeSubprocess(
+                    tcmd,
+                    rc=1,
+                    stdout=b'{"ok":false,"error":"CDP attach failed"}\n',
+                    block_until_terminated=True,
+                )
+
+                async def _exit_soon() -> None:
+                    await asyncio.sleep(0.03)
+                    wp.returncode = 1
+
+                asyncio.create_task(_exit_soon())
+                return wp
+            return _FakeSubprocess(tcmd, stdout=b"ok\n")
+
+        self.browser_svc._subprocess_exec = _exec_preexisting_fail
+        r_pre = await self.client.post(
+            "/api/browser/launch",
+            json={"engine": "external_chromium", "profile": "default"},
+            headers=admin_hdrs,
+        )
+        self.assertEqual(500, r_pre.status)
+        self.assertNotIn(
+            (str(fake_ext_cli), "--profile", "default", "stop"),
+            cmds_pre,
+            "Failure attaching to a pre-existing running CDP container MUST NOT execute `stop`",
+        )
+
+        # 2. Pre-existing Live view: active -> HTTP 409 and ZERO `stop`
+        cmds_live: list[tuple[str, ...]] = []
+
+        async def _exec_live_active(*cmd, **kw):
+            tcmd = tuple(str(c) for c in cmd)
+            cmds_live.append(tcmd)
+            if "status" in tcmd:
+                return _FakeSubprocess(
+                    tcmd,
+                    stdout=b"Container: ext-browser (running)\nCDP: 127.0.0.1:19222\nLive view: active\n",
+                )
+            return _FakeSubprocess(tcmd, stdout=b"ok\n")
+
+        self.browser_svc._subprocess_exec = _exec_live_active
+        r_409 = await self.client.post(
+            "/api/browser/launch",
+            json={"engine": "external_chromium", "profile": "default"},
+            headers=admin_hdrs,
+        )
+        self.assertEqual(409, r_409.status)
+        self.assertNotIn((str(fake_ext_cli), "--profile", "default", "stop"), cmds_live)
+
+        # 3. Concurrent replacement CAS: old launch calling _stop_external_watch(expected_proc=old_proc, stop_external_profile=True)
+        #    terminates ONLY old_proc without clearing new_proc slot, killing new_proc, or invoking external `stop`.
+        stop_cmds_cas: list[tuple[str, ...]] = []
+
+        async def _exec_record_stop(*cmd, **kw):
+            tcmd = tuple(str(c) for c in cmd)
+            stop_cmds_cas.append(tcmd)
+            return _FakeSubprocess(tcmd, stdout=b"ok\n")
+
+        self.browser_svc._subprocess_exec = _exec_record_stop
+        old_proc = _FakeSubprocess((str(fake_ext_cli), "--profile", "default", "live", "--watch"), block_until_terminated=True)
+        new_proc = _FakeSubprocess((str(fake_ext_cli), "--profile", "default", "live", "--watch"), block_until_terminated=True)
+        new_task: asyncio.Task[None] = asyncio.create_task(asyncio.sleep(60))
+
+        async with self.browser_svc._ext_lock:
+            self.browser_svc._ext_watch_proc = new_proc
+            self.browser_svc._ext_watch_meta = {"profile": "default", "owner_bot": "main_bot"}
+            self.browser_svc._ext_watch_stderr_task = new_task
+
+        try:
+            stopped_slot = await self.browser_svc._stop_external_watch(
+                stop_external_profile=True,
+                expected_proc=old_proc,
+            )
+            self.assertFalse(stopped_slot, "CAS mismatch must return False without clearing active slot")
+            self.assertIsNotNone(old_proc.returncode, "Stale expected_proc must still be safely terminated")
+            self.assertIs(self.browser_svc._ext_watch_proc, new_proc, "Active new_proc slot must remain untouched")
+            self.assertIsNone(new_proc.returncode, "Active new_proc must NOT be terminated")
+            self.assertEqual("default", self.browser_svc._ext_watch_meta.get("profile"))
+            self.assertFalse(new_task.cancelled(), "Active new session stderr_task must NOT be cancelled")
+            self.assertEqual([], stop_cmds_cas, "Stale CAS cleanup must NEVER execute external CLI stop")
+        finally:
+            await self.browser_svc._stop_external_watch(stop_external_profile=False)
+
     def test_bm8_stage1_core_files_zero_private_literals(self) -> None:
         """BM8: Stage 1 core modules contain zero hardcoded host paths or private vault prefixes."""
         forbidden_tokens = (
@@ -2005,6 +2384,62 @@ class TestBrowserPortraitCameraAndInvariants(unittest.TestCase):
         self.assertIn("pt-12 sm:px-5 sm:pb-5 sm:pt-6", src)
         self.assertIn("rounded-2xl", src)
         self.assertIn("leading-snug break-words", src)
+
+    def test_workstream_e_c6_portrait_topbar_stop_button_modal_and_live_rbac_guards(self) -> None:
+        """C6: Portrait top-bar stop button, 2-step confirm modal, live RBAC/state auto-close, 375px flex safety, dist rebuilt."""
+        import re
+
+        src = (REPO_ROOT / "webui/src/components/BrowserView.tsx").read_text(encoding="utf-8")
+
+        # 1. Zero XSS sink & zero private host/vault literals
+        self.assertNotIn("dangerouslySetInnerHTML", src)
+        for forbidden in ("/" + "home" + "/" + "ubuntu", "lv" + "1/", "lv" + "2/"):
+            self.assertNotIn(forbidden, src)
+
+        # 2. Portrait top-bar prominent red stop button strictly gated by admin && running && !session_restricted
+        m_btn = re.search(
+            r'\{liveRole === "admin" && state\.running && !state\.session_restricted && \(\s*<button[\s\S]*?data-testid="mobile-topbar-stop-btn"[\s\S]*?<span>关闭</span>[\s\S]*?</button>\s*\)\}',
+            src,
+        )
+        self.assertIsNotNone(m_btn, "C6: portrait top-bar red stop button must be gated on admin && running && !session_restricted")
+        assert m_btn is not None
+        self.assertIn("shrink-0", m_btn.group(0))
+        self.assertIn("setStopConfirmModalOpen(true)", m_btn.group(0))
+        # Center URL pill keeps flex-1 min-w-0 for 375px zero horizontal overflow
+        self.assertIn("flex-1 min-w-0 h-8 rounded-lg", src)
+
+        # 3. Secondary confirmation modal gated on stopConfirmModalOpen && admin && running && !session_restricted
+        m_modal = re.search(
+            r'\{stopConfirmModalOpen && liveRole === "admin" && state\.running && !state\.session_restricted && \([\s\S]*?data-testid="mobile-stop-confirm-modal"[\s\S]*?data-testid="mobile-stop-confirm-submit"[\s\S]*?<span>确认关闭</span>[\s\S]*?\)\}',
+            src,
+        )
+        self.assertIsNotNone(m_modal, "C6: stop confirmation modal must be strictly gated and include confirm button")
+        assert m_modal is not None
+        modal_body = m_modal.group(0)
+        self.assertIn("activeEngineLabel", modal_body)
+        self.assertIn("state.profile", modal_body)
+        self.assertIn("disabled={stopping}", modal_body)
+        self.assertIn("取消", modal_body)
+
+        # 4. Auto-close useEffect & live WS/submit guards on role downgrade / stop / session_restricted
+        self.assertIn("const canStopBrowser =", src)
+        self.assertIn("if (!canStopBrowser) {", src)
+        self.assertGreaterEqual(src.count("setStopConfirmModalOpen(false);"), 6)
+        self.assertIn('roleRef.current !== "admin"', src)
+
+        # 5. Fallback stop entry in "更多" drawer preserved
+        self.assertIn("confirmMobileStop", src)
+        self.assertIn("停止当前浏览器会话", src)
+
+        # 6. When built dist assets exist (webui/dist is gitignored in clean CI/public checkouts),
+        # verify the JS bundle has been rebuilt with the new testid/label
+        dist_dir = REPO_ROOT / "webui/dist/assets"
+        if dist_dir.is_dir():
+            js_bundles = list(dist_dir.glob("*.js"))
+            self.assertTrue(js_bundles, "webui/dist/assets must contain built JS bundle")
+            bundle_txt = "".join(p.read_text(encoding="utf-8", errors="ignore") for p in js_bundles)
+            self.assertIn("mobile-topbar-stop-btn", bundle_txt)
+            self.assertIn("mobile-stop-confirm-modal", bundle_txt)
 
 
 if __name__ == "__main__":

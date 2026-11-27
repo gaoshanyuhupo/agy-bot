@@ -619,8 +619,8 @@ class SyncLiveBridge:
                     start_tgen = _parse_strict_int_no_ws(start_data.get("takeover_gen"))
                     if start_tgen is not None:
                         self._last_takeover_gen = start_tgen
-                    self._pinned_verified = bool(start_data.get("pinned_verified"))
-                    self._allow_google_verified = bool(start_data.get("allow_google_verified"))
+                    self._pinned_verified = start_data.get("pinned_verified") is True
+                    self._allow_google_verified = start_data.get("allow_google_verified") is True
             except Exception as exc:
                 self._last_error = str(exc) or type(exc).__name__
                 self.enabled = False
@@ -1061,6 +1061,8 @@ class SyncLiveBridge:
         """Enforce non-pinned / unauthorized Google domain navigation block matching hosted policy."""
         if getattr(self, "_pinned_verified", False):
             return False
+        if getattr(self, "_allow_google_verified", False):
+            return False
         try:
             script_dir = str(Path(__file__).resolve().parent)
             if script_dir not in sys.path:
@@ -1071,7 +1073,7 @@ class SyncLiveBridge:
                 _srv.enforce_google_profile_policy(
                     url,
                     is_pinned=False,
-                    allow_google=bool(getattr(self, "_allow_google_verified", False)),
+                    allow_google=False,
                     profile_name=getattr(self, "_profile_name", None),
                     profile_dir=getattr(self, "_profile_dir", None),
                 )
@@ -1809,6 +1811,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_cdp.add_argument("--url", default=None, help="Optional initial http(s):// URL to open after attaching.")
     p_cdp.add_argument("--no-notify", action="store_true", help="Skip sending Telegram Live Card.")
+    p_cdp.add_argument("--profile", default=None, help="Optional profile name label for the attached external CDP session.")
+    p_cdp.add_argument(
+        "--profile-dir",
+        dest="profile_dir",
+        default=None,
+        help="Optional absolute host profile directory path for external Google whitelist verification.",
+    )
+    p_cdp.add_argument(
+        "--allow-google",
+        dest="allow_google",
+        action="store_true",
+        default=False,
+        help="Request Google domain access for a host-whitelisted external profile directory.",
+    )
 
     return p
 
@@ -1839,6 +1855,9 @@ def main(argv: list[str] | None = None) -> int:
                 bot=args.bot,
                 user_id=args.user_id,
                 notify=False if args.no_notify else None,
+                profile=args.profile,
+                profile_dir=args.profile_dir,
+                allow_google=bool(args.allow_google),
             )
         else:
             cli = LiveBrowserClient(bot=args.bot, user_id=args.user_id)

@@ -291,6 +291,24 @@ def _validate_strict_bool(raw: Any, field: str) -> bool:
     return raw
 
 
+def _parse_positive_bot_id(raw: Any) -> int | None:
+    """Normalize a positive integer or ASCII digit string bot_id; reject bool/non-positive/malformed."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw if raw > 0 else None
+    if isinstance(raw, str):
+        if not raw or any(ch.isspace() for ch in raw):
+            return None
+        if not raw.isascii() or not raw.isdigit():
+            return None
+        if len(raw) > 1 and raw.startswith("0"):
+            return None
+        val = int(raw)
+        return val if val > 0 else None
+    return None
+
+
 def _validate_profile_name(raw: Any) -> str:
     if not isinstance(raw, str):
         raise ValueError("Profile 名称必须为字符串")
@@ -663,15 +681,30 @@ class StudioBrowserControlService:
             return True
         return str(self._ext_watch_meta.get("profile") or "") == profile
 
-    async def _stop_external_watch(self, *, stop_external_profile: bool = False) -> bool:
+    async def _stop_external_watch(
+        self,
+        *,
+        stop_external_profile: bool = False,
+        expected_proc: Any | None = None,
+    ) -> bool:
         async with self._ext_lock:
-            proc = self._ext_watch_proc
-            meta = dict(self._ext_watch_meta)
-            stderr_task = self._ext_watch_stderr_task
-            self._ext_watch_proc = None
-            self._ext_watch_meta = {}
-            self._ext_watch_stderr_task = None
-            self._ext_watch_stderr_buf.clear()
+            if expected_proc is not None and self._ext_watch_proc is not expected_proc:
+                stale_proc = expected_proc
+                proc = None
+                meta: dict[str, Any] = {}
+                stderr_task = None
+            else:
+                stale_proc = None
+                proc = self._ext_watch_proc
+                meta = dict(self._ext_watch_meta)
+                stderr_task = self._ext_watch_stderr_task
+                self._ext_watch_proc = None
+                self._ext_watch_meta = {}
+                self._ext_watch_stderr_task = None
+                self._ext_watch_stderr_buf.clear()
+        if stale_proc is not None:
+            await self._terminate_proc_group(stale_proc, grace_sec=self._external_watch_stop_grace)
+            return False
         if proc is not None:
             await self._terminate_proc_group(proc, grace_sec=self._external_watch_stop_grace)
         if stderr_task is not None:
@@ -1593,7 +1626,7 @@ class StudioBrowserControlService:
             )
 
         norm_handle = str(roster_entry["handle"])
-        bot_id = roster_entry.get("bot_id")
+        bot_id = _parse_positive_bot_id(roster_entry.get("bot_id"))
         hub_payload: dict[str, Any] = {
             "owner_bot": norm_handle,
             "source": "tg_cmd",
@@ -1601,7 +1634,7 @@ class StudioBrowserControlService:
             "bot": str(sess["bot"]),
             "user_id": int(sess["user_id"]),
         }
-        if isinstance(bot_id, int) and bot_id > 0:
+        if bot_id is not None:
             hub_payload["owner_bot_id"] = bot_id
         if body.get("expected_session_gen") is not None:
             hub_payload["expected_session_gen"] = body["expected_session_gen"]
@@ -1618,7 +1651,7 @@ class StudioBrowserControlService:
             return web.json_response({"ok": False, "source": "upstream", "error": err_msg}, status=sc)
 
         self._default_owner_bot = norm_handle
-        self._default_owner_bot_id = bot_id if isinstance(bot_id, int) and bot_id > 0 else None
+        self._default_owner_bot_id = bot_id
         if self._ext_watch_meta:
             self._ext_watch_meta["owner_bot"] = norm_handle
             self._ext_watch_meta["owner_bot_id"] = self._default_owner_bot_id
@@ -1714,7 +1747,7 @@ class StudioBrowserControlService:
             vault_ref = resolved_ref[1]
 
         owner_bot: str | None = self._default_owner_bot
-        owner_bot_id: int | None = self._default_owner_bot_id
+        owner_bot_id: int | None = _parse_positive_bot_id(self._default_owner_bot_id)
         if body.get("owner_bot") is not None and str(body.get("owner_bot")).strip():
             roster_entry = self._lookup_roster_bot(body.get("owner_bot"))
             if roster_entry is None:
@@ -1724,10 +1757,14 @@ class StudioBrowserControlService:
                     status=400,
                 )
             owner_bot = str(roster_entry["handle"])
-            raw_bid = roster_entry.get("bot_id")
-            owner_bot_id = int(raw_bid) if isinstance(raw_bid, int) and raw_bid > 0 else None
+            owner_bot_id = _parse_positive_bot_id(roster_entry.get("bot_id"))
             self._default_owner_bot = owner_bot
             self._default_owner_bot_id = owner_bot_id
+        elif owner_bot and owner_bot_id is None:
+            roster_entry = self._lookup_roster_bot(owner_bot)
+            if roster_entry is not None:
+                owner_bot_id = _parse_positive_bot_id(roster_entry.get("bot_id"))
+                self._default_owner_bot_id = owner_bot_id
 
         http_session = request.app[HTTP_SESSION_KEY]
 
@@ -1882,8 +1919,13 @@ class StudioBrowserControlService:
             log.warning("External chromium status probe failed for %s: %s", profile, type(exc).__name__)
             rc_st, out_st = -1, ""
 
+        container_preexisted = False
         if rc_st == 0:
             st_flags = _parse_external_status_output(out_st)
+            container_preexisted = bool(
+                st_flags["container_running"]
+                and not (st_flags["cdp_disabled"] and st_flags["live_inactive"])
+            )
             if st_flags["live_active"]:
                 err_msg = f"外部 Chromium Profile '{profile}' 已有活跃的 Live 直播桥在运行，请先停止后再试"
                 self.audit.record(
@@ -1984,7 +2026,7 @@ class StudioBrowserControlService:
                 "started_at": time.monotonic(),
             }
 
-        # 3. Wait for Hub sync_external attachment
+        # 3. Wait for Hub sync_external attachment (skipping transient `/internal/sync/start` placeholder state)
         deadline = time.monotonic() + self._external_attach_timeout
         attached = False
         latest_st: dict[str, Any] = {}
@@ -1997,7 +2039,10 @@ class StudioBrowserControlService:
                         pass
                 diag = self._format_stderr_tail(stderr_buf)
                 exit_rc = watch_proc.returncode
-                await self._stop_external_watch()
+                await self._stop_external_watch(
+                    stop_external_profile=not container_preexisted,
+                    expected_proc=watch_proc,
+                )
                 audit_err = f"watch_exited_early:{diag}" if diag else "watch_exited_early"
                 self.audit.record(
                     action="browser_launch",
@@ -2019,13 +2064,22 @@ class StudioBrowserControlService:
                 )
             latest_st = await self._fetch_hub_status(http_session, sess)
             if latest_st.get("running") and latest_st.get("engine_mode") == "sync_external":
+                ai_st = latest_st.get("ai_status")
+                has_frame = bool(latest_st.get("has_frame"))
+                has_url = bool(str(latest_st.get("url") or "").strip())
+                if ai_st == "已启动同步浏览器会话" and not has_frame and not has_url:
+                    await asyncio.sleep(self._external_attach_poll_interval)
+                    continue
                 attached = True
                 break
             await asyncio.sleep(self._external_attach_poll_interval)
 
         if not attached:
             diag = self._format_stderr_tail(stderr_buf)
-            await self._stop_external_watch()
+            await self._stop_external_watch(
+                stop_external_profile=not container_preexisted,
+                expected_proc=watch_proc,
+            )
             audit_err = f"attach_timeout:{diag}" if diag else "attach_timeout"
             self.audit.record(
                 action="browser_launch",
@@ -2081,6 +2135,49 @@ class StudioBrowserControlService:
             )
             if sc_tk == 200 and isinstance(tk_data, dict):
                 latest_st = tk_data
+
+        # 6. Post-handover liveness re-check: prevent fake HTTP 200 if watch exited or Hub dropped back to idle
+        post_rc = getattr(watch_proc, "returncode", None)
+        post_st = await self._fetch_hub_status(http_session, sess)
+        hub_still_running = bool(post_st.get("running") and post_st.get("engine_mode") == "sync_external")
+        if post_rc is not None or not hub_still_running:
+            if stderr_task is not None and not stderr_task.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(stderr_task), timeout=0.3)
+                except Exception:
+                    pass
+            diag = self._format_stderr_tail(stderr_buf)
+            await self._stop_external_watch(
+                stop_external_profile=not container_preexisted,
+                expected_proc=watch_proc,
+            )
+            if post_rc is not None:
+                audit_err = f"watch_exited_after_attach:{diag}" if diag else "watch_exited_after_attach"
+                err_msg = (
+                    f"外部 Chromium 直播桥启动后意外退出（code={post_rc}）: {diag}"
+                    if diag
+                    else f"外部 Chromium 直播桥启动后意外退出（code={post_rc}）"
+                )
+            else:
+                audit_err = f"hub_not_running_after_attach:{diag}" if diag else "hub_not_running_after_attach"
+                err_msg = (
+                    f"外部 Chromium 未能保持连接（Hub 已回到待机）: {diag}"
+                    if diag
+                    else "外部 Chromium 未能保持连接（Hub 已回到待机）"
+                )
+            self.audit.record(
+                action="browser_launch",
+                ok=False,
+                sess=sess,
+                engine="external_chromium",
+                profile=profile,
+                owner_bot=owner_bot or "",
+                error=audit_err,
+            )
+            return web.json_response(
+                {"ok": False, "source": "upstream", "error": err_msg},
+                status=500,
+            )
 
         self.audit.record(
             action="browser_launch",

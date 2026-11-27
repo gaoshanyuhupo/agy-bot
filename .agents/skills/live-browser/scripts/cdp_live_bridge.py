@@ -59,6 +59,32 @@ PYTHON_OVERRIDE_ENV = "AGY_LIVE_BROWSER_PYTHON"
 _LOOPBACK_NETLOC_RE = re.compile(r"^(?:(127\.0\.0\.1)|\[(::1)\]):([1-9][0-9]{3,4})$")
 _WS_DEVTOOLS_PATH_RE = re.compile(r"^/devtools/[A-Za-z0-9._/-]+$")
 _HTTP_ALLOWED_PATHS = frozenset({"", "/", "/json/version"})
+_FALLBACK_GOOGLE_HOST_RE = re.compile(
+    r"^(?:[a-z0-9-]+\.)*(?:"
+    r"google\.[a-z]{2,3}(?:\.[a-z]{2})?|"
+    r"gmail\.com|googlemail\.com|"
+    r"youtube\.com|youtu\.be|"
+    r"googleapis\.com|googleusercontent\.com|gstatic\.com|googlevideo\.com|withgoogle\.com|"
+    r"g\.co|goo\.gl"
+    r")$"
+)
+
+
+def _is_google_destination_url_fallback(url: str | None) -> bool:
+    """Fail-closed Google destination check when live_browser_server cannot be imported."""
+    raw = str(url or "").strip()
+    if not raw:
+        return False
+    if "://" not in raw and not raw.lower().startswith(("about:", "data:", "javascript:", "blob:")):
+        raw = "https://" + raw
+    try:
+        parsed = urllib.parse.urlparse(raw)
+    except Exception:
+        return True
+    host = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not host:
+        return False
+    return bool(_FALLBACK_GOOGLE_HOST_RE.match(host))
 
 _FATAL_CDP_ERROR_PATTERNS = (
     "targetclosederror",
@@ -511,6 +537,9 @@ def run_cdp_live_bridge(
     bot: str | None = None,
     user_id: int | str | None = None,
     notify: bool | None = None,
+    profile: str | None = None,
+    profile_dir: str | Path | None = None,
+    allow_google: bool = False,
     connect_timeout_ms: int = 15000,
     active_tick_seconds: float = ACTIVE_TAKEOVER_TICK_SECONDS,
     watch_idle_tick_seconds: float = WATCH_IDLE_TICK_SECONDS,
@@ -530,6 +559,8 @@ def run_cdp_live_bridge(
     """
     if mode not in ("wait_human", "watch"):
         raise ValueError(f"Unsupported mode {mode!r}; expected 'wait_human' or 'watch'")
+    if not isinstance(allow_google, bool):
+        raise ValueError("allow_google must be a boolean")
 
     timeout_s: float | None
     if mode == "wait_human":
@@ -581,6 +612,7 @@ def run_cdp_live_bridge(
     ctx: Any = None
     self_held_takeover: tuple[int, int] | None = None
     remote_dead = False
+    skip_final_checkpoint = False
     exit_reason = "completed"
     frames_pushed = 0
     consecutive_shot_errors = 0
@@ -607,13 +639,14 @@ def run_cdp_live_bridge(
             bot_hint=resolved_bot,
             notify=notify,
             user_id=user_id,
-            profile_dir=None,
+            profile_dir=profile_dir,
             pinned_launch=False,
-            allow_google=False,
-            profile_name=None,
+            allow_google=bool(allow_google),
+            profile_name=profile,
         )
 
         if not getattr(bridge, "enabled", False):
+            skip_final_checkpoint = True
             exit_reason = "sync_start_rejected"
             return {
                 "ok": False,
@@ -626,18 +659,29 @@ def run_cdp_live_bridge(
 
         if nav_url is not None:
             is_google_blocked = getattr(bridge, "_is_sync_google_nav_blocked", None)
-            if callable(is_google_blocked) and is_google_blocked(nav_url):
+            blocked_by_bridge = bool(callable(is_google_blocked) and is_google_blocked(nav_url))
+            if not blocked_by_bridge and allow_google and not getattr(bridge, "_allow_google_verified", False):
+                # Explicit --allow-google was NOT verified by Hub: fail closed for Google destinations even if
+                # client process does not carry server-side pinned env switches.
+                try:
+                    srv_mod = ctl._import_server_module()
+                    blocked_by_bridge = bool(srv_mod.is_google_destination_url(nav_url))
+                except Exception:
+                    blocked_by_bridge = _is_google_destination_url_fallback(nav_url)
+            if blocked_by_bridge:
+                skip_final_checkpoint = True
                 exit_reason = "google_nav_blocked"
                 return {
                     "ok": False,
                     "mode": mode,
                     "reason": exit_reason,
                     "frames_pushed": 0,
-                    "error": "Google domains are blocked for non-pinned external CDP sessions",
+                    "error": "外部 CDP 会话未获 Google 域白名单授权，已拒绝打开目标 Google 页面",
                 }
             try:
                 first_page.goto(nav_url, wait_until="domcontentloaded", timeout=45000)
             except Exception as exc:
+                skip_final_checkpoint = True
                 if _is_fatal_cdp_error(type(exc).__name__, str(exc)):
                     remote_dead = True
                 exit_reason = "navigation_failed"
@@ -646,7 +690,7 @@ def run_cdp_live_bridge(
                     "mode": mode,
                     "reason": exit_reason,
                     "frames_pushed": 0,
-                    "error": f"Failed to navigate to initial URL: {exc}",
+                    "error": f"打开初始页面失败: {exc}",
                 }
 
         # Push initial frame before requesting takeover / entering watch loop.
@@ -916,7 +960,7 @@ def run_cdp_live_bridge(
         # 3. Close SyncLiveBridge (/internal/sync/stop with X-Sync-Lease-Id -> retire card & idle).
         if bridge is not None:
             try:
-                bridge.close(skip_final_checkpoint=remote_dead)
+                bridge.close(skip_final_checkpoint=(remote_dead or skip_final_checkpoint))
             except TypeError:
                 try:
                     bridge.close()

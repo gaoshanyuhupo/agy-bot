@@ -34,6 +34,7 @@ import secrets
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -456,6 +457,128 @@ def is_dedicated_google_profiles_enabled() -> bool:
     return _parse_env_bool(os.environ.get("AGY_LIVE_BROWSER_ALLOW_DEDICATED_GOOGLE_PROFILES"))
 
 
+def _validate_safe_external_google_dir(
+    raw_path: Any,
+    *,
+    host_pinned_resolved: Path | None = None,
+) -> Path | None:
+    """Validate an external Google profile directory fail-closed.
+
+    Rejects:
+      - empty, non-string/Path, leading/trailing whitespace, control chars, backslashes
+      - relative paths, '.' or '..' segments, or root '/'
+      - symlinks at leaf OR any ancestor directory
+      - non-existent or non-directory paths
+      - world-writable leaf directory (mode & 0o002 != 0, blocking 0o777 and 0o1777)
+        or non-sticky world-writable ancestor directory
+      - exact match or parent/child overlap with the host-pinned primary profile directory
+    """
+    if raw_path is None or not isinstance(raw_path, (str, Path)):
+        return None
+    raw_str = str(raw_path)
+    if not raw_str or raw_str != raw_str.strip() or _CONTROL_CHAR_RE.search(raw_str):
+        return None
+    if not raw_str.startswith("/") or "\\" in raw_str:
+        return None
+    raw_parts = raw_str.split("/")
+    if any(seg in ("..", ".") for seg in raw_parts):
+        return None
+    clean_str = raw_str.rstrip("/")
+    if not clean_str:
+        return None
+    parts = [p for p in clean_str.split("/") if p]
+    if not parts:
+        return None
+
+    cur = Path("/")
+    try:
+        root_st = os.lstat(cur)
+    except OSError:
+        return None
+    if stat.S_ISLNK(root_st.st_mode) or not stat.S_ISDIR(root_st.st_mode):
+        return None
+
+    last_idx = len(parts) - 1
+    for idx, part in enumerate(parts):
+        cur = cur / part
+        try:
+            st = os.lstat(cur)
+        except OSError:
+            return None
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            return None
+        if idx == last_idx:
+            # Leaf directory MUST NOT be world-writable (blocks both 0o777 and sticky 0o1777).
+            if st.st_mode & 0o002:
+                return None
+        else:
+            # Ancestor directory MUST NOT be non-sticky world-writable (blocks 0o777 while allowing system /tmp 0o1777).
+            if (st.st_mode & 0o002) and not (st.st_mode & stat.S_ISVTX):
+                return None
+
+    if not os.path.isdir(str(cur)):
+        return None
+    try:
+        resolved = cur.resolve()
+    except OSError:
+        return None
+    if resolved != cur:
+        return None
+
+    if host_pinned_resolved is not None:
+        if (
+            resolved == host_pinned_resolved
+            or host_pinned_resolved in resolved.parents
+            or resolved in host_pinned_resolved.parents
+        ):
+            return None
+    return resolved
+
+
+def verify_external_google_profile_dir(
+    profile_dir: str | Path | None,
+    *,
+    host_pinned: dict[str, Any] | None = None,
+) -> bool:
+    """Fail-closed check that `profile_dir` exactly matches a validated dir in AGY_LIVE_BROWSER_EXTERNAL_GOOGLE_PROFILE_DIRS."""
+    raw_env = os.environ.get("AGY_LIVE_BROWSER_EXTERNAL_GOOGLE_PROFILE_DIRS", "")
+    if not raw_env.strip():
+        return False
+    if profile_dir is None or not isinstance(profile_dir, (str, Path)):
+        return False
+    if str(profile_dir).strip() == "":
+        return False
+
+    eff_host_pinned = host_pinned
+    if eff_host_pinned is None:
+        try:
+            eff_host_pinned = discover_pinned_host_profile()
+        except Exception:
+            return False
+    pinned_resolved: Path | None = None
+    if eff_host_pinned is not None:
+        try:
+            pinned_resolved = Path(eff_host_pinned["profile_dir"]).resolve()
+        except OSError:
+            return False
+
+    allowed_dirs: set[Path] = set()
+    for raw_entry in raw_env.split(os.pathsep):
+        entry = raw_entry.strip()
+        if not entry:
+            continue
+        valid_entry = _validate_safe_external_google_dir(entry, host_pinned_resolved=pinned_resolved)
+        if valid_entry is not None:
+            allowed_dirs.add(valid_entry)
+    if not allowed_dirs:
+        return False
+
+    cand = _validate_safe_external_google_dir(profile_dir, host_pinned_resolved=pinned_resolved)
+    if cand is None:
+        return False
+    return cand in allowed_dirs
+
+
 def _validate_strict_bool(val: Any, field_name: str) -> bool:
     """Validate that `val` is a strict Python bool (rejects strings like 'true'/'false' and ints like 1/0)."""
     if not isinstance(val, bool):
@@ -651,7 +774,10 @@ def verify_dedicated_google_profile(
     """
     if not is_dedicated_google_profiles_enabled():
         return False, None
-    if profile_dir is None or str(profile_dir).strip() == "":
+    if profile_dir is None or not isinstance(profile_dir, (str, Path)):
+        return False, None
+    raw_dir_str = str(profile_dir)
+    if not raw_dir_str or raw_dir_str != raw_dir_str.strip():
         return False, None
     raw_dir = Path(profile_dir)
     if ".." in raw_dir.parts or raw_dir.is_symlink():
@@ -736,6 +862,7 @@ def enforce_google_profile_policy(
         except OSError:
             effective_pinned = False
     effective_dedicated = False
+    effective_external = False
     if not effective_pinned and allow_google is True:
         ok_ded, _ = verify_dedicated_google_profile(
             profile_dir,
@@ -746,9 +873,14 @@ def enforce_google_profile_policy(
             host_pinned=host_pinned,
         )
         effective_dedicated = ok_ded
-    if not (effective_pinned or effective_dedicated) and is_google_destination_url(url):
+        if not effective_dedicated and profile_dir is not None:
+            effective_external = verify_external_google_profile_dir(
+                profile_dir,
+                host_pinned=host_pinned,
+            )
+    if not (effective_pinned or effective_dedicated or effective_external) and is_google_destination_url(url):
         raise ValueError(
-            "安全策略拦截：此主机仅允许主 Pinned Profile 或已启用并登记的专用持久化 Google Profile 访问 Google/Gmail/YouTube 域。"
+            "安全策略拦截：此主机仅允许主 Pinned Profile、已登记的专用持久化 Google Profile 或宿主白名单外部 Google Profile 访问 Google/Gmail/YouTube 域。"
         )
 
 
@@ -4592,6 +4724,7 @@ class LiveBrowserHub:
         self.active_pinned_verified: bool = False
         self.active_allow_google: bool = False
         self.active_allow_google_verified: bool = False
+        self.sync_allow_google: bool = False
         self.active_egress: str = "direct"
         self.active_os: str = ""
         self.active_fingerprint: dict[str, Any] = {}
@@ -4958,6 +5091,40 @@ class LiveBrowserHub:
             return next(iter(bots.keys()))
         return None
 
+    def _is_bound_owner_bot_key(self, bot_key: str) -> bool:
+        """Return True iff `bot_key` matches `active_owner_bot_id` strictly via token-derived `id_map`.
+
+        Never trusts handle string `active_owner_bot` alone.
+        """
+        if self.engine_mode == "idle":
+            return False
+        clean_key = str(bot_key or "").strip()
+        if not clean_key:
+            return False
+        raw_bid = self.active_owner_bot_id
+        if isinstance(raw_bid, bool) or not isinstance(raw_bid, int) or raw_bid <= 0:
+            return False
+        bots, id_map, _, _, _ = _load_auth_context()
+        bid_str = str(int(raw_bid))
+        resolved = id_map.get(bid_str)
+        return bool(resolved) and resolved == clean_key and clean_key in bots
+
+    def _is_bound_owner_bot_same_admin(self, bot_key: str, user_id: int, role: str) -> bool:
+        """Return True iff caller is the same human admin operating through the token-verified bound owner bot."""
+        if role != "admin":
+            return False
+        if self.engine_mode == "idle":
+            return False
+        if not self._has_verified_session_owner():
+            return False
+        if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
+            return False
+        assert self.session_owner is not None
+        _s_bot, s_uid = self.session_owner
+        if int(user_id) != int(s_uid):  # type: ignore[arg-type]
+            return False
+        return self._is_bound_owner_bot_key(bot_key)
+
     def _is_active_pinned_verified(self) -> bool:
         """Verify active profile matches the real host canonical pinned directory (rejects forged pinned)."""
         if not (self.active_pinned and self.active_pinned_verified):
@@ -4988,9 +5155,23 @@ class LiveBrowserHub:
         )
         return ok_ded
 
+    def _is_active_external_google_verified(self) -> bool:
+        """Verify active external sync session is backed by a host-whitelisted external Google profile directory."""
+        if self.engine_mode != "sync_external":
+            return False
+        if not (self.sync_allow_google and self.active_allow_google and self.active_allow_google_verified):
+            return False
+        if self.active_profile_dir is None:
+            return False
+        return verify_external_google_profile_dir(self.active_profile_dir)
+
     def _is_active_google_allowed(self) -> bool:
-        """Return True iff the active session is verified as either host-pinned or dedicated Google."""
-        return self._is_active_pinned_verified() or self._is_active_dedicated_google_verified()
+        """Return True iff the active session is verified as host-pinned, dedicated Google, or whitelisted external Google."""
+        return (
+            self._is_active_pinned_verified()
+            or self._is_active_dedicated_google_verified()
+            or self._is_active_external_google_verified()
+        )
 
     def state_dict(
         self,
@@ -5027,6 +5208,7 @@ class LiveBrowserHub:
             "takeover_reason": self.takeover_reason,
             "ai_status": self.ai_status,
             "ai_busy": self.ai_busy_count > 0,
+            "has_frame": bool(self.latest_jpeg),
             "url": self.url,
             "title": self.title,
             "vw": self.vw,
@@ -5068,6 +5250,7 @@ class LiveBrowserHub:
             "takeover_reason": "",
             "ai_status": "🔒 当前浏览器由其他授权会话占用",
             "ai_busy": False,
+            "has_frame": False,
             "url": "",
             "title": "",
             "vw": 1280,
@@ -7447,6 +7630,7 @@ class LiveBrowserHub:
         self.active_pinned_verified = False
         self.active_allow_google = False
         self.active_allow_google_verified = False
+        self.sync_allow_google = False
         self.active_egress = "direct"
         self.active_os = ""
         self.active_fingerprint = {}
@@ -8079,6 +8263,7 @@ class LiveBrowserHub:
         card_message_id: int | None = None,
         require_card: bool = False,
         force: bool = False,
+        allow_bound_owner_bot: bool | None = None,
     ) -> tuple[bool, str]:
         async with self._engine_lock:
             if callable(pre_stop_verify):
@@ -8112,7 +8297,15 @@ class LiveBrowserHub:
                     live_role = _check_live_user_role(a_bot, a_uid)
                     if live_role != "admin":
                         return False, "当前用户未授权或不是管理员"
-                    if self.engine_mode != "idle" and not self._viewer_can_mutate(a_bot, a_uid, live_role):
+                    eff_allow_bound = (
+                        bool(allow_bound_owner_bot)
+                        if allow_bound_owner_bot is not None
+                        else (source in ("tg_cmd", "tg", "internal_stop"))
+                    )
+                    can_stop = self._viewer_can_mutate(a_bot, a_uid, live_role) or (
+                        eff_allow_bound and self._is_bound_owner_bot_same_admin(a_bot, a_uid, live_role)
+                    )
+                    if self.engine_mode != "idle" and not can_stop:
                         return False, "🔒 无权关闭其他 Bot/用户或本机 CLI 持有的浏览器会话"
                 if self.engine_mode == "sync_external":
                     return False, "当前为外部脚本联动会话，无法直接关闭"
@@ -9837,7 +10030,10 @@ class LiveBrowserHub:
                         enforce_google_profile_policy(
                             url,
                             is_pinned=self._is_active_pinned_verified(),
-                            allow_google=self._is_active_dedicated_google_verified(),
+                            allow_google=(
+                                self._is_active_dedicated_google_verified()
+                                or self._is_active_external_google_verified()
+                            ),
                             profile_name=self.active_profile or None,
                             profile_dir=self.active_profile_dir,
                         )
@@ -10088,13 +10284,14 @@ class LiveBrowserHub:
     ) -> dict[str, Any]:
         if auth_ctx is None:
             ok_ctrl, err_ctrl, _, auth_ctx = _verify_internal_caller_control(
-                self, payload, require_running=False
+                self, payload, require_running=False, allow_bound_owner_bot=True
             )
             if not ok_ctrl:
                 raise PermissionError(err_ctrl)
 
         action = str(payload.get("action", "")).strip()
         is_tg = bool(auth_ctx.get("is_tg"))
+        allow_bound = bool(auth_ctx.get("allow_bound_owner_bot")) and not bool(auth_ctx.get("from_card"))
         actor_arg = (auth_ctx["bot_key"], auth_ctx["chat_id"]) if is_tg else None
         source_arg = str(auth_ctx.get("source") or "tg_cmd") if is_tg else "cli"
         exp_gen = (
@@ -10119,7 +10316,11 @@ class LiveBrowserHub:
             live_role = _check_live_user_role(a_bot, a_uid)
             if live_role != "admin":
                 return True
-            return not self._viewer_can_read_session(a_bot, a_uid, live_role)
+            if self._viewer_can_read_session(a_bot, a_uid, live_role):
+                return False
+            if allow_bound and self._is_bound_owner_bot_same_admin(a_bot, a_uid, live_role):
+                return False
+            return True
 
         def _safe_action_state(expected_gen: int | None) -> dict[str, Any]:
             if _should_redact_tg_state(expected_gen):
@@ -10306,7 +10507,11 @@ class LiveBrowserHub:
             active_sgen = exp_gen if exp_gen is not None else self.session_gen
             if notify and bot_hint:
                 bot_key = actor_arg[0] if actor_arg is not None else self.resolve_bot_key(bot_hint)
-                if bot_key is not None and not self.tg.has_card_for_bot(bot_key):
+                if (
+                    bot_key is not None
+                    and (not self.session_owner or bot_key == self.session_owner[0])
+                    and not self.tg.has_card_for_bot(bot_key)
+                ):
                     asyncio.create_task(self.tg.ensure_card(bot_key, preferred_user_id=pref_uid))
 
         def _reverify_tg_action_actor() -> None:
@@ -10316,7 +10521,12 @@ class LiveBrowserHub:
                 return
             a_bot, a_uid = actor_arg
             live_role = _check_live_user_role(a_bot, a_uid)
-            if live_role != "admin" or not self._viewer_can_mutate(a_bot, a_uid, live_role):
+            if live_role != "admin":
+                raise PermissionError("当前用户未授权、权限已撤销或非会话归属者")
+            can_act = self._viewer_can_mutate(a_bot, a_uid, live_role) or (
+                allow_bound and self._is_bound_owner_bot_same_admin(a_bot, a_uid, live_role)
+            )
+            if not can_act:
                 raise PermissionError("当前用户未授权、权限已撤销或非会话归属者")
 
         self.ai_busy_count += 1
@@ -10347,7 +10557,10 @@ class LiveBrowserHub:
                             enforce_google_profile_policy(
                                 url,
                                 is_pinned=self._is_active_pinned_verified(),
-                                allow_google=self._is_active_dedicated_google_verified(),
+                                allow_google=(
+                                    self._is_active_dedicated_google_verified()
+                                    or self._is_active_external_google_verified()
+                                ),
                                 profile_name=self.active_profile or None,
                                 profile_dir=self.active_profile_dir,
                             )
@@ -12010,7 +12223,10 @@ async def handle_api_download(request: web.Request) -> web.StreamResponse:
 
 
 def _resolve_internal_tg_reader_info(
-    hub: LiveBrowserHub, query: Any
+    hub: LiveBrowserHub,
+    query: Any,
+    *,
+    allow_bound_owner_bot: bool = False,
 ) -> tuple[bool, bool, str | None]:
     """Inspect internal GET query params for Telegram caller context, delivery scope & live RBAC role.
 
@@ -12070,7 +12286,10 @@ def _resolve_internal_tg_reader_info(
         return True, False, "denied"
     if live_role not in ("admin", "readonly"):
         return True, False, live_role
-    return True, hub._viewer_can_read_session(target_bot, uid_val, live_role), live_role
+    can_read = hub._viewer_can_read_session(target_bot, uid_val, live_role) or (
+        allow_bound_owner_bot and hub._is_bound_owner_bot_same_admin(target_bot, uid_val, live_role)
+    )
+    return True, can_read, live_role
 
 
 def _resolve_internal_tg_reader(
@@ -12098,7 +12317,9 @@ async def internal_status(request: web.Request) -> web.Response:
     hub: LiveBrowserHub = request.app["hub"]
     check_local_auth(request, hub)
     query = getattr(request, "query", {}) or {}
-    is_tg, can_read, live_role = _resolve_internal_tg_reader_info(hub, query)
+    is_tg, can_read, live_role = _resolve_internal_tg_reader_info(
+        hub, query, allow_bound_owner_bot=True
+    )
     if is_tg and not can_read:
         return web.json_response({"ok": True, **hub._redacted_state_dict()})
     is_group = _is_group_internal_scope(query)
@@ -12126,6 +12347,7 @@ def _verify_internal_caller_control(
     body: dict[str, Any],
     *,
     require_running: bool = True,
+    allow_bound_owner_bot: bool = False,
 ) -> tuple[bool, str, tuple[str, int | None] | None, dict[str, Any]]:
     """Verify bot/user/card ownership and session generation on internal control endpoints.
 
@@ -12221,7 +12443,10 @@ def _verify_internal_caller_control(
     live_role = _check_live_user_role(target_bot, cid_val)
     if live_role != "admin":
         return False, "当前用户未授权或不是管理员", None, {}
-    if hub.engine_mode != "idle" and not hub._viewer_can_mutate(target_bot, cid_val, live_role):
+    can_mutate = hub._viewer_can_mutate(target_bot, cid_val, live_role) or (
+        allow_bound_owner_bot and hub._is_bound_owner_bot_same_admin(target_bot, cid_val, live_role)
+    )
+    if hub.engine_mode != "idle" and not can_mutate:
         return False, "无权操作其他 Bot/用户或本机 CLI 持有的浏览器会话", None, {}
     return (
         True,
@@ -12235,6 +12460,7 @@ def _verify_internal_caller_control(
             "chat_id": cid_val,
             "message_id": None,
             "expected_gen": expected_gen,
+            "allow_bound_owner_bot": bool(allow_bound_owner_bot),
         },
     )
 
@@ -12611,7 +12837,9 @@ async def internal_stop(request: web.Request) -> web.Response:
     query = getattr(request, "query", {}) or {}
     force = _parse_bool_flag(body.get("force")) or _parse_bool_flag(query.get("force"))
 
-    ok_ctrl, err_ctrl, _, auth_ctx = _verify_internal_caller_control(hub, body, require_running=False)
+    ok_ctrl, err_ctrl, _, auth_ctx = _verify_internal_caller_control(
+        hub, body, require_running=False, allow_bound_owner_bot=True
+    )
     if not ok_ctrl:
         return web.json_response({"ok": False, "error": err_ctrl}, status=403)
 
@@ -12635,6 +12863,7 @@ async def internal_stop(request: web.Request) -> web.Response:
             card_message_id=auth_ctx.get("message_id"),
             require_card=bool(auth_ctx.get("from_card")),
             force=force,
+            allow_bound_owner_bot=bool(auth_ctx.get("allow_bound_owner_bot")),
         )
     else:
         if auth_ctx.get("expected_gen") is not None:
@@ -12662,7 +12891,9 @@ async def internal_action(request: web.Request) -> web.Response:
     if not isinstance(body, dict):
         return web.json_response({"ok": False, "error": "Request body must be a JSON object"}, status=400)
     is_group_scope = _is_group_internal_scope(body)
-    ok_ctrl, err_ctrl, _, auth_ctx = _verify_internal_caller_control(hub, body, require_running=False)
+    ok_ctrl, err_ctrl, _, auth_ctx = _verify_internal_caller_control(
+        hub, body, require_running=False, allow_bound_owner_bot=True
+    )
     if not ok_ctrl:
         err_msg = "当前操作未获授权，请前往私聊查看与操作" if is_group_scope else err_ctrl
         return web.json_response({"ok": False, "error": err_msg}, status=403)
@@ -12949,6 +13180,15 @@ async def internal_sync_start(request: web.Request) -> web.Response:
         err_msg = "当前操作未获授权，请前往私聊查看与操作" if is_group_scope else err_ctrl
         return web.json_response({"ok": False, "error": err_msg}, status=403)
 
+    # Strict boolean check for optional `allow_google` (rejects string/int/truthy bypasses).
+    allow_google_claim = False
+    if "allow_google" in body and body["allow_google"] is not None:
+        try:
+            allow_google_claim = _validate_strict_bool(body["allow_google"], "allow_google")
+        except ValueError as exc:
+            err_msg = "请求参数无效，请前往私聊检查" if is_group_scope else str(exc)
+            return web.json_response({"ok": False, "error": err_msg}, status=400)
+
     is_tg = bool(auth_ctx.get("is_tg"))
     exp_gen = auth_ctx.get("expected_gen")
     prev_sync_retire: tuple[int, bytes | None] | None = None
@@ -13005,15 +13245,21 @@ async def internal_sync_start(request: web.Request) -> web.Response:
         # Never infer producer `pinned=True` or `allow_google=True` from bare flags alone!
         # Verify either:
         #   1) canonical host pinned `profile_dir` + `pinned_launch=True`, OR
-        #   2) host-enabled, registry-backed, containment-verified dedicated Google `profile_dir` + `allow_google=True`.
-        raw_pdir = str(body.get("profile_dir") or "").strip()
+        #   2) host-enabled, registry-backed, containment-verified dedicated Google `profile_dir` + `allow_google=True`, OR
+        #   3) host-whitelisted external Google `profile_dir` (`AGY_LIVE_BROWSER_EXTERNAL_GOOGLE_PROFILE_DIRS`) + `allow_google=True`.
+        raw_pdir_obj = body.get("profile_dir")
+        raw_pdir: str | None = (
+            raw_pdir_obj
+            if isinstance(raw_pdir_obj, str) and raw_pdir_obj != ""
+            else None
+        )
         pinned_claim = body.get("pinned_launch") is True
-        allow_google_claim = body.get("allow_google") is True
         pinned_verified = False
         allow_google_verified = False
+        external_google_verified = False
         ded_name: str | None = None
         host_pinned = None
-        if raw_pdir and pinned_claim:
+        if raw_pdir is not None and raw_pdir == raw_pdir.strip() and pinned_claim:
             try:
                 host_pinned = discover_pinned_host_profile()
             except Exception:
@@ -13026,8 +13272,9 @@ async def internal_sync_start(request: web.Request) -> web.Response:
                         pinned_verified = True
                 except OSError:
                     pinned_verified = False
-        elif raw_pdir and allow_google_claim:
-            req_prof_name = str(body.get("profile") or "").strip() or None
+        elif raw_pdir is not None and allow_google_claim:
+            raw_prof_obj = body.get("profile")
+            req_prof_name = raw_prof_obj.strip() or None if isinstance(raw_prof_obj, str) else None
             ok_ded, verified_ded_name = verify_dedicated_google_profile(
                 raw_pdir,
                 profile_name=req_prof_name,
@@ -13036,6 +13283,10 @@ async def internal_sync_start(request: web.Request) -> web.Response:
             if ok_ded and verified_ded_name:
                 allow_google_verified = True
                 ded_name = verified_ded_name
+            elif verify_external_google_profile_dir(raw_pdir):
+                allow_google_verified = True
+                external_google_verified = True
+                ded_name = req_prof_name or Path(raw_pdir).name
 
         if pinned_verified and host_pinned is not None:
             hub.active_profile = host_pinned["name"]
@@ -13044,6 +13295,7 @@ async def internal_sync_start(request: web.Request) -> web.Response:
             hub.active_pinned_verified = True
             hub.active_allow_google = False
             hub.active_allow_google_verified = False
+            hub.sync_allow_google = False
             hub.active_egress = "direct"
             hub.active_os = str(host_pinned["fingerprint"].get("os", "windows"))
             hub.active_fingerprint = {"os": hub.active_os, "persistent": True}
@@ -13054,6 +13306,7 @@ async def internal_sync_start(request: web.Request) -> web.Response:
             hub.active_pinned_verified = False
             hub.active_allow_google = True
             hub.active_allow_google_verified = True
+            hub.sync_allow_google = external_google_verified
             hub.active_egress = "direct"
             hub.active_os = str(body.get("os") or "")
             hub.active_fingerprint = {"persistent": True}
@@ -13064,6 +13317,7 @@ async def internal_sync_start(request: web.Request) -> web.Response:
             hub.active_pinned_verified = False
             hub.active_allow_google = False
             hub.active_allow_google_verified = False
+            hub.sync_allow_google = False
             hub.active_egress = "direct"
             hub.active_os = str(body.get("os") or "")
             hub.active_fingerprint = {}

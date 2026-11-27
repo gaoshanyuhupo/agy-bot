@@ -2391,5 +2391,579 @@ class TestTakeoverStabilityContractC1C2(unittest.TestCase):
         asyncio.run(_scenario())
 
 
+class TestWorkstreamEBoundOwnerBotRBAC(unittest.TestCase):
+    """C3, C4, C5: Token-derived active_owner_bot_id same-admin RBAC alignment and strict isolation boundaries."""
+
+    def setUp(self) -> None:
+        self._orig_env = dict(os.environ)
+        os.environ.clear()
+        os.environ.update(_clean_agy_env())
+        self.auth_ws = _TestAuthWorkspace()
+        self._orig_bridge_dir = srv._BRIDGE_DIR
+        self._orig_profiles_data_dir = srv.PROFILES_DATA_DIR
+        self._orig_config_dir = srv.CONFIG_DIR
+        self._orig_profiles_file = srv.PROFILES_FILE
+        self._orig_web = srv.web
+        self._orig_form_data = srv.FormData
+        srv._BRIDGE_DIR = self.auth_ws.bridge_dir
+        srv.PROFILES_DATA_DIR = self.auth_ws.root / "profiles-data"
+        srv.CONFIG_DIR = self.auth_ws.root / "config"
+        srv.PROFILES_FILE = srv.CONFIG_DIR / "profiles.json"
+        if srv.web is None:
+            srv.web = _FAKE_WEB  # type: ignore[assignment]
+        if srv.FormData is None:
+            srv.FormData = _FakeFormData  # type: ignore[assignment]
+        os.environ["AGY_GOOGLE_SKILL_SCRIPTS"] = ""
+        os.environ["AGY_LIVE_BROWSER_REQUIRE_PINNED"] = ""
+
+    def tearDown(self) -> None:
+        srv._BRIDGE_DIR = self._orig_bridge_dir
+        srv.PROFILES_DATA_DIR = self._orig_profiles_data_dir
+        srv.CONFIG_DIR = self._orig_config_dir
+        srv.PROFILES_FILE = self._orig_profiles_file
+        srv.web = self._orig_web
+        srv.FormData = self._orig_form_data
+        self.auth_ws.cleanup()
+        os.environ.clear()
+        os.environ.update(self._orig_env)
+
+    @staticmethod
+    def _make_active_hub(
+        *,
+        owner: tuple[str, int | None] | None = ("main", ADMIN_UID_A),
+        owner_bot_handle: str | None = "sg_bot",
+        owner_bot_id: int | None = 202,
+        takeover: bool = False,
+        takeover_owner: tuple[str, int | None] | None = None,
+    ) -> tuple[srv.LiveBrowserHub, _FakeAsyncPage]:
+        hub = srv.LiveBrowserHub({"public_url": "https://live.example"}, LOCAL_TOKEN)
+        page = _FakeAsyncPage(url="https://app.example/dashboard", title="Admin Dashboard")
+        hub.engine_mode = "async_hosted"
+        hub.session_gen = 42
+        hub.takeover_gen = 7
+        hub.session_owner = owner
+        hub.active_owner_bot = owner_bot_handle
+        hub.active_owner_bot_id = owner_bot_id
+        hub.active_profile = "work-profile"
+        hub.url = page.url
+        hub.title = page._title
+        hub.tabs = [{"index": 0, "url": page.url, "title": page._title, "active": True}]
+        hub.ctx = types.SimpleNamespace(pages=[page])
+        hub.takeover = takeover
+        hub.takeover_owner = takeover_owner
+        if takeover:
+            hub.ai_allowed_event.clear()
+        else:
+            hub.ai_allowed_event.set()
+        return hub, page
+
+    def test_c3_bound_owner_bot_same_admin_grant_token_derived_only_and_no_start_preempt(self) -> None:
+        async def _scenario() -> None:
+            # 1. Positive path: session owned by ("main", ADMIN_UID_A), bound to sg (bot_id=202 in id_map)
+            hub, page = self._make_active_hub()
+
+            # 1a. internal_status -> 200 unredacted full state
+            r_st = await srv.internal_status(
+                _make_req(
+                    hub,
+                    {},
+                    query={
+                        "source": "tg_cmd",
+                        "chat_scope": "private",
+                        "bot": "sg",
+                        "user_id": str(ADMIN_UID_A),
+                        "chat_id": str(ADMIN_UID_A),
+                    },
+                )  # type: ignore[arg-type]
+            )
+            self.assertEqual(200, r_st.status)
+            d_st = _resp_json(r_st)
+            self.assertTrue(d_st["running"])
+            self.assertFalse(bool(d_st.get("session_restricted")))
+            self.assertEqual("https://app.example/dashboard", d_st["url"])
+            self.assertEqual("work-profile", d_st["profile"])
+
+            # 1b. internal_action -> 200
+            r_act = await srv.internal_action(
+                _make_req(
+                    hub,
+                    {
+                        "action": "eval",
+                        "expression": "document.title",
+                        "source": "tg_cmd",
+                        "chat_scope": "private",
+                        "bot": "sg",
+                        "user_id": ADMIN_UID_A,
+                        "chat_id": ADMIN_UID_A,
+                        "notify": False,
+                    },
+                )  # type: ignore[arg-type]
+            )
+            self.assertEqual(200, r_act.status)
+            self.assertTrue(_resp_json(r_act)["ok"])
+            self.assertEqual(1, len(page.eval_calls))
+
+            # 1c. internal_start & internal_sync_start MUST remain 403 (no preempt/restart by bound bot!)
+            r_start = await srv.internal_start(
+                _make_req(
+                    hub,
+                    {
+                        "url": "https://example.org",
+                        "restart": True,
+                        "source": "tg_cmd",
+                        "chat_scope": "private",
+                        "bot": "sg",
+                        "user_id": ADMIN_UID_A,
+                        "chat_id": ADMIN_UID_A,
+                    },
+                )  # type: ignore[arg-type]
+            )
+            self.assertEqual(403, r_start.status)
+
+            r_sync = await srv.internal_sync_start(
+                _make_req(
+                    hub,
+                    {
+                        "source": "tg_cmd",
+                        "chat_scope": "private",
+                        "bot": "sg",
+                        "user_id": ADMIN_UID_A,
+                        "chat_id": ADMIN_UID_A,
+                    },
+                )  # type: ignore[arg-type]
+            )
+            self.assertEqual(403, r_sync.status)
+
+            # 1d. internal_stop (via stop_hosted) -> 200
+            with mock.patch.object(hub, "_stop_hosted_locked", new=mock.AsyncMock()) as m_stop_locked:
+                r_stop = await srv.internal_stop(
+                    _make_req(
+                        hub,
+                        {
+                            "source": "tg_cmd",
+                            "chat_scope": "private",
+                            "bot": "sg",
+                            "user_id": ADMIN_UID_A,
+                            "chat_id": ADMIN_UID_A,
+                        },
+                    )  # type: ignore[arg-type]
+                )
+            self.assertEqual(200, r_stop.status)
+            m_stop_locked.assert_awaited_once()
+
+            # 2. Handle-only spoof (active_owner_bot="sg" with active_owner_bot_id=None or unmapped 999999) -> ALL 403 / redacted!
+            for bad_bid in (None, 999999, 101):
+                hub_spoof, page_spoof = self._make_active_hub(owner_bot_handle="sg", owner_bot_id=bad_bid)
+                r_st_bad = await srv.internal_status(
+                    _make_req(
+                        hub_spoof,
+                        {},
+                        query={
+                            "source": "tg_cmd",
+                            "chat_scope": "private",
+                            "bot": "sg",
+                            "user_id": str(ADMIN_UID_A),
+                            "chat_id": str(ADMIN_UID_A),
+                        },
+                    )  # type: ignore[arg-type]
+                )
+                d_bad = _resp_json(r_st_bad)
+                self.assertTrue(d_bad.get("session_restricted"), f"Handle-only spoof with bid={bad_bid} must redact")
+                self.assertNotIn("app.example", json.dumps(d_bad))
+
+                r_act_bad = await srv.internal_action(
+                    _make_req(
+                        hub_spoof,
+                        {
+                            "action": "eval",
+                            "expression": "1+1",
+                            "source": "tg_cmd",
+                            "chat_scope": "private",
+                            "bot": "sg",
+                            "user_id": ADMIN_UID_A,
+                            "chat_id": ADMIN_UID_A,
+                            "notify": False,
+                        },
+                    )  # type: ignore[arg-type]
+                )
+                self.assertEqual(403, r_act_bad.status, f"Handle-only spoof action must return 403 (bid={bad_bid})")
+                self.assertEqual([], page_spoof.eval_calls)
+
+                r_stop_bad = await srv.internal_stop(
+                    _make_req(
+                        hub_spoof,
+                        {
+                            "source": "tg_cmd",
+                            "chat_scope": "private",
+                            "bot": "sg",
+                            "user_id": ADMIN_UID_A,
+                            "chat_id": ADMIN_UID_A,
+                        },
+                    )  # type: ignore[arg-type]
+                )
+                self.assertEqual(403, r_stop_bad.status, f"Handle-only spoof stop must return 403 (bid={bad_bid})")
+
+        asyncio.run(_scenario())
+
+    def test_c4_cross_tenant_revocation_group_rebind_and_unowned_isolation(self) -> None:
+        async def _scenario() -> None:
+            hub, _ = self._make_active_hub()
+
+            # 1. Cross-user ADMIN_UID_B on bound bot sg -> redacted & 403
+            r_st_b = await srv.internal_status(
+                _make_req(
+                    hub,
+                    {},
+                    query={
+                        "source": "tg_cmd",
+                        "chat_scope": "private",
+                        "bot": "sg",
+                        "user_id": str(ADMIN_UID_B),
+                        "chat_id": str(ADMIN_UID_B),
+                    },
+                )  # type: ignore[arg-type]
+            )
+            self.assertTrue(_resp_json(r_st_b).get("session_restricted"))
+            self.assertNotIn("app.example", json.dumps(_resp_json(r_st_b)))
+            for ep_fn, ep_body in (
+                (srv.internal_action, {"action": "eval", "expression": "1", "notify": False}),
+                (srv.internal_stop, {}),
+            ):
+                r_b = await ep_fn(
+                    _make_req(
+                        hub,
+                        {
+                            **ep_body,
+                            "source": "tg_cmd",
+                            "chat_scope": "private",
+                            "bot": "sg",
+                            "user_id": ADMIN_UID_B,
+                            "chat_id": ADMIN_UID_B,
+                        },
+                    )  # type: ignore[arg-type]
+                )
+                self.assertEqual(403, r_b.status)
+
+            # 2. Group chat scope or negative chat_id on bound bot sg + ADMIN_UID_A -> redacted & 403
+            for grp_fields in (
+                {"chat_scope": "group", "user_id": ADMIN_UID_A},
+                {"chat_scope": "private", "user_id": ADMIN_UID_A, "chat_id": GROUP_CHAT_ID},
+            ):
+                q_grp = {k: str(v) for k, v in grp_fields.items()}
+                q_grp.update({"source": "tg_cmd", "bot": "sg"})
+                r_stg = await srv.internal_status(_make_req(hub, {}, query=q_grp))  # type: ignore[arg-type]
+                self.assertTrue(_resp_json(r_stg).get("session_restricted"))
+                self.assertNotIn("app.example", json.dumps(_resp_json(r_stg)))
+
+                r_actg = await srv.internal_action(
+                    _make_req(
+                        hub,
+                        {"action": "eval", "expression": "1", "source": "tg_cmd", "bot": "sg", "notify": False, **grp_fields},
+                    )  # type: ignore[arg-type]
+                )
+                self.assertEqual(403, r_actg.status)
+                r_stopg = await srv.internal_stop(
+                    _make_req(hub, {"source": "tg_cmd", "bot": "sg", **grp_fields})  # type: ignore[arg-type]
+                )
+                self.assertEqual(403, r_stopg.status)
+
+            # 3. Unowned CLI sessions (None or ("main", None)) -> bound sg + ADMIN_UID_A gets redacted & 403
+            for unowned in (None, ("main", None)):
+                hub_cli, _ = self._make_active_hub(owner=unowned)
+                r_st_u = await srv.internal_status(
+                    _make_req(
+                        hub_cli,
+                        {},
+                        query={"source": "tg_cmd", "chat_scope": "private", "bot": "sg", "user_id": str(ADMIN_UID_A)},
+                    )  # type: ignore[arg-type]
+                )
+                self.assertTrue(_resp_json(r_st_u).get("session_restricted"))
+                r_act_u = await srv.internal_action(
+                    _make_req(
+                        hub_cli,
+                        {
+                            "action": "eval",
+                            "expression": "1",
+                            "source": "tg_cmd",
+                            "chat_scope": "private",
+                            "bot": "sg",
+                            "user_id": ADMIN_UID_A,
+                            "notify": False,
+                        },
+                    )  # type: ignore[arg-type]
+                )
+                self.assertEqual(403, r_act_u.status)
+                r_stop_u = await srv.internal_stop(
+                    _make_req(
+                        hub_cli,
+                        {"source": "tg_cmd", "chat_scope": "private", "bot": "sg", "user_id": ADMIN_UID_A},
+                    )  # type: ignore[arg-type]
+                )
+                self.assertEqual(403, r_stop_u.status)
+
+            # 4. Readonly / revoked ADMIN_UID_A on bound bot sg -> redacted & 403
+            self.auth_ws.write_env(
+                "sg",
+                token=BOT_SG_TOKEN,
+                allowed=[ADMIN_UID_A, ADMIN_UID_B],
+                admins=[ADMIN_UID_B],
+                readonly=[ADMIN_UID_A],
+            )
+            r_st_ro = await srv.internal_status(
+                _make_req(
+                    hub,
+                    {},
+                    query={"source": "tg_cmd", "chat_scope": "private", "bot": "sg", "user_id": str(ADMIN_UID_A)},
+                )  # type: ignore[arg-type]
+            )
+            self.assertTrue(_resp_json(r_st_ro).get("session_restricted"))
+            r_act_ro = await srv.internal_action(
+                _make_req(
+                    hub,
+                    {
+                        "action": "eval",
+                        "expression": "1",
+                        "source": "tg_cmd",
+                        "chat_scope": "private",
+                        "bot": "sg",
+                        "user_id": ADMIN_UID_A,
+                        "notify": False,
+                    },
+                )  # type: ignore[arg-type]
+            )
+            self.assertEqual(403, r_act_ro.status)
+
+            # Restore ADMIN_UID_A as admin on sg for multi-step await revocation & hot-rebind tests
+            self.auth_ws.write_env(
+                "sg",
+                token=BOT_SG_TOKEN,
+                allowed=[ADMIN_UID_A, ADMIN_UID_B],
+                admins=[ADMIN_UID_A, ADMIN_UID_B],
+            )
+
+            # 5. Multi-step execute_ai_action: mid-flight revocation OR hot-rebind across await aborts 2nd step!
+            for revoke_mode in ("rbac_downgrade", "hot_rebind"):
+                self.auth_ws.write_env(
+                    "sg",
+                    token=BOT_SG_TOKEN,
+                    allowed=[ADMIN_UID_A, ADMIN_UID_B],
+                    admins=[ADMIN_UID_A, ADMIN_UID_B],
+                )
+                hub_ms, _ = self._make_active_hub()
+                step2_calls: list[str] = []
+
+                class _StepRevokingLoc:
+                    @property
+                    def first(self):
+                        return self
+
+                    async def fill(self, _text: str, **_kw: object) -> None:
+                        if revoke_mode == "rbac_downgrade":
+                            self.auth_ws_ref.write_env(
+                                "sg",
+                                token=BOT_SG_TOKEN,
+                                allowed=[ADMIN_UID_A, ADMIN_UID_B],
+                                admins=[ADMIN_UID_B],
+                                readonly=[ADMIN_UID_A],
+                            )
+                        else:
+                            hub_ms.active_owner_bot = "main_bot"
+                            hub_ms.active_owner_bot_id = 101
+
+                    def __init__(self, auth_ws_ref: _TestAuthWorkspace) -> None:
+                        self.auth_ws_ref = auth_ws_ref
+
+                class _StepKeyboard:
+                    async def press(self, key: str) -> None:
+                        step2_calls.append(f"press:{key}")
+
+                ms_page = _FakeAsyncPage()
+                ms_page.locator = lambda _sel: _StepRevokingLoc(self.auth_ws)  # type: ignore[attr-defined]
+                ms_page.keyboard = _StepKeyboard()  # type: ignore[attr-defined]
+                hub_ms.ctx = types.SimpleNamespace(pages=[ms_page])
+
+                r_ms = await srv.internal_action(
+                    _make_req(
+                        hub_ms,
+                        {
+                            "action": "fill",
+                            "selector": "#q",
+                            "text": "hello",
+                            "submit": True,
+                            "source": "tg_cmd",
+                            "chat_scope": "private",
+                            "bot": "sg",
+                            "user_id": ADMIN_UID_A,
+                            "notify": False,
+                        },
+                    )  # type: ignore[arg-type]
+                )
+                self.assertEqual(403, r_ms.status, f"Mid-flight {revoke_mode} must abort with 403")
+                self.assertEqual([], step2_calls, f"Mid-flight {revoke_mode} must execute 0 step-2 actions")
+
+            # 6. Hot-rebind via /internal/owner-bot -> old bound bot sg immediately loses access
+            self.auth_ws.write_env(
+                "sg",
+                token=BOT_SG_TOKEN,
+                allowed=[ADMIN_UID_A, ADMIN_UID_B],
+                admins=[ADMIN_UID_A, ADMIN_UID_B],
+            )
+            hub_rb, _ = self._make_active_hub()
+            r_rb = await srv.internal_owner_bot(
+                _make_req(
+                    hub_rb,
+                    {
+                        "owner_bot": "main_bot",
+                        "owner_bot_id": 101,
+                        "source": "tg_cmd",
+                        "chat_scope": "private",
+                        "bot": "main",
+                        "user_id": ADMIN_UID_A,
+                    },
+                )  # type: ignore[arg-type]
+            )
+            self.assertEqual(200, r_rb.status)
+            r_old_st = await srv.internal_status(
+                _make_req(
+                    hub_rb,
+                    {},
+                    query={"source": "tg_cmd", "chat_scope": "private", "bot": "sg", "user_id": str(ADMIN_UID_A)},
+                )  # type: ignore[arg-type]
+            )
+            self.assertTrue(_resp_json(r_old_st).get("session_restricted"))
+            r_old_stop = await srv.internal_stop(
+                _make_req(
+                    hub_rb,
+                    {"source": "tg_cmd", "chat_scope": "private", "bot": "sg", "user_id": ADMIN_UID_A},
+                )  # type: ignore[arg-type]
+            )
+            self.assertEqual(403, r_old_stop.status)
+
+            # 7. Session stop clears active_owner_bot_id immediately
+            hub_clr, _ = self._make_active_hub()
+            hub_clr._clear_session_caches()
+            self.assertIsNone(hub_clr.active_owner_bot_id)
+            self.assertFalse(hub_clr._is_bound_owner_bot_key("sg"))
+
+        asyncio.run(_scenario())
+
+    def test_c5_takeover_mutex_and_telegram_card_isolation(self) -> None:
+        async def _scenario() -> None:
+            hub, page = self._make_active_hub(
+                owner=("main", ADMIN_UID_A),
+                owner_bot_handle="sg_bot",
+                owner_bot_id=202,
+                takeover=True,
+                takeover_owner=("main", ADMIN_UID_A),
+            )
+            hub.tg.cards[("main", ADMIN_UID_A)] = {
+                "message_id": 777,
+                "session_gen": hub.session_gen,
+                "owner_bot": "main",
+                "owner_uid": ADMIN_UID_A,
+            }
+
+            # 1. Bound bot sg CANNOT release, alter, or preempt takeover via set_takeover / internal_takeover / internal_config
+            for want in (False, True):
+                ok_tk, _err_tk, _, _ = await hub.set_takeover(
+                    want,
+                    reason="bound_bot_attempt",
+                    actor=("sg", ADMIN_UID_A),
+                    expected_session_gen=hub.session_gen,
+                    expected_takeover_gen=hub.takeover_gen,
+                )
+                self.assertFalse(ok_tk)
+                self.assertTrue(hub.takeover)
+                self.assertEqual(("main", ADMIN_UID_A), hub.takeover_owner)
+
+                r_tk = await srv.internal_takeover(
+                    _make_req(
+                        hub,
+                        {
+                            "active": want,
+                            "source": "tg_cmd",
+                            "chat_scope": "private",
+                            "bot": "sg",
+                            "user_id": ADMIN_UID_A,
+                            "chat_id": ADMIN_UID_A,
+                        },
+                    )  # type: ignore[arg-type]
+                )
+                self.assertEqual(403, r_tk.status)
+                self.assertTrue(hub.takeover)
+                self.assertEqual(("main", ADMIN_UID_A), hub.takeover_owner)
+
+                r_cfg = await srv.internal_config(
+                    _make_req(
+                        hub,
+                        {
+                            "takeover": want,
+                            "source": "tg_cmd",
+                            "chat_scope": "private",
+                            "bot": "sg",
+                            "user_id": ADMIN_UID_A,
+                            "chat_id": ADMIN_UID_A,
+                        },
+                    )  # type: ignore[arg-type]
+                )
+                self.assertEqual(403, r_cfg.status)
+                self.assertTrue(hub.takeover)
+                self.assertEqual(("main", ADMIN_UID_A), hub.takeover_owner)
+
+            # 2. Bound bot sg CANNOT bypass takeover barrier to execute mutating AI action
+            act_task = asyncio.create_task(
+                srv.internal_action(
+                    _make_req(
+                        hub,
+                        {
+                            "action": "goto",
+                            "url": "https://example.org/blocked-by-takeover",
+                            "source": "tg_cmd",
+                            "chat_scope": "private",
+                            "bot": "sg",
+                            "user_id": ADMIN_UID_A,
+                            "chat_id": ADMIN_UID_A,
+                            "notify": False,
+                        },
+                    )  # type: ignore[arg-type]
+                )
+            )
+            await asyncio.sleep(0.05)
+            self.assertFalse(act_task.done(), "Mutating AI action from bound bot MUST block while takeover is active")
+            self.assertEqual([], page.goto_calls)
+            act_task.cancel()
+            try:
+                await act_task
+            except asyncio.CancelledError:
+                pass
+
+            # 3. Cross-bot TG Live Card callback from sg on main's card -> 403 everywhere
+            for card_ep, card_body in (
+                (srv.internal_stop, {}),
+                (srv.internal_takeover, {"active": False}),
+                (srv.internal_config, {"refresh_card": True}),
+            ):
+                r_card = await card_ep(
+                    _make_req(
+                        hub,
+                        {
+                            **card_body,
+                            "source": "tg_card",
+                            "from_card": True,
+                            "bot": "sg",
+                            "user_id": ADMIN_UID_A,
+                            "chat_id": ADMIN_UID_A,
+                            "message_id": 777,
+                        },
+                    )  # type: ignore[arg-type]
+                )
+                self.assertEqual(403, r_card.status, f"Cross-bot TG card callback must return 403 on {card_ep.__name__}")
+
+            self.assertTrue(hub.takeover)
+            self.assertEqual(("main", ADMIN_UID_A), hub.takeover_owner)
+
+        asyncio.run(_scenario())
+
+
 if __name__ == "__main__":
     unittest.main()

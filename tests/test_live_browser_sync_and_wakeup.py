@@ -3012,5 +3012,218 @@ class TestStage2BridgeWakeupRaceAndPromptIsolation(unittest.TestCase):
                 self.assertEqual(2, len(enqueued_new), "Handback carrying explicit admin instruction must NOT be swallowed")
 
 
+class TestWorkstreamEExternalCdpGoogleAndFastFail(unittest.TestCase):
+    """C1 & C2: attach-cdp external Google flags, client trust boundary, fast-fail skip_final_checkpoint & non-destructive detach."""
+
+    def test_c1_cli_attach_cdp_optional_google_flags_and_client_trusts_only_hub_verified(self) -> None:
+        # 1. Parser defaults omit profile/profile_dir/allow_google
+        args_default = ctl.build_parser().parse_args(
+            ["attach-cdp", "--cdp-url", "ws://127.0.0.1:19222/devtools/browser/def", "--watch"]
+        )
+        self.assertIsNone(args_default.profile)
+        self.assertIsNone(args_default.profile_dir)
+        self.assertFalse(args_default.allow_google)
+
+        args_ext = ctl.build_parser().parse_args(
+            [
+                "attach-cdp",
+                "--cdp-url",
+                "ws://127.0.0.1:19222/devtools/browser/ext",
+                "--watch",
+                "--profile",
+                "ext-default",
+                "--profile-dir",
+                "/tmp/mock-ext-profile",
+                "--allow-google",
+            ]
+        )
+        self.assertEqual("ext-default", args_ext.profile)
+        self.assertEqual("/tmp/mock-ext-profile", args_ext.profile_dir)
+        self.assertTrue(args_ext.allow_google)
+
+        # 2. Client process has NO AGY_LIVE_BROWSER_EXTERNAL_GOOGLE_PROFILE_DIRS env var,
+        #    yet Hub returns allow_google_verified=True -> Google nav succeeds!
+        env = _make_clean_cdp_env()
+        env["AGY_LIVE_BROWSER_REQUIRE_PINNED"] = "1"
+        env.pop("AGY_LIVE_BROWSER_EXTERNAL_GOOGLE_PROFILE_DIRS", None)
+
+        log: list[tuple[str, ...]] = []
+        page = _MockCDPPage("p0", log=log)
+        ctx = _MockCDPContext([page], log)
+        browser = _MockCDPBrowser([ctx], log)
+        pw = _MockPlaywright(log)
+        hub_sess = _MockHubSession()
+
+        orig_post = hub_sess.post
+
+        def _post_with_verified(url: str, **kwargs: object) -> _MockHTTPResponse:
+            resp = orig_post(url, **kwargs)
+            if "/internal/sync/start" in url and resp.status_code == 200 and isinstance(resp._body, dict):
+                resp._body["allow_google_verified"] = True
+                resp._body["google_allowed"] = True
+            return resp
+
+        hub_sess.post = _post_with_verified  # type: ignore[method-assign]
+        now_t = [0.0]
+
+        def _adv_sleep(dt: float) -> None:
+            now_t[0] += max(dt, 1.0)
+
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(ctl, "LiveBrowserClient", side_effect=lambda *_a, **_kw: _build_mock_hub_client(hub_sess)),
+        ):
+            res = cdp_bridge.run_cdp_live_bridge(
+                "ws://127.0.0.1:19222/devtools/browser/ext-ok",
+                mode="watch",
+                timeout=0.5,
+                url="https://mail.google.com/mail/u/0/",
+                profile="ext-default",
+                profile_dir="/var/lib/mock-ext-profile",
+                allow_google=True,
+                connect_fn=lambda _u, _t: (pw, browser),
+                clock_fn=lambda: now_t[0],
+                sleep_fn=_adv_sleep,
+                install_signals=False,
+                env=env,
+            )
+        self.assertTrue(res["ok"], f"Verified external Google CDP session should succeed: {res}")
+        self.assertEqual("https://mail.google.com/mail/u/0/", page.url)
+        start_calls = [c for c in hub_sess.calls if "/internal/sync/start" in str(c["url"])]
+        self.assertEqual(1, len(start_calls))
+        start_body = start_calls[0]["json"]
+        assert isinstance(start_body, dict)
+        self.assertEqual("ext-default", start_body.get("profile"))
+        self.assertEqual("/var/lib/mock-ext-profile", start_body.get("profile_dir"))
+        self.assertIs(True, start_body.get("allow_google"))
+        self.assertFalse(bool(start_body.get("pinned_launch")))
+        self.assertEqual(0, page.close_calls)
+        self.assertEqual(0, ctx.close_calls)
+
+    def test_c2_unauthorized_google_and_nav_fail_fast_skip_final_checkpoint_and_preserve_remote_page(self) -> None:
+        # Case A: Hub returns allow_google_verified=False despite caller passing allow_google=True -> fast-fail
+        env = _make_clean_cdp_env()
+        env["AGY_LIVE_BROWSER_REQUIRE_PINNED"] = "1"
+        log: list[tuple[str, ...]] = []
+        page = _MockCDPPage("p0", url="https://example.org/start", log=log)
+        ctx = _MockCDPContext([page], log)
+        browser = _MockCDPBrowser([ctx], log)
+        pw = _MockPlaywright(log)
+        hub_sess = _MockHubSession()
+
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(ctl, "LiveBrowserClient", side_effect=lambda *_a, **_kw: _build_mock_hub_client(hub_sess)),
+        ):
+            res = cdp_bridge.run_cdp_live_bridge(
+                "ws://127.0.0.1:19222/devtools/browser/unauth-goog",
+                mode="watch",
+                url="https://mail.google.com/",
+                profile="ext-unverified",
+                profile_dir="/tmp/unlisted-dir",
+                allow_google=True,
+                connect_fn=lambda _u, _t: (pw, browser),
+                sleep_fn=lambda _s: None,
+                install_signals=False,
+                env=env,
+            )
+
+        self.assertFalse(res["ok"])
+        self.assertEqual("google_nav_blocked", res["reason"])
+        self.assertEqual(0, res["frames_pushed"])
+        self.assertIn("Google", str(res.get("error") or ""))
+        self.assertIn("拒绝", str(res.get("error") or ""))
+        self.assertEqual("https://example.org/start", page.url, "Blocked Google nav must never call page.goto")
+
+        # Must NOT push any "会话即将完成" final checkpoint frame!
+        push_calls = [c for c in hub_sess.calls if "/internal/sync/push" in str(c["url"])]
+        self.assertEqual([], push_calls, "Fast-fail must set skip_final_checkpoint=True and push 0 frames")
+        # Must cleanly call /internal/sync/stop and non-destructively detach without closing remote page/ctx
+        self.assertEqual(1, len(hub_sess.stop_calls))
+        self.assertEqual(0, page.close_calls)
+        self.assertEqual(0, ctx.close_calls)
+        self.assertEqual(1, browser.close_calls)
+        self.assertEqual(1, pw.stop_calls)
+
+        # Case B: Initial page.goto raises error -> fast-fail with skip_final_checkpoint=True & Chinese reason
+        page_err = _MockCDPPage("p_err", url="https://example.org/init", log=log)
+
+        def _boom_goto(_u: str, **_kw: object) -> None:
+            raise RuntimeError("net::ERR_CONNECTION_REFUSED")
+
+        page_err.goto = _boom_goto  # type: ignore[method-assign]
+        ctx2 = _MockCDPContext([page_err], log)
+        browser2 = _MockCDPBrowser([ctx2], log)
+        pw2 = _MockPlaywright(log)
+        hub_sess2 = _MockHubSession()
+
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(ctl, "LiveBrowserClient", side_effect=lambda *_a, **_kw: _build_mock_hub_client(hub_sess2)),
+        ):
+            res2 = cdp_bridge.run_cdp_live_bridge(
+                "ws://127.0.0.1:19222/devtools/browser/nav-err",
+                mode="watch",
+                url="https://example.com/fail",
+                connect_fn=lambda _u, _t: (pw2, browser2),
+                sleep_fn=lambda _s: None,
+                install_signals=False,
+                env=env,
+            )
+        self.assertFalse(res2["ok"])
+        self.assertEqual("navigation_failed", res2["reason"])
+        self.assertIn("打开初始页面失败", str(res2.get("error") or ""))
+        push_calls2 = [c for c in hub_sess2.calls if "/internal/sync/push" in str(c["url"])]
+        self.assertEqual([], push_calls2, "navigation_failed must also set skip_final_checkpoint=True")
+        self.assertEqual(0, page_err.close_calls)
+        self.assertEqual(0, ctx2.close_calls)
+        self.assertEqual(1, browser2.close_calls)
+        self.assertEqual(1, pw2.stop_calls)
+
+    def test_f3_unverified_allow_google_import_error_fails_closed(self) -> None:
+        """F3: When allow_google=True is unverified by Hub and _import_server_module() raises, Google URL MUST fail-closed."""
+        env = _make_clean_cdp_env()
+        # Intentionally omit AGY_LIVE_BROWSER_REQUIRE_PINNED so client-side _is_sync_google_nav_blocked
+        # returns False and relies on the secondary guard in run_cdp_live_bridge.
+        env.pop("AGY_LIVE_BROWSER_REQUIRE_PINNED", None)
+
+        log: list[tuple[str, ...]] = []
+        page = _MockCDPPage("p0", url="https://example.org/start", log=log)
+        ctx = _MockCDPContext([page], log)
+        browser = _MockCDPBrowser([ctx], log)
+        pw = _MockPlaywright(log)
+        hub_sess = _MockHubSession()
+
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(ctl, "LiveBrowserClient", side_effect=lambda *_a, **_kw: _build_mock_hub_client(hub_sess)),
+            mock.patch.object(ctl, "_import_server_module", side_effect=ImportError("simulated server import failure")),
+        ):
+            res = cdp_bridge.run_cdp_live_bridge(
+                "ws://127.0.0.1:19222/devtools/browser/f3-import-err",
+                mode="watch",
+                url="https://mail.google.com/",
+                profile="ext-unverified",
+                profile_dir="/tmp/unlisted-dir",
+                allow_google=True,
+                connect_fn=lambda _u, _t: (pw, browser),
+                sleep_fn=lambda _s: None,
+                install_signals=False,
+                env=env,
+            )
+
+        self.assertFalse(res["ok"], f"Import failure under unverified allow_google MUST fail closed: {res}")
+        self.assertEqual("google_nav_blocked", res["reason"])
+        self.assertEqual(0, res["frames_pushed"])
+        self.assertEqual("https://example.org/start", page.url, "Fail-closed guard must never call page.goto")
+        push_calls = [c for c in hub_sess.calls if "/internal/sync/push" in str(c["url"])]
+        self.assertEqual([], push_calls, "Fail-closed guard must set skip_final_checkpoint=True (0 push frames)")
+        self.assertEqual(1, len(hub_sess.stop_calls))
+        self.assertEqual(0, page.close_calls)
+        self.assertEqual(0, ctx.close_calls)
+        self.assertEqual(1, browser.close_calls)
+        self.assertEqual(1, pw.stop_calls)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -51,6 +51,24 @@ _MUTATING_WS_TYPES = frozenset({
 _BLOCKED_CLIENT_WS_TYPES = frozenset({"auth", "internal_auth"})
 
 
+def _parse_positive_bot_id(raw: Any) -> int | None:
+    """Normalize a positive integer or ASCII digit string bot_id; reject bool/leading-zero/malformed."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw if raw > 0 else None
+    if isinstance(raw, str):
+        if not raw or any(ch.isspace() for ch in raw):
+            return None
+        if not raw.isascii() or not raw.isdigit():
+            return None
+        if len(raw) > 1 and raw.startswith("0"):
+            return None
+        val = int(raw)
+        return val if val > 0 else None
+    return None
+
+
 def _http_to_ws_url(base_http_url: str, path: str) -> str:
     clean = base_http_url.strip().rstrip("/")
     if clean.startswith("https://"):
@@ -467,12 +485,63 @@ class BrowserProxy:
                                     )
                                 )
                             continue
-                        # Strip any client-forged `role` key before forwarding upstream
+                        # Strip any client-forged `role` key before forwarding upstream;
+                        # normalize/fill `owner_bot_id` on `rebind_owner_bot` from Studio roster.
+                        mutated_payload = False
                         if "role" in payload:
                             payload.pop("role", None)
-                            forward_str = json.dumps(payload, ensure_ascii=False)
-                        else:
-                            forward_str = msg.data
+                            mutated_payload = True
+                        if mtype == "rebind_owner_bot":
+                            raw_owner_bot = payload.get("owner_bot")
+                            target_handle = (
+                                raw_owner_bot.strip().lstrip("@").lower()
+                                if isinstance(raw_owner_bot, str)
+                                else ""
+                            )
+                            roster_bots: list[dict[str, Any]] | None = None
+                            try:
+                                bots_data = self.data_sources.get_browser_bots()
+                                raw_list = bots_data.get("bots") if isinstance(bots_data, dict) else None
+                                if isinstance(raw_list, list):
+                                    roster_bots = [item for item in raw_list if isinstance(item, dict)]
+                            except Exception:
+                                roster_bots = None
+
+                            roster_match: dict[str, Any] | None = None
+                            if target_handle and roster_bots:
+                                for item in roster_bots:
+                                    if str(item.get("handle") or "").strip().lower() == target_handle:
+                                        roster_match = item
+                                        break
+
+                            had_owner_bot_id = "owner_bot_id" in payload
+                            if roster_match is not None:
+                                roster_bid = _parse_positive_bot_id(roster_match.get("bot_id"))
+                                if roster_bid is not None:
+                                    cur_bid = payload.get("owner_bot_id")
+                                    if isinstance(cur_bid, bool) or cur_bid != roster_bid or type(cur_bid) is not int:
+                                        payload["owner_bot_id"] = roster_bid
+                                        mutated_payload = True
+                                elif had_owner_bot_id:
+                                    payload.pop("owner_bot_id", None)
+                                    mutated_payload = True
+                            elif roster_bots:
+                                # Roster is configured and target owner_bot is absent/unlisted:
+                                # strip any client-supplied owner_bot_id to align with HTTP /api/browser/owner-bot.
+                                if had_owner_bot_id:
+                                    payload.pop("owner_bot_id", None)
+                                    mutated_payload = True
+                            else:
+                                client_bid = _parse_positive_bot_id(payload.get("owner_bot_id"))
+                                if client_bid is not None:
+                                    cur_bid = payload.get("owner_bot_id")
+                                    if isinstance(cur_bid, bool) or cur_bid != client_bid or type(cur_bid) is not int:
+                                        payload["owner_bot_id"] = client_bid
+                                        mutated_payload = True
+                                elif had_owner_bot_id:
+                                    payload.pop("owner_bot_id", None)
+                                    mutated_payload = True
+                        forward_str = json.dumps(payload, ensure_ascii=False) if mutated_payload else msg.data
                         if not upstream_ws.closed and not entry.get("closing"):
                             await upstream_ws.send_str(forward_str)
                     elif msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED, WSMsgType.ERROR):

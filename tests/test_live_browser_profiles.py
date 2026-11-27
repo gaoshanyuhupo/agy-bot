@@ -2710,6 +2710,224 @@ class TestLiveBrowserProfiles(unittest.TestCase):
 
         asyncio.run(_scenario_bridge_ok())
 
+    def test_workstream_e_c1_external_google_dir_whitelist_fail_closed_and_c7_invariants(self) -> None:
+        """C1 & C7: AGY_LIVE_BROWSER_EXTERNAL_GOOGLE_PROFILE_DIRS fail-closed dir verification & sync_allow_google lifecycle."""
+        pinned_dir = self._install_mock_google_browser("pinned_acct")
+        ext_root = self.root / "ext_profiles"
+        ext_root.mkdir(parents=True, exist_ok=True)
+        os.chmod(ext_root, 0o700)
+
+        allowed_dir = ext_root / "ext_google_ok"
+        allowed_dir.mkdir()
+        os.chmod(allowed_dir, 0o700)
+
+        other_dir = ext_root / "ext_not_whitelisted"
+        other_dir.mkdir()
+        os.chmod(other_dir, 0o700)
+
+        ww_dir = ext_root / "ext_ww_777"
+        ww_dir.mkdir()
+        os.chmod(ww_dir, 0o777)
+
+        sticky_ww_dir = ext_root / "ext_sticky_1777"
+        sticky_ww_dir.mkdir()
+        os.chmod(sticky_ww_dir, 0o1777)
+
+        ww_ancestor = ext_root / "ww_ancestor"
+        ww_ancestor.mkdir()
+        os.chmod(ww_ancestor, 0o777)
+        under_ww_ancestor = ww_ancestor / "child_prof"
+        under_ww_ancestor.mkdir()
+        os.chmod(under_ww_ancestor, 0o700)
+
+        sym_leaf = ext_root / "sym_leaf"
+        os.symlink(str(allowed_dir), str(sym_leaf))
+
+        sym_parent = ext_root / "sym_parent"
+        os.symlink(str(ext_root), str(sym_parent))
+        under_sym_parent = sym_parent / "ext_google_ok"
+
+        regular_file = ext_root / "not_a_dir"
+        regular_file.write_text("x", encoding="utf-8")
+        os.chmod(regular_file, 0o600)
+
+        pinned_child = pinned_dir / "nested_child"
+        pinned_child.mkdir(parents=True, exist_ok=True)
+        os.chmod(pinned_child, 0o700)
+
+        # 1. Default empty env -> fail-closed
+        with mock.patch.dict(os.environ, {"AGY_LIVE_BROWSER_EXTERNAL_GOOGLE_PROFILE_DIRS": ""}, clear=False):
+            self.assertFalse(srv.verify_external_google_profile_dir(str(allowed_dir)))
+            self.assertFalse(srv.verify_external_google_profile_dir(None))
+            self.assertFalse(srv.verify_external_google_profile_dir(""))
+
+        # 2. Populate whitelist with valid + deliberately unsafe entries (all unsafe entries MUST be rejected)
+        wl_val = os.pathsep.join(
+            [
+                str(allowed_dir),
+                str(ww_dir),
+                str(sticky_ww_dir),
+                str(under_ww_ancestor),
+                str(sym_leaf),
+                str(under_sym_parent),
+                str(regular_file),
+                str(pinned_dir),
+                str(pinned_child),
+                str(pinned_dir.parent),
+                str(ext_root / "missing_dir"),
+                "relative/ext_dir",
+                f"{allowed_dir}/../ext_google_ok",
+            ]
+        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                "AGY_LIVE_BROWSER_EXTERNAL_GOOGLE_PROFILE_DIRS": wl_val,
+                "AGY_LIVE_BROWSER_REQUIRE_PINNED": "1",
+            },
+            clear=False,
+        ):
+            # Only canonical safe whitelisted directory passes
+            self.assertTrue(srv.verify_external_google_profile_dir(str(allowed_dir)))
+            self.assertTrue(srv.verify_external_google_profile_dir(f"{allowed_dir}/"))
+
+            # All unsafe / non-whitelisted / pinned-overlapping candidates MUST fail closed
+            for bad_cand in (
+                None,
+                "",
+                "   ",
+                "relative/ext_dir",
+                f"{allowed_dir}/../ext_google_ok",
+                f"{allowed_dir}/./",
+                str(ext_root / "missing_dir"),
+                str(other_dir),
+                str(ww_dir),
+                str(sticky_ww_dir),
+                str(under_ww_ancestor),
+                str(sym_leaf),
+                str(under_sym_parent),
+                str(regular_file),
+                str(pinned_dir),
+                str(pinned_child),
+                str(pinned_dir.parent),
+                "/",
+                "/tmp",
+            ):
+                self.assertFalse(
+                    srv.verify_external_google_profile_dir(bad_cand),
+                    f"Unsafe/unauthorized external Google dir must be rejected: {bad_cand!r}",
+                )
+
+            # 3. Real internal_sync_start verification & strict bool check
+            async def _verify_sync_start() -> None:
+                hub = srv.LiveBrowserHub({"host": "127.0.0.1", "port": 18795, "public_url": ""}, "sec-tok")
+                with mock.patch.object(srv, "web", self._make_fake_web()):
+                    # Non-bool allow_google rejected with 400 (anti-truthy bypass)
+                    for bad_bool in ("true", "1", 1, ["yes"], {"a": 1}):
+                        r_type = await srv.internal_sync_start(
+                            self._make_internal_req(
+                                hub,
+                                body={"profile_dir": str(allowed_dir), "allow_google": bad_bool},
+                            )
+                        )  # type: ignore[arg-type]
+                        self.assertEqual(400, r_type.status, f"Non-bool allow_google={bad_bool!r} must return 400")
+
+                    # Whitelisted dir WITHOUT allow_google=True NEVER escalates
+                    for no_claim in (
+                        {"profile_dir": str(allowed_dir)},
+                        {"profile_dir": str(allowed_dir), "allow_google": False},
+                    ):
+                        r_no = await srv.internal_sync_start(
+                            self._make_internal_req(hub, body=no_claim)
+                        )  # type: ignore[arg-type]
+                        self.assertEqual(200, r_no.status)
+                        self.assertFalse(r_no.data["allow_google_verified"])
+                        self.assertFalse(r_no.data["google_allowed"])
+                        self.assertFalse(r_no.data["pinned_verified"])
+                        self.assertFalse(hub.sync_allow_google)
+                        self.assertFalse(hub._is_active_google_allowed())
+
+                    # Bare allow_google=True or unsafe/whitespace/non-string dir -> fail-closed
+                    for bad_body in (
+                        {"allow_google": True},
+                        {"allow_google": True, "profile_dir": str(other_dir)},
+                        {"allow_google": True, "profile_dir": str(ww_dir)},
+                        {"allow_google": True, "profile_dir": str(sticky_ww_dir)},
+                        {"allow_google": True, "profile_dir": str(sym_leaf)},
+                        {"allow_google": True, "profile_dir": str(pinned_dir)},
+                        {"allow_google": True, "profile_dir": f" {allowed_dir} "},
+                        {"allow_google": True, "profile_dir": f" {allowed_dir}"},
+                        {"allow_google": True, "profile_dir": f"{allowed_dir} "},
+                        {"allow_google": True, "profile_dir": f"\t{allowed_dir}\n"},
+                        {"allow_google": True, "profile_dir": 123},
+                        {"allow_google": True, "profile_dir": [str(allowed_dir)]},
+                        {"allow_google": True, "profile_dir": {"dir": str(allowed_dir)}},
+                        {"allow_google": True, "profile_dir": True},
+                        {"pinned_launch": True, "profile_dir": f" {pinned_dir} "},
+                        {"pinned_launch": True, "profile_dir": 123},
+                    ):
+                        r_bad = await srv.internal_sync_start(
+                            self._make_internal_req(hub, body=bad_body)
+                        )  # type: ignore[arg-type]
+                        self.assertEqual(200, r_bad.status)
+                        self.assertFalse(
+                            r_bad.data["allow_google_verified"],
+                            f"bad_body={bad_body!r} must fail closed allow_google_verified",
+                        )
+                        self.assertFalse(
+                            r_bad.data["google_allowed"],
+                            f"bad_body={bad_body!r} must fail closed google_allowed",
+                        )
+                        self.assertFalse(
+                            r_bad.data["pinned_verified"],
+                            f"bad_body={bad_body!r} must fail closed pinned_verified",
+                        )
+                        self.assertFalse(hub.sync_allow_google)
+                        self.assertFalse(hub._is_active_google_allowed())
+
+                    # Valid whitelisted dir + allow_google=True -> verified external Google (NEVER pinned_verified!)
+                    r_ok = await srv.internal_sync_start(
+                        self._make_internal_req(
+                            hub,
+                            body={
+                                "profile": "ext-main",
+                                "profile_dir": str(allowed_dir),
+                                "allow_google": True,
+                            },
+                        )
+                    )  # type: ignore[arg-type]
+                    self.assertEqual(200, r_ok.status)
+                    self.assertTrue(r_ok.data["allow_google_verified"])
+                    self.assertTrue(r_ok.data["google_allowed"])
+                    self.assertFalse(r_ok.data["pinned_verified"], "External sync MUST NEVER forge pinned_verified=True")
+                    self.assertTrue(hub.sync_allow_google)
+                    self.assertTrue(hub._is_active_google_allowed())
+                    self.assertTrue(hub.state_dict(include_profiles=False)["allow_google"])
+
+                    # enforce_google_profile_policy allows Google URL for verified external profile_dir
+                    srv.enforce_google_profile_policy(
+                        "https://mail.google.com/mail/u/0/",
+                        is_pinned=False,
+                        allow_google=True,
+                        profile_dir=allowed_dir,
+                    )
+                    # Still blocks when allow_google=False
+                    with self.assertRaises(ValueError):
+                        srv.enforce_google_profile_policy(
+                            "https://mail.google.com/mail/u/0/",
+                            is_pinned=False,
+                            allow_google=False,
+                            profile_dir=allowed_dir,
+                        )
+
+                    # Session stop/invalidation immediately resets sync_allow_google -> False
+                    hub._invalidate_sync_session_sync()
+                    self.assertFalse(hub.sync_allow_google)
+                    self.assertFalse(hub.active_allow_google_verified)
+                    self.assertFalse(hub._is_active_google_allowed())
+
+            asyncio.run(_verify_sync_start())
+
 
 if __name__ == "__main__":
     unittest.main()

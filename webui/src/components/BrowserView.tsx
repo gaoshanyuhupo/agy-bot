@@ -199,6 +199,7 @@ export function BrowserView({
   const [mobileTabsOpen, setMobileTabsOpen] = useState(false);
   const [mobileMoreOpen, setMobileMoreOpen] = useState(false);
   const [confirmMobileStop, setConfirmMobileStop] = useState(false);
+  const [stopConfirmModalOpen, setStopConfirmModalOpen] = useState(false);
   const [desktopPillCollapsed, setDesktopPillCollapsed] = useState(false);
 
   // Virtual camera projection & touch interaction state
@@ -297,6 +298,24 @@ export function BrowserView({
   useEffect(() => {
     roleRef.current = liveRole;
   }, [liveRole]);
+
+  const canStopBrowser =
+    liveRole === "admin" && state.running && !state.session_restricted;
+
+  useEffect(() => {
+    if (!canStopBrowser) {
+      setStopConfirmModalOpen(false);
+      setConfirmMobileStop(false);
+    }
+  }, [canStopBrowser]);
+
+  const activeEngineLabel = useMemo(() => {
+    const matched = engines.find((e) => e.id === state.engine);
+    if (matched?.label) return matched.label;
+    if (state.engine === "external_chromium") return "External Chromium";
+    if (state.engine === "camoufox") return "Camoufox";
+    return state.engine_mode === "sync_external" ? "External Chromium" : "Camoufox";
+  }, [engines, state.engine, state.engine_mode]);
 
   const showToast = useCallback((msg: string) => {
     setToast(msg);
@@ -743,6 +762,8 @@ export function BrowserView({
           setState((prev) => ({ ...prev, takeover: false }));
           setKbSheetOpen(false);
           setMobileUrlEditing(false);
+          setStopConfirmModalOpen(false);
+          setConfirmMobileStop(false);
           const infoMsg =
             typeof msg.message === "string" && msg.message
               ? msg.message
@@ -772,6 +793,8 @@ export function BrowserView({
           }
           if (nextState.session_restricted || !nextState.running) {
             clearCanvasFrame();
+            setStopConfirmModalOpen(false);
+            setConfirmMobileStop(false);
           }
           setState(nextState);
         } else if (mtype === "toast" && typeof msg.message === "string") {
@@ -808,6 +831,8 @@ export function BrowserView({
       setWsStatus("disconnected");
       if (ev.code === 4003) {
         setState((prev) => ({ ...prev, takeover: false }));
+        setStopConfirmModalOpen(false);
+        setConfirmMobileStop(false);
         onSessionRevoked("会话权限已被撤销或已退出登录");
         return;
       }
@@ -819,6 +844,8 @@ export function BrowserView({
         setState((prev) => ({ ...prev, takeover: false }));
         setKbSheetOpen(false);
         setMobileUrlEditing(false);
+        setStopConfirmModalOpen(false);
+        setConfirmMobileStop(false);
         if (reconnectTimerRef.current) window.clearTimeout(reconnectTimerRef.current);
         reconnectTimerRef.current = window.setTimeout(() => {
           if (!unmountedRef.current) connectWs();
@@ -1641,11 +1668,22 @@ export function BrowserView({
   };
 
   const handleStopBrowser = async () => {
-    if (liveRole !== "admin" || stopping) return;
+    if (
+      roleRef.current !== "admin" ||
+      liveRole !== "admin" ||
+      !stateRef.current.running ||
+      stateRef.current.session_restricted ||
+      stopping
+    ) {
+      setStopConfirmModalOpen(false);
+      setConfirmMobileStop(false);
+      return;
+    }
     releaseAllHeldInputs();
     setStopping(true);
     try {
       await stopBrowser();
+      setStopConfirmModalOpen(false);
       setConfirmMobileStop(false);
       setMobileMoreOpen(false);
       showToast("⏹ 浏览器已安全停止");
@@ -2228,13 +2266,36 @@ export function BrowserView({
                 setMobileMoreOpen(true);
               }}
               title={activeOwnerHandle ? `当前绑定 AI: @${activeOwnerHandle}` : "切换操作 AI / 更多"}
-              className="h-8 max-w-[92px] px-2 rounded-lg border border-slate-700/80 bg-slate-950/85 hover:bg-slate-800 text-[11px] text-sky-300 inline-flex items-center gap-1 shrink-0 cursor-pointer"
+              className="h-8 max-w-[76px] px-1.5 rounded-lg border border-slate-700/80 bg-slate-950/85 hover:bg-slate-800 text-[11px] text-sky-300 inline-flex items-center gap-1 shrink-0 cursor-pointer"
             >
               <Bot className="w-3.5 h-3.5 shrink-0" />
               <span className="truncate font-mono">
                 {activeOwnerHandle ? activeOwnerHandle.replace(/_bot$/i, "") : "AI"}
               </span>
             </button>
+
+            {liveRole === "admin" && state.running && !state.session_restricted && (
+              <button
+                type="button"
+                disabled={stopping}
+                onClick={() => {
+                  setMobileTabsOpen(false);
+                  setMobileMoreOpen(false);
+                  setStopConfirmModalOpen(true);
+                }}
+                aria-label="关闭浏览器"
+                title="关闭当前浏览器会话"
+                data-testid="mobile-topbar-stop-btn"
+                className="h-8 px-2 rounded-lg border border-rose-500/70 bg-rose-600/90 hover:bg-rose-500 active:bg-rose-700 text-white text-[11px] font-semibold inline-flex items-center gap-1 shrink-0 cursor-pointer disabled:opacity-45 disabled:pointer-events-none"
+              >
+                {stopping ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+                ) : (
+                  <Square className="w-3 h-3 fill-current shrink-0" />
+                )}
+                <span>关闭</span>
+              </button>
+            )}
 
             {isDrawer && onExpandFull && (
               <button
@@ -3116,6 +3177,78 @@ export function BrowserView({
                 )}
               </div>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* ==================== PORTRAIT TOP-BAR STOP CONFIRM MODAL ==================== */}
+      {stopConfirmModalOpen && liveRole === "admin" && state.running && !state.session_restricted && (
+        <div
+          className="fixed inset-0 bg-black/65 backdrop-blur-xs z-50 flex items-center justify-center p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-label="确认关闭浏览器"
+          data-testid="mobile-stop-confirm-modal"
+          onClick={() => {
+            if (!stopping) setStopConfirmModalOpen(false);
+          }}
+        >
+          <div
+            className="w-full max-w-sm rounded-2xl border border-rose-500/40 bg-slate-900 p-4 shadow-2xl space-y-3"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2 text-sm font-semibold text-rose-300 min-w-0">
+                <Square className="w-3.5 h-3.5 fill-current shrink-0" />
+                <span className="truncate">关闭当前浏览器会话</span>
+              </div>
+              <button
+                type="button"
+                disabled={stopping}
+                onClick={() => setStopConfirmModalOpen(false)}
+                aria-label="取消关闭弹窗"
+                className="text-slate-400 hover:text-slate-200 cursor-pointer shrink-0 disabled:opacity-40"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="rounded-xl border border-slate-800 bg-slate-950/80 px-3 py-2 text-xs text-slate-300 space-y-1">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-slate-400 shrink-0">引擎</span>
+                <span className="font-mono text-slate-100 truncate">{activeEngineLabel}</span>
+              </div>
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-slate-400 shrink-0">Profile</span>
+                <span className="font-mono text-slate-100 truncate">{state.profile || "default"}</span>
+              </div>
+            </div>
+            <p className="text-xs text-slate-400 leading-relaxed">
+              关闭后将断开当前实时画面并回收浏览器进程，确认继续吗？
+            </p>
+            <div className="flex items-center justify-end gap-2 pt-1">
+              <button
+                type="button"
+                disabled={stopping}
+                onClick={() => setStopConfirmModalOpen(false)}
+                className="h-9 px-3.5 rounded-lg border border-slate-700 text-xs text-slate-300 hover:bg-slate-800 cursor-pointer disabled:opacity-40"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                disabled={stopping}
+                onClick={() => void handleStopBrowser()}
+                data-testid="mobile-stop-confirm-submit"
+                className="h-9 px-4 rounded-lg bg-rose-600 hover:bg-rose-500 text-xs font-semibold text-white inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+              >
+                {stopping ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <Square className="w-3 h-3 fill-current" />
+                )}
+                <span>确认关闭</span>
+              </button>
+            </div>
           </div>
         </div>
       )}
