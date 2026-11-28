@@ -2,14 +2,10 @@
 
 [简体中文](./README.md) | **English**
 
-An open-source AI collaborative workbench and multi-platform companion suite built natively on the **official Google Antigravity CLI (`agy`)**—connecting directly to local `agy` sessions without risky third-party reverse proxies, so you can orchestrate your AI engineering team seamlessly across **Telegram, Desktop WebUI, and Mobile WebUI**.
+An open-source AI collaborative workbench and multi-platform companion suite built natively on the **official Google Antigravity CLI (`agy`)**—connecting directly to local `agy` sessions without risky third-party reverse proxies, and federating with external agents such as **Hermes / Muse** so you can orchestrate a cross-framework AI engineering team seamlessly across **Telegram, Desktop WebUI, and Mobile WebUI**.
 
-- **License**: [MIT](./LICENSE)
-- **Repository**: [gaoshanyuhupo/agy-bot](https://github.com/gaoshanyuhupo/agy-bot)
 - **Showcase Site**: [aibigbigworld.com/agy-bot](https://aibigbigworld.com/agy-bot/)
 - **Live Interactive Demo**: [aibigbigworld.com/agy-bot/demo](https://aibigbigworld.com/agy-bot/demo/) (try AGY Studio Desktop & Mobile WebUI directly in your browser—no setup required)
-- **Community**: [LINUX.DO](https://linux.do/)
-- **Security & Contributing**: [SECURITY.md](./SECURITY.md) · [CONTRIBUTING.md](./CONTRIBUTING.md)
 
 ---
 
@@ -23,10 +19,11 @@ An open-source AI collaborative workbench and multi-platform companion suite bui
 | **4. Self-Hosted OpenBao Secret Custody** | Centralizes API keys, proxy credentials, and service tokens with on-demand injection—eliminating plaintext keys in chat context |
 | **5. External Third-Party Model Gateways** | Mix official models with OpenAI / Anthropic / Gemini-compatible relays or local Ollama/vLLM, with 1-click latency probing and per-bot model selection |
 | **6. Desktop-Style Workbench & 3-Platform Sync** | Desktop-grade AGY Studio WebUI synced in real time with Telegram and Mobile WebUI across chats, team views, sidebar state, and default bot models |
+| **7. External Agent Federation (Hermes / Muse & More) & Federation Workbench** | Unifies local/remote Hermes, Muse, HTTP/A2A, NAT Pull Workers, and MCP/REST agents into a dedicated Federation Workbench with Telegram group mirroring, any-agent team leaders, and zero-trust security |
 
 ---
 
-## Six Core Features
+## Seven Core Features
 
 ### 1. Telegram Group Multi-Bot Team Collaboration
 
@@ -104,6 +101,25 @@ Telegram is unbeatable for issuing tasks on the go, while deep code review, file
 
 ---
 
+### 7. External Agent Federation (Hermes / Muse & More) & Federation Workbench
+
+When your workflow spans beyond a single framework—bringing **Hermes**, **Muse**, or custom agents running across private LANs and cloud hosts into one unified team—`agy-bot` provides a full bidirectional External Agent Federation architecture and dedicated workbench:
+
+- **Unified Multi-Form Heterogeneous Agent Onboarding**:
+  - **Hermes**: Connects directly to local `hermes -p <profile>` multi-profile parallel instances as well as remote standalone Hermes servers (with `/p/<profile>` multi-instance routing);
+  - **Muse**: Integrates remote Muse / OpenAI-compatible streaming external agents;
+  - **Standard Extensible Protocols**: Also supports bidirectional **HTTP / A2A** federation nodes, zero-public-port **NAT Pull Workers** (which proactively pull and report tasks via `PullWorkerQueue`, paired with the single-process multi-bot bridge `federation_tg_bridge.py`), and inbound-only **MCP / REST Agents**—all freely composable alongside local `agy` bots.
+- **Federation Workbench & Flexible Multi-Team Orchestration**:
+  - AGY Studio includes dedicated **Federation Workbench** and **Federation Management** control planes with **federation projects and multi-turn context conversations**, an **independent Federation Chatroom with real-time bidirectional Telegram group mirroring**, **live external agent Presence Heartbeat monitoring**, and a **cross-source task timeline**;
+  - Supports multi-team management where the Owner can authorize **any registered node** (local/remote Hermes, Muse, or an `agy` bot) to serve as team Leader, removing single-framework lock-in.
+- **Zero-Trust & Zero-Plaintext Security Boundary**:
+  - `Federation Hub` binds strictly to loopback by default (`127.0.0.1:18799`), and all node registrations, team edits, and role changes enforce strict Owner-only authorization;
+  - Credentials accept only OpenBao `secret_ref` references with zero plaintext on disk, while inbound calls enforce zero-cache real-time Bearer Token verification (`full` / `peek` scopes with 1-click rotate/revoke), HMAC-SHA256 anti-replay signatures, and `0600` redacted audit logs.
+
+![AGY Studio Federation Workbench with Hermes / Muse External Agent Collaboration](./docs/images/showcase-federation.svg)
+
+---
+
 ## Quickstart
 
 > For a zero-guesswork single/multi-bot setup guide and Docker Compose instructions, see **[docs/AI-INSTALL.md](./docs/AI-INSTALL.md)** (ready to hand directly to your AI assistant).
@@ -135,7 +151,7 @@ chmod 600 "$HOME/agy-tg-bridge/.env"
 ```
 
 - MCP configuration template: [config/mcp_config.example.json](./config/mcp_config.example.json)
-- Systemd service templates: [systemd/examples/](./systemd/examples) (including [`agy-studio.service.example`](./systemd/examples/agy-studio.service.example))
+- Systemd service templates: [systemd/examples/](./systemd/examples) (including [`agy-studio.service.example`](./systemd/examples/agy-studio.service.example), [`agy-federation-hub.service.example`](./systemd/examples/agy-federation-hub.service.example))
 
 </details>
 

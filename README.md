@@ -2,14 +2,10 @@
 
 **简体中文** | [English](./README.en.md)
 
-基于官方 **Google Antigravity CLI (`agy`)** 原生构建的开源 AI 协作工作台与多端助手套件——直连本地官方 `agy` 会话，不走第三方反代链路，让你在 **Telegram、桌面 WebUI、移动 WebUI** 三端无缝指挥自己的 AI 工程团队。
+基于官方 **Google Antigravity CLI (`agy`)** 原生构建的开源 AI 协作工作台与多端助手套件——直连本地官方 `agy` 会话，不走第三方反代链路，支持联动 **Hermes / Muse** 等外部 Agent 组建跨框架团队，让你在 **Telegram、桌面 WebUI、移动 WebUI** 三端无缝指挥自己的 AI 工程团队。
 
-- **开源协议**：[MIT](./LICENSE)
-- **代码仓库**：[gaoshanyuhupo/agy-bot](https://github.com/gaoshanyuhupo/agy-bot)
 - **项目展示页**：[aibigbigworld.com/agy-bot](https://aibigbigworld.com/agy-bot/)
 - **在线交互 Demo**：[aibigbigworld.com/agy-bot/demo](https://aibigbigworld.com/agy-bot/demo/)（免部署直开体验 AGY Studio 桌面/移动工作台）
-- **社区交流**：[LINUX.DO](https://linux.do/)
-- **安全与贡献**：[SECURITY.md](./SECURITY.md) · [CONTRIBUTING.md](./CONTRIBUTING.md)
 
 ---
 
@@ -23,10 +19,11 @@
 | **4. 自部署 OpenBao 密钥统一托管** | API Key、代理凭据集中托管按需注入，彻底告别把密钥明文贴进聊天上下文的风险 |
 | **5. 外部第三方模型自由接入与混搭** | 除官方模型外，兼容主流 OpenAI / Anthropic / Gemini 中转与本地 Ollama/vLLM，一键测速、按 Bot 自由搭配 |
 | **6. 模拟桌面版反重力工作台（三端互通）** | 贴近桌面 IDE 的 Web 工作台，与 Telegram、移动端 WebUI 实现消息、团队视图、侧栏状态与默认模型三端同步 |
+| **7. 外部 Agent 联邦接入（Hermes / Muse 等）与联邦工作台** | 统一接入本机/远端 Hermes、Muse、HTTP/A2A、内网 NAT Pull Worker 与 MCP/REST 节点；内置联邦工作台、TG 群双向镜像、多团队任意节点任 Leader 与零信任防线 |
 
 ---
 
-## 六大核心功能
+## 七大核心功能
 
 ### 1. Telegram 群组多 Bot 团队协作
 
@@ -104,6 +101,25 @@
 
 ---
 
+### 7. 外部 Agent 联邦接入（Hermes / Muse 等）与联邦工作台
+
+当你的工程实践不再局限于单一框架——希望把 **Hermes**、**Muse** 或部署在不同内网/云主机上的自定义 Agent 纳入同一个协作团队时，`agy-bot` 提供了完整的异构外部 Agent 双向联邦体系与专属工作台：
+
+- **多形态异构 Agent 统一接入**：
+  - **Hermes**：支持直连本机 `hermes -p <profile>` 多 Profile 并行，以及远程独立 Hermes 服务器（支持 `/p/<profile>` 多实例路由）；
+  - **Muse**：支持接入远程 Muse / OpenAI 兼容推流外部 Agent；
+  - **标准扩展协议**：同时支持标准 **HTTP / A2A** 双向联邦节点、无需公网端口的内网 **NAT Pull Worker**（主动向 Hub 拉取并回传任务，配套单进程多 Bot 桥接 `federation_tg_bridge.py`）与仅入站 **MCP / REST Agent**，可与本机 `agy` Bot 无缝混编协同。
+- **联邦工作台（Federation Workbench）与多团队自由编排**：
+  - AGY Studio 内置独立的「**联邦工作台**」与「**联邦管理**」控制面，支持**联邦项目与多轮上下文会话**、**独立联邦群聊室（Federation Chatroom）及 Telegram 群双向实时镜像**、**外部 Agent 实时在线心跳（Presence Heartbeat）监测与跨来源任务时间线观测**；
+  - 支持多团队编排，并可由所有者授权**任意已注册节点**（本机/远程 Hermes、Muse 或 `agy` Bot）担任团队 Leader，打破单一框架限制。
+- **零信任与零明文安全防线**：
+  - `Federation Hub` 默认仅回环监听（`127.0.0.1:18799`），所有节点注册、团队调整与角色变更严格由 Owner 独占授权；
+  - 凭据仅支持 OpenBao `secret_ref` 引用零明文落盘，入站采用零缓存实时 Bearer Token 校验（支持 `full` / `peek` 权限分级与一键轮换/吊销）+ HMAC-SHA256 防重放签名 + `0600` 脱敏审计日志。
+
+![AGY Studio 联邦工作台与 Hermes / Muse 外部 Agent 联邦协同](./docs/images/showcase-federation.svg)
+
+---
+
 ## 快速开始
 
 > 完整的单 Bot / 多 Bot 一键初始化向导与 Docker Compose 编排说明，请参阅 **[docs/AI-INSTALL.md](./docs/AI-INSTALL.md)**（可直接交给你的 AI 助手按步骤引导安装）。
@@ -135,7 +151,7 @@ chmod 600 "$HOME/agy-tg-bridge/.env"
 ```
 
 - MCP 配置模板：[config/mcp_config.example.json](./config/mcp_config.example.json)
-- Systemd 托管模板：[systemd/examples/](./systemd/examples)（含 [`agy-studio.service.example`](./systemd/examples/agy-studio.service.example)）
+- Systemd 托管模板：[systemd/examples/](./systemd/examples)（含 [`agy-studio.service.example`](./systemd/examples/agy-studio.service.example)、[`agy-federation-hub.service.example`](./systemd/examples/agy-federation-hub.service.example)）
 
 </details>
 

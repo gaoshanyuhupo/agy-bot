@@ -1,0 +1,309 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 720" width="1200" height="720" role="img" aria-label="AGY Studio Federation Workbench and External Agent Collaboration">
+  <defs>
+    <linearGradient id="fedBg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#070b16"/>
+      <stop offset="55%" stop-color="#0c1324"/>
+      <stop offset="100%" stop-color="#090f1d"/>
+    </linearGradient>
+    <radialGradient id="glowCyan" cx="0.14" cy="0.10" r="0.46">
+      <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.16"/>
+      <stop offset="100%" stop-color="#38bdf8" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glowIndigo" cx="0.86" cy="0.88" r="0.48">
+      <stop offset="0%" stop-color="#818cf8" stop-opacity="0.16"/>
+      <stop offset="100%" stop-color="#818cf8" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glowEmerald" cx="0.52" cy="0.18" r="0.38">
+      <stop offset="0%" stop-color="#10b981" stop-opacity="0.09"/>
+      <stop offset="100%" stop-color="#10b981" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="chatroomCardGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#312e81" stop-opacity="0.78"/>
+      <stop offset="100%" stop-color="#1e1b4b" stop-opacity="0.62"/>
+    </linearGradient>
+    <linearGradient id="humanGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1d4ed8" stop-opacity="0.48"/>
+      <stop offset="100%" stop-color="#3730a3" stop-opacity="0.38"/>
+    </linearGradient>
+    <linearGradient id="sendBtnGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#2563eb"/>
+      <stop offset="100%" stop-color="#4f46e5"/>
+    </linearGradient>
+    <filter id="softShadow" x="-8%" y="-8%" width="116%" height="120%">
+      <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#020617" flood-opacity="0.45"/>
+    </filter>
+    <style>
+      .f { font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+      .t-title { font-size: 13.5px; font-weight: 700; fill: #f1f5f9; }
+      .t-sec { font-size: 10.5px; font-weight: 700; fill: #64748b; letter-spacing: 0.5px; }
+      .t-item { font-size: 12.5px; font-weight: 600; fill: #e2e8f0; }
+      .t-sub { font-size: 10.5px; font-weight: 400; fill: #94a3b8; }
+      .t-body { font-size: 12px; font-weight: 400; fill: #e2e8f0; }
+      .t-name { font-size: 12.5px; font-weight: 700; }
+    </style>
+  </defs>
+
+  <!-- Outer Desktop App Shell -->
+  <rect x="0" y="0" width="1200" height="720" rx="20" fill="url(#fedBg)"/>
+  <rect x="0" y="0" width="1200" height="720" rx="20" fill="url(#glowCyan)"/>
+  <rect x="0" y="0" width="1200" height="720" rx="20" fill="url(#glowIndigo)"/>
+  <rect x="0" y="0" width="1200" height="720" rx="20" fill="url(#glowEmerald)"/>
+  <rect x="1" y="1" width="1198" height="718" rx="19" fill="none" stroke="#1e293b" stroke-width="1.5"/>
+
+  <!-- Top Window Chrome Bar -->
+  <path d="M 1 20 Q 1 1 20 1 L 1180 1 Q 1199 1 1199 20 L 1199 48 L 1 48 Z" fill="#0b1120" fill-opacity="0.94"/>
+  <line x1="1" y1="48" x2="1199" y2="48" stroke="#1e293b" stroke-width="1"/>
+  <circle cx="26" cy="24" r="5.5" fill="#ef4444" fill-opacity="0.85"/>
+  <circle cx="46" cy="24" r="5.5" fill="#f59e0b" fill-opacity="0.85"/>
+  <circle cx="66" cy="24" r="5.5" fill="#22c55e" fill-opacity="0.85"/>
+  <text x="92" y="29" class="f t-title">AGY Studio · 联邦工作台（Federation Workbench）</text>
+
+  <!-- Top Right Status Pills -->
+  <rect x="772" y="12" width="194" height="24" rx="12" fill="#064e3b" fill-opacity="0.72" stroke="#10b981" stroke-opacity="0.55"/>
+  <circle cx="788" cy="24" r="4" fill="#34d399"/>
+  <text x="799" y="28" class="mono" font-size="11" font-weight="600" fill="#a7f3d0">Hub 127.0.0.1:18799</text>
+  <rect x="976" y="12" width="206" height="24" rx="12" fill="#312e81" fill-opacity="0.72" stroke="#818cf8" stroke-opacity="0.55"/>
+  <text x="1079" y="28" text-anchor="middle" class="f" font-size="11" font-weight="600" fill="#e0e7ff">Hermes / Muse · 跨框架联邦</text>
+
+  <!-- ==================== LEFT SIDEBAR (x=16..276, w=260, y=60..704) ==================== -->
+  <rect x="16" y="60" width="260" height="644" rx="14" fill="#0e1629" fill-opacity="0.88" stroke="#1e2d4a" stroke-width="1"/>
+
+  <!-- Federation Chatroom Active Entry -->
+  <rect x="28" y="74" width="236" height="58" rx="11" fill="url(#chatroomCardGrad)" stroke="#6366f1" stroke-opacity="0.72" stroke-width="1.3" filter="url(#softShadow)"/>
+  <rect x="28" y="84" width="3.5" height="38" rx="2" fill="#38bdf8"/>
+  <text x="42" y="98" class="f" font-size="13" font-weight="700" fill="#f8fafc">✦ 联邦群聊室</text>
+  <rect x="180" y="83" width="74" height="19" rx="9.5" fill="#065f46" stroke="#10b981" stroke-opacity="0.55"/>
+  <text x="217" y="96" text-anchor="middle" class="f" font-size="10" font-weight="700" fill="#a7f3d0">TG 镜像中</text>
+  <text x="42" y="119" class="f" font-size="10.5" fill="#c7d2fe">TG 群双向实时镜像 · 5 节点在线</text>
+
+  <!-- Federation Projects & Multi-Turn Sessions -->
+  <text x="32" y="156" class="f t-sec">联邦项目与多轮会话 · PROJECTS</text>
+
+  <rect x="28" y="166" width="236" height="48" rx="9" fill="#172554" fill-opacity="0.58" stroke="#38bdf8" stroke-opacity="0.45"/>
+  <text x="42" y="186" class="f t-item">📌 cross-framework-ops</text>
+  <text x="42" y="203" class="f" font-size="10.5" fill="#93c5fd">多轮上下文 · Hermes + Muse 联调</text>
+
+  <rect x="28" y="222" width="236" height="44" rx="9" fill="#111b30" stroke="#1e293b"/>
+  <text x="42" y="241" class="f t-item">📁 nat-worker-pipeline</text>
+  <text x="42" y="257" class="f t-sub">内网 Pull 任务流 · 4 轮会话</text>
+
+  <rect x="28" y="274" width="236" height="44" rx="9" fill="#111b30" stroke="#1e293b"/>
+  <text x="42" y="293" class="f t-item">📁 multi-team-review</text>
+  <text x="42" y="309" class="f t-sub">跨团队架构评审 · 已归档 2 条</text>
+
+  <!-- External Agent Live Heartbeat Roster -->
+  <line x1="28" y1="332" x2="264" y2="332" stroke="#1e293b"/>
+  <text x="32" y="352" class="f t-sec">外部 AGENT 实时心跳 · PRESENCE</text>
+
+  <!-- Agent 1: AGY Coord (Leader) -->
+  <rect x="28" y="362" width="236" height="58" rx="9" fill="#181b38" stroke="#818cf8" stroke-opacity="0.5"/>
+  <circle cx="43" cy="383" r="4.5" fill="#34d399"/>
+  <text x="55" y="387" class="f" font-size="12" font-weight="700" fill="#e0e7ff">AGY Coord</text>
+  <rect x="190" y="373" width="64" height="18" rx="9" fill="#4f46e5"/>
+  <text x="222" y="385" text-anchor="middle" class="f" font-size="10" font-weight="700" fill="#ffffff">Leader</text>
+  <text x="40" y="408" class="f" font-size="10.5" fill="#94a3b8">agy_local · 本机编排 · 心跳 2s 前</text>
+
+  <!-- Agent 2: Hermes Local / Remote -->
+  <rect x="28" y="428" width="236" height="58" rx="9" fill="#0f1e36" stroke="#38bdf8" stroke-opacity="0.45"/>
+  <circle cx="43" cy="449" r="4.5" fill="#34d399"/>
+  <text x="55" y="453" class="f" font-size="12" font-weight="700" fill="#bae6fd">Hermes 节点</text>
+  <rect x="180" y="439" width="74" height="18" rx="9" fill="#0369a1"/>
+  <text x="217" y="451" text-anchor="middle" class="f" font-size="10" font-weight="600" fill="#e0f2fe">本机 / 远端</text>
+  <text x="40" y="474" class="f" font-size="10.5" fill="#94a3b8">-p 多 Profile · /p 路由 · 4s 前</text>
+
+  <!-- Agent 3: Muse Remote -->
+  <rect x="28" y="494" width="236" height="58" rx="9" fill="#1b1736" stroke="#a78bfa" stroke-opacity="0.45"/>
+  <circle cx="43" cy="515" r="4.5" fill="#34d399"/>
+  <text x="55" y="519" class="f" font-size="12" font-weight="700" fill="#ddd6fe">Muse Agent</text>
+  <rect x="174" y="505" width="80" height="18" rx="9" fill="#6d28d9"/>
+  <text x="214" y="517" text-anchor="middle" class="f" font-size="10" font-weight="600" fill="#f5f3ff">OpenAI 推流</text>
+  <text x="40" y="540" class="f" font-size="10.5" fill="#94a3b8">muse_remote · 流式评审 · 6s 前</text>
+
+  <!-- Agent 4: NAT Pull Worker -->
+  <rect x="28" y="560" width="236" height="58" rx="9" fill="#0b2421" stroke="#10b981" stroke-opacity="0.45"/>
+  <circle cx="43" cy="581" r="4.5" fill="#34d399"/>
+  <text x="55" y="585" class="f" font-size="12" font-weight="700" fill="#a7f3d0">NAT Worker</text>
+  <rect x="180" y="571" width="74" height="18" rx="9" fill="#047857"/>
+  <text x="217" y="583" text-anchor="middle" class="f" font-size="10" font-weight="600" fill="#d1fae5">Pull 队列</text>
+  <text x="40" y="606" class="f" font-size="10.5" fill="#94a3b8">内网无公网口 · 主动拉取 · 3s 前</text>
+
+  <!-- Agent 5: HTTP / A2A & MCP Inbound -->
+  <rect x="28" y="626" width="236" height="58" rx="9" fill="#241a10" stroke="#f59e0b" stroke-opacity="0.45"/>
+  <circle cx="43" cy="647" r="4.5" fill="#fbbf24"/>
+  <text x="55" y="651" class="f" font-size="12" font-weight="700" fill="#fde68a">HTTP / A2A</text>
+  <rect x="176" y="637" width="78" height="18" rx="9" fill="#b45309"/>
+  <text x="215" y="649" text-anchor="middle" class="f" font-size="10" font-weight="600" fill="#fef3c7">MCP / REST</text>
+  <text x="40" y="672" class="f" font-size="10.5" fill="#94a3b8">双向联邦 &amp; 仅入站 · 心跳 8s 前</text>
+
+  <!-- ==================== CENTER MAIN PANE (x=288..912, w=624, y=60..704) ==================== -->
+  <rect x="288" y="60" width="624" height="644" rx="14" fill="#0d1527" fill-opacity="0.9" stroke="#1e2d4a" stroke-width="1"/>
+
+  <!-- Center Pane Header Bar -->
+  <rect x="289" y="61" width="622" height="54" rx="13" fill="#111b31" fill-opacity="0.94"/>
+  <line x1="289" y1="115" x2="911" y2="115" stroke="#1e293b"/>
+  <text x="306" y="92" class="f" font-size="13.5" font-weight="700" fill="#f8fafc"># 联邦群聊室 · 跨框架协同流</text>
+  <rect x="556" y="75" width="166" height="26" rx="8" fill="#1e293b" stroke="#334155"/>
+  <text x="639" y="92" text-anchor="middle" class="f" font-size="11" font-weight="600" fill="#cbd5e1">团队: cross-agent-team</text>
+  <rect x="732" y="75" width="164" height="26" rx="8" fill="#064e3b" fill-opacity="0.72" stroke="#10b981" stroke-opacity="0.55"/>
+  <text x="814" y="92" text-anchor="middle" class="f" font-size="11" font-weight="700" fill="#a7f3d0">🔄 TG 群双向实时镜像</text>
+
+  <!-- MSG 1: Human Requirement (Right-aligned) -->
+  <rect x="364" y="128" width="532" height="66" rx="12" fill="url(#humanGrad)" stroke="#60a5fa" stroke-opacity="0.48"/>
+  <rect x="378" y="138" width="44" height="18" rx="9" fill="#1e3a8a"/>
+  <text x="400" y="150" text-anchor="middle" class="f" font-size="10" font-weight="700" fill="#bfdbfe">需求</text>
+  <text x="430" y="151" class="f" font-size="12" font-weight="700" fill="#dbeafe">项目负责人（来自 WebUI / TG 群）</text>
+  <text x="882" y="151" text-anchor="end" class="f" font-size="10.5" fill="#93c5fd">16:02</text>
+  <text x="378" y="177" class="f" font-size="12" fill="#f8fafc">联动 Hermes 巡检远端服务、Muse 评审改动方案、NAT Worker 拉取内网日志并汇总回群。</text>
+
+  <!-- MSG 2: Leader Dispatch -->
+  <circle cx="318" cy="228" r="14" fill="#4f46e5" fill-opacity="0.32" stroke="#818cf8" stroke-width="1.3"/>
+  <text x="318" y="232" text-anchor="middle" class="f" font-size="11.5" font-weight="700" fill="#e0e7ff">L</text>
+  <rect x="342" y="206" width="554" height="72" rx="12" fill="#161936" stroke="#818cf8" stroke-opacity="0.5"/>
+  <text x="356" y="227" class="f t-name" fill="#e0e7ff">AGY Coord</text>
+  <rect x="434" y="214" width="128" height="18" rx="9" fill="#4338ca"/>
+  <text x="498" y="226" text-anchor="middle" class="f" font-size="10" font-weight="600" fill="#eef2ff">Leader · 跨框架派单</text>
+  <text x="882" y="227" text-anchor="end" class="f t-sub">16:02</text>
+  <text x="356" y="250" class="f t-body">已按多团队编排并行分派：Hermes 节点执行环境诊断、Muse 外部 Agent 输出评审建议、</text>
+  <text x="356" y="268" class="f t-body">NAT Pull Worker 主动拉取内网诊断任务；各节点结果将实时入库并同步镜像至 TG 群。</text>
+
+  <!-- MSG 3A & 3B: Parallel Heterogeneous Cards (Hermes + Muse) -->
+  <!-- Left Parallel Card: Hermes -->
+  <rect x="304" y="290" width="290" height="96" rx="11" fill="#0e1e38" stroke="#38bdf8" stroke-opacity="0.52"/>
+  <circle cx="324" cy="312" r="11" fill="#0284c7" fill-opacity="0.35" stroke="#38bdf8"/>
+  <text x="324" y="316" text-anchor="middle" class="f" font-size="10.5" font-weight="700" fill="#e0f2fe">H</text>
+  <text x="342" y="316" class="f" font-size="12" font-weight="700" fill="#bae6fd">Hermes 节点</text>
+  <rect x="434" y="303" width="146" height="18" rx="9" fill="#075985"/>
+  <text x="507" y="315" text-anchor="middle" class="f" font-size="9.5" font-weight="600" fill="#e0f2fe">本机 -p / 远端 /p 路由</text>
+  <text x="318" y="342" class="f" font-size="11.5" fill="#cbd5e1">多 Profile 并行完成目标主机巡检，</text>
+  <text x="318" y="360" class="f" font-size="11.5" fill="#cbd5e1">服务端口与健康探针全部绿灯。</text>
+  <text x="318" y="378" class="f" font-size="10.5" font-weight="600" fill="#34d399">✓ 1.8s 回传 · SSRF 防护与脱敏已校验</text>
+
+  <!-- Right Parallel Card: Muse -->
+  <rect x="606" y="290" width="290" height="96" rx="11" fill="#1b1636" stroke="#a78bfa" stroke-opacity="0.52"/>
+  <circle cx="626" cy="312" r="11" fill="#7c3aed" fill-opacity="0.35" stroke="#a78bfa"/>
+  <text x="626" y="316" text-anchor="middle" class="f" font-size="10.5" font-weight="700" fill="#ede9fe">M</text>
+  <text x="644" y="316" class="f" font-size="12" font-weight="700" fill="#ddd6fe">Muse Agent</text>
+  <rect x="734" y="303" width="148" height="18" rx="9" fill="#5b21b6"/>
+  <text x="808" y="315" text-anchor="middle" class="f" font-size="9.5" font-weight="600" fill="#f5f3ff">OpenAI 兼容推流接入</text>
+  <text x="620" y="342" class="f" font-size="11.5" fill="#cbd5e1">远程推流完成变更边界与风险评审，</text>
+  <text x="620" y="360" class="f" font-size="11.5" fill="#cbd5e1">输出 3 条收敛建议并写入多轮上下文。</text>
+  <text x="620" y="378" class="f" font-size="10.5" font-weight="600" fill="#c4b5fd">✓ 2.3s 回传 · OpenBao 按需注入凭据</text>
+
+  <!-- MSG 3C: NAT Pull Worker Full-Width Card -->
+  <rect x="304" y="398" width="592" height="72" rx="11" fill="#0b2320" stroke="#10b981" stroke-opacity="0.5"/>
+  <circle cx="324" cy="420" r="11" fill="#059669" fill-opacity="0.35" stroke="#34d399"/>
+  <text x="324" y="424" text-anchor="middle" class="f" font-size="10.5" font-weight="700" fill="#d1fae5">P</text>
+  <text x="342" y="424" class="f" font-size="12" font-weight="700" fill="#a7f3d0">NAT Pull Worker</text>
+  <rect x="462" y="411" width="174" height="18" rx="9" fill="#065f46"/>
+  <text x="549" y="423" text-anchor="middle" class="f" font-size="10" font-weight="600" fill="#d1fae5">无公网端口 · 主动拉取回传</text>
+  <text x="882" y="423" text-anchor="end" class="f t-sub">16:03 · 2.1s</text>
+  <text x="318" y="446" class="f t-body">通过 PullQueue 主动拉取（claim → result）并回传脱敏运行日志；配套单进程多 Bot 桥接</text>
+  <text x="318" y="463" class="f" font-size="11" fill="#6ee7b7">federation_tg_bridge.py，支持内网节点与公网 / 本机 AGY Bot 混编协同。</text>
+
+  <!-- MSG 4: Leader Aggregation & Telegram Mirror Card -->
+  <rect x="304" y="482" width="592" height="114" rx="12" fill="#121d36" stroke="#38bdf8" stroke-opacity="0.55" stroke-width="1.2"/>
+  <circle cx="324" cy="505" r="11" fill="#4f46e5" fill-opacity="0.35" stroke="#818cf8"/>
+  <text x="324" y="509" text-anchor="middle" class="f" font-size="10.5" font-weight="700" fill="#e0e7ff">L</text>
+  <text x="342" y="509" class="f t-name" fill="#f8fafc">AGY Coord</text>
+  <rect x="422" y="496" width="116" height="18" rx="9" fill="#065f46"/>
+  <text x="480" y="508" text-anchor="middle" class="f" font-size="10" font-weight="700" fill="#a7f3d0">✅ 跨框架汇总完成</text>
+  <rect x="742" y="496" width="140" height="18" rx="9" fill="#1e3a8a" stroke="#38bdf8" stroke-opacity="0.5"/>
+  <text x="812" y="508" text-anchor="middle" class="f" font-size="10" font-weight="600" fill="#bae6fd">🔄 已实时镜像至 TG 群</text>
+
+  <text x="318" y="534" class="f t-body">三路异构 Agent 执行全部收敛：巡检绿灯、评审建议与内网日志已汇总归档并同步回 Telegram 群。</text>
+
+  <!-- Cross-Source Timeline Strip -->
+  <rect x="318" y="548" width="564" height="36" rx="8" fill="#09101f" stroke="#1e3a5f"/>
+  <text x="330" y="570" class="f" font-size="10.5" font-weight="700" fill="#64748b">跨来源时间线</text>
+  <rect x="408" y="556" width="98" height="20" rx="10" fill="#0c2d48" stroke="#38bdf8" stroke-opacity="0.5"/>
+  <text x="457" y="570" text-anchor="middle" class="f" font-size="10" font-weight="600" fill="#bae6fd">✓ Hermes 1.8s</text>
+  <text x="519" y="570" text-anchor="middle" class="f" font-size="11" fill="#64748b">→</text>
+  <rect x="532" y="556" width="94" height="20" rx="10" fill="#2e1065" stroke="#a78bfa" stroke-opacity="0.5"/>
+  <text x="579" y="570" text-anchor="middle" class="f" font-size="10" font-weight="600" fill="#ddd6fe">✓ Muse 2.3s</text>
+  <text x="639" y="570" text-anchor="middle" class="f" font-size="11" fill="#64748b">→</text>
+  <rect x="652" y="556" width="108" height="20" rx="10" fill="#064e3b" stroke="#10b981" stroke-opacity="0.5"/>
+  <text x="706" y="570" text-anchor="middle" class="f" font-size="10" font-weight="600" fill="#a7f3d0">✓ NAT Pull 2.1s</text>
+  <text x="773" y="570" text-anchor="middle" class="f" font-size="11" fill="#64748b">→</text>
+  <rect x="786" y="556" width="84" height="20" rx="10" fill="#172554" stroke="#60a5fa" stroke-opacity="0.5"/>
+  <text x="828" y="570" text-anchor="middle" class="f" font-size="10" font-weight="600" fill="#dbeafe">✓ TG 镜像</text>
+
+  <!-- Bottom Composer Box -->
+  <rect x="304" y="608" width="592" height="82" rx="12" fill="#0a1120" stroke="#334155" stroke-width="1.2"/>
+  <rect x="316" y="618" width="118" height="22" rx="6" fill="#172554" stroke="#3b82f6" stroke-opacity="0.5"/>
+  <text x="375" y="633" text-anchor="middle" class="f" font-size="10.5" font-weight="600" fill="#bfdbfe">🎯 指定联邦节点</text>
+  <rect x="442" y="618" width="122" height="22" rx="6" fill="#131c31" stroke="#334155"/>
+  <text x="503" y="633" text-anchor="middle" class="f" font-size="10.5" font-weight="600" fill="#cbd5e1">🔗 携带多轮上下文</text>
+  <rect x="572" y="618" width="124" height="22" rx="6" fill="#064e3b" fill-opacity="0.55" stroke="#10b981" stroke-opacity="0.45"/>
+  <text x="634" y="633" text-anchor="middle" class="f" font-size="10.5" font-weight="600" fill="#a7f3d0">🔄 同步回 TG 群聊</text>
+
+  <text x="318" y="672" class="f" font-size="12" fill="#94a3b8">向联邦群聊室发送指令，自由调度 Hermes / Muse / NAT Worker / AGY 协同...</text>
+  <rect x="812" y="652" width="72" height="28" rx="8" fill="url(#sendBtnGrad)"/>
+  <text x="848" y="670" text-anchor="middle" class="f" font-size="11.5" font-weight="700" fill="#ffffff">发送</text>
+
+  <!-- ==================== RIGHT TELEMETRY & CONTROL PANE (x=924..1184, w=260, y=60..704) ==================== -->
+  <rect x="924" y="60" width="260" height="644" rx="14" fill="#0e1629" fill-opacity="0.88" stroke="#1e2d4a" stroke-width="1"/>
+
+  <!-- Control Plane Tabs -->
+  <rect x="936" y="74" width="114" height="30" rx="8" fill="#172554" stroke="#38bdf8" stroke-opacity="0.55"/>
+  <text x="993" y="93" text-anchor="middle" class="f" font-size="11.5" font-weight="700" fill="#e0f2fe">联邦控制面</text>
+  <rect x="1058" y="74" width="114" height="30" rx="8" fill="#131c31" stroke="#1e293b"/>
+  <text x="1115" y="93" text-anchor="middle" class="f" font-size="11.5" font-weight="600" fill="#94a3b8">任务时间线</text>
+
+  <!-- Section 1: Multi-Team & Any-Agent Leader -->
+  <text x="938" y="128" class="f t-sec">多团队与 ANY-AGENT LEADER</text>
+  <rect x="936" y="138" width="236" height="122" rx="10" fill="#111b30" stroke="#1e2d4a"/>
+
+  <text x="948" y="160" class="f" font-size="11.5" font-weight="600" fill="#e2e8f0">主研发团队</text>
+  <rect x="1076" y="146" width="86" height="19" rx="9" fill="#312e81"/>
+  <text x="1119" y="159" text-anchor="middle" class="f" font-size="10" font-weight="600" fill="#e0e7ff">Leader: AGY</text>
+
+  <text x="948" y="188" class="f" font-size="11.5" font-weight="600" fill="#e2e8f0">巡检专班</text>
+  <rect x="1062" y="174" width="100" height="19" rx="9" fill="#075985"/>
+  <text x="1112" y="187" text-anchor="middle" class="f" font-size="10" font-weight="600" fill="#e0f2fe">Leader: Hermes</text>
+
+  <text x="948" y="216" class="f" font-size="11.5" font-weight="600" fill="#e2e8f0">评审小组</text>
+  <rect x="1072" y="202" width="90" height="19" rx="9" fill="#5b21b6"/>
+  <text x="1117" y="215" text-anchor="middle" class="f" font-size="10" font-weight="600" fill="#f5f3ff">Leader: Muse</text>
+
+  <line x1="948" y1="232" x2="1160" y2="232" stroke="#1e293b"/>
+  <text x="1054" y="249" text-anchor="middle" class="f" font-size="10.5" fill="#94a3b8">Owner 可授权任意节点任 Leader</text>
+
+  <!-- Section 2: Hub Channels & Protocols -->
+  <text x="938" y="284" class="f t-sec">HUB 通道与接入协议</text>
+  <rect x="936" y="294" width="236" height="156" rx="10" fill="#0b1222" stroke="#1e3a5f"/>
+
+  <circle cx="952" cy="316" r="4" fill="#34d399"/>
+  <text x="964" y="320" class="f" font-size="11.5" font-weight="600" fill="#f1f5f9">Hub 监听</text>
+  <text x="1160" y="320" text-anchor="end" class="mono" font-size="10.5" fill="#34d399">127.0.0.1:18799</text>
+
+  <circle cx="952" cy="346" r="4" fill="#38bdf8"/>
+  <text x="964" y="350" class="f" font-size="11.5" font-weight="600" fill="#f1f5f9">PullQueue</text>
+  <text x="1160" y="350" text-anchor="end" class="f" font-size="10.5" fill="#7dd3fc">内网拉取 · 在线</text>
+
+  <circle cx="952" cy="376" r="4" fill="#a78bfa"/>
+  <text x="964" y="380" class="f" font-size="11.5" font-weight="600" fill="#f1f5f9">HTTP / A2A</text>
+  <text x="1160" y="380" text-anchor="end" class="f" font-size="10.5" fill="#c4b5fd">双向联邦 · 就绪</text>
+
+  <circle cx="952" cy="406" r="4" fill="#fbbf24"/>
+  <text x="964" y="410" class="f" font-size="11.5" font-weight="600" fill="#f1f5f9">MCP / REST</text>
+  <text x="1160" y="410" text-anchor="end" class="mono" font-size="10.5" fill="#fde68a">/hub/mcp · /v1</text>
+
+  <circle cx="952" cy="434" r="4" fill="#34d399"/>
+  <text x="964" y="438" class="f" font-size="11.5" font-weight="600" fill="#f1f5f9">TG 联邦桥接</text>
+  <text x="1160" y="438" text-anchor="end" class="f" font-size="10.5" fill="#a7f3d0">单进程多 Bot</text>
+
+  <!-- Section 3: Zero-Trust & Zero-Plaintext Security -->
+  <text x="938" y="474" class="f t-sec">零信任与零明文安全防线</text>
+  <rect x="936" y="484" width="236" height="206" rx="11" fill="#064e3b" fill-opacity="0.22" stroke="#10b981" stroke-opacity="0.48"/>
+  <text x="950" y="508" class="f" font-size="12" font-weight="700" fill="#a7f3d0">🔐 零信任安全护栏</text>
+  <text x="950" y="532" class="f" font-size="11" fill="#cbd5e1">• Owner 独占注册与角色授权</text>
+  <text x="950" y="553" class="f" font-size="11" fill="#cbd5e1">• OpenBao secret_ref 零明文</text>
+  <text x="950" y="574" class="f" font-size="11" fill="#cbd5e1">• 零缓存实时 Bearer 校验</text>
+  <text x="950" y="595" class="f" font-size="11" fill="#cbd5e1">• full / peek 分级 + 一键吊销</text>
+  <text x="950" y="616" class="f" font-size="11" fill="#cbd5e1">• HMAC-SHA256 防重放签名</text>
+  <text x="950" y="637" class="f" font-size="11" fill="#cbd5e1">• 脱敏审计日志 (0600 落盘)</text>
+
+  <rect x="950" y="652" width="208" height="26" rx="7" fill="#065f46" fill-opacity="0.7" stroke="#34d399" stroke-opacity="0.45"/>
+  <text x="1054" y="669" text-anchor="middle" class="f" font-size="10.5" font-weight="700" fill="#d1fae5">✓ 0 明文密钥 · 审计校验开启</text>
+</svg>
